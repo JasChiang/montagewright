@@ -20,6 +20,16 @@ from jascue_video_lab.gemini import (
     GeminiLabClient,
     canonicalize_feature_edit_plan_output,
 )
+from jascue_video_lab.models import (
+    FeatureChapterBrief,
+    FeatureChapterSelect,
+    FeatureEditBrief,
+    FeatureEditPlan,
+    ModelProvenance,
+    RushClip,
+    RushFrame,
+    RushesCatalog,
+)
 
 
 class _StopRequest(RuntimeError):
@@ -68,6 +78,521 @@ def _client() -> tuple[GeminiLabClient, _RejectingInteractions]:
     client.client = SimpleNamespace(interactions=interactions)
     client.model_id = MODEL_ID
     return client, interactions
+
+
+class _CompletedFeatureInteraction:
+    id = "paid-feature-interaction"
+
+    def __init__(self, output_text: str) -> None:
+        self.output_text = output_text
+
+    def model_dump(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "model": MODEL_ID,
+            "output_text": self.output_text,
+            "usage": {
+                "total_input_tokens": 100,
+                "total_output_tokens": 10,
+                "total_thought_tokens": 0,
+            },
+        }
+
+
+class _CompletedFeatureInteractions:
+    def __init__(self, output_text: str) -> None:
+        self.output_text = output_text
+        self.calls = 0
+
+    def create(self, **_request: Any) -> _CompletedFeatureInteraction:
+        self.calls += 1
+        return _CompletedFeatureInteraction(self.output_text)
+
+
+class _ForbiddenInteractions:
+    def create(self, **_request: Any) -> None:
+        pytest.fail("raw output reuse must not issue a new Gemini request")
+
+
+def _feature_plan_fixture(
+    tmp_path: Path,
+) -> tuple[RushesCatalog, FeatureEditBrief, FeatureEditPlan]:
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    reel_path = tmp_path / "catalog-reel.mp4"
+    reel_path.write_bytes(b"catalog reel")
+    clip = RushClip(
+        clip_id="clip-generic",
+        path=str(source_path),
+        sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        duration_ms=10_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=source_path.stat().st_size,
+    )
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id=clip.clip_id,
+        requested_time_ms=2_000,
+        image_path=str(tmp_path / "frame.jpg"),
+    )
+    catalog = RushesCatalog(
+        catalog_id="catalog-generic",
+        source_directory=str(tmp_path),
+        sample_interval_ms=2_000,
+        total_duration_ms=clip.duration_ms,
+        clips=[clip],
+        frames=[frame],
+        analysis_reel_path=str(reel_path),
+        generated_at="2026-07-23T00:00:00+00:00",
+    )
+    brief = FeatureEditBrief(
+        project_id="project-generic",
+        title="Generic edit",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id="opening",
+                title="Opening",
+                detail_lines=[],
+                target_duration_seconds=3,
+            )
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id=catalog.catalog_id,
+        title=brief.title,
+        chapters=[
+            FeatureChapterSelect(
+                feature_id="opening",
+                evidence_status="supported",
+                horizontal_frame_id=frame.frame_id,
+                vertical_frame_id=frame.frame_id,
+                observed_visual_evidence="A directly visible subject.",
+                selection_reason="Representative visible evidence.",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                quality_risks=[],
+                confidence=0.9,
+                recommended_duration_seconds=3,
+                duration_rationale="One concise observable state.",
+            )
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="paid-run",
+            generated_at="2026-07-23T00:00:00+00:00",
+        ),
+    )
+    return catalog, brief, plan
+
+
+def _run_paid_feature_plan(
+    *,
+    tmp_path: Path,
+    catalog: RushesCatalog,
+    brief: FeatureEditBrief,
+    plan: FeatureEditPlan,
+    prompt_template: str = "Select observable evidence.",
+    music_sha256: str | None = None,
+) -> Path:
+    run_dir = tmp_path / "feature-plan"
+    run_dir.mkdir()
+    interactions = _CompletedFeatureInteractions(plan.model_dump_json())
+    client = object.__new__(GeminiLabClient)
+    client.client = SimpleNamespace(interactions=interactions)
+    client.model_id = MODEL_ID
+    uploaded_audio = (
+        SimpleNamespace(
+            uri="https://example.invalid/music",
+            mime_type="audio/wav",
+        )
+        if music_sha256 is not None
+        else None
+    )
+    client.plan_feature_edit(
+        catalog=catalog,
+        brief=brief,
+        uploaded=SimpleNamespace(
+            uri="https://example.invalid/reel",
+            mime_type="video/mp4",
+        ),
+        uploaded_audio=uploaded_audio,
+        music_sha256=music_sha256,
+        prompt_template=prompt_template,
+        run_id="fresh-run",
+        run_dir=run_dir,
+    )
+    assert interactions.calls == 1
+    return run_dir
+
+
+def test_feature_plan_missing_aspect_fails_closed_without_projection(
+    tmp_path: Path,
+) -> None:
+    _, _, plan = _feature_plan_fixture(tmp_path)
+    payload = plan.model_dump(mode="json")
+    payload["chapters"][0]["horizontal_frame_id"] = None
+
+    with pytest.raises(
+        ValueError,
+        match="cross-aspect projection is an editorial decision",
+    ):
+        canonicalize_feature_edit_plan_output(json.dumps(payload))
+
+    assert payload["chapters"][0]["horizontal_frame_id"] is None
+    assert payload["chapters"][0]["vertical_frame_id"] == "RF000001"
+
+
+def test_feature_plan_raw_reuse_accepts_exact_causal_binding_without_api(
+    tmp_path: Path,
+) -> None:
+    catalog, brief, plan = _feature_plan_fixture(tmp_path)
+    music_sha256 = "a" * 64
+    run_dir = _run_paid_feature_plan(
+        tmp_path=tmp_path,
+        catalog=catalog,
+        brief=brief,
+        plan=plan,
+        music_sha256=music_sha256,
+    )
+    binding_path = run_dir / "feature_edit_plan.raw_output_binding.json"
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+
+    assert binding["contract_version"] == (
+        "feature-edit-plan-raw-reuse-binding-v1"
+    )
+    assert binding["music_sha256"] == music_sha256
+    assert binding["catalog_reel_sha256"] == hashlib.sha256(
+        Path(catalog.analysis_reel_path).read_bytes()
+    ).hexdigest()
+    assert {
+        "catalog_definition_sha256",
+        "brief_definition_sha256",
+        "prompt_template_sha256",
+        "causal_prompt_sha256",
+        "system_instruction_sha256",
+        "response_schema_sha256",
+        "model_id_sha256",
+        "request_definition_sha256",
+        "definition_sha256",
+    }.issubset(binding)
+
+    client = object.__new__(GeminiLabClient)
+    client.client = SimpleNamespace(interactions=_ForbiddenInteractions())
+    client.model_id = MODEL_ID
+    reused = client.plan_feature_edit(
+        catalog=catalog,
+        brief=brief,
+        uploaded=None,
+        music_sha256=music_sha256,
+        prompt_template="Select observable evidence.",
+        run_id="reuse-run",
+        run_dir=run_dir,
+        reuse_raw_output=True,
+    )
+
+    assert reused.model_provenance.interaction_id == "paid-feature-interaction"
+    reuse_record = json.loads(
+        (run_dir / "feature_edit_plan.raw_output_reuse.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert reuse_record["causal_input_binding_sha256"] == hashlib.sha256(
+        binding_path.read_bytes()
+    ).hexdigest()
+    assert reuse_record["causal_input_definition_sha256"] == binding[
+        "definition_sha256"
+    ]
+
+
+def test_feature_plan_raw_reuse_fails_closed_without_binding(
+    tmp_path: Path,
+) -> None:
+    catalog, brief, plan = _feature_plan_fixture(tmp_path)
+    run_dir = _run_paid_feature_plan(
+        tmp_path=tmp_path,
+        catalog=catalog,
+        brief=brief,
+        plan=plan,
+    )
+    (run_dir / "feature_edit_plan.raw_output_binding.json").unlink()
+    client = object.__new__(GeminiLabClient)
+    client.client = SimpleNamespace(interactions=_ForbiddenInteractions())
+    client.model_id = MODEL_ID
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="causal input binding",
+    ):
+        client.plan_feature_edit(
+            catalog=catalog,
+            brief=brief,
+            uploaded=None,
+            prompt_template="Select observable evidence.",
+            run_id="reuse-run",
+            run_dir=run_dir,
+            reuse_raw_output=True,
+        )
+
+
+def test_fresh_feature_plan_refuses_to_resend_existing_paid_evidence(
+    tmp_path: Path,
+) -> None:
+    catalog, brief, plan = _feature_plan_fixture(tmp_path)
+    run_dir = _run_paid_feature_plan(
+        tmp_path=tmp_path,
+        catalog=catalog,
+        brief=brief,
+        plan=plan,
+    )
+    client = object.__new__(GeminiLabClient)
+    client.client = SimpleNamespace(interactions=_ForbiddenInteractions())
+    client.model_id = MODEL_ID
+
+    with pytest.raises(
+        FileExistsError,
+        match="explicit --reuse-feature-plan-raw-output",
+    ):
+        client.plan_feature_edit(
+            catalog=catalog,
+            brief=brief,
+            uploaded=SimpleNamespace(
+                uri="https://example.invalid/reel",
+                mime_type="video/mp4",
+            ),
+            prompt_template="Select observable evidence.",
+            run_id="accidental-fresh-replay",
+            run_dir=run_dir,
+            reuse_raw_output=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "changed_input",
+    [
+        "brief",
+        "catalog",
+        "catalog_reel",
+        "prompt",
+        "system_instruction",
+        "response_schema",
+        "model",
+        "music",
+    ],
+)
+def test_feature_plan_raw_reuse_rejects_changed_causal_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_input: str,
+) -> None:
+    catalog, brief, plan = _feature_plan_fixture(tmp_path)
+    original_prompt = "Select observable evidence."
+    original_music_sha256 = "a" * 64
+    run_dir = _run_paid_feature_plan(
+        tmp_path=tmp_path,
+        catalog=catalog,
+        brief=brief,
+        plan=plan,
+        prompt_template=original_prompt,
+        music_sha256=original_music_sha256,
+    )
+    current_catalog = catalog
+    current_brief = brief
+    current_prompt = original_prompt
+    current_music_sha256 = original_music_sha256
+    current_model = MODEL_ID
+    if changed_input == "brief":
+        current_brief = brief.model_copy(update={"title": "Changed intent"})
+    elif changed_input == "catalog":
+        current_catalog = catalog.model_copy(
+            update={"sample_interval_ms": 3_000}
+        )
+    elif changed_input == "catalog_reel":
+        Path(catalog.analysis_reel_path).write_bytes(b"changed catalog reel")
+    elif changed_input == "prompt":
+        current_prompt = "Use a changed editorial prompt."
+    elif changed_input == "system_instruction":
+        monkeypatch.setattr(
+            gemini_module,
+            "EDITORIAL_SYSTEM_INSTRUCTION",
+            EDITORIAL_SYSTEM_INSTRUCTION + "\nChanged binding test.",
+        )
+    elif changed_input == "response_schema":
+        original_schema_builder = gemini_module.gemini_response_schema
+
+        def changed_schema(model: type[Any]) -> dict[str, Any]:
+            schema = original_schema_builder(model)
+            return {**schema, "x-binding-test": True}
+
+        monkeypatch.setattr(
+            gemini_module,
+            "gemini_response_schema",
+            changed_schema,
+        )
+    elif changed_input == "model":
+        current_model = "gemini-3.5-flash"
+    elif changed_input == "music":
+        current_music_sha256 = "b" * 64
+    else:  # pragma: no cover - guarded by parametrization
+        raise AssertionError(changed_input)
+
+    client = object.__new__(GeminiLabClient)
+    client.client = SimpleNamespace(interactions=_ForbiddenInteractions())
+    client.model_id = current_model
+    with pytest.raises(
+        ValueError,
+        match="raw feature-plan reuse inputs differ",
+    ):
+        client.plan_feature_edit(
+            catalog=current_catalog,
+            brief=current_brief,
+            uploaded=None,
+            music_sha256=current_music_sha256,
+            prompt_template=current_prompt,
+            run_id="reuse-run",
+            run_dir=run_dir,
+            reuse_raw_output=True,
+        )
+
+
+def _semantic_music_fixture() -> tuple[Any, Any, str]:
+    music_sha256 = "c" * 64
+    music_definition_sha256 = "d" * 64
+    visual_sha256 = "e" * 64
+    music_lock = SimpleNamespace(
+        music_id=f"sha256:{music_sha256}",
+        definition_sha256=music_definition_sha256,
+        duration_ms=10_000,
+        bpm=120.0,
+        meter=4,
+        sections=[],
+        cues=[],
+    )
+    visual_map = SimpleNamespace(
+        project_duration_ms=10_000,
+        aspect_ratio="16:9",
+        points=[],
+        model_dump=lambda mode: {
+            "project_duration_ms": 10_000,
+            "aspect_ratio": "16:9",
+            "points": [],
+        },
+    )
+    return music_lock, visual_map, visual_sha256
+
+
+def _semantic_music_output(
+    *,
+    music_lock: Any,
+    visual_sha256: str,
+) -> str:
+    return json.dumps(
+        {
+            "contract_version": "semantic-music-pairing-v1",
+            "music_id": music_lock.music_id,
+            "music_definition_sha256": music_lock.definition_sha256,
+            "visual_sync_map_sha256": visual_sha256,
+            "global_strategy": "Preserve the observable musical flow.",
+            "section_interpretations": [],
+            "pairings": [],
+            "uncertainties": [],
+            "requires_human_review": True,
+            "model_provenance": ModelProvenance(
+                model_id=MODEL_ID,
+                api="gemini_interactions",
+                sdk="google-genai",
+                sdk_version="test",
+                run_id="semantic-paid",
+                generated_at="2026-07-23T00:00:00+00:00",
+            ).model_dump(mode="json"),
+        }
+    )
+
+
+def test_semantic_music_raw_reuse_requires_exact_definition_binding(
+    tmp_path: Path,
+) -> None:
+    music_lock, visual_map, visual_sha256 = _semantic_music_fixture()
+    interactions = _CompletedFeatureInteractions(
+        _semantic_music_output(
+            music_lock=music_lock,
+            visual_sha256=visual_sha256,
+        )
+    )
+    client = object.__new__(GeminiLabClient)
+    client.client = SimpleNamespace(interactions=interactions)
+    client.model_id = MODEL_ID
+    uploaded_audio = SimpleNamespace(
+        uri="https://example.invalid/music",
+        mime_type="audio/wav",
+    )
+    run_dir = tmp_path / "semantic-music"
+    client.plan_music_semantic_pairing(
+        music_lock=music_lock,
+        visual_map=visual_map,
+        visual_sync_map_sha256=visual_sha256,
+        uploaded_audio=uploaded_audio,
+        prompt_template="Interpret only the supplied audible evidence.",
+        run_id="fresh-semantic-run",
+        run_dir=run_dir,
+    )
+    assert interactions.calls == 1
+    binding_path = (
+        run_dir / "semantic_music_pairing.raw_output_binding.json"
+    )
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    assert binding["music_media_sha256"] == "c" * 64
+    assert binding["music_definition_sha256"] == "d" * 64
+    assert binding["visual_sync_map_sha256"] == visual_sha256
+    assert {
+        "prompt_template_sha256",
+        "causal_prompt_sha256",
+        "system_instruction_sha256",
+        "response_schema_sha256",
+        "model_id_sha256",
+        "request_definition_sha256",
+        "full_request_sha256",
+        "definition_sha256",
+    }.issubset(binding)
+
+    client.client = SimpleNamespace(interactions=_ForbiddenInteractions())
+    reused = client.plan_music_semantic_pairing(
+        music_lock=music_lock,
+        visual_map=visual_map,
+        visual_sync_map_sha256=visual_sha256,
+        uploaded_audio=uploaded_audio,
+        prompt_template="Interpret only the supplied audible evidence.",
+        run_id="reuse-semantic-run",
+        run_dir=run_dir,
+        reuse_raw_output=True,
+    )
+    assert reused.model_provenance.interaction_id == "paid-feature-interaction"
+
+    with pytest.raises(
+        ValueError,
+        match="semantic music raw reuse inputs differ",
+    ):
+        client.plan_music_semantic_pairing(
+            music_lock=music_lock,
+            visual_map=visual_map,
+            visual_sync_map_sha256=visual_sha256,
+            uploaded_audio=uploaded_audio,
+            prompt_template="A changed semantic music prompt.",
+            run_id="changed-semantic-run",
+            run_dir=run_dir,
+            reuse_raw_output=True,
+        )
 
 
 def test_live_client_disables_hidden_sdk_retries(

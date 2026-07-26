@@ -38,6 +38,7 @@ from jascue_video_lab.feature_cut import (
     _render_text_layer,
     _requested_render_aspects,
     _required_track_union,
+    _resolve_editorial_chapter_durations,
     _resolve_vertical_candidate_intent,
     _segment_variant_fingerprint,
     _soft_extent_visibility_audit,
@@ -51,6 +52,7 @@ from jascue_video_lab.feature_cut import (
     _vertical_center_crop_filter,
     _vertical_filter_from_track,
     _vertical_fit_filter,
+    _vertical_required_scope_fit_filter,
     _vertical_runtime_candidate_options,
     _vertical_target_fits_crop,
     _write_incremental_pricing,
@@ -93,6 +95,202 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
         ]
     )
     assert vertical.aspect == "9x16"
+
+
+def test_editorial_dwell_reconciles_short_source_without_synthetic_hold() -> None:
+    brief = FeatureEditBrief(
+        project_id="generic-project",
+        title="Generic edit",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id=feature_id,
+                title=feature_id,
+                detail_lines=[],
+                target_duration_seconds=10,
+            )
+            for feature_id in (
+                "opening",
+                "action",
+                "detail",
+                "comparison",
+                "result",
+                "closing",
+            )
+        ],
+    )
+    chapters = [
+        FeatureChapterSelect(
+            feature_id=feature_id,
+            evidence_status="supported",
+            observed_visual_evidence=f"Observable {feature_id}.",
+            selection_reason=f"Selected {feature_id}.",
+            horizontal_frame_id=f"RF{index:06d}",
+            horizontal_strategy="original",
+            horizontal_zoom_intent="none",
+            horizontal_target_description=None,
+            vertical_frame_id=f"RF{index:06d}",
+            vertical_strategy="fit_with_background",
+            vertical_target_description=None,
+            recommended_duration_seconds=10,
+            duration_rationale="Relative information and action judgment.",
+            quality_risks=[],
+            confidence=0.9,
+        )
+        for index, feature_id in enumerate(
+            (
+                "opening",
+                "action",
+                "detail",
+                "comparison",
+                "result",
+                "closing",
+            ),
+            start=1,
+        )
+    ]
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id="generic-catalog",
+        title=brief.title,
+        chapters=chapters,
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    durations, audit = _resolve_editorial_chapter_durations(
+        brief,
+        plan,
+        source_capacity_seconds={
+            "opening": 2.5,
+            "action": 20,
+            "closing": 20,
+        },
+    )
+
+    assert durations == {
+        "opening": 2.5,
+        "action": 11.5,
+        "detail": 11.5,
+        "comparison": 11.5,
+        "result": 11.5,
+        "closing": 11.5,
+    }
+    assert sum(durations.values()) == 60
+    assert audit["capacity_reconciliation_applied"] is True
+    opening = next(
+        row for row in audit["chapters"] if row["feature_id"] == "opening"
+    )
+    assert opening["source_capacity_applied"] is True
+    assert opening["source_capacity_seconds"] == 2.5
+
+
+def test_editorial_dwell_saves_generic_shortfall_audit_before_fail_closed(
+    tmp_path: Path,
+) -> None:
+    brief = FeatureEditBrief(
+        project_id="generic-project",
+        title="Generic edit",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id="only",
+                title="Only",
+                detail_lines=[],
+                target_duration_seconds=10,
+            )
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id="generic-catalog",
+        title=brief.title,
+        chapters=[
+            FeatureChapterSelect(
+                feature_id="only",
+                evidence_status="supported",
+                observed_visual_evidence="Observable action.",
+                selection_reason="Selected evidence.",
+                horizontal_frame_id="RF000001",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_frame_id="RF000001",
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                recommended_duration_seconds=10,
+                duration_rationale="Relative information and action judgment.",
+                quality_risks=[],
+                confidence=0.9,
+            )
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    audit_path = tmp_path / "editorial-duration-capacity-shortfall.json"
+    with pytest.raises(ValueError, match="cannot satisfy"):
+        _resolve_editorial_chapter_durations(
+            brief,
+            plan,
+            source_capacity_seconds={"only": 2.5},
+            shortfall_audit_path=audit_path,
+        )
+    audit = read_json(audit_path)
+    assert audit["contract_version"] == (
+        "editorial-duration-capacity-shortfall-v1"
+    )
+    assert audit["status"] == "blocked"
+    assert audit["failure_policy"] == "fail_closed_before_render"
+    assert audit["preferred_total_seconds"] == 60
+    assert audit["feasible_total_seconds"] == 2.5
+    assert audit["shortfall_seconds"] == 57.5
+    assert audit["user_duration_range"] == {
+        "minimum_seconds": 60.0,
+        "preferred_seconds": 60.0,
+        "maximum_seconds": 90.0,
+        "source": (
+            "FeatureEditBrief.target_duration_seconds contract and user brief"
+        ),
+    }
+    assert audit["chapter_capacities"] == [
+        {
+            "feature_id": "only",
+            "preferred_weight_seconds": 10.0,
+            "preferred_weight_authority": "gemini_relative_dwell",
+            "feasible_capacity_seconds": 2.5,
+            "capacity_evidence": "selected_shot_boundary",
+        }
+    ]
+    action_by_id = {
+        action["action_id"]: action for action in audit["next_actions"]
+    }
+    assert set(action_by_id) == {
+        "select_alternate_candidates",
+        "provide_additional_source",
+        "approve_shorter_project_duration",
+        "revise_required_scope",
+    }
+    assert (
+        action_by_id["approve_shorter_project_duration"]["available"] is False
+    )
+    assert "repeat_selected_footage" in audit["prohibited_automatic_actions"]
 
 
 @pytest.mark.parametrize(
@@ -177,9 +375,11 @@ def test_feature_cut_single_aspect_skips_unrequested_segments_and_concat(
         plan_dir / "feature-plan.binding.json",
         _current_feature_plan_binding(
             catalog_path=catalog_path,
+            catalog_reel_sha256="a" * 64,
             brief_path=brief_path,
             plan_path=plan_path,
             plan_prompt="plan",
+            music_sha256=None,
             request_path=request_path,
             created_at="test",
             origin="generated",
@@ -350,9 +550,11 @@ def test_feature_cut_single_aspect_found_evidence_never_runs_other_geometry(
         plan_dir / "feature-plan.binding.json",
         _current_feature_plan_binding(
             catalog_path=catalog_path,
+            catalog_reel_sha256="a" * 64,
             brief_path=brief_path,
             plan_path=plan_path,
             plan_prompt="plan",
+            music_sha256=None,
             request_path=request_path,
             created_at="test",
             origin="generated",
@@ -432,6 +634,11 @@ def test_feature_cut_single_aspect_found_evidence_never_runs_other_geometry(
     monkeypatch.setattr(feature_cut_module, "GeminiLabClient", FakeClient)
     monkeypatch.setattr(feature_cut_module, "probe_video", fake_probe)
     monkeypatch.setattr(feature_cut_module, "has_audio_stream", lambda _path: False)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_selected_source_capacity_seconds",
+        lambda *args, **kwargs: {},
+    )
     monkeypatch.setattr(
         feature_cut_module,
         "_chapter_bounds_with_approved_trim",
@@ -672,18 +879,22 @@ def test_feature_plan_binding_rejects_changed_causal_inputs(tmp_path: Path) -> N
 
     saved = _current_feature_plan_binding(
         catalog_path=catalog,
+        catalog_reel_sha256="a" * 64,
         brief_path=brief,
         plan_path=plan,
         plan_prompt="generic editorial prompt",
+        music_sha256=None,
         request_path=request,
         created_at="2026-01-01T00:00:00+00:00",
         origin="generated",
     )
     current = _current_feature_plan_binding(
         catalog_path=catalog,
+        catalog_reel_sha256="a" * 64,
         brief_path=brief,
         plan_path=plan,
         plan_prompt="generic editorial prompt",
+        music_sha256=None,
         request_path=request,
         created_at="2026-01-02T00:00:00+00:00",
         origin="generated",
@@ -691,6 +902,7 @@ def test_feature_plan_binding_rejects_changed_causal_inputs(tmp_path: Path) -> N
     _validate_feature_plan_binding(saved, current)
     causal_hashes = {
         "catalog_sha256",
+        "catalog_reel_sha256",
         "brief_sha256",
         "plan_prompt_sha256",
         "system_instruction_sha256",
@@ -700,12 +912,18 @@ def test_feature_plan_binding_rejects_changed_causal_inputs(tmp_path: Path) -> N
         "request_sha256",
     }
     assert causal_hashes <= saved.keys()
+    assert "music_sha256" in saved
+    assert saved["music_sha256"] is None
 
     for key in causal_hashes:
         changed = dict(current)
         changed[key] = "0" * 64
         with pytest.raises(ValueError, match=key):
             _validate_feature_plan_binding(saved, changed)
+    changed_music = dict(current)
+    changed_music["music_sha256"] = "b" * 64
+    with pytest.raises(ValueError, match="music_sha256"):
+        _validate_feature_plan_binding(saved, changed_music)
 
 
 def test_legacy_feature_plan_reuse_migrates_without_overwriting_evidence(
@@ -758,9 +976,11 @@ def test_legacy_feature_plan_reuse_migrates_without_overwriting_evidence(
     migrated = _migrate_legacy_feature_plan_binding(
         plan_dir=plan_dir,
         catalog_path=catalog,
+        catalog_reel_sha256="a" * 64,
         brief_path=brief,
         plan_path=plan,
         plan_prompt=prompt,
+        music_sha256=None,
     )
 
     assert migrated["origin"] == "migrated_legacy_reuse"
@@ -775,9 +995,11 @@ def test_legacy_feature_plan_reuse_migrates_without_overwriting_evidence(
         _migrate_legacy_feature_plan_binding(
             plan_dir=plan_dir,
             catalog_path=catalog,
+            catalog_reel_sha256="a" * 64,
             brief_path=brief,
             plan_path=plan,
             plan_prompt=prompt,
+            music_sha256=None,
         )
 
 
@@ -993,8 +1215,10 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
     binding = _current_external_projection_binding(
         plan_dir=plan_dir,
         catalog_path=catalog_path,
+        catalog_reel_sha256="a" * 64,
         brief_path=brief_path,
         plan_path=feature_plan_path,
+        music_sha256=None,
         created_at="2026-01-02T00:00:00+00:00",
     )
 
@@ -1008,8 +1232,10 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
         _current_external_projection_binding(
             plan_dir=plan_dir,
             catalog_path=catalog_path,
+            catalog_reel_sha256="a" * 64,
             brief_path=brief_path,
             plan_path=feature_plan_path,
+            music_sha256=None,
             created_at="2026-01-02T00:00:00+00:00",
         )
 
@@ -2399,8 +2625,41 @@ def test_vertical_fallback_filters_are_aspect_preserving_on_tall_sources() -> No
     center_filter = _vertical_center_crop_filter()
 
     assert "force_original_aspect_ratio=decrease" in fit_filter
-    assert "[foreground_source]scale=1080:1920" in fit_filter
+    assert "pad=1080:1920" in fit_filter
+    assert "gblur" not in fit_filter
+    assert "color=0x0b0e12" in fit_filter
     assert "y=(ih-oh)/2" in center_filter
+
+
+def test_required_scope_fit_removes_only_space_outside_all_sampled_unions() -> None:
+    result = _vertical_required_scope_fit_filter(
+        {
+            "source_display_width": 3840,
+            "source_display_height": 2160,
+            "source_geometry_lineage_passed": True,
+            "tracking_confidence_gate_passed": True,
+            "crop_keyframes": [
+                {"required_union_box": [210, 239, 761, 785]},
+                {"required_union_box": [212, 241, 764, 783]},
+            ],
+        }
+    )
+
+    assert result is not None
+    filter_graph, audit = result
+    assert "gblur" not in filter_graph
+    assert "color=0x0b0e12" in filter_graph
+    assert "crop=" in filter_graph
+    assert audit["applied_strategy"] == "required_scope_solid_fit"
+    assert audit["required_envelope_contained"] is True
+    assert audit["scope_envelope_box_2d"] == [165.0, 194.0, 809.0, 830.0]
+    assert audit["source_geometry_lineage_passed"] is True
+    assert audit["tracking_confidence_gate_passed"] is True
+    crop = audit["scope_crop_pixels"]
+    assert 0 < crop["x"] < 3840
+    assert 0 < crop["y"] < 2160
+    assert crop["width"] < 3840
+    assert crop["height"] < 2160
 
 
 def test_non_square_pixel_source_fails_closed_to_sar_normalized_static_reframe() -> None:
@@ -2738,7 +2997,7 @@ def test_automatic_reframe_summary_preserves_switch_and_failure_audit() -> None:
             },
             {
                 "feature_id": "closing",
-                "applied_strategy": "policy_blocked_preview_fit",
+                "applied_strategy": "policy_blocked_preview_solid_fit",
                 "requires_gemini_review": True,
                 "automatic_candidate_selection": {
                     "enabled": True,

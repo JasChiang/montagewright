@@ -2933,6 +2933,30 @@ class FeatureChapterSelect(StrictModel):
     vertical_target_description: str | None
     quality_risks: list[str]
     confidence: Confidence
+    recommended_duration_seconds: float | None = Field(
+        default=None,
+        ge=1.0,
+        le=15.0,
+        description=(
+            "Gemini's editorial dwell recommendation based on the observable "
+            "action/information, the brief, and (when supplied) the audible music. "
+            "It is a relative planning recommendation, not a source cut point."
+        ),
+    )
+    duration_rationale: str | None = Field(
+        default=None,
+        description=(
+            "Observable editorial reason for the recommended dwell. It must not "
+            "claim fixed pacing rules or invent unsupported content."
+        ),
+    )
+    source_reuse_justification: str | None = Field(
+        default=None,
+        description=(
+            "Required only when this chapter intentionally reuses a source clip "
+            "already selected by another chapter."
+        ),
+    )
     horizontal_candidates: list[FeatureHorizontalCandidate] = Field(
         default_factory=list, max_length=4
     )
@@ -2942,6 +2966,12 @@ class FeatureChapterSelect(StrictModel):
 
     @model_validator(mode="after")
     def validate_evidence(self) -> "FeatureChapterSelect":
+        if self.recommended_duration_seconds is not None and not (
+            self.duration_rationale and self.duration_rationale.strip()
+        ):
+            raise ValueError(
+                "recommended_duration_seconds requires duration_rationale"
+            )
         if self.evidence_status == "not_found":
             if self.horizontal_frame_id is not None or self.vertical_frame_id is not None:
                 raise ValueError("not_found feature chapters cannot reference catalog frames")
@@ -3018,4 +3048,317 @@ class FeatureEditPlan(StrictModel):
         ids = [chapter.feature_id for chapter in self.chapters]
         if len(ids) != len(set(ids)):
             raise ValueError("feature plan chapter IDs must be unique")
+        return self
+
+
+class MusicAssemblySpan(FrozenStrictModel):
+    """One half-open source interval mapped onto the output music timeline."""
+
+    span_id: str = Field(pattern=r"^music-span-[0-9]{3}$")
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    output_start_sample: int = Field(ge=0)
+    output_end_sample: int = Field(gt=0)
+    start_boundary_kind: Literal[
+        "track_start",
+        "section_boundary",
+        "phrase_grid",
+    ]
+    end_boundary_kind: Literal["phrase_grid", "natural_track_end"]
+    start_bar_index: int | None = Field(default=None, ge=0)
+    end_bar_index: int | None = Field(default=None, gt=0)
+    bar_count: int | None = Field(default=None, gt=0)
+    phrase_bar_multiple: int | None = Field(default=None, gt=0)
+    start_boundary_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+    end_boundary_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_mapping(self) -> "MusicAssemblySpan":
+        source_duration = self.source_end_sample - self.source_start_sample
+        output_duration = self.output_end_sample - self.output_start_sample
+        if source_duration <= 0:
+            raise ValueError("music assembly source span must be non-empty")
+        if output_duration != source_duration:
+            raise ValueError(
+                "music assembly v1 must preserve sample duration without time-stretching"
+            )
+        if self.start_boundary_kind == "track_start" and self.source_start_sample != 0:
+            raise ValueError("track_start boundary must begin at source sample zero")
+        if (
+            self.start_boundary_kind == "section_boundary"
+            and self.source_start_sample == 0
+        ):
+            raise ValueError("source sample zero must use track_start boundary kind")
+        if self.start_boundary_kind == "phrase_grid":
+            if self.start_bar_index is None or self.phrase_bar_multiple is None:
+                raise ValueError(
+                    "phrase-grid start requires bar index and alignment multiple"
+                )
+            if self.start_bar_index % self.phrase_bar_multiple != 0:
+                raise ValueError("music assembly start is not phrase-grid aligned")
+        elif self.start_bar_index is not None or self.phrase_bar_multiple is not None:
+            raise ValueError(
+                "non-grid start cannot claim phrase-grid alignment metadata"
+            )
+
+        if self.end_boundary_kind == "phrase_grid":
+            if self.start_boundary_kind != "phrase_grid":
+                raise ValueError(
+                    "phrase-grid end requires a phrase-grid start in assembly v1"
+                )
+            if (
+                self.start_bar_index is None
+                or self.end_bar_index is None
+                or self.bar_count is None
+                or self.phrase_bar_multiple is None
+            ):
+                raise ValueError("phrase-grid interval requires complete bar metadata")
+            if self.end_bar_index <= self.start_bar_index:
+                raise ValueError("music assembly bar interval must be non-empty")
+            if self.bar_count != self.end_bar_index - self.start_bar_index:
+                raise ValueError(
+                    "music assembly bar_count does not match its bar interval"
+                )
+            if self.bar_count % self.phrase_bar_multiple != 0:
+                raise ValueError("music assembly duration is not phrase-grid aligned")
+        elif self.end_bar_index is not None or self.bar_count is not None:
+            raise ValueError(
+                "natural track end cannot claim a complete phrase-grid ending"
+            )
+        return self
+
+
+class MusicAssemblyCueInstance(FrozenStrictModel):
+    """A locked source cue projected onto the assembled output timeline."""
+
+    cue_instance_id: str = Field(pattern=r"^music-cue-instance-[0-9]{5}$")
+    source_cue_id: str = Field(pattern=r"^locked-cue-[0-9]{5}$")
+    span_id: str = Field(pattern=r"^music-span-[0-9]{3}$")
+    kind: Literal[
+        "section_boundary",
+        "downbeat",
+        "beat",
+        "accent",
+        "ending_hit",
+    ]
+    priority: Literal["hard", "preferred", "optional"]
+    source_sample_index: int = Field(ge=0)
+    output_sample_index: int = Field(ge=0)
+    strength: float = Field(ge=0.0, le=1.0)
+
+
+class MusicAssemblyPlan(StrictModel):
+    """Immutable v1 plan for one continuous, non-spliced music interval."""
+
+    contract_version: Literal["music-assembly-plan-v1"] = "music-assembly-plan-v1"
+    assembly_id: str = Field(pattern=r"^music-assembly:[0-9a-f]{64}$")
+    assembly_mode: Literal["single_continuous_interval"] = (
+        "single_continuous_interval"
+    )
+    join_count: Literal[0] = 0
+    music_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    music_lock_path: str = Field(min_length=1)
+    music_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    master_sample_rate: int = Field(ge=8_000, le=192_000)
+    source_duration_samples: int = Field(gt=0)
+    target_duration_samples: int = Field(gt=0)
+    minimum_duration_samples: int = Field(gt=0)
+    maximum_duration_samples: int = Field(gt=0)
+    output_duration_samples: int = Field(gt=0)
+    target_duration_error_samples: int = Field(ge=0)
+    ending_policy: Literal[
+        "short_fade_at_phrase_grid_boundary",
+        "preserve_natural_track_end_no_fade_out",
+    ]
+    preferred_phrase_bars: tuple[int, ...] = Field(min_length=1, max_length=16)
+    spans: list[MusicAssemblySpan] = Field(min_length=1, max_length=1)
+    cue_instances: list[MusicAssemblyCueInstance]
+    uncertainties: list[str]
+    requires_human_review: Literal[True] = True
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_single_continuous_interval(self) -> "MusicAssemblyPlan":
+        if not (
+            self.minimum_duration_samples
+            <= self.target_duration_samples
+            <= self.maximum_duration_samples
+        ):
+            raise ValueError("target music duration must lie inside the requested range")
+        if len(set(self.preferred_phrase_bars)) != len(self.preferred_phrase_bars):
+            raise ValueError("preferred phrase-bar values must be unique")
+        if any(value <= 0 for value in self.preferred_phrase_bars):
+            raise ValueError("preferred phrase-bar values must be positive")
+        if len(self.spans) != 1:
+            raise ValueError(
+                "music assembly v1 permits exactly one continuous source interval"
+            )
+        span = self.spans[0]
+        if span.output_start_sample != 0:
+            raise ValueError("music assembly v1 output must begin at sample zero")
+        if span.source_end_sample > self.source_duration_samples:
+            raise ValueError("music assembly source span exceeds the locked source")
+        if span.output_end_sample != self.output_duration_samples:
+            raise ValueError("music assembly span does not cover the output timeline")
+        if not (
+            self.minimum_duration_samples
+            <= self.output_duration_samples
+            <= self.maximum_duration_samples
+        ):
+            raise ValueError("assembled music duration lies outside the requested range")
+        if self.target_duration_error_samples != abs(
+            self.output_duration_samples - self.target_duration_samples
+        ):
+            raise ValueError("target music duration error is inconsistent")
+        if (
+            span.phrase_bar_multiple is not None
+            and span.phrase_bar_multiple not in self.preferred_phrase_bars
+        ):
+            raise ValueError("selected phrase grid was not one of the requested grids")
+        if span.end_boundary_kind == "natural_track_end":
+            if self.ending_policy != "preserve_natural_track_end_no_fade_out":
+                raise ValueError(
+                    "natural track end requires the no-fade preservation policy"
+                )
+            if span.source_end_sample != self.source_duration_samples:
+                raise ValueError(
+                    "natural_track_end must preserve the locked source endpoint"
+                )
+            if span.end_boundary_cue_id is not None:
+                raise ValueError(
+                    "natural_track_end is an exclusive endpoint, not a source cue"
+                )
+        elif self.ending_policy != "short_fade_at_phrase_grid_boundary":
+            raise ValueError(
+                "phrase-grid ending requires the explicit short-fade policy"
+            )
+
+        instance_ids = [item.cue_instance_id for item in self.cue_instances]
+        source_ids = [item.source_cue_id for item in self.cue_instances]
+        if len(instance_ids) != len(set(instance_ids)):
+            raise ValueError("music cue instance IDs must be unique")
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("a locked source cue may only be mapped once in v1")
+        ordering = [
+            (item.output_sample_index, item.cue_instance_id)
+            for item in self.cue_instances
+        ]
+        if ordering != sorted(ordering):
+            raise ValueError("music cue instances must be chronological")
+        for item in self.cue_instances:
+            if item.span_id != span.span_id:
+                raise ValueError("music cue instance references an unknown span")
+            if not (
+                span.source_start_sample
+                <= item.source_sample_index
+                < span.source_end_sample
+            ):
+                raise ValueError("music cue instance lies outside its source span")
+            expected_output = (
+                span.output_start_sample
+                + item.source_sample_index
+                - span.source_start_sample
+            )
+            if item.output_sample_index != expected_output:
+                raise ValueError("music cue source/output sample mapping is inconsistent")
+        return self
+
+
+class MusicAssemblyArtifactBinding(StrictModel):
+    """Hashes that bind a saved assembly plan to its reviewed music lock."""
+
+    contract_version: Literal["music-assembly-artifact-binding-v1"] = (
+        "music-assembly-artifact-binding-v1"
+    )
+    assembly_id: str = Field(pattern=r"^music-assembly:[0-9a-f]{64}$")
+    assembly_plan_path: str = Field(min_length=1)
+    assembly_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_lock_path: str = Field(min_length=1)
+    music_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    generated_at: str
+
+
+class MusicAssemblyRenderManifest(StrictModel):
+    """Auditable QC record for one FFmpeg-rendered music interval."""
+
+    contract_version: Literal["music-assembly-render-v1"] = (
+        "music-assembly-render-v1"
+    )
+    render_id: str = Field(pattern=r"^music-render:[0-9a-f]{64}$")
+    assembly_id: str = Field(pattern=r"^music-assembly:[0-9a-f]{64}$")
+    assembly_plan_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_audio_path: str = Field(min_length=1)
+    source_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_audio_path: str = Field(min_length=1)
+    output_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_codec: Literal["pcm_s16le"] = "pcm_s16le"
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    source_master_sample_rate: int = Field(ge=8_000, le=192_000)
+    end_boundary_kind: Literal["phrase_grid", "natural_track_end"]
+    output_sample_rate: Literal[48_000] = 48_000
+    output_channels: Literal[2] = 2
+    expected_output_samples: int = Field(gt=0)
+    probed_output_samples: int = Field(gt=0)
+    duration_delta_samples: int
+    duration_tolerance_samples: int = Field(ge=0, le=16)
+    fade_in_samples: int = Field(gt=0)
+    fade_out_samples: int = Field(ge=0)
+    internal_join_count: Literal[0] = 0
+    ending_policy: Literal[
+        "short_fade_at_phrase_grid_boundary",
+        "preserve_natural_track_end_no_fade_out",
+    ]
+    natural_track_end_preserved: bool
+    ffmpeg_filter_graph: str = Field(min_length=1)
+    ffmpeg_command: list[str] = Field(min_length=1)
+    ffprobe_audio_stream: dict[str, Any]
+    qc_passed: bool
+    qc_errors: list[str]
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_render_qc(self) -> "MusicAssemblyRenderManifest":
+        if self.source_end_sample <= self.source_start_sample:
+            raise ValueError("render source interval must be non-empty")
+        if self.duration_delta_samples != (
+            self.probed_output_samples - self.expected_output_samples
+        ):
+            raise ValueError("render duration delta is inconsistent")
+        duration_passed = (
+            abs(self.duration_delta_samples) <= self.duration_tolerance_samples
+        )
+        if self.qc_passed != (duration_passed and not self.qc_errors):
+            raise ValueError("render QC status does not match its measurements")
+        if self.qc_passed and self.qc_errors:
+            raise ValueError("passing render QC cannot retain errors")
+        if not self.qc_passed and not self.qc_errors:
+            raise ValueError("failed render QC must preserve at least one error")
+        expected_natural_end = self.end_boundary_kind == "natural_track_end"
+        if self.natural_track_end_preserved != expected_natural_end:
+            raise ValueError("natural-ending flag is inconsistent with the plan")
+        if expected_natural_end:
+            if self.ending_policy != "preserve_natural_track_end_no_fade_out":
+                raise ValueError(
+                    "natural track end requires the no-fade preservation policy"
+                )
+            if self.fade_out_samples != 0:
+                raise ValueError("natural track end cannot apply a fade-out")
+        else:
+            if self.ending_policy != "short_fade_at_phrase_grid_boundary":
+                raise ValueError(
+                    "phrase-grid ending requires the explicit short-fade policy"
+                )
+            if self.fade_out_samples <= 0:
+                raise ValueError("phrase-grid ending requires a non-zero fade-out")
+        if "concat" in self.ffmpeg_filter_graph.lower():
+            raise ValueError("music assembly v1 render graph cannot contain concat")
         return self

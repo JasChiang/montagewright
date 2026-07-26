@@ -8,20 +8,22 @@
 
 1. **整理素材**：程式先讀取每支影片的長度、尺寸與切鏡等基本資訊，並建立較輕量的分析版本，不必反覆處理原始 4K 檔案。
 2. **AI 看帶**：Gemini 逐支理解影片，整理成可重用的 Clip Card，記錄拍到了什麼、有哪些人物或物件、動作是否完整，以及可能適合放在哪一段。
-3. **有指定音樂就先規劃音樂**：本機先找精確節拍、重音、能量與段落；Gemini 可選擇性先聽音樂，判斷 opening、build、peak、留白與 closing 適合承接什麼畫面。真人核准 CuePlan 後，選片才開始。
-4. **提出選片建議**：有剪輯 brief 時，AI 會同時依主題、功能、音樂角色與各段長度挑選素材；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。
+3. **有指定音樂就讓 AI 實際聽音樂**：本機先找精確節拍、重音、能量與段落；Gemini 的選片規劃 call 必須同時取得音樂與 brief，判斷 opening、build、peak、留白與 closing 適合承接什麼畫面。只有沒有提供音樂時，才允許純視覺選片。
+4. **提出選片與相對停留建議**：有剪輯 brief 時，AI 會同時依主題、功能、可觀察資訊量、動作是否完整及音樂 flow 挑選素材，並逐章說明相對上該多看或少看；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。系統不會因為畫面被分類成人物、產品、UI 或靜態鏡頭，就套用固定秒數。
 5. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
-6. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。
-7. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。成片後的 VisualSyncMap／CuePlan 仍會再做一次節奏 QC，但不再是第一次考慮音樂。真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
+6. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。必要主體無法安全裝進滿版 9:16 時，review fallback 會先依全段 required-region envelope 去除無關外圍，再用純色 matte 補邊；不使用模糊背景，也不以中心裁切偷掉必要主體。
+7. **保留連續音樂，不拿毛片原音疊上去**：review delivery 只使用已核准的一段連續音樂，優先保留自然收尾；不把同一首歌切成數段交疊、不 time-stretch，也不混入每顆毛片原音造成突兀重疊。若畫面長度與連續音樂無法在容差內對齊，會停止而不是硬裁或 freeze 畫面。
+8. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。Gemini 可用一次有聲 16:9 call 檢查 brief、資訊停留、重複、轉場及音樂 flow；9:16 另以靜音 proxy 只檢查裁切、文字與追蹤。QA 只提出觀察，不會自行改片；真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
 
 ```text
 一批毛片
   → AI 看帶並建立 Clip Cards
-  → 有指定音樂時先建立 MusicMap、Gemini 語意配對與 CuePlan Lock
-  → 有 brief 就照需求挑片；沒有 brief 就先提出故事候選
+  → 有指定音樂時先建立 MusicMap，並讓 Gemini 同時聽音樂、看 brief 與素材
+  → Gemini 提出選片、敘事順序與基於資訊量／動作／音樂的相對停留
   → 真人確認選片與重要目標
   → 只有需要直式重構或圖卡避讓時才做 bbox／SAM tracking
-  → 成片後再用 exact visual events 做 CuePlan QC
+  → 使用單一連續音樂段落組裝，不混毛片原音
+  → 成片後再做 brief／音樂 flow QA 與 9:16 crop-only QA
   → 輸出可播放的人工審核版
   → 真人修改或核准
 ```
@@ -36,7 +38,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 | FFmpeg／ffprobe | 讀取片長、尺寸、旋轉與影格時間；製作 proxy、偵測切鏡、抽原始影格及輸出 review cut | 不理解人物、物件或故事 |
 | Temporal Risk Window scanner | 以本機低解析影格差異找出可能被約 1 FPS 粗取樣漏掉的短暫視覺變化，提出需要加密檢查的時間窗 | 不宣稱時間窗內一定有語意事件，也不產生剪點 |
 | Gemini File API | 上傳並暫存可重用的影片或圖片，避免同一檔案在有效期內重複上傳 | 不執行內容判斷 |
-| Gemini 3.6 Flash＋Interactions API | 看完整 proxy、建立 Clip Cards、提出選片與敘事候選；在指定的單張影格中找出目標 bbox | 影片時間只適合語意搜尋，不提供 frame-accurate 剪點；單張 bbox 也不是逐幀追蹤 |
+| Gemini 3.6 Flash＋Interactions API | 看完整 proxy、建立 Clip Cards、提出選片與敘事候選；有音樂時同時聽音樂與讀 brief，判斷各章相對停留；在指定單張影格中找出目標 bbox | 不以固定類型秒數取代剪輯判斷；影片時間只適合語意搜尋，不提供 frame-accurate 剪點；單張 bbox 也不是逐幀追蹤 |
 | Pydantic Structured Output | 限制模型輸出欄位與型別，拒絕超界時間、非法 bbox 或不存在的 frame ID | Schema 合法不代表模型的內容判斷一定正確 |
 | SHA-256＋不可變 frame ID | 確認素材、proxy、影格與模型結果的來源，並把 AI 選中的畫面映射回原片 | 不判斷畫面好不好 |
 | Evidence Proposal／QueryLock | 先讓真人確認目標身分、動作條件與構圖需求，再把這份決定鎖定供後續步驟引用 | 不自動創造新目標，也不取代人工核准 |
@@ -45,8 +47,11 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 | Identity checkpoint | 在固定預算內挑出追蹤起點／終點、遮擋後重現或幾何異常的 exact frames，再驗證是否仍為鎖定實例 | 不修改 SAM geometry，也不能用未執行的檢查冒充通過 |
 | 本機 crop solver | 根據整段 tracking、required regions 與畫面邊界計算 9:16 安全裁切路徑 | 不自行決定哪個人物或物件最重要 |
 | 本機 MusicMap analyzer | 將音訊解碼成 PCM，提出 beat、accent、energy、section 與 ending-hit 候選 | 不理解歌詞、音樂情緒或剪輯 brief；BPM、第一個 downbeat 與 meter 未經真人核准不可執行 |
-| Gemini semantic music pairing（選配） | 聽取音樂的強弱、張力、留白與收尾感，再把既有 visual event ID 配對既有 music cue ID | 不重新偵測拍點、不輸出精確時間，也不能創造本機 MusicMap 沒有的 cue |
+| Gemini brief＋music selection planning | 使用者有給音樂時，選片 call 必須實際聽音樂並閱讀 brief，提出素材、順序、相對停留與理由 | 不直接產生精確音樂 sample、cut PTS，也不能因總長要求重複或 freeze 片段 |
+| Gemini semantic music pairing（進階選配） | 在完成選片後，再把既有 visual event ID 配對既有 music cue ID，增加語意型卡點線索 | 不重新偵測拍點、不輸出精確時間，也不能創造本機 MusicMap 沒有的 cue |
 | VisualSyncMap＋CuePlan | 把畫面的 cut、reveal、action apex、ending pose 等事件，在明確 timing window 內對到已核准的音樂 cue；可把 Gemini 配對當排序加分 | 不會為了卡拍暗中截斷 setup／action／result，也不會直接改寫選片、trim、identity 或 geometry |
+| Continuous music assembly | 從核准音樂中選一段連續、可稽核且優先自然收尾的區間；delivery 排除毛片原音，避免疊音 | 不拼接多個音樂片段、不 time-stretch、不為補長度硬切音樂或 freeze 畫面 |
+| Final Edit QA | 以一次有聲 16:9 review 檢查 brief、動作完整、資訊停留、重複、轉場與音樂 flow；9:16 另做 crop-only review | 只保存觀察與修正建議，不自動重剪，也不能覆蓋本機 geometry gate 或真人核准 |
 | Pillow | 把 bbox 或 mask 畫回原始影格，產生方便人工檢查的 debug 圖 | 不參與辨識或追蹤 |
 | 本機 HTML／JavaScript review page | 播放事件、候選片段、debug 圖與裁切結果，供真人核准或退回 | 不會因頁面能正常開啟就宣告模型結果正確 |
 | pytest | 驗證 schema contract、時間邊界、座標轉換、cache 與 geometry 規則 | 不取代對真實影片的人工觀看 |
@@ -260,7 +265,7 @@ v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 
 
 自動路徑使用版本化 `auto_bounded_clip_v1`：候選必須先用 `preserve_all` 解出 hard core；只有 soft extent 仍高於明列 floor 時，才可標記為 bounded clip。它不授權裁掉 hard core 或 atomic region。相對地，`controlled_clip` 仍必須來自 content-addressed 的真人 policy sidecar；一旦存在此 binding，renderer 會停用自動換候選，完全依真人核准的候選與 edge priority 執行。
 
-失敗會保存 typed failure code 與 recovery action，例如 shot crossing、coverage 不足、hard core 被裁、soft extent 低於門檻、keepout 違規或 crop motion 過快。現行 executor 會實際嘗試下一個 Top-K 候選，並把預先規劃的 safe-fit 候選延後到 tracked candidates 之後；其他 recovery action 目前是可稽核建議，尚未自動執行。所有候選都失敗時，輸出只是一份 `policy_blocked_preview_fit` 全內容補邊預覽並固定要求人工 review，不會偷偷改用未驗證的中心裁切。
+失敗會保存 typed failure code 與 recovery action，例如 shot crossing、coverage 不足、hard core 被裁、soft extent 低於門檻、keepout 違規或 crop motion 過快。現行 executor 會實際嘗試下一個 Top-K 候選，並把預先規劃的 safe-fit 候選延後到 tracked candidates 之後；其他 recovery action 目前是可稽核建議，尚未自動執行。所有候選都失敗時，輸出只是一份 `policy_blocked_preview_solid_fit` 全內容純色補邊預覽並固定要求人工 review，不會偷偷改用未驗證的中心裁切。
 
 這個設計也控制成本：Top-K 是同一次 planner 回應中的 2–4 個備選，不是把每支影片重送 K 次。Clip Card 可跨 brief 重用；planner 預設只允許一次 text-only Structured Output request，`--repair-attempts` 預設為 `0`。bbox／SAM geometry 採 lazy evaluation，只有已選 chapter 的候選才依序執行，遇到第一個通過 preflight 的候選就停止。Predicate refinement 也是明確指令才執行的一次局部 image call，不會在 Grounding 內暗中 repair；同一 identity＋exact frame 可在 framing 改變後重用 bbox。每次 model request、raw response、usage、prompt/schema/model fingerprint，以及每個候選的嘗試與 geometry fingerprint 都會保存；重跑時每次 response 另存 immutable attempt，canonical 檔不再覆蓋歷史成本。計價會把 `total_cached_tokens` 依 cached-input 牌價和一般 input 分開計算；若某份 response 沒有 usage，會列為未計價 request 並把總額標成不完整下限，不會當成免費。失敗候選仍可能增加 Grounding 費用與 SAM 時間，因此成本報告須以實際 raw usage 與本機 tracker timing 為準，不能只用候選數乘固定牌價。
 
@@ -343,6 +348,10 @@ uv run jascue-video-lab feature-cut \
 
 Feature renderer 同樣接受無音軌來源：有原音時保留並淡入淡出，無音軌時為 review segment 明確合成 deterministic stereo silence，讓所有 segment 維持一致的 A/V concat contract；manifest 會標示 `audio_origin=source` 或 `synthetic_silence`，不把靜音說成來源音訊證據。
 
+這個 segment-level 音軌只為了讓 FFmpeg concat contract 穩定，不是最終混音。指定音樂的 delivery 會明確只 map 核准的 continuous music track，排除所有 rush source audio，因此不會出現毛片原音彼此重疊或和背景音樂疊成突兀的雙重音軌。Picture 與 music 長度超過容差時會 fail closed，不以 `-shortest` 的副作用冒充已完成音樂剪輯。
+
+每章停留時間也不是按內容類別寫死。Gemini 先根據 brief、實際畫面、動作完整性、資訊密度與已提供的音樂提出 `recommended_duration_seconds` 與理由；本機只把這些數值當成**相對權重**，再受單一 shot 的合法 source capacity、核准總長與 MusicMap cue 約束。若某個 selected shot 太短，系統只能把剩餘時間分配給其他有足夠合法素材的章節，不能重播、freeze 或跨 shot 偷延長；全部容量不足時會先寫出 `editorial-duration-capacity-shortfall.json` 再停止。舊 brief 的逐章秒數只作缺少模型建議時的 legacy fallback，不能被解讀成「某類畫面一律停留幾秒」。
+
 若 geometry 與片段已經渲染，只想比較另一種敘事順序，不需要再呼叫 Gemini。`scripts/resequence_segments.py` 讀取明確的 trim/sequence JSON，重新編排現有編號 A/V segments，並輸出包含每段來源、trim 與新時間軸的 manifest。這只適合可稽核的 picture-edit A/B；它不會把既有片段描述冒充成新 Full Clip Card，也不能取代原片層級的 take selection。
 
 完整的 Clip Card-driven A/B 則分成兩次 Gemini 任務：第一輪逐片產生 Clip Cards；第二輪只讀已驗證 Clip Cards 與使用者 brief，輸出 Structured narrative plan。`scripts/plan_selected_clip_cards.py` 實作第二輪，`scripts/render_clip_card_narrative.py` 只從通過 evidence gate 的 source/event/MM:SS 建立 16:9 review cut。第二輪仍可能產生規格換算錯誤，Clip Card 也可能把局部可見的數字或型號字元誤判成另一個相似值。因此任何 OCR／身分衝突只能觸發 `needs_human_review`，必須回查 orientation-corrected 原始影格後才能採用或排除；schema validation 不能取代 claim validation，也不能把模型 OCR 當成 ground truth。
@@ -380,7 +389,9 @@ Gemini 的成片 `pass` 不可覆蓋本機幾何證據。QA validator 會把 req
 
 editorial brief（尚未選片）
   → Brief VisualSyncMap：章節意圖與可調整時間窗，不冒充影片證據
-  → 選配：Gemini 先聽音樂並配對既有 visual intent ID 與 music cue ID
+  → 有音樂時：Gemini 選片 call 必須同時聽音樂、讀 brief、看 catalog
+  → Gemini 提出選片、順序、相對停留與音樂角色理由
+  → 進階選配：再配對既有 visual intent ID 與 music cue ID
   → 全局 CuePlan scheduler
   → 真人核准成 immutable CuePlan Lock
   → CuePlan 的章節長度與音樂策略進入 feature-cut
@@ -397,7 +408,9 @@ editorial brief（尚未選片）
 
 零成本 baseline 全部在本機執行，不呼叫 Gemini。分析器只提出聲學候選，不把 `section_001` 冒充為 verse、chorus 或 drop；human review 之前，beat grid 不具執行權限。`narrative`、`balanced`、`montage` 三種 preset 只改變 section／downbeat／accent／一般 beat 的排序權重，不改變素材語意。
 
-若要減少規則式卡點的機械感，可選擇再執行一次 `gemini-3.6-flash` 音樂語意配對。Gemini 會同時取得音樂、已核准的 MusicMap cue IDs，以及 Clip Card／render manifest 衍生的視覺事件語意；它只能回答「哪個 visual event 適合哪些既有 cue IDs」，不能自己發明秒數。程式只傳送至少落在一個 visual event 合法 timing window 內的 cue，避免把數百個永遠不可能採用的拍點塞入 prompt。這是每支音樂一次、以音樂 SHA-256 跨比例共用 File API cache 的選配請求，不會對每個鏡頭重送音樂。最終 sample-accurate 位置、合法 timing window、全局順序與 hard gate 仍由本機決定。
+有指定音樂時，Gemini 的主要選片規劃請求不再是選配：它必須實際取得音樂、brief 與 catalog，否則不得宣稱做了 music-aware edit。若要進一步減少規則式卡點的機械感，才選配第二次 `gemini-3.6-flash` 音樂語意配對。第二次 call 會取得已核准的 MusicMap cue IDs 與 Clip Card／render manifest 衍生的 visual event 語意，只回答「哪個 visual event 適合哪些既有 cue IDs」，不能自己發明秒數。程式只傳送至少落在一個 visual event 合法 timing window 內的 cue，避免把數百個永遠不可能採用的拍點塞入 prompt。音樂以 SHA-256 cache，不會對每個鏡頭重送；最終 sample-accurate 位置、合法 timing window、全局順序與 hard gate 仍由本機決定。
+
+Music-aware delivery 預設保留一段連續音樂區間，優先選擇 phrase-aligned start 與自然 ending；`join_count` 必須為零，`internal_music_edits` 必須為空。畫面邊界可在合法 source capacity 內小幅對齊 MusicMap 的 section／downbeat／accent，但不能為卡拍截斷 setup／action／result，也不能把音樂切碎後交疊拼接。成片完成後，canonical 16:9 會以一次有聲 Structured Output QA 檢查 brief delivery、停留、重複、轉場與 music flow；9:16 另用靜音 proxy 做 crop-only QA，避免把音樂好聽誤判成構圖正確。
 
 ```bash
 # 1. 本機分析音樂；輸出 proposal，不會自動核准
@@ -472,6 +485,26 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab review-cue-plan \
 目前 MVP 的正式路徑完成卡點分析、排程、稽核與 lock；`scripts/render_music_cue_preview.py` 另可產生清楚標示為 **unapproved review preview** 的 A/B 影片，方便真人直接聽看 Gemini 語意配對是否改善節奏。preview 只在已授權的小窗口內對既有 segment 做有限 retime 並替換音樂，audit 會保存每個邊界的目標 cue、實際位移與變速比例；它不是 production RenderPlan，也不得冒充經 source-handle-aware re-trim 的正式成片。
 
 這是刻意的 fail-closed 邊界：render manifest 只有既有 segment duration，不能證明把 cut 移動 250 ms 仍保留完整 setup／action／result、合法 source handle、同一 shot、可用構圖與片尾 hold。正式下一階段必須讓經核准的 Trim Intent 提供 action-safe timing window，通過 geometry preflight 後才可將 CuePlan 套入新的 RenderPlan；不會直接用 `setpts` 變速或裁掉動作來製造「有卡拍」的假象。
+
+完成 picture cut 後，可用下列獨立工具組裝連續音樂與執行唯讀 QA。組裝器會驗證 MusicAssembly plan／binding／render manifest、實際音樂 hash 與 picture／music 各自的 stream 長度；任何證據不一致或超出容差都會拒絕，不會用 `-shortest` 暗中截斷。QA 會保存影片、manifest、brief、prompt、schema、raw response、usage 與成本 hash，重跑相同輸入不會再次付費：
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/assemble_music_delivery.py \
+  FEATURE_OUTPUT/renders/feature-cut-16x9-clean.mp4 CONTINUOUS_MUSIC.wav \
+  --music-assembly-artifacts MUSIC_ASSEMBLY_ARTIFACT_DIR \
+  --aspect 16:9 \
+  --output DELIVERY/feature-cut-16x9.mp4 \
+  --manifest DELIVERY/feature-cut-16x9.manifest.json
+
+UV_CACHE_DIR=.uv-cache uv run python scripts/run_final_edit_qa.py \
+  canonical_16x9 DELIVERY/feature-cut-16x9.mp4 \
+  FEATURE_OUTPUT/render-manifest.16x9.json QA/16x9 \
+  --brief FEATURE_BRIEF.json
+
+UV_CACHE_DIR=.uv-cache uv run python scripts/run_final_edit_qa.py \
+  crop_only_9x16 DELIVERY/feature-cut-9x16.mp4 \
+  FEATURE_OUTPUT/render-manifest.9x16.json QA/9x16
+```
 
 ## 重要界線
 

@@ -15,6 +15,8 @@
 3. 只描述畫面直接可見的 `observed_visual_evidence`。
 4. 如果精確功能 UI 沒有被 2 秒 sampling 捕捉，但有相近產品／操作 B-roll，使用 `partial`，並清楚寫明差距。
 5. 完全沒有合理畫面則使用 `not_found`，兩個 frame ID 都回傳 null；不得拿相近但不符合事件條件的素材假裝是直接證據。
+6. 對 supported／partial chapter 提出 `recommended_duration_seconds` 與 `duration_rationale`。停留長度必須依本次畫面真正包含的資訊量、動作 setup／action／result、brief 中的敘事重要性，以及本次實際提供的音樂流動綜合判斷；不得套用「靜態畫面固定幾秒」或「動作畫面固定幾秒」之類的硬規則。這只是相對剪輯建議，不是原片 timestamp；本機會依總長、shot、原始 PTS 與合法 handles 校正。
+7. 不同 chapter 原則上應選不同 source clip／take。只有同一來源的另一段確實提供不可替代、且視覺上有意義不同的證據時才可重用，並填寫 `source_reuse_justification`。不得只因第一候選 confidence 較高而重複使用幾乎相同的構圖。
 
 使用者 brief 的規格文字是允許顯示的 editorial copy，但不是你從影片觀察到的證據。不要因為 brief 寫了某功能，就謊稱畫面中確實看見。
 
@@ -39,5 +41,7 @@
 ## 品質
 
 優先：主體清楚、低動態模糊、低遮擋、構圖乾淨、能代表 chapter、與前後 chapter 不重複。把 2 秒抽樣、相似 take、UI 反光、手部遮擋與功能證據不足寫入 uncertainties／quality_risks。
+
+若本次同時提供音樂，必須真的聆聽音樂，讓開場、建立、推進、峰值、呼吸與收尾等可聽見的段落角色影響素材、動作相位與相對停留長度；不得為了逐拍對齊而破壞 brief 順序、切斷完整動作或重複素材。不得輸出音樂 timestamp、sample 或自行改寫本機鎖定的時間證據。
 
 只回傳符合 Structured Output schema 的資料。

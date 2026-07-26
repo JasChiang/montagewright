@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.metadata
 import json
 import mimetypes
@@ -59,7 +60,7 @@ from .query_refinement import (
     write_query_temporal_consumer_lineage,
 )
 from .schema import gemini_response_schema
-from .storage import append_error, utc_now, write_json
+from .storage import append_error, read_json, utc_now, write_json
 
 
 MODEL_ID = os.environ.get("JASCUE_GEMINI_MODEL", "gemini-3.6-flash")
@@ -80,6 +81,250 @@ EDITORIAL_SYSTEM_INSTRUCTION = """你是 evidence-constrained 剪輯規劃系統
 
 SEMANTIC_IDENTITY_GENERATION_CONFIG = {"thinking_level": "medium"}
 
+_FEATURE_PLAN_RAW_REUSE_BINDING_VERSION = (
+    "feature-edit-plan-raw-reuse-binding-v1"
+)
+_FEATURE_PLAN_RAW_REUSE_BINDING_FILENAME = (
+    "feature_edit_plan.raw_output_binding.json"
+)
+_SEMANTIC_MUSIC_RAW_REUSE_BINDING_VERSION = (
+    "semantic-music-raw-reuse-binding-v1"
+)
+_SEMANTIC_MUSIC_RAW_REUSE_BINDING_FILENAME = (
+    "semantic_music_pairing.raw_output_binding.json"
+)
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _model_input_payload(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "model_dump_json"):
+        return json.loads(value.model_dump_json())
+    raise TypeError(
+        "feature-plan causal input must provide model_dump or model_dump_json"
+    )
+
+
+def _catalog_input_payload(catalog: RushesCatalog) -> Any:
+    if hasattr(catalog, "model_dump") or hasattr(catalog, "model_dump_json"):
+        return _model_input_payload(catalog)
+    return {
+        "catalog_id": catalog.catalog_id,
+        "frames": [
+            {
+                "frame_id": frame.frame_id,
+                "clip_id": getattr(frame, "clip_id", None),
+            }
+            for frame in catalog.frames
+        ],
+    }
+
+
+def _catalog_reel_sha256(catalog: RushesCatalog) -> str | None:
+    value = getattr(catalog, "analysis_reel_path", None)
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value).expanduser()
+    return sha256_file(path) if path.is_file() else None
+
+
+def _feature_plan_raw_reuse_binding(
+    *,
+    catalog: RushesCatalog,
+    brief: FeatureEditBrief,
+    prompt_template: str,
+    causal_prompt: str,
+    model_id: str,
+    music_sha256: str | None,
+    response_schema: dict[str, Any],
+    request_record: dict[str, Any],
+) -> dict[str, Any]:
+    components: dict[str, Any] = {
+        "contract_version": _FEATURE_PLAN_RAW_REUSE_BINDING_VERSION,
+        "catalog_definition_sha256": _canonical_json_sha256(
+            _catalog_input_payload(catalog)
+        ),
+        "catalog_reel_sha256": _catalog_reel_sha256(catalog),
+        "brief_definition_sha256": _canonical_json_sha256(
+            _model_input_payload(brief)
+        ),
+        "prompt_template_sha256": hashlib.sha256(
+            prompt_template.encode("utf-8")
+        ).hexdigest(),
+        "causal_prompt_sha256": hashlib.sha256(
+            causal_prompt.encode("utf-8")
+        ).hexdigest(),
+        "system_instruction_sha256": hashlib.sha256(
+            EDITORIAL_SYSTEM_INSTRUCTION.encode("utf-8")
+        ).hexdigest(),
+        "response_schema_sha256": _canonical_json_sha256(response_schema),
+        "model_id": model_id,
+        "model_id_sha256": hashlib.sha256(model_id.encode("utf-8")).hexdigest(),
+        "music_sha256": music_sha256,
+        "request_definition_sha256": _canonical_json_sha256(request_record),
+    }
+    return {
+        **components,
+        "definition_sha256": _canonical_json_sha256(components),
+    }
+
+
+def _validate_feature_plan_raw_reuse_binding(
+    saved: Any,
+    expected: dict[str, Any],
+) -> None:
+    if not isinstance(saved, dict):
+        raise ValueError("raw feature-plan reuse binding must be a JSON object")
+    required = tuple(expected)
+    missing = [key for key in required if key not in saved]
+    if missing:
+        raise ValueError(
+            "raw feature-plan reuse binding is incomplete: "
+            + ", ".join(sorted(missing))
+        )
+    saved_components = {
+        key: value for key, value in saved.items() if key != "definition_sha256"
+    }
+    if saved.get("definition_sha256") != _canonical_json_sha256(
+        saved_components
+    ):
+        raise ValueError("raw feature-plan reuse binding integrity check failed")
+    mismatches = [key for key in required if saved.get(key) != expected[key]]
+    if mismatches:
+        raise ValueError(
+            "raw feature-plan reuse inputs differ from the paid request: "
+            + ", ".join(sorted(mismatches))
+        )
+
+
+def _semantic_music_request_definition(
+    *,
+    model_id: str,
+    causal_prompt: str,
+    response_schema: dict[str, Any],
+    music_media_sha256: str,
+    audio_mime_type: str,
+) -> dict[str, Any]:
+    """Return the URI- and run-id-independent definition of a paid request."""
+
+    return {
+        "model": model_id,
+        "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+        "store": False,
+        "input": [
+            {"type": "text", "text": causal_prompt},
+            {
+                "type": "audio",
+                "media_sha256": music_media_sha256,
+                "mime_type": audio_mime_type,
+            },
+        ],
+        "generation_config": {
+            "thinking_level": "low",
+            "max_output_tokens": 4096,
+        },
+        "response_format": {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": response_schema,
+        },
+    }
+
+
+def _semantic_music_raw_reuse_binding(
+    *,
+    music_lock: MusicMapLock,
+    visual_map: VisualSyncMap,
+    visual_sync_map_sha256: str,
+    prompt_template: str,
+    causal_prompt: str,
+    model_id: str,
+    response_schema: dict[str, Any],
+    request_record: dict[str, Any],
+    audio_mime_type: str,
+) -> dict[str, Any]:
+    music_media_sha256 = music_lock.music_id.removeprefix("sha256:")
+    request_definition = _semantic_music_request_definition(
+        model_id=model_id,
+        causal_prompt=causal_prompt,
+        response_schema=response_schema,
+        music_media_sha256=music_media_sha256,
+        audio_mime_type=audio_mime_type,
+    )
+    components: dict[str, Any] = {
+        "contract_version": _SEMANTIC_MUSIC_RAW_REUSE_BINDING_VERSION,
+        "music_media_sha256": music_media_sha256,
+        "music_definition_sha256": music_lock.definition_sha256,
+        "visual_sync_map_sha256": visual_sync_map_sha256,
+        "visual_sync_map_definition_sha256": _canonical_json_sha256(
+            _model_input_payload(visual_map)
+        ),
+        "prompt_template_sha256": hashlib.sha256(
+            prompt_template.encode("utf-8")
+        ).hexdigest(),
+        "causal_prompt_sha256": hashlib.sha256(
+            causal_prompt.encode("utf-8")
+        ).hexdigest(),
+        "system_instruction_sha256": hashlib.sha256(
+            EDITORIAL_SYSTEM_INSTRUCTION.encode("utf-8")
+        ).hexdigest(),
+        "response_schema_sha256": _canonical_json_sha256(response_schema),
+        "model_id": model_id,
+        "model_id_sha256": hashlib.sha256(model_id.encode("utf-8")).hexdigest(),
+        "audio_mime_type": audio_mime_type,
+        # The definition hash proves the current causal request even though a
+        # File API URI and provenance run_id may legitimately differ later.
+        "request_definition_sha256": _canonical_json_sha256(
+            request_definition
+        ),
+        # The complete saved request is also immutable and independently
+        # hashed, so local reuse cannot silently substitute another paid call.
+        "full_request_sha256": _canonical_json_sha256(request_record),
+    }
+    return {
+        **components,
+        "definition_sha256": _canonical_json_sha256(components),
+    }
+
+
+def _validate_semantic_music_raw_reuse_binding(
+    saved: Any,
+    expected: dict[str, Any],
+) -> None:
+    if not isinstance(saved, dict):
+        raise ValueError("semantic music raw reuse binding must be a JSON object")
+    missing = [key for key in expected if key not in saved]
+    if missing:
+        raise ValueError(
+            "semantic music raw reuse binding is incomplete: "
+            + ", ".join(sorted(missing))
+        )
+    saved_components = {
+        key: value for key, value in saved.items() if key != "definition_sha256"
+    }
+    if saved.get("definition_sha256") != _canonical_json_sha256(
+        saved_components
+    ):
+        raise ValueError("semantic music raw reuse binding integrity check failed")
+    mismatches = [
+        key for key, value in expected.items() if saved.get(key) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "semantic music raw reuse inputs differ from the paid request: "
+            + ", ".join(sorted(mismatches))
+        )
+
 
 def canonicalize_feature_edit_plan_output(
     output_text: str,
@@ -95,6 +340,16 @@ def canonicalize_feature_edit_plan_output(
     for chapter_index, chapter in enumerate(chapters):
         if not isinstance(chapter, dict):
             continue
+        if chapter.get("evidence_status") in {"supported", "partial"}:
+            horizontal_frame = chapter.get("horizontal_frame_id")
+            vertical_frame = chapter.get("vertical_frame_id")
+            if horizontal_frame is None or vertical_frame is None:
+                raise ValueError(
+                    "supported/partial feature chapter is missing an aspect-specific "
+                    "frame; cross-aspect projection is an editorial decision and "
+                    "cannot be canonicalized without human review "
+                    f"(chapter_index={chapter_index})"
+                )
         for field in ("horizontal_candidates", "vertical_candidates"):
             candidates = chapter.get(field)
             if isinstance(candidates, list) and len(candidates) == 1:
@@ -2214,60 +2469,200 @@ model_provenance (return it unchanged with interaction_id=null):
         catalog: RushesCatalog,
         brief: FeatureEditBrief,
         uploaded: Any,
+        uploaded_audio: Any | None = None,
+        music_sha256: str | None = None,
         prompt_template: str,
         run_id: str,
         run_dir: Path,
+        reuse_raw_output: bool = False,
     ) -> FeatureEditPlan:
         """Select evidence-backed frame IDs for a user-authored feature brief."""
         provenance = _provenance(run_id, model_id=self.model_id)
-        prompt = (
+        music_supplied = music_sha256 is not None
+        if not reuse_raw_output and (uploaded_audio is not None) != music_supplied:
+            raise ValueError(
+                "fresh feature-plan requests require both uploaded music and its "
+                "content SHA-256, or neither"
+            )
+        if hasattr(brief, "model_dump"):
+            brief_for_model = brief.model_dump(mode="json")
+        else:
+            brief_for_model = json.loads(brief.model_dump_json())
+        for chapter in brief_for_model["chapters"]:
+            chapter.pop("target_duration_seconds", None)
+        frame_source_map = {
+            frame.frame_id: getattr(frame, "clip_id", "source-not-provided")
+            for frame in catalog.frames
+        }
+        causal_prompt = (
             prompt_template
             + "\n\n## 本次不可變 metadata\n"
             + f"project_id 必須原樣回傳：{brief.project_id}\n"
             + f"catalog_id 必須原樣回傳：{catalog.catalog_id}\n"
+            + "成片目標總長（不是各章硬配額）："
+            + f"{getattr(brief, 'target_duration_seconds', 'unspecified')} 秒\n"
             + f"合法 frame ID 數量：{len(catalog.frames)}\n"
-            + "合法 frame IDs（只能逐字選用，不得推算、補號或創造）：\n"
+            + "合法 frame ID → source clip 對照（只能逐字選用；"
+            + "跨 chapter 重用同一 source 必須說明）：\n"
             + json.dumps(
-                [frame.frame_id for frame in catalog.frames],
+                frame_source_map,
                 ensure_ascii=False,
             )
             + "\n"
             + "chapters 必須依 brief 順序完整回傳，一個 feature_id 恰好一次。\n"
+            + "每章原先的手填秒數已從下方 model-facing brief 移除，避免形成硬性"
+            + "停留規則。請依實際媒體、brief 與音樂（若有）提出相對停留長度；"
+            + "本機只會在保持相對判斷的前提下校正總長與合法 source handles。\n"
+            + (
+                f"本次另附音樂，music_sha256={music_sha256}。你必須實際聆聽"
+                "音樂後再決定素材與相對停留，不得只依文字描述猜音樂。\n"
+                if music_supplied
+                else "本次未附音樂；不得推測不存在的節拍或能量變化。\n"
+            )
             + "\n## 使用者提供的 editorial brief（文字可用，但不等於影片證據）\n"
-            + brief.model_dump_json(indent=2)
+            + json.dumps(brief_for_model, ensure_ascii=False, indent=2)
+        )
+        prompt = (
+            causal_prompt
             + "\n\nmodel_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
             + provenance.model_dump_json()
         )
-        request_record = {
-            "model": self.model_id,
-            "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
-            "store": False,
-            "input": [
-                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+        request_path = run_dir / "feature_edit_plan.request.json"
+        raw_interaction_path = run_dir / "feature_edit_plan.raw_interaction.json"
+        raw_output_path = run_dir / "feature_edit_plan.raw_output.json"
+        raw_binding_path = (
+            run_dir / _FEATURE_PLAN_RAW_REUSE_BINDING_FILENAME
+        )
+        response_schema = gemini_response_schema(FeatureEditPlan)
+        if reuse_raw_output:
+            if not all(
+                path.exists()
+                for path in (
+                    request_path,
+                    raw_interaction_path,
+                    raw_output_path,
+                    raw_binding_path,
+                )
+            ):
+                raise FileNotFoundError(
+                    "raw feature-plan reuse requires the saved request, raw "
+                    "interaction, raw output, and causal input binding from one "
+                    "completed paid response"
+                )
+            request_record = read_json(request_path)
+            expected_binding = _feature_plan_raw_reuse_binding(
+                catalog=catalog,
+                brief=brief,
+                prompt_template=prompt_template,
+                causal_prompt=causal_prompt,
+                model_id=self.model_id,
+                music_sha256=music_sha256,
+                response_schema=response_schema,
+                request_record=request_record,
+            )
+            _validate_feature_plan_raw_reuse_binding(
+                read_json(raw_binding_path),
+                expected_binding,
+            )
+        else:
+            existing_paid_artifacts = [
+                path
+                for path in (raw_interaction_path, raw_output_path)
+                if path.exists()
+            ]
+            if existing_paid_artifacts:
+                raise FileExistsError(
+                    "feature-plan paid evidence already exists; pass explicit "
+                    "--reuse-feature-plan-raw-output after verifying its causal "
+                    "binding, or choose a new output directory. Refusing to send "
+                    "the same paid request again: "
+                    + ", ".join(path.name for path in existing_paid_artifacts)
+                )
+            request_input: list[dict[str, Any]] = [
                 {"type": "text", "text": prompt},
-            ],
-            "generation_config": {"thinking_level": "low"},
-            "response_format": {
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": gemini_response_schema(FeatureEditPlan),
-            },
-        }
-        write_json(run_dir / "feature_edit_plan.request.json", request_record)
-        try:
-            interaction = self.client.interactions.create(**request_record)
-            _record_interaction_attempt(
-                run_dir=run_dir,
-                operation="feature_edit_plan",
-                canonical_filename="feature_edit_plan.raw_interaction.json",
-                interaction=interaction,
-            )
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                },
+            ]
+            if uploaded_audio is not None:
+                request_input.append(
+                    {
+                        "type": "audio",
+                        "uri": uploaded_audio.uri,
+                        "mime_type": uploaded_audio.mime_type,
+                    }
+                )
+            request_record = {
+                "model": self.model_id,
+                "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+                "store": False,
+                "input": request_input,
+                "generation_config": {"thinking_level": "low"},
+                "response_format": {
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": response_schema,
+                },
+            }
+            write_json(request_path, request_record)
             write_json(
-                run_dir / "feature_edit_plan.raw_output.json",
-                {"output_text": interaction.output_text},
+                raw_binding_path,
+                _feature_plan_raw_reuse_binding(
+                    catalog=catalog,
+                    brief=brief,
+                    prompt_template=prompt_template,
+                    causal_prompt=causal_prompt,
+                    model_id=self.model_id,
+                    music_sha256=music_sha256,
+                    response_schema=response_schema,
+                    request_record=request_record,
+                ),
             )
+        try:
+            if reuse_raw_output:
+                saved_interaction = read_json(raw_interaction_path)
+                saved_raw_output = read_json(raw_output_path)
+                output_text = str(saved_raw_output["output_text"])
+                interaction_id = str(saved_interaction.get("id") or "")
+                write_json(
+                    run_dir / "feature_edit_plan.raw_output_reuse.json",
+                    {
+                        "reused": True,
+                        "reason": "representation_only_local_normalization",
+                        "source_raw_output_sha256": sha256_file(raw_output_path),
+                        "source_raw_interaction_sha256": sha256_file(
+                            raw_interaction_path
+                        ),
+                        "causal_input_binding_path": str(
+                            raw_binding_path.resolve()
+                        ),
+                        "causal_input_binding_sha256": sha256_file(
+                            raw_binding_path
+                        ),
+                        "causal_input_definition_sha256": expected_binding[
+                            "definition_sha256"
+                        ],
+                        "reused_at": utc_now(),
+                    },
+                )
+            else:
+                interaction = self.client.interactions.create(**request_record)
+                _record_interaction_attempt(
+                    run_dir=run_dir,
+                    operation="feature_edit_plan",
+                    canonical_filename="feature_edit_plan.raw_interaction.json",
+                    interaction=interaction,
+                )
+                output_text = interaction.output_text
+                interaction_id = interaction.id
+                write_json(
+                    raw_output_path,
+                    {"output_text": output_text},
+                )
             canonical_text, normalization_changes = (
-                canonicalize_feature_edit_plan_output(interaction.output_text)
+                canonicalize_feature_edit_plan_output(output_text)
             )
             write_json(
                 run_dir / "feature_edit_plan.canonical_output.json",
@@ -2301,10 +2696,61 @@ model_provenance (return it unchanged with interaction_id=null):
             )
             if invalid:
                 raise GeminiContractError(f"Feature Edit Plan referenced unknown frame IDs: {invalid}")
+            reuse_rows: list[dict[str, Any]] = []
+            reuse_violations: list[dict[str, Any]] = []
+            for aspect_name, field_name in (
+                ("16:9", "horizontal_frame_id"),
+                ("9:16", "vertical_frame_id"),
+            ):
+                seen_source: dict[str, str] = {}
+                seen_frame: dict[str, str] = {}
+                for chapter in parsed.chapters:
+                    frame_id = getattr(chapter, field_name)
+                    if frame_id is None:
+                        continue
+                    source_clip_id = frame_source_map[frame_id]
+                    prior_feature = seen_source.get(source_clip_id)
+                    prior_same_frame = seen_frame.get(frame_id)
+                    if prior_feature is not None:
+                        row = {
+                            "aspect_ratio": aspect_name,
+                            "feature_id": chapter.feature_id,
+                            "prior_feature_id": prior_feature,
+                            "source_clip_id": source_clip_id,
+                            "frame_id": frame_id,
+                            "same_frame_reused": prior_same_frame is not None,
+                            "justification": chapter.source_reuse_justification,
+                        }
+                        reuse_rows.append(row)
+                        if prior_same_frame is not None or not (
+                            chapter.source_reuse_justification
+                            and chapter.source_reuse_justification.strip()
+                        ):
+                            reuse_violations.append(row)
+                    else:
+                        seen_source[source_clip_id] = chapter.feature_id
+                    seen_frame.setdefault(frame_id, chapter.feature_id)
+            write_json(
+                run_dir / "feature_edit_plan.source_reuse_audit.json",
+                {
+                    "contract_version": "feature-source-reuse-audit-v1",
+                    "music_supplied": music_sha256 is not None,
+                    "rows": reuse_rows,
+                    "violations": reuse_violations,
+                    "ok": not reuse_violations,
+                },
+            )
+            if reuse_violations:
+                raise GeminiContractError(
+                    "Feature Edit Plan reused source evidence without an explicit "
+                    f"non-duplicate rationale: {reuse_violations}"
+                )
             final = parsed.model_copy(
                 update={
                     "model_provenance": parsed.model_provenance.model_copy(
                         update={"interaction_id": interaction.id}
+                        if not reuse_raw_output
+                        else {"interaction_id": interaction_id}
                     )
                 }
             )
@@ -2352,7 +2798,7 @@ model_provenance (return it unchanged with interaction_id=null):
             for cue in music_lock.cues
             if cue.cue_id in eligible_cue_ids
         ]
-        prompt = (
+        causal_prompt = (
             prompt_template
             + "\n\n只有下列 eligible cues 位於至少一個 visual event "
             "已授權的 timing window；preferred_cue_ids 只能引用這些 cue。"
@@ -2390,9 +2836,15 @@ model_provenance (return it unchanged with interaction_id=null):
                 ensure_ascii=False,
                 indent=2,
             )
+        )
+        prompt = (
+            causal_prompt
             + "\n\nmodel_provenance 必須原樣回傳以下內容"
             "（interaction_id 先回傳 null）：\n"
             + provenance.model_dump_json()
+        )
+        response_schema = gemini_response_schema(
+            SemanticMusicPairingProposal
         )
         request_record = {
             "model": self.model_id,
@@ -2413,48 +2865,129 @@ model_provenance (return it unchanged with interaction_id=null):
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
-                "schema": gemini_response_schema(SemanticMusicPairingProposal),
+                "schema": response_schema,
             },
         }
         run_dir.mkdir(parents=True, exist_ok=True)
         request_path = run_dir / "semantic_music_pairing.request.json"
         raw_interaction_path = run_dir / "semantic_music_pairing.raw_interaction.json"
         raw_output_path = run_dir / "semantic_music_pairing.raw_output.json"
+        raw_binding_path = (
+            run_dir / _SEMANTIC_MUSIC_RAW_REUSE_BINDING_FILENAME
+        )
         if reuse_raw_output:
             if not all(
                 path.exists()
-                for path in (request_path, raw_interaction_path, raw_output_path)
+                for path in (
+                    request_path,
+                    raw_interaction_path,
+                    raw_output_path,
+                    raw_binding_path,
+                )
             ):
                 raise FileNotFoundError(
                     "--reuse-raw-output requires the saved request, raw interaction, "
-                    "and raw output from one completed paid response"
+                    "raw output, and causal definition binding from one completed "
+                    "paid response"
                 )
             saved_request = json.loads(request_path.read_text())
-            if saved_request.get("model") != self.model_id:
-                raise ValueError(
-                    "saved semantic music request used a different model"
+            saved_inputs = saved_request.get("input")
+            saved_audio = (
+                next(
+                    (
+                        item
+                        for item in saved_inputs
+                        if isinstance(item, dict)
+                        and item.get("type") == "audio"
+                    ),
+                    None,
                 )
-            # The freshly generated provenance contains a new run_id, so the
-            # full request text is not byte-identical on reuse.  Immutable
-            # MusicMap and VisualSyncMap hashes are verified against the
-            # parsed response below; the paid saved request remains untouched.
+                if isinstance(saved_inputs, list)
+                else None
+            )
+            saved_mime_type = (
+                saved_audio.get("mime_type")
+                if isinstance(saved_audio, dict)
+                else None
+            )
+            current_mime_type = getattr(uploaded_audio, "mime_type", None)
+            if (
+                not isinstance(saved_mime_type, str)
+                or not saved_mime_type
+                or current_mime_type != saved_mime_type
+            ):
+                raise ValueError(
+                    "semantic music raw reuse audio MIME differs from the paid request"
+                )
+            expected_binding = _semantic_music_raw_reuse_binding(
+                music_lock=music_lock,
+                visual_map=visual_map,
+                visual_sync_map_sha256=visual_sync_map_sha256,
+                prompt_template=prompt_template,
+                causal_prompt=causal_prompt,
+                model_id=self.model_id,
+                response_schema=response_schema,
+                request_record=saved_request,
+                audio_mime_type=saved_mime_type,
+            )
+            _validate_semantic_music_raw_reuse_binding(
+                read_json(raw_binding_path),
+                expected_binding,
+            )
             request_record = saved_request
         else:
-            if any(
-                path.exists()
+            existing_paid_artifacts = [
+                path
                 for path in (raw_interaction_path, raw_output_path)
-            ):
+                if path.exists()
+            ]
+            if existing_paid_artifacts:
                 raise FileExistsError(
                     "semantic music paid artifacts already exist; use "
-                    "--reuse-raw-output or a new output directory"
+                    "--reuse-raw-output or a new output directory: "
+                    + ", ".join(path.name for path in existing_paid_artifacts)
                 )
             write_json(request_path, request_record)
+            write_json(
+                raw_binding_path,
+                _semantic_music_raw_reuse_binding(
+                    music_lock=music_lock,
+                    visual_map=visual_map,
+                    visual_sync_map_sha256=visual_sync_map_sha256,
+                    prompt_template=prompt_template,
+                    causal_prompt=causal_prompt,
+                    model_id=self.model_id,
+                    response_schema=response_schema,
+                    request_record=request_record,
+                    audio_mime_type=str(uploaded_audio.mime_type),
+                ),
+            )
         try:
             if reuse_raw_output:
                 saved_interaction = json.loads(raw_interaction_path.read_text())
                 raw_payload = json.loads(raw_output_path.read_text())
                 output_text = str(raw_payload["output_text"])
                 interaction_id = str(saved_interaction.get("id") or "")
+                write_json(
+                    run_dir / "semantic_music_pairing.raw_output_reuse.json",
+                    {
+                        "reused": True,
+                        "reason": "local_contract_normalization_or_validation",
+                        "source_raw_output_sha256": sha256_file(
+                            raw_output_path
+                        ),
+                        "source_raw_interaction_sha256": sha256_file(
+                            raw_interaction_path
+                        ),
+                        "causal_input_binding_sha256": sha256_file(
+                            raw_binding_path
+                        ),
+                        "causal_input_definition_sha256": expected_binding[
+                            "definition_sha256"
+                        ],
+                        "reused_at": utc_now(),
+                    },
+                )
             else:
                 if uploaded_audio is None:
                     raise ValueError("uploaded audio is required for a paid request")

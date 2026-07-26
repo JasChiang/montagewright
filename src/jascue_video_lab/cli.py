@@ -648,6 +648,7 @@ def command_render_rushes(args: argparse.Namespace) -> int:
 
 def command_feature_cut(args: argparse.Namespace) -> int:
     brief_path = args.brief_json
+    music_lock_path = args.music_map_lock
     plan_prompt = _load_prompt("feature_cut_selects_zh-TW.txt")
     if args.music_first_cue_lock is not None:
         cue_lock_path = args.music_first_cue_lock.expanduser().resolve(strict=True)
@@ -657,29 +658,53 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         )
         visual_map = VisualSyncMap.model_validate(read_json(visual_path))
         original_brief = FeatureEditBrief.model_validate(read_json(args.brief_json))
-        guided_brief = apply_music_first_cue_lock(
+        # Retain every immutable lineage check from the original projection
+        # path, but deliberately discard its fixed chapter durations.
+        apply_music_first_cue_lock(
             original_brief,
             visual_map=visual_map,
             cue_lock=cue_lock,
         )
+        cue_music_lock_path = Path(
+            cue_lock.plan.music_lock_path
+        ).expanduser().resolve(strict=True)
+        if cue_lock.plan.music_lock_sha256 != sha256_file(cue_music_lock_path):
+            raise ValueError("CuePlan music lock lineage no longer matches disk")
+        if music_lock_path is None:
+            music_lock_path = cue_music_lock_path
+        elif (
+            music_lock_path.expanduser().resolve(strict=True)
+            != cue_music_lock_path
+        ):
+            raise ValueError(
+                "--music-map-lock must match the approved CuePlan music lock"
+            )
         input_dir = args.output_dir / "music-first-input"
         input_dir.mkdir(parents=True, exist_ok=True)
         brief_path = input_dir / "brief.music-first.json"
-        write_json(brief_path, guided_brief)
+        # Music-first v2 deliberately does not project cue spacing into fixed
+        # chapter durations before media selection. Gemini proposes relative
+        # dwell after jointly observing the catalog reel, brief, and supplied
+        # soundtrack; local code later reconciles the total and source handles.
+        write_json(brief_path, original_brief)
         context = {
-            "contract_version": "music-first-feature-context-v1",
+            "contract_version": "music-first-feature-context-v2",
             "original_brief_path": str(args.brief_json.expanduser().resolve(strict=True)),
             "original_brief_sha256": sha256_file(args.brief_json),
             "music_lock_sha256": cue_lock.plan.music_lock_sha256,
             "cue_plan_lock_path": str(cue_lock_path),
             "cue_plan_lock_sha256": sha256_file(cue_lock_path),
             "global_music_strategy": None,
+            "project_target_duration_seconds": original_brief.target_duration_seconds,
+            "duration_authority": (
+                "gemini_relative_dwell_then_local_total_and_pts_reconciliation"
+            ),
             "chapter_slots": [
                 {
                     "feature_id": chapter.feature_id,
-                    "target_duration_seconds": chapter.target_duration_seconds,
+                    "duration_status": "gemini_to_propose_from_media_brief_and_music",
                 }
-                for chapter in guided_brief.chapters
+                for chapter in original_brief.chapters
             ],
         }
         if cue_lock.plan.semantic_pairing_used:
@@ -696,10 +721,12 @@ def command_feature_cut(args: argparse.Namespace) -> int:
             ]
         write_json(input_dir / "music-first-context.json", context)
         plan_prompt += (
-            "\n\n## 已核准的 music-first 剪輯約束\n"
-            "下列資料在選片前建立。請選擇能配合各音樂段落角色、動作完整性"
-            "與指定長度的素材；不得為了卡點捏造畫面證據。精確節拍已由本機"
-            " CuePlan 鎖定，不得自行改寫時間。\n"
+            "\n\n## 已核准的 music-first 語意脈絡\n"
+            "下列資料在選片前建立，但不再把各章秒數鎖死。請同時觀看 catalog"
+            " reel、閱讀 brief，並在本次另附音樂時實際聆聽音樂；依音樂段落角色、"
+            "畫面資訊量與完整動作提出每章相對停留長度。不得逐拍機械剪接、不得"
+            "為卡點切斷 setup／action／result，也不得讓音樂優先於 brief。精確"
+            " sample、source PTS 與總長校正由本機處理。\n"
             + json.dumps(context, ensure_ascii=False, indent=2)
         )
     result = run_feature_cut_experiment(
@@ -714,7 +741,11 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         trim_decision_paths=args.trim_decision,
         allow_proposed_trim_preview=args.allow_proposed_trim_preview,
         reuse_feature_plan=args.reuse_feature_plan,
+        reuse_feature_plan_raw_output=args.reuse_feature_plan_raw_output,
+        allow_unverified_geometry_preview=args.allow_unverified_geometry_preview,
         aspect=args.aspect,
+        music_path=args.music,
+        music_lock_path=music_lock_path,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2100,6 +2131,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     feature_cut_parser.add_argument(
+        "--reuse-feature-plan-raw-output",
+        action="store_true",
+        help=(
+            "Re-validate and normalize one already billed saved raw feature-plan "
+            "response after a representation-only contract repair. No upload or "
+            "new Gemini request is made."
+        ),
+    )
+    feature_cut_parser.add_argument(
         "--allow-proposed-trim-preview",
         action="store_true",
         help=(
@@ -2108,12 +2148,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     feature_cut_parser.add_argument(
+        "--allow-unverified-geometry-preview",
+        action="store_true",
+        help=(
+            "For an explicitly human-reviewed experiment only, render a tracked "
+            "crop whose geometry exists but whose semantic/automatic gate remains "
+            "pending. The manifest remains review-required; failed or unavailable "
+            "geometry still uses the configured fallback."
+        ),
+    )
+    feature_cut_parser.add_argument(
         "--music-first-cue-lock",
         type=Path,
         help=(
-            "Approved pre-selection CuePlan lock. Its music-aware chapter slots "
-            "are applied before Gemini selects media; post-render cue planning "
-            "remains a QC/refinement stage."
+            "Approved pre-selection CuePlan context. Its brief/music lineage and "
+            "semantic roles are validated before Gemini jointly sees the reel, "
+            "brief, and soundtrack; its old fixed chapter seconds are not "
+            "projected into the selection request."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--music",
+        type=Path,
+        help=(
+            "Optional soundtrack supplied to the same Gemini media-selection "
+            "request as the catalog reel, so dwell and shot choices can respond "
+            "to audible flow. File API state is cached by content hash."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--music-map-lock",
+        type=Path,
+        help=(
+            "Optional reviewed MusicMap lock used only to refine Gemini's "
+            "relative chapter boundaries to nearby approved musical boundaries. "
+            "It never changes source PTS or invents cues."
         ),
     )
     feature_cut_parser.add_argument("--output-dir", type=Path, required=True)

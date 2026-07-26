@@ -36,6 +36,7 @@ from .grounding_selection import (
     require_tracking_seed_candidate,
 )
 from .media import extract_frame, has_audio_stream, probe_video, sha256_file
+from .music import MusicMapLock
 from .multi_tracking import validate_segmentation_track_alignment
 from .models import (
     EvidenceApprovalSource,
@@ -529,12 +530,20 @@ def _current_external_projection_binding(
     *,
     plan_dir: Path,
     catalog_path: Path,
+    catalog_reel_sha256: str,
     brief_path: Path,
     plan_path: Path,
+    music_sha256: str | None,
     created_at: str,
 ) -> dict[str, Any]:
     """Verify every external projection artifact and derive a reusable binding."""
 
+    if not re.fullmatch(r"[0-9a-f]{64}", catalog_reel_sha256):
+        raise ValueError("catalog reel SHA-256 is required for feature plan binding")
+    if music_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", music_sha256
+    ):
+        raise ValueError("music SHA-256 must be a lowercase hexadecimal digest")
     pointer_path, record_path, record = load_external_feature_plan_projection(
         plan_dir
     )
@@ -625,8 +634,10 @@ def _current_external_projection_binding(
         "external_projection_contract_id": contract_id,
         "catalog_path": str(catalog_path.resolve()),
         "catalog_sha256": current_files["catalog_sha256"],
+        "catalog_reel_sha256": catalog_reel_sha256,
         "brief_path": str(brief_path.resolve()),
         "brief_sha256": current_files["brief_sha256"],
+        "music_sha256": music_sha256,
         # For external projections, the actual source-model input is the prompt
         # contract; the renderer's unused direct-video plan prompt is irrelevant.
         "plan_prompt_sha256": request_claims["source_request_input_sha256"],
@@ -665,11 +676,18 @@ def validate_external_feature_plan_projection(plan_dir: Path) -> dict[str, Any]:
     }
     if not all(isinstance(value, str) for value in required_paths.values()):
         raise ValueError("external projection record has incomplete primary paths")
+    catalog_path = Path(required_paths["catalog_path"])  # type: ignore[arg-type]
+    catalog = RushesCatalog.model_validate(read_json(catalog_path))
+    reel_path = Path(catalog.analysis_reel_path).expanduser().resolve()
+    if not reel_path.is_file():
+        raise FileNotFoundError(reel_path)
     _current_external_projection_binding(
         plan_dir=plan_dir,
-        catalog_path=Path(required_paths["catalog_path"]),  # type: ignore[arg-type]
+        catalog_path=catalog_path,
+        catalog_reel_sha256=sha256_file(reel_path),
         brief_path=Path(required_paths["brief_path"]),  # type: ignore[arg-type]
         plan_path=Path(required_paths["feature_plan_path"]),  # type: ignore[arg-type]
+        music_sha256=None,
         created_at=utc_now(),
     )
     return record
@@ -678,22 +696,35 @@ def validate_external_feature_plan_projection(plan_dir: Path) -> dict[str, Any]:
 def _current_feature_plan_binding(
     *,
     catalog_path: Path,
+    catalog_reel_sha256: str,
     brief_path: Path,
     plan_path: Path,
     plan_prompt: str,
+    music_sha256: str | None,
     request_path: Path | None,
     created_at: str,
     origin: Literal["generated", "migrated_legacy_reuse", "external_projection"],
 ) -> dict[str, Any]:
     """Build the immutable causal inputs for one saved editorial plan."""
 
+    if not re.fullmatch(r"[0-9a-f]{64}", catalog_reel_sha256):
+        raise ValueError("catalog reel SHA-256 is required for feature plan binding")
+    if music_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", music_sha256
+    ):
+        raise ValueError("music SHA-256 must be a lowercase hexadecimal digest")
     binding: dict[str, Any] = {
         "binding_version": _FEATURE_PLAN_BINDING_VERSION,
         "origin": origin,
         "catalog_path": str(catalog_path.resolve()),
         "catalog_sha256": sha256_file(catalog_path),
+        "catalog_reel_sha256": catalog_reel_sha256,
         "brief_path": str(brief_path.resolve()),
         "brief_sha256": sha256_file(brief_path),
+        # Presence and absence are both causal.  ``None`` means that the paid
+        # planner did not hear music, and therefore must not be reused for a
+        # later run that supplies one (or vice versa).
+        "music_sha256": music_sha256,
         "plan_prompt_sha256": _sha256_text(plan_prompt),
         "system_instruction_sha256": _sha256_text(
             EDITORIAL_SYSTEM_INSTRUCTION
@@ -733,6 +764,10 @@ def _validate_feature_plan_binding(
         "plan_sha256",
         "request_sha256",
     )
+    required_exact_keys: tuple[str, ...] = ()
+    if saved.get("origin") != REFRAME_POLICY_BINDING_ORIGIN:
+        required_hashes += ("catalog_reel_sha256",)
+        required_exact_keys += ("music_sha256",)
     if saved.get("origin") == "external_projection":
         required_hashes += (
             "source_plan_sha256",
@@ -742,6 +777,7 @@ def _validate_feature_plan_binding(
             "source_artifact_set_sha256",
         )
     missing = [key for key in required_hashes if not saved.get(key)]
+    missing.extend(key for key in required_exact_keys if key not in saved)
     if saved.get("binding_version") != _FEATURE_PLAN_BINDING_VERSION:
         missing.insert(0, "binding_version")
     if missing:
@@ -752,6 +788,11 @@ def _validate_feature_plan_binding(
     mismatches = [
         key for key in required_hashes if saved[key] != current.get(key)
     ]
+    mismatches.extend(
+        key
+        for key in required_exact_keys
+        if saved.get(key) != current.get(key)
+    )
     if saved.get("origin") != current.get("origin"):
         mismatches.append("origin")
     if saved.get("model_id") != current.get("model_id"):
@@ -767,9 +808,11 @@ def _migrate_legacy_feature_plan_binding(
     *,
     plan_dir: Path,
     catalog_path: Path,
+    catalog_reel_sha256: str,
     brief_path: Path,
     plan_path: Path,
     plan_prompt: str,
+    music_sha256: str | None,
 ) -> dict[str, Any]:
     """Validate old reuse evidence plus the original API request before migration.
 
@@ -847,9 +890,11 @@ def _migrate_legacy_feature_plan_binding(
 
     binding = _current_feature_plan_binding(
         catalog_path=catalog_path,
+        catalog_reel_sha256=catalog_reel_sha256,
         brief_path=brief_path,
         plan_path=plan_path,
         plan_prompt=plan_prompt,
+        music_sha256=music_sha256,
         request_path=request_path,
         created_at=utc_now(),
         origin="migrated_legacy_reuse",
@@ -1242,6 +1287,8 @@ def _render_missing_segment(
     output_path: Path,
     overlay_path: Path,
     dimensions: tuple[int, int],
+    *,
+    duration_seconds: float | None = None,
 ) -> None:
     _render_text_layer(
         chapter,
@@ -1250,7 +1297,11 @@ def _render_missing_segment(
         missing_evidence=True,
         opaque=True,
     )
-    duration = chapter.target_duration_seconds
+    duration = (
+        duration_seconds
+        if duration_seconds is not None
+        else chapter.target_duration_seconds
+    )
     _run_segment_encoder(
         [
             "ffmpeg",
@@ -3358,13 +3409,111 @@ def _vertical_fit_filter() -> str:
     return (
         "[0:v]fps=30,"
         "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
-        "split=2[background_source][foreground_source];"
-        "[background_source]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920:x=(iw-ow)/2:y=(ih-oh)/2,gblur=sigma=28[background];"
-        "[foreground_source]scale=1080:1920:force_original_aspect_ratio=decrease"
-        "[foreground];"
-        "[background][foreground]overlay=(W-w)/2:(H-h)/2,setsar=1[base]"
+        "scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x0b0e12,setsar=1[base]"
     )
+
+
+def _vertical_required_scope_fit_filter(
+    geometry: Mapping[str, Any],
+    *,
+    margin_normalized: float = 45.0,
+) -> tuple[str, dict[str, Any]] | None:
+    """Build a static solid-matte fit around the tracked required envelope.
+
+    A full-source fit preserves semantics but can make a horizontal subject
+    occupy only a small strip inside 9:16.  When failed tracked-crop geometry
+    already contains an auditable required-union box for every sampled frame,
+    remove only source space that lies outside their all-frame envelope plus a
+    fixed safety margin.  This never clips the required envelope and never
+    invents a new target; it is a review fallback, not an approved crop.
+    """
+
+    keyframes = geometry.get("crop_keyframes")
+    source_width = geometry.get("source_display_width")
+    source_height = geometry.get("source_display_height")
+    if (
+        not isinstance(keyframes, list)
+        or not keyframes
+        or not isinstance(source_width, int)
+        or not isinstance(source_height, int)
+        or source_width <= 0
+        or source_height <= 0
+    ):
+        return None
+    boxes: list[list[float]] = []
+    for keyframe in keyframes:
+        box = (
+            keyframe.get("required_union_box")
+            if isinstance(keyframe, dict)
+            else None
+        )
+        if (
+            not isinstance(box, list)
+            or len(box) != 4
+            or not all(isinstance(value, (int, float)) for value in box)
+            or not (0 <= box[0] < box[2] <= 1000)
+            or not (0 <= box[1] < box[3] <= 1000)
+        ):
+            return None
+        boxes.append([float(value) for value in box])
+    envelope = [
+        max(0.0, min(box[0] for box in boxes) - margin_normalized),
+        max(0.0, min(box[1] for box in boxes) - margin_normalized),
+        min(1000.0, max(box[2] for box in boxes) + margin_normalized),
+        min(1000.0, max(box[3] for box in boxes) + margin_normalized),
+    ]
+    if envelope[2] <= envelope[0] or envelope[3] <= envelope[1]:
+        return None
+    crop_x = max(0, round(source_width * envelope[0] / 1000))
+    crop_y = max(0, round(source_height * envelope[1] / 1000))
+    crop_width = max(
+        2,
+        int(source_width * (envelope[2] - envelope[0]) / 1000) // 2 * 2,
+    )
+    crop_height = max(
+        2,
+        int(source_height * (envelope[3] - envelope[1]) / 1000) // 2 * 2,
+    )
+    crop_width = min(crop_width, source_width - crop_x)
+    crop_height = min(crop_height, source_height - crop_y)
+    crop_width -= crop_width % 2
+    crop_height -= crop_height % 2
+    if crop_width < 2 or crop_height < 2:
+        return None
+    filter_graph = (
+        "[0:v]fps=30,"
+        "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
+        f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+        "scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x0b0e12,setsar=1[base]"
+    )
+    return filter_graph, {
+        "applied_strategy": "required_scope_solid_fit",
+        "fallback_reason": "required_region_union_too_large_for_safe_9x16_crop",
+        "scope_fit_source": "tracked_required_union_all_frame_envelope",
+        "scope_envelope_box_2d": [round(value, 3) for value in envelope],
+        "scope_margin_normalized": margin_normalized,
+        "scope_crop_pixels": {
+            "x": crop_x,
+            "y": crop_y,
+            "width": crop_width,
+            "height": crop_height,
+        },
+        "required_sample_count": len(boxes),
+        "required_envelope_contained": True,
+        "risk_codes": [
+            "scope_preserving_solid_fit",
+            "human_review_required",
+        ],
+        "requires_gemini_review": True,
+        "source_geometry_lineage_passed": bool(
+            geometry.get("source_geometry_lineage_passed")
+        ),
+        "tracking_confidence_gate_passed": bool(
+            geometry.get("tracking_confidence_gate_passed")
+        ),
+    }
 
 
 def _vertical_center_crop_filter() -> str:
@@ -4617,9 +4766,11 @@ def _summarize_automatic_reframe(
                 if isinstance(code, str) and code:
                     failure_counts[code] = failure_counts.get(code, 0) + 1
         selected_rank = routing.get("selected_candidate_rank")
-        policy_blocked = (
-            chapter.get("applied_strategy") == "policy_blocked_preview_fit"
-        )
+        policy_blocked = chapter.get("applied_strategy") in {
+            "policy_blocked_preview_fit",
+            "policy_blocked_preview_solid_fit",
+            "policy_blocked_preview_center_crop",
+        }
         review_required = bool(chapter.get("requires_gemini_review"))
         chapters.append(
             {
@@ -4807,6 +4958,509 @@ def _render_review_html(
     )
 
 
+def _selected_source_capacity_seconds(
+    plan: FeatureEditPlan,
+    *,
+    frames: Mapping[str, RushFrame],
+    clips: Mapping[str, RushClip],
+    shot_cache: dict[str, ShotManifest],
+    shots_dir: Path,
+    scdet_threshold: float,
+) -> dict[str, float]:
+    """Return the shortest legal selected-shot capacity for each chapter.
+
+    The same editorial duration is used by both aspect renders. When their
+    selected evidence frames differ, the shorter legal shot is authoritative
+    so neither render silently truncates the chapter.
+    """
+
+    capacities: dict[str, float] = {}
+    for selected in plan.chapters:
+        if selected.evidence_status == "not_found":
+            continue
+        frame_ids = {
+            frame_id
+            for frame_id in (
+                selected.horizontal_frame_id,
+                selected.vertical_frame_id,
+            )
+            if frame_id is not None
+        }
+        chapter_capacities: list[int] = []
+        for frame_id in frame_ids:
+            frame = frames[frame_id]
+            clip = clips[frame.clip_id]
+            if clip.clip_id not in shot_cache:
+                shot_cache[clip.clip_id] = detect_shots_ffmpeg(
+                    Path(clip.path),
+                    threshold=scdet_threshold,
+                    output_path=shots_dir / f"{clip.clip_id}.json",
+                )
+            shot = next(
+                item
+                for item in shot_cache[clip.clip_id].shots
+                if item.start_time_ms
+                <= frame.requested_time_ms
+                < item.end_time_ms
+            )
+            chapter_capacities.append(
+                min(shot.end_time_ms, clip.duration_ms)
+                - max(shot.start_time_ms, 0)
+            )
+        if chapter_capacities:
+            capacities[selected.feature_id] = min(chapter_capacities) / 1000
+    return capacities
+
+
+def _feature_edit_user_duration_range_seconds() -> tuple[float, float]:
+    """Read the public user-duration bounds from the brief contract itself."""
+
+    duration_schema = FeatureEditBrief.model_json_schema()["properties"][
+        "target_duration_seconds"
+    ]
+    minimum = duration_schema.get("minimum")
+    maximum = duration_schema.get("maximum")
+    if not isinstance(minimum, (int, float)) or not isinstance(
+        maximum, (int, float)
+    ):
+        raise ValueError("FeatureEditBrief duration range is not machine-readable")
+    return float(minimum), float(maximum)
+
+
+def _build_duration_capacity_shortfall_audit(
+    *,
+    brief: FeatureEditBrief,
+    plan: FeatureEditPlan,
+    weighted: Sequence[tuple[FeatureChapterSelect, float, str]],
+    capacity_ms: Mapping[str, int],
+    preferred_total_ms: int,
+    feasible_total_ms: int,
+) -> dict[str, Any]:
+    minimum_seconds, maximum_seconds = (
+        _feature_edit_user_duration_range_seconds()
+    )
+    shortfall_ms = preferred_total_ms - feasible_total_ms
+    if shortfall_ms <= 0:
+        raise ValueError("duration shortfall audit requires a positive shortfall")
+    rows = [
+        {
+            "feature_id": selected.feature_id,
+            "preferred_weight_seconds": round(weight, 3),
+            "preferred_weight_authority": authority,
+            "feasible_capacity_seconds": (
+                round(capacity_ms[selected.feature_id] / 1000, 3)
+                if selected.feature_id in capacity_ms
+                else None
+            ),
+            "capacity_evidence": (
+                "selected_shot_boundary"
+                if selected.feature_id in capacity_ms
+                else "not_finitely_bounded_in_this_audit"
+            ),
+        }
+        for selected, weight, authority in weighted
+    ]
+    shorter_within_range = feasible_total_ms >= round(minimum_seconds * 1000)
+    return {
+        "contract_version": "editorial-duration-capacity-shortfall-v1",
+        "status": "blocked",
+        "failure_policy": "fail_closed_before_render",
+        "reason_code": "selected_source_capacity_below_preferred_total",
+        "project_id": brief.project_id,
+        "catalog_id": plan.catalog_id,
+        "brief_sha256": _sha256_json(brief.model_dump(mode="json")),
+        "feature_plan_sha256": _sha256_json(plan.model_dump(mode="json")),
+        "preferred_total_ms": preferred_total_ms,
+        "preferred_total_seconds": round(preferred_total_ms / 1000, 3),
+        "relative_dwell_weight_total_seconds": round(
+            sum(weight for _, weight, _ in weighted),
+            3,
+        ),
+        "feasible_total_ms": feasible_total_ms,
+        "feasible_total_seconds": round(feasible_total_ms / 1000, 3),
+        "shortfall_ms": shortfall_ms,
+        "shortfall_seconds": round(shortfall_ms / 1000, 3),
+        "user_duration_range": {
+            "minimum_seconds": minimum_seconds,
+            "preferred_seconds": brief.target_duration_seconds,
+            "maximum_seconds": maximum_seconds,
+            "source": "FeatureEditBrief.target_duration_seconds contract and user brief",
+        },
+        "chapter_capacities": rows,
+        "next_actions": [
+            {
+                "action_id": "select_alternate_candidates",
+                "description": (
+                    "Choose evidence-bound source candidates whose legal shot "
+                    "intervals provide enough additional capacity."
+                ),
+                "requires_user_approval": True,
+                "available": True,
+            },
+            {
+                "action_id": "provide_additional_source",
+                "description": (
+                    "Add usable source material that supports the same brief "
+                    "without repeating or freezing existing footage."
+                ),
+                "requires_user_approval": True,
+                "available": True,
+            },
+            {
+                "action_id": "approve_shorter_project_duration",
+                "description": (
+                    "Approve a shorter total only when it remains inside the "
+                    "declared user-duration range."
+                ),
+                "requires_user_approval": True,
+                "available": shorter_within_range,
+                "maximum_feasible_seconds": round(feasible_total_ms / 1000, 3),
+            },
+            {
+                "action_id": "revise_required_scope",
+                "description": (
+                    "Explicitly revise required chapters or claims before "
+                    "replanning; the renderer cannot silently drop them."
+                ),
+                "requires_user_approval": True,
+                "available": True,
+            },
+        ],
+        "prohibited_automatic_actions": [
+            "repeat_selected_footage",
+            "freeze_last_frame_to_fill_duration",
+            "extend_across_shot_boundary",
+            "reduce_duration_outside_user_range",
+            "drop_required_chapter",
+        ],
+        "generated_at": utc_now(),
+    }
+
+
+def _resolve_editorial_chapter_durations(
+    brief: FeatureEditBrief,
+    plan: FeatureEditPlan,
+    *,
+    music_lock: MusicMapLock | None = None,
+    source_capacity_seconds: Mapping[str, float] | None = None,
+    shortfall_audit_path: Path | None = None,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Reconcile Gemini's relative dwell judgment to one legal project total.
+
+    The model never supplies source cut points. It only ranks the relative
+    amount of viewing time justified by the observed information/action and,
+    when present, the soundtrack. Local code preserves those proportions while
+    making the chapter durations sum exactly to the user-approved project total.
+    Legacy plans without recommendations retain their brief values.
+    """
+
+    brief_by_id = {chapter.feature_id: chapter for chapter in brief.chapters}
+    weighted: list[tuple[FeatureChapterSelect, float, str]] = []
+    for selected in plan.chapters:
+        fallback = brief_by_id[selected.feature_id].target_duration_seconds
+        if selected.recommended_duration_seconds is None:
+            weighted.append((selected, fallback, "brief_fallback"))
+        else:
+            weighted.append(
+                (selected, selected.recommended_duration_seconds, "gemini_relative_dwell")
+            )
+    weight_total = sum(weight for _, weight, _ in weighted)
+    if weight_total <= 0:
+        raise ValueError("editorial duration weights must have a positive sum")
+
+    target_duration_ms = round(brief.target_duration_seconds * 1000)
+    capacity_ms = {
+        feature_id: max(1, round(seconds * 1000))
+        for feature_id, seconds in (source_capacity_seconds or {}).items()
+    }
+    finite_capacity_total_ms = sum(
+        capacity_ms.get(selected.feature_id, target_duration_ms)
+        for selected, _, _ in weighted
+    )
+    if finite_capacity_total_ms < target_duration_ms:
+        shortfall_audit = _build_duration_capacity_shortfall_audit(
+            brief=brief,
+            plan=plan,
+            weighted=weighted,
+            capacity_ms=capacity_ms,
+            preferred_total_ms=target_duration_ms,
+            feasible_total_ms=finite_capacity_total_ms,
+        )
+        if shortfall_audit_path is not None:
+            write_json(shortfall_audit_path, shortfall_audit)
+        raise ValueError(
+            "selected source shots cannot satisfy the requested project duration; "
+            "choose another candidate or approve a shorter project duration"
+            + (
+                f"; audit saved to {shortfall_audit_path}"
+                if shortfall_audit_path is not None
+                else ""
+            )
+        )
+
+    # Allocate in integer milliseconds. When a selected source shot is shorter
+    # than Gemini's relative dwell recommendation, cap that chapter and
+    # redistribute only the remaining duration across the other Gemini weights.
+    # This preserves the model's editorial ordering without inventing repeated
+    # frames, synthetic holds, or source time outside a legal shot.
+    remaining_ms = target_duration_ms
+    active = list(weighted)
+    allocated_ms: dict[str, int] = {}
+    while active:
+        active_weight = sum(weight for _, weight, _ in active)
+        if active_weight <= 0:
+            raise ValueError("active editorial duration weights must be positive")
+        newly_capped: list[tuple[FeatureChapterSelect, float, str]] = []
+        for selected, weight, authority in active:
+            feature_capacity = capacity_ms.get(
+                selected.feature_id,
+                target_duration_ms,
+            )
+            proportional_ms = remaining_ms * weight / active_weight
+            if proportional_ms > feature_capacity:
+                allocated_ms[selected.feature_id] = feature_capacity
+                remaining_ms -= feature_capacity
+                newly_capped.append((selected, weight, authority))
+        if newly_capped:
+            capped_ids = {selected.feature_id for selected, _, _ in newly_capped}
+            active = [
+                item for item in active if item[0].feature_id not in capped_ids
+            ]
+            continue
+
+        raw_allocations = [
+            (
+                selected,
+                weight,
+                authority,
+                remaining_ms * weight / active_weight,
+            )
+            for selected, weight, authority in active
+        ]
+        floor_allocations = {
+            selected.feature_id: math.floor(raw_ms)
+            for selected, _, _, raw_ms in raw_allocations
+        }
+        remainder = remaining_ms - sum(floor_allocations.values())
+        for selected, _, _, raw_ms in sorted(
+            raw_allocations,
+            key=lambda item: (
+                -(item[3] - math.floor(item[3])),
+                item[0].feature_id,
+            ),
+        ):
+            value = floor_allocations[selected.feature_id]
+            if remainder > 0:
+                value += 1
+                remainder -= 1
+            allocated_ms[selected.feature_id] = value
+        remaining_ms = 0
+        break
+    if remaining_ms != 0 or sum(allocated_ms.values()) != target_duration_ms:
+        raise ValueError("editorial duration capacity reconciliation did not close")
+
+    scale = brief.target_duration_seconds / weight_total
+    unsnapped: list[tuple[FeatureChapterSelect, float, str, float]] = []
+    for selected, weight, authority in weighted:
+        seconds = allocated_ms[selected.feature_id] / 1000
+        if seconds <= 0:
+            raise ValueError(
+                f"resolved duration is not positive for {selected.feature_id}"
+            )
+        unsnapped.append((selected, weight, authority, seconds))
+
+    boundary_audit: list[dict[str, Any]] = []
+    snapped_boundaries_ms: list[int] | None = None
+    capped_feature_ids = {
+        feature_id
+        for feature_id, allocated in allocated_ms.items()
+        if feature_id in capacity_ms and allocated >= capacity_ms[feature_id]
+    }
+    if music_lock is not None and len(unsnapped) > 1:
+        if abs(music_lock.duration_ms - round(brief.target_duration_seconds * 1000)) > 80:
+            raise ValueError(
+                "music lock duration differs from the requested project duration"
+            )
+        cue_candidates = [
+            cue
+            for cue in music_lock.cues
+            if cue.kind in {"section_boundary", "downbeat", "accent", "ending_hit"}
+        ]
+        proposed_boundaries: list[int] = []
+        running_ms = 0
+        for _, _, _, seconds in unsnapped[:-1]:
+            running_ms += round(seconds * 1000)
+            proposed_boundaries.append(running_ms)
+        snapped_boundaries_ms = []
+        previous = 0
+        for boundary_index, proposed_ms in enumerate(proposed_boundaries):
+            remaining_chapters = len(unsnapped) - boundary_index - 1
+            latest_ms = music_lock.duration_ms - remaining_chapters * 750
+            current_feature_id = unsnapped[boundary_index][0].feature_id
+            next_feature_id = unsnapped[boundary_index + 1][0].feature_id
+            current_capacity_ms = capacity_ms.get(
+                current_feature_id,
+                target_duration_ms,
+            )
+            remaining_capacity_ms = sum(
+                capacity_ms.get(item[0].feature_id, target_duration_ms)
+                for item in unsnapped[boundary_index + 1 :]
+            )
+            eligible = [
+                cue
+                for cue in cue_candidates
+                if (
+                    current_feature_id not in capped_feature_ids
+                    and next_feature_id not in capped_feature_ids
+                    and previous + 750 <= cue.time_ms <= latest_ms
+                    and abs(cue.time_ms - proposed_ms) <= 450
+                    and cue.time_ms - previous <= current_capacity_ms
+                    and music_lock.duration_ms - cue.time_ms
+                    <= remaining_capacity_ms
+                )
+            ]
+            if eligible:
+                chosen = min(
+                    eligible,
+                    key=lambda cue: (
+                        0 if cue.kind == "section_boundary" else 1,
+                        0 if cue.kind == "downbeat" else 1,
+                        abs(cue.time_ms - proposed_ms),
+                        -cue.strength,
+                        cue.time_ms,
+                    ),
+                )
+                applied_ms = chosen.time_ms
+                cue_id = chosen.cue_id
+                cue_kind = chosen.kind
+            else:
+                applied_ms = proposed_ms
+                cue_id = None
+                cue_kind = None
+            snapped_boundaries_ms.append(applied_ms)
+            boundary_audit.append(
+                {
+                    "boundary_after_feature_id": unsnapped[boundary_index][
+                        0
+                    ].feature_id,
+                    "gemini_relative_boundary_ms": proposed_ms,
+                    "resolved_boundary_ms": applied_ms,
+                    "snap_delta_ms": applied_ms - proposed_ms,
+                    "music_cue_id": cue_id,
+                    "music_cue_kind": cue_kind,
+                }
+            )
+            previous = applied_ms
+
+        candidate_boundaries = [
+            0,
+            *snapped_boundaries_ms,
+            music_lock.duration_ms,
+        ]
+        capacity_violations: list[dict[str, Any]] = []
+        for index, (start_ms, end_ms) in enumerate(
+            zip(
+                candidate_boundaries[:-1],
+                candidate_boundaries[1:],
+                strict=True,
+            )
+        ):
+            feature_id = unsnapped[index][0].feature_id
+            chapter_ms = end_ms - start_ms
+            feature_capacity_ms = capacity_ms.get(feature_id, target_duration_ms)
+            if chapter_ms <= 0 or chapter_ms > feature_capacity_ms:
+                capacity_violations.append(
+                    {
+                        "feature_id": feature_id,
+                        "candidate_duration_ms": chapter_ms,
+                        "source_capacity_ms": feature_capacity_ms,
+                    }
+                )
+        if capacity_violations:
+            snapped_boundaries_ms = None
+            for row in boundary_audit:
+                row["music_snap_applied"] = False
+                row["music_snap_rejected_reason"] = (
+                    "global_source_capacity_validation_failed"
+                )
+                row["candidate_resolved_boundary_ms"] = row[
+                    "resolved_boundary_ms"
+                ]
+                row["resolved_boundary_ms"] = row[
+                    "gemini_relative_boundary_ms"
+                ]
+                row["snap_delta_ms"] = 0
+                row["source_capacity_violations"] = capacity_violations
+        else:
+            for row in boundary_audit:
+                row["music_snap_applied"] = row["music_cue_id"] is not None
+                row["music_snap_rejected_reason"] = None
+
+    resolved: dict[str, float] = {}
+    rows: list[dict[str, Any]] = []
+    prior_boundary_ms = 0
+    final_boundary_ms = round(brief.target_duration_seconds * 1000)
+    for index, (selected, weight, authority, unsnapped_seconds) in enumerate(
+        unsnapped
+    ):
+        next_boundary_ms = (
+            snapped_boundaries_ms[index]
+            if snapped_boundaries_ms is not None
+            and index < len(snapped_boundaries_ms)
+            else (
+                final_boundary_ms
+                if index == len(unsnapped) - 1
+                else prior_boundary_ms + round(unsnapped_seconds * 1000)
+            )
+        )
+        seconds = round((next_boundary_ms - prior_boundary_ms) / 1000, 3)
+        prior_boundary_ms = next_boundary_ms
+        resolved[selected.feature_id] = seconds
+        rows.append(
+            {
+                "feature_id": selected.feature_id,
+                "input_weight_seconds": weight,
+                "input_authority": authority,
+                "duration_rationale": selected.duration_rationale,
+                "unsnapped_duration_seconds": unsnapped_seconds,
+                "resolved_duration_seconds": seconds,
+                "source_capacity_seconds": (
+                    round(capacity_ms[selected.feature_id] / 1000, 3)
+                    if selected.feature_id in capacity_ms
+                    else None
+                ),
+                "source_capacity_applied": (
+                    selected.feature_id in capacity_ms
+                    and allocated_ms[selected.feature_id]
+                    >= capacity_ms[selected.feature_id]
+                ),
+            }
+        )
+    audit = {
+        "contract_version": "editorial-duration-plan-v1",
+        "interpretation": (
+            "Gemini proposes relative dwell; local code only reconciles the "
+            "approved total and later maps it to legal shot-local source PTS."
+        ),
+        "project_target_duration_seconds": brief.target_duration_seconds,
+        "input_weight_total_seconds": round(weight_total, 3),
+        "reconciliation_scale": scale,
+        "capacity_reconciliation_applied": bool(capacity_ms),
+        "source_capacity_total_seconds": (
+            round(finite_capacity_total_ms / 1000, 3)
+            if capacity_ms
+            else None
+        ),
+        "resolved_total_seconds": round(sum(resolved.values()), 3),
+        "music_lock_definition_sha256": (
+            music_lock.definition_sha256 if music_lock is not None else None
+        ),
+        "music_boundary_refinements": boundary_audit,
+        "chapters": rows,
+    }
+    return resolved, audit
+
+
 def run_feature_cut_experiment(
     *,
     catalog_path: Path,
@@ -4820,7 +5474,11 @@ def run_feature_cut_experiment(
     trim_decision_paths: Sequence[Path] = (),
     allow_proposed_trim_preview: bool = False,
     reuse_feature_plan: bool = False,
+    reuse_feature_plan_raw_output: bool = False,
+    allow_unverified_geometry_preview: bool = False,
     aspect: RenderAspect = "both",
+    music_path: Path | None = None,
+    music_lock_path: Path | None = None,
 ) -> dict[str, Any]:
     render_horizontal, render_vertical = _requested_render_aspects(aspect)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -4887,6 +5545,32 @@ def run_feature_cut_experiment(
     reel_path = Path(catalog.analysis_reel_path)
     reel_media = probe_video(reel_path)
     upload_dir = catalog_path.parent / "file-cache" / reel_media.sha256 / "upload"
+    resolved_music_path = (
+        music_path.expanduser().resolve(strict=True)
+        if music_path is not None
+        else None
+    )
+    music_sha256 = (
+        sha256_file(resolved_music_path)
+        if resolved_music_path is not None
+        else None
+    )
+    resolved_music_lock_path = (
+        music_lock_path.expanduser().resolve(strict=True)
+        if music_lock_path is not None
+        else None
+    )
+    music_lock = (
+        MusicMapLock.model_validate(read_json(resolved_music_lock_path))
+        if resolved_music_lock_path is not None
+        else None
+    )
+    if (
+        music_lock is not None
+        and music_sha256 is not None
+        and music_lock.music_id != f"sha256:{music_sha256}"
+    ):
+        raise ValueError("music file does not match the supplied MusicMap lock")
     client = GeminiLabClient()
     plan_reuse_record_path: Path | None = None
     gemini_geometry_block_reason: str | None = None
@@ -4984,8 +5668,10 @@ def run_feature_cut_experiment(
                     current_binding = _current_external_projection_binding(
                         plan_dir=plan_dir,
                         catalog_path=catalog_path,
+                        catalog_reel_sha256=reel_media.sha256,
                         brief_path=brief_path,
                         plan_path=plan_path,
+                        music_sha256=music_sha256,
                         created_at=utc_now(),
                     )
                 else:
@@ -4994,9 +5680,11 @@ def run_feature_cut_experiment(
                         raise ValueError("saved feature plan binding origin is unsupported")
                     current_binding = _current_feature_plan_binding(
                         catalog_path=catalog_path,
+                        catalog_reel_sha256=reel_media.sha256,
                         brief_path=brief_path,
                         plan_path=plan_path,
                         plan_prompt=plan_prompt,
+                        music_sha256=music_sha256,
                         request_path=(
                             plan_dir / "feature_edit_plan.request.json"
                             if (plan_dir / "feature_edit_plan.request.json").exists()
@@ -5009,8 +5697,10 @@ def run_feature_cut_experiment(
                 current_binding = _current_external_projection_binding(
                     plan_dir=plan_dir,
                     catalog_path=catalog_path,
+                    catalog_reel_sha256=reel_media.sha256,
                     brief_path=brief_path,
                     plan_path=plan_path,
+                    music_sha256=music_sha256,
                     created_at=utc_now(),
                 )
                 saved_binding = current_binding
@@ -5018,9 +5708,11 @@ def run_feature_cut_experiment(
             else:
                 current_binding = _current_feature_plan_binding(
                     catalog_path=catalog_path,
+                    catalog_reel_sha256=reel_media.sha256,
                     brief_path=brief_path,
                     plan_path=plan_path,
                     plan_prompt=plan_prompt,
+                    music_sha256=music_sha256,
                     request_path=(
                         plan_dir / "feature_edit_plan.request.json"
                         if (plan_dir / "feature_edit_plan.request.json").exists()
@@ -5032,9 +5724,11 @@ def run_feature_cut_experiment(
                 saved_binding = _migrate_legacy_feature_plan_binding(
                     plan_dir=plan_dir,
                     catalog_path=catalog_path,
+                    catalog_reel_sha256=reel_media.sha256,
                     brief_path=brief_path,
                     plan_path=plan_path,
                     plan_prompt=plan_prompt,
+                    music_sha256=music_sha256,
                 )
                 write_json(plan_binding_path, saved_binding)
                 current_binding["origin"] = saved_binding["origin"]
@@ -5056,7 +5750,9 @@ def run_feature_cut_experiment(
                         key: current_binding[key]
                         for key in (
                             "catalog_sha256",
+                            "catalog_reel_sha256",
                             "brief_sha256",
+                            "music_sha256",
                             "plan_prompt_sha256",
                             "system_instruction_sha256",
                             "model_id_sha256",
@@ -5082,25 +5778,55 @@ def run_feature_cut_experiment(
             timings["gemini_plan_seconds"] = 0.0
             plan_reused = True
         else:
-            stage = monotonic()
-            uploaded, file_api_reused = client.ensure_video_upload(reel_path, upload_dir)
-            timings["file_api_seconds"] = round(monotonic() - stage, 3)
+            uploaded = None
+            uploaded_audio = None
+            music_file_api_reused: bool | None = None
+            if reuse_feature_plan_raw_output:
+                file_api_reused = True
+                timings["file_api_seconds"] = 0.0
+                timings["music_file_api_seconds"] = 0.0
+            else:
+                stage = monotonic()
+                uploaded, file_api_reused = client.ensure_video_upload(
+                    reel_path, upload_dir
+                )
+                timings["file_api_seconds"] = round(monotonic() - stage, 3)
+                if resolved_music_path is not None and music_sha256 is not None:
+                    music_upload_dir = (
+                        catalog_path.parent
+                        / "file-cache"
+                        / music_sha256
+                        / "music-upload"
+                    )
+                    music_upload_stage = monotonic()
+                    uploaded_audio, music_file_api_reused = client.ensure_video_upload(
+                        resolved_music_path,
+                        music_upload_dir,
+                    )
+                    timings["music_file_api_seconds"] = round(
+                        monotonic() - music_upload_stage, 3
+                    )
             stage = monotonic()
             plan = client.plan_feature_edit(
                 catalog=catalog,
                 brief=brief,
                 uploaded=uploaded,
+                uploaded_audio=uploaded_audio,
+                music_sha256=music_sha256,
                 prompt_template=plan_prompt,
                 run_id=f"feature-plan-{uuid.uuid4().hex[:8]}",
                 run_dir=plan_dir,
+                reuse_raw_output=reuse_feature_plan_raw_output,
             )
             timings["gemini_plan_seconds"] = round(monotonic() - stage, 3)
             request_path = plan_dir / "feature_edit_plan.request.json"
             binding = _current_feature_plan_binding(
                 catalog_path=catalog_path,
+                catalog_reel_sha256=reel_media.sha256,
                 brief_path=brief_path,
                 plan_path=plan_path,
                 plan_prompt=plan_prompt,
+                music_sha256=music_sha256,
                 request_path=request_path,
                 created_at=utc_now(),
                 origin="generated",
@@ -5109,6 +5835,24 @@ def run_feature_cut_experiment(
             plan_reused = False
         shot_cache: dict[str, ShotManifest] = {}
         shots_dir = output_dir / "shots"
+        source_capacity_seconds = _selected_source_capacity_seconds(
+            plan,
+            frames=frames,
+            clips=clips,
+            shot_cache=shot_cache,
+            shots_dir=shots_dir,
+            scdet_threshold=scdet_threshold,
+        )
+        chapter_durations, duration_audit = _resolve_editorial_chapter_durations(
+            brief,
+            plan,
+            music_lock=music_lock,
+            source_capacity_seconds=source_capacity_seconds,
+            shortfall_audit_path=(
+                output_dir / "editorial-duration-capacity-shortfall.json"
+            ),
+        )
+        write_json(output_dir / "editorial-duration-plan.json", duration_audit)
         horizontal_segments: list[Path] = []
         vertical_segments: list[Path] = []
         render_config = {
@@ -5116,6 +5860,8 @@ def run_feature_cut_experiment(
             "aspect": aspect,
             "brief": brief.model_dump(mode="json"),
             "plan": plan.model_dump(mode="json"),
+            "editorial_duration_plan": duration_audit,
+            "music_sha256": music_sha256,
             "sam_analysis_fps": sam_analysis_fps,
             "scdet_threshold": scdet_threshold,
             "trim_decisions": [
@@ -5126,6 +5872,7 @@ def run_feature_cut_experiment(
                 for path, decision in trim_decisions
             ],
             "allow_proposed_trim_preview": allow_proposed_trim_preview,
+            "allow_unverified_geometry_preview": allow_unverified_geometry_preview,
         }
         render_key = hashlib.sha256(
             json.dumps(render_config, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -5143,6 +5890,9 @@ def run_feature_cut_experiment(
             "render_cache_key": render_key,
             "requested_aspect": aspect,
             "feature_plan_reused": plan_reused,
+            "music_supplied_to_feature_planner": resolved_music_path is not None,
+            "music_sha256": music_sha256,
+            "editorial_duration_plan": duration_audit,
             "feature_plan_binding": str(plan_binding_path.resolve()),
             "feature_plan_reuse_record": (
                 str(plan_reuse_record_path.resolve())
@@ -5163,6 +5913,7 @@ def run_feature_cut_experiment(
             "contains_unreviewed_trim_proposals": any(
                 decision.approval_status == "proposed" for _, decision in trim_decisions
             ),
+            "allow_unverified_geometry_preview": allow_unverified_geometry_preview,
             "trim_decisions": [
                 {
                     "path": str(path),
@@ -5191,6 +5942,7 @@ def run_feature_cut_experiment(
         stage = monotonic()
         for index, selected in enumerate(plan.chapters):
             brief_chapter = brief_by_id[selected.feature_id]
+            chapter_duration_seconds = chapter_durations[selected.feature_id]
             horizontal_overlay = output_dir / "overlays" / "16x9" / f"{index:02d}.png"
             vertical_overlay = output_dir / "overlays" / "9x16" / f"{index:02d}.png"
             horizontal_segment = (
@@ -5203,11 +5955,15 @@ def run_feature_cut_experiment(
                 if render_horizontal:
                     if not _segment_is_valid(
                         horizontal_segment,
-                        expected_duration=brief_chapter.target_duration_seconds,
+                        expected_duration=chapter_duration_seconds,
                         dimensions=(1920, 1080),
                     ):
                         _render_missing_segment(
-                            brief_chapter,
+                            brief_chapter.model_copy(
+                                update={
+                                    "target_duration_seconds": chapter_duration_seconds
+                                }
+                            ),
                             horizontal_segment,
                             horizontal_overlay,
                             (1920, 1080),
@@ -5219,7 +5975,7 @@ def run_feature_cut_experiment(
                         "observed_visual_evidence": selected.observed_visual_evidence,
                         "selection_reason": selected.selection_reason,
                         "duration_ms": round(
-                            brief_chapter.target_duration_seconds * 1000
+                            chapter_duration_seconds * 1000
                         ),
                         "source_clip_id": None,
                         "source_in_ms": None,
@@ -5233,11 +5989,15 @@ def run_feature_cut_experiment(
                 if render_vertical:
                     if not _segment_is_valid(
                         vertical_segment,
-                        expected_duration=brief_chapter.target_duration_seconds,
+                        expected_duration=chapter_duration_seconds,
                         dimensions=(1080, 1920),
                     ):
                         _render_missing_segment(
-                            brief_chapter,
+                            brief_chapter.model_copy(
+                                update={
+                                    "target_duration_seconds": chapter_duration_seconds
+                                }
+                            ),
                             vertical_segment,
                             vertical_overlay,
                             (1080, 1920),
@@ -5249,7 +6009,7 @@ def run_feature_cut_experiment(
                         "observed_visual_evidence": selected.observed_visual_evidence,
                         "selection_reason": selected.selection_reason,
                         "duration_ms": round(
-                            brief_chapter.target_duration_seconds * 1000
+                            chapter_duration_seconds * 1000
                         ),
                         "source_clip_id": None,
                         "source_in_ms": None,
@@ -5277,7 +6037,7 @@ def run_feature_cut_experiment(
                         _chapter_bounds_with_approved_trim(
                             horizontal_frame,
                             horizontal_clip,
-                            brief_chapter.target_duration_seconds,
+                            chapter_duration_seconds,
                             shot_cache,
                             shots_dir,
                             scdet_threshold,
@@ -5439,6 +6199,7 @@ def run_feature_cut_experiment(
                 )
                 candidate_attempts: list[dict[str, Any]] = []
                 deferred_fit: dict[str, Any] | None = None
+                deferred_required_scope_fit: dict[str, Any] | None = None
                 selected_vertical: dict[str, Any] | None = None
                 for option_index, option in enumerate(vertical_options):
                     option_data = option
@@ -5471,7 +6232,7 @@ def run_feature_cut_experiment(
                         _chapter_bounds_with_approved_trim(
                             candidate_frame,
                             candidate_clip,
-                            brief_chapter.target_duration_seconds,
+                            chapter_duration_seconds,
                             shot_cache,
                             shots_dir,
                             scdet_threshold,
@@ -5514,8 +6275,8 @@ def run_feature_cut_experiment(
                     if option_data["strategy"] == "fit_with_background":
                         attempt.update(
                             {
-                                "decision": "deferred_safe_fit",
-                                "reason_code": "planner_requested_fit",
+                                "decision": "deferred_fallback",
+                                "reason_code": "planner_requested_scope_preserving_fit",
                             }
                         )
                         candidate_attempts.append(attempt)
@@ -5533,12 +6294,14 @@ def run_feature_cut_experiment(
                                 "target": candidate_target,
                                 "filter": _vertical_fit_filter(),
                                 "geometry": {
-                                    "applied_strategy": "fit_with_background",
+                                    "applied_strategy": "fit_with_solid_matte",
                                     "fallback_reason": None,
-                                    "risk_codes": ["auto_candidate_used_safe_fit"],
+                                    "risk_codes": [
+                                        "planner_requested_scope_preserving_fit"
+                                    ],
                                     "requires_gemini_review": True,
                                     "semantic_review_reasons": [
-                                        "safe_fit_is_review_only"
+                                        "scope_preserving_fit_is_review_only"
                                     ],
                                 },
                                 "debugs": [],
@@ -5664,6 +6427,25 @@ def run_feature_cut_experiment(
                             )
                             hard_gate_passed = auto_audit.approved
                             failure_codes = list(auto_audit.failure_codes)
+                            preview_allowed_failures = {
+                                FailureCode.IDENTITY_VERIFICATION_PENDING,
+                            }
+                            if (
+                                allow_unverified_geometry_preview
+                                and candidate_geometry.get("fallback_reason") is None
+                                and bool(failure_codes)
+                                and set(failure_codes).issubset(
+                                    preview_allowed_failures
+                                )
+                            ):
+                                hard_gate_passed = True
+                                candidate_geometry[
+                                    "unverified_geometry_preview_override"
+                                ] = True
+                                candidate_geometry["requires_gemini_review"] = True
+                                candidate_geometry.setdefault("risk_codes", []).append(
+                                    "explicit_unverified_geometry_preview"
+                                )
                             candidate_geometry["auto_bounded_clip_audit"] = (
                                 auto_audit.model_dump(mode="json")
                             )
@@ -5684,6 +6466,52 @@ def run_feature_cut_experiment(
                                 ),
                             )
                         )
+                        if (
+                            not hard_gate_passed
+                            and deferred_required_scope_fit is None
+                            and FailureCode.NO_FEASIBLE_PRESENTATION
+                            in failure_codes
+                        ):
+                            scoped_fit = _vertical_required_scope_fit_filter(
+                                candidate_geometry
+                            )
+                            if scoped_fit is not None:
+                                scoped_filter, scoped_geometry = scoped_fit
+                                deferred_required_scope_fit = {
+                                    "option": option_data,
+                                    "frame": candidate_frame,
+                                    "clip": candidate_clip,
+                                    "media": candidate_media,
+                                    "start_ms": candidate_start,
+                                    "end_ms": candidate_end,
+                                    "shot_id": candidate_shot,
+                                    "trim": candidate_trim,
+                                    "regions": candidate_regions,
+                                    "target": candidate_target,
+                                    "filter": scoped_filter,
+                                    "geometry": {
+                                        **scoped_geometry,
+                                        "source_failed_geometry": {
+                                            "applied_strategy": (
+                                                candidate_geometry.get(
+                                                    "applied_strategy"
+                                                )
+                                            ),
+                                            "fallback_reason": (
+                                                candidate_geometry.get(
+                                                    "fallback_reason"
+                                                )
+                                            ),
+                                            "track_geometry_fingerprint": (
+                                                candidate_track_fingerprint
+                                            ),
+                                        },
+                                    },
+                                    "debugs": candidate_debugs,
+                                    "track_fingerprint": (
+                                        candidate_track_fingerprint
+                                    ),
+                                }
                         attempt.update(
                             {
                                 "decision": (
@@ -5789,11 +6617,13 @@ def run_feature_cut_experiment(
                             break
 
                 if selected_vertical is None:
-                    selected_vertical = deferred_fit
+                    selected_vertical = (
+                        deferred_required_scope_fit or deferred_fit
+                    )
                 if selected_vertical is None:
-                    # All evidence-bound crop candidates failed. Render a safe,
-                    # fully visible preview for human review instead of silently
-                    # applying the brief's center crop.
+                    # All evidence-bound crop candidates failed. Honor the
+                    # explicitly selected project fallback, but keep it marked
+                    # as an unverified human-review preview.
                     first_data = vertical_options[0]
                     vertical_frame = frames[str(first_data["frame_id"])]
                     vertical_clip = clips[vertical_frame.clip_id]
@@ -5810,7 +6640,7 @@ def run_feature_cut_experiment(
                         _chapter_bounds_with_approved_trim(
                             vertical_frame,
                             vertical_clip,
-                            brief_chapter.target_duration_seconds,
+                            chapter_duration_seconds,
                             shot_cache,
                             shots_dir,
                             scdet_threshold,
@@ -5822,9 +6652,21 @@ def run_feature_cut_experiment(
                         selected.vertical_target_description
                         or brief_chapter.vertical_primary_target_description
                     )
-                    vertical_filter = _vertical_fit_filter()
+                    use_center_crop_preview = (
+                        human_reframe_policy_requested
+                        and brief.vertical_fallback_strategy == "center_crop"
+                    )
+                    vertical_filter = (
+                        _vertical_center_crop_filter()
+                        if use_center_crop_preview
+                        else _vertical_fit_filter()
+                    )
                     vertical_geometry = {
-                        "applied_strategy": "policy_blocked_preview_fit",
+                        "applied_strategy": (
+                            "policy_blocked_preview_center_crop"
+                            if use_center_crop_preview
+                            else "policy_blocked_preview_solid_fit"
+                        ),
                         "fallback_reason": "all_automatic_candidates_exhausted",
                         "risk_codes": [
                             "automatic_candidate_exhaustion",
@@ -5874,7 +6716,13 @@ def run_feature_cut_experiment(
                     "selected_candidate_rank": selected_candidate_rank,
                     "attempts": candidate_attempts,
                     "human_policy_binding_present": human_reframe_policy_requested,
-                    "center_crop_used_as_unverified_fallback": False,
+                    "center_crop_used_as_unverified_fallback": (
+                        vertical_geometry.get("applied_strategy")
+                        in {
+                            "unverified_center_crop_preview",
+                            "policy_blocked_preview_center_crop",
+                        }
+                    ),
                 }
                 vertical_segment_fingerprint = _segment_variant_fingerprint(
                     source_sha256=vertical_clip.sha256,
