@@ -66,6 +66,11 @@ from .sam_tracking import (
     track_bboxes_shared_sam21,
 )
 from .shots import detect_shots_ffmpeg
+from .shot_quality import (
+    build_candidate_capacity,
+    build_render_quality_report,
+    scan_shot_quality,
+)
 from .storage import append_error, read_json, write_json
 from .temporal_risk import scan_temporal_risk_windows
 from .timeline import render_direct_moment_timeline, render_temporal_timeline, render_timeline
@@ -596,6 +601,55 @@ def command_scan_temporal_risk(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_scan_shot_quality(args: argparse.Namespace) -> int:
+    shot_manifest = detect_shots_ffmpeg(
+        args.video,
+        threshold=args.shot_threshold,
+        output_path=args.shot_manifest_output,
+    )
+    shot_id = args.shot_id
+    if shot_id is None:
+        if len(shot_manifest.shots) != 1:
+            raise ValueError(
+                "--shot-id is required when shot detection returns multiple shots"
+            )
+        shot_id = shot_manifest.shots[0].shot_id
+    result = scan_shot_quality(
+        args.video,
+        shot_manifest=shot_manifest,
+        shot_id=shot_id,
+        analysis_width=args.analysis_width,
+        analysis_height=args.analysis_height,
+        output_path=args.output,
+    )
+    print(result.model_dump_json(indent=2))
+    return 0
+
+
+def command_build_candidate_capacity(args: argparse.Namespace) -> int:
+    result = build_candidate_capacity(
+        candidate_id=args.candidate_id,
+        quality_map_path=args.quality_map,
+        preferred_duration=args.preferred_duration,
+        min_editorial_duration=args.minimum_duration,
+        horizontal_geometry_status=args.horizontal_geometry_status,
+        vertical_geometry_status=args.vertical_geometry_status,
+    )
+    write_json(args.output, result)
+    print(result.model_dump_json(indent=2))
+    return 0
+
+
+def command_scan_render_quality(args: argparse.Namespace) -> int:
+    result = build_render_quality_report(
+        args.render,
+        scdet_threshold=args.shot_threshold,
+        output_dir=args.output_dir,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_catalog_rushes(args: argparse.Namespace) -> int:
     catalog = create_rushes_catalog(
         args.source_directory,
@@ -739,6 +793,8 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         scdet_threshold=args.scdet_threshold,
         sam_analysis_fps=args.sam_analysis_fps,
         trim_decision_paths=args.trim_decision,
+        shot_quality_map_paths=args.shot_quality_map,
+        post_render_quality_qc=args.post_render_quality_qc,
         allow_proposed_trim_preview=args.allow_proposed_trim_preview,
         reuse_feature_plan=args.reuse_feature_plan,
         reuse_feature_plan_raw_output=args.reuse_feature_plan_raw_output,
@@ -2067,6 +2123,56 @@ def build_parser() -> argparse.ArgumentParser:
     risk_parser.add_argument("--output", type=Path, required=True)
     risk_parser.set_defaults(handler=command_scan_temporal_risk)
 
+    quality_parser = subparsers.add_parser(
+        "scan-shot-quality",
+        help=(
+            "Measure exact-PTS technical quality windows for one shortlisted "
+            "shot at source FPS"
+        ),
+    )
+    quality_parser.add_argument("video", type=Path)
+    quality_parser.add_argument("--shot-id")
+    quality_parser.add_argument("--shot-threshold", type=float, default=4.0)
+    quality_parser.add_argument("--analysis-width", type=int, default=320)
+    quality_parser.add_argument("--analysis-height", type=int, default=180)
+    quality_parser.add_argument("--output", type=Path, required=True)
+    quality_parser.add_argument(
+        "--shot-manifest-output",
+        type=Path,
+        required=True,
+    )
+    quality_parser.set_defaults(handler=command_scan_shot_quality)
+
+    capacity_parser = subparsers.add_parser(
+        "build-candidate-capacity",
+        help="Derive continuous quality-safe capacity from one shot quality map",
+    )
+    capacity_parser.add_argument("quality_map", type=Path)
+    capacity_parser.add_argument("--candidate-id", required=True)
+    capacity_parser.add_argument("--preferred-duration", type=float, required=True)
+    capacity_parser.add_argument("--minimum-duration", type=float, default=0.0)
+    capacity_parser.add_argument(
+        "--horizontal-geometry-status",
+        choices=["not_evaluated", "feasible", "partial", "blocked"],
+        default="not_evaluated",
+    )
+    capacity_parser.add_argument(
+        "--vertical-geometry-status",
+        choices=["not_evaluated", "feasible", "partial", "blocked"],
+        default="not_evaluated",
+    )
+    capacity_parser.add_argument("--output", type=Path, required=True)
+    capacity_parser.set_defaults(handler=command_build_candidate_capacity)
+
+    render_quality_parser = subparsers.add_parser(
+        "scan-render-quality",
+        help="Run deterministic per-shot technical QC on a completed render",
+    )
+    render_quality_parser.add_argument("render", type=Path)
+    render_quality_parser.add_argument("--shot-threshold", type=float, default=4.0)
+    render_quality_parser.add_argument("--output-dir", type=Path, required=True)
+    render_quality_parser.set_defaults(handler=command_scan_render_quality)
+
     catalog_parser = subparsers.add_parser(
         "catalog-rushes", help="Build a labeled immutable-frame-ID catalog reel from rushes"
     )
@@ -2120,6 +2226,27 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Explicitly human-approved trim decision JSON; repeat for multiple selected events. "
             "Proposed or rejected decisions are refused."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--shot-quality-map",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Exact-PTS ShotQualityMap for a shortlisted source shot; repeat for "
+            "multiple candidates. Capacity planning excludes unresolved hard "
+            "and trim-candidate windows before rendering."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--post-render-quality-qc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run the same deterministic technical scan on completed aspect "
+            "renders. Hard decoder/PTS defects fail closed; subjective visual "
+            "risks remain review evidence."
         ),
     )
     feature_cut_parser.add_argument(

@@ -81,6 +81,8 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
         ]
     )
     assert defaults.aspect == "both"
+    assert defaults.shot_quality_map == []
+    assert defaults.post_render_quality_qc is True
     vertical = build_parser().parse_args(
         [
             "feature-cut",
@@ -191,6 +193,146 @@ def test_editorial_dwell_reconciles_short_source_without_synthetic_hold() -> Non
     )
     assert opening["source_capacity_applied"] is True
     assert opening["source_capacity_seconds"] == 2.5
+
+
+def test_editorial_dwell_locks_human_approved_trim_before_allocation() -> None:
+    feature_ids = ("opening", "action", "detail", "comparison", "result", "closing")
+    brief = FeatureEditBrief(
+        project_id="generic-project",
+        title="Generic edit",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id=feature_id,
+                title=feature_id,
+                detail_lines=[],
+                target_duration_seconds=10,
+            )
+            for feature_id in feature_ids
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id="generic-catalog",
+        title=brief.title,
+        chapters=[
+            FeatureChapterSelect(
+                feature_id=feature_id,
+                evidence_status="supported",
+                observed_visual_evidence=f"Observable {feature_id}.",
+                selection_reason=f"Selected {feature_id}.",
+                horizontal_frame_id=f"RF{index:06d}",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_frame_id=f"RF{index:06d}",
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                recommended_duration_seconds=10,
+                duration_rationale="Relative information and action judgment.",
+                quality_risks=[],
+                confidence=0.9,
+            )
+            for index, feature_id in enumerate(feature_ids, start=1)
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    durations, audit = _resolve_editorial_chapter_durations(
+        brief,
+        plan,
+        source_capacity_seconds={
+            "opening": 4.2,
+            **{feature_id: 20 for feature_id in feature_ids[1:]},
+        },
+        fixed_duration_seconds={"opening": 4.2},
+    )
+
+    assert durations["opening"] == 4.2
+    assert sum(durations.values()) == 60
+    assert set(durations[feature_id] for feature_id in feature_ids[1:]) == {
+        11.16
+    }
+    opening = next(
+        row for row in audit["chapters"] if row["feature_id"] == "opening"
+    )
+    assert opening["fixed_duration_authority"] == (
+        "human_approved_trim_exact_pts"
+    )
+    assert audit["fixed_approved_trim_duration_seconds"] == {"opening": 4.2}
+
+
+def test_editorial_dwell_refuses_approved_trim_beyond_safe_capacity() -> None:
+    feature_ids = ("opening", "action", "detail", "comparison", "result", "closing")
+    brief = FeatureEditBrief(
+        project_id="generic-project",
+        title="Generic edit",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id=feature_id,
+                title=feature_id,
+                detail_lines=[],
+                target_duration_seconds=10,
+            )
+            for feature_id in feature_ids
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id="generic-catalog",
+        title=brief.title,
+        chapters=[
+            FeatureChapterSelect(
+                feature_id=feature_id,
+                evidence_status="supported",
+                observed_visual_evidence="Observable evidence.",
+                selection_reason="Selected evidence.",
+                horizontal_frame_id=f"RF{index:06d}",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_frame_id=f"RF{index:06d}",
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                recommended_duration_seconds=10,
+                duration_rationale="Relative information and action judgment.",
+                quality_risks=[],
+                confidence=0.9,
+            )
+            for index, feature_id in enumerate(feature_ids, start=1)
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exceeds its QualitySafeInterval"):
+        _resolve_editorial_chapter_durations(
+            brief,
+            plan,
+            source_capacity_seconds={
+                "opening": 3.0,
+                **{feature_id: 20 for feature_id in feature_ids[1:]},
+            },
+            fixed_duration_seconds={"opening": 4.2},
+        )
 
 
 def test_editorial_dwell_saves_generic_shortfall_audit_before_fail_closed(
@@ -434,6 +576,7 @@ def test_feature_cut_single_aspect_skips_unrequested_segments_and_concat(
         grounding_prompt="ground",
         reuse_feature_plan=True,
         aspect=aspect,
+        post_render_quality_qc=False,
     )
 
     manifest = read_json(output_dir / "render-manifest.json")
@@ -690,6 +833,7 @@ def test_feature_cut_single_aspect_found_evidence_never_runs_other_geometry(
         grounding_prompt="ground",
         reuse_feature_plan=True,
         aspect=aspect,
+        post_render_quality_qc=False,
     )
 
     assert build_track_calls == expected_build_track_calls

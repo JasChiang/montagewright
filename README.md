@@ -11,9 +11,10 @@
 3. **有指定音樂就讓 AI 實際聽音樂**：本機先找精確節拍、重音、能量與段落；Gemini 的選片規劃 call 必須同時取得音樂與 brief，判斷 opening、build、peak、留白與 closing 適合承接什麼畫面。只有沒有提供音樂時，才允許純視覺選片。
 4. **提出選片與相對停留建議**：有剪輯 brief 時，AI 會同時依主題、功能、可觀察資訊量、動作是否完整及音樂 flow 挑選素材，並逐章說明相對上該多看或少看；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。系統不會因為畫面被分類成人物、產品、UI 或靜態鏡頭，就套用固定秒數。
 5. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
-6. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。必要主體無法安全裝進滿版 9:16 時，review fallback 會先依全段 required-region envelope 去除無關外圍，再用純色 matte 補邊；不使用模糊背景，也不以中心裁切偷掉必要主體。
-7. **保留連續音樂，不拿毛片原音疊上去**：review delivery 只使用已核准的一段連續音樂，優先保留自然收尾；不把同一首歌切成數段交疊、不 time-stretch，也不混入每顆毛片原音造成突兀重疊。若畫面長度與連續音樂無法在容差內對齊，會停止而不是硬裁或 freeze 畫面。
-8. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。Gemini 可用一次有聲 16:9 call 檢查 brief、資訊停留、重複、轉場及音樂 flow；9:16 另以靜音 proxy 只檢查裁切、文字與追蹤。QA 只提出觀察，不會自行改片；真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
+6. **確認真正可用的秒數**：只對入選 shot 逐幀量測黑白格、freeze、解碼／PTS 異常及需複核的失焦、模糊與晃動，先算出連續的安全區間，再分配章節片長；不拿包含髒畫面的整個 shot 長度冒充可用容量。
+7. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。必要主體無法安全裝進滿版 9:16 時，review fallback 會先依全段 required-region envelope 去除無關外圍，再用純色 matte 補邊；不使用模糊背景，也不以中心裁切偷掉必要主體。
+8. **保留連續音樂，不拿毛片原音疊上去**：review delivery 只使用已核准的一段連續音樂，優先保留自然收尾；不把同一首歌切成數段交疊、不 time-stretch，也不混入每顆毛片原音造成突兀重疊。若畫面長度與連續音樂無法在容差內對齊，會停止而不是硬裁或 freeze 畫面。
+9. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。Gemini 可用一次有聲 16:9 call 檢查 brief、資訊停留、重複、轉場及音樂 flow；9:16 另以靜音 proxy 只檢查裁切、文字與追蹤。QA 只提出觀察，不會自行改片；真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
 
 ```text
 一批毛片
@@ -21,6 +22,7 @@
   → 有指定音樂時先建立 MusicMap，並讓 Gemini 同時聽音樂、看 brief 與素材
   → Gemini 提出選片、敘事順序與基於資訊量／動作／音樂的相對停留
   → 真人確認選片與重要目標
+  → shortlisted shots 以 source FPS 建立 QualitySafeInterval
   → 只有需要直式重構或圖卡避讓時才做 bbox／SAM tracking
   → 使用單一連續音樂段落組裝，不混毛片原音
   → 成片後再做 brief／音樂 flow QA 與 9:16 crop-only QA
@@ -37,6 +39,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 | Python 3.12＋`uv` | 執行整套實驗程式、管理套件與可重現的環境 | 不分析影片內容 |
 | FFmpeg／ffprobe | 讀取片長、尺寸、旋轉與影格時間；製作 proxy、偵測切鏡、抽原始影格及輸出 review cut | 不理解人物、物件或故事 |
 | Temporal Risk Window scanner | 以本機低解析影格差異找出可能被約 1 FPS 粗取樣漏掉的短暫視覺變化，提出需要加密檢查的時間窗 | 不宣稱時間窗內一定有語意事件，也不產生剪點 |
+| ShotQualityMap／QualitySafeInterval | 只對入選 shot 以 source FPS 量測黑白格、freeze、相對失焦／模糊、晃動與 PTS／解碼異常，保存 exact PTS 證據；在分配片長前算出最長連續安全區間 | 不把測量值直接當刪除命令；rack focus、whip pan、locked shot 等意圖仍需語意或人工確認 |
 | Gemini File API | 上傳並暫存可重用的影片或圖片，避免同一檔案在有效期內重複上傳 | 不執行內容判斷 |
 | Gemini 3.6 Flash＋Interactions API | 看完整 proxy、建立 Clip Cards、提出選片與敘事候選；有音樂時同時聽音樂與讀 brief，判斷各章相對停留；在指定單張影格中找出目標 bbox | 不以固定類型秒數取代剪輯判斷；影片時間只適合語意搜尋，不提供 frame-accurate 剪點；單張 bbox 也不是逐幀追蹤 |
 | Pydantic Structured Output | 限制模型輸出欄位與型別，拒絕超界時間、非法 bbox 或不存在的 frame ID | Schema 合法不代表模型的內容判斷一定正確 |
@@ -351,6 +354,54 @@ Feature renderer 同樣接受無音軌來源：有原音時保留並淡入淡出
 這個 segment-level 音軌只為了讓 FFmpeg concat contract 穩定，不是最終混音。指定音樂的 delivery 會明確只 map 核准的 continuous music track，排除所有 rush source audio，因此不會出現毛片原音彼此重疊或和背景音樂疊成突兀的雙重音軌。Picture 與 music 長度超過容差時會 fail closed，不以 `-shortest` 的副作用冒充已完成音樂剪輯。
 
 每章停留時間也不是按內容類別寫死。Gemini 先根據 brief、實際畫面、動作完整性、資訊密度與已提供的音樂提出 `recommended_duration_seconds` 與理由；本機只把這些數值當成**相對權重**，再受單一 shot 的合法 source capacity、核准總長與 MusicMap cue 約束。若某個 selected shot 太短，系統只能把剩餘時間分配給其他有足夠合法素材的章節，不能重播、freeze 或跨 shot 偷延長；全部容量不足時會先寫出 `editorial-duration-capacity-shortfall.json` 再停止。舊 brief 的逐章秒數只作缺少模型建議時的 legacy fallback，不能被解讀成「某類畫面一律停留幾秒」。
+
+#### Quality-safe interval 規劃
+
+`quality_risks: list[str]` 只能提醒人「可能有問題」，無法安全驅動剪輯。新的 P0 路徑會在 Top-K 候選縮小後，才以本機 source-FPS scanner 建立 `ShotQualityMap`：
+
+```text
+shortlisted source shot
+  → source-FPS 本機品質量測
+  → exact-PTS QualityRiskWindow
+  → 排除 hard block 與尚未確認為刻意的 trim candidate
+  → QualitySafeInterval
+  → 各比例最長連續 CandidateCapacity
+  → Gemini 相對停留建議 × 本機安全容量
+  → exact trim／geometry／render
+  → 成片再跑一次 technical QC
+```
+
+品質風險分成三種影響：
+
+- `hard_block`：解碼／PTS 完整性等不可安全執行的問題，直接 fail closed。
+- `trim_candidate`：黑白格、持續 freeze 等高可信疑點；`intent=unknown` 時不進入自動容量，只有人工或語意證據確認為 `intentional` 才保留。
+- `review`：相對失焦、motion blur、camera shake 等可能是 rack focus、whip pan 或刻意手持的訊號；保留片段但標記人工複核。
+
+容量使用「最長連續安全區間」，不會把被髒畫面隔開的 4 秒與 3 秒偷偷相加成可連續使用的 7 秒。真人已核准的 Trim Intent 會在片長分配前鎖定為 exact duration；若穿過被排除的品質區間，renderer 會拒絕，而不是事後縮短、停格或延長其他髒尾巴。若 runtime 候選無法承接已規劃的長度，目前 v1 會換下一個能完整承接的 Top-K 候選或停止；尚不會在 renderer 裡靜默做全域縮時重排。
+
+```bash
+# 先保存 FFmpeg shot PTS，再只掃描入選 shot
+uv run jascue-video-lab scan-shot-quality SOURCE.mp4 \
+  --shot-id shot-0003 \
+  --shot-manifest-output artifacts/quality/shot-manifest.json \
+  --output artifacts/quality/shot-0003.quality-map.json
+
+# 由同一份 evidence 建立雙比例的連續安全容量
+uv run jascue-video-lab build-candidate-capacity \
+  artifacts/quality/shot-0003.quality-map.json \
+  --candidate-id candidate-003 \
+  --preferred-duration 5.5 \
+  --minimum-duration 2.0 \
+  --output artifacts/quality/candidate-003.capacity.json
+
+# feature-cut 要求所有可能實際嘗試的 source shot 都有 quality map
+uv run jascue-video-lab feature-cut CATALOG.json BRIEF.json \
+  --sam-checkpoint SAM_CHECKPOINT.pt \
+  --shot-quality-map artifacts/quality/shot-0003.quality-map.json \
+  --output-dir FEATURE_OUTPUT
+```
+
+這個 scanner 是 deterministic guardrail，不是通用美學判官。focus／shake 目前仍是 shot-relative heuristic；目標是否可見與各比例是否放得下，要等 QueryLock、tracking 與 geometry preflight 才能加入 capacity。`scan-temporal-risk` 仍只負責低成本 visual-change recall，不能替代這條品質路徑。
 
 若 geometry 與片段已經渲染，只想比較另一種敘事順序，不需要再呼叫 Gemini。`scripts/resequence_segments.py` 讀取明確的 trim/sequence JSON，重新編排現有編號 A/V segments，並輸出包含每段來源、trim 與新時間軸的 manifest。這只適合可稽核的 picture-edit A/B；它不會把既有片段描述冒充成新 Full Clip Card，也不能取代原片層級的 take selection。
 

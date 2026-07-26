@@ -1434,6 +1434,242 @@ class DenseEventSelection(StrictModel):
         return self
 
 
+QualityRiskReason = Literal[
+    "black",
+    "white_clip",
+    "freeze",
+    "focus_loss",
+    "motion_blur",
+    "camera_shake",
+    "occlusion",
+    "target_not_visible",
+    "duplicate_pts",
+    "decoder_gap",
+    "compression_artifact",
+]
+
+QualityRiskSeverity = Literal[
+    "hard_block",
+    "trim_candidate",
+    "review",
+    "note",
+]
+
+QualityRiskIntent = Literal[
+    "accidental",
+    "intentional",
+    "unknown",
+]
+
+
+class QualityFrameEvidence(StrictModel):
+    """One reproducible analysis frame tied back to decoded source PTS."""
+
+    frame_id: str = Field(pattern=r"^QF-[0-9a-f]{16}$")
+    frame_pts: int
+    frame_time_ms: int = Field(ge=0)
+    analysis_frame_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class QualityRiskWindow(StrictModel):
+    """Measured source interval; it is not itself an edit instruction."""
+
+    risk_window_id: str = Field(pattern=r"^QRW-[0-9]{4}$")
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    shot_id: str = Field(min_length=1)
+    start_pts: int
+    end_pts: int
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    reason_code: QualityRiskReason
+    severity: QualityRiskSeverity
+    intent: QualityRiskIntent
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence_frame_ids: list[str] = Field(max_length=16)
+    metric_summary: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_quality_window(self) -> "QualityRiskWindow":
+        if self.end_pts <= self.start_pts:
+            raise ValueError("quality risk PTS interval must be non-empty")
+        if self.end_ms <= self.start_ms:
+            raise ValueError("quality risk time interval must be non-empty")
+        if len(self.evidence_frame_ids) != len(set(self.evidence_frame_ids)):
+            raise ValueError("quality risk evidence frame IDs must be unique")
+        if self.reason_code != "decoder_gap" and not self.evidence_frame_ids:
+            raise ValueError(
+                "measured quality risks require at least one evidence frame"
+            )
+        return self
+
+
+class ShotQualityMap(StrictModel):
+    """Deterministic source-FPS measurements for one immutable source shot."""
+
+    contract_version: Literal["shot-quality-map-v1"] = "shot-quality-map-v1"
+    scanner_version: str = Field(min_length=1)
+    source_path: str
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    shot_id: str = Field(min_length=1)
+    shot_start_pts: int
+    shot_end_pts: int
+    shot_start_ms: int = Field(ge=0)
+    shot_end_ms: int = Field(gt=0)
+    source_time_base: Rational
+    analysis_width: int = Field(gt=0)
+    analysis_height: int = Field(gt=0)
+    decoded_frame_count: int = Field(ge=0)
+    request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_frames: list[QualityFrameEvidence]
+    risk_windows: list[QualityRiskWindow]
+    warnings: list[str]
+    generated_at: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_quality_map(self) -> "ShotQualityMap":
+        if self.shot_end_pts <= self.shot_start_pts:
+            raise ValueError("shot quality PTS interval must be non-empty")
+        if self.shot_end_ms <= self.shot_start_ms:
+            raise ValueError("shot quality time interval must be non-empty")
+        evidence_ids = [frame.frame_id for frame in self.evidence_frames]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("quality evidence frame IDs must be unique")
+        known_evidence = set(evidence_ids)
+        window_ids = [window.risk_window_id for window in self.risk_windows]
+        if len(window_ids) != len(set(window_ids)):
+            raise ValueError("quality risk window IDs must be unique")
+        for window in self.risk_windows:
+            if (
+                window.source_asset_id != self.source_asset_id
+                or window.shot_id != self.shot_id
+            ):
+                raise ValueError("quality risk window lineage differs from its map")
+            if not (
+                self.shot_start_ms
+                <= window.start_ms
+                < window.end_ms
+                <= self.shot_end_ms
+            ):
+                raise ValueError("quality risk window lies outside its shot")
+            if not set(window.evidence_frame_ids) <= known_evidence:
+                raise ValueError("quality risk references unknown evidence frames")
+        return self
+
+
+class QualitySafeInterval(StrictModel):
+    """One continuous interval eligible for deterministic source trimming."""
+
+    interval_id: str = Field(pattern=r"^QSI-[0-9]{4}$")
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    shot_id: str = Field(min_length=1)
+    start_pts: int
+    end_pts: int
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    excluded_risk_window_ids: list[str]
+    review_risk_window_ids: list[str]
+    requires_human_review: bool
+    quality_map_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_safe_interval(self) -> "QualitySafeInterval":
+        if self.end_pts <= self.start_pts or self.end_ms <= self.start_ms:
+            raise ValueError("quality-safe interval must be non-empty")
+        if len(self.excluded_risk_window_ids) != len(
+            set(self.excluded_risk_window_ids)
+        ):
+            raise ValueError("excluded risk IDs must be unique")
+        if len(self.review_risk_window_ids) != len(
+            set(self.review_risk_window_ids)
+        ):
+            raise ValueError("review risk IDs must be unique")
+        if self.requires_human_review != bool(self.review_risk_window_ids):
+            raise ValueError(
+                "safe interval review flag must reflect unresolved review risks"
+            )
+        return self
+
+
+class AspectCandidateCapacity(StrictModel):
+    """Quality and geometry capacity for one delivery aspect."""
+
+    aspect: Literal["16:9", "9:16"]
+    geometry_status: Literal[
+        "not_evaluated",
+        "feasible",
+        "partial",
+        "blocked",
+    ]
+    safe_intervals: list[QualitySafeInterval]
+    maximum_continuous_seconds: float = Field(ge=0.0)
+    requires_human_review: bool
+
+    @model_validator(mode="after")
+    def validate_capacity(self) -> "AspectCandidateCapacity":
+        if self.geometry_status == "blocked" and (
+            self.safe_intervals or self.maximum_continuous_seconds != 0
+        ):
+            raise ValueError(
+                "geometry-blocked capacity cannot expose executable intervals"
+            )
+        measured = max(
+            (
+                (interval.end_ms - interval.start_ms) / 1000
+                for interval in self.safe_intervals
+            ),
+            default=0.0,
+        )
+        if abs(measured - self.maximum_continuous_seconds) > 0.001:
+            raise ValueError(
+                "aspect capacity must equal its longest continuous safe interval"
+            )
+        if self.requires_human_review != any(
+            interval.requires_human_review for interval in self.safe_intervals
+        ):
+            raise ValueError(
+                "aspect review flag must reflect its safe interval evidence"
+            )
+        return self
+
+
+class CandidateCapacity(StrictModel):
+    """Planning capacity; never inferred from the complete shot duration."""
+
+    contract_version: Literal["candidate-capacity-v1"] = "candidate-capacity-v1"
+    candidate_id: str = Field(min_length=1)
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    shot_id: str = Field(min_length=1)
+    horizontal: AspectCandidateCapacity
+    vertical: AspectCandidateCapacity
+    min_editorial_duration: float = Field(ge=0.0)
+    preferred_duration: float = Field(ge=0.0)
+    max_editorial_duration: float = Field(ge=0.0)
+    quality_map_path: str
+    quality_map_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_candidate_capacity(self) -> "CandidateCapacity":
+        if self.horizontal.aspect != "16:9" or self.vertical.aspect != "9:16":
+            raise ValueError("candidate capacity aspect fields are reversed")
+        if not (
+            self.min_editorial_duration
+            <= self.preferred_duration
+            <= self.max_editorial_duration
+        ):
+            raise ValueError(
+                "candidate editorial durations must satisfy min <= preferred <= max"
+            )
+        available = min(
+            self.horizontal.maximum_continuous_seconds,
+            self.vertical.maximum_continuous_seconds,
+        )
+        if self.max_editorial_duration > available + 0.001:
+            raise ValueError(
+                "candidate maximum editorial duration exceeds safe aspect capacity"
+            )
+        return self
+
+
 TrimTailIntent = Literal[
     "none",
     "natural_pause",

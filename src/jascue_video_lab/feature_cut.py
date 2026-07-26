@@ -64,6 +64,7 @@ from .models import (
     RushFrame,
     RushesCatalog,
     SegmentationTrack,
+    ShotQualityMap,
     SharedSam21AnalysisFramesManifest,
     SharedSam21BBoxSeed,
     SharedSam21SessionManifest,
@@ -88,6 +89,11 @@ from .sam_tracking import (
 )
 from .schema import gemini_response_schema
 from .shots import ShotManifest, detect_shots_ffmpeg
+from .shot_quality import (
+    build_quality_safe_intervals,
+    build_render_quality_report,
+    load_shot_quality_map,
+)
 from .storage import read_json, utc_now, write_json
 
 
@@ -96,7 +102,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v10-full-auto-v2"
+_RENDER_PIPELINE_VERSION = "feature-cut-v11-quality-safe-intervals"
 RenderAspect = Literal["both", "9x16", "16x9"]
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
@@ -1091,6 +1097,84 @@ def _load_trim_decisions(
     return accepted
 
 
+def _load_shot_quality_maps(
+    paths: Sequence[Path],
+) -> list[tuple[Path, ShotQualityMap]]:
+    loaded: list[tuple[Path, ShotQualityMap]] = []
+    identities: set[tuple[str, str]] = set()
+    for path in paths:
+        resolved, quality_map = load_shot_quality_map(path)
+        identity = (quality_map.source_asset_id, quality_map.shot_id)
+        if identity in identities:
+            raise ValueError(
+                "multiple ShotQualityMap artifacts describe the same source shot"
+            )
+        identities.add(identity)
+        loaded.append((resolved, quality_map))
+    return loaded
+
+
+def _quality_map_for_shot(
+    quality_maps: Sequence[tuple[Path, ShotQualityMap]],
+    *,
+    source_asset_id: str,
+    shot_id: str,
+) -> tuple[Path, ShotQualityMap] | None:
+    matches = [
+        (path, quality_map)
+        for path, quality_map in quality_maps
+        if quality_map.source_asset_id == source_asset_id
+        and quality_map.shot_id == shot_id
+    ]
+    if len(matches) > 1:
+        raise ValueError("quality-map source/shot lineage is ambiguous")
+    return matches[0] if matches else None
+
+
+def _matching_trim_decision(
+    decisions: Sequence[tuple[Path, TrimIntentDecision]],
+    *,
+    source_asset_id: str,
+    shot_id: str,
+    event_id: str | None,
+) -> tuple[Path, TrimIntentDecision] | None:
+    matches = [
+        (path, decision)
+        for path, decision in decisions
+        if decision.source_asset_id == source_asset_id
+        and decision.shot_id == shot_id
+        and (event_id is None or decision.event_id == event_id)
+        and decision.source_in_ms is not None
+        and decision.source_out_ms is not None
+    ]
+    if len(matches) > 1:
+        raise ValueError(
+            "multiple trim decisions match one selected source shot/event"
+        )
+    return matches[0] if matches else None
+
+
+def _selected_event_id(
+    selected: FeatureChapterSelect,
+    *,
+    frame_id: str,
+    aspect: Literal["16:9", "9:16"],
+) -> str | None:
+    candidates = (
+        selected.horizontal_candidates
+        if aspect == "16:9"
+        else selected.vertical_candidates
+    )
+    matches = [
+        candidate.event_id
+        for candidate in candidates
+        if candidate.frame_id == frame_id and candidate.rank == 1
+    ]
+    if len(set(matches)) > 1:
+        raise ValueError("rank-one candidate event mapping is ambiguous")
+    return matches[0] if matches else None
+
+
 def _chapter_bounds_with_approved_trim(
     frame: RushFrame,
     clip: RushClip,
@@ -1100,6 +1184,7 @@ def _chapter_bounds_with_approved_trim(
     scdet_threshold: float,
     approved_decisions: Sequence[tuple[Path, TrimIntentDecision]],
     expected_event_id: str | None = None,
+    quality_maps: Sequence[tuple[Path, ShotQualityMap]] = (),
 ) -> tuple[int, int, str, dict[str, Any]]:
     fallback_start, fallback_end, shot_id = _chapter_bounds(
         frame,
@@ -1110,29 +1195,86 @@ def _chapter_bounds_with_approved_trim(
         scdet_threshold,
     )
     asset_id = f"sha256:{clip.sha256}"
-    matches = [
-        (path, decision)
-        for path, decision in approved_decisions
-        if decision.source_asset_id == asset_id
-        and decision.shot_id == shot_id
-        and (expected_event_id is None or decision.event_id == expected_event_id)
-        and decision.source_in_ms is not None
-        and decision.source_out_ms is not None
-    ]
-    if not matches:
-        return fallback_start, fallback_end, shot_id, {
+    match = _matching_trim_decision(
+        approved_decisions,
+        source_asset_id=asset_id,
+        shot_id=shot_id,
+        event_id=expected_event_id,
+    )
+    quality_match = _quality_map_for_shot(
+        quality_maps,
+        source_asset_id=asset_id,
+        shot_id=shot_id,
+    )
+    if quality_maps and quality_match is None:
+        raise ValueError(
+            "ShotQualityMap coverage is incomplete for the source shot selected "
+            f"at runtime: {asset_id}/{shot_id}"
+        )
+    quality_path: Path | None = None
+    quality_map: ShotQualityMap | None = None
+    safe_intervals = []
+    if quality_match is not None:
+        quality_path, quality_map = quality_match
+        if sha256_file(Path(quality_map.source_path)) != clip.sha256:
+            raise ValueError("ShotQualityMap source hash differs from the selected clip")
+        safe_intervals = build_quality_safe_intervals(
+            quality_map,
+            quality_map_sha256=sha256_file(quality_path),
+        )
+    if match is None:
+        if quality_map is None:
+            return fallback_start, fallback_end, shot_id, {
+                "trim_method": "keyframe_centered_requested_duration",
+                "trim_decision_path": None,
+                "trim_event_id": None,
+                "trim_tail_intent": None,
+                "trim_human_review": None,
+                "quality_map_path": None,
+                "quality_safe_interval_id": None,
+            }
+        requested_ms = max(1, round(duration_seconds * 1000))
+        containing = [
+            interval
+            for interval in safe_intervals
+            if interval.start_ms
+            <= frame.requested_time_ms
+            < interval.end_ms
+            and interval.end_ms - interval.start_ms >= requested_ms
+        ]
+        if not containing:
+            raise ValueError(
+                "selected evidence frame has no continuous QualitySafeInterval "
+                "long enough for the resolved chapter duration"
+            )
+        interval = min(
+            containing,
+            key=lambda item: (
+                item.requires_human_review,
+                item.end_ms - item.start_ms,
+                item.start_ms,
+            ),
+        )
+        safe_start = max(
+            interval.start_ms,
+            min(
+                frame.requested_time_ms - requested_ms // 2,
+                interval.end_ms - requested_ms,
+            ),
+        )
+        safe_end = safe_start + requested_ms
+        return safe_start, safe_end, shot_id, {
             "trim_method": "keyframe_centered_requested_duration",
             "trim_decision_path": None,
             "trim_event_id": None,
             "trim_tail_intent": None,
             "trim_human_review": None,
+            "quality_map_path": str(quality_path),
+            "quality_map_sha256": sha256_file(quality_path),
+            "quality_safe_interval_id": interval.interval_id,
+            "quality_requires_human_review": interval.requires_human_review,
         }
-    if len(matches) > 1:
-        raise ValueError(
-            f"multiple trim decisions match the selected source shot for {frame.frame_id}; "
-            "event mapping is ambiguous"
-        )
-    path, decision = matches[0]
+    path, decision = match
     assert decision.source_in_ms is not None and decision.source_out_ms is not None
     shot = next(item for item in shot_cache[clip.clip_id].shots if item.shot_id == shot_id)
     if decision.shot_id != shot_id:
@@ -1146,6 +1288,22 @@ def _chapter_bounds_with_approved_trim(
         <= shot.end_time_ms
     ):
         raise ValueError("approved trim decision crosses the selected shot boundary")
+    quality_interval = None
+    if quality_map is not None:
+        quality_interval = next(
+            (
+                interval
+                for interval in safe_intervals
+                if interval.start_ms <= decision.source_in_ms
+                and decision.source_out_ms <= interval.end_ms
+            ),
+            None,
+        )
+        if quality_interval is None:
+            raise ValueError(
+                "approved trim crosses an unresolved hard/trim quality risk; "
+                "review the risk intent or revise the trim before rendering"
+            )
     approved = decision.approval_status == "approved"
     return decision.source_in_ms, decision.source_out_ms, shot_id, {
         "trim_method": (
@@ -1161,6 +1319,18 @@ def _chapter_bounds_with_approved_trim(
             decision.human_review.model_dump(mode="json")
             if decision.human_review is not None
             else None
+        ),
+        "quality_map_path": str(quality_path) if quality_path is not None else None,
+        "quality_map_sha256": (
+            sha256_file(quality_path) if quality_path is not None else None
+        ),
+        "quality_safe_interval_id": (
+            quality_interval.interval_id if quality_interval is not None else None
+        ),
+        "quality_requires_human_review": (
+            quality_interval.requires_human_review
+            if quality_interval is not None
+            else False
         ),
     }
 
@@ -4966,28 +5136,29 @@ def _selected_source_capacity_seconds(
     shot_cache: dict[str, ShotManifest],
     shots_dir: Path,
     scdet_threshold: float,
+    approved_decisions: Sequence[tuple[Path, TrimIntentDecision]] = (),
+    quality_maps: Sequence[tuple[Path, ShotQualityMap]] = (),
 ) -> dict[str, float]:
-    """Return the shortest legal selected-shot capacity for each chapter.
+    """Return the shortest continuous safe capacity for each chapter.
 
     The same editorial duration is used by both aspect renders. When their
-    selected evidence frames differ, the shorter legal shot is authoritative
-    so neither render silently truncates the chapter.
+    selected evidence frames differ, the shorter approved/quality-safe interval
+    is authoritative so neither render silently truncates the chapter.
     """
 
     capacities: dict[str, float] = {}
     for selected in plan.chapters:
         if selected.evidence_status == "not_found":
             continue
-        frame_ids = {
-            frame_id
-            for frame_id in (
-                selected.horizontal_frame_id,
-                selected.vertical_frame_id,
-            )
-            if frame_id is not None
-        }
+        aspect_frames = [
+            ("16:9", selected.horizontal_frame_id),
+            ("9:16", selected.vertical_frame_id),
+        ]
         chapter_capacities: list[int] = []
-        for frame_id in frame_ids:
+        seen: set[tuple[str, str, str | None]] = set()
+        for aspect, frame_id in aspect_frames:
+            if frame_id is None:
+                continue
             frame = frames[frame_id]
             clip = clips[frame.clip_id]
             if clip.clip_id not in shot_cache:
@@ -5003,13 +5174,137 @@ def _selected_source_capacity_seconds(
                 <= frame.requested_time_ms
                 < item.end_time_ms
             )
-            chapter_capacities.append(
-                min(shot.end_time_ms, clip.duration_ms)
-                - max(shot.start_time_ms, 0)
+            event_id = _selected_event_id(
+                selected,
+                frame_id=frame_id,
+                aspect=aspect,
             )
+            source_asset_id = f"sha256:{clip.sha256}"
+            identity = (source_asset_id, shot.shot_id, event_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            interval_start = max(shot.start_time_ms, 0)
+            interval_end = min(shot.end_time_ms, clip.duration_ms)
+            trim_match = _matching_trim_decision(
+                approved_decisions,
+                source_asset_id=source_asset_id,
+                shot_id=shot.shot_id,
+                event_id=event_id,
+            )
+            if trim_match is not None:
+                _, decision = trim_match
+                assert decision.source_in_ms is not None
+                assert decision.source_out_ms is not None
+                interval_start = decision.source_in_ms
+                interval_end = decision.source_out_ms
+            quality_match = _quality_map_for_shot(
+                quality_maps,
+                source_asset_id=source_asset_id,
+                shot_id=shot.shot_id,
+            )
+            if quality_maps and quality_match is None:
+                raise ValueError(
+                    "ShotQualityMap coverage is incomplete for a selected source "
+                    f"shot: {source_asset_id}/{shot.shot_id}"
+                )
+            if quality_match is not None:
+                quality_path, quality_map = quality_match
+                if sha256_file(Path(quality_map.source_path)) != clip.sha256:
+                    raise ValueError(
+                        "ShotQualityMap source hash differs from the selected clip"
+                    )
+                safe_intervals = build_quality_safe_intervals(
+                    quality_map,
+                    quality_map_sha256=sha256_file(quality_path),
+                    allowed_start_ms=interval_start,
+                    allowed_end_ms=interval_end,
+                )
+                capacity_ms = max(
+                    (
+                        interval.end_ms - interval.start_ms
+                        for interval in safe_intervals
+                    ),
+                    default=0,
+                )
+            else:
+                capacity_ms = interval_end - interval_start
+            chapter_capacities.append(max(0, capacity_ms))
         if chapter_capacities:
             capacities[selected.feature_id] = min(chapter_capacities) / 1000
     return capacities
+
+
+def _selected_fixed_trim_durations_seconds(
+    plan: FeatureEditPlan,
+    *,
+    frames: Mapping[str, RushFrame],
+    clips: Mapping[str, RushClip],
+    shot_cache: dict[str, ShotManifest],
+    shots_dir: Path,
+    scdet_threshold: float,
+    approved_decisions: Sequence[tuple[Path, TrimIntentDecision]],
+) -> dict[str, float]:
+    """Return exact human-approved trim durations used by the renderer."""
+
+    if not approved_decisions:
+        return {}
+    fixed: dict[str, float] = {}
+    for selected in plan.chapters:
+        if selected.evidence_status == "not_found":
+            continue
+        durations_ms: list[int] = []
+        seen: set[tuple[str, str, str | None]] = set()
+        for aspect, frame_id in (
+            ("16:9", selected.horizontal_frame_id),
+            ("9:16", selected.vertical_frame_id),
+        ):
+            if frame_id is None:
+                continue
+            frame = frames[frame_id]
+            clip = clips[frame.clip_id]
+            if clip.clip_id not in shot_cache:
+                shot_cache[clip.clip_id] = detect_shots_ffmpeg(
+                    Path(clip.path),
+                    threshold=scdet_threshold,
+                    output_path=shots_dir / f"{clip.clip_id}.json",
+                )
+            shot = next(
+                item
+                for item in shot_cache[clip.clip_id].shots
+                if item.start_time_ms
+                <= frame.requested_time_ms
+                < item.end_time_ms
+            )
+            event_id = _selected_event_id(
+                selected,
+                frame_id=frame_id,
+                aspect=aspect,
+            )
+            identity = (clip.sha256, shot.shot_id, event_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            match = _matching_trim_decision(
+                approved_decisions,
+                source_asset_id=f"sha256:{clip.sha256}",
+                shot_id=shot.shot_id,
+                event_id=event_id,
+            )
+            if match is None:
+                continue
+            _, decision = match
+            assert decision.source_in_ms is not None
+            assert decision.source_out_ms is not None
+            durations_ms.append(decision.source_out_ms - decision.source_in_ms)
+        if durations_ms:
+            if max(durations_ms) - min(durations_ms) > 1:
+                raise ValueError(
+                    "aspect-specific approved trims for one chapter have "
+                    "different exact durations"
+                )
+            fixed[selected.feature_id] = durations_ms[0] / 1000
+    return fixed
 
 
 def _feature_edit_user_duration_range_seconds() -> tuple[float, float]:
@@ -5143,6 +5438,7 @@ def _resolve_editorial_chapter_durations(
     *,
     music_lock: MusicMapLock | None = None,
     source_capacity_seconds: Mapping[str, float] | None = None,
+    fixed_duration_seconds: Mapping[str, float] | None = None,
     shortfall_audit_path: Path | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Reconcile Gemini's relative dwell judgment to one legal project total.
@@ -5173,9 +5469,30 @@ def _resolve_editorial_chapter_durations(
         feature_id: max(1, round(seconds * 1000))
         for feature_id, seconds in (source_capacity_seconds or {}).items()
     }
-    finite_capacity_total_ms = sum(
+    known_feature_ids = {selected.feature_id for selected, _, _ in weighted}
+    fixed_ms = {
+        feature_id: max(1, round(seconds * 1000))
+        for feature_id, seconds in (fixed_duration_seconds or {}).items()
+    }
+    unknown_fixed_ids = set(fixed_ms) - known_feature_ids
+    if unknown_fixed_ids:
+        raise ValueError(
+            "fixed editorial durations reference unknown chapters: "
+            + ", ".join(sorted(unknown_fixed_ids))
+        )
+    for feature_id, duration_ms in fixed_ms.items():
+        feature_capacity = capacity_ms.get(feature_id)
+        if feature_capacity is not None and duration_ms > feature_capacity:
+            raise ValueError(
+                f"approved trim for {feature_id} exceeds its QualitySafeInterval "
+                "capacity"
+            )
+    flexible_weighted = [
+        item for item in weighted if item[0].feature_id not in fixed_ms
+    ]
+    finite_capacity_total_ms = sum(fixed_ms.values()) + sum(
         capacity_ms.get(selected.feature_id, target_duration_ms)
-        for selected, _, _ in weighted
+        for selected, _, _ in flexible_weighted
     )
     if finite_capacity_total_ms < target_duration_ms:
         shortfall_audit = _build_duration_capacity_shortfall_audit(
@@ -5203,9 +5520,18 @@ def _resolve_editorial_chapter_durations(
     # redistribute only the remaining duration across the other Gemini weights.
     # This preserves the model's editorial ordering without inventing repeated
     # frames, synthetic holds, or source time outside a legal shot.
-    remaining_ms = target_duration_ms
-    active = list(weighted)
-    allocated_ms: dict[str, int] = {}
+    remaining_ms = target_duration_ms - sum(fixed_ms.values())
+    if remaining_ms < 0:
+        raise ValueError(
+            "human-approved trim durations exceed the requested project duration"
+        )
+    active = list(flexible_weighted)
+    allocated_ms: dict[str, int] = dict(fixed_ms)
+    if not active and remaining_ms != 0:
+        raise ValueError(
+            "fixed approved trims do not sum to the requested project duration "
+            "and no flexible chapter remains"
+        )
     while active:
         active_weight = sum(weight for _, weight, _ in active)
         if active_weight <= 0:
@@ -5275,7 +5601,7 @@ def _resolve_editorial_chapter_durations(
         feature_id
         for feature_id, allocated in allocated_ms.items()
         if feature_id in capacity_ms and allocated >= capacity_ms[feature_id]
-    }
+    } | set(fixed_ms)
     if music_lock is not None and len(unsnapped) > 1:
         if abs(music_lock.duration_ms - round(brief.target_duration_seconds * 1000)) > 80:
             raise ValueError(
@@ -5421,6 +5747,11 @@ def _resolve_editorial_chapter_durations(
                 "feature_id": selected.feature_id,
                 "input_weight_seconds": weight,
                 "input_authority": authority,
+                "fixed_duration_authority": (
+                    "human_approved_trim_exact_pts"
+                    if selected.feature_id in fixed_ms
+                    else None
+                ),
                 "duration_rationale": selected.duration_rationale,
                 "unsnapped_duration_seconds": unsnapped_seconds,
                 "resolved_duration_seconds": seconds,
@@ -5446,6 +5777,10 @@ def _resolve_editorial_chapter_durations(
         "input_weight_total_seconds": round(weight_total, 3),
         "reconciliation_scale": scale,
         "capacity_reconciliation_applied": bool(capacity_ms),
+        "fixed_approved_trim_duration_seconds": {
+            feature_id: round(duration_ms / 1000, 3)
+            for feature_id, duration_ms in sorted(fixed_ms.items())
+        },
         "source_capacity_total_seconds": (
             round(finite_capacity_total_ms / 1000, 3)
             if capacity_ms
@@ -5472,6 +5807,7 @@ def run_feature_cut_experiment(
     scdet_threshold: float = 4.0,
     sam_analysis_fps: float = 2.0,
     trim_decision_paths: Sequence[Path] = (),
+    shot_quality_map_paths: Sequence[Path] = (),
     allow_proposed_trim_preview: bool = False,
     reuse_feature_plan: bool = False,
     reuse_feature_plan_raw_output: bool = False,
@@ -5479,6 +5815,7 @@ def run_feature_cut_experiment(
     aspect: RenderAspect = "both",
     music_path: Path | None = None,
     music_lock_path: Path | None = None,
+    post_render_quality_qc: bool = True,
 ) -> dict[str, Any]:
     render_horizontal, render_vertical = _requested_render_aspects(aspect)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -5538,6 +5875,7 @@ def run_feature_cut_experiment(
         trim_decision_paths,
         allow_proposed_preview=allow_proposed_trim_preview,
     )
+    shot_quality_maps = _load_shot_quality_maps(shot_quality_map_paths)
     brief_by_id = {chapter.feature_id: chapter for chapter in brief.chapters}
     timings: dict[str, float] = {}
     incremental_pricing: dict[str, Any] = {}
@@ -5842,12 +6180,24 @@ def run_feature_cut_experiment(
             shot_cache=shot_cache,
             shots_dir=shots_dir,
             scdet_threshold=scdet_threshold,
+            approved_decisions=trim_decisions,
+            quality_maps=shot_quality_maps,
+        )
+        fixed_duration_seconds = _selected_fixed_trim_durations_seconds(
+            plan,
+            frames=frames,
+            clips=clips,
+            shot_cache=shot_cache,
+            shots_dir=shots_dir,
+            scdet_threshold=scdet_threshold,
+            approved_decisions=trim_decisions,
         )
         chapter_durations, duration_audit = _resolve_editorial_chapter_durations(
             brief,
             plan,
             music_lock=music_lock,
             source_capacity_seconds=source_capacity_seconds,
+            fixed_duration_seconds=fixed_duration_seconds,
             shortfall_audit_path=(
                 output_dir / "editorial-duration-capacity-shortfall.json"
             ),
@@ -5871,6 +6221,17 @@ def run_feature_cut_experiment(
                 }
                 for path, decision in trim_decisions
             ],
+            "shot_quality_maps": [
+                {
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                    "source_asset_id": quality_map.source_asset_id,
+                    "shot_id": quality_map.shot_id,
+                    "request_sha256": quality_map.request_sha256,
+                }
+                for path, quality_map in shot_quality_maps
+            ],
+            "post_render_quality_qc": post_render_quality_qc,
             "allow_proposed_trim_preview": allow_proposed_trim_preview,
             "allow_unverified_geometry_preview": allow_unverified_geometry_preview,
         }
@@ -5925,6 +6286,17 @@ def run_feature_cut_experiment(
                 }
                 for path, decision in trim_decisions
             ],
+            "shot_quality_maps": [
+                {
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                    "source_asset_id": quality_map.source_asset_id,
+                    "shot_id": quality_map.shot_id,
+                    "request_sha256": quality_map.request_sha256,
+                }
+                for path, quality_map in shot_quality_maps
+            ],
+            "post_render_quality_qc_requested": post_render_quality_qc,
             "horizontal": {
                 "requested": render_horizontal,
                 "status": "pending" if render_horizontal else "not_requested",
@@ -6042,6 +6414,12 @@ def run_feature_cut_experiment(
                             shots_dir,
                             scdet_threshold,
                             trim_decisions,
+                            expected_event_id=_selected_event_id(
+                                selected,
+                                frame_id=horizontal_frame.frame_id,
+                                aspect="16:9",
+                            ),
+                            quality_maps=shot_quality_maps,
                         )
                     )
                     if horizontal_clip.sha256 not in source_audio_cache:
@@ -6238,6 +6616,7 @@ def run_feature_cut_experiment(
                             scdet_threshold,
                             trim_decisions,
                             expected_event_id=option_data.get("event_id"),
+                            quality_maps=shot_quality_maps,
                         )
                     )
                     candidate_regions, candidate_target = (
@@ -6645,6 +7024,12 @@ def run_feature_cut_experiment(
                             shots_dir,
                             scdet_threshold,
                             trim_decisions,
+                            expected_event_id=_selected_event_id(
+                                selected,
+                                frame_id=vertical_frame.frame_id,
+                                aspect="9:16",
+                            ),
+                            quality_maps=shot_quality_maps,
                         )
                     )
                     vertical_regions = list(brief_chapter.vertical_regions)
@@ -6877,8 +7262,47 @@ def run_feature_cut_experiment(
                 "status": "not_requested",
                 "chapter_count": 0,
             }
+        post_render_reports: dict[str, Any] = {}
+        if post_render_quality_qc:
+            quality_stage = monotonic()
+            for aspect_name, output_path in (
+                ("16x9", horizontal_output),
+                ("9x16", vertical_output),
+            ):
+                if output_path is None:
+                    continue
+                report = build_render_quality_report(
+                    output_path,
+                    scdet_threshold=scdet_threshold,
+                    output_dir=output_dir / "post-render-quality" / aspect_name,
+                )
+                post_render_reports[aspect_name] = report
+            timings["post_render_quality_qc_seconds"] = round(
+                monotonic() - quality_stage,
+                3,
+            )
+        timings["total_seconds"] = round(monotonic() - started, 3)
+        manifest["post_render_quality_qc"] = {
+            "requested": post_render_quality_qc,
+            "reports": post_render_reports,
+            "technical_qc_passed": all(
+                bool(report["technical_qc_passed"])
+                for report in post_render_reports.values()
+            ),
+            "requires_human_review": any(
+                bool(report["requires_human_review"])
+                for report in post_render_reports.values()
+            ),
+        }
         manifest["generated_at"] = utc_now()
         write_json(output_dir / "render-manifest.json", manifest)
+        if post_render_quality_qc and not manifest["post_render_quality_qc"][
+            "technical_qc_passed"
+        ]:
+            raise ValueError(
+                "post-render technical quality QC found hard decoder/PTS defects; "
+                "inspect post-render-quality before delivery"
+            )
         pricing = summarize_usage_and_list_price(output_dir)
         write_json(output_dir / "pricing.json", pricing)
         incremental_pricing = _write_incremental_pricing(
