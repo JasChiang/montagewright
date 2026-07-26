@@ -15,6 +15,7 @@ from .models import (
     ReframePolicyBinding,
     RushesCatalog,
     StrictModel,
+    VerticalVirtualCameraPhase,
 )
 from .storage import read_json, utc_now, write_json
 
@@ -34,6 +35,10 @@ class ChapterReframeOverride(StrictModel):
         "balanced", "preserve_start", "preserve_end"
     ] | None = None
     vertical_crop_mode: Literal["strict", "primary_center"] | None = None
+    vertical_camera_phases: list[VerticalVirtualCameraPhase] | None = Field(
+        default=None,
+        max_length=8,
+    )
     decision_reason: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -138,6 +143,8 @@ def apply_policy(
         )
         if override.vertical_regions is not None:
             update["vertical_regions"] = override.vertical_regions
+        if override.vertical_camera_phases is not None:
+            update["vertical_camera_phases"] = override.vertical_camera_phases
         chapters.append(chapter.model_copy(update=update))
     revised = FeatureEditBrief.model_validate(
         brief.model_copy(
@@ -153,6 +160,13 @@ def apply_policy(
     ) and binding is None:
         raise ValueError(
             "controlled_clip requires an immutable human reframe policy binding"
+        )
+    if any(chapter.vertical_camera_phases for chapter in revised.chapters) and (
+        binding is None
+    ):
+        raise ValueError(
+            "vertical camera phases require an immutable human reframe policy "
+            "binding"
         )
     return revised
 

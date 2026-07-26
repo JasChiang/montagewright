@@ -56,6 +56,7 @@ from jascue_video_lab.feature_cut import (
     _vertical_center_crop_filter,
     _vertical_filter_from_track,
     _vertical_fit_filter,
+    _vertical_virtual_camera_filter_from_tracks,
     _vertical_required_scope_fit_filter,
     _vertical_runtime_candidate_options,
     _vertical_target_fits_crop,
@@ -65,6 +66,11 @@ from jascue_video_lab.feature_cut import (
 )
 from jascue_video_lab.auto_reframe import FailureCode
 from jascue_video_lab.cli import build_parser
+from jascue_video_lab.models import (
+    FeatureChapterBrief,
+    FramingRegionIntent,
+    VerticalVirtualCameraPhase,
+)
 
 
 def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
@@ -3029,6 +3035,363 @@ def test_vertical_multi_region_reframe_rejects_disagreeing_seed_dimensions() -> 
     assert audit["fallback_reason"].endswith("required_tracks_disagree")
     assert audit["risk_codes"] == ["track_source_geometry_mismatch"]
     assert audit["requires_gemini_review"] is True
+
+
+def test_vertical_camera_phases_require_contiguous_known_region_anchors() -> None:
+    regions = [
+        FramingRegionIntent(
+            region_id="left",
+            target_description="the visible subject on the left",
+            role="required",
+        ),
+        FramingRegionIntent(
+            region_id="right",
+            target_description="the visible subject on the right",
+            role="required",
+        ),
+    ]
+    phases = [
+        VerticalVirtualCameraPhase(
+            phase_id="right-first",
+            start_progress=0.0,
+            end_progress=0.45,
+            anchor_region_ids=["right"],
+            camera_behavior="hold",
+            editorial_reason="Establish the result first.",
+        ),
+        VerticalVirtualCameraPhase(
+            phase_id="left-second",
+            start_progress=0.45,
+            end_progress=1.0,
+            anchor_region_ids=["left"],
+            camera_behavior="follow",
+            transition_in="smoothstep",
+            transition_duration_fraction=0.4,
+            editorial_reason="Reveal the performer after the result.",
+        ),
+    ]
+
+    chapter = FeatureChapterBrief(
+        feature_id="generic_scene",
+        title="Generic scene",
+        detail_lines=[],
+        target_duration_seconds=5,
+        vertical_regions=regions,
+        vertical_camera_phases=phases,
+    )
+
+    assert [phase.phase_id for phase in chapter.vertical_camera_phases] == [
+        "right-first",
+        "left-second",
+    ]
+    with pytest.raises(
+        ValidationError,
+        match="vertical camera phases reference unknown regions",
+    ):
+        FeatureChapterBrief(
+            feature_id="generic_scene",
+            title="Generic scene",
+            detail_lines=[],
+            target_duration_seconds=5,
+            vertical_regions=regions,
+            vertical_camera_phases=[
+                phases[0],
+                phases[1].model_copy(
+                    update={"anchor_region_ids": ["missing"]}
+                ),
+            ],
+        )
+    with pytest.raises(
+        ValidationError,
+        match="cannot relax visibility for atomic",
+    ):
+        FeatureChapterBrief(
+            feature_id="generic_scene",
+            title="Generic scene",
+            detail_lines=[],
+            target_duration_seconds=5,
+            vertical_regions=[
+                regions[0].model_copy(update={"atomic": True}),
+                regions[1],
+            ],
+            vertical_camera_phases=[
+                phases[0],
+                phases[1].model_copy(
+                    update={"minimum_anchor_visible_fraction": 0.8}
+                ),
+            ],
+        )
+
+
+def test_phase_virtual_camera_moves_between_independent_tracked_anchors() -> None:
+    def track(target_id: str, box: list[int]) -> SimpleNamespace:
+        samples = [
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                source_pts=index * 15,
+                tracking_state=TrackingState.TRACKED,
+                derived_tracking_box=box,
+            )
+            for index in range(9)
+        ]
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=4000,
+            analysis_fps=2.0,
+            seed_source_width=1920,
+            seed_source_height=1080,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target_id,
+            target_id=target_id,
+            samples=samples,
+            model_dump=lambda *, mode: {
+                "target_id": target_id,
+                "box": box,
+                "mode": mode,
+            },
+        )
+
+    phases = [
+        VerticalVirtualCameraPhase(
+            phase_id="right-first",
+            start_progress=0.0,
+            end_progress=0.5,
+            anchor_region_ids=["right"],
+            camera_behavior="hold",
+            editorial_reason="Establish the right-side evidence.",
+        ),
+        VerticalVirtualCameraPhase(
+            phase_id="left-second",
+            start_progress=0.5,
+            end_progress=1.0,
+            anchor_region_ids=["left"],
+            camera_behavior="hold",
+            transition_in="smoothstep",
+            transition_duration_fraction=0.5,
+            editorial_reason="Pan to the left-side evidence.",
+        ),
+    ]
+    filter_graph, audit = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={
+            "left": track("left", [100, 180, 260, 820]),
+            "right": track("right", [400, 180, 560, 820]),
+        },
+        phases=phases,
+    )
+
+    assert "crop=1080:1920" in filter_graph
+    assert audit["applied_strategy"] == "phase_virtual_camera"
+    assert audit["minimum_visible_required_area_fraction"] == 1.0
+    assert audit["transition_sample_count"] >= 1
+    assert audit["requires_gemini_review"] is True
+    keyframes = audit["crop_keyframes"]
+    assert keyframes[0]["phase_id"] == "right-first"
+    assert keyframes[-1]["phase_id"] == "left-second"
+    assert keyframes[0]["crop_x_pixels"] > keyframes[-1]["crop_x_pixels"]
+    plan = audit["phase_virtual_camera_plan"]
+    assert plan["anchor_region_ids"] == ["right", "left"]
+    assert plan["execution_status"] == "applied"
+
+
+def test_phase_virtual_camera_allows_reviewed_non_atomic_clipping() -> None:
+    samples = [
+        SimpleNamespace(
+            analysis_sample_time_ms=index * 500,
+            source_pts=index * 15,
+            tracking_state=TrackingState.TRACKED,
+            derived_tracking_box=[250, 100, 650, 900],
+        )
+        for index in range(5)
+    ]
+    track = SimpleNamespace(
+        analysis_start_ms=0,
+        analysis_end_ms=2000,
+        analysis_fps=2.0,
+        seed_source_width=1920,
+        seed_source_height=1080,
+        analysis_width=960,
+        analysis_height=540,
+        target_description="wide non-atomic subject",
+        target_id="subject",
+        samples=samples,
+        model_dump=lambda *, mode: {"target_id": "subject", "mode": mode},
+    )
+
+    _, audit = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={"subject": track},
+        phases=[
+            VerticalVirtualCameraPhase(
+                phase_id="reviewed-clip",
+                start_progress=0.0,
+                end_progress=1.0,
+                anchor_region_ids=["subject"],
+                minimum_anchor_visible_fraction=0.75,
+                editorial_reason="The reviewed portrait composition may trim shoulders.",
+            )
+        ],
+    )
+
+    assert audit["applied_strategy"] == "phase_virtual_camera"
+    assert audit["subject_clipping_allowed"] is True
+    assert audit["full_containment_feasible"] is False
+    assert audit["minimum_visible_required_area_fraction"] >= 0.75
+    assert "phase_intentional_anchor_clipping" in audit["risk_codes"]
+
+
+def test_phase_virtual_camera_interpolates_one_short_track_gap() -> None:
+    def track(target_id: str, *, missing_index: int | None = None) -> SimpleNamespace:
+        samples = [
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                source_pts=index * 15,
+                tracking_state=(
+                    TrackingState.LOW_CONFIDENCE
+                    if index == missing_index
+                    else TrackingState.TRACKED
+                ),
+                derived_tracking_box=(
+                    None
+                    if index == missing_index
+                    else [100 + index, 180, 260 + index, 820]
+                ),
+            )
+            for index in range(9)
+        ]
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=4000,
+            analysis_fps=2.0,
+            seed_source_width=1920,
+            seed_source_height=1080,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target_id,
+            target_id=target_id,
+            samples=samples,
+            model_dump=lambda *, mode: {"target_id": target_id, "mode": mode},
+        )
+
+    _, audit = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={
+            "first": track("first"),
+            "second": track("second", missing_index=5),
+        },
+        phases=[
+            VerticalVirtualCameraPhase(
+                phase_id="first",
+                start_progress=0.0,
+                end_progress=0.5,
+                anchor_region_ids=["first"],
+                editorial_reason="First subject.",
+            ),
+            VerticalVirtualCameraPhase(
+                phase_id="second",
+                start_progress=0.5,
+                end_progress=1.0,
+                anchor_region_ids=["second"],
+                transition_in="smoothstep",
+                transition_duration_fraction=0.25,
+                editorial_reason="Second subject.",
+            ),
+        ],
+    )
+
+    assert audit["interpolated_anchor_sample_count"] == 1
+    assert audit["interpolated_anchor_sample_ratio"] < 0.15
+    assert "phase_anchor_track_gap_interpolated" in audit["risk_codes"]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_phase_virtual_camera_filter_renders_playable_portrait(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "portrait-pan.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=1.1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+
+    def track(target_id: str, box: list[int]) -> SimpleNamespace:
+        samples = [
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 250,
+                source_pts=index * 8,
+                tracking_state=TrackingState.TRACKED,
+                derived_tracking_box=box,
+            )
+            for index in range(5)
+        ]
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=1000,
+            analysis_fps=4.0,
+            seed_source_width=640,
+            seed_source_height=360,
+            analysis_width=640,
+            analysis_height=360,
+            target_description=target_id,
+            target_id=target_id,
+            samples=samples,
+            model_dump=lambda *, mode: {
+                "target_id": target_id,
+                "box": box,
+                "mode": mode,
+            },
+        )
+
+    filter_graph, _ = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={
+            "left": track("left", [120, 200, 280, 800]),
+            "right": track("right", [420, 200, 580, 800]),
+        },
+        phases=[
+            VerticalVirtualCameraPhase(
+                phase_id="right",
+                start_progress=0.0,
+                end_progress=0.5,
+                anchor_region_ids=["right"],
+                editorial_reason="Start right.",
+            ),
+            VerticalVirtualCameraPhase(
+                phase_id="left",
+                start_progress=0.5,
+                end_progress=1.0,
+                anchor_region_ids=["left"],
+                transition_in="smoothstep",
+                transition_duration_fraction=0.5,
+                editorial_reason="Move left.",
+            ),
+        ],
+    )
+    _render_source_segment(
+        source_path=source,
+        start_ms=0,
+        end_ms=1000,
+        overlay_path=None,
+        base_filter=filter_graph,
+        output_path=output,
+        source_has_audio=False,
+    )
+
+    assert output.exists()
+    assert output.stat().st_size > 0
 
 
 def test_vertical_fallback_filters_are_aspect_preserving_on_tall_sources() -> None:

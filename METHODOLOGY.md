@@ -128,6 +128,8 @@ Clip Card 的 `MM:SS` event 只負責召回可能可用的區間。真正入選�
 
 9:16 的 crop 決策必須可回放與診斷。除 target、Grounding、SAM track 與 fallback 外，renderer 需保存每個 crop keyframe 的片段相對時間、required-region union、合法 crop interval、containment、可見比例及實際 `crop_x_pixels`。裁切路徑先平滑，再逐 sample 投影回可行區間，不能讓平滑延遲把主體推出畫面。多個必留人物／物件／文字／UI 應分成獨立 required regions，各自取得 bbox 並共用一個 SAM session，不能期待一個複合自然語言 target 產生可靠聯合 mask。
 
+當不同重點不必同時出現時，`vertical_camera_phases` 可在不重做 identity Grounding 的前提下，依序啟用不同的已追蹤 anchor。這份 phase contract 必須來自 content-addressed 人工 reframe policy；模型只能提出建議，不能直接取得執行權。每個 phase 保存 normalized edit progress、anchor IDs、hold／follow、cut／smoothstep、transition span、最低可見比例與 editorial reason。本機以 track sample 的原始 PTS 產生 crop keyframes，量測 steady visibility、transition 中至少一側 anchor 的可見率、速度、加速度、jerk，以及少量短 gap 的插值比例。超過 15% active anchor samples 需要插值、steady visibility 低於核准 floor、或 UI／文字要求低於 100% 時一律 fail closed。Phase camera 也不能把本來必須同時比較的關係拆成誤導性的先後畫面；那類內容應以 joint relation ROI、其他 take 或 layout 解決。
+
 同一套 geometry 不應假設來源比例固定。Renderer 以 orientation-corrected display dimensions 建立 aspect-preserving cover transform，並在 x／y 兩軸分別求解合法 crop interval；因此 4:3、直式、超寬來源不會被拉伸。FFmpeg 的 sample aspect ratio 也屬於來源幾何：非方形像素須先正規化成 square-pixel display space；在 tracker 尚未與該座標系綁定前，動態 reframe 必須 fail closed 到 SAR-corrected 靜態版本並留下 review risk。track seed dimensions、analysis aspect 或多 track lineage 不一致時也不得重新解釋 normalized bbox。
 
 `primary_center` 表示未列為 required 的次要 context 可以犧牲，不表示正式輸出可任意裁掉 required target。required union 比 9:16 視窗寬、tracking coverage 不完整或任一 sample 無法 containment 時，預設換候選或 fail closed。人工明示 `controlled_clip` 時可依 `preserve_start`、`preserve_end` 或 `balanced` 做受控溢位，並保存最小可見比例與 review requirement。

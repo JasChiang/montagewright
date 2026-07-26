@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from enum import StrEnum
 from fractions import Fraction
 from typing import Annotated, Any, Literal
@@ -1855,6 +1856,101 @@ class VirtualCameraPlan(StrictModel):
         return self
 
 
+class VerticalVirtualCameraPhase(StrictModel):
+    """One reviewable portrait composition phase over normalized edit progress.
+
+    A phase changes which already-grounded regions are compositionally required.
+    It does not create a new identity, bbox, mask, timestamp, or source edit.
+    """
+
+    phase_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    start_progress: float = Field(ge=0.0, le=1.0)
+    end_progress: float = Field(gt=0.0, le=1.0)
+    anchor_region_ids: list[str] = Field(min_length=1, max_length=4)
+    camera_behavior: Literal["hold", "follow"] = "follow"
+    transition_in: Literal["cut", "smoothstep"] = "cut"
+    transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
+    minimum_anchor_visible_fraction: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Reviewed visibility floor for the active anchor union during the "
+            "steady part of this phase. A value below 1 permits intentional, "
+            "auditable clipping rather than an implicit center-crop fallback."
+        ),
+    )
+    editorial_reason: str = Field(min_length=1, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_phase(self) -> "VerticalVirtualCameraPhase":
+        if self.end_progress <= self.start_progress:
+            raise ValueError("vertical camera phase must have positive duration")
+        if len(self.anchor_region_ids) != len(set(self.anchor_region_ids)):
+            raise ValueError("vertical camera phase anchor IDs must be unique")
+        if self.transition_in == "cut" and self.transition_duration_fraction != 0:
+            raise ValueError("cut transition cannot have a transition duration")
+        if self.transition_in == "smoothstep" and (
+            self.transition_duration_fraction <= 0
+        ):
+            raise ValueError("smoothstep transition requires a positive duration")
+        return self
+
+
+class VerticalVirtualCameraPlan(StrictModel):
+    """Executed phase-based 9:16 crop plan tied to tracked region evidence."""
+
+    contract_version: Literal["vertical-virtual-camera-plan-v1"] = (
+        "vertical-virtual-camera-plan-v1"
+    )
+    phases: list[VerticalVirtualCameraPhase] = Field(min_length=1)
+    anchor_region_ids: list[str] = Field(min_length=1)
+    keyframes: list[VirtualCameraKeyframe] = Field(min_length=2)
+    steady_containment_passed: bool
+    transition_minimum_anchor_visible_fraction: float = Field(ge=0.0, le=1.0)
+    max_velocity: float = Field(ge=0.0)
+    max_acceleration: float = Field(ge=0.0)
+    max_jerk: float = Field(ge=0.0)
+    execution_status: Literal["applied", "fallback", "blocked"]
+    fallback_reason: str | None = None
+    requires_human_review: Literal[True] = True
+    editorial_reason: str = Field(min_length=1)
+    source_track_fingerprints: dict[str, str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_vertical_virtual_camera(self) -> "VerticalVirtualCameraPlan":
+        times = [keyframe.time_seconds for keyframe in self.keyframes]
+        if times != sorted(set(times)):
+            raise ValueError(
+                "vertical virtual-camera keyframe times must be strictly increasing"
+            )
+        if self.execution_status == "applied" and self.fallback_reason is not None:
+            raise ValueError(
+                "applied vertical virtual-camera plans cannot have a fallback reason"
+            )
+        if self.execution_status != "applied" and not self.fallback_reason:
+            raise ValueError(
+                "non-applied vertical virtual-camera plans require a reason"
+            )
+        expected_ids = list(
+            dict.fromkeys(
+                region_id
+                for phase in self.phases
+                for region_id in phase.anchor_region_ids
+            )
+        )
+        if self.anchor_region_ids != expected_ids:
+            raise ValueError(
+                "vertical virtual-camera anchor IDs must match phase order"
+            )
+        if any(
+            not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+            for fingerprint in self.source_track_fingerprints.values()
+        ):
+            raise ValueError("vertical camera track fingerprints must be SHA-256")
+        return self
+
+
 TrimTailIntent = Literal[
     "none",
     "natural_pause",
@@ -3342,6 +3438,10 @@ class FeatureChapterBrief(StrictModel):
     vertical_primary_target_description: str | None = None
     vertical_crop_mode: Literal["strict", "primary_center"] = "strict"
     vertical_regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=4)
+    vertical_camera_phases: list[VerticalVirtualCameraPhase] = Field(
+        default_factory=list,
+        max_length=8,
+    )
     vertical_overflow_policy: Literal["preserve_all", "controlled_clip"] = (
         "preserve_all"
     )
@@ -3365,6 +3465,83 @@ class FeatureChapterBrief(StrictModel):
             raise ValueError(
                 "edge priority only applies when vertical_overflow_policy is controlled_clip"
             )
+        if self.vertical_camera_phases:
+            if not self.vertical_regions:
+                raise ValueError(
+                    "vertical camera phases require explicit framing regions"
+                )
+            phase_ids = [
+                phase.phase_id for phase in self.vertical_camera_phases
+            ]
+            if len(phase_ids) != len(set(phase_ids)):
+                raise ValueError("vertical camera phase IDs must be unique")
+            if abs(self.vertical_camera_phases[0].start_progress) > 1e-6:
+                raise ValueError("vertical camera phases must start at progress zero")
+            if abs(self.vertical_camera_phases[-1].end_progress - 1.0) > 1e-6:
+                raise ValueError("vertical camera phases must end at progress one")
+            for prior, current in zip(
+                self.vertical_camera_phases[:-1],
+                self.vertical_camera_phases[1:],
+                strict=True,
+            ):
+                if abs(prior.end_progress - current.start_progress) > 1e-6:
+                    raise ValueError(
+                        "vertical camera phases must be contiguous and non-overlapping"
+                    )
+            if self.vertical_camera_phases[0].transition_in != "cut":
+                raise ValueError(
+                    "the first vertical camera phase cannot transition from an "
+                    "unknown prior anchor"
+                )
+            known_region_ids = set(ids)
+            referenced_region_ids = {
+                region_id
+                for phase in self.vertical_camera_phases
+                for region_id in phase.anchor_region_ids
+            }
+            unknown = sorted(referenced_region_ids - known_region_ids)
+            if unknown:
+                raise ValueError(
+                    "vertical camera phases reference unknown regions: "
+                    + ", ".join(unknown)
+                )
+            keepout_ids = {
+                region.region_id
+                for region in self.vertical_regions
+                if region.execution_role == "overlay_keepout"
+            }
+            invalid_keepouts = sorted(referenced_region_ids & keepout_ids)
+            if invalid_keepouts:
+                raise ValueError(
+                    "overlay keepout regions cannot be camera anchors: "
+                    + ", ".join(invalid_keepouts)
+                )
+            atomic_ids = {
+                region.region_id
+                for region in self.vertical_regions
+                if region.atomic
+            }
+            for phase in self.vertical_camera_phases:
+                if (
+                    phase.minimum_anchor_visible_fraction < 1.0
+                    and atomic_ids.intersection(phase.anchor_region_ids)
+                ):
+                    raise ValueError(
+                        "camera phases cannot relax visibility for atomic "
+                        "text or UI regions"
+                    )
+            required_ids = {
+                region.region_id
+                for region in self.vertical_regions
+                if region.execution_role == "hard_core"
+            }
+            missing_required = sorted(required_ids - referenced_region_ids)
+            if missing_required:
+                raise ValueError(
+                    "every hard-core region must be active in at least one camera "
+                    "phase: "
+                    + ", ".join(missing_required)
+                )
         return self
 
 
@@ -3384,6 +3561,13 @@ class FeatureEditBrief(StrictModel):
         ids = [chapter.feature_id for chapter in self.chapters]
         if len(ids) != len(set(ids)):
             raise ValueError("feature brief chapter IDs must be unique")
+        if any(chapter.vertical_camera_phases for chapter in self.chapters) and (
+            self.reframe_policy_binding is None
+        ):
+            raise ValueError(
+                "vertical camera phases require an immutable human reframe "
+                "policy binding"
+            )
         return self
 
 

@@ -71,6 +71,8 @@ from .models import (
     SharedSam21SessionManifest,
     TrackingState,
     TrimIntentDecision,
+    VerticalVirtualCameraPhase,
+    VerticalVirtualCameraPlan,
     VirtualCameraKeyframe,
     VirtualCameraPlan,
     approve_evidence_query_proposal_v2,
@@ -106,7 +108,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v12-attention-rhythm-camera"
+_RENDER_PIPELINE_VERSION = "feature-cut-v13-portrait-phase-camera"
 RenderAspect = Literal["both", "9x16", "16x9"]
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
@@ -2413,7 +2415,12 @@ def _smooth(values: Sequence[float], alpha: float = 0.34) -> list[float]:
     return list(reversed(backward))
 
 
-def _piecewise_expression(times: Sequence[float], values: Sequence[float]) -> str:
+def _piecewise_expression(
+    times: Sequence[float],
+    values: Sequence[float],
+    *,
+    cut_before_indexes: frozenset[int] = frozenset(),
+) -> str:
     if not times or len(times) != len(values):
         raise ValueError("crop expression needs aligned non-empty times and values")
     if len(times) == 1:
@@ -2423,7 +2430,11 @@ def _piecewise_expression(times: Sequence[float], values: Sequence[float]) -> st
         t0, t1 = times[index], times[index + 1]
         x0, x1 = values[index], values[index + 1]
         delta = max(0.001, t1 - t0)
-        linear = f"{x0:.3f}+({x1 - x0:.3f})*(t-{t0:.3f})/{delta:.3f}"
+        linear = (
+            f"{x0:.3f}"
+            if index + 1 in cut_before_indexes
+            else f"{x0:.3f}+({x1 - x0:.3f})*(t-{t0:.3f})/{delta:.3f}"
+        )
         expression = f"if(lt(t\\,{t1:.3f})\\,{linear}\\,{expression})"
     # Do not extrapolate before the first observed analysis frame.  FFmpeg
     # otherwise evaluates the first linear segment at negative relative time,
@@ -4141,6 +4152,509 @@ def _vertical_filter_from_track(
     )
 
 
+def _visible_area_fraction(
+    box: Sequence[float],
+    *,
+    crop_left: float,
+    crop_top: float,
+    crop_width: float,
+    crop_height: float,
+) -> float:
+    x_min, y_min, x_max, y_max = (float(value) for value in box)
+    visible_width = max(
+        0.0,
+        min(x_max, crop_left + crop_width) - max(x_min, crop_left),
+    )
+    visible_height = max(
+        0.0,
+        min(y_max, crop_top + crop_height) - max(y_min, crop_top),
+    )
+    return (
+        visible_width
+        / max(1e-6, x_max - x_min)
+        * visible_height
+        / max(1e-6, y_max - y_min)
+    )
+
+
+def _vertical_virtual_camera_filter_from_tracks(
+    *,
+    tracks_by_region: Mapping[str, SegmentationTrack],
+    phases: Sequence[VerticalVirtualCameraPhase],
+    display_sample_aspect_ratio: float = 1.0,
+) -> tuple[str, dict[str, Any]]:
+    """Build a review-only phase-based 9:16 virtual camera.
+
+    Each steady phase must fully contain its active, already-grounded anchors.
+    A smooth transition may move between mutually exclusive anchors, but the
+    audit measures both sides and requires at least one anchor to remain
+    substantially visible. Exact source time still comes from SAM samples.
+    """
+
+    if not phases:
+        raise ValueError("vertical virtual camera requires at least one phase")
+    if not math.isclose(display_sample_aspect_ratio, 1.0, rel_tol=0, abs_tol=1e-6):
+        raise ValueError(
+            "phase virtual camera requires square-pixel normalized tracking"
+        )
+    referenced_ids = list(
+        dict.fromkeys(
+            region_id
+            for phase in phases
+            for region_id in phase.anchor_region_ids
+        )
+    )
+    missing = [
+        region_id for region_id in referenced_ids if region_id not in tracks_by_region
+    ]
+    if missing:
+        raise ValueError(
+            "phase virtual camera has no track for: " + ", ".join(missing)
+        )
+    tracks = [tracks_by_region[region_id] for region_id in referenced_ids]
+    source_width, source_height, lineage = _orientation_corrected_track_dimensions(
+        tracks
+    )
+    starts = {track.analysis_start_ms for track in tracks}
+    ends = {track.analysis_end_ms for track in tracks}
+    rates = {float(track.analysis_fps) for track in tracks}
+    if len(starts) != 1 or len(ends) != 1 or len(rates) != 1:
+        raise ValueError("phase virtual-camera tracks must share one interval and rate")
+    start_ms = starts.pop()
+    end_ms = ends.pop()
+    if end_ms is None or end_ms <= start_ms:
+        raise ValueError("phase virtual-camera tracks require a positive interval")
+    analysis_fps = rates.pop()
+    boxes_by_region: dict[str, dict[int, list[int]]] = {}
+    for region_id in referenced_ids:
+        track = tracks_by_region[region_id]
+        boxes_by_region[region_id] = {
+            sample.analysis_sample_time_ms: [
+                int(value) for value in sample.derived_tracking_box
+            ]
+            for sample in track.samples
+            if sample.tracking_state == TrackingState.TRACKED
+            and sample.derived_tracking_box is not None
+        }
+    exact_times_by_region = {
+        region_id: sorted(boxes)
+        for region_id, boxes in boxes_by_region.items()
+    }
+    imputed_anchor_samples: set[tuple[str, int]] = set()
+
+    def resolved_box(region_id: str, time_ms: int) -> list[int] | None:
+        exact = boxes_by_region[region_id].get(time_ms)
+        if exact is not None:
+            return exact
+        known_times = exact_times_by_region[region_id]
+        prior = max((value for value in known_times if value < time_ms), default=None)
+        following = min(
+            (value for value in known_times if value > time_ms),
+            default=None,
+        )
+        maximum_gap_ms = (1000.0 / analysis_fps) * 1.6
+        if (
+            prior is not None
+            and following is not None
+            and time_ms - prior <= maximum_gap_ms
+            and following - time_ms <= maximum_gap_ms
+        ):
+            alpha = (time_ms - prior) / (following - prior)
+            before = boxes_by_region[region_id][prior]
+            after = boxes_by_region[region_id][following]
+            imputed_anchor_samples.add((region_id, time_ms))
+            return [
+                round(before[index] + (after[index] - before[index]) * alpha)
+                for index in range(4)
+            ]
+        nearest = min(
+            known_times,
+            key=lambda value: abs(value - time_ms),
+            default=None,
+        )
+        if nearest is not None and abs(nearest - time_ms) <= maximum_gap_ms:
+            imputed_anchor_samples.add((region_id, time_ms))
+            return boxes_by_region[region_id][nearest]
+        return None
+    all_times_ms = sorted(
+        {
+            time_ms
+            for boxes in boxes_by_region.values()
+            for time_ms in boxes
+            if start_ms <= time_ms <= end_ms
+        }
+    )
+    if len(all_times_ms) < 2:
+        raise ValueError("phase virtual camera has fewer than two usable samples")
+    duration_ms = end_ms - start_ms
+
+    def phase_for_progress(progress: float) -> tuple[int, VerticalVirtualCameraPhase]:
+        for index, phase in enumerate(phases):
+            if progress < phase.end_progress - 1e-9 or index == len(phases) - 1:
+                if progress + 1e-9 >= phase.start_progress:
+                    return index, phase
+        raise ValueError("phase virtual-camera progress is not covered")
+
+    def union_box(
+        region_ids: Sequence[str],
+        time_ms: int,
+    ) -> list[int] | None:
+        members = [
+            resolved_box(region_id, time_ms)
+            for region_id in region_ids
+        ]
+        if any(member is None for member in members):
+            return None
+        resolved = [member for member in members if member is not None]
+        return [
+            min(box[0] for box in resolved),
+            min(box[1] for box in resolved),
+            max(box[2] for box in resolved),
+            max(box[3] for box in resolved),
+        ]
+
+    transform = _cover_transform(
+        source_width,
+        source_height,
+        1080,
+        1920,
+    )
+    scaled_width = float(transform["scaled_width"])
+    scaled_height = float(transform["scaled_height"])
+    crop_width_normalized = 1080 / scaled_width * 1000
+    crop_height_normalized = 1920 / scaled_height * 1000
+    max_crop_left = max(0.0, 1000 - crop_width_normalized)
+    max_crop_top = max(0.0, 1000 - crop_height_normalized)
+
+    phase_centers: dict[str, tuple[float, float]] = {}
+    for phase in phases:
+        samples: list[tuple[int, list[int]]] = []
+        for time_ms in all_times_ms:
+            progress = max(0.0, min(1.0, (time_ms - start_ms) / duration_ms))
+            _, active_phase = phase_for_progress(progress)
+            if active_phase.phase_id != phase.phase_id:
+                continue
+            box = union_box(phase.anchor_region_ids, time_ms)
+            if box is not None:
+                samples.append((time_ms, box))
+        if not samples:
+            raise ValueError(
+                f"phase {phase.phase_id} has no complete tracked anchor sample"
+            )
+        phase_centers[phase.phase_id] = (
+            sum((box[0] + box[2]) / 2 for _, box in samples) / len(samples),
+            sum((box[1] + box[3]) / 2 for _, box in samples) / len(samples),
+        )
+
+    times: list[float] = []
+    x_values: list[float] = []
+    y_values: list[float] = []
+    crop_keyframes: list[dict[str, Any]] = []
+    steady_visible_fractions: list[float] = []
+    transition_visible_fractions: list[float] = []
+    transition_sample_count = 0
+    missing_active_samples = 0
+    active_anchor_samples: set[tuple[str, int]] = set()
+    for time_ms in all_times_ms:
+        progress = max(0.0, min(1.0, (time_ms - start_ms) / duration_ms))
+        phase_index, phase = phase_for_progress(progress)
+        active_anchor_samples.update(
+            (region_id, time_ms) for region_id in phase.anchor_region_ids
+        )
+        current_box = union_box(phase.anchor_region_ids, time_ms)
+        if current_box is None:
+            missing_active_samples += 1
+            continue
+        current_center = (
+            (current_box[0] + current_box[2]) / 2,
+            (current_box[1] + current_box[3]) / 2,
+        )
+        if phase.camera_behavior == "hold":
+            current_center = phase_centers[phase.phase_id]
+        transition = False
+        previous_box: list[int] | None = None
+        desired_center = current_center
+        if phase_index > 0 and phase.transition_in == "smoothstep":
+            phase_duration = phase.end_progress - phase.start_progress
+            transition_end = phase.start_progress + (
+                phase_duration * phase.transition_duration_fraction
+            )
+            if progress < transition_end - 1e-9:
+                transition = True
+                transition_sample_count += 1
+                previous_phase = phases[phase_index - 1]
+                previous_box = union_box(
+                    previous_phase.anchor_region_ids,
+                    time_ms,
+                )
+                previous_center = (
+                    (
+                        (previous_box[0] + previous_box[2]) / 2,
+                        (previous_box[1] + previous_box[3]) / 2,
+                    )
+                    if previous_box is not None
+                    else phase_centers[previous_phase.phase_id]
+                )
+                raw_alpha = (
+                    (progress - phase.start_progress)
+                    / max(1e-6, transition_end - phase.start_progress)
+                )
+                alpha = max(0.0, min(1.0, raw_alpha))
+                alpha = alpha * alpha * (3 - 2 * alpha)
+                desired_center = (
+                    previous_center[0]
+                    + (current_center[0] - previous_center[0]) * alpha,
+                    previous_center[1]
+                    + (current_center[1] - previous_center[1]) * alpha,
+                )
+        crop_left = max(
+            0.0,
+            min(max_crop_left, desired_center[0] - crop_width_normalized / 2),
+        )
+        crop_top = max(
+            0.0,
+            min(max_crop_top, desired_center[1] - crop_height_normalized / 2),
+        )
+        if not transition and phase.minimum_anchor_visible_fraction >= 1.0 - 1e-9:
+            legal_left_low = max(0.0, current_box[2] - crop_width_normalized)
+            legal_left_high = min(max_crop_left, float(current_box[0]))
+            legal_top_low = max(0.0, current_box[3] - crop_height_normalized)
+            legal_top_high = min(max_crop_top, float(current_box[1]))
+            if (
+                legal_left_low > legal_left_high + 1e-6
+                or legal_top_low > legal_top_high + 1e-6
+            ):
+                raise ValueError(
+                    f"phase {phase.phase_id} anchor union cannot fit 9:16"
+                )
+            crop_left = max(legal_left_low, min(legal_left_high, crop_left))
+            crop_top = max(legal_top_low, min(legal_top_high, crop_top))
+        current_visible = min(
+            _visible_area_fraction(
+                resolved_box(region_id, time_ms) or current_box,
+                crop_left=crop_left,
+                crop_top=crop_top,
+                crop_width=crop_width_normalized,
+                crop_height=crop_height_normalized,
+            )
+            for region_id in phase.anchor_region_ids
+        )
+        previous_visible = (
+            _visible_area_fraction(
+                previous_box,
+                crop_left=crop_left,
+                crop_top=crop_top,
+                crop_width=crop_width_normalized,
+                crop_height=crop_height_normalized,
+            )
+            if previous_box is not None
+            else 0.0
+        )
+        if transition:
+            transition_visible_fractions.append(
+                max(current_visible, previous_visible)
+            )
+        else:
+            if (
+                current_visible + 1e-6
+                < phase.minimum_anchor_visible_fraction
+            ):
+                raise ValueError(
+                    f"phase {phase.phase_id} anchor visibility "
+                    f"{current_visible:.3f} is below reviewed floor "
+                    f"{phase.minimum_anchor_visible_fraction:.3f}"
+                )
+            steady_visible_fractions.append(current_visible)
+        relative_seconds = (time_ms - start_ms) / 1000
+        crop_x_pixels = crop_left / 1000 * scaled_width
+        crop_y_pixels = crop_top / 1000 * scaled_height
+        times.append(relative_seconds)
+        x_values.append(crop_x_pixels)
+        y_values.append(crop_y_pixels)
+        crop_keyframes.append(
+            {
+                "time_seconds": round(relative_seconds, 6),
+                "analysis_sample_time_ms": time_ms,
+                "phase_id": phase.phase_id,
+                "transition_sample": transition,
+                "active_anchor_region_ids": list(phase.anchor_region_ids),
+                "required_union_box": current_box,
+                "previous_anchor_union_box": previous_box,
+                "current_anchor_visible_fraction": round(current_visible, 6),
+                "minimum_anchor_visible_fraction": (
+                    phase.minimum_anchor_visible_fraction
+                ),
+                "previous_anchor_visible_fraction": round(previous_visible, 6),
+                "crop_x_pixels": round(crop_x_pixels, 3),
+                "crop_y_pixels": round(crop_y_pixels, 3),
+            }
+        )
+    if len(times) < 2 or missing_active_samples:
+        raise ValueError(
+            "phase virtual-camera active anchors do not cover every analysis sample"
+        )
+    active_imputed_samples = imputed_anchor_samples & active_anchor_samples
+    imputed_anchor_sample_ratio = len(active_imputed_samples) / max(
+        1,
+        len(active_anchor_samples),
+    )
+    if imputed_anchor_sample_ratio > 0.15:
+        raise ValueError(
+            "phase virtual-camera requires too many interpolated anchor samples"
+        )
+    steady_minimum = min(steady_visible_fractions, default=0.0)
+    transition_minimum = min(transition_visible_fractions, default=1.0)
+    if transition_minimum + 1e-6 < 0.10:
+        raise ValueError(
+            "phase virtual-camera transition loses both anchors"
+        )
+    max_velocity, max_acceleration, max_jerk = _motion_extrema(
+        times,
+        x_values,
+        y_values,
+        [1.0 for _ in times],
+    )
+    keyframes = [
+        VirtualCameraKeyframe(
+            time_seconds=round(time, 6),
+            source_pts=next(
+                (
+                    sample.source_pts
+                    for sample in tracks[0].samples
+                    if sample.analysis_sample_time_ms
+                    == crop_keyframe["analysis_sample_time_ms"]
+                ),
+                None,
+            ),
+            scale=1.0,
+            center_x_normalized=round(
+                (crop_x + 540) / scaled_width * 1000,
+                6,
+            ),
+            center_y_normalized=round(
+                (crop_y + 960) / scaled_height * 1000,
+                6,
+            ),
+        )
+        for time, crop_x, crop_y, crop_keyframe in zip(
+            times,
+            x_values,
+            y_values,
+            crop_keyframes,
+            strict=True,
+        )
+    ]
+    plan = VerticalVirtualCameraPlan(
+        phases=list(phases),
+        anchor_region_ids=referenced_ids,
+        keyframes=keyframes,
+        steady_containment_passed=True,
+        transition_minimum_anchor_visible_fraction=round(
+            transition_minimum,
+            6,
+        ),
+        max_velocity=round(max_velocity, 6),
+        max_acceleration=round(max_acceleration, 6),
+        max_jerk=round(max_jerk, 6),
+        execution_status="applied",
+        fallback_reason=None,
+        editorial_reason=(
+            "Apply reviewed phase-specific anchors instead of requiring every "
+            "region to remain simultaneously visible for the whole segment."
+        ),
+        source_track_fingerprints={
+            region_id: _track_geometry_fingerprint(tracks_by_region[region_id])
+            for region_id in referenced_ids
+        },
+    )
+    phase_by_id = {phase.phase_id: phase for phase in phases}
+    cut_before_indexes = frozenset(
+        index
+        for index in range(1, len(crop_keyframes))
+        if (
+            crop_keyframes[index]["phase_id"]
+            != crop_keyframes[index - 1]["phase_id"]
+            and phase_by_id[crop_keyframes[index]["phase_id"]].transition_in
+            == "cut"
+        )
+    )
+    x_expression = _piecewise_expression(
+        times,
+        x_values,
+        cut_before_indexes=cut_before_indexes,
+    )
+    y_expression = _piecewise_expression(
+        times,
+        y_values,
+        cut_before_indexes=cut_before_indexes,
+    )
+    filter_graph = (
+        "[0:v]fps=30,"
+        f"scale={int(scaled_width)}:{int(scaled_height)},"
+        f"crop=1080:1920:x='{x_expression}':y='{y_expression}',setsar=1[base]"
+    )
+    return filter_graph, {
+        "applied_strategy": "phase_virtual_camera",
+        "fallback_reason": None,
+        "risk_codes": [
+            "human_reviewed_phase_virtual_camera",
+            "phase_transition_containment_is_time_varying",
+            *(
+                ["phase_intentional_anchor_clipping"]
+                if any(
+                    phase.minimum_anchor_visible_fraction < 1.0
+                    for phase in phases
+                )
+                else []
+            ),
+            *(
+                ["phase_anchor_track_gap_interpolated"]
+                if active_imputed_samples
+                else []
+            ),
+        ],
+        "requires_gemini_review": True,
+        "full_containment_feasible": all(
+            phase.minimum_anchor_visible_fraction >= 1.0
+            for phase in phases
+        ),
+        "subject_clipping_allowed": any(
+            phase.minimum_anchor_visible_fraction < 1.0
+            for phase in phases
+        ),
+        "containment_failure_count": 0,
+        "minimum_visible_required_area_fraction": round(steady_minimum, 6),
+        "transition_minimum_anchor_visible_fraction": round(
+            transition_minimum,
+            6,
+        ),
+        "transition_sample_count": transition_sample_count,
+        "interpolated_anchor_sample_count": len(active_imputed_samples),
+        "interpolated_anchor_sample_ratio": round(
+            imputed_anchor_sample_ratio,
+            6,
+        ),
+        "phase_virtual_camera_plan": plan.model_dump(mode="json"),
+        "crop_coordinate_space": transform,
+        "crop_width_normalized": round(crop_width_normalized, 6),
+        "crop_height_normalized": round(crop_height_normalized, 6),
+        "crop_x_values_pixels": x_values,
+        "crop_y_values_pixels": y_values,
+        "crop_keyframes": crop_keyframes,
+        "max_crop_speed_pixels_per_second": round(max_velocity, 6),
+        "max_crop_acceleration_pixels_per_second_squared": round(
+            max_acceleration,
+            6,
+        ),
+        "max_crop_jerk_pixels_per_second_cubed": round(max_jerk, 6),
+        "tracking_confidence_gate_passed": True,
+        "coverage_passed": True,
+        "source_display_width": source_width,
+        "source_display_height": source_height,
+        **lineage,
+    }
+
+
 def _vertical_fit_filter() -> str:
     return (
         "[0:v]fps=30,"
@@ -5077,6 +5591,7 @@ def _vertical_candidate_geometry(
     event_description: str,
     target_description: str | None,
     regions: Sequence[FramingRegionIntent],
+    camera_phases: Sequence[VerticalVirtualCameraPhase],
     crop_mode: Literal["strict", "primary_center"],
     overflow_policy: Literal["preserve_all", "controlled_clip"],
     edge_priority: Literal["balanced", "preserve_start", "preserve_end"],
@@ -5144,17 +5659,44 @@ def _vertical_candidate_geometry(
                 ],
             }
         )
-        filter_graph, geometry = _vertical_filter_from_track(
-            hard_tracks,
-            allow_subject_clipping=crop_mode == "primary_center",
-            overflow_policy=overflow_policy,
-            edge_priority=edge_priority,
-            region_ids=[region.region_id for region in hard_regions],
-            fallback_strategy=fallback_strategy,
-            display_sample_aspect_ratio=display_sample_aspect_ratio,
-            preferred_tracks=soft_tracks,
-            preferred_regions=soft_regions,
-        )
+        if camera_phases:
+            try:
+                filter_graph, geometry = (
+                    _vertical_virtual_camera_filter_from_tracks(
+                        tracks_by_region=tracks_by_region,
+                        phases=camera_phases,
+                        display_sample_aspect_ratio=display_sample_aspect_ratio,
+                    )
+                )
+            except ValueError as error:
+                filter_graph, geometry = _vertical_filter_from_track(
+                    hard_tracks,
+                    allow_subject_clipping=crop_mode == "primary_center",
+                    overflow_policy=overflow_policy,
+                    edge_priority=edge_priority,
+                    region_ids=[region.region_id for region in hard_regions],
+                    fallback_strategy=fallback_strategy,
+                    display_sample_aspect_ratio=display_sample_aspect_ratio,
+                    preferred_tracks=soft_tracks,
+                    preferred_regions=soft_regions,
+                )
+                geometry.setdefault("risk_codes", []).append(
+                    "phase_virtual_camera_preflight_failed"
+                )
+                geometry["phase_virtual_camera_fallback_reason"] = str(error)
+                geometry["requires_gemini_review"] = True
+        else:
+            filter_graph, geometry = _vertical_filter_from_track(
+                hard_tracks,
+                allow_subject_clipping=crop_mode == "primary_center",
+                overflow_policy=overflow_policy,
+                edge_priority=edge_priority,
+                region_ids=[region.region_id for region in hard_regions],
+                fallback_strategy=fallback_strategy,
+                display_sample_aspect_ratio=display_sample_aspect_ratio,
+                preferred_tracks=soft_tracks,
+                preferred_regions=soft_regions,
+            )
     else:
         target = (target_description or "").strip()
         if not target:
@@ -5226,6 +5768,8 @@ def _vertical_candidate_geometry(
     semantic_review_reasons: list[str] = []
     if len(hard_regions) > 1:
         semantic_review_reasons.append("multiple_hard_core_regions")
+    if camera_phases:
+        semantic_review_reasons.append("phase_virtual_camera_requires_sequence_review")
     if any(
         region.kind in {"text_region", "ui_region"} or region.atomic
         for region in crop_regions
@@ -5251,6 +5795,9 @@ def _vertical_candidate_geometry(
             ),
         }
         for region in regions
+    ]
+    geometry["vertical_camera_phases"] = [
+        phase.model_dump(mode="json") for phase in camera_phases
     ]
     return filter_graph, geometry, debug_paths, track_fingerprint
 
@@ -7558,7 +8105,10 @@ def run_feature_cut_experiment(
                             for region in candidate_regions
                         ],
                     }
-                    if option_data["strategy"] == "fit_with_background":
+                    if (
+                        option_data["strategy"] == "fit_with_background"
+                        and not brief_chapter.vertical_camera_phases
+                    ):
                         attempt.update(
                             {
                                 "decision": "deferred_fallback",
@@ -7661,6 +8211,7 @@ def run_feature_cut_experiment(
                                 str(candidate_target) if candidate_target else None
                             ),
                             regions=candidate_regions,
+                            camera_phases=brief_chapter.vertical_camera_phases,
                             crop_mode=candidate_crop_mode,
                             overflow_policy=(
                                 brief_chapter.vertical_overflow_policy

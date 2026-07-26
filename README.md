@@ -66,6 +66,8 @@ Top-K 直式候選
 
 因此「稍微切到背景、衣服邊緣或非必要環境」可以是正確構圖；「切掉臉、指定產品、關鍵操作手、必要 UI／文字」則不能因滿版好看而合理化。Gemini 成片 QA 也會把 geometry safety 與 portrait composition 分開：沒有切到主體只代表安全，不自動代表畫布利用、視覺焦點與 matte fallback 都理想。
 
+同一個橫式鏡頭若有左右兩個不能同時塞進 9:16、但可以依序觀看的重點，可使用人工核准的 `vertical_camera_phases`。每個 phase 只引用已 Grounding、已由 SAM 追蹤的 region ID，並明列起訖進度、`hold`／`follow`、切換方式及最低可見比例；本機再從原始 PTS 算出 crop path。例如先看右側操作結果，再平滑移向左側人物，或先看較小物件再移到較大物件。這不是把「兩個都必須同時看見」改成任意裁切：若兩者的關係必須在同一時刻成立，就應保留 joint relation ROI、換 take、split／PiP 或 solid fit。原子文字與 UI 的最低可見比例固定為 100%；只有真人 policy 可對非原子人物／物件明示較低門檻，而且成片永遠標記為 review-required。
+
 研究用的 `--allow-unverified-geometry-preview` 另有一條明確標記為 review-only 的受控虛擬鏡頭路徑：只有上游選擇 `primary_center`、SAM 已產生無 fallback 的 tracked crop、hard core 不含 atomic／文字／UI／graphic，且整段最小可見 required 面積至少 90% 時，才可輸出略裁主體邊緣的滿版預覽。artifact 會固定保存 `review_only_controlled_primary_center_clip`、可見比例與 `requires_gemini_review`；這不是 production success，也不會改變正式 unattended delivery 的 100% containment 規則。
 
 ### 用到哪些技術
