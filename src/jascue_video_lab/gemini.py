@@ -129,6 +129,31 @@ def canonicalize_selected_vertical_framing_output(
     changes: list[dict[str, Any]] = []
     proposal = payload.get("virtual_camera_proposal")
     action = payload.get("recommended_action")
+    if (
+        action == "tracked_crop"
+        and payload.get("semantic_requirement") == "simultaneous_relation"
+        and isinstance(proposal, dict)
+        and proposal.get("composition_mode")
+        in {"single_anchor_hold", "single_anchor_follow"}
+    ):
+        phases_value = proposal.get("phases")
+        if isinstance(phases_value, list) and any(
+            len(phase.get("anchor_region_ids") or []) > 1
+            for phase in phases_value
+            if isinstance(phase, dict)
+        ):
+            changes.append(
+                {
+                    "field": "virtual_camera_proposal.composition_mode",
+                    "from": proposal.get("composition_mode"),
+                    "to": "joint_relation",
+                    "reason": (
+                        "multiple_simultaneous_evidence_anchors_form_one_"
+                        "joint_composition"
+                    ),
+                }
+            )
+            proposal["composition_mode"] = "joint_relation"
     if action != "tracked_crop" and proposal is not None:
         payload["virtual_camera_proposal"] = None
         changes.append(

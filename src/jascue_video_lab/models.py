@@ -3654,9 +3654,18 @@ class SelectedVerticalFramingProposal(StrictModel):
             self.semantic_requirement == "simultaneous_relation"
             and proposal.composition_mode == "sequential_focus"
         ):
-            raise ValueError(
-                "a simultaneous relation cannot be split into sequential focus"
-            )
+            scale_changing = [
+                phase.phase_id
+                for phase in proposal.phases
+                if phase.camera_behavior
+                in {"push_in", "pull_out", "punch_in_cut"}
+            ]
+            if scale_changing:
+                raise ValueError(
+                    "a sequential comparison may reconstruct a simultaneous "
+                    "relation only with scale-preserving camera behaviors; "
+                    f"scale-changing phases: {scale_changing}"
+                )
         return self
 
 

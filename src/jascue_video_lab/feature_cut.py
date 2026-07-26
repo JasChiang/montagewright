@@ -4873,6 +4873,13 @@ def _vertical_virtual_camera_filter_from_tracks(
         ),
         "native_zoom_limit": round(native_zoom_limit, 6),
         "maximum_applied_zoom": round(max(scale_values), 6),
+        "minimum_applied_zoom": round(min(scale_values), 6),
+        "scale_continuity_locked": math.isclose(
+            min(scale_values),
+            max(scale_values),
+            rel_tol=0,
+            abs_tol=1e-6,
+        ),
         "zoom_limited_by_source_resolution": bool(
             maximum_zoom + 1e-6 < _PORTRAIT_PHASE_MAX_ZOOM
         ),
@@ -5022,6 +5029,43 @@ def _vertical_center_crop_filter() -> str:
         "scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920:x=(iw-ow)/2:y=(ih-oh)/2,setsar=1[base]"
     )
+
+
+def _vertical_delivery_fallback(
+    strategy: Literal["fit_with_background", "center_crop"],
+    *,
+    reason: str,
+) -> tuple[str, dict[str, Any]]:
+    """Honor the explicit delivery preference while preserving review lineage."""
+
+    if strategy == "center_crop":
+        return _vertical_center_crop_filter(), {
+            "applied_strategy": "full_bleed_center_crop_review",
+            "fallback_reason": reason,
+            "risk_codes": [
+                "explicit_full_bleed_delivery_preference",
+                "unverified_center_crop",
+                "human_review_required",
+            ],
+            "requires_gemini_review": True,
+            "full_bleed": True,
+            "semantic_review_reasons": [
+                "fallback_crop_requires_sequence_review",
+            ],
+        }
+    return _vertical_fit_filter(), {
+        "applied_strategy": "fit_with_solid_matte",
+        "fallback_reason": reason,
+        "risk_codes": [
+            "scope_preserving_solid_fit",
+            "human_review_required",
+        ],
+        "requires_gemini_review": True,
+        "full_bleed": False,
+        "semantic_review_reasons": [
+            "scope_preserving_fit_is_review_only",
+        ],
+    }
 
 
 def _tracking_seed_request_ms(
@@ -5872,10 +5916,11 @@ def _vertical_candidate_geometry(
     ]
     debug_paths: list[Path] = []
     track_fingerprint: str | None = None
+    optional_region_failures: list[dict[str, str]] = []
     if crop_regions:
         if not hard_regions:
             raise ValueError("candidate region contract has no hard core")
-        _, tracks, debug_paths = _build_framing_region_tracks(
+        _, hard_tracks, hard_debug_paths = _build_framing_region_tracks(
             client=client,
             clip=clip,
             frame=frame,
@@ -5883,38 +5928,96 @@ def _vertical_candidate_geometry(
             end_ms=end_ms,
             feature_id=feature_id,
             event_description=event_description,
-            regions=crop_regions,
+            regions=hard_regions,
             checkpoint_path=checkpoint_path,
             grounding_prompt=grounding_prompt,
             output_dir=output_dir,
             analysis_fps=analysis_fps,
             scdet_threshold=scdet_threshold,
-            include_execution_roles=frozenset({"hard_core", "soft_extent"}),
+            include_execution_roles=frozenset({"hard_core"}),
             model_request_block_reason=model_request_block_reason,
             query_lock_v2=query_lock_v2,
         )
+        debug_paths.extend(hard_debug_paths)
         tracks_by_region = {
             region.region_id: track
-            for region, track in zip(crop_regions, tracks, strict=True)
+            for region, track in zip(hard_regions, hard_tracks, strict=True)
         }
-        hard_tracks = [tracks_by_region[region.region_id] for region in hard_regions]
-        soft_tracks = [tracks_by_region[region.region_id] for region in soft_regions]
+        available_soft_regions: list[FramingRegionIntent] = []
+        soft_tracks: list[SegmentationTrack] = []
+        for soft_region in soft_regions:
+            try:
+                _, region_tracks, region_debug_paths = (
+                    _build_framing_region_tracks(
+                        client=client,
+                        clip=clip,
+                        frame=frame,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        feature_id=feature_id,
+                        event_description=event_description,
+                        regions=[soft_region],
+                        checkpoint_path=checkpoint_path,
+                        grounding_prompt=grounding_prompt,
+                        output_dir=output_dir,
+                        analysis_fps=analysis_fps,
+                        scdet_threshold=scdet_threshold,
+                        include_execution_roles=frozenset({"soft_extent"}),
+                        model_request_block_reason=model_request_block_reason,
+                        query_lock_v2=query_lock_v2,
+                    )
+                )
+            except (RuntimeError, ValueError) as error:
+                optional_region_failures.append(
+                    {
+                        "region_id": soft_region.region_id,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    }
+                )
+                continue
+            available_soft_regions.append(soft_region)
+            soft_tracks.append(region_tracks[0])
+            tracks_by_region[soft_region.region_id] = region_tracks[0]
+            debug_paths.extend(region_debug_paths)
+        available_regions = [*hard_regions, *available_soft_regions]
+        available_region_ids = set(tracks_by_region)
+        effective_camera_phases: list[VerticalVirtualCameraPhase] = []
+        for phase in camera_phases:
+            available_anchors = [
+                region_id
+                for region_id in phase.anchor_region_ids
+                if region_id in available_region_ids
+            ]
+            if not available_anchors:
+                raise ValueError(
+                    f"phase {phase.phase_id} has no available hard-core anchor"
+                )
+            effective_camera_phases.append(
+                phase.model_copy(
+                    update={"anchor_region_ids": available_anchors}
+                )
+            )
         track_fingerprint = _stable_fingerprint(
             {
-                "contract_version": "feature-vertical-region-tracks-v2",
-                "regions": [region.model_dump(mode="json") for region in crop_regions],
+                "contract_version": "feature-vertical-region-tracks-v3",
+                "regions": [
+                    region.model_dump(mode="json")
+                    for region in available_regions
+                ],
                 "tracks": [
                     _track_geometry_fingerprint(tracks_by_region[region.region_id])
-                    for region in crop_regions
+                    for region in available_regions
                 ],
+                "optional_region_failures": optional_region_failures,
             }
         )
-        if camera_phases:
+        if effective_camera_phases:
             try:
                 filter_graph, geometry = (
                     _vertical_virtual_camera_filter_from_tracks(
                         tracks_by_region=tracks_by_region,
-                        phases=camera_phases,
+                        phases=effective_camera_phases,
                         phase_origin=camera_phase_origin,
                         display_sample_aspect_ratio=display_sample_aspect_ratio,
                     )
@@ -5929,7 +6032,7 @@ def _vertical_candidate_geometry(
                     fallback_strategy=fallback_strategy,
                     display_sample_aspect_ratio=display_sample_aspect_ratio,
                     preferred_tracks=soft_tracks,
-                    preferred_regions=soft_regions,
+                    preferred_regions=available_soft_regions,
                 )
                 geometry.setdefault("risk_codes", []).append(
                     "phase_virtual_camera_preflight_failed"
@@ -5946,7 +6049,7 @@ def _vertical_candidate_geometry(
                 fallback_strategy=fallback_strategy,
                 display_sample_aspect_ratio=display_sample_aspect_ratio,
                 preferred_tracks=soft_tracks,
-                preferred_regions=soft_regions,
+                preferred_regions=available_soft_regions,
             )
     else:
         target = (target_description or "").strip()
@@ -6030,6 +6133,12 @@ def _vertical_candidate_geometry(
         semantic_review_reasons.append("overlay_keepout_requires_layout_gate")
     if geometry.get("fallback_reason"):
         semantic_review_reasons.append("fallback_applied")
+    if optional_region_failures:
+        semantic_review_reasons.append("optional_region_grounding_unavailable")
+        geometry.setdefault("risk_codes", []).append(
+            "optional_region_grounding_unavailable"
+        )
+        geometry["optional_region_failures"] = optional_region_failures
     if not geometry.get("soft_extent_visibility_passed", True):
         semantic_review_reasons.append("soft_extent_visibility_below_floor")
     geometry["semantic_review_reasons"] = list(
@@ -6291,6 +6400,7 @@ def _refine_selected_vertical_candidate(
     prompt_template: str,
     catalog_path: Path,
     output_dir: Path,
+    vertical_fallback_strategy: Literal["fit_with_background", "center_crop"],
 ) -> tuple[dict[str, Any], SelectedVerticalFramingProposal, bool]:
     """Run or reuse the full-clip 9:16 presentation decision before geometry."""
 
@@ -6308,10 +6418,15 @@ def _refine_selected_vertical_candidate(
         "current_target_description": option_data.get("target_description"),
         "current_regions": option_data.get("regions", []),
         "quality_risks": option_data.get("quality_risks", []),
+        "delivery_preference": {
+            "aspect": "9:16",
+            "fallback_strategy": vertical_fallback_strategy,
+            "full_bleed_preferred": vertical_fallback_strategy == "center_crop",
+        },
     }
     chapter_context = chapter.model_dump(mode="json")
     fingerprint_payload = {
-        "contract_version": "selected-vertical-framing-request-v1",
+        "contract_version": "selected-vertical-framing-request-v2",
         "source_sha256": clip.sha256,
         "candidate_context": candidate_context,
         "chapter_context": chapter_context,
@@ -6758,6 +6873,7 @@ def _summarize_automatic_reframe(
             "tracked_crop",
             "seed_anchor_crop",
             "center_crop",
+            "full_bleed_center_crop_review",
             "unverified_center_crop_preview",
             "policy_blocked_preview_center_crop",
         }
@@ -8640,7 +8756,15 @@ def run_feature_cut_experiment(
                 vertical_primary_override = (
                     brief_chapter.vertical_primary_target_description
                 )
-                auto_reframe_policy = AutoReframePolicy()
+                # feature-cut produces an auditable review render, not an
+                # unattended production approval. Missing independent
+                # identity checkpoints and optional-context shortfalls remain
+                # advisories; hard-core, atomic, lineage, tracking, and motion
+                # failures still block the candidate.
+                auto_reframe_policy = AutoReframePolicy(
+                    require_semantic_checkpoints_for_tracked_crop=False,
+                    soft_extent_below_minimum_is_failure=False,
+                )
                 vertical_options = _vertical_runtime_candidate_options(
                     selected,
                     human_policy_binding_present=human_reframe_policy_requested,
@@ -8714,6 +8838,9 @@ def run_feature_cut_experiment(
                                 prompt_template=resolved_vertical_framing_prompt,
                                 catalog_path=catalog_path,
                                 output_dir=output_dir,
+                                vertical_fallback_strategy=(
+                                    brief.vertical_fallback_strategy
+                                ),
                             )
                         except Exception as error:
                             abort_for_geometry_quota(error)
@@ -8791,10 +8918,21 @@ def run_feature_cut_experiment(
                         option_data["strategy"] == "fit_with_background"
                         and not candidate_camera_phases
                     ):
+                        fallback_filter, fallback_geometry = (
+                            _vertical_delivery_fallback(
+                                brief.vertical_fallback_strategy,
+                                reason=(
+                                    "gemini_fit_or_layout_after_full_bleed_attempts"
+                                ),
+                            )
+                        )
                         attempt.update(
                             {
                                 "decision": "deferred_fallback",
-                                "reason_code": "planner_requested_scope_preserving_fit",
+                                "reason_code": (
+                                    "planner_requested_fit_or_layout;"
+                                    f"delivery_fallback={brief.vertical_fallback_strategy}"
+                                ),
                             }
                         )
                         candidate_attempts.append(attempt)
@@ -8810,18 +8948,8 @@ def run_feature_cut_experiment(
                                 "trim": candidate_trim,
                                 "regions": candidate_regions,
                                 "target": candidate_target,
-                                "filter": _vertical_fit_filter(),
-                                "geometry": {
-                                    "applied_strategy": "fit_with_solid_matte",
-                                    "fallback_reason": None,
-                                    "risk_codes": [
-                                        "planner_requested_scope_preserving_fit"
-                                    ],
-                                    "requires_gemini_review": True,
-                                    "semantic_review_reasons": [
-                                        "scope_preserving_fit_is_review_only"
-                                    ],
-                                },
+                                "filter": fallback_filter,
+                                "geometry": fallback_geometry,
                                 "debugs": [],
                                 "track_fingerprint": None,
                             }
@@ -9003,6 +9131,14 @@ def run_feature_cut_experiment(
                             candidate_geometry["auto_bounded_clip_audit"] = (
                                 auto_audit.model_dump(mode="json")
                             )
+                            if auto_audit.advisory_codes:
+                                candidate_geometry["requires_gemini_review"] = True
+                                candidate_geometry.setdefault(
+                                    "risk_codes", []
+                                ).extend(
+                                    code.value
+                                    for code in auto_audit.advisory_codes
+                                )
                             candidate_geometry["auto_bounded_clip_applied"] = (
                                 auto_audit.auto_bounded_clip_applied
                             )
@@ -9023,6 +9159,8 @@ def run_feature_cut_experiment(
                         if (
                             not hard_gate_passed
                             and deferred_required_scope_fit is None
+                            and brief.vertical_fallback_strategy
+                            != "center_crop"
                             and FailureCode.NO_FEASIBLE_PRESENTATION
                             in failure_codes
                         ):
@@ -9212,28 +9350,15 @@ def run_feature_cut_experiment(
                         selected.vertical_target_description
                         or brief_chapter.vertical_primary_target_description
                     )
-                    use_center_crop_preview = (
-                        human_reframe_policy_requested
-                        and brief.vertical_fallback_strategy == "center_crop"
+                    vertical_filter, vertical_geometry = (
+                        _vertical_delivery_fallback(
+                            brief.vertical_fallback_strategy,
+                            reason="all_automatic_candidates_exhausted",
+                        )
                     )
-                    vertical_filter = (
-                        _vertical_center_crop_filter()
-                        if use_center_crop_preview
-                        else _vertical_fit_filter()
+                    vertical_geometry.setdefault("risk_codes", []).append(
+                        "automatic_candidate_exhaustion"
                     )
-                    vertical_geometry = {
-                        "applied_strategy": (
-                            "policy_blocked_preview_center_crop"
-                            if use_center_crop_preview
-                            else "policy_blocked_preview_solid_fit"
-                        ),
-                        "fallback_reason": "all_automatic_candidates_exhausted",
-                        "risk_codes": [
-                            "automatic_candidate_exhaustion",
-                            "human_review_required",
-                        ],
-                        "requires_gemini_review": True,
-                    }
                     vertical_debugs = []
                     vertical_track_fingerprint = None
                     selected_candidate_id = str(first_data["candidate_id"])
@@ -9282,6 +9407,7 @@ def run_feature_cut_experiment(
                     "center_crop_used_as_unverified_fallback": (
                         vertical_geometry.get("applied_strategy")
                         in {
+                            "full_bleed_center_crop_review",
                             "unverified_center_crop_preview",
                             "policy_blocked_preview_center_crop",
                         }

@@ -59,6 +59,21 @@ def test_auto_bounded_clip_only_clips_soft_context() -> None:
     assert len(audit.audit_sha256) == 64
 
 
+def test_review_policy_keeps_soft_extent_shortfall_as_advisory() -> None:
+    policy = AutoReframePolicy(
+        soft_extent_below_minimum_is_failure=False,
+    )
+    audit = audit_auto_bounded_clip(
+        preflight(soft_visible=0.4),
+        policy,
+        expected_geometry_fingerprint="a" * 64,
+    )
+
+    assert audit.approved is True
+    assert FailureCode.SOFT_EXTENT_BELOW_MINIMUM not in audit.failure_codes
+    assert FailureCode.SOFT_EXTENT_BELOW_MINIMUM in audit.advisory_codes
+
+
 def test_hard_core_or_atomic_clipping_fails_closed() -> None:
     candidate = preflight()
     candidate.regions[0].minimum_visible_fraction = 0.99
@@ -123,6 +138,28 @@ def test_tracked_crop_without_completed_identity_verification_fails_closed() -> 
 
     assert FailureCode.IDENTITY_VERIFICATION_PENDING in failures
     assert FailureCode.IDENTITY_SWITCH_DETECTED not in failures
+
+
+def test_review_policy_keeps_pending_identity_as_advisory() -> None:
+    candidate = preflight().model_copy(
+        update={
+            "semantic_checkpoint_status": (
+                SemanticCheckpointStatus.REQUIRED_PENDING
+            )
+        }
+    )
+    policy = AutoReframePolicy(
+        require_semantic_checkpoints_for_tracked_crop=False,
+    )
+    audit = audit_auto_bounded_clip(
+        candidate,
+        policy,
+        expected_geometry_fingerprint="a" * 64,
+    )
+
+    assert audit.approved is True
+    assert FailureCode.IDENTITY_VERIFICATION_PENDING not in audit.failure_codes
+    assert FailureCode.IDENTITY_VERIFICATION_PENDING in audit.advisory_codes
 
 
 def test_ambiguous_identity_is_not_misreported_as_a_confirmed_switch() -> None:

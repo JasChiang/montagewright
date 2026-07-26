@@ -12,7 +12,7 @@
 4. **提出選片與相對停留建議**：有剪輯 brief 時，AI 會同時依主題、可觀察資訊量、動作是否完整及音樂 flow 挑選素材；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。每段另保存 AttentionProfile，分開記錄閱讀負擔、動作進度、重複壓力、刻意停留價值等理由，再由 RhythmPlan 產生最短／偏好／最長停留範圍。系統不會因為畫面被分類成人物、產品、UI 或靜態鏡頭，就套用固定秒數。
 5. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
 6. **確認真正可用的秒數**：只對入選 shot 逐幀量測黑白格、freeze、解碼／PTS 異常及需複核的失焦、模糊與晃動，先算出連續的安全區間，再分配章節片長；不拿包含髒畫面的整個 shot 長度冒充可用容量。
-7. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨目標、做有目的的 push-in／pull-out／punch-in，或避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。VirtualCameraPlan 只接受已鎖定的實例與通過 containment gate 的路徑；沒有兩個獨立 anchor 時，`pan_reveal` 會明確 fallback，不會拿單一 track 猜第二個目標。必要主體無法安全裝進滿版 9:16 時，review fallback 會先依全段 required-region envelope 去除無關外圍，再用純色 matte 補邊；不使用模糊背景，也不以中心裁切偷掉必要主體。
+7. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨目標、做有目的的 push-in／pull-out／punch-in，或避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。VirtualCameraPlan 只接受已鎖定的實例與通過 containment gate 的路徑；沒有兩個獨立 anchor 時，`pan_reveal` 會明確 fallback，不會拿單一 track 猜第二個目標。多主體會先嘗試帶共同錨點的 phase，例如「左＋中 → 中＋右」；同源畫面的 A→B 比較也可依序呈現，但必須由本機鎖定相同數位縮放，避免鏡頭倍率偽造大小差異。必要主體無法安全裝進滿版 9:16 時，renderer 依 brief 明示的交付偏好選擇待審的滿版中心裁切或純色 scope-preserving fit；不使用模糊背景，也不把 review fallback 冒充成正式 geometry success。
 8. **保留連續音樂，不拿毛片原音疊上去**：review delivery 只使用已核准的一段連續音樂，優先保留自然收尾；不把同一首歌切成數段交疊、不 time-stretch，也不混入每顆毛片原音造成突兀重疊。若畫面長度與連續音樂無法在容差內對齊，會停止而不是硬裁或 freeze 畫面。
 9. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。Gemini 可用一次有聲 16:9 call 檢查 brief、資訊停留、重複、轉場及音樂 flow；9:16 另以靜音 proxy 只檢查裁切、文字與追蹤。QA 只提出觀察，不會自行改片；真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
 
@@ -60,21 +60,22 @@ Top-K 直式候選
   → 追蹤 hard core，求整段都可行的滿版 9:16 crop
   → 必要時有限裁切 soft extent／optional context
   → 不可行則換同章下一個 take
-  → 多主體確實無法容納時才使用 scope-preserving solid fit／layout
+  → 多主體先嘗試有共同錨點的虛擬鏡頭或下一個候選
+  → 最後才依 brief 選擇滿版待審裁切或 scope-preserving fit／layout
   → 仍不確定就停止並交給真人
 ```
 
 因此「稍微切到背景、衣服邊緣或非必要環境」可以是正確構圖；「切掉臉、指定產品、關鍵操作手、必要 UI／文字」則不能因滿版好看而合理化。Gemini 成片 QA 也會把 geometry safety 與 portrait composition 分開：沒有切到主體只代表安全，不自動代表畫布利用、視覺焦點與 matte fallback 都理想。
 
-同一個橫式鏡頭若有兩個以上不能同時塞進 9:16、但可以依序觀看的重點，Gemini 在完整觀看單支 proxy、建立 Clip Card 時，先以 `portrait_attention_sequence` 記錄素材直接支持的動作、視線、結果揭露與資訊交接；選片階段才可依這份證據提出 `virtual_camera_proposal`。方向不是固定的左→中→右：可以是右→左、人物→結果、整體→細節，或判斷完全不應移動。每個 phase 可選 `hold`、帶 deadband 的 `follow`、連續 `follow`、`push_in`、`pull_out` 或硬切式 `punch_in_cut`；不再把所有相位交接一律做成定速平移。proposal 只保存相對 phase 順序、可見 predicate、交接條件與既有 Entity／region ID，不包含 source timestamp、bbox 或 crop 座標；本機仍須對各 anchor 做 exact-frame Grounding、SAM 追蹤、100% active-anchor containment 與速度／加速度／jerk gate，通過後才會產生可執行 `VerticalVirtualCameraPlan`。
+同一個橫式鏡頭若有兩個以上不能同時塞進 9:16、但可以依序觀看的重點，Gemini 在完整觀看單支 proxy、建立 Clip Card 時，先以 `portrait_attention_sequence` 記錄素材直接支持的動作、視線、結果揭露與資訊交接；選片階段才可依這份證據提出 `virtual_camera_proposal`。方向不是固定的左→中→右：可以是右→左、人物→結果、整體→細節，或判斷完全不應移動。群體、陳列或交接關係可用相鄰 phase 的共同 anchor 維持脈絡；真正的尺寸、距離、接觸或同時狀態比較，仍須在關鍵 phase 同框。每個 phase 可選 `hold`、帶 deadband 的 `follow`、連續 `follow`、`push_in`、`pull_out` 或硬切式 `punch_in_cut`；不再把所有相位交接一律做成定速平移。proposal 只保存相對 phase 順序、可見 predicate、交接條件與既有 Entity／region ID，不包含 source timestamp、bbox 或 crop 座標；本機仍須對各 anchor 做 exact-frame Grounding、SAM 追蹤、100% active-anchor containment 與速度／加速度／jerk gate，通過後才會產生可執行 `VerticalVirtualCameraPlan`。
 
 `feature-cut` 現在也預設補上一個 **selected-clip framing refinement**：catalog reel 先負責選片，但 renderer 不會因為 reel 沒產生 camera proposal 就直接退回背景補邊。每個實際嘗試的 9:16 候選會在 Grounding／SAM 之前讓 Gemini 完整觀看該片段，鎖定原本的 asset／event／frame identity，只能決定 `tracked_crop`、`fit_or_layout` 或 `try_next_candidate`。它必須明示單一主體、先後注意力或同時關係，並保存 regions、phase predicate、理由、不確定性、raw response、usage 與 content-addressed cache。已有完整 Clip Card projection 且帶有效 proposal 時可直接沿用，避免重複付費；File API 物件也按來源 SHA-256 重用。可用 `--no-auto-vertical-framing` 做受控舊路徑比較，但不是預設交付流程。
 
 本機的 phase transition 使用 smoothstep easing，並依實際移動距離同時估算速度、加速度與 jerk 所需的最低時間；Gemini 建議的 transition 若太短，不能直接把鏡頭加速。能安全完成時才移動，距離太遠或 phase 太短時改成有稽核紀錄的硬切，微小 tracker 位移則由 deadband 吸收。scale 也受來源解析度與最多 1.12× 的保守上限約束。若幾何失敗就改試下一個 take 或安全 fallback，不會硬做模型要求的移動。
 
-這也不是把「兩個都必須同時看見」改成任意裁切：兩者關係必須同時成立時，proposal 必須使用 `joint_relation`，否則應換 take、split／PiP 或 solid fit。自動 proposal 永遠不能授權裁掉 active anchor；只有具 provenance 的真人 `vertical_camera_phases` policy 可對非原子人物／物件明示較低可見門檻。兩條路徑的成片都標記為 review-required，artifact 也會分清 `gemini_proposed` 與 `human_reviewed`，避免把人工測試方向冒充成模型判斷。
+這也不是把「兩個都必須同時看見」改成任意裁切：接觸、距離或相對位置必須同時成立時，proposal 必須在關鍵 phase 使用 `joint_relation`；群體關係可用相鄰 phase 的重疊 anchor 延續脈絡；A／B 外觀或尺寸比較可使用不重疊的 sequential phases，但不得使用 push-in、pull-out 或 punch-in 改變比較尺度。自動 proposal 永遠不能授權裁掉 active hard core；若 brief 明示 `center_crop`，所有 geometry 候選仍失敗時才可輸出 `full_bleed_center_crop_review`，並保存被裁風險與人工複核要求。artifact 也會分清 geometry success、Gemini proposal、真人 policy 與待審 fallback，避免把預覽冒充正式核准。
 
-研究用的 `--allow-unverified-geometry-preview` 另有一條明確標記為 review-only 的受控虛擬鏡頭路徑：只有上游選擇 `primary_center`、SAM 已產生無 fallback 的 tracked crop、hard core 不含 atomic／文字／UI／graphic，且整段最小可見 required 面積至少 90% 時，才可輸出略裁主體邊緣的滿版預覽。artifact 會固定保存 `review_only_controlled_primary_center_clip`、可見比例與 `requires_gemini_review`；這不是 production success，也不會改變正式 unattended delivery 的 100% containment 規則。
+`feature-cut` 是人工審核用成片，因此 policy 將兩類未完成事項保留為 advisory：尚未做中後段獨立身分複核的 `identity_verification_pending`，以及 preferred／soft extent 未達建議可見比例。兩者都會寫入 artifact 並要求 review，但不再淘汰 hard core、SAM coverage 與運動 gate 已通過的候選；optional region 無法 Grounding 時也只移除該 optional track，不能拖垮 required 主體。正式 unattended delivery 仍要求 identity checkpoint 通過。研究用的 `--allow-unverified-geometry-preview` 則另允許在上游選擇 `primary_center`、hard core 非 atomic／文字／UI／graphic，且 required 最小可見面積至少 90% 時，輸出略裁 hard-core 邊緣的受控預覽；它不會改變 production 的 100% containment 規則。
 
 ### 用到哪些技術
 
@@ -315,7 +316,7 @@ v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 
 
 自動路徑使用版本化 `auto_bounded_clip_v1`：候選必須先用 `preserve_all` 解出 hard core；只有 soft extent 仍高於明列 floor 時，才可標記為 bounded clip。它不授權裁掉 hard core 或 atomic region。相對地，`controlled_clip` 仍必須來自 content-addressed 的真人 policy sidecar；一旦存在此 binding，renderer 會停用自動換候選，完全依真人核准的候選與 edge priority 執行。
 
-失敗會保存 typed failure code 與 recovery action，例如 shot crossing、coverage 不足、hard core 被裁、soft extent 低於門檻、keepout 違規或 crop motion 過快。現行 executor 會實際嘗試下一個 Top-K 候選，並把預先規劃的 safe-fit 候選延後到 tracked candidates 之後；其他 recovery action 目前是可稽核建議，尚未自動執行。所有候選都失敗時，輸出只是一份 `policy_blocked_preview_solid_fit` 全內容純色補邊預覽並固定要求人工 review，不會偷偷改用未驗證的中心裁切。
+失敗會保存 typed failure code 與 recovery action，例如 shot crossing、coverage 不足、hard core 被裁、soft extent 低於門檻、keepout 違規或 crop motion 過快。現行 executor 會實際嘗試下一個 Top-K 候選，並把預先規劃的 safe-fit 候選延後到 tracked candidates 之後；其他 recovery action 目前是可稽核建議，尚未自動執行。所有候選都失敗時，renderer 會遵守 brief 的 `vertical_fallback_strategy`：`center_crop` 產生滿版但明確標記未驗證的 review cut，`fit_with_background` 才產生保全全部內容的純色補邊；兩者都不算 production geometry success。
 
 這個設計也控制成本：Top-K 是同一次 planner 回應中的 2–4 個備選，不是把每支影片重送 K 次。Clip Card 可跨 brief 重用；planner 預設只允許一次 text-only Structured Output request，`--repair-attempts` 預設為 `0`。bbox／SAM geometry 採 lazy evaluation，只有已選 chapter 的候選才依序執行，遇到第一個通過 preflight 的候選就停止。Predicate refinement 也是明確指令才執行的一次局部 image call，不會在 Grounding 內暗中 repair；同一 identity＋exact frame 可在 framing 改變後重用 bbox。每次 model request、raw response、usage、prompt/schema/model fingerprint，以及每個候選的嘗試與 geometry fingerprint 都會保存；重跑時每次 response 另存 immutable attempt，canonical 檔不再覆蓋歷史成本。計價會把 `total_cached_tokens` 依 cached-input 牌價和一般 input 分開計算；若某份 response 沒有 usage，會列為未計價 request 並把總額標成不完整下限，不會當成免費。失敗候選仍可能增加 Grounding 費用與 SAM 時間，因此成本報告須以實際 raw usage 與本機 tracker timing 為準，不能只用候選數乘固定牌價。
 

@@ -56,6 +56,7 @@ from jascue_video_lab.feature_cut import (
     _validate_shared_sam_session_cache,
     _vertical_crop_geometry,
     _vertical_center_crop_filter,
+    _vertical_delivery_fallback,
     _vertical_filter_from_track,
     _vertical_fit_filter,
     _vertical_virtual_camera_filter_from_tracks,
@@ -1903,7 +1904,7 @@ def test_gemini_virtual_camera_proposal_preserves_observed_anchor_order() -> Non
     assert "Visible predicate" in phases[0].editorial_reason
 
 
-def test_selected_framing_cannot_split_simultaneous_relation() -> None:
+def test_selected_framing_allows_scale_locked_sequential_comparison() -> None:
     sequential = VerticalVirtualCameraProposal(
         composition_mode="sequential_focus",
         phases=[
@@ -1926,31 +1927,88 @@ def test_selected_framing_cannot_split_simultaneous_relation() -> None:
                 editorial_reason="Show the second subject.",
             ),
         ],
-        proposal_reason="Invalidly separates a required simultaneous relation.",
+        proposal_reason="Show both comparison subjects at one consistent scale.",
     )
-    with pytest.raises(ValidationError, match="simultaneous relation"):
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="candidate-a",
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="event-a",
+        frame_id="RF000001",
+        semantic_requirement="simultaneous_relation",
+        recommended_action="tracked_crop",
+        regions=[
+            {
+                "region_id": "subject-a",
+                "target_description": "the first visible subject",
+                "role": "required",
+            },
+            {
+                "region_id": "subject-b",
+                "target_description": "the second visible subject",
+                "role": "required",
+            },
+        ],
+        virtual_camera_proposal=sequential,
+        observed_evidence=["Both subjects are visible in the same source shot."],
+        decision_reason="The same-scale views support a sequential comparison.",
+        confidence=0.8,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    assert proposal.virtual_camera_proposal == sequential
+
+
+def test_sequential_comparison_rejects_scale_changing_phase() -> None:
+    sequential = VerticalVirtualCameraProposal(
+        composition_mode="sequential_focus",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="first",
+                start_progress=0.0,
+                end_progress=0.5,
+                anchor_region_ids=["subject-a"],
+                observable_predicate="The first subject is visible.",
+                transition_condition="Attention moves to the second subject.",
+                editorial_reason="Show the first subject.",
+                camera_behavior="push_in",
+            ),
+            VerticalVirtualCameraProposalPhase(
+                phase_id="second",
+                start_progress=0.5,
+                end_progress=1.0,
+                anchor_region_ids=["subject-b"],
+                observable_predicate="The second subject is visible.",
+                transition_condition="Hold to the end.",
+                editorial_reason="Show the second subject.",
+            ),
+        ],
+        proposal_reason="An invalid comparison that changes scale.",
+    )
+    with pytest.raises(ValidationError, match="scale-preserving"):
         SelectedVerticalFramingProposal(
-            candidate_id="candidate-a",
-            source_asset_id="sha256:" + "a" * 64,
-            event_id="event-a",
+            candidate_id="candidate-scale-change",
+            source_asset_id="sha256:" + "e" * 64,
+            event_id="event-scale-change",
             frame_id="RF000001",
             semantic_requirement="simultaneous_relation",
             recommended_action="tracked_crop",
             regions=[
                 {
-                    "region_id": "subject-a",
-                    "target_description": "the first visible subject",
+                    "region_id": region_id,
+                    "target_description": f"the {region_id} visible subject",
                     "role": "required",
-                },
-                {
-                    "region_id": "subject-b",
-                    "target_description": "the second visible subject",
-                    "role": "required",
-                },
+                }
+                for region_id in ("subject-a", "subject-b")
             ],
             virtual_camera_proposal=sequential,
-            observed_evidence=["Both subjects are visible together."],
-            decision_reason="The relation requires both at once.",
+            observed_evidence=["Both subjects are visible."],
+            decision_reason="Changing scale would invalidate the comparison.",
             confidence=0.8,
             model_provenance=ModelProvenance(
                 model_id=MODEL_ID,
@@ -1961,6 +2019,62 @@ def test_selected_framing_cannot_split_simultaneous_relation() -> None:
                 generated_at="test",
             ),
         )
+
+
+def test_selected_framing_allows_overlapping_multi_subject_handoff() -> None:
+    sequential = VerticalVirtualCameraProposal(
+        composition_mode="sequential_focus",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="left-center",
+                start_progress=0.0,
+                end_progress=0.5,
+                anchor_region_ids=["left", "center"],
+                observable_predicate="The left and center subjects are visible.",
+                transition_condition="Attention moves toward the right.",
+                editorial_reason="Establish the group with an overlapping anchor.",
+            ),
+            VerticalVirtualCameraProposalPhase(
+                phase_id="center-right",
+                start_progress=0.5,
+                end_progress=1.0,
+                anchor_region_ids=["center", "right"],
+                observable_predicate="The center and right subjects are visible.",
+                transition_condition="Hold to the end.",
+                editorial_reason="Preserve the center subject across the handoff.",
+            ),
+        ],
+        proposal_reason="The shared center anchor preserves the group relation.",
+    )
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="candidate-overlap",
+        source_asset_id="sha256:" + "d" * 64,
+        event_id="event-overlap",
+        frame_id="RF000001",
+        semantic_requirement="simultaneous_relation",
+        recommended_action="tracked_crop",
+        regions=[
+            {
+                "region_id": region_id,
+                "target_description": f"the {region_id} visible subject",
+                "role": "required",
+            }
+            for region_id in ("left", "center", "right")
+        ],
+        virtual_camera_proposal=sequential,
+        observed_evidence=["Three subjects form one visible group."],
+        decision_reason="Overlapping phases preserve the group relationship.",
+        confidence=0.8,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    assert proposal.virtual_camera_proposal == sequential
 
 
 def test_selected_vertical_framing_runs_once_then_reuses_content_cache(
@@ -2081,6 +2195,7 @@ def test_selected_vertical_framing_runs_once_then_reuses_content_cache(
         prompt_template="generic framing prompt",
         catalog_path=tmp_path / "catalog.json",
         output_dir=tmp_path / "artifacts",
+        vertical_fallback_strategy="center_crop",
     )
     second, second_proposal, second_reused = _refine_selected_vertical_candidate(
         client=client,  # type: ignore[arg-type]
@@ -2091,6 +2206,7 @@ def test_selected_vertical_framing_runs_once_then_reuses_content_cache(
         prompt_template="generic framing prompt",
         catalog_path=tmp_path / "catalog.json",
         output_dir=tmp_path / "artifacts",
+        vertical_fallback_strategy="center_crop",
     )
 
     assert first["strategy"] == "tracked_crop"
@@ -3964,6 +4080,32 @@ def test_vertical_fallback_filters_are_aspect_preserving_on_tall_sources() -> No
     assert "gblur" not in fit_filter
     assert "color=0x0b0e12" in fit_filter
     assert "y=(ih-oh)/2" in center_filter
+
+
+def test_explicit_center_crop_delivery_fallback_stays_full_bleed_and_audited() -> None:
+    filter_graph, audit = _vertical_delivery_fallback(
+        "center_crop",
+        reason="all_automatic_candidates_exhausted",
+    )
+
+    assert "force_original_aspect_ratio=increase" in filter_graph
+    assert "pad=1080:1920" not in filter_graph
+    assert audit["applied_strategy"] == "full_bleed_center_crop_review"
+    assert audit["full_bleed"] is True
+    assert audit["requires_gemini_review"] is True
+    assert "unverified_center_crop" in audit["risk_codes"]
+
+
+def test_scope_preserving_delivery_fallback_remains_available_by_request() -> None:
+    filter_graph, audit = _vertical_delivery_fallback(
+        "fit_with_background",
+        reason="atomic_relation_cannot_be_cropped",
+    )
+
+    assert "force_original_aspect_ratio=decrease" in filter_graph
+    assert "pad=1080:1920" in filter_graph
+    assert audit["applied_strategy"] == "fit_with_solid_matte"
+    assert audit["full_bleed"] is False
 
 
 def test_required_scope_fit_removes_only_space_outside_all_sampled_unions() -> None:

@@ -99,6 +99,38 @@ def test_selected_vertical_framing_repairs_camera_phase_representation() -> None
     assert changes
 
 
+def test_selected_vertical_framing_repairs_joint_hold_mode() -> None:
+    canonical, changes = canonicalize_selected_vertical_framing_output(
+        json.dumps(
+            {
+                "semantic_requirement": "simultaneous_relation",
+                "recommended_action": "tracked_crop",
+                "regions": [
+                    {"region_id": "reference", "role": "required"},
+                    {"region_id": "subject", "role": "required"},
+                ],
+                "virtual_camera_proposal": {
+                    "composition_mode": "single_anchor_hold",
+                    "phases": [
+                        {
+                            "phase_id": "comparison",
+                            "anchor_region_ids": ["reference", "subject"],
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    payload = json.loads(canonical)
+    assert (
+        payload["virtual_camera_proposal"]["composition_mode"]
+        == "joint_relation"
+    )
+    assert changes[0]["reason"].startswith(
+        "multiple_simultaneous_evidence_anchors"
+    )
+
+
 def test_feature_plan_single_candidate_lists_use_legacy_projection() -> None:
     canonical, changes = canonicalize_feature_edit_plan_output(
         json.dumps(

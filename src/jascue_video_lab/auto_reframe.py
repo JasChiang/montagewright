@@ -147,6 +147,7 @@ class AutoReframePolicy(StrictModel):
         default=7200.0, gt=0.0
     )
     require_semantic_checkpoints_for_tracked_crop: bool = True
+    soft_extent_below_minimum_is_failure: bool = True
     # A center crop is not safe merely because it is deterministic.  Automatic
     # routing may only use it when a caller explicitly opts in *and* supplies
     # the same region/track preflight as any other presentation.
@@ -169,6 +170,7 @@ class AutoBoundedClipAudit(StrictModel):
     approved: bool
     auto_bounded_clip_applied: bool
     failure_codes: list[FailureCode]
+    advisory_codes: list[FailureCode] = Field(default_factory=list)
     geometry_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     track_fingerprints: list[str]
@@ -220,7 +222,10 @@ def failure_codes_for_preflight(
         failures.append(FailureCode.IDENTITY_SWITCH_DETECTED)
     elif checkpoint_status == SemanticCheckpointStatus.AMBIGUOUS:
         failures.append(FailureCode.IDENTITY_VERIFICATION_AMBIGUOUS)
-    elif checkpoint_status == SemanticCheckpointStatus.REQUIRED_PENDING:
+    elif (
+        checkpoint_required
+        and checkpoint_status == SemanticCheckpointStatus.REQUIRED_PENDING
+    ):
         failures.append(FailureCode.IDENTITY_VERIFICATION_PENDING)
     elif (
         checkpoint_required
@@ -240,9 +245,13 @@ def failure_codes_for_preflight(
                 if region.atomic
                 else FailureCode.HARD_CORE_NOT_FULLY_RETAINED
             )
-        if region.role == "soft_extent" and (
+        if (
+            policy.soft_extent_below_minimum_is_failure
+            and region.role == "soft_extent"
+            and (
             region.minimum_visible_fraction + 1e-6
             < region.required_visible_fraction
+            )
         ):
             failures.append(FailureCode.SOFT_EXTENT_BELOW_MINIMUM)
         if region.role == "overlay_keepout" and region.overlay_overlap_fraction > 0:
@@ -287,6 +296,24 @@ def audit_auto_bounded_clip(
         region.role == "soft_extent" and region.minimum_visible_fraction < 1.0
         for region in preflight.regions
     )
+    advisory_codes: list[FailureCode] = []
+    if (
+        not policy.require_semantic_checkpoints_for_tracked_crop
+        and preflight.presentation == "tracked_crop"
+        and preflight.semantic_checkpoint_status
+        == SemanticCheckpointStatus.REQUIRED_PENDING
+    ):
+        advisory_codes.append(FailureCode.IDENTITY_VERIFICATION_PENDING)
+    if (
+        not policy.soft_extent_below_minimum_is_failure
+        and any(
+            region.role == "soft_extent"
+            and region.minimum_visible_fraction + 1e-6
+            < region.required_visible_fraction
+            for region in preflight.regions
+        )
+    ):
+        advisory_codes.append(FailureCode.SOFT_EXTENT_BELOW_MINIMUM)
     body = {
         "policy_id": policy.policy_id,
         "policy_sha256": policy.definition_sha256(),
@@ -295,6 +322,7 @@ def audit_auto_bounded_clip(
         "approved": not failures,
         "auto_bounded_clip_applied": not failures and clipped_soft_extent,
         "failure_codes": [failure.value for failure in failures],
+        "advisory_codes": [code.value for code in advisory_codes],
         "geometry_fingerprint": preflight.geometry_fingerprint,
         "source_fingerprint": preflight.source_fingerprint,
         "track_fingerprints": preflight.track_fingerprints,
