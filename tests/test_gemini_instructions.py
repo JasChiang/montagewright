@@ -254,6 +254,74 @@ def test_feature_plan_missing_aspect_fails_closed_without_projection(
     assert payload["chapters"][0]["vertical_frame_id"] == "RF000001"
 
 
+def test_feature_plan_rf_ids_are_catalog_bound_in_response_schema() -> None:
+    legal_ids = ["RF000001", "RF000002"]
+    schema = gemini_module._feature_edit_plan_response_schema(legal_ids)
+    chapter_schema = schema["$defs"]["FeatureChapterSelect"]
+    properties = chapter_schema["properties"]
+    for field_name in ("horizontal_frame_id", "vertical_frame_id"):
+        assert properties[field_name] == {
+            "type": "string",
+            "enum": [*legal_ids, "RF_NONE"],
+        }
+        assert field_name in chapter_schema["required"]
+
+    for definition in ("FeatureHorizontalCandidate", "FeatureVerticalCandidate"):
+        frame_schema = schema["$defs"][definition]["properties"]["frame_id"]
+        assert frame_schema["enum"] == legal_ids
+
+    for field_name in (
+        "horizontal_camera_intent",
+        "duration_rationale",
+        "attention_observation",
+    ):
+        assert field_name in chapter_schema["required"]
+
+
+def test_feature_plan_not_found_transport_sentinel_becomes_local_null() -> None:
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "not_found",
+                        "horizontal_frame_id": "RF_NONE",
+                        "vertical_frame_id": "RF_NONE",
+                    }
+                ]
+            }
+        )
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+    assert chapter["horizontal_frame_id"] is None
+    assert chapter["vertical_frame_id"] is None
+    assert changes[0]["rule"] == "not_found_transport_sentinel_to_local_null"
+
+
+def test_feature_plan_attention_review_gate_is_system_owned() -> None:
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "horizontal_frame_id": "RF000001",
+                        "vertical_frame_id": "RF000002",
+                        "attention_observation": {
+                            "requires_human_review": False,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+    attention = json.loads(canonical)["chapters"][0]["attention_observation"]
+    assert attention["requires_human_review"] is True
+    assert changes[0]["rule"] == (
+        "system_owned_attention_review_gate_is_always_true"
+    )
+
+
 def test_feature_plan_raw_reuse_accepts_exact_causal_binding_without_api(
     tmp_path: Path,
 ) -> None:

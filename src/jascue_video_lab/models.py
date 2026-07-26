@@ -3067,7 +3067,11 @@ class RushClip(StrictModel):
 
 
 class RushFrame(StrictModel):
-    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    frame_id: str = Field(
+        pattern=r"^RF[0-9]{6}$",
+        min_length=8,
+        max_length=8,
+    )
     clip_id: str
     requested_time_ms: int = Field(ge=0)
     image_path: str
@@ -3242,7 +3246,11 @@ class FeatureHorizontalCandidate(StrictModel):
     rank: int = Field(ge=1, le=4)
     source_asset_id: str = Field(min_length=1)
     event_id: str = Field(min_length=1)
-    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    frame_id: str = Field(
+        pattern=r"^RF[0-9]{6}$",
+        min_length=8,
+        max_length=8,
+    )
     observed_visual_evidence: str = Field(min_length=1)
     selection_reason: str = Field(min_length=1)
     strategy: Literal["original", "tracked_reframe"]
@@ -3382,8 +3390,18 @@ class FeatureEditBrief(StrictModel):
 class FeatureChapterSelect(StrictModel):
     feature_id: str
     evidence_status: Literal["supported", "partial", "not_found"]
-    horizontal_frame_id: str | None = Field(default=None, pattern=r"^RF[0-9]{6}$")
-    vertical_frame_id: str | None = Field(default=None, pattern=r"^RF[0-9]{6}$")
+    horizontal_frame_id: str | None = Field(
+        default=None,
+        pattern=r"^RF[0-9]{6}$",
+        min_length=8,
+        max_length=8,
+    )
+    vertical_frame_id: str | None = Field(
+        default=None,
+        pattern=r"^RF[0-9]{6}$",
+        min_length=8,
+        max_length=8,
+    )
     observed_visual_evidence: str
     selection_reason: str
     horizontal_strategy: Literal["original", "tracked_reframe"]

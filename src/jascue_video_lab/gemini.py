@@ -340,9 +340,33 @@ def canonicalize_feature_edit_plan_output(
     for chapter_index, chapter in enumerate(chapters):
         if not isinstance(chapter, dict):
             continue
-        if chapter.get("evidence_status") in {"supported", "partial"}:
-            horizontal_frame = chapter.get("horizontal_frame_id")
-            vertical_frame = chapter.get("vertical_frame_id")
+        evidence_status = chapter.get("evidence_status")
+        horizontal_frame = chapter.get("horizontal_frame_id")
+        vertical_frame = chapter.get("vertical_frame_id")
+        if evidence_status == "not_found":
+            if horizontal_frame == "RF_NONE" and vertical_frame == "RF_NONE":
+                chapter["horizontal_frame_id"] = None
+                chapter["vertical_frame_id"] = None
+                changes.append(
+                    {
+                        "json_path": f"$.chapters[{chapter_index}]",
+                        "before": {
+                            "horizontal_frame_id": "RF_NONE",
+                            "vertical_frame_id": "RF_NONE",
+                        },
+                        "after": {
+                            "horizontal_frame_id": None,
+                            "vertical_frame_id": None,
+                        },
+                        "rule": "not_found_transport_sentinel_to_local_null",
+                    }
+                )
+            elif horizontal_frame is not None or vertical_frame is not None:
+                raise ValueError(
+                    "not_found feature chapter must use RF_NONE for both "
+                    f"aspect frames (chapter_index={chapter_index})"
+                )
+        elif evidence_status in {"supported", "partial"}:
             if horizontal_frame is None or vertical_frame is None:
                 raise ValueError(
                     "supported/partial feature chapter is missing an aspect-specific "
@@ -350,6 +374,23 @@ def canonicalize_feature_edit_plan_output(
                     "cannot be canonicalized without human review "
                     f"(chapter_index={chapter_index})"
                 )
+        attention = chapter.get("attention_observation")
+        if isinstance(attention, dict) and attention.get(
+            "requires_human_review"
+        ) is not True:
+            before = attention.get("requires_human_review")
+            attention["requires_human_review"] = True
+            changes.append(
+                {
+                    "json_path": (
+                        f"$.chapters[{chapter_index}]."
+                        "attention_observation.requires_human_review"
+                    ),
+                    "before": before,
+                    "after": True,
+                    "rule": "system_owned_attention_review_gate_is_always_true",
+                }
+            )
         for field in ("horizontal_candidates", "vertical_candidates"):
             candidates = chapter.get(field)
             if isinstance(candidates, list) and len(candidates) == 1:
@@ -368,6 +409,59 @@ def canonicalize_feature_edit_plan_output(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         changes,
     )
+
+
+def _feature_edit_plan_response_schema(frame_ids: list[str]) -> dict[str, Any]:
+    """Bind every editable RF reference to the catalog's immutable ID set.
+
+    Interactions structured output does not accept Pydantic's string pattern
+    and length keywords, so local validation alone cannot stop a generated ID
+    from growing or drifting.  JSON Schema ``enum`` is supported and expresses
+    the actual contract more precisely: the model may only copy an RF ID that
+    the current catalog contains.
+    """
+
+    legal_ids = list(dict.fromkeys(frame_ids))
+    if not legal_ids or any(
+        re.fullmatch(r"RF[0-9]{6}", frame_id) is None for frame_id in legal_ids
+    ):
+        raise ValueError("feature edit schema requires legal immutable RF frame IDs")
+
+    schema = gemini_response_schema(FeatureEditPlan)
+
+    def bind_string_enum(definition: str, field_name: str) -> None:
+        field_schema = schema["$defs"][definition]["properties"][field_name]
+        variants = field_schema.get("anyOf")
+        if isinstance(variants, list):
+            string_schema = next(
+                item for item in variants if item.get("type") == "string"
+            )
+        else:
+            string_schema = field_schema
+        string_schema["enum"] = legal_ids
+
+    chapter_schema = schema["$defs"]["FeatureChapterSelect"]
+    chapter_required = chapter_schema.setdefault("required", [])
+    for field_name in ("horizontal_frame_id", "vertical_frame_id"):
+        # The wire contract uses an explicit string sentinel so structured
+        # output cannot silently omit one aspect.  Canonicalization converts
+        # the sentinel to local null only for a genuine not_found chapter.
+        chapter_schema["properties"][field_name] = {
+            "type": "string",
+            "enum": [*legal_ids, "RF_NONE"],
+        }
+        if field_name not in chapter_required:
+            chapter_required.append(field_name)
+    for field_name in (
+        "horizontal_camera_intent",
+        "duration_rationale",
+        "attention_observation",
+    ):
+        if field_name not in chapter_required:
+            chapter_required.append(field_name)
+    bind_string_enum("FeatureHorizontalCandidate", "frame_id")
+    bind_string_enum("FeatureVerticalCandidate", "frame_id")
+    return schema
 
 
 class GeminiContractError(RuntimeError):
@@ -2509,6 +2603,14 @@ model_provenance (return it unchanged with interaction_id=null):
                 ensure_ascii=False,
             )
             + "\n"
+            + "所有 frame ID 都必須逐字複製為恰好八個字元：RF 加六位數字。"
+            + "不得延長、附註、重複字元或創造清單外 ID。supported／partial "
+            + "章節必須同時回傳 horizontal_frame_id 與 vertical_frame_id；"
+            + "即使兩個比例選用同一張 evidence frame，也要在兩欄各自逐字回傳。"
+            + "not_found 才能在兩欄都回傳 RF_NONE；其他狀態不得使用 RF_NONE。"
+            + "每個 supported／partial 章節都必須回傳非 null 的 "
+            + "attention_observation、duration_rationale 與 "
+            + "horizontal_camera_intent；這些是可審核提案，不是精確 cut point。\n"
             + "chapters 必須依 brief 順序完整回傳，一個 feature_id 恰好一次。\n"
             + "每章原先的手填秒數已從下方 model-facing brief 移除，避免形成硬性"
             + "停留規則。請依實際媒體、brief 與音樂（若有）提出相對停留長度；"
@@ -2533,7 +2635,9 @@ model_provenance (return it unchanged with interaction_id=null):
         raw_binding_path = (
             run_dir / _FEATURE_PLAN_RAW_REUSE_BINDING_FILENAME
         )
-        response_schema = gemini_response_schema(FeatureEditPlan)
+        response_schema = _feature_edit_plan_response_schema(
+            [frame.frame_id for frame in catalog.frames]
+        )
         if reuse_raw_output:
             if not all(
                 path.exists()
