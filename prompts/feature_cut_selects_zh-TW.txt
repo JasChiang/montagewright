@@ -16,6 +16,8 @@
 4. 如果精確功能 UI 沒有被 2 秒 sampling 捕捉，但有相近產品／操作 B-roll，使用 `partial`，並清楚寫明差距。
 5. 完全沒有合理畫面則使用 `not_found`，兩個 frame ID 都回傳 null；不得拿相近但不符合事件條件的素材假裝是直接證據。
 6. 對 supported／partial chapter 提出 `recommended_duration_seconds` 與 `duration_rationale`。停留長度必須依本次畫面真正包含的資訊量、動作 setup／action／result、brief 中的敘事重要性，以及本次實際提供的音樂流動綜合判斷；不得套用「靜態畫面固定幾秒」或「動作畫面固定幾秒」之類的硬規則。這只是相對剪輯建議，不是原片 timestamp；本機會依總長、shot、原始 PTS 與合法 handles 校正。
+   - 同時填寫 `attention_observation`，分開評估 semantic novelty、動作在片段結尾是否已完成、visual motion、composition change、reading load、尚未解決的動作／懸念、刻意停留價值、重複壓力與音樂轉場機會。每個值 0–1，只代表本次可見證據下的相對判斷，不是客觀真值。
+   - `minimum_dwell_seconds` 是辨認主體、看懂必要文字、完成動作或保留必要情緒停頓所需的下限；`maximum_dwell_seconds` 是在資訊開始重複前仍合理的上限。`recommended_duration_seconds` 必須位於兩者之間。全部仍是待審 editorial proposal，不是 source timestamp。
 7. 不同 chapter 原則上應選不同 source clip／take。只有同一來源的另一段確實提供不可替代、且視覺上有意義不同的證據時才可重用，並填寫 `source_reuse_justification`。不得只因第一候選 confidence 較高而重複使用幾乎相同的構圖。
 
 使用者 brief 的規格文字是允許顯示的 editorial copy，但不是你從影片觀察到的證據。不要因為 brief 寫了某功能，就謊稱畫面中確實看見。
@@ -24,6 +26,7 @@
 
 - 全景、兩人分居左右、完整產品陳列或本來構圖已緊密：`horizontal_strategy=original`、`horizontal_zoom_intent=none`。
 - 若有一個明確且可持續辨識的實例或局部值得在高解析原片內做安全 punch-in：使用 `tracked_reframe`，並以 `subtle` 或 `detail` 表示剪輯意圖。
+- `horizontal_camera_intent` 只描述剪輯意圖：`hold` 保持穩定、`follow` 只隨目標移動、`punch_in_cut` 以硬切改成近景、`push_in`／`pull_out` 是短而有目的的漸進運鏡、`recenter` 是重新置中。`pan_reveal` 只有畫面存在兩個可區分且需交接的 anchor 時才可使用。不要輸出像素座標或倍率。
 - `subtle` 只是輕微強調；`detail` 才是指定局部或關鍵狀態。實際倍率由本機依 mask、移動範圍、安全 margin 與來源／輸出解析度上限計算，你不要輸出 zoom 數字。
 - `horizontal_target_description` 必須指定要持續保留的實例與層級。SAM 只提供 geometry，不能替代剪輯意圖。
 

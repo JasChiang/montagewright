@@ -1670,6 +1670,191 @@ class CandidateCapacity(StrictModel):
         return self
 
 
+class AttentionChapterProfile(StrictModel):
+    """One chapter's attention evidence and executable dwell envelope."""
+
+    feature_id: str = Field(pattern=r"^[a-z0-9_-]+$")
+    evidence_authority: Literal[
+        "gemini_attention_observation",
+        "gemini_relative_dwell_legacy",
+        "brief_fallback",
+    ]
+    semantic_novelty: float | None = Field(default=None, ge=0.0, le=1.0)
+    action_progress: float | None = Field(default=None, ge=0.0, le=1.0)
+    visual_motion: float | None = Field(default=None, ge=0.0, le=1.0)
+    composition_change: float | None = Field(default=None, ge=0.0, le=1.0)
+    reading_load: float | None = Field(default=None, ge=0.0, le=1.0)
+    unresolved_tension: float | None = Field(default=None, ge=0.0, le=1.0)
+    emotional_hold_value: float | None = Field(default=None, ge=0.0, le=1.0)
+    repetition_pressure: float | None = Field(default=None, ge=0.0, le=1.0)
+    music_transition_opportunity: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    minimum_dwell_seconds: float = Field(gt=0.0)
+    preferred_dwell_seconds: float = Field(gt=0.0)
+    maximum_dwell_seconds: float = Field(gt=0.0)
+    quality_safe_capacity_seconds: float | None = Field(default=None, ge=0.0)
+    rationale: str = Field(min_length=1)
+    uncertainties: list[str]
+    requires_human_review: bool
+
+    @model_validator(mode="after")
+    def validate_attention_profile(self) -> "AttentionChapterProfile":
+        if not (
+            self.minimum_dwell_seconds
+            <= self.preferred_dwell_seconds
+            <= self.maximum_dwell_seconds
+        ):
+            raise ValueError(
+                "attention dwell must satisfy minimum <= preferred <= maximum"
+            )
+        if (
+            self.quality_safe_capacity_seconds is not None
+            and self.maximum_dwell_seconds
+            > self.quality_safe_capacity_seconds + 0.001
+        ):
+            raise ValueError("attention maximum exceeds quality-safe capacity")
+        metrics = (
+            self.semantic_novelty,
+            self.action_progress,
+            self.visual_motion,
+            self.composition_change,
+            self.reading_load,
+            self.unresolved_tension,
+            self.emotional_hold_value,
+            self.repetition_pressure,
+            self.music_transition_opportunity,
+        )
+        if self.evidence_authority == "gemini_attention_observation":
+            if any(value is None for value in metrics):
+                raise ValueError("Gemini attention profiles require the full vector")
+        elif any(value is not None for value in metrics):
+            raise ValueError("legacy attention profiles cannot invent vector values")
+        return self
+
+
+class AttentionProfile(StrictModel):
+    contract_version: Literal["attention-profile-v1"] = "attention-profile-v1"
+    project_id: str
+    source_brief_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_feature_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    chapters: list[AttentionChapterProfile] = Field(min_length=1)
+    generated_at: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_attention_chapters(self) -> "AttentionProfile":
+        ids = [chapter.feature_id for chapter in self.chapters]
+        if len(ids) != len(set(ids)):
+            raise ValueError("attention profile chapter IDs must be unique")
+        return self
+
+
+class RhythmChapterPlan(StrictModel):
+    feature_id: str = Field(pattern=r"^[a-z0-9_-]+$")
+    minimum_duration_seconds: float = Field(gt=0.0)
+    preferred_duration_seconds: float = Field(gt=0.0)
+    maximum_duration_seconds: float = Field(gt=0.0)
+    cut_pressure: float | None = Field(default=None, ge=0.0, le=1.0)
+    boundary_priority: Literal["low", "normal", "high"]
+    protected_reasons: list[str]
+    transition_reasons: list[str]
+    evidence_authority: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_rhythm_durations(self) -> "RhythmChapterPlan":
+        if not (
+            self.minimum_duration_seconds
+            <= self.preferred_duration_seconds
+            <= self.maximum_duration_seconds
+        ):
+            raise ValueError(
+                "rhythm durations must satisfy minimum <= preferred <= maximum"
+            )
+        return self
+
+
+class RhythmPlan(StrictModel):
+    contract_version: Literal["rhythm-plan-v1"] = "rhythm-plan-v1"
+    project_id: str
+    style_profile: Literal["calm", "standard", "energetic"]
+    target_duration_seconds: float = Field(gt=0.0)
+    attention_profile_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    chapters: list[RhythmChapterPlan] = Field(min_length=1)
+    interpretation: Literal[
+        "attention_bounds_and_boundary_pressure_not_frame_accurate_cuts"
+    ] = "attention_bounds_and_boundary_pressure_not_frame_accurate_cuts"
+    generated_at: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_rhythm_chapters(self) -> "RhythmPlan":
+        ids = [chapter.feature_id for chapter in self.chapters]
+        if len(ids) != len(set(ids)):
+            raise ValueError("rhythm plan chapter IDs must be unique")
+        if sum(chapter.minimum_duration_seconds for chapter in self.chapters) > (
+            self.target_duration_seconds + 0.001
+        ):
+            raise ValueError("rhythm minimum durations exceed project duration")
+        if sum(chapter.maximum_duration_seconds for chapter in self.chapters) + (
+            0.001
+        ) < self.target_duration_seconds:
+            raise ValueError("rhythm maximum durations cannot fill project duration")
+        return self
+
+
+class VirtualCameraKeyframe(StrictModel):
+    time_seconds: float = Field(ge=0.0)
+    source_pts: int | None = None
+    scale: float = Field(ge=1.0)
+    center_x_normalized: float = Field(ge=0.0, le=1000.0)
+    center_y_normalized: float = Field(ge=0.0, le=1000.0)
+
+
+class VirtualCameraPlan(StrictModel):
+    contract_version: Literal["virtual-camera-plan-v1"] = "virtual-camera-plan-v1"
+    requested_intent: VirtualCameraIntent
+    applied_intent: VirtualCameraIntent
+    anchor_target_ids: list[str]
+    keyframes: list[VirtualCameraKeyframe] = Field(min_length=1)
+    easing: Literal["hold", "linear", "smoothstep", "cut"]
+    geometry_safe_max_scale: float = Field(ge=1.0)
+    source_resolution_native_scale_limit: float = Field(ge=1.0)
+    source_resolution_upscale_required: bool
+    max_velocity: float = Field(ge=0.0)
+    max_acceleration: float = Field(ge=0.0)
+    max_jerk: float = Field(ge=0.0)
+    execution_status: Literal["applied", "fallback", "blocked"]
+    fallback_reason: str | None = None
+    editorial_reason: str = Field(min_length=1)
+    source_track_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_virtual_camera(self) -> "VirtualCameraPlan":
+        times = [keyframe.time_seconds for keyframe in self.keyframes]
+        if times != sorted(set(times)):
+            raise ValueError("virtual-camera keyframe times must be strictly increasing")
+        if self.execution_status == "applied" and self.fallback_reason is not None:
+            raise ValueError("applied virtual-camera plans cannot have a fallback reason")
+        if self.execution_status != "applied" and not self.fallback_reason:
+            raise ValueError("non-applied virtual-camera plans require a reason")
+        if self.requested_intent == "pan_reveal" and len(self.anchor_target_ids) < 2:
+            if self.execution_status == "applied":
+                raise ValueError(
+                    "pan reveal requires two anchors or a non-applied plan"
+                )
+        if max(keyframe.scale for keyframe in self.keyframes) > (
+            self.geometry_safe_max_scale + 0.001
+        ):
+            raise ValueError("virtual-camera scale exceeds geometry-safe limit")
+        expected_upscale = max(
+            keyframe.scale for keyframe in self.keyframes
+        ) > (self.source_resolution_native_scale_limit + 0.001)
+        if self.source_resolution_upscale_required != expected_upscale:
+            raise ValueError(
+                "source-resolution upscale flag disagrees with camera scales"
+            )
+        return self
+
+
 TrimTailIntent = Literal[
     "none",
     "natural_pause",
@@ -3014,6 +3199,42 @@ class FramingRegionIntent(StrictModel):
         return self.minimum_visible_fraction if self.minimum_visible_fraction is not None else 0.72
 
 
+VirtualCameraIntent = Literal[
+    "hold",
+    "follow",
+    "punch_in_cut",
+    "push_in",
+    "pull_out",
+    "pan_reveal",
+    "recenter",
+]
+
+
+class AttentionObservation(StrictModel):
+    """Gemini's reviewable editorial-attention vector, never a cut point."""
+
+    semantic_novelty: float = Field(ge=0.0, le=1.0)
+    action_progress: float = Field(ge=0.0, le=1.0)
+    visual_motion: float = Field(ge=0.0, le=1.0)
+    composition_change: float = Field(ge=0.0, le=1.0)
+    reading_load: float = Field(ge=0.0, le=1.0)
+    unresolved_tension: float = Field(ge=0.0, le=1.0)
+    emotional_hold_value: float = Field(ge=0.0, le=1.0)
+    repetition_pressure: float = Field(ge=0.0, le=1.0)
+    music_transition_opportunity: float = Field(ge=0.0, le=1.0)
+    minimum_dwell_seconds: float = Field(ge=0.5, le=15.0)
+    maximum_dwell_seconds: float = Field(ge=0.5, le=15.0)
+    rationale: str = Field(min_length=1, max_length=800)
+    uncertainties: list[str] = Field(default_factory=list, max_length=8)
+    requires_human_review: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_dwell_bounds(self) -> "AttentionObservation":
+        if self.maximum_dwell_seconds < self.minimum_dwell_seconds:
+            raise ValueError("attention dwell bounds must satisfy minimum <= maximum")
+        return self
+
+
 class FeatureHorizontalCandidate(StrictModel):
     """One evidence-bound 16:9 option retained for local automatic routing."""
 
@@ -3026,6 +3247,7 @@ class FeatureHorizontalCandidate(StrictModel):
     selection_reason: str = Field(min_length=1)
     strategy: Literal["original", "tracked_reframe"]
     zoom_intent: Literal["none", "subtle", "detail"]
+    camera_intent: VirtualCameraIntent = "hold"
     target_description: str | None = None
     quality_risks: list[str] = Field(default_factory=list)
     confidence: Confidence
@@ -3037,6 +3259,8 @@ class FeatureHorizontalCandidate(StrictModel):
                 raise ValueError("tracked_reframe candidate requires zoom intent and target")
         elif self.zoom_intent != "none":
             raise ValueError("original candidate must use zoom intent none")
+        if self.strategy == "original" and self.camera_intent != "hold":
+            raise ValueError("original candidate must use virtual-camera intent hold")
         return self
 
 
@@ -3164,6 +3388,7 @@ class FeatureChapterSelect(StrictModel):
     selection_reason: str
     horizontal_strategy: Literal["original", "tracked_reframe"]
     horizontal_zoom_intent: Literal["none", "subtle", "detail"]
+    horizontal_camera_intent: VirtualCameraIntent = "hold"
     horizontal_target_description: str | None
     vertical_strategy: Literal["tracked_crop", "fit_with_background"]
     vertical_target_description: str | None
@@ -3186,6 +3411,7 @@ class FeatureChapterSelect(StrictModel):
             "claim fixed pacing rules or invent unsupported content."
         ),
     )
+    attention_observation: AttentionObservation | None = None
     source_reuse_justification: str | None = Field(
         default=None,
         description=(
@@ -3208,6 +3434,19 @@ class FeatureChapterSelect(StrictModel):
             raise ValueError(
                 "recommended_duration_seconds requires duration_rationale"
             )
+        if self.attention_observation is not None:
+            if self.recommended_duration_seconds is None:
+                raise ValueError(
+                    "attention observation requires a preferred dwell recommendation"
+                )
+            if not (
+                self.attention_observation.minimum_dwell_seconds
+                <= self.recommended_duration_seconds
+                <= self.attention_observation.maximum_dwell_seconds
+            ):
+                raise ValueError(
+                    "recommended dwell must lie inside the attention observation bounds"
+                )
         if self.evidence_status == "not_found":
             if self.horizontal_frame_id is not None or self.vertical_frame_id is not None:
                 raise ValueError("not_found feature chapters cannot reference catalog frames")
@@ -3220,6 +3459,11 @@ class FeatureChapterSelect(StrictModel):
                 )
         elif self.horizontal_zoom_intent != "none":
             raise ValueError("original horizontal strategy must use zoom intent none")
+        if (
+            self.horizontal_strategy == "original"
+            and self.horizontal_camera_intent != "hold"
+        ):
+            raise ValueError("original horizontal strategy must hold the virtual camera")
         if self.vertical_strategy == "tracked_crop" and not self.vertical_target_description:
             primary_candidate = next(
                 (candidate for candidate in self.vertical_candidates if candidate.rank == 1),
@@ -3257,6 +3501,7 @@ class FeatureChapterSelect(StrictModel):
                 self.horizontal_frame_id != primary.frame_id
                 or self.horizontal_strategy != primary.strategy
                 or self.horizontal_zoom_intent != primary.zoom_intent
+                or self.horizontal_camera_intent != primary.camera_intent
                 or self.horizontal_target_description != primary.target_description
             ):
                 raise ValueError("rank-1 horizontal candidate must match legacy projection")

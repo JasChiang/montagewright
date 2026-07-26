@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +84,7 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
     assert defaults.aspect == "both"
     assert defaults.shot_quality_map == []
     assert defaults.post_render_quality_qc is True
+    assert defaults.rhythm_style == "standard"
     vertical = build_parser().parse_args(
         [
             "feature-cut",
@@ -1254,6 +1256,18 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
     brief, feature_plan, _ = project_feature_contracts(
         source_plan,
         preserve_runtime_candidates=preserve_runtime_candidates,
+    )
+    assert all(
+        selected.recommended_duration_seconds == 6
+        for selected in feature_plan.chapters
+    )
+    assert all(
+        selected.duration_rationale == "Maintain visible narrative progression."
+        for selected in feature_plan.chapters
+    )
+    assert all(
+        selected.horizontal_camera_intent == "hold"
+        for selected in feature_plan.chapters
     )
     catalog_path = tmp_path / "catalog.json"
     brief_path = tmp_path / "brief.json"
@@ -2677,6 +2691,180 @@ def test_horizontal_four_by_three_reframe_tracks_in_both_crop_axes() -> None:
     assert audit["full_containment_feasible"] is True
     assert audit["crop_coordinate_space"]["source_display_width"] == 1440
     assert audit["crop_coordinate_space"]["active_pan_axes"] == ["x", "y"]
+
+
+def test_horizontal_push_in_builds_keyframed_virtual_camera() -> None:
+    track = SimpleNamespace(
+        analysis_start_ms=0,
+        seed_source_width=1920,
+        seed_source_height=1080,
+        analysis_width=960,
+        analysis_height=540,
+        target_id="generic-subject",
+        samples=[
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                source_pts=index * 15,
+                tracking_state=TrackingState.TRACKED,
+                center_2d=[500.0, 500.0],
+                derived_tracking_box=[420, 300, 580, 700],
+            )
+            for index in range(3)
+        ],
+    )
+
+    filter_graph, audit = _horizontal_filter_from_track(  # type: ignore[arg-type]
+        track,
+        "subtle",
+        camera_intent="push_in",
+    )
+
+    camera = audit["virtual_camera_plan"]
+    assert "eval=frame" in filter_graph
+    assert camera["requested_intent"] == "push_in"
+    assert camera["applied_intent"] == "push_in"
+    assert camera["execution_status"] == "applied"
+    assert camera["anchor_target_ids"] == ["generic-subject"]
+    assert camera["keyframes"][0]["scale"] == pytest.approx(1.0)
+    assert camera["keyframes"][-1]["scale"] == pytest.approx(1.12)
+
+
+def test_horizontal_hold_uses_one_static_safe_camera_when_feasible() -> None:
+    track = SimpleNamespace(
+        analysis_start_ms=0,
+        seed_source_width=1920,
+        seed_source_height=1080,
+        analysis_width=960,
+        analysis_height=540,
+        target_id="moving-subject",
+        samples=[
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                source_pts=index * 15,
+                tracking_state=TrackingState.TRACKED,
+                center_2d=[450.0 + index * 50, 500.0],
+                derived_tracking_box=[
+                    380 + index * 50,
+                    300,
+                    520 + index * 50,
+                    700,
+                ],
+            )
+            for index in range(3)
+        ],
+    )
+
+    _, audit = _horizontal_filter_from_track(  # type: ignore[arg-type]
+        track,
+        "subtle",
+        camera_intent="hold",
+    )
+
+    camera = audit["virtual_camera_plan"]
+    assert camera["execution_status"] == "applied"
+    assert camera["applied_intent"] == "hold"
+    assert audit["stable_hold_feasible"] is True
+    assert len(set(audit["crop_x_values_pixels"])) == 1
+    assert len(set(audit["crop_y_values_pixels"])) == 1
+    assert camera["max_velocity"] == 0
+
+
+def test_pan_reveal_without_two_locks_falls_back_with_evidence() -> None:
+    track = SimpleNamespace(
+        analysis_start_ms=0,
+        seed_source_width=1920,
+        seed_source_height=1080,
+        analysis_width=960,
+        analysis_height=540,
+        target_id="first-anchor-only",
+        samples=[
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                source_pts=index * 15,
+                tracking_state=TrackingState.TRACKED,
+                center_2d=[500.0, 500.0],
+                derived_tracking_box=[420, 300, 580, 700],
+            )
+            for index in range(3)
+        ],
+    )
+
+    _, audit = _horizontal_filter_from_track(  # type: ignore[arg-type]
+        track,
+        "subtle",
+        camera_intent="pan_reveal",
+    )
+
+    camera = audit["virtual_camera_plan"]
+    assert camera["requested_intent"] == "pan_reveal"
+    assert camera["applied_intent"] == "follow"
+    assert camera["execution_status"] == "fallback"
+    assert camera["fallback_reason"] == (
+        "pan_reveal_requires_two_independently_locked_anchors"
+    )
+    assert audit["requires_gemini_review"] is True
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_virtual_camera_filter_renders_a_playable_segment(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "virtual-camera.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=0.6",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+    track = SimpleNamespace(
+        analysis_start_ms=0,
+        seed_source_width=640,
+        seed_source_height=360,
+        analysis_width=640,
+        analysis_height=360,
+        target_id="render-subject",
+        samples=[
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 300,
+                source_pts=index * 9,
+                tracking_state=TrackingState.TRACKED,
+                center_2d=[500.0, 500.0],
+                derived_tracking_box=[420, 300, 580, 700],
+            )
+            for index in range(3)
+        ],
+    )
+    filter_graph, audit = _horizontal_filter_from_track(  # type: ignore[arg-type]
+        track,
+        "subtle",
+        camera_intent="push_in",
+    )
+
+    _render_source_segment(
+        source_path=source,
+        start_ms=0,
+        end_ms=600,
+        overlay_path=None,
+        base_filter=filter_graph,
+        output_path=output,
+        source_has_audio=False,
+    )
+
+    assert output.exists()
+    assert output.stat().st_size > 0
+    assert audit["virtual_camera_plan"]["execution_status"] == "applied"
 
 
 def test_vertical_portrait_reframe_uses_track_driven_y_crop() -> None:

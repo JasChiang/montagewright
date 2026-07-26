@@ -9,10 +9,10 @@
 1. **整理素材**：程式先讀取每支影片的長度、尺寸與切鏡等基本資訊，並建立較輕量的分析版本，不必反覆處理原始 4K 檔案。
 2. **AI 看帶**：Gemini 逐支理解影片，整理成可重用的 Clip Card，記錄拍到了什麼、有哪些人物或物件、動作是否完整，以及可能適合放在哪一段。
 3. **有指定音樂就讓 AI 實際聽音樂**：本機先找精確節拍、重音、能量與段落；Gemini 的選片規劃 call 必須同時取得音樂與 brief，判斷 opening、build、peak、留白與 closing 適合承接什麼畫面。只有沒有提供音樂時，才允許純視覺選片。
-4. **提出選片與相對停留建議**：有剪輯 brief 時，AI 會同時依主題、功能、可觀察資訊量、動作是否完整及音樂 flow 挑選素材，並逐章說明相對上該多看或少看；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。系統不會因為畫面被分類成人物、產品、UI 或靜態鏡頭，就套用固定秒數。
+4. **提出選片與相對停留建議**：有剪輯 brief 時，AI 會同時依主題、可觀察資訊量、動作是否完整及音樂 flow 挑選素材；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。每段另保存 AttentionProfile，分開記錄閱讀負擔、動作進度、重複壓力、刻意停留價值等理由，再由 RhythmPlan 產生最短／偏好／最長停留範圍。系統不會因為畫面被分類成人物、產品、UI 或靜態鏡頭，就套用固定秒數。
 5. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
 6. **確認真正可用的秒數**：只對入選 shot 逐幀量測黑白格、freeze、解碼／PTS 異常及需複核的失焦、模糊與晃動，先算出連續的安全區間，再分配章節片長；不拿包含髒畫面的整個 shot 長度冒充可用容量。
-7. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。必要主體無法安全裝進滿版 9:16 時，review fallback 會先依全段 required-region envelope 去除無關外圍，再用純色 matte 補邊；不使用模糊背景，也不以中心裁切偷掉必要主體。
+7. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨目標、做有目的的 push-in／pull-out／punch-in，或避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。VirtualCameraPlan 只接受已鎖定的實例與通過 containment gate 的路徑；沒有兩個獨立 anchor 時，`pan_reveal` 會明確 fallback，不會拿單一 track 猜第二個目標。必要主體無法安全裝進滿版 9:16 時，review fallback 會先依全段 required-region envelope 去除無關外圍，再用純色 matte 補邊；不使用模糊背景，也不以中心裁切偷掉必要主體。
 8. **保留連續音樂，不拿毛片原音疊上去**：review delivery 只使用已核准的一段連續音樂，優先保留自然收尾；不把同一首歌切成數段交疊、不 time-stretch，也不混入每顆毛片原音造成突兀重疊。若畫面長度與連續音樂無法在容差內對齊，會停止而不是硬裁或 freeze 畫面。
 9. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。Gemini 可用一次有聲 16:9 call 檢查 brief、資訊停留、重複、轉場及音樂 flow；9:16 另以靜音 proxy 只檢查裁切、文字與追蹤。QA 只提出觀察，不會自行改片；真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
 
@@ -40,6 +40,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 | FFmpeg／ffprobe | 讀取片長、尺寸、旋轉與影格時間；製作 proxy、偵測切鏡、抽原始影格及輸出 review cut | 不理解人物、物件或故事 |
 | Temporal Risk Window scanner | 以本機低解析影格差異找出可能被約 1 FPS 粗取樣漏掉的短暫視覺變化，提出需要加密檢查的時間窗 | 不宣稱時間窗內一定有語意事件，也不產生剪點 |
 | ShotQualityMap／QualitySafeInterval | 只對入選 shot 以 source FPS 量測黑白格、freeze、相對失焦／模糊、晃動與 PTS／解碼異常，保存 exact PTS 證據；在分配片長前算出最長連續安全區間 | 不把測量值直接當刪除命令；rack focus、whip pan、locked shot 等意圖仍需語意或人工確認 |
+| AttentionProfile／RhythmPlan | 保存每段可見資訊、閱讀、動作、重複與情緒停留的分項理由，將 Gemini 的相對停留建議限制在 QualitySafeInterval 容量內，再決定章節邊界的低／中／高轉場壓力 | 不輸出來源 cut timestamp，不用單一「無聊分數」取代可審核的理由 |
 | Gemini File API | 上傳並暫存可重用的影片或圖片，避免同一檔案在有效期內重複上傳 | 不執行內容判斷 |
 | Gemini 3.6 Flash＋Interactions API | 看完整 proxy、建立 Clip Cards、提出選片與敘事候選；有音樂時同時聽音樂與讀 brief，判斷各章相對停留；在指定單張影格中找出目標 bbox | 不以固定類型秒數取代剪輯判斷；影片時間只適合語意搜尋，不提供 frame-accurate 剪點；單張 bbox 也不是逐幀追蹤 |
 | Pydantic Structured Output | 限制模型輸出欄位與型別，拒絕超界時間、非法 bbox 或不存在的 frame ID | Schema 合法不代表模型的內容判斷一定正確 |
@@ -49,6 +50,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 | SAM 2.1（選配） | 以人工或 Gemini bbox 作為 seed，在同一個 shot 內產生 mask 並向前、向後追蹤 | 不理解剪輯 brief，也不應跨切鏡自行延續物件身分 |
 | Identity checkpoint | 在固定預算內挑出追蹤起點／終點、遮擋後重現或幾何異常的 exact frames，再驗證是否仍為鎖定實例 | 不修改 SAM geometry，也不能用未執行的檢查冒充通過 |
 | 本機 crop solver | 根據整段 tracking、required regions 與畫面邊界計算 9:16 安全裁切路徑 | 不自行決定哪個人物或物件最重要 |
+| VirtualCameraPlan | 將已核准的 `hold`、`follow`、`punch_in_cut`、`push_in`、`pull_out`、`recenter` 等意圖投影成有 containment、速度、加速度、jerk 與來源解析度紀錄的 16:9 運鏡；每段另存 sidecar | 不用運鏡掩蓋髒畫面、不憑單一 target 自動執行雙 anchor `pan_reveal` |
 | 本機 MusicMap analyzer | 將音訊解碼成 PCM，提出 beat、accent、energy、section 與 ending-hit 候選 | 不理解歌詞、音樂情緒或剪輯 brief；BPM、第一個 downbeat 與 meter 未經真人核准不可執行 |
 | Gemini brief＋music selection planning | 使用者有給音樂時，選片 call 必須實際聽音樂並閱讀 brief，提出素材、順序、相對停留與理由 | 不直接產生精確音樂 sample、cut PTS，也不能因總長要求重複或 freeze 片段 |
 | Gemini semantic music pairing（進階選配） | 在完成選片後，再把既有 visual event ID 配對既有 music cue ID，增加語意型卡點線索 | 不重新偵測拍點、不輸出精確時間，也不能創造本機 MusicMap 沒有的 cue |
@@ -377,7 +379,9 @@ shortlisted source shot
 - `trim_candidate`：黑白格、持續 freeze 等高可信疑點；`intent=unknown` 時不進入自動容量，只有人工或語意證據確認為 `intentional` 才保留。
 - `review`：相對失焦、motion blur、camera shake 等可能是 rack focus、whip pan 或刻意手持的訊號；保留片段但標記人工複核。
 
-容量使用「最長連續安全區間」，不會把被髒畫面隔開的 4 秒與 3 秒偷偷相加成可連續使用的 7 秒。真人已核准的 Trim Intent 會在片長分配前鎖定為 exact duration；若穿過被排除的品質區間，renderer 會拒絕，而不是事後縮短、停格或延長其他髒尾巴。若 runtime 候選無法承接已規劃的長度，目前 v1 會換下一個能完整承接的 Top-K 候選或停止；尚不會在 renderer 裡靜默做全域縮時重排。
+容量使用「最長連續安全區間」，不會把被髒畫面隔開的 4 秒與 3 秒偷偷相加成可連續使用的 7 秒。例如一顆 12 秒 shot 經本機 source-FPS 掃描後，發現 `00:01–00:02` 失焦、`00:06.800–00:07.200` 被遮擋，安全區間是 `00:00–00:01`、`00:02–00:06.800`、`00:07.200–00:12`，最長連續容量就是 4.8 秒。小數時間來自 decoded frame ID 對回原始 PTS，**不是 Gemini 輸出的小數秒**；Gemini 只提供 `MM:SS` coarse window 或選擇本機建立的 immutable frame ID。
+
+真人已核准的 Trim Intent 會在片長分配前鎖定為 exact duration；若穿過被排除的品質區間，renderer 會拒絕，而不是事後縮短、停格或延長其他髒尾巴。若 runtime 候選無法承接已規劃的長度，目前 v1 會換下一個能完整承接的 Top-K 候選或停止；尚不會在 renderer 裡靜默做全域縮時重排。
 
 ```bash
 # 先保存 FFmpeg shot PTS，再只掃描入選 shot
@@ -402,6 +406,29 @@ uv run jascue-video-lab feature-cut CATALOG.json BRIEF.json \
 ```
 
 這個 scanner 是 deterministic guardrail，不是通用美學判官。focus／shake 目前仍是 shot-relative heuristic；目標是否可見與各比例是否放得下，要等 QueryLock、tracking 與 geometry preflight 才能加入 capacity。`scan-temporal-risk` 仍只負責低成本 visual-change recall，不能替代這條品質路徑。
+
+#### Attention、Rhythm 與 Virtual Camera
+
+P1 不再把 Gemini 的 `recommended_duration_seconds` 當成孤立數字。每章可另外保存一份 `attention_observation`：
+
+- `minimum_dwell_seconds`：辨認主體、讀完必要文字、完成動作或保留必要情緒所需下限。
+- `recommended_duration_seconds`：模型基於本次可見證據提出的偏好停留。
+- `maximum_dwell_seconds`：在資訊開始重複前仍合理的上限。
+- semantic novelty、action progress、reading load、unresolved tension、emotional hold、repetition pressure 與 music transition opportunity 等分項證據。
+
+本機先將 maximum clamp 到 QualitySafeInterval 的連續容量，再建立 `AttentionProfile` 與 `RhythmPlan`。RhythmPlan 只提供章節時長上下限和 boundary pressure；它沒有 source timestamp 欄位，不能自行產生 frame-accurate cut。舊 plan 沒有完整 attention vector 時，未知欄位保持 `null`，不以規則偽造模型分數。
+
+P2 將 16:9 reframe 從固定倍率升級為 `VirtualCameraPlan`。Gemini 只選 `hold`、`follow`、`punch_in_cut`、`push_in`、`pull_out`、`recenter` 或雙 anchor 的 `pan_reveal` 意圖；實際 keyframe scale、center、containment、速度、加速度與 jerk 由本機 track 和 geometry solver 決定。每個執行結果保存 sidecar 與 track fingerprint。只有一個鎖定 target 時，`pan_reveal` 會退回 `follow` 並要求 review；系統不會憑語意猜出第二條運鏡軌跡。這套 16:9 剪輯運鏡與 9:16 版型 reframe 使用相同 tracking evidence，但分屬不同 editorial contract。
+
+```bash
+uv run jascue-video-lab feature-cut CATALOG.json BRIEF.json \
+  --sam-checkpoint SAM_CHECKPOINT.pt \
+  --rhythm-style standard \
+  --shot-quality-map artifacts/quality/shot-0003.quality-map.json \
+  --output-dir FEATURE_OUTPUT
+```
+
+`calm`、`standard`、`energetic` 只調整 boundary-pressure 分級，不會改寫 Gemini evidence、突破 min/max dwell、跳過動作完整性或把所有剪點吸到 beat。
 
 若 geometry 與片段已經渲染，只想比較另一種敘事順序，不需要再呼叫 Gemini。`scripts/resequence_segments.py` 讀取明確的 trim/sequence JSON，重新編排現有編號 A/V segments，並輸出包含每段來源、trim 與新時間軸的 manifest。這只適合可稽核的 picture-edit A/B；它不會把既有片段描述冒充成新 Full Clip Card，也不能取代原片層級的 take selection。
 

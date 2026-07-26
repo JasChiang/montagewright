@@ -26,6 +26,7 @@ from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
+    AttentionObservation,
     FeatureChapterBrief,
     FeatureChapterSelect,
     FeatureEditBrief,
@@ -36,6 +37,7 @@ from jascue_video_lab.models import (
     FullClipCard,
     ModelProvenance,
     RushesCatalog,
+    VirtualCameraIntent,
 )
 from jascue_video_lab.schema import gemini_response_schema
 from jascue_video_lab.storage import read_json, utc_now, write_json
@@ -65,6 +67,7 @@ class OpenEditCandidate(StrictModel):
     quality_risks: list[str]
     horizontal_strategy: Literal["original", "tracked_reframe"]
     horizontal_zoom_intent: Literal["none", "subtle", "detail"]
+    horizontal_camera_intent: VirtualCameraIntent = "hold"
     horizontal_target_description: str | None
     vertical_strategy: Literal["tracked_crop", "fit_with_background"]
     vertical_target_description: str | None
@@ -84,6 +87,11 @@ class OpenEditCandidate(StrictModel):
                 raise ValueError("tracked_reframe requires zoom intent and target")
         elif self.horizontal_zoom_intent != "none":
             raise ValueError("original horizontal strategy must use zoom intent none")
+        if (
+            self.horizontal_strategy == "original"
+            and self.horizontal_camera_intent != "hold"
+        ):
+            raise ValueError("original horizontal strategy must use camera intent hold")
         required_regions = [
             region for region in self.vertical_regions if region.role == "required"
         ]
@@ -118,6 +126,7 @@ class OpenEditShot(StrictModel):
     ]
     intended_effect: str
     target_duration_seconds: float = Field(ge=3.0, le=10.0)
+    attention_observation: AttentionObservation | None = None
     candidates: list[OpenEditCandidate] = Field(min_length=2, max_length=4)
     horizontal_candidate_id: str = Field(
         pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=64
@@ -141,6 +150,14 @@ class OpenEditShot(StrictModel):
             )
         if self.horizontal_candidate_id not in ids or self.vertical_candidate_id not in ids:
             raise ValueError("selected candidate must be present in candidates")
+        if self.attention_observation is not None and not (
+            self.attention_observation.minimum_dwell_seconds
+            <= self.target_duration_seconds
+            <= self.attention_observation.maximum_dwell_seconds
+        ):
+            raise ValueError(
+                "target duration must lie inside the attention dwell bounds"
+            )
         return self
 
     def candidate(self, candidate_id: str) -> OpenEditCandidate:
@@ -449,6 +466,7 @@ def project_feature_contracts(
                 ),
                 horizontal_strategy=horizontal.horizontal_strategy,
                 horizontal_zoom_intent=horizontal.horizontal_zoom_intent,
+                horizontal_camera_intent=horizontal.horizontal_camera_intent,
                 horizontal_target_description=horizontal.horizontal_target_description,
                 vertical_strategy=vertical.vertical_strategy,
                 vertical_target_description=vertical_target_description,
@@ -464,6 +482,13 @@ def project_feature_contracts(
                     )
                 ),
                 confidence=min(horizontal.confidence, vertical.confidence),
+                recommended_duration_seconds=shot.target_duration_seconds,
+                duration_rationale=(
+                    shot.attention_observation.rationale
+                    if shot.attention_observation is not None
+                    else shot.intended_effect
+                ),
+                attention_observation=shot.attention_observation,
                 horizontal_candidates=[
                     FeatureHorizontalCandidate(
                         candidate_id=candidate.candidate_id,
@@ -475,6 +500,7 @@ def project_feature_contracts(
                         selection_reason=candidate.selection_reason,
                         strategy=candidate.horizontal_strategy,
                         zoom_intent=candidate.horizontal_zoom_intent,
+                        camera_intent=candidate.horizontal_camera_intent,
                         target_description=candidate.horizontal_target_description,
                         quality_risks=candidate.quality_risks,
                         confidence=candidate.confidence,
@@ -732,17 +758,19 @@ def main() -> int:
 請只根據下方完整 Clip Card library，自行推論素材共同主題，規劃一支一般觀眾容易看完的短版 highlight review cut。
 
 操作限制：
-1. 產生同一個 60–90 秒故事順序，供 16:9 與 9:16 共用；由你決定 10–16 個時間軸位置及各段秒數。
+1. 產生同一個 60–90 秒故事順序，供 16:9 與 9:16 共用；由你決定 10–16 個時間軸位置及各段相對停留秒數。秒數是 editorial dwell，不是來源影片 timestamp。
 2. 第一段必須是 hook，最後一段必須是 closing。中間應有視覺節奏、資訊推進與畫面變化，不能只是依素材檔案順序排列。
 3. 每個位置保留 2–4 個依品質排序的候選。候選必須引用存在的 source_asset_id、event_id 與 RF frame_id，並說明為何入選及風險。
 4. 16:9 與 9:16 可從同一候選組選不同 take；若同一 take 足夠，優先共用。不得輸出 bbox、mask、crop 座標或自行發明 timestamp。
    - horizontal_strategy=original 時，horizontal_zoom_intent 必須是 none，而且 horizontal_target_description 必須是 null。
    - horizontal_strategy=tracked_reframe 時，horizontal_zoom_intent 必須是 subtle 或 detail，而且 horizontal_target_description 必須明確指出本畫面中要跟隨的可見實例。
+   - horizontal_camera_intent 只描述剪輯意圖：hold 保持穩定、follow 跟隨、punch_in_cut 以硬切改成近景、push_in／pull_out 是短而有目的的漸進運鏡、recenter 是重新置中。pan_reveal 只有存在兩個可區分且需交接的可見 anchor 時才可提出。不得輸出倍率、路徑或座標。
 5. 可以讓同一語意主題使用多個鏡頭，例如 setup、action、result、beauty，但不得重複使用完全相同的代表 frame。
 6. 只使用 Clip Card 記錄的可見證據。品牌、型號、規格與功能名稱若不清楚，使用泛稱並保存 uncertainty；不得用模型記憶補完。
 7. 不要假裝知道導演意圖。疑似失焦、拍攝準備、重複 take、無意義停頓或不適合直式的畫面，只能根據保存的 evidence 提出排除或風險。
 8. geometry intent 必須可泛化到任何可見內容。單一主體可沿用 vertical_target_description；若人物、物件、文字、UI 等多個區域都必須保留，請逐一建立 vertical_regions，不得把兩個獨立實例合寫成一個模糊 target。region kind 只按可見證據選 subject、text_region、ui_region、graphic 或 other。vertical_regions 是實際 crop constraints，因此有 regions 時 vertical_strategy 必須是 tracked_crop；fit_with_background 不得同時宣告 regions。role=required 或 atomic=true 的 region 若填 minimum_visible_fraction，只能是 1.0；非 atomic 的 preferred region 才可填小於 1.0 的比例；avoid_overlay 必須省略該欄位或回傳 null。
 9. vertical_overflow_policy 必須固定為 preserve_all，vertical_edge_priority 必須固定為 balanced；你沒有權限授權 renderer 裁掉 required union。若依畫面證據判斷有限裁切可能值得由真人考慮，只能填 vertical_overflow_proposal，說明 proposed_edge_priority 與 rationale。proposal 不會直接執行，也不得被描述成已核准。若 required union 可能無法容納，仍應優先改選較適合直式的候選。
+10. 每個時間軸位置都填 attention_observation。分開評估 semantic novelty、動作／結果在片段結尾的完成程度、visual motion、composition change、reading load、尚未解決的動作／懸念、刻意停留價值、重複壓力與音樂轉場機會。minimum_dwell_seconds 是辨認主體、閱讀必要文字、完成動作或保留情緒所需下限；maximum_dwell_seconds 是資訊開始重複前仍合理的上限；target_duration_seconds 必須位於兩者之間。這些都是待人工審核的相對節奏建議，不是 source timestamp。
 
 project_id 必須原樣回傳：{args.project_id}
 catalog_id 必須原樣回傳：{catalog.catalog_id}

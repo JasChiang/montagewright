@@ -63,6 +63,7 @@ from .models import (
     RushClip,
     RushFrame,
     RushesCatalog,
+    RhythmPlan,
     SegmentationTrack,
     ShotQualityMap,
     SharedSam21AnalysisFramesManifest,
@@ -70,6 +71,8 @@ from .models import (
     SharedSam21SessionManifest,
     TrackingState,
     TrimIntentDecision,
+    VirtualCameraKeyframe,
+    VirtualCameraPlan,
     approve_evidence_query_proposal_v2,
 )
 from .overlay import draw_grounding_overlay
@@ -94,6 +97,7 @@ from .shot_quality import (
     build_render_quality_report,
     load_shot_quality_map,
 )
+from .editorial_planning import build_attention_profile, build_rhythm_plan
 from .storage import read_json, utc_now, write_json
 
 
@@ -102,7 +106,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v11-quality-safe-intervals"
+_RENDER_PIPELINE_VERSION = "feature-cut-v12-attention-rhythm-camera"
 RenderAspect = Literal["both", "9x16", "16x9"]
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
@@ -3077,11 +3081,270 @@ def _soft_extent_visibility_audit(
     }
 
 
+def _virtual_camera_zoom_values(
+    times: Sequence[float],
+    *,
+    intent: str,
+    maximum_scale: float,
+) -> tuple[list[float], str]:
+    if not times:
+        raise ValueError("virtual camera requires tracking times")
+    start = times[0]
+    duration = max(0.001, times[-1] - start)
+    progress = [
+        max(0.0, min(1.0, (time - start) / duration))
+        for time in times
+    ]
+    smooth = [value * value * (3 - 2 * value) for value in progress]
+    if intent in {"hold", "follow", "recenter", "pan_reveal"}:
+        return [maximum_scale for _ in times], "hold"
+    if intent == "push_in":
+        return [
+            1 + (maximum_scale - 1) * value for value in smooth
+        ], "smoothstep"
+    if intent == "pull_out":
+        return [
+            maximum_scale - (maximum_scale - 1) * value for value in smooth
+        ], "smoothstep"
+    if intent == "punch_in_cut":
+        return [
+            1.0 if value < 0.5 else maximum_scale for value in progress
+        ], "cut"
+    raise ValueError(f"unknown virtual-camera intent: {intent}")
+
+
+def _motion_extrema(
+    times: Sequence[float],
+    x_values: Sequence[float],
+    y_values: Sequence[float],
+    scales: Sequence[float],
+) -> tuple[float, float, float]:
+    velocities: list[float] = []
+    for index in range(1, len(times)):
+        delta = max(0.001, times[index] - times[index - 1])
+        velocities.append(
+            math.sqrt(
+                ((x_values[index] - x_values[index - 1]) / delta) ** 2
+                + ((y_values[index] - y_values[index - 1]) / delta) ** 2
+                + (960 * (scales[index] - scales[index - 1]) / delta) ** 2
+            )
+        )
+    accelerations = [
+        abs(current - prior)
+        / max(0.001, times[index + 1] - times[index])
+        for index, (prior, current) in enumerate(
+            zip(velocities[:-1], velocities[1:], strict=True),
+            start=1,
+        )
+    ]
+    jerks = [
+        abs(current - prior)
+        / max(0.001, times[index + 2] - times[index + 1])
+        for index, (prior, current) in enumerate(
+            zip(accelerations[:-1], accelerations[1:], strict=True),
+            start=1,
+        )
+    ]
+    return (
+        max(velocities, default=0.0),
+        max(accelerations, default=0.0),
+        max(jerks, default=0.0),
+    )
+
+
+def _virtual_camera_filter_from_track(
+    track: SegmentationTrack,
+    *,
+    times: Sequence[float],
+    boxes: Sequence[Sequence[int]],
+    source_width: int,
+    source_height: int,
+    requested_intent: str,
+    maximum_scale: float,
+    geometry_safe_max_scale: float,
+    source_resolution_native_scale_limit: float,
+    source_track_fingerprint: str,
+) -> tuple[str, VirtualCameraPlan, dict[str, Any]]:
+    """Build one keyframed, containment-projected 16:9 virtual camera."""
+
+    applied_intent = requested_intent
+    execution_status: Literal["applied", "fallback", "blocked"] = "applied"
+    fallback_reason: str | None = None
+    if requested_intent == "pan_reveal":
+        # The current horizontal contract has one identity anchor. Do not turn
+        # one track into a fabricated two-anchor reveal.
+        applied_intent = "follow"
+        execution_status = "fallback"
+        fallback_reason = "pan_reveal_requires_two_independently_locked_anchors"
+    scales, easing = _virtual_camera_zoom_values(
+        times,
+        intent=applied_intent,
+        maximum_scale=maximum_scale,
+    )
+    base = _cover_transform(source_width, source_height, 1920, 1080)
+    base_width = int(base["scaled_width"])
+    base_height = int(base["scaled_height"])
+    base_crop_x = (base_width - 1920) / 2
+    base_crop_y = (base_height - 1080) / 2
+    centers_x: list[float] = []
+    centers_y: list[float] = []
+    mapped_boxes: list[tuple[float, float, float, float]] = []
+    for box in boxes:
+        x_min, y_min, x_max, y_max = (float(value) for value in box)
+        mapped = (
+            x_min / 1000 * base_width - base_crop_x,
+            y_min / 1000 * base_height - base_crop_y,
+            x_max / 1000 * base_width - base_crop_x,
+            y_max / 1000 * base_height - base_crop_y,
+        )
+        mapped_boxes.append(mapped)
+        centers_x.append((mapped[0] + mapped[2]) / 2)
+        centers_y.append((mapped[1] + mapped[3]) / 2)
+    if applied_intent == "recenter":
+        progress = [
+            (time - times[0]) / max(0.001, times[-1] - times[0])
+            for time in times
+        ]
+        centers_x = [
+            960 + (center - 960) * value
+            for center, value in zip(centers_x, progress, strict=True)
+        ]
+        centers_y = [
+            540 + (center - 540) * value
+            for center, value in zip(centers_y, progress, strict=True)
+        ]
+    desired_x: list[float] = []
+    desired_y: list[float] = []
+    lower_x: list[float] = []
+    upper_x: list[float] = []
+    lower_y: list[float] = []
+    upper_y: list[float] = []
+    for center_x, center_y, box, scale in zip(
+        centers_x,
+        centers_y,
+        mapped_boxes,
+        scales,
+        strict=True,
+    ):
+        scaled_width = 1920 * scale
+        scaled_height = 1080 * scale
+        x_min, y_min, x_max, y_max = box
+        margin_x = max(8.0, (x_max - x_min) * 0.18)
+        margin_y = max(8.0, (y_max - y_min) * 0.18)
+        x_low = max(0.0, (x_max + margin_x) * scale - 1920)
+        x_high = min(scaled_width - 1920, (x_min - margin_x) * scale)
+        y_low = max(0.0, (y_max + margin_y) * scale - 1080)
+        y_high = min(scaled_height - 1080, (y_min - margin_y) * scale)
+        if x_low > x_high + 1e-6 or y_low > y_high + 1e-6:
+            raise ValueError(
+                "virtual-camera containment has no legal crop interval"
+            )
+        lower_x.append(x_low)
+        upper_x.append(x_high)
+        lower_y.append(y_low)
+        upper_y.append(y_high)
+        desired_x.append(
+            max(0.0, min(scaled_width - 1920, center_x * scale - 960))
+        )
+        desired_y.append(
+            max(0.0, min(scaled_height - 1080, center_y * scale - 540))
+        )
+    x_values = _projected_smooth(desired_x, lower_x, upper_x)
+    y_values = _projected_smooth(desired_y, lower_y, upper_y)
+    zoom_expression = _piecewise_expression(times, scales)
+    width_expression = (
+        f"max(1920\\,2*trunc((1920*({zoom_expression}))/2))"
+    )
+    height_expression = (
+        f"max(1080\\,2*trunc((1080*({zoom_expression}))/2))"
+    )
+    x_expression = _piecewise_expression(times, x_values)
+    y_expression = _piecewise_expression(times, y_values)
+    usable_samples = [
+        sample
+        for sample in track.samples
+        if (
+            sample.tracking_state == TrackingState.TRACKED
+            and sample.center_2d is not None
+            and sample.derived_tracking_box is not None
+        )
+    ]
+    keyframes = [
+        VirtualCameraKeyframe(
+            time_seconds=round(time, 6),
+            source_pts=getattr(sample, "source_pts", None),
+            scale=round(scale, 6),
+            center_x_normalized=round(
+                (crop_x + 960) / (1920 * scale) * 1000,
+                6,
+            ),
+            center_y_normalized=round(
+                (crop_y + 540) / (1080 * scale) * 1000,
+                6,
+            ),
+        )
+        for time, sample, scale, crop_x, crop_y in zip(
+            times,
+            usable_samples,
+            scales,
+            x_values,
+            y_values,
+            strict=True,
+        )
+    ]
+    max_velocity, max_acceleration, max_jerk = _motion_extrema(
+        times, x_values, y_values, scales
+    )
+    plan = VirtualCameraPlan(
+        requested_intent=requested_intent,
+        applied_intent=applied_intent,
+        anchor_target_ids=[
+            getattr(track, "target_id", None)
+            or f"track:{source_track_fingerprint[:16]}"
+        ],
+        keyframes=keyframes,
+        easing=easing,
+        geometry_safe_max_scale=round(geometry_safe_max_scale, 6),
+        source_resolution_native_scale_limit=round(
+            source_resolution_native_scale_limit,
+            6,
+        ),
+        source_resolution_upscale_required=(
+            max(scales) > source_resolution_native_scale_limit + 0.001
+        ),
+        max_velocity=round(max_velocity, 6),
+        max_acceleration=round(max_acceleration, 6),
+        max_jerk=round(max_jerk, 6),
+        execution_status=execution_status,
+        fallback_reason=fallback_reason,
+        editorial_reason=(
+            "Apply the selected editorial camera intent only after target "
+            "identity, tracking confidence, containment, and resolution gates."
+        ),
+        source_track_fingerprint=source_track_fingerprint,
+    )
+    filter_graph = (
+        f"[0:v]fps=30,scale={base_width}:{base_height},"
+        f"crop=1920:1080:x={base_crop_x:.3f}:y={base_crop_y:.3f},setsar=1,"
+        f"scale=w='{width_expression}':h='{height_expression}':eval=frame,"
+        f"crop=1920:1080:x='{x_expression}':y='{y_expression}',setsar=1[base]"
+    )
+    audit = {
+        "virtual_camera_plan": plan.model_dump(mode="json"),
+        "virtual_camera_containment_passed": True,
+        "virtual_camera_scale_values": [round(value, 6) for value in scales],
+        "virtual_camera_crop_x_values": [round(value, 3) for value in x_values],
+        "virtual_camera_crop_y_values": [round(value, 3) for value in y_values],
+    }
+    return filter_graph, plan, audit
+
+
 def _horizontal_filter_from_track(
     track: SegmentationTrack,
     zoom_intent: str,
     *,
     display_sample_aspect_ratio: float = 1.0,
+    camera_intent: str = "hold",
 ) -> tuple[str, dict[str, Any]]:
     diagnostics = _track_confidence_diagnostics(track)
     if not math.isclose(display_sample_aspect_ratio, 1.0, rel_tol=0, abs_tol=1e-6):
@@ -3142,6 +3405,10 @@ def _horizontal_filter_from_track(
         1080
         / (max_height / 1000 * int(base_transform["scaled_height"]) * 1.45),
     )
+    resolution_safe_max = max(
+        1.0,
+        min(source_width / 1920, source_height / 1080),
+    )
     applied = max(1.0, min(requested, safe_max))
     if applied < 1.035:
         return _horizontal_original_filter(), _horizontal_reframe_failure_geometry(
@@ -3151,6 +3418,76 @@ def _horizontal_filter_from_track(
             diagnostics={**diagnostics, **lineage},
             geometry_safe_max_zoom=round(safe_max, 4),
         )
+    track_fingerprint = (
+        _track_geometry_fingerprint(track)
+        if hasattr(track, "model_dump")
+        else _stable_fingerprint(
+            {
+                "analysis_start_ms": track.analysis_start_ms,
+                "seed_source_width": source_width,
+                "seed_source_height": source_height,
+                "samples": [
+                    {
+                        "time_ms": sample.analysis_sample_time_ms,
+                        "source_pts": getattr(sample, "source_pts", None),
+                        "center_2d": sample.center_2d,
+                        "box": sample.derived_tracking_box,
+                        "state": str(sample.tracking_state),
+                    }
+                    for sample in track.samples
+                ],
+            }
+        )
+    )
+    if camera_intent not in {"hold", "follow"}:
+        try:
+            dynamic_filter, _, dynamic_audit = _virtual_camera_filter_from_track(
+                track,
+                times=times,
+                boxes=boxes,
+                source_width=source_width,
+                source_height=source_height,
+                requested_intent=camera_intent,
+                maximum_scale=applied,
+                geometry_safe_max_scale=safe_max,
+                source_resolution_native_scale_limit=resolution_safe_max,
+                source_track_fingerprint=track_fingerprint,
+            )
+        except ValueError as error:
+            return _horizontal_original_filter(), _horizontal_reframe_failure_geometry(
+                zoom_intent,
+                fallback_reason=f"virtual_camera_preflight_failed:{error}",
+                risk_code="virtual_camera_preflight_failed",
+                diagnostics={
+                    **diagnostics,
+                    **lineage,
+                    "requested_camera_intent": camera_intent,
+                },
+                geometry_safe_max_zoom=round(safe_max, 4),
+            )
+        return dynamic_filter, {
+            "requested_zoom": requested,
+            "geometry_safe_max_zoom": round(safe_max, 4),
+            "resolution_safe_max_zoom": round(resolution_safe_max, 4),
+            "applied_zoom": round(applied, 4),
+            "requested_camera_intent": camera_intent,
+            "fallback_reason": dynamic_audit[
+                "virtual_camera_plan"
+            ]["fallback_reason"],
+            "risk_codes": (
+                ["virtual_camera_intent_fallback"]
+                if dynamic_audit["virtual_camera_plan"]["execution_status"]
+                != "applied"
+                else []
+            ),
+            "requires_gemini_review": (
+                dynamic_audit["virtual_camera_plan"]["execution_status"]
+                != "applied"
+            ),
+            **diagnostics,
+            **lineage,
+            **dynamic_audit,
+        }
     x_values, y_values, crop_audit = _tracked_crop_geometry(
         times,
         centers_x,
@@ -3173,21 +3510,159 @@ def _horizontal_filter_from_track(
             diagnostics={**diagnostics, **lineage, **crop_audit},
             geometry_safe_max_zoom=round(safe_max, 4),
         )
+    applied_camera_intent = camera_intent
+    camera_execution_status: Literal["applied", "fallback", "blocked"] = "applied"
+    camera_fallback_reason: str | None = None
+    if camera_intent == "hold":
+        keyframe_audit = crop_audit["crop_keyframes"]
+        stable_left_low = max(
+            float(item["legal_crop_left_min_normalized"])
+            for item in keyframe_audit
+        )
+        stable_left_high = min(
+            float(item["legal_crop_left_max_normalized"])
+            for item in keyframe_audit
+        )
+        stable_top_low = max(
+            float(item["legal_crop_top_min_normalized"])
+            for item in keyframe_audit
+        )
+        stable_top_high = min(
+            float(item["legal_crop_top_max_normalized"])
+            for item in keyframe_audit
+        )
+        if (
+            stable_left_low <= stable_left_high + 1e-6
+            and stable_top_low <= stable_top_high + 1e-6
+        ):
+            coordinate_space = crop_audit["crop_coordinate_space"]
+            scaled_width = int(coordinate_space["scaled_width"])
+            scaled_height = int(coordinate_space["scaled_height"])
+            preferred_left = sum(x_values) / len(x_values) * 1000 / scaled_width
+            preferred_top = sum(y_values) / len(y_values) * 1000 / scaled_height
+            stable_left = max(
+                stable_left_low,
+                min(stable_left_high, preferred_left),
+            )
+            stable_top = max(
+                stable_top_low,
+                min(stable_top_high, preferred_top),
+            )
+            x_values = [stable_left * scaled_width / 1000 for _ in times]
+            y_values = [stable_top * scaled_height / 1000 for _ in times]
+            crop_audit = {
+                **crop_audit,
+                "crop_x_values_pixels": x_values,
+                "crop_y_values_pixels": y_values,
+                "max_crop_x_speed_pixels_per_second": 0.0,
+                "max_crop_y_speed_pixels_per_second": 0.0,
+                "max_crop_speed_pixels_per_second": 0.0,
+                "max_crop_acceleration_pixels_per_second_squared": 0.0,
+                "max_crop_jerk_pixels_per_second_cubed": 0.0,
+                "stable_hold_feasible": True,
+                "crop_keyframes": [
+                    {
+                        **item,
+                        "crop_x_pixels": round(x_values[index], 3),
+                        "crop_y_pixels": round(y_values[index], 3),
+                    }
+                    for index, item in enumerate(keyframe_audit)
+                ],
+            }
+        else:
+            applied_camera_intent = "follow"
+            camera_execution_status = "fallback"
+            camera_fallback_reason = (
+                "stable_hold_cannot_contain_locked_target_across_full_interval"
+            )
+            crop_audit = {
+                **crop_audit,
+                "stable_hold_feasible": False,
+            }
     coordinate_space = crop_audit["crop_coordinate_space"]
     scaled_width = int(coordinate_space["scaled_width"])
     scaled_height = int(coordinate_space["scaled_height"])
     x_expression = _piecewise_expression(times, x_values)
     y_expression = _piecewise_expression(times, y_values)
+    usable_samples = [
+        sample
+        for sample in track.samples
+        if (
+            sample.tracking_state == TrackingState.TRACKED
+            and sample.center_2d is not None
+            and sample.derived_tracking_box is not None
+        )
+    ]
+    camera_keyframes = [
+        VirtualCameraKeyframe(
+            time_seconds=round(time, 6),
+            source_pts=getattr(sample, "source_pts", None),
+            scale=round(applied, 6),
+            center_x_normalized=round(
+                (crop_x + 960) / scaled_width * 1000,
+                6,
+            ),
+            center_y_normalized=round(
+                (crop_y + 540) / scaled_height * 1000,
+                6,
+            ),
+        )
+        for time, sample, crop_x, crop_y in zip(
+            times,
+            usable_samples,
+            x_values,
+            y_values,
+            strict=True,
+        )
+    ]
+    virtual_camera_plan = VirtualCameraPlan(
+        requested_intent=camera_intent,
+        applied_intent=applied_camera_intent,
+        anchor_target_ids=[
+            getattr(track, "target_id", None)
+            or f"track:{track_fingerprint[:16]}"
+        ],
+        keyframes=camera_keyframes,
+        easing="hold",
+        geometry_safe_max_scale=round(safe_max, 6),
+        source_resolution_native_scale_limit=round(resolution_safe_max, 6),
+        source_resolution_upscale_required=(
+            applied > resolution_safe_max + 0.001
+        ),
+        max_velocity=float(
+            crop_audit["max_crop_speed_pixels_per_second"]
+        ),
+        max_acceleration=float(
+            crop_audit["max_crop_acceleration_pixels_per_second_squared"]
+        ),
+        max_jerk=float(
+            crop_audit["max_crop_jerk_pixels_per_second_cubed"]
+        ),
+        execution_status=camera_execution_status,
+        fallback_reason=camera_fallback_reason,
+        editorial_reason=(
+            "Maintain stable scale while the safety path keeps the locked "
+            "identity inside the composition."
+        ),
+        source_track_fingerprint=track_fingerprint,
+    )
     return (
         f"[0:v]fps=30,scale={scaled_width}:{scaled_height},"
         f"crop=1920:1080:x='{x_expression}':y='{y_expression}',setsar=1[base]",
         {
             "requested_zoom": requested,
             "geometry_safe_max_zoom": round(safe_max, 4),
+            "resolution_safe_max_zoom": round(resolution_safe_max, 4),
             "applied_zoom": round(applied, 4),
-            "fallback_reason": None,
-            "risk_codes": [],
-            "requires_gemini_review": False,
+            "requested_camera_intent": camera_intent,
+            "virtual_camera_plan": virtual_camera_plan.model_dump(mode="json"),
+            "fallback_reason": camera_fallback_reason,
+            "risk_codes": (
+                ["virtual_camera_intent_fallback"]
+                if camera_execution_status != "applied"
+                else []
+            ),
+            "requires_gemini_review": camera_execution_status != "applied",
             **diagnostics,
             **lineage,
             **crop_audit,
@@ -5439,6 +5914,7 @@ def _resolve_editorial_chapter_durations(
     music_lock: MusicMapLock | None = None,
     source_capacity_seconds: Mapping[str, float] | None = None,
     fixed_duration_seconds: Mapping[str, float] | None = None,
+    rhythm_plan: RhythmPlan | None = None,
     shortfall_audit_path: Path | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Reconcile Gemini's relative dwell judgment to one legal project total.
@@ -5451,10 +5927,27 @@ def _resolve_editorial_chapter_durations(
     """
 
     brief_by_id = {chapter.feature_id: chapter for chapter in brief.chapters}
+    rhythm_by_id = (
+        {chapter.feature_id: chapter for chapter in rhythm_plan.chapters}
+        if rhythm_plan is not None
+        else {}
+    )
+    if rhythm_plan is not None and set(rhythm_by_id) != {
+        chapter.feature_id for chapter in plan.chapters
+    }:
+        raise ValueError("RhythmPlan chapters differ from the feature plan")
     weighted: list[tuple[FeatureChapterSelect, float, str]] = []
     for selected in plan.chapters:
         fallback = brief_by_id[selected.feature_id].target_duration_seconds
-        if selected.recommended_duration_seconds is None:
+        if selected.feature_id in rhythm_by_id:
+            weighted.append(
+                (
+                    selected,
+                    rhythm_by_id[selected.feature_id].preferred_duration_seconds,
+                    "attention_rhythm_plan",
+                )
+            )
+        elif selected.recommended_duration_seconds is None:
             weighted.append((selected, fallback, "brief_fallback"))
         else:
             weighted.append(
@@ -5468,6 +5961,19 @@ def _resolve_editorial_chapter_durations(
     capacity_ms = {
         feature_id: max(1, round(seconds * 1000))
         for feature_id, seconds in (source_capacity_seconds or {}).items()
+    }
+    if rhythm_plan is not None:
+        for feature_id, chapter in rhythm_by_id.items():
+            rhythm_maximum = max(
+                1, round(chapter.maximum_duration_seconds * 1000)
+            )
+            capacity_ms[feature_id] = min(
+                capacity_ms.get(feature_id, rhythm_maximum),
+                rhythm_maximum,
+            )
+    minimum_ms = {
+        feature_id: max(1, round(chapter.minimum_duration_seconds * 1000))
+        for feature_id, chapter in rhythm_by_id.items()
     }
     known_feature_ids = {selected.feature_id for selected, _, _ in weighted}
     fixed_ms = {
@@ -5486,6 +5992,17 @@ def _resolve_editorial_chapter_durations(
             raise ValueError(
                 f"approved trim for {feature_id} exceeds its QualitySafeInterval "
                 "capacity"
+            )
+    for selected, _, _ in weighted:
+        feature_id = selected.feature_id
+        if feature_id in fixed_ms:
+            continue
+        minimum = minimum_ms.get(feature_id, 0)
+        maximum = capacity_ms.get(feature_id, target_duration_ms)
+        if minimum > maximum:
+            raise ValueError(
+                f"minimum attention dwell for {feature_id} exceeds its "
+                "QualitySafeInterval capacity"
             )
     flexible_weighted = [
         item for item in weighted if item[0].feature_id not in fixed_ms
@@ -5520,13 +6037,28 @@ def _resolve_editorial_chapter_durations(
     # redistribute only the remaining duration across the other Gemini weights.
     # This preserves the model's editorial ordering without inventing repeated
     # frames, synthetic holds, or source time outside a legal shot.
-    remaining_ms = target_duration_ms - sum(fixed_ms.values())
+    flexible_minimum_total_ms = sum(
+        minimum_ms.get(selected.feature_id, 0)
+        for selected, _, _ in flexible_weighted
+    )
+    remaining_ms = (
+        target_duration_ms
+        - sum(fixed_ms.values())
+        - flexible_minimum_total_ms
+    )
     if remaining_ms < 0:
         raise ValueError(
-            "human-approved trim durations exceed the requested project duration"
+            "human-approved trims plus minimum attention dwell exceed the "
+            "requested project duration"
         )
     active = list(flexible_weighted)
-    allocated_ms: dict[str, int] = dict(fixed_ms)
+    allocated_ms: dict[str, int] = {
+        **fixed_ms,
+        **{
+            selected.feature_id: minimum_ms.get(selected.feature_id, 0)
+            for selected, _, _ in flexible_weighted
+        },
+    }
     if not active and remaining_ms != 0:
         raise ValueError(
             "fixed approved trims do not sum to the requested project duration "
@@ -5542,10 +6074,13 @@ def _resolve_editorial_chapter_durations(
                 selected.feature_id,
                 target_duration_ms,
             )
+            available_headroom = (
+                feature_capacity - allocated_ms[selected.feature_id]
+            )
             proportional_ms = remaining_ms * weight / active_weight
-            if proportional_ms > feature_capacity:
+            if proportional_ms > available_headroom:
                 allocated_ms[selected.feature_id] = feature_capacity
-                remaining_ms -= feature_capacity
+                remaining_ms -= available_headroom
                 newly_capped.append((selected, weight, authority))
         if newly_capped:
             capped_ids = {selected.feature_id for selected, _, _ in newly_capped}
@@ -5579,7 +6114,7 @@ def _resolve_editorial_chapter_durations(
             if remainder > 0:
                 value += 1
                 remainder -= 1
-            allocated_ms[selected.feature_id] = value
+            allocated_ms[selected.feature_id] += value
         remaining_ms = 0
         break
     if remaining_ms != 0 or sum(allocated_ms.values()) != target_duration_ms:
@@ -5620,8 +6155,11 @@ def _resolve_editorial_chapter_durations(
         snapped_boundaries_ms = []
         previous = 0
         for boundary_index, proposed_ms in enumerate(proposed_boundaries):
-            remaining_chapters = len(unsnapped) - boundary_index - 1
-            latest_ms = music_lock.duration_ms - remaining_chapters * 750
+            remaining_minimum_ms = sum(
+                minimum_ms.get(item[0].feature_id, 750)
+                for item in unsnapped[boundary_index + 1 :]
+            )
+            latest_ms = music_lock.duration_ms - remaining_minimum_ms
             current_feature_id = unsnapped[boundary_index][0].feature_id
             next_feature_id = unsnapped[boundary_index + 1][0].feature_id
             current_capacity_ms = capacity_ms.get(
@@ -5632,14 +6170,33 @@ def _resolve_editorial_chapter_durations(
                 capacity_ms.get(item[0].feature_id, target_duration_ms)
                 for item in unsnapped[boundary_index + 1 :]
             )
+            boundary_priority = (
+                rhythm_by_id[current_feature_id].boundary_priority
+                if current_feature_id in rhythm_by_id
+                else "normal"
+            )
+            snap_window_ms = {
+                "low": 250,
+                "normal": 450,
+                "high": 650,
+            }[boundary_priority]
+            allowed_cue_kinds = (
+                {"section_boundary", "downbeat"}
+                if boundary_priority == "low"
+                else {"section_boundary", "downbeat", "accent", "ending_hit"}
+            )
             eligible = [
                 cue
                 for cue in cue_candidates
                 if (
                     current_feature_id not in capped_feature_ids
                     and next_feature_id not in capped_feature_ids
-                    and previous + 750 <= cue.time_ms <= latest_ms
-                    and abs(cue.time_ms - proposed_ms) <= 450
+                    and previous
+                    + minimum_ms.get(current_feature_id, 750)
+                    <= cue.time_ms
+                    <= latest_ms
+                    and cue.kind in allowed_cue_kinds
+                    and abs(cue.time_ms - proposed_ms) <= snap_window_ms
                     and cue.time_ms - previous <= current_capacity_ms
                     and music_lock.duration_ms - cue.time_ms
                     <= remaining_capacity_ms
@@ -5674,6 +6231,8 @@ def _resolve_editorial_chapter_durations(
                     "snap_delta_ms": applied_ms - proposed_ms,
                     "music_cue_id": cue_id,
                     "music_cue_kind": cue_kind,
+                    "rhythm_boundary_priority": boundary_priority,
+                    "rhythm_snap_window_ms": snap_window_ms,
                 }
             )
             previous = applied_ms
@@ -5694,11 +6253,16 @@ def _resolve_editorial_chapter_durations(
             feature_id = unsnapped[index][0].feature_id
             chapter_ms = end_ms - start_ms
             feature_capacity_ms = capacity_ms.get(feature_id, target_duration_ms)
-            if chapter_ms <= 0 or chapter_ms > feature_capacity_ms:
+            feature_minimum_ms = minimum_ms.get(feature_id, 1)
+            if (
+                chapter_ms < feature_minimum_ms
+                or chapter_ms > feature_capacity_ms
+            ):
                 capacity_violations.append(
                     {
                         "feature_id": feature_id,
                         "candidate_duration_ms": chapter_ms,
+                        "attention_minimum_ms": feature_minimum_ms,
                         "source_capacity_ms": feature_capacity_ms,
                     }
                 )
@@ -5760,6 +6324,16 @@ def _resolve_editorial_chapter_durations(
                     if selected.feature_id in capacity_ms
                     else None
                 ),
+                "minimum_attention_dwell_seconds": (
+                    round(minimum_ms[selected.feature_id] / 1000, 3)
+                    if selected.feature_id in minimum_ms
+                    else None
+                ),
+                "rhythm_boundary_priority": (
+                    rhythm_by_id[selected.feature_id].boundary_priority
+                    if selected.feature_id in rhythm_by_id
+                    else None
+                ),
                 "source_capacity_applied": (
                     selected.feature_id in capacity_ms
                     and allocated_ms[selected.feature_id]
@@ -5768,7 +6342,7 @@ def _resolve_editorial_chapter_durations(
             }
         )
     audit = {
-        "contract_version": "editorial-duration-plan-v1",
+        "contract_version": "editorial-duration-plan-v2",
         "interpretation": (
             "Gemini proposes relative dwell; local code only reconciles the "
             "approved total and later maps it to legal shot-local source PTS."
@@ -5781,6 +6355,11 @@ def _resolve_editorial_chapter_durations(
             feature_id: round(duration_ms / 1000, 3)
             for feature_id, duration_ms in sorted(fixed_ms.items())
         },
+        "attention_profile_sha256": (
+            rhythm_plan.attention_profile_sha256
+            if rhythm_plan is not None
+            else None
+        ),
         "source_capacity_total_seconds": (
             round(finite_capacity_total_ms / 1000, 3)
             if capacity_ms
@@ -5816,6 +6395,7 @@ def run_feature_cut_experiment(
     music_path: Path | None = None,
     music_lock_path: Path | None = None,
     post_render_quality_qc: bool = True,
+    rhythm_style: Literal["calm", "standard", "energetic"] = "standard",
 ) -> dict[str, Any]:
     render_horizontal, render_vertical = _requested_render_aspects(aspect)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -6192,12 +6772,31 @@ def run_feature_cut_experiment(
             scdet_threshold=scdet_threshold,
             approved_decisions=trim_decisions,
         )
+        editorial_dir = output_dir / "editorial-planning"
+        attention_path = editorial_dir / "attention-profile.json"
+        attention_profile = build_attention_profile(
+            brief,
+            plan,
+            source_brief_sha256=sha256_file(brief_path),
+            source_feature_plan_sha256=sha256_file(plan_path),
+            quality_safe_capacity_seconds=source_capacity_seconds,
+        )
+        write_json(attention_path, attention_profile)
+        rhythm_path = editorial_dir / "rhythm-plan.json"
+        rhythm_plan = build_rhythm_plan(
+            attention_profile,
+            target_duration_seconds=brief.target_duration_seconds,
+            attention_profile_sha256=sha256_file(attention_path),
+            style_profile=rhythm_style,
+        )
+        write_json(rhythm_path, rhythm_plan)
         chapter_durations, duration_audit = _resolve_editorial_chapter_durations(
             brief,
             plan,
             music_lock=music_lock,
             source_capacity_seconds=source_capacity_seconds,
             fixed_duration_seconds=fixed_duration_seconds,
+            rhythm_plan=rhythm_plan,
             shortfall_audit_path=(
                 output_dir / "editorial-duration-capacity-shortfall.json"
             ),
@@ -6232,6 +6831,11 @@ def run_feature_cut_experiment(
                 for path, quality_map in shot_quality_maps
             ],
             "post_render_quality_qc": post_render_quality_qc,
+            "rhythm_style": rhythm_style,
+            "attention_profile_path": str(attention_path.resolve()),
+            "attention_profile_sha256": sha256_file(attention_path),
+            "rhythm_plan_path": str(rhythm_path.resolve()),
+            "rhythm_plan_sha256": sha256_file(rhythm_path),
             "allow_proposed_trim_preview": allow_proposed_trim_preview,
             "allow_unverified_geometry_preview": allow_unverified_geometry_preview,
         }
@@ -6297,6 +6901,13 @@ def run_feature_cut_experiment(
                 for path, quality_map in shot_quality_maps
             ],
             "post_render_quality_qc_requested": post_render_quality_qc,
+            "editorial_planning": {
+                "attention_profile_path": str(attention_path.resolve()),
+                "attention_profile_sha256": sha256_file(attention_path),
+                "rhythm_plan_path": str(rhythm_path.resolve()),
+                "rhythm_plan_sha256": sha256_file(rhythm_path),
+                "rhythm_style": rhythm_style,
+            },
             "horizontal": {
                 "requested": render_horizontal,
                 "status": "pending" if render_horizontal else "not_requested",
@@ -6495,8 +7106,18 @@ def run_feature_cut_experiment(
                                     track,
                                     selected.horizontal_zoom_intent,
                                     display_sample_aspect_ratio=horizontal_display_sar,
+                                    camera_intent=(
+                                        selected.horizontal_camera_intent
+                                    ),
                                 )
                             )
+                            if "virtual_camera_plan" in horizontal_geometry:
+                                write_json(
+                                    track_root / "virtual-camera-plan.json",
+                                    horizontal_geometry[
+                                        "virtual_camera_plan"
+                                    ],
+                                )
                             horizontal_debug = track_root / "grounding-debug.png"
                         except Exception as error:
                             abort_for_geometry_quota(error)

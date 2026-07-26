@@ -795,6 +795,7 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         trim_decision_paths=args.trim_decision,
         shot_quality_map_paths=args.shot_quality_map,
         post_render_quality_qc=args.post_render_quality_qc,
+        rhythm_style=args.rhythm_style,
         allow_proposed_trim_preview=args.allow_proposed_trim_preview,
         reuse_feature_plan=args.reuse_feature_plan,
         reuse_feature_plan_raw_output=args.reuse_feature_plan_raw_output,
@@ -2247,6 +2248,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Run the same deterministic technical scan on completed aspect "
             "renders. Hard decoder/PTS defects fail closed; subjective visual "
             "risks remain review evidence."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--rhythm-style",
+        choices=["calm", "standard", "energetic"],
+        default="standard",
+        help=(
+            "Set the boundary-pressure threshold profile. It does not impose "
+            "fixed shot lengths or bypass attention/quality dwell bounds."
         ),
     )
     feature_cut_parser.add_argument(

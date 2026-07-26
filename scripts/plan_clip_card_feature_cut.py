@@ -31,6 +31,7 @@ from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
+    AttentionObservation,
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
@@ -40,6 +41,7 @@ from jascue_video_lab.models import (
     FullClipCard,
     ModelProvenance,
     RushesCatalog,
+    VirtualCameraIntent,
 )
 from jascue_video_lab.schema import gemini_response_schema
 from jascue_video_lab.storage import read_json, utc_now, write_json
@@ -362,6 +364,7 @@ class ClipCardFeatureCandidateV3(StrictModel):
     quality_risks: list[str]
     horizontal_strategy: Literal["original", "tracked_reframe"]
     horizontal_zoom_intent: Literal["none", "subtle", "detail"]
+    horizontal_camera_intent: VirtualCameraIntent = "hold"
     horizontal_focus_entity_id: str | None = None
     vertical_strategy: Literal["tracked_crop", "fit_with_background"]
     vertical_crop_mode: Literal["strict", "primary_center"] = "strict"
@@ -378,6 +381,11 @@ class ClipCardFeatureCandidateV3(StrictModel):
                 raise ValueError("tracked_reframe requires a focus entity and zoom intent")
         elif self.horizontal_zoom_intent != "none" or self.horizontal_focus_entity_id:
             raise ValueError("original horizontal strategy cannot declare a focus entity or zoom")
+        if (
+            self.horizontal_strategy == "original"
+            and self.horizontal_camera_intent != "hold"
+        ):
+            raise ValueError("original horizontal candidate must hold the camera")
         if self.vertical_strategy == "tracked_crop" and not self.required_entity_ids:
             raise ValueError("tracked_crop requires at least one required entity")
         classified = (
@@ -402,9 +410,27 @@ class ClipCardFeatureSelectV3(StrictModel):
     vertical_candidate_id: str | None = Field(
         default=None, pattern=r"^[A-Za-z0-9_-]+$"
     )
+    recommended_duration_seconds: float | None = Field(
+        default=None, ge=1.0, le=15.0
+    )
+    duration_rationale: str | None = None
+    attention_observation: AttentionObservation | None = None
 
     @model_validator(mode="after")
     def validate_selection(self) -> "ClipCardFeatureSelectV3":
+        if self.recommended_duration_seconds is not None and not (
+            self.duration_rationale and self.duration_rationale.strip()
+        ):
+            raise ValueError("recommended dwell requires a duration rationale")
+        if self.attention_observation is not None:
+            if self.recommended_duration_seconds is None:
+                raise ValueError("attention observation requires preferred dwell")
+            if not (
+                self.attention_observation.minimum_dwell_seconds
+                <= self.recommended_duration_seconds
+                <= self.attention_observation.maximum_dwell_seconds
+            ):
+                raise ValueError("preferred dwell lies outside attention bounds")
         if self.evidence_status == "not_found":
             if self.candidates or self.horizontal_candidate_id or self.vertical_candidate_id:
                 raise ValueError("not_found chapters cannot reference candidates")
@@ -1289,11 +1315,19 @@ def project_feature_contracts_v3(
                 selection_reason=reason,
                 horizontal_strategy=horizontal_primary.horizontal_strategy,
                 horizontal_zoom_intent=horizontal_primary.horizontal_zoom_intent,
+                horizontal_camera_intent=(
+                    horizontal_primary.horizontal_camera_intent
+                ),
                 horizontal_target_description=horizontal_primary_target,
                 vertical_strategy=vertical_primary.vertical_strategy,
                 vertical_target_description=vertical_primary_target,
                 quality_risks=quality_risks,
                 confidence=min(horizontal_primary.confidence, vertical_primary.confidence),
+                recommended_duration_seconds=(
+                    chapter.recommended_duration_seconds
+                ),
+                duration_rationale=chapter.duration_rationale,
+                attention_observation=chapter.attention_observation,
                 horizontal_candidates=[
                     FeatureHorizontalCandidate(
                         candidate_id=candidate.candidate_id,
@@ -1305,6 +1339,7 @@ def project_feature_contracts_v3(
                         selection_reason=candidate.selection_reason,
                         strategy=candidate.horizontal_strategy,
                         zoom_intent=candidate.horizontal_zoom_intent,
+                        camera_intent=candidate.horizontal_camera_intent,
                         target_description=horizontal_target(candidate),
                         quality_risks=candidate.quality_risks,
                         confidence=candidate.confidence,
@@ -1766,11 +1801,13 @@ def main() -> int:
 5. 每個 candidate 都必須保存可直接重試的 16:9 strategy／zoom／horizontal_focus_entity_id，以及 9:16 strategy、framing_intent 和 brief-specific entity priorities。橫式與直式可以從同一候選組選不同來源；horizontal_candidate_id／vertical_candidate_id 必須指向 candidates。不要重複輸出 rank-1 asset/event/frame mirror、target description 或 resolved crop regions；程式會從所選 candidate 與 hash-bound Clip Card evidence 確定性補出。
    - horizontal_strategy=original 時，horizontal_zoom_intent 必須是 none，而且 horizontal_focus_entity_id 必須是 null；原始構圖不需要追蹤焦點。
    - horizontal_strategy=tracked_reframe 時，horizontal_zoom_intent 必須是 subtle 或 detail，而且 horizontal_focus_entity_id 必須引用該 event 中一個可見 entity。
+   - horizontal_camera_intent 只能描述剪輯語言：hold、follow、punch_in_cut、push_in、pull_out、recenter，或在確實存在兩個可區分 anchor 時使用 pan_reveal。不要輸出倍率、座標或運鏡時間。
 6. 9:16 應把 brief 的 vertical_primary_target_description 視為內容優先序，不是強制演算法。只有需要動態跟隨且存在可靠 target 時才用 tracked_crop；若穩定構圖已可保留內容，或窄裁切無法安全包含必要範圍，可以使用 fit_with_background。不得只因 brief 有 primary target 就強制 tracked_crop。
 7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。只分類與這次構圖決策直接相關的 entity；未列入者不會被程式偷偷視為 required 或 sacrificable。不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
 8. framing_intent 只需簡潔描述本候選的構圖取捨；不得輸出座標、bbox、mask、target description 或 verbose region contract。程式會把這些 entity priority ID 與 Clip Card entity/grounding target 資料轉成 domain-neutral hard-core、soft-extent 與 overlay keepout regions。
-9. bbox、mask、crop 座標與精確 cut point 均由後續 Grounding／tracker／FFmpeg 處理；本階段不得輸出座標。
-10. confidence 是 proposal，不是人工真值；候選排序仍須由可見 evidence 與風險說明支持。
+9. 每個 supported／partial chapter 應依可見資訊、動作完整性、閱讀需求、情緒停留、重複壓力與音樂角色提出 recommended_duration_seconds、duration_rationale 與 attention_observation。minimum／recommended／maximum dwell 必須依序排列；attention 各分量 0–1，只是待審相對判斷，不是 source timestamp 或客觀真值。action_progress 表示到片段結尾時動作／結果已完成、適合轉場的程度。
+10. bbox、mask、crop 座標與精確 cut point 均由後續 Grounding／tracker／FFmpeg 處理；本階段不得輸出座標。
+11. confidence 是 proposal，不是人工真值；候選排序仍須由可見 evidence 與風險說明支持。
 
 contract_version 必須原樣回傳：clip-card-feature-cut-v3
 project_id 必須原樣回傳：{brief.project_id}
