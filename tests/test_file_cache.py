@@ -48,6 +48,27 @@ def test_ensure_upload_reuploads_only_after_confirmed_404(tmp_path: Path) -> Non
     assert list((upload_dir / "history").glob("*/file_upload_initial.json"))
 
 
+def test_ensure_upload_replaces_noncanonical_audio_mime_alias(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "music.wav"
+    audio_path.write_bytes(b"RIFF")
+    upload_dir = tmp_path / "upload"
+    write_json(upload_dir / "file_upload_initial.json", {"name": "files/alias"})
+    client = _client_without_network()
+    cached = SimpleNamespace(name="files/alias", mime_type="audio/x-wav")
+    replacement = SimpleNamespace(name="files/canonical", mime_type="audio/wav")
+    client.resume_video_upload = lambda *_args, **_kwargs: cached  # type: ignore[method-assign]
+    client.upload_video = lambda *_args, **_kwargs: replacement  # type: ignore[method-assign]
+
+    result, reused = client.ensure_video_upload(audio_path, upload_dir)
+
+    assert result is replacement
+    assert reused is False
+    cache_record = (upload_dir / "file_cache.json").read_text(encoding="utf-8")
+    assert "saved_file_api_mime_type_is_not_canonical" in cache_record
+
+
 def test_ensure_upload_does_not_duplicate_on_transient_error(tmp_path: Path) -> None:
     upload_dir = tmp_path / "upload"
     write_json(upload_dir / "file_upload_initial.json", {"name": "files/unknown"})

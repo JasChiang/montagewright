@@ -19,6 +19,12 @@
    - 同時填寫 `attention_observation`，分開評估 semantic novelty、動作在片段結尾是否已完成、visual motion、composition change、reading load、尚未解決的動作／懸念、刻意停留價值、重複壓力與音樂轉場機會。每個值 0–1，只代表本次可見證據下的相對判斷，不是客觀真值。
    - `minimum_dwell_seconds` 是辨認主體、看懂必要文字、完成動作或保留必要情緒停頓所需的下限；`maximum_dwell_seconds` 是在資訊開始重複前仍合理的上限。`recommended_duration_seconds` 必須位於兩者之間。全部仍是待審 editorial proposal，不是 source timestamp。
 7. 不同 chapter 原則上應選不同 source clip／take。只有同一來源的另一段確實提供不可替代、且視覺上有意義不同的證據時才可重用，並填寫 `source_reuse_justification`。不得只因第一候選 confidence 較高而重複使用幾乎相同的構圖。
+8. 每個 supported／partial chapter 的 `horizontal_candidates` 與
+   `vertical_candidates` 都必須各保留 2–4 個不同 source event／RF frame 的
+   可執行候選，rank 從 1 連續排列；rank-1 必須與外層相容欄位完全一致。
+   候選不是重複詢問模型，而是同一次回應中供後續品質、geometry 與重複風險
+   gate 依序嘗試的備選。若真的只有一個有證據的素材，請回傳 `partial` 並在
+   uncertainties 說明，不得複製同一影格湊數。
 
 使用者 brief 的規格文字是允許顯示的 editorial copy，但不是你從影片觀察到的證據。不要因為 brief 寫了某功能，就謊稱畫面中確實看見。
 
@@ -57,6 +63,14 @@
   任一方向當成固定模板。
 - `observable_predicate` 說明為什麼此時該看該 anchor；
   `transition_condition` 說明畫面中出現什麼可見條件才適合交接。
+- `camera_behavior` 只表達剪輯意圖：一般跟隨優先用
+  `follow_deadband`，避免把 tracker 的細小抖動變成攝影機抖動；
+  只有每一段移動都需要被看見時才用 `follow`。`push_in` 用於畫面直接支持的
+  細節／結果強調，`pull_out` 用於回到整體關係，`punch_in_cut` 用於明確資訊
+  落點的硬切放大，`hold` 用於固定構圖。不得為了補秒數或裝飾靜態畫面而發明
+  運鏡，也不得輸出倍率、像素速度、 easing 或曲線；本機會依來源解析度、移動
+  距離、phase 時長、速度、加速度與 jerk 決定安全縮放／移動，距離過遠而時間
+  不足時可確定性改成 cut。
 - `start_progress`／`end_progress` 只表示相對敘事順序，必須從 0 連續覆蓋到 1；
   不得輸出或暗示 source timestamp。快速或關鍵交接仍需後續 dense frame ID
   refine 才能改動精確剪點。

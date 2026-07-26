@@ -67,6 +67,20 @@ MODEL_ID = os.environ.get("JASCUE_GEMINI_MODEL", "gemini-3.6-flash")
 API_NAME = "gemini_interactions"
 SDK_NAME = "google-genai"
 
+
+def canonical_interactions_mime_type(mime_type: str) -> str:
+    """Normalize common OS/File API aliases to Interactions API media types."""
+
+    normalized = mime_type.strip().lower()
+    aliases = {
+        "audio/x-wav": "audio/wav",
+        "audio/vnd.wave": "audio/wav",
+        "audio/wave": "audio/wav",
+        "audio/x-m4a": "audio/m4a",
+        "audio/mp4": "audio/m4a",
+    }
+    return aliases.get(normalized, normalized)
+
 VISUAL_EVIDENCE_SYSTEM_INSTRUCTION = """你是 evidence-constrained 多模態觀察系統。
 回答時只能使用本次請求實際提供的影像、影片、音訊，以及明確標示為 metadata 的文字。模型訓練記憶、產品知識、常見命名、相似外觀、上下文期待與「最可能答案」都不是觀察證據，不得用來補完、修正或取代媒體中的內容。
 
@@ -391,6 +405,55 @@ def canonicalize_feature_edit_plan_output(
                     "rule": "system_owned_attention_review_gate_is_always_true",
                 }
             )
+        candidate_mirrors = {
+            "horizontal_candidates": {
+                "horizontal_frame_id": "frame_id",
+                "horizontal_strategy": "strategy",
+                "horizontal_zoom_intent": "zoom_intent",
+                "horizontal_camera_intent": "camera_intent",
+                "horizontal_target_description": "target_description",
+            },
+            "vertical_candidates": {
+                "vertical_frame_id": "frame_id",
+                "vertical_strategy": "strategy",
+                "vertical_target_description": "target_description",
+            },
+        }
+        for candidate_field, mirrors in candidate_mirrors.items():
+            candidates = chapter.get(candidate_field)
+            if not isinstance(candidates, list):
+                continue
+            rank_one = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if isinstance(candidate, dict) and candidate.get("rank") == 1
+                ),
+                None,
+            )
+            if rank_one is None or any(
+                candidate_key not in rank_one
+                for candidate_key in mirrors.values()
+            ):
+                continue
+            for legacy_key, candidate_key in mirrors.items():
+                candidate_value = rank_one[candidate_key]
+                if chapter.get(legacy_key) == candidate_value:
+                    continue
+                before = chapter.get(legacy_key)
+                chapter[legacy_key] = candidate_value
+                changes.append(
+                    {
+                        "json_path": (
+                            f"$.chapters[{chapter_index}].{legacy_key}"
+                        ),
+                        "before": before,
+                        "after": candidate_value,
+                        "rule": (
+                            "rank_one_candidate_is_authoritative_legacy_projection"
+                        ),
+                    }
+                )
         for field in ("horizontal_candidates", "vertical_candidates"):
             candidates = chapter.get(field)
             if isinstance(candidates, list) and len(candidates) == 1:
@@ -606,7 +669,20 @@ class GeminiLabClient:
                 raise FileNotFoundError(path)
             # Do not resolve an ASCII artifact symlink back to a non-ASCII
             # source basename: the SDK puts the basename in an HTTP header.
-            uploaded = self.client.files.upload(file=str(path.absolute()))
+            guessed_mime_type = mimetypes.guess_type(str(path))[0]
+            canonical_mime_type = (
+                canonical_interactions_mime_type(guessed_mime_type)
+                if guessed_mime_type
+                else None
+            )
+            uploaded = self.client.files.upload(
+                file=str(path.absolute()),
+                config=(
+                    types.UploadFileConfig(mime_type=canonical_mime_type)
+                    if canonical_mime_type
+                    else None
+                ),
+            )
             write_json(artifact_dir / "file_upload_initial.json", _raw_dump(uploaded))
             deadline = time.monotonic() + timeout_seconds
             while not uploaded.state or uploaded.state.name == "PROCESSING":
@@ -661,11 +737,29 @@ class GeminiLabClient:
         if initial_path.exists() and not force_reupload:
             try:
                 uploaded = self.resume_video_upload(artifact_dir, timeout_seconds)
-                write_json(
-                    artifact_dir / "file_cache.json",
-                    {"reused": True, "reason": "saved_file_api_object_is_active", "checked_at": utc_now()},
+                expected_mime_type = mimetypes.guess_type(str(path))[0]
+                expected_mime_type = (
+                    canonical_interactions_mime_type(expected_mime_type)
+                    if expected_mime_type
+                    else None
                 )
-                return uploaded, True
+                saved_mime_type = getattr(uploaded, "mime_type", None)
+                if (
+                    expected_mime_type
+                    and isinstance(saved_mime_type, str)
+                    and saved_mime_type.strip().lower() != expected_mime_type
+                ):
+                    reason = "saved_file_api_mime_type_is_not_canonical"
+                else:
+                    write_json(
+                        artifact_dir / "file_cache.json",
+                        {
+                            "reused": True,
+                            "reason": "saved_file_api_object_is_active",
+                            "checked_at": utc_now(),
+                        },
+                    )
+                    return uploaded, True
             except Exception as error:
                 if not _is_file_api_not_found(error):
                     raise
@@ -2695,7 +2789,9 @@ model_provenance (return it unchanged with interaction_id=null):
                     {
                         "type": "audio",
                         "uri": uploaded_audio.uri,
-                        "mime_type": uploaded_audio.mime_type,
+                        "mime_type": canonical_interactions_mime_type(
+                            str(uploaded_audio.mime_type)
+                        ),
                     }
                 )
             request_record = {
@@ -2959,7 +3055,9 @@ model_provenance (return it unchanged with interaction_id=null):
                 {
                     "type": "audio",
                     "uri": uploaded_audio.uri,
-                    "mime_type": uploaded_audio.mime_type,
+                    "mime_type": canonical_interactions_mime_type(
+                        str(uploaded_audio.mime_type)
+                    ),
                 },
             ],
             "generation_config": {
@@ -3063,7 +3161,9 @@ model_provenance (return it unchanged with interaction_id=null):
                     model_id=self.model_id,
                     response_schema=response_schema,
                     request_record=request_record,
-                    audio_mime_type=str(uploaded_audio.mime_type),
+                    audio_mime_type=canonical_interactions_mime_type(
+                        str(uploaded_audio.mime_type)
+                    ),
                 ),
             )
         try:

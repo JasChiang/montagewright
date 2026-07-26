@@ -667,8 +667,20 @@ def derive_visual_sync_map(
                 start_progress = float(phase.get("start_progress", -1))
                 if not 0.0 < start_progress < 1.0:
                     continue
-                project_time_ms = elapsed + round(duration * start_progress)
                 transition_kind = str(phase.get("transition_in") or "cut")
+                transition_fraction = float(
+                    phase.get("transition_duration_fraction") or 0.0
+                )
+                end_progress = float(phase.get("end_progress", start_progress))
+                arrival_progress = start_progress
+                if transition_kind == "smoothstep":
+                    arrival_progress = min(
+                        end_progress,
+                        start_progress
+                        + max(0.0, transition_fraction)
+                        * max(0.0, end_progress - start_progress),
+                    )
+                project_time_ms = elapsed + round(duration * arrival_progress)
                 anchor_ids = [
                     str(value)
                     for value in phase.get("anchor_region_ids", [])
@@ -702,13 +714,13 @@ def derive_visual_sync_map(
                             f"phase-origin:{phase_origin}",
                         ),
                         semantic_description=(
-                            f"Geometry-validated {transition_kind} hand-off to "
+                            f"Geometry-validated {transition_kind} hand-off arrival at "
                             + (", ".join(anchor_ids) if anchor_ids else "the next anchor")
                             + ". "
                             + str(phase.get("editorial_reason") or "")
                         ).strip(),
                         editorial_note=(
-                            "An executed virtual-camera phase boundary is an "
+                            "The executed virtual-camera arrival is an "
                             "eligible musical accent, not a command to retime the "
                             "source or cut an incomplete action. Proposal origin: "
                             f"{phase_origin}."

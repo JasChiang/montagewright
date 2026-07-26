@@ -223,6 +223,7 @@ def test_visual_sync_map_includes_executed_virtual_camera_handoffs(
                 "end_progress": 1.0,
                 "anchor_region_ids": ["second-anchor"],
                 "transition_in": "smoothstep",
+                "transition_duration_fraction": 0.5,
                 "editorial_reason": "Hand off to the visible result.",
             },
         ],
@@ -239,7 +240,7 @@ def test_visual_sync_map_includes_executed_virtual_camera_handoffs(
     ]
 
     assert len(transitions) == 1
-    assert transitions[0].project_time_ms == 1600
+    assert transitions[0].project_time_ms == 1900
     assert transitions[0].priority == VisualSyncPriority.PREFERRED
     assert transitions[0].allowed_cue_kinds == ("downbeat", "accent", "beat")
     assert "second-anchor" in transitions[0].semantic_description

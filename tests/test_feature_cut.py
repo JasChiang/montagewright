@@ -96,6 +96,7 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
     assert defaults.shot_quality_map == []
     assert defaults.post_render_quality_qc is True
     assert defaults.rhythm_style == "standard"
+    assert defaults.allow_shorter_within_delivery_range is False
     vertical = build_parser().parse_args(
         [
             "feature-cut",
@@ -307,6 +308,119 @@ def test_editorial_dwell_locks_human_approved_trim_before_allocation() -> None:
         "human_approved_trim_exact_pts"
     )
     assert audit["fixed_approved_trim_duration_seconds"] == {"opening": 4.2}
+
+
+def test_editorial_dwell_can_snap_to_longer_music_prefix_when_authorized() -> None:
+    feature_ids = ("opening", "action", "detail", "comparison", "result", "closing")
+    brief = FeatureEditBrief(
+        project_id="generic-project",
+        title="Generic edit",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id=feature_id,
+                title=feature_id,
+                detail_lines=[],
+                target_duration_seconds=10,
+            )
+            for feature_id in feature_ids
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id="generic-catalog",
+        title=brief.title,
+        chapters=[
+            FeatureChapterSelect(
+                feature_id=feature_id,
+                evidence_status="supported",
+                observed_visual_evidence="Observable evidence.",
+                selection_reason="Selected evidence.",
+                horizontal_frame_id=f"RF{index:06d}",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_frame_id=f"RF{index:06d}",
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                recommended_duration_seconds=10,
+                duration_rationale="Relative information and action judgment.",
+                quality_risks=[],
+                confidence=0.9,
+            )
+            for index, feature_id in enumerate(feature_ids, start=1)
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    music_lock = MusicMapLock(
+        music_id=f"sha256:{'a' * 64}",
+        proposal_path="/test/music-map.proposal.json",
+        proposal_sha256="b" * 64,
+        review=MusicMapReview(
+            proposal_sha256="b" * 64,
+            reviewer="test",
+            reviewed_at="2026-07-26T00:00:00+00:00",
+            decision="approved",
+            bpm=120,
+            first_downbeat_sample=0,
+            meter=4,
+        ),
+        master_sample_rate=48_000,
+        duration_samples=61 * 48_000,
+        duration_ms=61_000,
+        bpm=120,
+        meter=4,
+        first_downbeat_sample=0,
+        cues=[
+            LockedMusicCue(
+                cue_id=f"locked-cue-{index:05d}",
+                kind="downbeat",
+                sample_index=time_ms * 48,
+                time_ms=time_ms,
+                strength=0.9,
+                priority=CuePriority.PREFERRED,
+            )
+            for index, time_ms in enumerate(
+                (10_100, 20_100, 30_100, 40_100, 50_100),
+                start=1,
+            )
+        ],
+        sections=[
+            MusicSectionCandidate(
+                section_id="section-001",
+                start_sample=0,
+                end_sample=61 * 48_000,
+                label="section_001",
+                boundary_source="whole_track",
+                confidence=1.0,
+            )
+        ],
+        definition_sha256="c" * 64,
+    )
+
+    durations, audit = _resolve_editorial_chapter_durations(
+        brief,
+        plan,
+        music_lock=music_lock,
+        project_duration_seconds=60,
+        allow_music_lock_prefix=True,
+    )
+
+    assert sum(durations.values()) == 60
+    assert durations["opening"] == 10.1
+    assert audit["music_lock_prefix_used"] is True
+    assert audit["music_lock_duration_ms"] == 61_000
+    assert audit["project_timeline_end_ms"] == 60_000
+    assert audit["music_boundary_refinements"][0]["music_snap_applied"] is True
 
 
 def test_editorial_dwell_refuses_approved_trim_beyond_safe_capacity() -> None:
@@ -944,6 +1058,13 @@ from jascue_video_lab.models import (
     TrackingState,
     VerticalVirtualCameraProposal,
     VerticalVirtualCameraProposalPhase,
+)
+from jascue_video_lab.music import (
+    CuePriority,
+    LockedMusicCue,
+    MusicMapLock,
+    MusicMapReview,
+    MusicSectionCandidate,
 )
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.sam_tracking import (
@@ -3292,7 +3413,10 @@ def test_phase_virtual_camera_moves_between_independent_tracked_anchors() -> Non
     assert "crop=1080:1920" in filter_graph
     assert audit["applied_strategy"] == "phase_virtual_camera"
     assert audit["minimum_visible_required_area_fraction"] == 1.0
-    assert audit["transition_sample_count"] >= 1
+    assert audit["transition_sample_count"] == 0
+    assert audit["distance_aware_transition_audit"][0]["disposition"] == (
+        "converted_to_cut"
+    )
     assert audit["requires_gemini_review"] is True
     keyframes = audit["crop_keyframes"]
     assert keyframes[0]["phase_id"] == "right-first"
@@ -3301,6 +3425,68 @@ def test_phase_virtual_camera_moves_between_independent_tracked_anchors() -> Non
     plan = audit["phase_virtual_camera_plan"]
     assert plan["anchor_region_ids"] == ["right", "left"]
     assert plan["execution_status"] == "applied"
+
+
+def test_virtual_camera_deadband_ignores_small_tracker_motion() -> None:
+    prior = (500.0, 500.0)
+
+    assert feature_cut_module._deadband_center(
+        prior,
+        (506.0, 496.0),
+        deadband_x=10.0,
+        deadband_y=10.0,
+    ) == prior
+    assert feature_cut_module._deadband_center(
+        prior,
+        (530.0, 500.0),
+        deadband_x=10.0,
+        deadband_y=10.0,
+    ) == (520.0, 500.0)
+
+
+def test_phase_virtual_camera_push_in_uses_resolution_bounded_scale() -> None:
+    samples = [
+        SimpleNamespace(
+            analysis_sample_time_ms=index * 500,
+            source_pts=index * 15,
+            tracking_state=TrackingState.TRACKED,
+            derived_tracking_box=[380, 220, 620, 780],
+        )
+        for index in range(7)
+    ]
+    track = SimpleNamespace(
+        analysis_start_ms=0,
+        analysis_end_ms=3000,
+        analysis_fps=2.0,
+        seed_source_width=3840,
+        seed_source_height=2160,
+        analysis_width=960,
+        analysis_height=540,
+        target_description="generic visible subject",
+        target_id="subject",
+        samples=samples,
+        model_dump=lambda *, mode: {"target_id": "subject", "mode": mode},
+    )
+
+    filter_graph, audit = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={"subject": track},
+        phases=[
+            VerticalVirtualCameraPhase(
+                phase_id="detail",
+                start_progress=0.0,
+                end_progress=1.0,
+                anchor_region_ids=["subject"],
+                camera_behavior="push_in",
+                editorial_reason="Emphasize the observed result.",
+            )
+        ],
+    )
+
+    assert "eval=frame" in filter_graph
+    assert audit["maximum_applied_zoom"] == pytest.approx(1.12)
+    assert audit["crop_scale_values"][0] == pytest.approx(1.0)
+    assert audit["crop_scale_values"][-1] == pytest.approx(1.12)
+    assert audit["max_crop_speed_pixels_per_second"] <= 720
 
 
 def test_phase_virtual_camera_allows_reviewed_non_atomic_clipping() -> None:

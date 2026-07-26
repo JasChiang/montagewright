@@ -66,7 +66,9 @@ Top-K 直式候選
 
 因此「稍微切到背景、衣服邊緣或非必要環境」可以是正確構圖；「切掉臉、指定產品、關鍵操作手、必要 UI／文字」則不能因滿版好看而合理化。Gemini 成片 QA 也會把 geometry safety 與 portrait composition 分開：沒有切到主體只代表安全，不自動代表畫布利用、視覺焦點與 matte fallback 都理想。
 
-同一個橫式鏡頭若有兩個以上不能同時塞進 9:16、但可以依序觀看的重點，Gemini 在完整觀看單支 proxy、建立 Clip Card 時，先以 `portrait_attention_sequence` 記錄素材直接支持的動作、視線、結果揭露與資訊交接；選片階段才可依這份證據提出 `virtual_camera_proposal`。方向不是固定的左→中→右：可以是右→左、人物→結果、整體→細節，或判斷完全不應移動。proposal 只保存相對 phase 順序、可見 predicate、交接條件與既有 Entity／region ID，不包含 source timestamp、bbox 或 crop 座標；本機仍須對各 anchor 做 exact-frame Grounding、SAM 追蹤、100% active-anchor containment 與速度／加速度／jerk gate，通過後才會產生可執行 `VerticalVirtualCameraPlan`。若幾何失敗就改試下一個 take 或安全 fallback，不會硬做模型要求的移動。
+同一個橫式鏡頭若有兩個以上不能同時塞進 9:16、但可以依序觀看的重點，Gemini 在完整觀看單支 proxy、建立 Clip Card 時，先以 `portrait_attention_sequence` 記錄素材直接支持的動作、視線、結果揭露與資訊交接；選片階段才可依這份證據提出 `virtual_camera_proposal`。方向不是固定的左→中→右：可以是右→左、人物→結果、整體→細節，或判斷完全不應移動。每個 phase 可選 `hold`、帶 deadband 的 `follow`、連續 `follow`、`push_in`、`pull_out` 或硬切式 `punch_in_cut`；不再把所有相位交接一律做成定速平移。proposal 只保存相對 phase 順序、可見 predicate、交接條件與既有 Entity／region ID，不包含 source timestamp、bbox 或 crop 座標；本機仍須對各 anchor 做 exact-frame Grounding、SAM 追蹤、100% active-anchor containment 與速度／加速度／jerk gate，通過後才會產生可執行 `VerticalVirtualCameraPlan`。
+
+本機的 phase transition 使用 smoothstep easing，並依實際移動距離同時估算速度、加速度與 jerk 所需的最低時間；Gemini 建議的 transition 若太短，不能直接把鏡頭加速。能安全完成時才移動，距離太遠或 phase 太短時改成有稽核紀錄的硬切，微小 tracker 位移則由 deadband 吸收。scale 也受來源解析度與最多 1.12× 的保守上限約束。若幾何失敗就改試下一個 take 或安全 fallback，不會硬做模型要求的移動。
 
 這也不是把「兩個都必須同時看見」改成任意裁切：兩者關係必須同時成立時，proposal 必須使用 `joint_relation`，否則應換 take、split／PiP 或 solid fit。自動 proposal 永遠不能授權裁掉 active anchor；只有具 provenance 的真人 `vertical_camera_phases` policy 可對非原子人物／物件明示較低可見門檻。兩條路徑的成片都標記為 review-required，artifact 也會分清 `gemini_proposed` 與 `human_reviewed`，避免把人工測試方向冒充成模型判斷。
 
@@ -459,7 +461,9 @@ P1 不再把 Gemini 的 `recommended_duration_seconds` 當成孤立數字。每�
 
 本機先將 maximum clamp 到 QualitySafeInterval 的連續容量，再建立 `AttentionProfile` 與 `RhythmPlan`。RhythmPlan 只提供章節時長上下限和 boundary pressure；它沒有 source timestamp 欄位，不能自行產生 frame-accurate cut。舊 plan 沒有完整 attention vector 時，未知欄位保持 `null`，不以規則偽造模型分數。
 
-P2 將 16:9 reframe 從固定倍率升級為 `VirtualCameraPlan`。Gemini 只選 `hold`、`follow`、`punch_in_cut`、`push_in`、`pull_out`、`recenter` 或雙 anchor 的 `pan_reveal` 意圖；實際 keyframe scale、center、containment、速度、加速度與 jerk 由本機 track 和 geometry solver 決定。每個執行結果保存 sidecar 與 track fingerprint。只有一個鎖定 target 時，`pan_reveal` 會退回 `follow` 並要求 review；系統不會憑語意猜出第二條運鏡軌跡。這套 16:9 剪輯運鏡與 9:16 版型 reframe 使用相同 tracking evidence，但分屬不同 editorial contract。
+P2 將 reframe 從固定倍率升級為可稽核的 `VirtualCameraPlan`。16:9 與 9:16 都能使用 Gemini 基於素材證據提出的 `hold`、`follow_deadband`、`follow`、`punch_in_cut`、`push_in` 或 `pull_out`；多 anchor 直式鏡頭另可依 phase 順序交接注意力。實際 keyframe scale、center、containment、deadband、速度、加速度與 jerk 由本機 track 和 geometry solver 決定，不能由模型直接填數值。每個執行結果保存 sidecar 與 track fingerprint；phase 間若沒有足夠時間完成安全移動，就轉為 hard cut 而不是快速掃過。這套 16:9 剪輯運鏡與 9:16 版型 reframe 共用 tracking evidence，但分屬不同 editorial contract。
+
+若使用者授權的交付範圍是 60–90 秒，而 Gemini 的各章 AttentionProfile 在 QualitySafeInterval 內的最大連續容量總和略短於 brief 偏好秒數，可明示 `--allow-shorter-within-delivery-range`。程式只會把 project duration 降到仍在交付範圍內的 attention maximum，並保存 `project-duration-resolution.json`；它不會重播、停格、穿過髒畫面或偷偷延長任何章節。若已核准的同一首連續音樂最多只比新 project timeline 長 2 秒，scheduler 可只使用其合法 prefix cue 來調整畫面章節邊界，音樂交付仍另做一次連續 trim 與自然淡出；不切碎、交疊或 time-stretch 音樂。預設仍 fail closed。
 
 ```bash
 uv run jascue-video-lab feature-cut CATALOG.json BRIEF.json \
@@ -688,6 +692,21 @@ App 的固定順序是：
 一個經授權的真實短片測例曾讓 A、B 兩種模式選中相同指定實例，但兩個 bbox 仍有明顯幾何差異。公開文字不揭露原始檔名與私人路徑；媒體本身仍可能含人物、品牌與活動場景，不能稱為已去識別化。這是模型輔助視覺檢查，不是獨立 human ground truth；B 模式的 reference frame 仍不可知，因此不能用來建立正式 tracking seed。
 
 持久資料位於被 Git 排除的 `artifacts/blind-review-app/<session-id>/`；跨 session 的 Gemini File API cache 依 analysis source SHA-256 位於 `artifacts/blind-review-file-cache/`。同一 upload identity 在官方 48 小時保存期內會重用。App 不會把 API key 傳到瀏覽器，也不以 browser storage 當實驗資料來源。
+
+### 從實驗工具變成可丟素材的 App
+
+目前核心流程已可包成簡單 App，不需要把分析、選片、Grounding、SAM 與 renderer 重寫成另一套。產品介面可以固定為：
+
+```text
+建立專案並拖入一批素材／brief／可選音樂
+  → 背景工作建立 proxy、Clip Cards、MusicMap 與 Top-K
+  → 使用者審核選片、Identity／Predicate／Framing Lock 和 trim
+  → 只對入選且需要重構的片段執行 Gemini bbox＋SAM
+  → 顯示 16:9／9:16、節奏、虛擬鏡頭與失敗原因
+  → 使用者核准後 deterministic render
+```
+
+真正還需要產品化的是 upload／job queue、進度與取消、artifact DAG／stale propagation、API 配額與成本上限、File API cache 管理、登入與媒體權限、人工 review UI，以及失敗後從哪個 stage 重跑。這些是服務與介面工程，不是要模型一次直接吐出不可稽核的完整時間軸。自動化程度可以很高，但 target identity、重要文字、主觀 hero take、受控裁切、trim 與最後節奏仍應保留 human-in-the-loop 核准。
 
 ## 產生四種真實影片 fixture
 

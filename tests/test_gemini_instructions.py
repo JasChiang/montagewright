@@ -18,6 +18,7 @@ from jascue_video_lab.gemini import (
     SEMANTIC_IDENTITY_GENERATION_CONFIG,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
     GeminiLabClient,
+    canonical_interactions_mime_type,
     canonicalize_feature_edit_plan_output,
 )
 from jascue_video_lab.models import (
@@ -34,6 +35,13 @@ from jascue_video_lab.models import (
 
 class _StopRequest(RuntimeError):
     pass
+
+
+def test_interactions_mime_type_normalizes_common_audio_aliases() -> None:
+    assert canonical_interactions_mime_type("audio/x-wav") == "audio/wav"
+    assert canonical_interactions_mime_type("audio/vnd.wave") == "audio/wav"
+    assert canonical_interactions_mime_type("audio/x-m4a") == "audio/m4a"
+    assert canonical_interactions_mime_type("audio/mpeg") == "audio/mpeg"
 
 
 def test_feature_plan_single_candidate_lists_use_legacy_projection() -> None:
@@ -61,6 +69,62 @@ def test_feature_plan_single_candidate_lists_use_legacy_projection() -> None:
     assert payload["chapters"][0]["vertical_candidates"] == []
     assert len(payload["chapters"][1]["horizontal_candidates"]) == 2
     assert len(changes) == 2
+
+
+def test_feature_plan_rank_one_candidate_repairs_redundant_legacy_projection() -> None:
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "horizontal_frame_id": "RF000001",
+                        "vertical_frame_id": "RF000002",
+                        "horizontal_strategy": "original",
+                        "horizontal_zoom_intent": "none",
+                        "horizontal_camera_intent": "hold",
+                        "horizontal_target_description": None,
+                        "vertical_strategy": "fit_with_background",
+                        "vertical_target_description": "old target",
+                        "horizontal_candidates": [
+                            {
+                                "rank": 1,
+                                "frame_id": "RF000101",
+                                "strategy": "tracked_reframe",
+                                "zoom_intent": "detail",
+                                "camera_intent": "push_in",
+                                "target_description": "rank-one focus",
+                            },
+                            {"rank": 2},
+                        ],
+                        "vertical_candidates": [
+                            {
+                                "rank": 1,
+                                "frame_id": "RF000202",
+                                "strategy": "tracked_crop",
+                                "target_description": "rank-one portrait target",
+                            },
+                            {"rank": 2},
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    chapter = json.loads(canonical)["chapters"][0]
+    assert chapter["horizontal_frame_id"] == "RF000101"
+    assert chapter["horizontal_strategy"] == "tracked_reframe"
+    assert chapter["horizontal_zoom_intent"] == "detail"
+    assert chapter["horizontal_camera_intent"] == "push_in"
+    assert chapter["horizontal_target_description"] == "rank-one focus"
+    assert chapter["vertical_frame_id"] == "RF000202"
+    assert chapter["vertical_strategy"] == "tracked_crop"
+    assert chapter["vertical_target_description"] == "rank-one portrait target"
+    assert len(changes) == 8
+    assert {
+        change["rule"] for change in changes
+    } == {"rank_one_candidate_is_authoritative_legacy_projection"}
 
 
 class _RejectingInteractions:

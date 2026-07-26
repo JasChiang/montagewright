@@ -114,6 +114,11 @@ RenderAspect = Literal["both", "9x16", "16x9"]
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
 _TRACKING_SEED_BOX_PADDING_RATIO = 0.04
+_PORTRAIT_PHASE_MAX_ZOOM = 1.12
+_PORTRAIT_DEADBAND_VIEWPORT_FRACTION = 0.08
+_PORTRAIT_MAX_SPEED_PX_S = 720.0
+_PORTRAIT_MAX_ACCELERATION_PX_S2 = 1800.0
+_PORTRAIT_MAX_JERK_PX_S3 = 7200.0
 _FEATURE_PLAN_BINDING_VERSION = "feature-plan-binding-v1"
 _EXTERNAL_PROJECTION_SIDECAR_VERSION = "external-feature-plan-projection-v1"
 _EXTERNAL_PROJECTION_POINTER_NAME = "feature-plan.external-projection.json"
@@ -4178,6 +4183,49 @@ def _visible_area_fraction(
     )
 
 
+def _deadband_center(
+    prior: tuple[float, float] | None,
+    current: tuple[float, float],
+    *,
+    deadband_x: float,
+    deadband_y: float,
+) -> tuple[float, float]:
+    """Move only enough to return a tracked target to the composition safe zone."""
+
+    if prior is None:
+        return current
+
+    def resolve(previous: float, observed: float, radius: float) -> float:
+        if observed < previous - radius:
+            return observed + radius
+        if observed > previous + radius:
+            return observed - radius
+        return previous
+
+    return (
+        resolve(prior[0], current[0], deadband_x),
+        resolve(prior[1], current[1], deadband_y),
+    )
+
+
+def _minimum_smoothstep_transition_seconds(distance_pixels: float) -> float:
+    """Return a conservative duration from smoothstep motion extrema."""
+
+    if distance_pixels <= 1e-6:
+        return 0.0
+    return max(
+        0.25,
+        1.5 * distance_pixels / _PORTRAIT_MAX_SPEED_PX_S,
+        math.sqrt(
+            6.0 * distance_pixels / _PORTRAIT_MAX_ACCELERATION_PX_S2
+        ),
+        (
+            12.0 * distance_pixels / _PORTRAIT_MAX_JERK_PX_S3
+        )
+        ** (1 / 3),
+    )
+
+
 def _vertical_virtual_camera_filter_from_tracks(
     *,
     tracks_by_region: Mapping[str, SegmentationTrack],
@@ -4325,8 +4373,12 @@ def _vertical_virtual_camera_filter_from_tracks(
     scaled_height = float(transform["scaled_height"])
     crop_width_normalized = 1080 / scaled_width * 1000
     crop_height_normalized = 1920 / scaled_height * 1000
-    max_crop_left = max(0.0, 1000 - crop_width_normalized)
-    max_crop_top = max(0.0, 1000 - crop_height_normalized)
+    base_source_scale = max(
+        scaled_width / source_width,
+        scaled_height / source_height,
+    )
+    native_zoom_limit = max(1.0, 1.0 / max(1e-9, base_source_scale))
+    maximum_zoom = min(_PORTRAIT_PHASE_MAX_ZOOM, native_zoom_limit)
 
     phase_centers: dict[str, tuple[float, float]] = {}
     for phase in phases:
@@ -4348,15 +4400,90 @@ def _vertical_virtual_camera_filter_from_tracks(
             sum((box[1] + box[3]) / 2 for _, box in samples) / len(samples),
         )
 
+    effective_phases: list[VerticalVirtualCameraPhase] = []
+    transition_audit: list[dict[str, Any]] = []
+    for phase_index, phase in enumerate(phases):
+        effective = phase
+        if phase_index > 0 and phase.transition_in == "smoothstep":
+            previous = phases[phase_index - 1]
+            prior_center = phase_centers[previous.phase_id]
+            current_center = phase_centers[phase.phase_id]
+            distance_pixels = math.hypot(
+                (current_center[0] - prior_center[0]) / 1000 * scaled_width,
+                (current_center[1] - prior_center[1]) / 1000 * scaled_height,
+            )
+            phase_seconds = (
+                (phase.end_progress - phase.start_progress)
+                * duration_ms
+                / 1000
+            )
+            requested_seconds = (
+                phase_seconds * phase.transition_duration_fraction
+            )
+            minimum_seconds = _minimum_smoothstep_transition_seconds(
+                distance_pixels
+            )
+            effective_seconds = max(requested_seconds, minimum_seconds)
+            maximum_seconds = phase_seconds
+            if effective_seconds > maximum_seconds + 1e-6:
+                effective = phase.model_copy(
+                    update={
+                        "transition_in": "cut",
+                        "transition_duration_fraction": 0.0,
+                    }
+                )
+                effective_fraction = 0.0
+                disposition = "converted_to_cut"
+            else:
+                effective_fraction = min(
+                    1.0,
+                    effective_seconds / max(0.001, phase_seconds),
+                )
+                effective = phase.model_copy(
+                    update={
+                        "transition_duration_fraction": effective_fraction,
+                    }
+                )
+                disposition = "smoothstep"
+            transition_audit.append(
+                {
+                    "phase_id": phase.phase_id,
+                    "distance_pixels": round(distance_pixels, 6),
+                    "requested_duration_seconds": round(requested_seconds, 6),
+                    "minimum_safe_duration_seconds": round(minimum_seconds, 6),
+                    "effective_duration_seconds": round(effective_seconds, 6),
+                    "effective_duration_fraction": round(effective_fraction, 6),
+                    "disposition": disposition,
+                    "policy": "distance_aware_smoothstep_v1",
+                }
+            )
+        effective_phases.append(effective)
+    phases = effective_phases
+
+    phase_scale_ranges: dict[str, tuple[float, float]] = {}
+    carried_scale = 1.0
+    for phase in phases:
+        start_scale = carried_scale
+        end_scale = carried_scale
+        if phase.camera_behavior in {"push_in", "punch_in_cut"}:
+            end_scale = maximum_zoom
+        elif phase.camera_behavior == "pull_out":
+            end_scale = 1.0
+        phase_scale_ranges[phase.phase_id] = (start_scale, end_scale)
+        carried_scale = end_scale
+
     times: list[float] = []
     x_values: list[float] = []
     y_values: list[float] = []
+    scale_values: list[float] = []
     crop_keyframes: list[dict[str, Any]] = []
     steady_visible_fractions: list[float] = []
     transition_visible_fractions: list[float] = []
     transition_sample_count = 0
     missing_active_samples = 0
     active_anchor_samples: set[tuple[str, int]] = set()
+    deadband_centers: dict[str, tuple[float, float]] = {}
+    punch_cut_sample_indexes: set[int] = set()
     for time_ms in all_times_ms:
         progress = max(0.0, min(1.0, (time_ms - start_ms) / duration_ms))
         phase_index, phase = phase_for_progress(progress)
@@ -4371,8 +4498,43 @@ def _vertical_virtual_camera_filter_from_tracks(
             (current_box[0] + current_box[2]) / 2,
             (current_box[1] + current_box[3]) / 2,
         )
-        if phase.camera_behavior == "hold":
+        if phase.camera_behavior in {
+            "hold",
+            "push_in",
+            "pull_out",
+            "punch_in_cut",
+        }:
             current_center = phase_centers[phase.phase_id]
+        elif phase.camera_behavior == "follow_deadband":
+            current_center = _deadband_center(
+                deadband_centers.get(phase.phase_id),
+                current_center,
+                deadband_x=(
+                    crop_width_normalized
+                    * _PORTRAIT_DEADBAND_VIEWPORT_FRACTION
+                ),
+                deadband_y=(
+                    crop_height_normalized
+                    * _PORTRAIT_DEADBAND_VIEWPORT_FRACTION
+                ),
+            )
+            deadband_centers[phase.phase_id] = current_center
+
+        phase_progress = (
+            (progress - phase.start_progress)
+            / max(1e-6, phase.end_progress - phase.start_progress)
+        )
+        phase_progress = max(0.0, min(1.0, phase_progress))
+        phase_smoothstep = phase_progress * phase_progress * (
+            3 - 2 * phase_progress
+        )
+        start_scale, end_scale = phase_scale_ranges[phase.phase_id]
+        if phase.camera_behavior == "punch_in_cut":
+            scale = start_scale if phase_progress < 0.5 else end_scale
+        elif phase.camera_behavior in {"push_in", "pull_out"}:
+            scale = start_scale + (end_scale - start_scale) * phase_smoothstep
+        else:
+            scale = start_scale
         transition = False
         previous_box: list[int] | None = None
         desired_center = current_center
@@ -4409,19 +4571,43 @@ def _vertical_virtual_camera_filter_from_tracks(
                     previous_center[1]
                     + (current_center[1] - previous_center[1]) * alpha,
                 )
-        crop_left = max(
+        dynamic_scaled_width = scaled_width * scale
+        dynamic_scaled_height = scaled_height * scale
+        dynamic_crop_width_normalized = 1080 / dynamic_scaled_width * 1000
+        dynamic_crop_height_normalized = 1920 / dynamic_scaled_height * 1000
+        max_crop_left_pixels = max(0.0, dynamic_scaled_width - 1080)
+        max_crop_top_pixels = max(0.0, dynamic_scaled_height - 1920)
+        crop_left_pixels = max(
             0.0,
-            min(max_crop_left, desired_center[0] - crop_width_normalized / 2),
+            min(
+                max_crop_left_pixels,
+                desired_center[0] / 1000 * dynamic_scaled_width - 540,
+            ),
         )
-        crop_top = max(
+        crop_top_pixels = max(
             0.0,
-            min(max_crop_top, desired_center[1] - crop_height_normalized / 2),
+            min(
+                max_crop_top_pixels,
+                desired_center[1] / 1000 * dynamic_scaled_height - 960,
+            ),
         )
         if not transition and phase.minimum_anchor_visible_fraction >= 1.0 - 1e-9:
-            legal_left_low = max(0.0, current_box[2] - crop_width_normalized)
-            legal_left_high = min(max_crop_left, float(current_box[0]))
-            legal_top_low = max(0.0, current_box[3] - crop_height_normalized)
-            legal_top_high = min(max_crop_top, float(current_box[1]))
+            legal_left_low = max(
+                0.0,
+                current_box[2] / 1000 * dynamic_scaled_width - 1080,
+            )
+            legal_left_high = min(
+                max_crop_left_pixels,
+                current_box[0] / 1000 * dynamic_scaled_width,
+            )
+            legal_top_low = max(
+                0.0,
+                current_box[3] / 1000 * dynamic_scaled_height - 1920,
+            )
+            legal_top_high = min(
+                max_crop_top_pixels,
+                current_box[1] / 1000 * dynamic_scaled_height,
+            )
             if (
                 legal_left_low > legal_left_high + 1e-6
                 or legal_top_low > legal_top_high + 1e-6
@@ -4429,15 +4615,23 @@ def _vertical_virtual_camera_filter_from_tracks(
                 raise ValueError(
                     f"phase {phase.phase_id} anchor union cannot fit 9:16"
                 )
-            crop_left = max(legal_left_low, min(legal_left_high, crop_left))
-            crop_top = max(legal_top_low, min(legal_top_high, crop_top))
+            crop_left_pixels = max(
+                legal_left_low,
+                min(legal_left_high, crop_left_pixels),
+            )
+            crop_top_pixels = max(
+                legal_top_low,
+                min(legal_top_high, crop_top_pixels),
+            )
+        crop_left = crop_left_pixels / dynamic_scaled_width * 1000
+        crop_top = crop_top_pixels / dynamic_scaled_height * 1000
         current_visible = min(
             _visible_area_fraction(
                 resolved_box(region_id, time_ms) or current_box,
                 crop_left=crop_left,
                 crop_top=crop_top,
-                crop_width=crop_width_normalized,
-                crop_height=crop_height_normalized,
+                crop_width=dynamic_crop_width_normalized,
+                crop_height=dynamic_crop_height_normalized,
             )
             for region_id in phase.anchor_region_ids
         )
@@ -4446,8 +4640,8 @@ def _vertical_virtual_camera_filter_from_tracks(
                 previous_box,
                 crop_left=crop_left,
                 crop_top=crop_top,
-                crop_width=crop_width_normalized,
-                crop_height=crop_height_normalized,
+                crop_width=dynamic_crop_width_normalized,
+                crop_height=dynamic_crop_height_normalized,
             )
             if previous_box is not None
             else 0.0
@@ -4468,11 +4662,21 @@ def _vertical_virtual_camera_filter_from_tracks(
                 )
             steady_visible_fractions.append(current_visible)
         relative_seconds = (time_ms - start_ms) / 1000
-        crop_x_pixels = crop_left / 1000 * scaled_width
-        crop_y_pixels = crop_top / 1000 * scaled_height
         times.append(relative_seconds)
-        x_values.append(crop_x_pixels)
-        y_values.append(crop_y_pixels)
+        x_values.append(crop_left_pixels)
+        y_values.append(crop_top_pixels)
+        scale_values.append(scale)
+        if (
+            phase.camera_behavior == "punch_in_cut"
+            and len(scale_values) > 1
+            and not math.isclose(
+                scale_values[-1],
+                scale_values[-2],
+                rel_tol=0,
+                abs_tol=1e-6,
+            )
+        ):
+            punch_cut_sample_indexes.add(len(scale_values) - 1)
         crop_keyframes.append(
             {
                 "time_seconds": round(relative_seconds, 6),
@@ -4487,8 +4691,17 @@ def _vertical_virtual_camera_filter_from_tracks(
                     phase.minimum_anchor_visible_fraction
                 ),
                 "previous_anchor_visible_fraction": round(previous_visible, 6),
-                "crop_x_pixels": round(crop_x_pixels, 3),
-                "crop_y_pixels": round(crop_y_pixels, 3),
+                "scale": round(scale, 6),
+                "crop_width_normalized": round(
+                    dynamic_crop_width_normalized,
+                    6,
+                ),
+                "crop_height_normalized": round(
+                    dynamic_crop_height_normalized,
+                    6,
+                ),
+                "crop_x_pixels": round(crop_left_pixels, 3),
+                "crop_y_pixels": round(crop_top_pixels, 3),
             }
         )
     if len(times) < 2 or missing_active_samples:
@@ -4514,7 +4727,7 @@ def _vertical_virtual_camera_filter_from_tracks(
         times,
         x_values,
         y_values,
-        [1.0 for _ in times],
+        scale_values,
     )
     keyframes = [
         VirtualCameraKeyframe(
@@ -4528,20 +4741,21 @@ def _vertical_virtual_camera_filter_from_tracks(
                 ),
                 None,
             ),
-            scale=1.0,
+            scale=round(scale, 6),
             center_x_normalized=round(
-                (crop_x + 540) / scaled_width * 1000,
+                (crop_x + 540) / (scaled_width * scale) * 1000,
                 6,
             ),
             center_y_normalized=round(
-                (crop_y + 960) / scaled_height * 1000,
+                (crop_y + 960) / (scaled_height * scale) * 1000,
                 6,
             ),
         )
-        for time, crop_x, crop_y, crop_keyframe in zip(
+        for time, crop_x, crop_y, scale, crop_keyframe in zip(
             times,
             x_values,
             y_values,
+            scale_values,
             crop_keyframes,
             strict=True,
         )
@@ -4571,14 +4785,17 @@ def _vertical_virtual_camera_filter_from_tracks(
     )
     phase_by_id = {phase.phase_id: phase for phase in phases}
     cut_before_indexes = frozenset(
-        index
-        for index in range(1, len(crop_keyframes))
-        if (
-            crop_keyframes[index]["phase_id"]
-            != crop_keyframes[index - 1]["phase_id"]
-            and phase_by_id[crop_keyframes[index]["phase_id"]].transition_in
-            == "cut"
-        )
+        {
+            index
+            for index in range(1, len(crop_keyframes))
+            if (
+                crop_keyframes[index]["phase_id"]
+                != crop_keyframes[index - 1]["phase_id"]
+                and phase_by_id[crop_keyframes[index]["phase_id"]].transition_in
+                == "cut"
+            )
+        }
+        | punch_cut_sample_indexes
     )
     x_expression = _piecewise_expression(
         times,
@@ -4590,9 +4807,22 @@ def _vertical_virtual_camera_filter_from_tracks(
         y_values,
         cut_before_indexes=cut_before_indexes,
     )
+    zoom_expression = _piecewise_expression(
+        times,
+        scale_values,
+        cut_before_indexes=cut_before_indexes,
+    )
+    width_expression = (
+        f"max(1080\\,2*trunc(({scaled_width:.3f}*"
+        f"({zoom_expression}))/2))"
+    )
+    height_expression = (
+        f"max(1920\\,2*trunc(({scaled_height:.3f}*"
+        f"({zoom_expression}))/2))"
+    )
     filter_graph = (
         "[0:v]fps=30,"
-        f"scale={int(scaled_width)}:{int(scaled_height)},"
+        f"scale=w='{width_expression}':h='{height_expression}':eval=frame,"
         f"crop=1080:1920:x='{x_expression}':y='{y_expression}',setsar=1[base]"
     )
     return filter_graph, {
@@ -4635,6 +4865,15 @@ def _vertical_virtual_camera_filter_from_tracks(
             6,
         ),
         "transition_sample_count": transition_sample_count,
+        "distance_aware_transition_audit": transition_audit,
+        "deadband_viewport_fraction": (
+            _PORTRAIT_DEADBAND_VIEWPORT_FRACTION
+        ),
+        "native_zoom_limit": round(native_zoom_limit, 6),
+        "maximum_applied_zoom": round(max(scale_values), 6),
+        "zoom_limited_by_source_resolution": bool(
+            maximum_zoom + 1e-6 < _PORTRAIT_PHASE_MAX_ZOOM
+        ),
         "interpolated_anchor_sample_count": len(active_imputed_samples),
         "interpolated_anchor_sample_ratio": round(
             imputed_anchor_sample_ratio,
@@ -4647,6 +4886,7 @@ def _vertical_virtual_camera_filter_from_tracks(
         "crop_height_normalized": round(crop_height_normalized, 6),
         "crop_x_values_pixels": x_values,
         "crop_y_values_pixels": y_values,
+        "crop_scale_values": scale_values,
         "crop_keyframes": crop_keyframes,
         "max_crop_speed_pixels_per_second": round(max_velocity, 6),
         "max_crop_acceleration_pixels_per_second_squared": round(
@@ -6790,6 +7030,8 @@ def _resolve_editorial_chapter_durations(
     fixed_duration_seconds: Mapping[str, float] | None = None,
     rhythm_plan: RhythmPlan | None = None,
     shortfall_audit_path: Path | None = None,
+    project_duration_seconds: float | None = None,
+    allow_music_lock_prefix: bool = False,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Reconcile Gemini's relative dwell judgment to one legal project total.
 
@@ -6831,7 +7073,12 @@ def _resolve_editorial_chapter_durations(
     if weight_total <= 0:
         raise ValueError("editorial duration weights must have a positive sum")
 
-    target_duration_ms = round(brief.target_duration_seconds * 1000)
+    resolved_project_duration_seconds = (
+        brief.target_duration_seconds
+        if project_duration_seconds is None
+        else project_duration_seconds
+    )
+    target_duration_ms = round(resolved_project_duration_seconds * 1000)
     capacity_ms = {
         feature_id: max(1, round(seconds * 1000))
         for feature_id, seconds in (source_capacity_seconds or {}).items()
@@ -6994,7 +7241,7 @@ def _resolve_editorial_chapter_durations(
     if remaining_ms != 0 or sum(allocated_ms.values()) != target_duration_ms:
         raise ValueError("editorial duration capacity reconciliation did not close")
 
-    scale = brief.target_duration_seconds / weight_total
+    scale = resolved_project_duration_seconds / weight_total
     unsnapped: list[tuple[FeatureChapterSelect, float, str, float]] = []
     for selected, weight, authority in weighted:
         seconds = allocated_ms[selected.feature_id] / 1000
@@ -7012,7 +7259,15 @@ def _resolve_editorial_chapter_durations(
         if feature_id in capacity_ms and allocated >= capacity_ms[feature_id]
     } | set(fixed_ms)
     if music_lock is not None and len(unsnapped) > 1:
-        if abs(music_lock.duration_ms - round(brief.target_duration_seconds * 1000)) > 80:
+        music_lock_prefix_used = (
+            allow_music_lock_prefix
+            and music_lock.duration_ms >= target_duration_ms
+            and music_lock.duration_ms - target_duration_ms <= 2000
+        )
+        if (
+            abs(music_lock.duration_ms - target_duration_ms) > 80
+            and not music_lock_prefix_used
+        ):
             raise ValueError(
                 "music lock duration differs from the requested project duration"
             )
@@ -7033,7 +7288,7 @@ def _resolve_editorial_chapter_durations(
                 minimum_ms.get(item[0].feature_id, 750)
                 for item in unsnapped[boundary_index + 1 :]
             )
-            latest_ms = music_lock.duration_ms - remaining_minimum_ms
+            latest_ms = target_duration_ms - remaining_minimum_ms
             current_feature_id = unsnapped[boundary_index][0].feature_id
             next_feature_id = unsnapped[boundary_index + 1][0].feature_id
             current_capacity_ms = capacity_ms.get(
@@ -7072,7 +7327,7 @@ def _resolve_editorial_chapter_durations(
                     and cue.kind in allowed_cue_kinds
                     and abs(cue.time_ms - proposed_ms) <= snap_window_ms
                     and cue.time_ms - previous <= current_capacity_ms
-                    and music_lock.duration_ms - cue.time_ms
+                    and target_duration_ms - cue.time_ms
                     <= remaining_capacity_ms
                 )
             ]
@@ -7114,7 +7369,7 @@ def _resolve_editorial_chapter_durations(
         candidate_boundaries = [
             0,
             *snapped_boundaries_ms,
-            music_lock.duration_ms,
+            target_duration_ms,
         ]
         capacity_violations: list[dict[str, Any]] = []
         for index, (start_ms, end_ms) in enumerate(
@@ -7163,7 +7418,7 @@ def _resolve_editorial_chapter_durations(
     resolved: dict[str, float] = {}
     rows: list[dict[str, Any]] = []
     prior_boundary_ms = 0
-    final_boundary_ms = round(brief.target_duration_seconds * 1000)
+    final_boundary_ms = target_duration_ms
     for index, (selected, weight, authority, unsnapped_seconds) in enumerate(
         unsnapped
     ):
@@ -7221,7 +7476,8 @@ def _resolve_editorial_chapter_durations(
             "Gemini proposes relative dwell; local code only reconciles the "
             "approved total and later maps it to legal shot-local source PTS."
         ),
-        "project_target_duration_seconds": brief.target_duration_seconds,
+        "brief_preferred_duration_seconds": brief.target_duration_seconds,
+        "project_target_duration_seconds": resolved_project_duration_seconds,
         "input_weight_total_seconds": round(weight_total, 3),
         "reconciliation_scale": scale,
         "capacity_reconciliation_applied": bool(capacity_ms),
@@ -7243,6 +7499,15 @@ def _resolve_editorial_chapter_durations(
         "music_lock_definition_sha256": (
             music_lock.definition_sha256 if music_lock is not None else None
         ),
+        "music_lock_prefix_used": (
+            music_lock is not None
+            and allow_music_lock_prefix
+            and music_lock.duration_ms > target_duration_ms + 80
+        ),
+        "music_lock_duration_ms": (
+            music_lock.duration_ms if music_lock is not None else None
+        ),
+        "project_timeline_end_ms": target_duration_ms,
         "music_boundary_refinements": boundary_audit,
         "chapters": rows,
     }
@@ -7270,6 +7535,7 @@ def run_feature_cut_experiment(
     music_lock_path: Path | None = None,
     post_render_quality_qc: bool = True,
     rhythm_style: Literal["calm", "standard", "energetic"] = "standard",
+    allow_shorter_within_delivery_range: bool = False,
 ) -> dict[str, Any]:
     render_horizontal, render_vertical = _requested_render_aspects(aspect)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -7656,10 +7922,48 @@ def run_feature_cut_experiment(
             quality_safe_capacity_seconds=source_capacity_seconds,
         )
         write_json(attention_path, attention_profile)
+        project_duration_seconds = brief.target_duration_seconds
+        duration_resolution_authority = "brief_preferred_duration"
+        attention_maximum_seconds = round(
+            sum(
+                chapter.maximum_dwell_seconds
+                for chapter in attention_profile.chapters
+            ),
+            3,
+        )
+        if (
+            attention_maximum_seconds + 0.001
+            < project_duration_seconds
+            and allow_shorter_within_delivery_range
+            and not fixed_duration_seconds
+        ):
+            if attention_maximum_seconds < 60.0:
+                raise ValueError(
+                    "attention and QualitySafeInterval capacity cannot reach "
+                    "the 60-second delivery floor"
+                )
+            project_duration_seconds = attention_maximum_seconds
+            duration_resolution_authority = (
+                "operator_authorized_shorter_attention_maximum"
+            )
+        write_json(
+            editorial_dir / "project-duration-resolution.json",
+            {
+                "brief_preferred_duration_seconds": brief.target_duration_seconds,
+                "attention_maximum_seconds": attention_maximum_seconds,
+                "resolved_project_duration_seconds": project_duration_seconds,
+                "authority": duration_resolution_authority,
+                "allow_shorter_within_delivery_range": (
+                    allow_shorter_within_delivery_range
+                ),
+                "fixed_trim_duration_count": len(fixed_duration_seconds),
+                "generated_at": utc_now(),
+            },
+        )
         rhythm_path = editorial_dir / "rhythm-plan.json"
         rhythm_plan = build_rhythm_plan(
             attention_profile,
-            target_duration_seconds=brief.target_duration_seconds,
+            target_duration_seconds=project_duration_seconds,
             attention_profile_sha256=sha256_file(attention_path),
             style_profile=rhythm_style,
         )
@@ -7671,6 +7975,8 @@ def run_feature_cut_experiment(
             source_capacity_seconds=source_capacity_seconds,
             fixed_duration_seconds=fixed_duration_seconds,
             rhythm_plan=rhythm_plan,
+            project_duration_seconds=project_duration_seconds,
+            allow_music_lock_prefix=allow_shorter_within_delivery_range,
             shortfall_audit_path=(
                 output_dir / "editorial-duration-capacity-shortfall.json"
             ),
@@ -7706,6 +8012,10 @@ def run_feature_cut_experiment(
             ],
             "post_render_quality_qc": post_render_quality_qc,
             "rhythm_style": rhythm_style,
+            "allow_shorter_within_delivery_range": (
+                allow_shorter_within_delivery_range
+            ),
+            "resolved_project_duration_seconds": project_duration_seconds,
             "attention_profile_path": str(attention_path.resolve()),
             "attention_profile_sha256": sha256_file(attention_path),
             "rhythm_plan_path": str(rhythm_path.resolve()),
@@ -7739,6 +8049,11 @@ def run_feature_cut_experiment(
                 },
             ),
             "editorial_duration_plan": duration_audit,
+            "project_duration_resolution": {
+                "brief_preferred_duration_seconds": brief.target_duration_seconds,
+                "resolved_project_duration_seconds": project_duration_seconds,
+                "authority": duration_resolution_authority,
+            },
             "feature_plan_binding": str(plan_binding_path.resolve()),
             "feature_plan_reuse_record": (
                 str(plan_reuse_record_path.resolve())

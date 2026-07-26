@@ -1121,7 +1121,14 @@ class FullClipAttentionPhase(StrictModel):
     phase_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
     anchor_entity_ids: list[str] = Field(min_length=1, max_length=4)
     relation_mode: Literal["single_focus", "joint_relation"]
-    suggested_camera_behavior: Literal["hold", "follow"]
+    suggested_camera_behavior: Literal[
+        "hold",
+        "follow",
+        "follow_deadband",
+        "push_in",
+        "pull_out",
+        "punch_in_cut",
+    ]
     observable_predicate: str = Field(min_length=1, max_length=800)
     transition_condition: str = Field(min_length=1, max_length=800)
 
@@ -1901,9 +1908,16 @@ class VerticalVirtualCameraPhase(StrictModel):
     start_progress: float = Field(ge=0.0, le=1.0)
     end_progress: float = Field(gt=0.0, le=1.0)
     anchor_region_ids: list[str] = Field(min_length=1, max_length=4)
-    camera_behavior: Literal["hold", "follow"] = "follow"
+    camera_behavior: Literal[
+        "hold",
+        "follow",
+        "follow_deadband",
+        "push_in",
+        "pull_out",
+        "punch_in_cut",
+    ] = "follow_deadband"
     transition_in: Literal["cut", "smoothstep"] = "cut"
-    transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
+    transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     minimum_anchor_visible_fraction: float = Field(
         default=1.0,
         gt=0.0,
@@ -1943,7 +1957,14 @@ class VerticalVirtualCameraProposalPhase(StrictModel):
     start_progress: float = Field(ge=0.0, le=1.0)
     end_progress: float = Field(gt=0.0, le=1.0)
     anchor_region_ids: list[str] = Field(min_length=1, max_length=4)
-    camera_behavior: Literal["hold", "follow"] = "follow"
+    camera_behavior: Literal[
+        "hold",
+        "follow",
+        "follow_deadband",
+        "push_in",
+        "pull_out",
+        "punch_in_cut",
+    ] = "follow_deadband"
     transition_in: Literal["cut", "smoothstep"] = "cut"
     transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
     observable_predicate: str = Field(

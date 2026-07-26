@@ -803,6 +803,9 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         aspect=args.aspect,
         music_path=args.music,
         music_lock_path=music_lock_path,
+        allow_shorter_within_delivery_range=(
+            args.allow_shorter_within_delivery_range
+        ),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2292,6 +2295,15 @@ def build_parser() -> argparse.ArgumentParser:
             "crop whose geometry exists but whose semantic/automatic gate remains "
             "pending. The manifest remains review-required; failed or unavailable "
             "geometry still uses the configured fallback."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--allow-shorter-within-delivery-range",
+        action="store_true",
+        help=(
+            "When the brief preference exceeds evidence-bound attention and "
+            "quality capacity, explicitly authorize the closest shorter 60-90 "
+            "second duration. Never repeats, freezes, or drops required chapters."
         ),
     )
     feature_cut_parser.add_argument(

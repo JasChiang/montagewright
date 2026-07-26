@@ -28,7 +28,12 @@ from jascue_video_lab.clip_card_retrieval import (
     validate_feature_shortlist,
 )
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
-from jascue_video_lab.gemini import GeminiLabClient, MODEL_ID, _raw_dump
+from jascue_video_lab.gemini import (
+    GeminiLabClient,
+    MODEL_ID,
+    _raw_dump,
+    canonical_interactions_mime_type,
+)
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
     AttentionObservation,
@@ -361,7 +366,14 @@ class ClipCardVirtualCameraPhaseV1(StrictModel):
     start_progress: float = Field(ge=0.0, le=1.0)
     end_progress: float = Field(gt=0.0, le=1.0)
     anchor_entity_ids: list[str] = Field(min_length=1, max_length=4)
-    camera_behavior: Literal["hold", "follow"] = "follow"
+    camera_behavior: Literal[
+        "hold",
+        "follow",
+        "follow_deadband",
+        "push_in",
+        "pull_out",
+        "punch_in_cut",
+    ] = "follow_deadband"
     transition_in: Literal["cut", "smoothstep"] = "cut"
     transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
     observable_predicate: str = Field(min_length=1, max_length=800)
@@ -1988,7 +2000,7 @@ def main() -> int:
 6. 9:16 應把 brief 的 vertical_primary_target_description 視為內容優先序，不是強制演算法。只有需要動態跟隨且存在可靠 target 時才用 tracked_crop；若穩定構圖已可保留內容，或窄裁切無法安全包含必要範圍，可以使用 fit_with_background。不得只因 brief 有 primary target 就強制 tracked_crop。
 7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。只分類與這次構圖決策直接相關的 entity；未列入者不會被程式偷偷視為 required 或 sacrificable。不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
 8. framing_intent 只需簡潔描述本候選的構圖取捨；不得輸出座標、bbox、mask、target description 或 verbose region contract。程式會把這些 entity priority ID 與 Clip Card entity/grounding target 資料轉成 domain-neutral hard-core、soft-extent 與 overlay keepout regions。
-8a. 若同一個 source event 有兩個以上「依序重要、但不必同時出現在單一 9:16 crop」的可追蹤 entity，可以提出 virtual_camera_proposal；否則必須為 null。順序必須引用 Clip Card 的 portrait_attention_sequence 或其他直接可見的動作、視線、結果揭露／資訊交接證據；evidence 沒有記錄順序時不得自行發明。方向可以左→右、右→左、人物→結果、整體→細節或完全不動，不得使用固定方向模板。phase 的 anchor_entity_ids 只能引用同 candidate 的 required_entity_ids 或 preferred_entity_ids；observable_predicate 與 transition_condition 必須描述可直接觀察的條件，不能引用常識、品牌知識或自創 timestamp。start_progress／end_progress 只表達連續覆蓋 0–1 的相對敘事順序。兩個 entity 的關係必須同時可見時用 joint_relation 並在同一 phase 引用兩者，不可假裝可依序裁掉。自動 proposal 不授權裁切 active anchor；後續 Grounding、SAM、containment 與 motion gate 失敗時會改試下一個候選或回退。
+8a. 若同一個 source event 有兩個以上「依序重要、但不必同時出現在單一 9:16 crop」的可追蹤 entity，可以提出 virtual_camera_proposal；否則必須為 null。順序必須引用 Clip Card 的 portrait_attention_sequence 或其他直接可見的動作、視線、結果揭露／資訊交接證據；evidence 沒有記錄順序時不得自行發明。方向可以左→右、右→左、人物→結果、整體→細節或完全不動，不得使用固定方向模板。phase 的 anchor_entity_ids 只能引用同 candidate 的 required_entity_ids 或 preferred_entity_ids；observable_predicate 與 transition_condition 必須描述可直接觀察的條件，不能引用常識、品牌知識或自創 timestamp。start_progress／end_progress 只表達連續覆蓋 0–1 的相對敘事順序。一般跟隨優先使用 follow_deadband，只有每一段移動都承載動作證據時才使用 follow；push_in 用於可見細節／結果逐漸成為重點，pull_out 用於回到整體關係，punch_in_cut 用於明確資訊落點的硬切放大，hold 用於固定構圖。不得輸出倍率、速度、easing 或曲線；本機會依來源解析度、距離、時長、速度、加速度與 jerk 決定安全運鏡，必要時將過短的遠距平移改為 cut。兩個 entity 的關係必須同時可見時用 joint_relation 並在同一 phase 引用兩者，不可假裝可依序裁掉。自動 proposal 不授權裁切 active anchor；後續 Grounding、SAM、containment 與 motion gate 失敗時會改試下一個候選或回退。
 9. 每個 supported／partial chapter 應依可見資訊、動作完整性、閱讀需求、情緒停留、重複壓力與音樂角色提出 recommended_duration_seconds、duration_rationale 與 attention_observation。minimum／recommended／maximum dwell 必須依序排列；attention 各分量 0–1，只是待審相對判斷，不是 source timestamp 或客觀真值。action_progress 表示到片段結尾時動作／結果已完成、適合轉場的程度。
 9a. {"本次另附實際音樂，music_sha256=" + music_sha256 + "。你必須實際聆聽音訊，依可聽見的段落、能量、留白與收尾安排候選及相對停留；不得只依文字猜音樂，也不得輸出自創 beat timestamp。" if music_sha256 is not None else "本次沒有附音樂；不得推測不存在的節拍、段落或能量變化。"}
 10. bbox、mask、crop 座標與精確 cut point 均由後續 Grounding／tracker／FFmpeg 處理；本階段不得輸出座標。
@@ -2032,7 +2044,9 @@ model_provenance 必須先原樣回傳：
             {
                 "type": "audio",
                 "uri": uploaded_music.uri,
-                "mime_type": uploaded_music.mime_type,
+                "mime_type": canonical_interactions_mime_type(
+                    str(uploaded_music.mime_type)
+                ),
             }
         )
     request = {
