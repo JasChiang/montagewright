@@ -790,6 +790,9 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         output_dir=args.output_dir,
         plan_prompt=plan_prompt,
         grounding_prompt=_load_prompt("grounding_native_yxyx_zh-TW.txt"),
+        vertical_framing_prompt=_load_prompt(
+            "selected_vertical_framing_zh-TW.txt"
+        ),
         scdet_threshold=args.scdet_threshold,
         sam_analysis_fps=args.sam_analysis_fps,
         trim_decision_paths=args.trim_decision,
@@ -806,6 +809,7 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         allow_shorter_within_delivery_range=(
             args.allow_shorter_within_delivery_range
         ),
+        auto_vertical_framing=args.auto_vertical_framing,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2304,6 +2308,16 @@ def build_parser() -> argparse.ArgumentParser:
             "When the brief preference exceeds evidence-bound attention and "
             "quality capacity, explicitly authorize the closest shorter 60-90 "
             "second duration. Never repeats, freezes, or drops required chapters."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--auto-vertical-framing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After selecting each 9:16 candidate, inspect its full clip and "
+            "propose a static crop, tracked virtual camera, simultaneous layout, "
+            "or alternate candidate before Grounding/SAM (default: enabled)."
         ),
     )
     feature_cut_parser.add_argument(

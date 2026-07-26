@@ -43,6 +43,7 @@ from .models import (
     ModelProvenance,
     RushesCatalog,
     RushesEditPlan,
+    SelectedVerticalFramingProposal,
     TargetCandidateMap,
     TemporalMap,
     TrimIntentProposal,
@@ -2966,6 +2967,122 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "feature_edit_plan", error)
+            raise
+
+    def propose_selected_vertical_framing(
+        self,
+        *,
+        uploaded: Any,
+        candidate_id: str,
+        source_asset_id: str,
+        event_id: str,
+        frame_id: str,
+        candidate_context: dict[str, Any],
+        chapter_context: dict[str, Any],
+        prompt_template: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> SelectedVerticalFramingProposal:
+        """Inspect one selected full clip before Grounding/SAM/rendering.
+
+        This call may refine presentation intent only.  It cannot replace the
+        selected source/event/evidence identity or provide pixel coordinates.
+        """
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        provenance = _provenance(run_id, model_id=self.model_id)
+        prompt = (
+            prompt_template
+            + "\n\n## 不可變的已選素材身分\n"
+            + f"candidate_id: {candidate_id}\n"
+            + f"source_asset_id: {source_asset_id}\n"
+            + f"event_id: {event_id}\n"
+            + f"frame_id: {frame_id}\n"
+            + "你只能決定這個候選如何呈現在 9:16；不得改選素材、事件或"
+            + " evidence frame。不得輸出時間戳、像素座標或裁切座標。\n"
+            + "\n## 已選候選的 catalog 證據\n"
+            + json.dumps(candidate_context, ensure_ascii=False, indent=2)
+            + "\n\n## 使用者 brief 中此章的意圖（不是媒體存在證據）\n"
+            + json.dumps(chapter_context, ensure_ascii=False, indent=2)
+            + "\n\nmodel_provenance 必須原樣回傳以下內容"
+            + "（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        request_record = {
+            "model": self.model_id,
+            "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+            "store": False,
+            "input": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                },
+            ],
+            "generation_config": {"thinking_level": "low"},
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(SelectedVerticalFramingProposal),
+            },
+        }
+        write_json(run_dir / "selected_vertical_framing.request.json", request_record)
+        try:
+            interaction = self.client.interactions.create(**request_record)
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="selected_vertical_framing",
+                canonical_filename="selected_vertical_framing.raw_interaction.json",
+                interaction=interaction,
+            )
+            write_json(
+                run_dir / "selected_vertical_framing.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = SelectedVerticalFramingProposal.model_validate_json(
+                interaction.output_text
+            )
+            expected = {
+                "candidate_id": candidate_id,
+                "source_asset_id": source_asset_id,
+                "event_id": event_id,
+                "frame_id": frame_id,
+            }
+            mismatches = {
+                key: {"expected": value, "actual": getattr(parsed, key)}
+                for key, value in expected.items()
+                if getattr(parsed, key) != value
+            }
+            if mismatches:
+                raise GeminiContractError(
+                    "selected vertical framing changed immutable selection: "
+                    f"{mismatches}"
+                )
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "selected_vertical_framing.json", final)
+            write_json(
+                run_dir / "selected_vertical_framing.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "selected_vertical_framing.schema_validation.json",
+                {
+                    "ok": False,
+                    "errors": [
+                        {"type": type(error).__name__, "message": str(error)}
+                    ],
+                },
+            )
+            append_error(run_dir, "selected_vertical_framing", error)
             raise
 
     def plan_music_semantic_pairing(

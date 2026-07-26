@@ -45,6 +45,7 @@ from jascue_video_lab.feature_cut import (
     _resolve_editorial_chapter_durations,
     _resolve_vertical_camera_phases,
     _resolve_vertical_candidate_intent,
+    _refine_selected_vertical_candidate,
     _segment_variant_fingerprint,
     _soft_extent_visibility_audit,
     _summarize_automatic_reframe,
@@ -97,6 +98,7 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
     assert defaults.post_render_quality_qc is True
     assert defaults.rhythm_style == "standard"
     assert defaults.allow_shorter_within_delivery_range is False
+    assert defaults.auto_vertical_framing is True
     vertical = build_parser().parse_args(
         [
             "feature-cut",
@@ -726,9 +728,11 @@ def test_feature_cut_single_aspect_skips_unrequested_segments_and_concat(
         output_dir=output_dir,
         plan_prompt="plan",
         grounding_prompt="ground",
+        vertical_framing_prompt="framing",
         reuse_feature_plan=True,
         aspect=aspect,
         post_render_quality_qc=False,
+        auto_vertical_framing=False,
     )
 
     manifest = read_json(output_dir / "render-manifest.json")
@@ -983,9 +987,11 @@ def test_feature_cut_single_aspect_found_evidence_never_runs_other_geometry(
         output_dir=output_dir,
         plan_prompt="plan",
         grounding_prompt="ground",
+        vertical_framing_prompt="framing",
         reuse_feature_plan=True,
         aspect=aspect,
         post_render_quality_qc=False,
+        auto_vertical_framing=False,
     )
 
     assert build_track_calls == expected_build_track_calls
@@ -1049,6 +1055,7 @@ from jascue_video_lab.models import (
     SegmentationModelProvenance,
     SegmentationSample,
     SegmentationTrack,
+    SelectedVerticalFramingProposal,
     SemanticIdentityStatus,
     SharedSam21AnalysisFrame,
     SharedSam21BBoxSeed,
@@ -1894,6 +1901,213 @@ def test_gemini_virtual_camera_proposal_preserves_observed_anchor_order() -> Non
     ]
     assert all(phase.minimum_anchor_visible_fraction == 1.0 for phase in phases)
     assert "Visible predicate" in phases[0].editorial_reason
+
+
+def test_selected_framing_cannot_split_simultaneous_relation() -> None:
+    sequential = VerticalVirtualCameraProposal(
+        composition_mode="sequential_focus",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="first",
+                start_progress=0.0,
+                end_progress=0.5,
+                anchor_region_ids=["subject-a"],
+                observable_predicate="The first subject is visible.",
+                transition_condition="Attention moves to the second subject.",
+                editorial_reason="Show the first subject.",
+            ),
+            VerticalVirtualCameraProposalPhase(
+                phase_id="second",
+                start_progress=0.5,
+                end_progress=1.0,
+                anchor_region_ids=["subject-b"],
+                observable_predicate="The second subject is visible.",
+                transition_condition="Hold to the end.",
+                editorial_reason="Show the second subject.",
+            ),
+        ],
+        proposal_reason="Invalidly separates a required simultaneous relation.",
+    )
+    with pytest.raises(ValidationError, match="simultaneous relation"):
+        SelectedVerticalFramingProposal(
+            candidate_id="candidate-a",
+            source_asset_id="sha256:" + "a" * 64,
+            event_id="event-a",
+            frame_id="RF000001",
+            semantic_requirement="simultaneous_relation",
+            recommended_action="tracked_crop",
+            regions=[
+                {
+                    "region_id": "subject-a",
+                    "target_description": "the first visible subject",
+                    "role": "required",
+                },
+                {
+                    "region_id": "subject-b",
+                    "target_description": "the second visible subject",
+                    "role": "required",
+                },
+            ],
+            virtual_camera_proposal=sequential,
+            observed_evidence=["Both subjects are visible together."],
+            decision_reason="The relation requires both at once.",
+            confidence=0.8,
+            model_provenance=ModelProvenance(
+                model_id=MODEL_ID,
+                api="gemini_interactions",
+                sdk="google-genai",
+                sdk_version="test",
+                run_id="test",
+                generated_at="test",
+            ),
+        )
+
+
+def test_selected_vertical_framing_runs_once_then_reuses_content_cache(
+    tmp_path: Path,
+) -> None:
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="legacy-primary",
+        source_asset_id="sha256:" + "b" * 64,
+        event_id="catalog-scene",
+        frame_id="RF000001",
+        semantic_requirement="single_primary",
+        recommended_action="tracked_crop",
+        regions=[
+            {
+                "region_id": "primary",
+                "target_description": "the directly visible primary subject",
+                "role": "required",
+            }
+        ],
+        virtual_camera_proposal=VerticalVirtualCameraProposal(
+            composition_mode="single_anchor_follow",
+            phases=[
+                VerticalVirtualCameraProposalPhase(
+                    phase_id="follow",
+                    start_progress=0.0,
+                    end_progress=1.0,
+                    anchor_region_ids=["primary"],
+                    camera_behavior="follow_deadband",
+                    observable_predicate="The primary subject remains visible.",
+                    transition_condition="No attention hand-off is observed.",
+                    editorial_reason="Follow meaningful movement without micro-jitter.",
+                )
+            ],
+            proposal_reason="One moving primary subject carries the shot.",
+        ),
+        observed_evidence=["One subject carries the visible action."],
+        decision_reason="A tracked portrait crop can retain the observed action.",
+        confidence=0.9,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    class FakeFramingClient:
+        model_id = MODEL_ID
+        upload_calls = 0
+        proposal_calls = 0
+
+        def ensure_video_upload(
+            self, _path: Path, _upload_dir: Path
+        ) -> tuple[SimpleNamespace, bool]:
+            self.upload_calls += 1
+            return (
+                SimpleNamespace(uri="files/test", mime_type="video/mp4"),
+                False,
+            )
+
+        def propose_selected_vertical_framing(
+            self, **kwargs: object
+        ) -> SelectedVerticalFramingProposal:
+            self.proposal_calls += 1
+            write_json(
+                Path(str(kwargs["run_dir"])) / "selected_vertical_framing.json",
+                proposal,
+            )
+            return proposal
+
+    client = FakeFramingClient()
+    clip = RushClip(
+        clip_id="clip-1",
+        path=str(tmp_path / "source.mp4"),
+        sha256="b" * 64,
+        duration_ms=5000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=1,
+    )
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id=clip.clip_id,
+        requested_time_ms=1000,
+        image_path=str(tmp_path / "frame.jpg"),
+    )
+    chapter = FeatureChapterBrief(
+        feature_id="scene",
+        title="Visible scene",
+        detail_lines=[],
+        target_duration_seconds=5,
+    )
+    option = {
+        "candidate_id": "legacy-primary",
+        "rank": 1,
+        "source_asset_id": None,
+        "event_id": None,
+        "frame_id": frame.frame_id,
+        "observed_visual_evidence": "One visible subject moves.",
+        "selection_reason": "The action supports the chapter.",
+        "strategy": "fit_with_background",
+        "crop_mode": "strict",
+        "target_description": None,
+        "regions": [],
+        "quality_risks": [],
+        "confidence": 0.8,
+    }
+
+    first, first_proposal, first_reused = _refine_selected_vertical_candidate(
+        client=client,  # type: ignore[arg-type]
+        option_data=option,
+        chapter=chapter,
+        clip=clip,
+        frame=frame,
+        prompt_template="generic framing prompt",
+        catalog_path=tmp_path / "catalog.json",
+        output_dir=tmp_path / "artifacts",
+    )
+    second, second_proposal, second_reused = _refine_selected_vertical_candidate(
+        client=client,  # type: ignore[arg-type]
+        option_data=option,
+        chapter=chapter,
+        clip=clip,
+        frame=frame,
+        prompt_template="generic framing prompt",
+        catalog_path=tmp_path / "catalog.json",
+        output_dir=tmp_path / "artifacts",
+    )
+
+    assert first["strategy"] == "tracked_crop"
+    assert first["virtual_camera_proposal"]["composition_mode"] == (
+        "single_anchor_follow"
+    )
+    assert second == first | {
+        "framing_refinement": {
+            **first["framing_refinement"],
+            "reused": True,
+        }
+    }
+    assert first_proposal == second_proposal == proposal
+    assert first_reused is False
+    assert second_reused is True
+    assert client.upload_calls == 1
+    assert client.proposal_calls == 1
 
 
 def test_virtual_camera_proposal_cannot_reference_untracked_or_fit_regions() -> None:

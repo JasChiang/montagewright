@@ -65,6 +65,7 @@ from .models import (
     RushesCatalog,
     RhythmPlan,
     SegmentationTrack,
+    SelectedVerticalFramingProposal,
     ShotQualityMap,
     SharedSam21AnalysisFramesManifest,
     SharedSam21BBoxSeed,
@@ -6279,6 +6280,166 @@ def _resolve_vertical_candidate_intent(
     return regions, target
 
 
+def _refine_selected_vertical_candidate(
+    *,
+    client: GeminiLabClient,
+    option_data: Mapping[str, Any],
+    chapter: FeatureChapterBrief,
+    clip: RushClip,
+    frame: RushFrame,
+    prompt_template: str,
+    catalog_path: Path,
+    output_dir: Path,
+) -> tuple[dict[str, Any], SelectedVerticalFramingProposal, bool]:
+    """Run or reuse the full-clip 9:16 presentation decision before geometry."""
+
+    candidate_id = str(option_data["candidate_id"])
+    source_asset_id = f"sha256:{clip.sha256}"
+    event_id = str(option_data.get("event_id") or f"catalog-{chapter.feature_id}")
+    candidate_context = {
+        "candidate_id": candidate_id,
+        "source_asset_id": source_asset_id,
+        "event_id": event_id,
+        "frame_id": frame.frame_id,
+        "observed_visual_evidence": option_data.get("observed_visual_evidence"),
+        "selection_reason": option_data.get("selection_reason"),
+        "current_strategy": option_data.get("strategy"),
+        "current_target_description": option_data.get("target_description"),
+        "current_regions": option_data.get("regions", []),
+        "quality_risks": option_data.get("quality_risks", []),
+    }
+    chapter_context = chapter.model_dump(mode="json")
+    fingerprint_payload = {
+        "contract_version": "selected-vertical-framing-request-v1",
+        "source_sha256": clip.sha256,
+        "candidate_context": candidate_context,
+        "chapter_context": chapter_context,
+        "prompt_sha256": hashlib.sha256(prompt_template.encode("utf-8")).hexdigest(),
+        "system_instruction_sha256": hashlib.sha256(
+            EDITORIAL_SYSTEM_INSTRUCTION.encode("utf-8")
+        ).hexdigest(),
+        "model_id": client.model_id,
+        "response_schema": gemini_response_schema(
+            SelectedVerticalFramingProposal
+        ),
+    }
+    request_fingerprint = _stable_fingerprint(fingerprint_payload)
+    run_dir = (
+        output_dir
+        / "selected-vertical-framing"
+        / chapter.feature_id
+        / candidate_id
+        / request_fingerprint[:16]
+    )
+    proposal_path = run_dir / "selected_vertical_framing.json"
+    binding_path = run_dir / "selected_vertical_framing.binding.json"
+    reused = False
+    if proposal_path.is_file() and binding_path.is_file():
+        binding = read_json(binding_path)
+        if binding.get("request_fingerprint") != request_fingerprint:
+            raise ValueError("selected vertical framing cache binding mismatch")
+        proposal = SelectedVerticalFramingProposal.model_validate(
+            read_json(proposal_path)
+        )
+        reused = True
+    else:
+        upload_dir = (
+            catalog_path.parent
+            / "file-cache"
+            / clip.sha256
+            / "selected-vertical-framing-upload"
+        )
+        uploaded, file_api_reused = client.ensure_video_upload(
+            Path(clip.path), upload_dir
+        )
+        proposal = client.propose_selected_vertical_framing(
+            uploaded=uploaded,
+            candidate_id=candidate_id,
+            source_asset_id=source_asset_id,
+            event_id=event_id,
+            frame_id=frame.frame_id,
+            candidate_context=candidate_context,
+            chapter_context=chapter_context,
+            prompt_template=prompt_template,
+            run_id=f"selected-framing-{uuid.uuid4().hex[:8]}",
+            run_dir=run_dir,
+        )
+        write_json(
+            binding_path,
+            {
+                **fingerprint_payload,
+                "request_fingerprint": request_fingerprint,
+                "file_api_reused": file_api_reused,
+                "proposal_sha256": sha256_file(proposal_path),
+                "created_at": utc_now(),
+            },
+        )
+
+    refined = dict(option_data)
+    refined["source_asset_id"] = source_asset_id
+    refined["event_id"] = event_id
+    refined["framing_refinement"] = {
+        "request_fingerprint": request_fingerprint,
+        "proposal_path": str(proposal_path.resolve()),
+        "proposal_sha256": sha256_file(proposal_path),
+        "reused": reused,
+        "recommended_action": proposal.recommended_action,
+        "semantic_requirement": proposal.semantic_requirement,
+        "decision_reason": proposal.decision_reason,
+        "observed_evidence": proposal.observed_evidence,
+        "uncertainties": proposal.uncertainties,
+        "confidence": proposal.confidence,
+    }
+    if proposal.recommended_action == "tracked_crop":
+        refined["strategy"] = "tracked_crop"
+        refined["crop_mode"] = "strict"
+        refined["regions"] = [
+            region.model_dump(mode="python") for region in proposal.regions
+        ]
+        refined["virtual_camera_proposal"] = (
+            proposal.virtual_camera_proposal.model_dump(mode="python")
+            if proposal.virtual_camera_proposal is not None
+            else None
+        )
+        hard_regions = [
+            region
+            for region in proposal.regions
+            if region.execution_role == "hard_core"
+        ]
+        refined["target_description"] = (
+            hard_regions[0].target_description
+            if len(hard_regions) == 1
+            else None
+        )
+        FeatureVerticalCandidate.model_validate(
+            {
+                key: refined[key]
+                for key in (
+                    "candidate_id",
+                    "rank",
+                    "source_asset_id",
+                    "event_id",
+                    "frame_id",
+                    "observed_visual_evidence",
+                    "selection_reason",
+                    "strategy",
+                    "crop_mode",
+                    "target_description",
+                    "regions",
+                    "virtual_camera_proposal",
+                    "quality_risks",
+                    "confidence",
+                )
+            }
+        )
+    else:
+        refined["strategy"] = "fit_with_background"
+        refined["target_description"] = None
+        refined["regions"] = []
+        refined["virtual_camera_proposal"] = None
+    return refined, proposal, reused
+
+
 def _vertical_runtime_candidate_options(
     selected: FeatureChapterSelect,
     *,
@@ -7522,6 +7683,7 @@ def run_feature_cut_experiment(
     output_dir: Path,
     plan_prompt: str,
     grounding_prompt: str,
+    vertical_framing_prompt: str | None = None,
     scdet_threshold: float = 4.0,
     sam_analysis_fps: float = 2.0,
     trim_decision_paths: Sequence[Path] = (),
@@ -7536,7 +7698,14 @@ def run_feature_cut_experiment(
     post_render_quality_qc: bool = True,
     rhythm_style: Literal["calm", "standard", "energetic"] = "standard",
     allow_shorter_within_delivery_range: bool = False,
+    auto_vertical_framing: bool = True,
 ) -> dict[str, Any]:
+    resolved_vertical_framing_prompt = vertical_framing_prompt or (
+        "Inspect the complete selected clip and propose a generic evidence-only "
+        "9:16 framing decision. Preserve simultaneous semantic relations; use "
+        "ordered virtual-camera phases only for directly observed sequential "
+        "attention. Do not output timestamps or coordinates."
+    )
     render_horizontal, render_vertical = _requested_render_aspects(aspect)
     output_dir.mkdir(parents=True, exist_ok=True)
     prior_interaction_hashes = {
@@ -7630,6 +7799,7 @@ def run_feature_cut_experiment(
     ):
         raise ValueError("music file does not match the supplied MusicMap lock")
     client = GeminiLabClient()
+    feature_plan_origin = "generated"
     plan_reuse_record_path: Path | None = None
     gemini_geometry_block_reason: str | None = None
     geometry_circuit_run_id = uuid.uuid4().hex
@@ -7791,6 +7961,7 @@ def run_feature_cut_experiment(
                 write_json(plan_binding_path, saved_binding)
                 current_binding["origin"] = saved_binding["origin"]
             _validate_feature_plan_binding(saved_binding, current_binding)
+            feature_plan_origin = str(current_binding["origin"])
             reuse_event_dir = plan_dir / "feature-plan-reuse-events"
             plan_reuse_record_path = (
                 reuse_event_dir / f"reuse-{uuid.uuid4().hex}.json"
@@ -8436,6 +8607,41 @@ def run_feature_cut_experiment(
                             quality_maps=shot_quality_maps,
                         )
                     )
+                    framing_refinement: dict[str, Any] | None = None
+                    framing_recommended_action: str | None = None
+                    if (
+                        auto_vertical_framing
+                        and not human_reframe_policy_requested
+                        and (
+                            feature_plan_origin != "external_projection"
+                            or option_data.get("virtual_camera_proposal") is None
+                        )
+                    ):
+                        try:
+                            (
+                                option_data,
+                                framing_proposal,
+                                framing_reused,
+                            ) = _refine_selected_vertical_candidate(
+                                client=client,
+                                option_data=option_data,
+                                chapter=brief_chapter,
+                                clip=candidate_clip,
+                                frame=candidate_frame,
+                                prompt_template=resolved_vertical_framing_prompt,
+                                catalog_path=catalog_path,
+                                output_dir=output_dir,
+                            )
+                        except Exception as error:
+                            abort_for_geometry_quota(error)
+                            raise
+                        framing_recommended_action = (
+                            framing_proposal.recommended_action
+                        )
+                        framing_refinement = {
+                            **dict(option_data["framing_refinement"]),
+                            "reused": framing_reused,
+                        }
                     candidate_regions, candidate_target = (
                         _resolve_vertical_candidate_intent(
                             option_regions=option_data.get("regions", []),
@@ -8477,7 +8683,27 @@ def run_feature_cut_experiment(
                             "virtual_camera_proposal"
                         ),
                         "camera_phase_origin": candidate_camera_phase_origin,
+                        "framing_refinement": framing_refinement,
                     }
+                    if framing_recommended_action == "try_next_candidate":
+                        attempt.update(
+                            {
+                                "decision": "try_next",
+                                "reason_code": (
+                                    "full_clip_framing_recommends_alternate_candidate"
+                                ),
+                                "failure_codes": [
+                                    FailureCode.NO_FEASIBLE_PRESENTATION.value
+                                ],
+                                "recovery_action": (
+                                    "try_next_candidate"
+                                    if option_index + 1 < len(vertical_options)
+                                    else "fallback_requires_review"
+                                ),
+                            }
+                        )
+                        candidate_attempts.append(attempt)
+                        continue
                     if (
                         option_data["strategy"] == "fit_with_background"
                         and not candidate_camera_phases

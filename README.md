@@ -68,6 +68,8 @@ Top-K 直式候選
 
 同一個橫式鏡頭若有兩個以上不能同時塞進 9:16、但可以依序觀看的重點，Gemini 在完整觀看單支 proxy、建立 Clip Card 時，先以 `portrait_attention_sequence` 記錄素材直接支持的動作、視線、結果揭露與資訊交接；選片階段才可依這份證據提出 `virtual_camera_proposal`。方向不是固定的左→中→右：可以是右→左、人物→結果、整體→細節，或判斷完全不應移動。每個 phase 可選 `hold`、帶 deadband 的 `follow`、連續 `follow`、`push_in`、`pull_out` 或硬切式 `punch_in_cut`；不再把所有相位交接一律做成定速平移。proposal 只保存相對 phase 順序、可見 predicate、交接條件與既有 Entity／region ID，不包含 source timestamp、bbox 或 crop 座標；本機仍須對各 anchor 做 exact-frame Grounding、SAM 追蹤、100% active-anchor containment 與速度／加速度／jerk gate，通過後才會產生可執行 `VerticalVirtualCameraPlan`。
 
+`feature-cut` 現在也預設補上一個 **selected-clip framing refinement**：catalog reel 先負責選片，但 renderer 不會因為 reel 沒產生 camera proposal 就直接退回背景補邊。每個實際嘗試的 9:16 候選會在 Grounding／SAM 之前讓 Gemini 完整觀看該片段，鎖定原本的 asset／event／frame identity，只能決定 `tracked_crop`、`fit_or_layout` 或 `try_next_candidate`。它必須明示單一主體、先後注意力或同時關係，並保存 regions、phase predicate、理由、不確定性、raw response、usage 與 content-addressed cache。已有完整 Clip Card projection 且帶有效 proposal 時可直接沿用，避免重複付費；File API 物件也按來源 SHA-256 重用。可用 `--no-auto-vertical-framing` 做受控舊路徑比較，但不是預設交付流程。
+
 本機的 phase transition 使用 smoothstep easing，並依實際移動距離同時估算速度、加速度與 jerk 所需的最低時間；Gemini 建議的 transition 若太短，不能直接把鏡頭加速。能安全完成時才移動，距離太遠或 phase 太短時改成有稽核紀錄的硬切，微小 tracker 位移則由 deadband 吸收。scale 也受來源解析度與最多 1.12× 的保守上限約束。若幾何失敗就改試下一個 take 或安全 fallback，不會硬做模型要求的移動。
 
 這也不是把「兩個都必須同時看見」改成任意裁切：兩者關係必須同時成立時，proposal 必須使用 `joint_relation`，否則應換 take、split／PiP 或 solid fit。自動 proposal 永遠不能授權裁掉 active anchor；只有具 provenance 的真人 `vertical_camera_phases` policy 可對非原子人物／物件明示較低可見門檻。兩條路徑的成片都標記為 review-required，artifact 也會分清 `gemini_proposed` 與 `human_reviewed`，避免把人工測試方向冒充成模型判斷。

@@ -3494,6 +3494,173 @@ class AttentionObservation(StrictModel):
         return self
 
 
+class _SelectedFramingRegionBase(StrictModel):
+    """Response-only region base with role-specific JSON schema branches."""
+
+    region_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    entity_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$",
+    )
+    target_description: str = Field(min_length=1)
+    kind: Literal["subject", "text_region", "ui_region", "graphic", "other"] = (
+        "subject"
+    )
+    observable_relations: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_text_lists(self) -> "_SelectedFramingRegionBase":
+        for field_name in ("observable_relations", "exclusions"):
+            values = getattr(self, field_name)
+            if any(not value.strip() for value in values):
+                raise ValueError(f"{field_name} values must be non-empty")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} values must be unique")
+        return self
+
+    def to_framing_region_intent(self) -> "FramingRegionIntent":
+        return FramingRegionIntent.model_validate(self.model_dump(mode="python"))
+
+
+class SelectedHardCoreFramingRegion(_SelectedFramingRegionBase):
+    role: Literal["required"]
+    atomic: bool = False
+    minimum_visible_fraction: Literal[1.0] | None = None
+
+    @property
+    def execution_role(self) -> Literal["hard_core"]:
+        return "hard_core"
+
+
+class SelectedSoftExtentFramingRegion(_SelectedFramingRegionBase):
+    role: Literal["preferred"]
+    atomic: Literal[False] = False
+    minimum_visible_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+
+    @property
+    def execution_role(self) -> Literal["soft_extent"]:
+        return "soft_extent"
+
+
+class SelectedOverlayKeepoutFramingRegion(_SelectedFramingRegionBase):
+    role: Literal["avoid_overlay"]
+    atomic: Literal[False] = False
+    minimum_visible_fraction: Literal[None] = None
+
+    @property
+    def execution_role(self) -> Literal["overlay_keepout"]:
+        return "overlay_keepout"
+
+
+SelectedFramingRegion = Annotated[
+    SelectedHardCoreFramingRegion
+    | SelectedSoftExtentFramingRegion
+    | SelectedOverlayKeepoutFramingRegion,
+    Field(discriminator="role"),
+]
+
+
+class SelectedVerticalFramingProposal(StrictModel):
+    """Full-clip semantic framing decision made after editorial selection.
+
+    The proposal may change how one already-selected candidate is presented,
+    but it cannot change the source asset, event, evidence frame, or candidate
+    identity.  Exact coordinates and motion remain downstream local work.
+    """
+
+    contract_version: Literal["selected-vertical-framing-proposal-v1"] = (
+        "selected-vertical-framing-proposal-v1"
+    )
+    candidate_id: str = Field(
+        pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=64
+    )
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    event_id: str = Field(min_length=1)
+    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    semantic_requirement: Literal[
+        "single_primary",
+        "sequential_attention",
+        "simultaneous_relation",
+    ]
+    recommended_action: Literal[
+        "tracked_crop",
+        "fit_or_layout",
+        "try_next_candidate",
+    ]
+    regions: list[SelectedFramingRegion] = Field(default_factory=list, max_length=8)
+    virtual_camera_proposal: VerticalVirtualCameraProposal | None = None
+    observed_evidence: list[str] = Field(min_length=1, max_length=12)
+    decision_reason: str = Field(min_length=1, max_length=1200)
+    uncertainties: list[str] = Field(default_factory=list, max_length=12)
+    confidence: Confidence
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_selected_framing(self) -> "SelectedVerticalFramingProposal":
+        region_ids = [region.region_id for region in self.regions]
+        if len(region_ids) != len(set(region_ids)):
+            raise ValueError("selected framing region IDs must be unique")
+        entity_ids = [
+            region.entity_id for region in self.regions if region.entity_id is not None
+        ]
+        if len(entity_ids) != len(set(entity_ids)):
+            raise ValueError("selected framing entity IDs must be unique")
+        if self.recommended_action == "tracked_crop" and not self.regions:
+            raise ValueError("tracked-crop framing requires explicit regions")
+        if self.recommended_action != "tracked_crop":
+            if self.virtual_camera_proposal is not None:
+                raise ValueError(
+                    "fit/layout or alternate-candidate decisions cannot execute "
+                    "a virtual-camera proposal"
+                )
+            return self
+        if self.virtual_camera_proposal is None:
+            raise ValueError(
+                "tracked-crop framing requires an explicit hold, follow, or "
+                "multi-phase virtual-camera proposal"
+            )
+        proposal = self.virtual_camera_proposal
+        known_region_ids = set(region_ids)
+        referenced = {
+            region_id
+            for phase in proposal.phases
+            for region_id in phase.anchor_region_ids
+        }
+        unknown = sorted(referenced - known_region_ids)
+        if unknown:
+            raise ValueError(
+                "selected framing proposal references unknown regions: "
+                + ", ".join(unknown)
+            )
+        required = {
+            region.region_id
+            for region in self.regions
+            if region.execution_role == "hard_core"
+        }
+        missing_required = sorted(required - referenced)
+        if missing_required:
+            raise ValueError(
+                "every hard-core selected framing region must be referenced: "
+                + ", ".join(missing_required)
+            )
+        if (
+            self.semantic_requirement == "sequential_attention"
+            and proposal.composition_mode != "sequential_focus"
+        ):
+            raise ValueError(
+                "sequential attention requires sequential-focus camera phases"
+            )
+        if (
+            self.semantic_requirement == "simultaneous_relation"
+            and proposal.composition_mode == "sequential_focus"
+        ):
+            raise ValueError(
+                "a simultaneous relation cannot be split into sequential focus"
+            )
+        return self
+
+
 class FeatureHorizontalCandidate(StrictModel):
     """One evidence-bound 16:9 option retained for local automatic routing."""
 
