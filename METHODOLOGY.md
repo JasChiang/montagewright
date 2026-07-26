@@ -144,6 +144,8 @@ Gemini 不需要每次重看整支成片。成本合理的順序是先跑零 API
 
 敘事規劃與構圖可行性是兩個不同問題。Planner 現在為每個有證據的 chapter 保存 2–4 個不同 frame 的候選，每個候選都綁定 source asset、event、frame、可見證據、品質風險與雙比例策略。v3 仍由 Gemini 針對 brief 排出 `required`、`preferred`、`sacrificable` entity priorities 與簡短 framing intent，但不讓模型重抄 target descriptions、rank-1 mirrors 或 verbose regions；這些執行資料由 hash-bound Clip Card evidence 確定性投影。Top-K 和 projection contract 會一起 hash-bound；runtime 換到下一候選不會修改或覆蓋原始 plan。
 
+若使用者提供音樂，v3 Top-K planner 會接收實際 audio 與相同 Clip Card evidence，依可聽見的段落、能量、留白與收尾調整候選及相對 dwell；它仍不能輸出自創 beat timestamp。來源音樂 SHA-256 會成為 external projection artifact，renderer 只能搭配同一音樂重用該 plan；沒有音樂的 plan 也不能在之後被冒充成已做 music-aware selection。這只增加一次 planner 的 audio input，不把 K 個候選拆成 K 次付費分析。
+
 9:16 自動路徑採 lazy geometry evaluation：
 
 ```text

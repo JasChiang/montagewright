@@ -638,6 +638,47 @@ def _current_external_projection_binding(
         source_request_path=request_path,
         source_artifacts=artifact_paths,
     )
+    source_music_path = artifact_paths.get("source_music")
+    source_music_sha256 = (
+        sha256_file(source_music_path)
+        if source_music_path is not None
+        else None
+    )
+    source_request = read_json(request_path)
+    source_inputs = (
+        source_request.get("input")
+        if isinstance(source_request, dict)
+        else None
+    )
+    source_inputs = source_inputs if isinstance(source_inputs, list) else []
+    request_has_audio = any(
+        isinstance(item, dict) and item.get("type") == "audio"
+        for item in source_inputs
+    )
+    if request_has_audio != (source_music_sha256 is not None):
+        raise ValueError(
+            "external projection source_music does not match the paid request "
+            "audio presence"
+        )
+    source_prompt = next(
+        (
+            str(item.get("text"))
+            for item in source_inputs
+            if isinstance(item, dict) and item.get("type") == "text"
+        ),
+        "",
+    )
+    if source_music_sha256 is not None and (
+        f"music_sha256={source_music_sha256}" not in source_prompt
+    ):
+        raise ValueError(
+            "external projection paid request does not bind the source music hash"
+        )
+    if music_sha256 != source_music_sha256:
+        raise ValueError(
+            "external projection music differs from the current render input; "
+            "the Top-K selection must hear the same music, or both must omit it"
+        )
     return {
         "binding_version": _FEATURE_PLAN_BINDING_VERSION,
         "origin": "external_projection",
@@ -691,13 +732,23 @@ def validate_external_feature_plan_projection(plan_dir: Path) -> dict[str, Any]:
     reel_path = Path(catalog.analysis_reel_path).expanduser().resolve()
     if not reel_path.is_file():
         raise FileNotFoundError(reel_path)
+    source_artifacts = record.get("source_artifacts")
+    source_music_sha256 = next(
+        (
+            str(artifact["sha256"])
+            for artifact in source_artifacts
+            if isinstance(artifact, dict)
+            and artifact.get("role") == "source_music"
+        ),
+        None,
+    ) if isinstance(source_artifacts, list) else None
     _current_external_projection_binding(
         plan_dir=plan_dir,
         catalog_path=catalog_path,
         catalog_reel_sha256=sha256_file(reel_path),
         brief_path=Path(required_paths["brief_path"]),  # type: ignore[arg-type]
         plan_path=Path(required_paths["feature_plan_path"]),  # type: ignore[arg-type]
-        music_sha256=None,
+        music_sha256=source_music_sha256,
         created_at=utc_now(),
     )
     return record

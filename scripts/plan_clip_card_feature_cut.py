@@ -28,7 +28,7 @@ from jascue_video_lab.clip_card_retrieval import (
     validate_feature_shortlist,
 )
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
-from jascue_video_lab.gemini import MODEL_ID, _raw_dump
+from jascue_video_lab.gemini import GeminiLabClient, MODEL_ID, _raw_dump
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
     AttentionObservation,
@@ -1645,6 +1645,16 @@ def main() -> int:
             "geometry-aware planner."
         ),
     )
+    parser.add_argument(
+        "--music",
+        type=Path,
+        help=(
+            "Optional actual music file. When supplied, Gemini receives the "
+            "audio together with the Clip Card evidence and must use audible "
+            "flow for selection and relative dwell. The source hash is bound "
+            "into the external projection."
+        ),
+    )
     args = parser.parse_args()
     if args.repair_attempts < 0:
         parser.error("--repair-attempts must be zero or greater")
@@ -1654,6 +1664,12 @@ def main() -> int:
         raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required")
     catalog = RushesCatalog.model_validate(read_json(args.catalog_json))
     brief = FeatureEditBrief.model_validate(read_json(args.brief_json))
+    music_path = (
+        args.music.expanduser().resolve(strict=True)
+        if args.music is not None
+        else None
+    )
+    music_sha256 = sha256_file(music_path) if music_path is not None else None
     frames = {frame.frame_id: frame for frame in catalog.frames}
     clips = {clip.clip_id: clip for clip in catalog.clips}
     asset_to_clip = {f"sha256:{clip.sha256}": clip for clip in catalog.clips}
@@ -1806,6 +1822,7 @@ def main() -> int:
 7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。只分類與這次構圖決策直接相關的 entity；未列入者不會被程式偷偷視為 required 或 sacrificable。不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
 8. framing_intent 只需簡潔描述本候選的構圖取捨；不得輸出座標、bbox、mask、target description 或 verbose region contract。程式會把這些 entity priority ID 與 Clip Card entity/grounding target 資料轉成 domain-neutral hard-core、soft-extent 與 overlay keepout regions。
 9. 每個 supported／partial chapter 應依可見資訊、動作完整性、閱讀需求、情緒停留、重複壓力與音樂角色提出 recommended_duration_seconds、duration_rationale 與 attention_observation。minimum／recommended／maximum dwell 必須依序排列；attention 各分量 0–1，只是待審相對判斷，不是 source timestamp 或客觀真值。action_progress 表示到片段結尾時動作／結果已完成、適合轉場的程度。
+9a. {"本次另附實際音樂，music_sha256=" + music_sha256 + "。你必須實際聆聽音訊，依可聽見的段落、能量、留白與收尾安排候選及相對停留；不得只依文字猜音樂，也不得輸出自創 beat timestamp。" if music_sha256 is not None else "本次沒有附音樂；不得推測不存在的節拍、段落或能量變化。"}
 10. bbox、mask、crop 座標與精確 cut point 均由後續 Grounding／tracker／FFmpeg 處理；本階段不得輸出座標。
 11. confidence 是 proposal，不是人工真值；候選排序仍須由可見 evidence 與風險說明支持。
 
@@ -1823,6 +1840,29 @@ model_provenance 必須先原樣回傳：
 """.strip()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    request_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if music_path is not None and not args.reuse_raw_output:
+        upload_dir = (
+            args.output_dir.parent
+            / "file-cache"
+            / music_sha256
+            / "upload"
+        )
+        upload_client = GeminiLabClient(api_key=api_key)
+        try:
+            uploaded_music, _ = upload_client.ensure_video_upload(
+                music_path,
+                upload_dir,
+            )
+        finally:
+            upload_client.close()
+        request_input.append(
+            {
+                "type": "audio",
+                "uri": uploaded_music.uri,
+                "mime_type": uploaded_music.mime_type,
+            }
+        )
     request = {
         "model": MODEL_ID,
         "system_instruction": (
@@ -1836,7 +1876,7 @@ model_provenance 必須先原樣回傳：
             "only tracked_reframe may name a horizontal focus entity."
         ),
         "store": False,
-        "input": [{"type": "text", "text": prompt}],
+        "input": request_input,
         "generation_config": {
             "thinking_level": args.thinking_level,
         },
@@ -1854,12 +1894,40 @@ model_provenance 必須先原樣回傳：
     canonical_output_path: Path
     normalization_audit_path: Path
     extra_projection_artifacts: dict[str, Path] = {}
+    if music_path is not None:
+        extra_projection_artifacts["source_music"] = music_path
     if args.reuse_raw_output:
         artifacts = _resolve_feature_reuse_artifacts(args.output_dir)
         source_request_path = artifacts["request"]
         source_raw_output_path = artifacts["raw_output"]
         source_raw_interaction_path = artifacts["raw_interaction"]
         original_request = read_json(source_request_path)
+        original_inputs = original_request.get("input")
+        original_inputs = (
+            original_inputs if isinstance(original_inputs, list) else []
+        )
+        original_has_audio = any(
+            isinstance(item, dict) and item.get("type") == "audio"
+            for item in original_inputs
+        )
+        if original_has_audio != (music_sha256 is not None):
+            raise ValueError(
+                "--reuse-raw-output music presence differs from the paid request"
+            )
+        original_text = next(
+            (
+                str(item.get("text"))
+                for item in original_inputs
+                if isinstance(item, dict) and item.get("type") == "text"
+            ),
+            "",
+        )
+        if music_sha256 is not None and (
+            f"music_sha256={music_sha256}" not in original_text
+        ):
+            raise ValueError(
+                "--reuse-raw-output music hash differs from the paid request"
+            )
         raw_interaction = read_json(source_raw_interaction_path)
         artifact_models = {
             "original_request": str(original_request.get("model") or ""),

@@ -23,8 +23,12 @@ from jascue_video_lab.models import (
     RushFrame,
     RushesCatalog,
 )
-from jascue_video_lab.feature_cut import write_external_feature_plan_projection
+from jascue_video_lab.feature_cut import (
+    _current_external_projection_binding,
+    write_external_feature_plan_projection,
+)
 from jascue_video_lab.gemini import MODEL_ID
+from jascue_video_lab.media import sha256_file
 from jascue_video_lab.schema import gemini_response_schema
 from jascue_video_lab.storage import write_json
 from scripts.plan_clip_card_feature_cut import (
@@ -800,6 +804,93 @@ def test_projection_sidecar_validates_both_exact_source_schemas(
     )
 
     assert pointer.name == "feature-plan.external-projection.json"
+
+
+def test_external_top_k_projection_binds_actual_music_to_paid_request(
+    tmp_path: Path,
+) -> None:
+    source_plan = _v2_plan()
+    feature_plan = project_feature_contracts(
+        source_plan,
+        brief=_brief(),
+        catalog=_catalog(),
+    )
+    plan_dir = tmp_path / "gemini-plan"
+    catalog_path = tmp_path / "catalog.json"
+    brief_path = tmp_path / "brief.json"
+    feature_plan_path = plan_dir / "feature_edit_plan.json"
+    source_plan_path = plan_dir / "source-plan.json"
+    source_request_path = plan_dir / "source.request.json"
+    raw_output_path = plan_dir / "source.raw_output.json"
+    raw_interaction_path = plan_dir / "source.raw_interaction.json"
+    music_path = tmp_path / "music.wav"
+    music_path.write_bytes(b"audible music fixture")
+    music_sha256 = sha256_file(music_path)
+    write_json(catalog_path, _catalog())
+    write_json(brief_path, _brief())
+    write_json(feature_plan_path, feature_plan)
+    write_json(source_plan_path, source_plan)
+    write_json(
+        source_request_path,
+        {
+            "model": MODEL_ID,
+            "system_instruction": "Use only the supplied evidence.",
+            "input": [
+                {
+                    "type": "text",
+                    "text": f"Select evidence. music_sha256={music_sha256}",
+                },
+                {
+                    "type": "audio",
+                    "uri": "https://example.invalid/files/music",
+                    "mime_type": "audio/wav",
+                },
+            ],
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(ClipCardFeaturePlanV2),
+            },
+        },
+    )
+    write_json(raw_output_path, {"output_text": source_plan.model_dump_json()})
+    write_json(raw_interaction_path, {"id": "interaction-music"})
+    write_external_feature_plan_projection(
+        plan_dir=plan_dir,
+        projection_contract_id="clip-card-feature-cut-v2",
+        catalog_path=catalog_path,
+        brief_path=brief_path,
+        feature_plan_path=feature_plan_path,
+        source_plan_path=source_plan_path,
+        source_request_path=source_request_path,
+        source_artifacts={
+            "source_raw_output": raw_output_path,
+            "source_raw_interaction": raw_interaction_path,
+            "source_music": music_path,
+        },
+    )
+
+    binding = _current_external_projection_binding(
+        plan_dir=plan_dir,
+        catalog_path=catalog_path,
+        catalog_reel_sha256="b" * 64,
+        brief_path=brief_path,
+        plan_path=feature_plan_path,
+        music_sha256=music_sha256,
+        created_at="2026-07-26T00:00:00+00:00",
+    )
+
+    assert binding["music_sha256"] == music_sha256
+    with pytest.raises(ValueError, match="music differs"):
+        _current_external_projection_binding(
+            plan_dir=plan_dir,
+            catalog_path=catalog_path,
+            catalog_reel_sha256="b" * 64,
+            brief_path=brief_path,
+            plan_path=feature_plan_path,
+            music_sha256="f" * 64,
+            created_at="2026-07-26T00:00:00+00:00",
+        )
 
 
 def test_v2_rejects_single_candidate() -> None:

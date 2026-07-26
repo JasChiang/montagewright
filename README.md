@@ -39,7 +39,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 因此正式流程把「召回」和「最後使用」分開：
 
 1. 每章先從 Clip Cards 召回不同 asset／event 的 Top-K，而不是只問一次最高分。
-2. 排名同時保存語意符合、動作完整、品質、構圖可行性、前後鏡頭差異與重複理由，不過早壓成單一 confidence。
+2. 使用者有提供音樂時，Top-K planner 會把同一支實際音樂與 Clip Card evidence 一起送給 Gemini；音樂檔 SHA-256 綁進 projection，之後換歌不能誤用舊排名。排名同時保存語意符合、動作完整、品質、構圖可行性、前後鏡頭差異與重複理由，不過早壓成單一 confidence。
 3. 16:9 與 9:16 可有不同排名；橫式最好的 take 不必強迫成為直式首選。
 4. 實際 geometry 只按排名逐一驗證，第一個通過者即停止；API／tracker 不會為全部候選預先付費。
 5. manifest 會列出 Top-K 是否完整、實際嘗試與換帶次數、rank-1 source reuse，以及重複是否有明確 editorial justification。重複本身只觸發 review，不會為了「看起來比較多樣」強迫換成較差素材。
