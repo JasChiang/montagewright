@@ -170,6 +170,10 @@ Region contract 只表達構圖語意，不綁定內容類別：
 
 自動政策 `auto_bounded_clip_v1` 只在 hard core／atomic 仍完整、soft extent 仍高於 floor 時接受有限裁切。它不是「讓 AI 自己決定犧牲必留內容」。真正能裁掉 required union 的 `controlled_clip` 仍只能由真人核准的 content-addressed policy sidecar 啟用；有這份 binding 時，自動換候選也會停用，避免 runtime 推翻審核決定。
 
+`safe-fit` 與 `tracked crop` 不應只用一個 pass/fail 分數比較。前者可能幾何上最安全，卻留下大量未利用的直式畫布；後者可能較像原生 9:16，但必須證明 hard core 在全段都完整。成片 QA 因此分兩層：本機 gate 驗證 containment、coverage、速度與來源 lineage；Gemini crop-only QA 另觀察畫布利用、焦點、動作方向空間，以及 matte 是否為必要 fallback。Gemini 不能用美觀理由覆蓋本機 hard-core failure。
+
+同一批素材在相同 brief 下重複選中少數強鏡頭可能是合理的穩定性，不應以隨機換帶冒充多樣性。每次 feature plan 仍須輸出 candidate audit：逐章記錄 Top-K 深度、候選來源數、rank-one-only 狀態、跨章 rank-one source reuse 與 justification。真正要降低單調感時，sequence planner 應在通過 hard gates 的候選中加入 take／shot-scale／語意資訊重複 penalty，而不是降低證據標準或強迫使用較差 take。
+
 Typed recovery 目前同時扮演執行與診斷契約：executor 已會嘗試下一候選、延後 safe-fit 候選，並在耗盡後產生待審 preview；split shot、改字卡位置、簡化 motion、換 seed 或重新尋回等 action 目前只會被建議與保存，尚未形成無人值守的自動 repair loop。未驗證 center crop 不會被當成隱形 fallback。
 
 這個路徑不是完整自動品質保證。目前已有固定預算的本機 identity checkpoint scheduler：根據 shot boundary、drift、低信心、面積／中心跳動與遮擋後重現，優先挑出 start／mid／end 等風險點。另有 exact-frame Gemini verifier 與 executor artifact：每個結果只能是 `matched`、`target_mismatch`、`ambiguous`、`not_visible`、`insufficient_evidence` 或保存錯誤；只有全部已選 frame 都 matched 才能成為 `passed`。Auto-reframe 不再使用 `bool | None`，tracked crop 在 verifier 尚未接到 renderer 時固定為 `required_pending` 並 fail closed。尚未完成的是 renderer 自動抽 checkpoint frame、執行 verifier、遮擋後 re-identification 與 overlay layout collision solver。有 overlay keepout 且需要上字時同樣會 fail closed。獨立成片 QA 可作額外 review 訊號，但不會覆蓋本機 geometry gate，也不等同真人核准。

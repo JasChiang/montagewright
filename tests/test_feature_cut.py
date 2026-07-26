@@ -24,6 +24,7 @@ from scripts.plan_clip_card_open_edit import (
 
 from jascue_video_lab.feature_cut import (
     _chapter_bounds_with_approved_trim,
+    _audit_feature_plan_candidate_recall,
     _cover_transform,
     _current_feature_plan_binding,
     _current_external_projection_binding,
@@ -3316,6 +3317,7 @@ def test_automatic_reframe_summary_preserves_switch_and_failure_audit() -> None:
                 "requires_gemini_review": False,
                 "automatic_candidate_selection": {
                     "enabled": True,
+                    "planned_candidate_count": 2,
                     "selected_candidate_id": "take-b",
                     "selected_candidate_rank": 2,
                     "attempts": [
@@ -3333,6 +3335,7 @@ def test_automatic_reframe_summary_preserves_switch_and_failure_audit() -> None:
                 "requires_gemini_review": True,
                 "automatic_candidate_selection": {
                     "enabled": True,
+                    "planned_candidate_count": 1,
                     "selected_candidate_id": "take-c",
                     "selected_candidate_rank": 1,
                     "attempts": [
@@ -3348,6 +3351,9 @@ def test_automatic_reframe_summary_preserves_switch_and_failure_audit() -> None:
 
     assert summary["candidate_attempt_count"] == 3
     assert summary["candidate_switch_count"] == 1
+    assert summary["candidate_recall_incomplete_chapter_count"] == 1
+    assert summary["portrait_crop_chapter_count"] == 1
+    assert summary["scope_preserving_fit_chapter_count"] == 1
     assert summary["policy_blocked_chapter_count"] == 1
     assert summary["review_required_chapter_count"] == 1
     assert summary["failure_code_counts"] == {
@@ -3355,3 +3361,56 @@ def test_automatic_reframe_summary_preserves_switch_and_failure_audit() -> None:
         "track_coverage_below_minimum": 1,
     }
     assert len(summary["summary_sha256"]) == 64
+
+
+def test_feature_plan_candidate_audit_exposes_rank_one_and_unexplained_reuse() -> None:
+    chapters = [
+        FeatureChapterSelect(
+            feature_id=feature_id,
+            evidence_status="supported",
+            observed_visual_evidence=f"Observable {feature_id}.",
+            selection_reason=f"Selected {feature_id}.",
+            horizontal_frame_id=f"RF{index:06d}",
+            horizontal_strategy="original",
+            horizontal_zoom_intent="none",
+            horizontal_target_description=None,
+            vertical_frame_id=f"RF{index:06d}",
+            vertical_strategy="fit_with_background",
+            vertical_target_description=None,
+            quality_risks=[],
+            confidence=0.9,
+        )
+        for index, feature_id in enumerate(("opening", "closing"), start=1)
+    ]
+    plan = FeatureEditPlan(
+        project_id="generic-project",
+        catalog_id="generic-catalog",
+        title="Generic",
+        chapters=chapters,
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    audit = _audit_feature_plan_candidate_recall(
+        plan,
+        frame_source_assets={
+            "RF000001": "sha256:" + "a" * 64,
+            "RF000002": "sha256:" + "a" * 64,
+        },
+    )
+
+    assert audit["candidate_recall_complete"] is False
+    assert audit["rank_one_only_chapter_count"] == 2
+    assert audit["selection_repetition_review_required"] is True
+    assert audit["reuse_groups"]["9x16"][0]["feature_ids"] == [
+        "opening",
+        "closing",
+    ]
+    assert len(audit["audit_sha256"]) == 64

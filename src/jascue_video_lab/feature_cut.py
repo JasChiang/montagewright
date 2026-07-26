@@ -5387,6 +5387,125 @@ def _vertical_runtime_candidate_options(
     ]
 
 
+def _audit_feature_plan_candidate_recall(
+    plan: FeatureEditPlan,
+    *,
+    frame_source_assets: Mapping[str, str],
+) -> dict[str, Any]:
+    """Describe candidate depth and repeated rank-one sources without judging taste.
+
+    Reusing a strong source can be editorially correct.  The audit therefore
+    never rejects repetition by itself; it exposes whether the planner preserved
+    alternatives and whether repeated rank-one choices carry an explicit reason.
+    """
+
+    rows: list[dict[str, Any]] = []
+    selected_sources: dict[str, list[tuple[str, str | None]]] = {
+        "16x9": [],
+        "9x16": [],
+    }
+    for chapter in plan.chapters:
+        horizontal_sources = {
+            candidate.source_asset_id for candidate in chapter.horizontal_candidates
+        }
+        vertical_sources = {
+            candidate.source_asset_id for candidate in chapter.vertical_candidates
+        }
+        applicable = chapter.evidence_status in {"supported", "partial"}
+        horizontal_count = len(chapter.horizontal_candidates)
+        vertical_count = len(chapter.vertical_candidates)
+        top_k_complete = (
+            not applicable or (horizontal_count >= 2 and vertical_count >= 2)
+        )
+        horizontal_selected_source = (
+            frame_source_assets.get(chapter.horizontal_frame_id)
+            if chapter.horizontal_frame_id is not None
+            else None
+        )
+        vertical_selected_source = (
+            frame_source_assets.get(chapter.vertical_frame_id)
+            if chapter.vertical_frame_id is not None
+            else None
+        )
+        if horizontal_selected_source is not None:
+            selected_sources["16x9"].append(
+                (chapter.feature_id, horizontal_selected_source)
+            )
+        if vertical_selected_source is not None:
+            selected_sources["9x16"].append(
+                (chapter.feature_id, vertical_selected_source)
+            )
+        rows.append(
+            {
+                "feature_id": chapter.feature_id,
+                "evidence_status": chapter.evidence_status,
+                "horizontal_candidate_count": horizontal_count,
+                "vertical_candidate_count": vertical_count,
+                "horizontal_distinct_source_count": len(horizontal_sources),
+                "vertical_distinct_source_count": len(vertical_sources),
+                "top_k_complete": top_k_complete,
+                "rank_one_only": applicable and not (
+                    chapter.horizontal_candidates or chapter.vertical_candidates
+                ),
+                "horizontal_selected_source_asset_id": horizontal_selected_source,
+                "vertical_selected_source_asset_id": vertical_selected_source,
+                "source_reuse_justification": chapter.source_reuse_justification,
+            }
+        )
+
+    reuse_groups: dict[str, list[dict[str, Any]]] = {}
+    for aspect, selections in selected_sources.items():
+        by_source: dict[str, list[str]] = {}
+        for feature_id, source_asset_id in selections:
+            if source_asset_id is None:
+                continue
+            by_source.setdefault(source_asset_id, []).append(feature_id)
+        reuse_groups[aspect] = [
+            {
+                "source_asset_id": source_asset_id,
+                "feature_ids": feature_ids,
+                "chapter_count": len(feature_ids),
+                "all_reuses_explained": all(
+                    bool(
+                        next(
+                            chapter.source_reuse_justification
+                            for chapter in plan.chapters
+                            if chapter.feature_id == feature_id
+                        )
+                    )
+                    for feature_id in feature_ids[1:]
+                ),
+            }
+            for source_asset_id, feature_ids in sorted(by_source.items())
+            if len(feature_ids) > 1
+        ]
+
+    applicable_rows = [
+        row for row in rows if row["evidence_status"] in {"supported", "partial"}
+    ]
+    body = {
+        "contract_version": "feature-plan-candidate-audit-v1",
+        "applicable_chapter_count": len(applicable_rows),
+        "top_k_complete_chapter_count": sum(
+            bool(row["top_k_complete"]) for row in applicable_rows
+        ),
+        "candidate_recall_complete": all(
+            bool(row["top_k_complete"]) for row in applicable_rows
+        ),
+        "rank_one_only_chapter_count": sum(
+            bool(row["rank_one_only"]) for row in applicable_rows
+        ),
+        "selection_repetition_review_required": any(
+            not bool(group["all_reuses_explained"])
+            for groups in reuse_groups.values()
+            for group in groups
+        ),
+        "reuse_groups": reuse_groups,
+        "chapters": rows,
+    }
+    return {**body, "audit_sha256": _stable_fingerprint(body)}
+
+
 def _summarize_automatic_reframe(
     vertical_chapters: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -5417,17 +5536,36 @@ def _summarize_automatic_reframe(
             "policy_blocked_preview_center_crop",
         }
         review_required = bool(chapter.get("requires_gemini_review"))
+        applied_strategy = chapter.get("applied_strategy")
+        scope_preserving_fit = applied_strategy in {
+            "fit_with_solid_matte",
+            "required_scope_solid_fit",
+            "policy_blocked_preview_fit",
+            "policy_blocked_preview_solid_fit",
+        }
+        portrait_crop = applied_strategy in {
+            "tracked_crop",
+            "seed_anchor_crop",
+            "center_crop",
+            "unverified_center_crop_preview",
+            "policy_blocked_preview_center_crop",
+        }
         chapters.append(
             {
                 "feature_id": chapter.get("feature_id"),
                 "automatic_routing_enabled": bool(routing.get("enabled")),
+                "planned_candidate_count": routing.get(
+                    "planned_candidate_count", 0
+                ),
                 "selected_candidate_id": routing.get("selected_candidate_id"),
                 "selected_candidate_rank": selected_rank,
                 "candidate_switch_applied": bool(
                     isinstance(selected_rank, int) and selected_rank > 1
                 ),
                 "candidate_attempt_count": len(attempts),
-                "applied_strategy": chapter.get("applied_strategy"),
+                "applied_strategy": applied_strategy,
+                "portrait_crop_applied": portrait_crop,
+                "scope_preserving_fit_applied": scope_preserving_fit,
                 "policy_blocked": policy_blocked,
                 "review_required": review_required,
             }
@@ -5441,6 +5579,15 @@ def _summarize_automatic_reframe(
         "candidate_attempt_count": total_attempts,
         "candidate_switch_count": sum(
             bool(item["candidate_switch_applied"]) for item in chapters
+        ),
+        "candidate_recall_incomplete_chapter_count": sum(
+            int(item["planned_candidate_count"]) < 2 for item in chapters
+        ),
+        "portrait_crop_chapter_count": sum(
+            bool(item["portrait_crop_applied"]) for item in chapters
+        ),
+        "scope_preserving_fit_chapter_count": sum(
+            bool(item["scope_preserving_fit_applied"]) for item in chapters
         ),
         "policy_blocked_chapter_count": sum(
             bool(item["policy_blocked"]) for item in chapters
@@ -6857,6 +7004,13 @@ def run_feature_cut_experiment(
             "feature_plan_reused": plan_reused,
             "music_supplied_to_feature_planner": resolved_music_path is not None,
             "music_sha256": music_sha256,
+            "feature_plan_candidate_audit": _audit_feature_plan_candidate_recall(
+                plan,
+                frame_source_assets={
+                    frame.frame_id: f"sha256:{clips[frame.clip_id].sha256}"
+                    for frame in catalog.frames
+                },
+            ),
             "editorial_duration_plan": duration_audit,
             "feature_plan_binding": str(plan_binding_path.resolve()),
             "feature_plan_reuse_record": (
@@ -7717,6 +7871,9 @@ def run_feature_cut_experiment(
                     "enabled": bool(
                         selected.vertical_candidates
                         and not human_reframe_policy_requested
+                    ),
+                    "planned_candidate_count": len(
+                        selected.vertical_candidates
                     ),
                     "selected_candidate_id": selected_candidate_id,
                     "selected_candidate_rank": selected_candidate_rank,
