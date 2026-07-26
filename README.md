@@ -40,6 +40,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 
 1. 每章先從 Clip Cards 召回不同 asset／event 的 Top-K，而不是只問一次最高分。
 2. 使用者有提供音樂時，Top-K planner 會把同一支實際音樂與 Clip Card evidence 一起送給 Gemini；音樂檔 SHA-256 綁進 projection，之後換歌不能誤用舊排名。排名同時保存語意符合、動作完整、品質、構圖可行性、前後鏡頭差異與重複理由，不過早壓成單一 confidence。
+   若完整 Top-K Structured Output 太大，應先保存已驗證的 evidence-bound plan，再用一次精簡的 actual-audio reranker 只選既有 candidate ID。這個降載 call 不能新增素材、frame、entity、bbox 或 region；本機再從上游 artifact 投影回完整執行計畫，避免為了聽音樂重送或重寫全部視覺證據。
 3. 16:9 與 9:16 可有不同排名；橫式最好的 take 不必強迫成為直式首選。
 4. 實際 geometry 只按排名逐一驗證，第一個通過者即停止；API／tracker 不會為全部候選預先付費。
 5. manifest 會列出 Top-K 是否完整、實際嘗試與換帶次數、rank-1 source reuse，以及重複是否有明確 editorial justification。重複本身只觸發 review，不會為了「看起來比較多樣」強迫換成較差素材。
@@ -64,6 +65,8 @@ Top-K 直式候選
 ```
 
 因此「稍微切到背景、衣服邊緣或非必要環境」可以是正確構圖；「切掉臉、指定產品、關鍵操作手、必要 UI／文字」則不能因滿版好看而合理化。Gemini 成片 QA 也會把 geometry safety 與 portrait composition 分開：沒有切到主體只代表安全，不自動代表畫布利用、視覺焦點與 matte fallback 都理想。
+
+研究用的 `--allow-unverified-geometry-preview` 另有一條明確標記為 review-only 的受控虛擬鏡頭路徑：只有上游選擇 `primary_center`、SAM 已產生無 fallback 的 tracked crop、hard core 不含 atomic／文字／UI／graphic，且整段最小可見 required 面積至少 90% 時，才可輸出略裁主體邊緣的滿版預覽。artifact 會固定保存 `review_only_controlled_primary_center_clip`、可見比例與 `requires_gemini_review`；這不是 production success，也不會改變正式 unattended delivery 的 100% containment 規則。
 
 ### 用到哪些技術
 
@@ -311,7 +314,7 @@ v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 
 
 Full Auto v2 目前仍有清楚限制：已有風險導向、固定預算的 identity checkpoint 規劃器、exact-frame Gemini verifier 與 executor artifact，但尚未把 frame extraction／verifier execution 自動接入每個 candidate preflight；因此 tracked crop 會保持 `required_pending` 並要求人工處理，而不會自動通過。遮擋後自動 re-identification 與自動圖卡避讓也尚未完成；`overlay_keepout` 在有字卡但沒有 layout solver 時會 fail closed。獨立的成片 QA 可以提出語意 review，但不會替 preflight 補造證據或覆蓋 geometry gate。Safe-fit 只是方便人工觀看的預覽，不是核准構圖；模型 rank、confidence、SAM mask 與 schema validation 也都不是 human ground truth。
 
-每個 tracked 9:16 segment 現在保存 renderer 真正使用的 crop keyframes、required-region union、逐時刻合法 crop interval、containment、可見寬度比例、首尾／中段 tracking coverage、crop speed 與 acceleration。裁切器不再先平滑 target 中心後直接裁切，而是先由每一個 required bbox 算出合法範圍，再把平滑路徑投影回該範圍；這可避免平滑延遲把快速移動主體推出畫面。`primary_center` 只會放寬 target 外圍的 8% safety margin，不暗中授權裁掉 target。
+每個 tracked 9:16 segment 現在保存 renderer 真正使用的 crop keyframes、required-region union、逐時刻合法 crop interval、containment、可見寬度比例、首尾／中段 tracking coverage、crop speed 與 acceleration。裁切器不再先平滑 target 中心後直接裁切，而是先由每一個 required bbox 算出合法範圍，再把平滑路徑投影回該範圍；這可避免平滑延遲把快速移動主體推出畫面。正式路徑中的 `primary_center` 只會放寬 target 外圍的 8% safety margin，不暗中授權裁掉 target；只有前述明示的 review-only preview gate 可接受有量測下限的有限裁切。
 
 Reframe geometry 使用 FFmpeg 自動旋轉後的 display dimensions 做 aspect-preserving cover，不再假設來源一定是 16:9。4:3、直式、超寬與相同比例素材都共用二維 x／y crop solver；manifest 保存來源／縮放／輸出座標空間、兩軸合法區間與實際 crop keyframes。非方形像素來源會先依 FFmpeg frame SAR 還原顯示比例；在 tracking 尚未建立同一顯示座標系前，只能 fail closed 到已正規化 SAR 的靜態 reframe 並標記人工複核。track seed 尺寸、analysis aspect 或多 track lineage 與來源不一致時同樣不能把 normalized 座標硬套進 renderer。
 
@@ -351,7 +354,7 @@ uv run jascue-video-lab feature-cut \
   → 可選字卡 + 原始現場音 + H.264/AAC review cuts
 ```
 
-SAM 只提供幾何，不自行決定剪輯美學。16:9 的 `none`／`subtle`／`detail` 由 feature plan 表示 editorial intent，實際倍率不得超過 mask 安全值。9:16 的 `strict` 要求完整保留 required regions；`primary_center` 只表示可犧牲未列為 required 的次要 context。真正允許裁掉 required union 時，必須另以 `controlled_clip` 明示並接受語意複核。使用者 brief 的規格文字與模型觀察到的畫面證據分開保存，沒有 ASR 或 transcript。
+SAM 只提供幾何，不自行決定剪輯美學。16:9 的 `none`／`subtle`／`detail` 由 feature plan 表示 editorial intent，實際倍率不得超過 mask 安全值。9:16 的 `strict` 要求完整保留 required regions；`primary_center` 只表示可犧牲未列為 required 的次要 context。正式輸出若要裁掉 required union，仍必須另以真人 `controlled_clip` 明示；研究 preview 可在前述 90% 可見、非 atomic／文字／UI 的窄條件下先產生受控虛擬鏡頭，供 Gemini 與真人複核，不能冒充正式核准。使用者 brief 的規格文字與模型觀察到的畫面證據分開保存，沒有 ASR 或 transcript。
 
 ```bash
 uv run jascue-video-lab feature-cut \

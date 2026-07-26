@@ -1626,7 +1626,12 @@ def main() -> int:
     parser.add_argument(
         "--thinking-level",
         choices=["low", "high"],
-        default="high",
+        default="low",
+        help=(
+            "Use low for the large Top-K Structured Output so reasoning does "
+            "not consume the response budget. High remains an explicit "
+            "research option for smaller evidence sets."
+        ),
     )
     parser.add_argument(
         "--reuse-raw-output",
@@ -1653,6 +1658,14 @@ def main() -> int:
             "audio together with the Clip Card evidence and must use audible "
             "flow for selection and relative dwell. The source hash is bound "
             "into the external projection."
+        ),
+    )
+    parser.add_argument(
+        "--file-cache-root",
+        type=Path,
+        help=(
+            "Optional shared SHA-256 keyed Gemini File API cache root. "
+            "Defaults to OUTPUT_DIR/../file-cache."
         ),
     )
     args = parser.parse_args()
@@ -1842,11 +1855,15 @@ model_provenance 必須先原樣回傳：
     args.output_dir.mkdir(parents=True, exist_ok=True)
     request_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     if music_path is not None and not args.reuse_raw_output:
+        file_cache_root = (
+            args.file_cache_root.expanduser().resolve()
+            if args.file_cache_root is not None
+            else args.output_dir.parent / "file-cache"
+        )
         upload_dir = (
-            args.output_dir.parent
-            / "file-cache"
+            file_cache_root
             / music_sha256
-            / "upload"
+            / "music-upload"
         )
         upload_client = GeminiLabClient(api_key=api_key)
         try:
@@ -1879,6 +1896,7 @@ model_provenance 必須先原樣回傳：
         "input": request_input,
         "generation_config": {
             "thinking_level": args.thinking_level,
+            "max_output_tokens": 32_000,
         },
         "response_format": {
             "type": "text",
@@ -2024,7 +2042,10 @@ model_provenance 必須先原樣回傳：
                     attempt_request = {
                         **request,
                         "input": [{"type": "text", "text": repair_prompt}],
-                        "generation_config": {"thinking_level": "low"},
+                        "generation_config": {
+                            "thinking_level": "low",
+                            "max_output_tokens": 32_000,
+                        },
                     }
                 attempt_stem = f"clip-card-feature-plan.attempt-{attempt:02d}"
                 attempt_request_path = args.output_dir / f"{attempt_stem}.request.json"

@@ -199,6 +199,29 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
             "selected_clip_card_evidence",
         ],
     },
+    "clip-card-feature-music-rerank-v1": {
+        "source": (
+            "music-aware aspect selections over an existing validated Top-K "
+            "Clip Card feature plan"
+        ),
+        "transform": (
+            "only selected horizontal and vertical candidate IDs are changed; "
+            "all candidate evidence, framing roles, and executable regions are "
+            "reused from hash-bound upstream artifacts"
+        ),
+        "target": "FeatureEditPlan",
+        "module": "scripts.rerank_clip_card_feature_plan_with_music",
+        "source_model": "MusicAwareTopKSelection",
+        "projector": "reproject_music_aware_topk_selection",
+        "raw_output_role": "source_raw_output",
+        "required_artifact_roles": [
+            "source_raw_interaction",
+            "source_raw_output",
+            "source_music",
+            "upstream_source_plan",
+            "selected_clip_card_evidence",
+        ],
+    },
     "open-edit-candidate-overrides-v1": {
         "source": "validated upstream open edit plan plus human-reviewed candidate patch",
         "transform": "only named aspect candidates are replaced before project_feature_contracts",
@@ -253,6 +276,21 @@ def _sha256_json(value: Any) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _prompt_binds_sha256(prompt: str, field_name: str, expected_sha256: str) -> bool:
+    """Accept explicit field bindings without coupling provenance to punctuation."""
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", field_name):
+        raise ValueError("invalid prompt binding field name")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("invalid expected SHA-256")
+    pattern = (
+        rf"(?<![A-Za-z0-9_]){re.escape(field_name)}"
+        rf"(?:\s*(?:=|:|：)|\s+必須原樣回傳\s*(?:=|:|：))"
+        rf"\s*{expected_sha256}(?![0-9a-f])"
+    )
+    return re.search(pattern, prompt) is not None
 
 
 def _external_projection_contract_sha256(contract_id: str) -> str:
@@ -668,8 +706,10 @@ def _current_external_projection_binding(
         ),
         "",
     )
-    if source_music_sha256 is not None and (
-        f"music_sha256={source_music_sha256}" not in source_prompt
+    if source_music_sha256 is not None and not _prompt_binds_sha256(
+        source_prompt,
+        "music_sha256",
+        source_music_sha256,
     ):
         raise ValueError(
             "external projection paid request does not bind the source music hash"
@@ -5344,6 +5384,47 @@ def _vertical_candidate_preflight(
     return preflight, geometry_fingerprint
 
 
+def _controlled_primary_center_preview_allowed(
+    *,
+    crop_mode: str,
+    geometry: Mapping[str, Any],
+    regions: Sequence[FramingRegionIntent],
+    failure_codes: Sequence[FailureCode],
+    minimum_visible_fraction: float = 0.90,
+) -> bool:
+    """Gate a bounded, explicitly review-only portrait crop preview.
+
+    Normal unattended delivery still requires complete hard-core containment.
+    This path is only reachable behind ``--allow-unverified-geometry-preview``
+    and an upstream ``primary_center`` framing choice. Eligibility is based on
+    region semantics and measured geometry, never on a product or subject
+    category.
+    """
+
+    if crop_mode != "primary_center":
+        return False
+    if geometry.get("applied_strategy") != "tracked_crop":
+        return False
+    if geometry.get("fallback_reason") is not None:
+        return False
+    if any(
+        region.atomic or region.kind in {"text_region", "ui_region", "graphic"}
+        for region in regions
+        if region.execution_role == "hard_core"
+    ):
+        return False
+    visible = float(
+        geometry.get("minimum_visible_required_area_fraction", 0.0)
+    )
+    if visible + 1e-6 < minimum_visible_fraction:
+        return False
+    allowed_failures = {
+        FailureCode.HARD_CORE_NOT_FULLY_RETAINED,
+        FailureCode.IDENTITY_VERIFICATION_PENDING,
+    }
+    return bool(failure_codes) and set(failure_codes).issubset(allowed_failures)
+
+
 def _failure_codes_from_geometry_error(error: Exception) -> list[FailureCode]:
     """Map existing Grounding/SAM errors to stable recovery categories."""
 
@@ -7522,6 +7603,16 @@ def run_feature_cut_experiment(
                         / f"candidate-{candidate_rank:02d}-{candidate_id}"
                     )
                     try:
+                        candidate_crop_mode = str(
+                            option_data.get(
+                                "crop_mode", brief_chapter.vertical_crop_mode
+                            )
+                        )
+                        controlled_preview_requested = (
+                            allow_unverified_geometry_preview
+                            and candidate_crop_mode == "primary_center"
+                            and not human_reframe_policy_requested
+                        )
                         candidate_query_lock: EvidenceQueryLockV2 | None = None
                         if (
                             selected.vertical_candidates
@@ -7570,13 +7661,15 @@ def run_feature_cut_experiment(
                                 str(candidate_target) if candidate_target else None
                             ),
                             regions=candidate_regions,
-                            crop_mode=option_data.get(
-                                "crop_mode", brief_chapter.vertical_crop_mode
-                            ),
+                            crop_mode=candidate_crop_mode,
                             overflow_policy=(
                                 brief_chapter.vertical_overflow_policy
                                 if human_reframe_policy_requested
-                                else "preserve_all"
+                                else (
+                                    "controlled_clip"
+                                    if controlled_preview_requested
+                                    else "preserve_all"
+                                )
                             ),
                             edge_priority=(
                                 brief_chapter.vertical_edge_priority
@@ -7635,18 +7728,40 @@ def run_feature_cut_experiment(
                             preview_allowed_failures = {
                                 FailureCode.IDENTITY_VERIFICATION_PENDING,
                             }
-                            if (
+                            standard_preview_allowed = (
                                 allow_unverified_geometry_preview
                                 and candidate_geometry.get("fallback_reason") is None
                                 and bool(failure_codes)
                                 and set(failure_codes).issubset(
                                     preview_allowed_failures
                                 )
+                            )
+                            controlled_primary_center_allowed = (
+                                allow_unverified_geometry_preview
+                                and _controlled_primary_center_preview_allowed(
+                                    crop_mode=candidate_crop_mode,
+                                    geometry=candidate_geometry,
+                                    regions=candidate_regions,
+                                    failure_codes=failure_codes,
+                                )
+                            )
+                            if (
+                                standard_preview_allowed
+                                or controlled_primary_center_allowed
                             ):
                                 hard_gate_passed = True
                                 candidate_geometry[
                                     "unverified_geometry_preview_override"
                                 ] = True
+                                if controlled_primary_center_allowed:
+                                    candidate_geometry[
+                                        "controlled_primary_center_preview"
+                                    ] = True
+                                    candidate_geometry.setdefault(
+                                        "risk_codes", []
+                                    ).append(
+                                        "review_only_controlled_primary_center_clip"
+                                    )
                                 candidate_geometry["requires_gemini_review"] = True
                                 candidate_geometry.setdefault("risk_codes", []).append(
                                     "explicit_unverified_geometry_preview"

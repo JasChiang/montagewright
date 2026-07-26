@@ -130,7 +130,9 @@ Clip Card 的 `MM:SS` event 只負責召回可能可用的區間。真正入選�
 
 同一套 geometry 不應假設來源比例固定。Renderer 以 orientation-corrected display dimensions 建立 aspect-preserving cover transform，並在 x／y 兩軸分別求解合法 crop interval；因此 4:3、直式、超寬來源不會被拉伸。FFmpeg 的 sample aspect ratio 也屬於來源幾何：非方形像素須先正規化成 square-pixel display space；在 tracker 尚未與該座標系綁定前，動態 reframe 必須 fail closed 到 SAR-corrected 靜態版本並留下 review risk。track seed dimensions、analysis aspect 或多 track lineage 不一致時也不得重新解釋 normalized bbox。
 
-`primary_center` 表示未列為 required 的次要 context 可以犧牲，不表示 required target 可以被裁掉。required union 比 9:16 視窗寬、tracking coverage 不完整或任一 sample 無法 containment 時，預設換候選或 fail closed。只有人工明示 `controlled_clip` 時才可依 `preserve_start`、`preserve_end` 或 `balanced` 做受控溢位，並保存最小可見比例與 review requirement。文字規則同樣泛化：把必須讀完的語意核心列為 required `text_region`，而不是為特定品牌或語言寫判斷分支。
+`primary_center` 表示未列為 required 的次要 context 可以犧牲，不表示正式輸出可任意裁掉 required target。required union 比 9:16 視窗寬、tracking coverage 不完整或任一 sample 無法 containment 時，預設換候選或 fail closed。人工明示 `controlled_clip` 時可依 `preserve_start`、`preserve_end` 或 `balanced` 做受控溢位，並保存最小可見比例與 review requirement。
+
+研究 review cut 可以在 `--allow-unverified-geometry-preview` 下先產生受控虛擬鏡頭，但資格由泛用語意與量測共同限制：必須是 `primary_center`、SAM tracked crop 無 fallback、hard core 不得包含 atomic／文字／UI／graphic，整段最小可見 required 面積至少 90%，而且 failure 只能是有限 containment 或 identity 待複核。這類輸出固定標成 `review_only_controlled_primary_center_clip`，不能成為 unattended production success。文字規則同樣泛化：把必須讀完的語意核心列為 required `text_region`，而不是為特定品牌或語言寫判斷分支。
 
 在明示禁用背景補邊的 preview 中，若 propagation coverage 失敗但 exact-frame seed 仍有效，可將 required seed union 作為整段靜態 anchor，而不是盲目退回來源中央。此降級固定保存 `seed_anchor_static_hold` 與 `motion_outside_seed_unverified`，不能聲稱追蹤完成；若主體會移動或 required union 本來就過寬，仍應改選 take、調整主次、拆鏡或交由人工決定 layout。
 
@@ -145,6 +147,8 @@ Gemini 不需要每次重看整支成片。成本合理的順序是先跑零 API
 敘事規劃與構圖可行性是兩個不同問題。Planner 現在為每個有證據的 chapter 保存 2–4 個不同 frame 的候選，每個候選都綁定 source asset、event、frame、可見證據、品質風險與雙比例策略。v3 仍由 Gemini 針對 brief 排出 `required`、`preferred`、`sacrificable` entity priorities 與簡短 framing intent，但不讓模型重抄 target descriptions、rank-1 mirrors 或 verbose regions；這些執行資料由 hash-bound Clip Card evidence 確定性投影。Top-K 和 projection contract 會一起 hash-bound；runtime 換到下一候選不會修改或覆蓋原始 plan。
 
 若使用者提供音樂，v3 Top-K planner 會接收實際 audio 與相同 Clip Card evidence，依可聽見的段落、能量、留白與收尾調整候選及相對 dwell；它仍不能輸出自創 beat timestamp。來源音樂 SHA-256 會成為 external projection artifact，renderer 只能搭配同一音樂重用該 plan；沒有音樂的 plan 也不能在之後被冒充成已做 music-aware selection。這只增加一次 planner 的 audio input，不把 K 個候選拆成 K 次付費分析。
+
+若完整 Top-K schema 加上全部 evidence 超過單次穩定輸出容量，降載方案不是刪除 provenance，而是先保留既有 validated Top-K plan，再用一次 `clip-card-feature-music-rerank-v1` actual-audio call 只回答每章的 horizontal／vertical candidate ID、音樂角色與理由。候選集合、frame、entity、framing regions 與 executable evidence 全部從 hash-bound 上游 artifact 確定性投影；模型不能創造新的 geometry 或素材。這讓音樂理解仍由 Gemini 完成，同時把成本與 schema failure 面縮小。
 
 9:16 自動路徑採 lazy geometry evaluation：
 

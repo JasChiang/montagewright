@@ -35,7 +35,9 @@ from jascue_video_lab.feature_cut import (
     _load_trim_decisions,
     _migrate_legacy_feature_plan_binding,
     _piecewise_expression,
+    _prompt_binds_sha256,
     _concat_segments,
+    _controlled_primary_center_preview_allowed,
     _render_source_segment,
     _render_text_layer,
     _requested_render_aspects,
@@ -61,6 +63,7 @@ from jascue_video_lab.feature_cut import (
     run_feature_cut_experiment,
     write_external_feature_plan_projection,
 )
+from jascue_video_lab.auto_reframe import FailureCode
 from jascue_video_lab.cli import build_parser
 
 
@@ -100,6 +103,31 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
         ]
     )
     assert vertical.aspect == "9x16"
+
+
+def test_prompt_sha256_binding_accepts_delimiters_but_not_near_matches() -> None:
+    digest = "a" * 64
+    assert _prompt_binds_sha256(f"music_sha256={digest}", "music_sha256", digest)
+    assert _prompt_binds_sha256(
+        f"music_sha256：{digest}",
+        "music_sha256",
+        digest,
+    )
+    assert _prompt_binds_sha256(
+        f"music_sha256 必須原樣回傳：{digest}",
+        "music_sha256",
+        digest,
+    )
+    assert not _prompt_binds_sha256(
+        f"other_music_sha256={digest}",
+        "music_sha256",
+        digest,
+    )
+    assert not _prompt_binds_sha256(
+        f"music_sha256={'b' * 64}",
+        "music_sha256",
+        digest,
+    )
 
 
 def test_editorial_dwell_reconciles_short_source_without_synthetic_hold() -> None:
@@ -1539,6 +1567,56 @@ def test_soft_extent_visibility_is_measured_without_relaxing_hard_containment() 
     assert accepted["soft_extent_visibility_passed"] is True
     assert rejected["soft_extent_visibility_passed"] is False
     assert rejected["soft_extent_regions"][0]["minimum_visible_area_fraction"] < 0.9
+
+
+def test_controlled_primary_center_preview_is_bounded_and_non_atomic() -> None:
+    subject = FramingRegionIntent(
+        region_id="primary-subject",
+        target_description="the selected visible subject",
+        kind="subject",
+        role="required",
+    )
+    geometry = {
+        "applied_strategy": "tracked_crop",
+        "fallback_reason": None,
+        "minimum_visible_required_area_fraction": 0.94,
+    }
+    failures = [
+        FailureCode.HARD_CORE_NOT_FULLY_RETAINED,
+        FailureCode.IDENTITY_VERIFICATION_PENDING,
+    ]
+
+    assert _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry=geometry,
+        regions=[subject],
+        failure_codes=failures,
+    )
+    assert not _controlled_primary_center_preview_allowed(
+        crop_mode="strict",
+        geometry=geometry,
+        regions=[subject],
+        failure_codes=failures,
+    )
+    assert not _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry={
+            **geometry,
+            "minimum_visible_required_area_fraction": 0.89,
+        },
+        regions=[subject],
+        failure_codes=failures,
+    )
+    assert not _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry=geometry,
+        regions=[
+            subject.model_copy(
+                update={"kind": "text_region", "atomic": True}
+            )
+        ],
+        failure_codes=failures,
+    )
 
 
 def test_ranked_candidate_intent_is_not_overridden_by_generic_brief_target() -> None:
