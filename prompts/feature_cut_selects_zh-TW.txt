@@ -41,6 +41,35 @@
 - 不得為了強行使用 crop 而犧牲任何 required entity 或 required evidence。
 - `vertical_target_description` 必須指定實例、物件層級、可見辨識特徵與排除條件；不可只寫寬泛類別名稱。
 
+### 9:16 虛擬鏡頭 proposal
+
+若同一個 source shot 內有兩個以上依序重要、但不必同時出現在單一
+9:16 crop 的可追蹤實例，可在該 `vertical_candidate` 提出
+`virtual_camera_proposal`。這是待 Grounding／SAM／geometry 驗證的剪輯意圖，
+不是座標或可直接執行的運鏡：
+
+- 先在 `regions` 建立穩定且可重複引用的 region ID，描述可見實例、局部層級、
+  辨識特徵、排除條件，以及 `required`／`preferred`／`avoid_overlay` role；
+  本機會再映射為 hard core／soft extent／overlay keepout。
+- phase 的 `anchor_region_ids` 只能引用同一 candidate 內已存在的 region ID。
+- phase 順序必須由這支素材實際可見的資訊揭露、人物視線、操作流程或動作交接
+  決定。可以是左→右、右→左、人物→結果、全體→細節，或完全不移動；不得把
+  任一方向當成固定模板。
+- `observable_predicate` 說明為什麼此時該看該 anchor；
+  `transition_condition` 說明畫面中出現什麼可見條件才適合交接。
+- `start_progress`／`end_progress` 只表示相對敘事順序，必須從 0 連續覆蓋到 1；
+  不得輸出或暗示 source timestamp。快速或關鍵交接仍需後續 dense frame ID
+  refine 才能改動精確剪點。
+- 能穩定只看一個 anchor 時，使用 `single_anchor_hold` 或
+  `single_anchor_follow`；需要依序交接才用 `sequential_focus`；兩者關係必須
+  同時成立時用 `joint_relation`，各 phase 同時引用必要 anchors。
+- 若固定 crop 已經清楚、移動沒有新增資訊、anchor 不可持續辨識、交接條件只靠
+  推測，或一次 9:16 無法保留必需的 joint relation，請將
+  `virtual_camera_proposal` 留空，改選其他 take、`fit_with_background`、
+  split／PiP 候選或人工 review。
+- 自動 proposal 不得授權裁掉 anchor。本機只會以 100% active-anchor
+  containment 執行；任何 intentional clipping 都必須另有人工 policy。
+
 ## 品質
 
 優先：主體清楚、低動態模糊、低遮擋、構圖乾淨、能代表 chapter、與前後 chapter 不重複。把 2 秒抽樣、相似 take、UI 反光、手部遮擋與功能證據不足寫入 uncertainties／quality_risks。

@@ -26,6 +26,7 @@ from jascue_video_lab.music_cues import (
     SemanticCuePairing,
     SemanticMusicPairingProposal,
     VisualSyncMap,
+    VisualSyncPriority,
     apply_music_first_cue_lock,
     derive_brief_visual_sync_map,
     derive_visual_sync_map,
@@ -196,6 +197,53 @@ def test_visual_sync_map_zero_flex_is_read_only(tmp_path: Path) -> None:
     assert visual.flexibility_authorization == "read_only_boundaries"
     assert all(point.flex_before_ms == 0 for point in visual.points)
     assert [point.project_time_ms for point in visual.points] == [0, 1000, 2200, 3000]
+
+
+def test_visual_sync_map_includes_executed_virtual_camera_handoffs(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "render-manifest.json"
+    _render_manifest(manifest)
+    payload = read_json(manifest)
+    payload["vertical"]["chapters"][1]["phase_virtual_camera_plan"] = {
+        "contract_version": "vertical-virtual-camera-plan-v1",
+        "execution_status": "applied",
+        "phases": [
+            {
+                "phase_id": "first",
+                "start_progress": 0.0,
+                "end_progress": 0.5,
+                "anchor_region_ids": ["first-anchor"],
+                "transition_in": "cut",
+                "editorial_reason": "Establish the first visible subject.",
+            },
+            {
+                "phase_id": "second",
+                "start_progress": 0.5,
+                "end_progress": 1.0,
+                "anchor_region_ids": ["second-anchor"],
+                "transition_in": "smoothstep",
+                "editorial_reason": "Hand off to the visible result.",
+            },
+        ],
+    }
+    write_json(manifest, payload)
+
+    visual = derive_visual_sync_map(
+        manifest,
+        aspect_ratio="9:16",
+        default_flex_ms=300,
+    )
+    transitions = [
+        point for point in visual.points if point.phase == "camera_transition"
+    ]
+
+    assert len(transitions) == 1
+    assert transitions[0].project_time_ms == 1600
+    assert transitions[0].priority == VisualSyncPriority.PREFERRED
+    assert transitions[0].allowed_cue_kinds == ("downbeat", "accent", "beat")
+    assert "second-anchor" in transitions[0].semantic_description
+    assert "phase-origin:legacy_unspecified" in transitions[0].evidence_refs
 
 
 def test_visual_sync_map_projects_human_approved_trim_phases(

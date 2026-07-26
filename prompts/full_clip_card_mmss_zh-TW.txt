@@ -31,6 +31,8 @@
 - `evidence` 與 `observable_evidence` 必須描述實際可見／可聽證據，不得把推論改寫成觀察事實。
 - `grounding_targets` 只列出後續確實可能需要重新構圖、callout、去背或身份確認的指定實例；`target_kind` 必須與引用 Entity 的 kind 完全相同，描述必須包含物件層級、辨識特徵與排除條件。指定物件局部時不可引用整體 Entity；指定整體時也不可擴大到持有人、支架或周邊背景。
 - 複合目標必須拆成多個可獨立驗證的 target，不要要求單一 mask 同時表示數個不同實例。
+- `portrait_attention_sequence` 只記錄你完整觀看這個 event 時，畫面直接支持的注意力順序。若資訊確實從一個可見 Entity 交接到另一個，可依序列出 phase；方向可以左→右、右→左、人物→結果、整體→細節或其他實際順序，不得套用固定方向。兩個 Entity 的關係必須同時理解時使用 `joint_relation` 並在同一 phase 引用兩者；固定構圖已足夠時只列一個 hold phase；沒有可靠順序時回傳空陣列。
+- 每個 attention phase 只能引用本 event 已存在的 Entity ID。`observable_predicate` 與 `transition_condition` 只能描述可直接看見的狀態，不得輸出 MM:SS、frame、bbox、crop 座標、相對秒數或假裝 tracker 已存在。這只是 Clip Card evidence，不是可執行運鏡。
 
 ## 剪輯用途與構圖
 

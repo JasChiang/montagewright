@@ -73,6 +73,7 @@ from .models import (
     TrimIntentDecision,
     VerticalVirtualCameraPhase,
     VerticalVirtualCameraPlan,
+    VerticalVirtualCameraProposal,
     VirtualCameraKeyframe,
     VirtualCameraPlan,
     approve_evidence_query_proposal_v2,
@@ -108,7 +109,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v13-portrait-phase-camera"
+_RENDER_PIPELINE_VERSION = "feature-cut-v14-gemini-phase-proposal"
 RenderAspect = Literal["both", "9x16", "16x9"]
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
@@ -4181,6 +4182,7 @@ def _vertical_virtual_camera_filter_from_tracks(
     *,
     tracks_by_region: Mapping[str, SegmentationTrack],
     phases: Sequence[VerticalVirtualCameraPhase],
+    phase_origin: Literal["human_reviewed", "gemini_proposed"] = "human_reviewed",
     display_sample_aspect_ratio: float = 1.0,
 ) -> tuple[str, dict[str, Any]]:
     """Build a review-only phase-based 9:16 virtual camera.
@@ -4559,8 +4561,8 @@ def _vertical_virtual_camera_filter_from_tracks(
         execution_status="applied",
         fallback_reason=None,
         editorial_reason=(
-            "Apply reviewed phase-specific anchors instead of requiring every "
-            "region to remain simultaneously visible for the whole segment."
+            "Apply geometry-validated phase-specific anchors instead of requiring "
+            "every region to remain simultaneously visible for the whole segment."
         ),
         source_track_fingerprints={
             region_id: _track_geometry_fingerprint(tracks_by_region[region_id])
@@ -4597,7 +4599,11 @@ def _vertical_virtual_camera_filter_from_tracks(
         "applied_strategy": "phase_virtual_camera",
         "fallback_reason": None,
         "risk_codes": [
-            "human_reviewed_phase_virtual_camera",
+            (
+                "human_reviewed_phase_virtual_camera"
+                if phase_origin == "human_reviewed"
+                else "gemini_proposed_geometry_validated_phase_virtual_camera"
+            ),
             "phase_transition_containment_is_time_varying",
             *(
                 ["phase_intentional_anchor_clipping"]
@@ -4635,6 +4641,7 @@ def _vertical_virtual_camera_filter_from_tracks(
             6,
         ),
         "phase_virtual_camera_plan": plan.model_dump(mode="json"),
+        "phase_virtual_camera_origin": phase_origin,
         "crop_coordinate_space": transform,
         "crop_width_normalized": round(crop_width_normalized, 6),
         "crop_height_normalized": round(crop_height_normalized, 6),
@@ -5592,6 +5599,7 @@ def _vertical_candidate_geometry(
     target_description: str | None,
     regions: Sequence[FramingRegionIntent],
     camera_phases: Sequence[VerticalVirtualCameraPhase],
+    camera_phase_origin: Literal["human_reviewed", "gemini_proposed"],
     crop_mode: Literal["strict", "primary_center"],
     overflow_policy: Literal["preserve_all", "controlled_clip"],
     edge_priority: Literal["balanced", "preserve_start", "preserve_end"],
@@ -5665,6 +5673,7 @@ def _vertical_candidate_geometry(
                     _vertical_virtual_camera_filter_from_tracks(
                         tracks_by_region=tracks_by_region,
                         phases=camera_phases,
+                        phase_origin=camera_phase_origin,
                         display_sample_aspect_ratio=display_sample_aspect_ratio,
                     )
                 )
@@ -6064,6 +6073,45 @@ def _vertical_runtime_candidate_options(
             "confidence": selected.confidence,
         }
     ]
+
+
+def _resolve_vertical_camera_phases(
+    *,
+    option_data: Mapping[str, Any],
+    reviewed_phases: Sequence[VerticalVirtualCameraPhase],
+) -> tuple[list[VerticalVirtualCameraPhase], Literal["human_reviewed", "gemini_proposed"]]:
+    """Convert an editorial proposal into fail-closed executable phase inputs.
+
+    Human-reviewed phases take precedence.  Automatic proposals can only request
+    full anchor visibility; they cannot authorize clipping, invent coordinates,
+    or bypass the downstream Grounding/SAM and motion gates.
+    """
+
+    if reviewed_phases:
+        return list(reviewed_phases), "human_reviewed"
+    raw_proposal = option_data.get("virtual_camera_proposal")
+    if raw_proposal is None:
+        return [], "gemini_proposed"
+    proposal = VerticalVirtualCameraProposal.model_validate(raw_proposal)
+    phases = [
+        VerticalVirtualCameraPhase(
+            phase_id=phase.phase_id,
+            start_progress=phase.start_progress,
+            end_progress=phase.end_progress,
+            anchor_region_ids=phase.anchor_region_ids,
+            camera_behavior=phase.camera_behavior,
+            transition_in=phase.transition_in,
+            transition_duration_fraction=phase.transition_duration_fraction,
+            minimum_anchor_visible_fraction=1.0,
+            editorial_reason=(
+                f"{phase.editorial_reason} Visible predicate: "
+                f"{phase.observable_predicate} Transition condition: "
+                f"{phase.transition_condition}"
+            ),
+        )
+        for phase in proposal.phases
+    ]
+    return phases, "gemini_proposed"
 
 
 def _audit_feature_plan_candidate_recall(
@@ -8092,6 +8140,12 @@ def run_feature_cut_experiment(
                             ),
                         )
                     )
+                    candidate_camera_phases, candidate_camera_phase_origin = (
+                        _resolve_vertical_camera_phases(
+                            option_data=option_data,
+                            reviewed_phases=brief_chapter.vertical_camera_phases,
+                        )
+                    )
                     attempt: dict[str, Any] = {
                         "candidate_id": candidate_id,
                         "rank": candidate_rank,
@@ -8104,10 +8158,14 @@ def run_feature_cut_experiment(
                             region.model_dump(mode="json")
                             for region in candidate_regions
                         ],
+                        "virtual_camera_proposal": option_data.get(
+                            "virtual_camera_proposal"
+                        ),
+                        "camera_phase_origin": candidate_camera_phase_origin,
                     }
                     if (
                         option_data["strategy"] == "fit_with_background"
-                        and not brief_chapter.vertical_camera_phases
+                        and not candidate_camera_phases
                     ):
                         attempt.update(
                             {
@@ -8211,7 +8269,8 @@ def run_feature_cut_experiment(
                                 str(candidate_target) if candidate_target else None
                             ),
                             regions=candidate_regions,
-                            camera_phases=brief_chapter.vertical_camera_phases,
+                            camera_phases=candidate_camera_phases,
+                            camera_phase_origin=candidate_camera_phase_origin,
                             crop_mode=candidate_crop_mode,
                             overflow_policy=(
                                 brief_chapter.vertical_overflow_policy

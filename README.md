@@ -66,7 +66,9 @@ Top-K 直式候選
 
 因此「稍微切到背景、衣服邊緣或非必要環境」可以是正確構圖；「切掉臉、指定產品、關鍵操作手、必要 UI／文字」則不能因滿版好看而合理化。Gemini 成片 QA 也會把 geometry safety 與 portrait composition 分開：沒有切到主體只代表安全，不自動代表畫布利用、視覺焦點與 matte fallback 都理想。
 
-同一個橫式鏡頭若有左右兩個不能同時塞進 9:16、但可以依序觀看的重點，可使用人工核准的 `vertical_camera_phases`。每個 phase 只引用已 Grounding、已由 SAM 追蹤的 region ID，並明列起訖進度、`hold`／`follow`、切換方式及最低可見比例；本機再從原始 PTS 算出 crop path。例如先看右側操作結果，再平滑移向左側人物，或先看較小物件再移到較大物件。這不是把「兩個都必須同時看見」改成任意裁切：若兩者的關係必須在同一時刻成立，就應保留 joint relation ROI、換 take、split／PiP 或 solid fit。原子文字與 UI 的最低可見比例固定為 100%；只有真人 policy 可對非原子人物／物件明示較低門檻，而且成片永遠標記為 review-required。
+同一個橫式鏡頭若有兩個以上不能同時塞進 9:16、但可以依序觀看的重點，Gemini 在完整觀看單支 proxy、建立 Clip Card 時，先以 `portrait_attention_sequence` 記錄素材直接支持的動作、視線、結果揭露與資訊交接；選片階段才可依這份證據提出 `virtual_camera_proposal`。方向不是固定的左→中→右：可以是右→左、人物→結果、整體→細節，或判斷完全不應移動。proposal 只保存相對 phase 順序、可見 predicate、交接條件與既有 Entity／region ID，不包含 source timestamp、bbox 或 crop 座標；本機仍須對各 anchor 做 exact-frame Grounding、SAM 追蹤、100% active-anchor containment 與速度／加速度／jerk gate，通過後才會產生可執行 `VerticalVirtualCameraPlan`。若幾何失敗就改試下一個 take 或安全 fallback，不會硬做模型要求的移動。
+
+這也不是把「兩個都必須同時看見」改成任意裁切：兩者關係必須同時成立時，proposal 必須使用 `joint_relation`，否則應換 take、split／PiP 或 solid fit。自動 proposal 永遠不能授權裁掉 active anchor；只有具 provenance 的真人 `vertical_camera_phases` policy 可對非原子人物／物件明示較低可見門檻。兩條路徑的成片都標記為 review-required，artifact 也會分清 `gemini_proposed` 與 `human_reviewed`，避免把人工測試方向冒充成模型判斷。
 
 研究用的 `--allow-unverified-geometry-preview` 另有一條明確標記為 review-only 的受控虛擬鏡頭路徑：只有上游選擇 `primary_center`、SAM 已產生無 fallback 的 tracked crop、hard core 不含 atomic／文字／UI／graphic，且整段最小可見 required 面積至少 90% 時，才可輸出略裁主體邊緣的滿版預覽。artifact 會固定保存 `review_only_controlled_primary_center_clip`、可見比例與 `requires_gemini_review`；這不是 production success，也不會改變正式 unattended delivery 的 100% containment 規則。
 
@@ -88,6 +90,7 @@ Top-K 直式候選
 | SAM 2.1（選配） | 以人工或 Gemini bbox 作為 seed，在同一個 shot 內產生 mask 並向前、向後追蹤 | 不理解剪輯 brief，也不應跨切鏡自行延續物件身分 |
 | Identity checkpoint | 在固定預算內挑出追蹤起點／終點、遮擋後重現或幾何異常的 exact frames，再驗證是否仍為鎖定實例 | 不修改 SAM geometry，也不能用未執行的檢查冒充通過 |
 | 本機 crop solver | 根據整段 tracking、required regions 與畫面邊界計算 9:16 安全裁切路徑 | 不自行決定哪個人物或物件最重要 |
+| Gemini VirtualCamera Proposal＋本機 VerticalVirtualCameraPlan | Gemini 依可見資訊順序提出固定、跟隨、依序交接或 joint relation；本機把 Entity 映射成 region，經 Grounding、SAM、containment 與運動 gate 後才投影成 9:16 crop path | 不使用固定左中右模板、不讓 Gemini 直接輸出像素／時間，也不以運鏡掩蓋髒畫面 |
 | VirtualCameraPlan | 將已核准的 `hold`、`follow`、`punch_in_cut`、`push_in`、`pull_out`、`recenter` 等意圖投影成有 containment、速度、加速度、jerk 與來源解析度紀錄的 16:9 運鏡；每段另存 sidecar | 不用運鏡掩蓋髒畫面、不憑單一 target 自動執行雙 anchor `pan_reveal` |
 | 本機 MusicMap analyzer | 將音訊解碼成 PCM，提出 beat、accent、energy、section 與 ending-hit 候選 | 不理解歌詞、音樂情緒或剪輯 brief；BPM、第一個 downbeat 與 meter 未經真人核准不可執行 |
 | Gemini brief＋music selection planning | 使用者有給音樂時，選片 call 必須實際聽音樂並閱讀 brief，提出素材、順序、相對停留與理由 | 不直接產生精確音樂 sample、cut PTS，也不能因總長要求重複或 freeze 片段 |
@@ -514,7 +517,7 @@ editorial brief（尚未選片）
   → Gemini 才從 catalog 選擇符合內容、動作與節奏的素材
 
 完成 feature-cut 後的 render manifest
-  → VisualSyncMap：目前 cut／chapter start／ending pose
+  → VisualSyncMap：cut／chapter start／ending pose／已執行的虛擬鏡頭交接
   → 可另外加入經證據確認的 reveal／action apex／UI change
   → 選配：Gemini 聽音樂並把既有 visual ID 配對既有 cue ID
   → 全局、順序保持的 CuePlan scheduler
@@ -526,7 +529,7 @@ editorial brief（尚未選片）
 
 有指定音樂時，Gemini 的主要選片規劃請求不再是選配：它必須實際取得音樂、brief 與 catalog，否則不得宣稱做了 music-aware edit。若要進一步減少規則式卡點的機械感，才選配第二次 `gemini-3.6-flash` 音樂語意配對。第二次 call 會取得已核准的 MusicMap cue IDs 與 Clip Card／render manifest 衍生的 visual event 語意，只回答「哪個 visual event 適合哪些既有 cue IDs」，不能自己發明秒數。程式只傳送至少落在一個 visual event 合法 timing window 內的 cue，避免把數百個永遠不可能採用的拍點塞入 prompt。音樂以 SHA-256 cache，不會對每個鏡頭重送；最終 sample-accurate 位置、合法 timing window、全局順序與 hard gate 仍由本機決定。
 
-Music-aware delivery 預設保留一段連續音樂區間，優先選擇 phrase-aligned start 與自然 ending；`join_count` 必須為零，`internal_music_edits` 必須為空。畫面邊界可在合法 source capacity 內小幅對齊 MusicMap 的 section／downbeat／accent，但不能為卡拍截斷 setup／action／result，也不能把音樂切碎後交疊拼接。成片完成後，canonical 16:9 會以一次有聲 Structured Output QA 檢查 brief delivery、停留、重複、轉場與 music flow；9:16 另用靜音 proxy 做 crop-only QA，避免把音樂好聽誤判成構圖正確。
+Music-aware delivery 預設保留一段連續音樂區間，優先選擇 phrase-aligned start 與自然 ending；`join_count` 必須為零，`internal_music_edits` 必須為空。畫面章節邊界以及 geometry 已驗證的虛擬鏡頭交接，可在合法窗口內配對 MusicMap 的 section／downbeat／accent；它們是可排序的 VisualSync 候選，不是「每拍都移動」的命令，也不能為卡拍截斷 setup／action／result，或把音樂切碎後交疊拼接。成片完成後，canonical 16:9 會以一次有聲 Structured Output QA 檢查 brief delivery、停留、重複、轉場與 music flow；9:16 另用靜音 proxy 做 crop-only QA，避免把音樂好聽誤判成構圖正確。Gemini QA 只提出 observation／revision suggestion，不會自動覆蓋本機 gate 或直接重剪。
 
 ```bash
 # 1. 本機分析音樂；輸出 proposal，不會自動核准

@@ -16,6 +16,7 @@ from jascue_video_lab.models import (
     FeatureChapterBrief,
     FeatureEditBrief,
     FullClipCard,
+    FullClipAttentionPhase,
     FullClipEvent,
     FullClipGroundingTarget,
     ModelProvenance,
@@ -34,6 +35,8 @@ from jascue_video_lab.storage import write_json
 from scripts.plan_clip_card_feature_cut import (
     ClipCardFeatureCandidate,
     ClipCardFeatureCandidateV3,
+    ClipCardVirtualCameraPhaseV1,
+    ClipCardVirtualCameraProposalV1,
     ClipCardFeaturePlan,
     ClipCardFeaturePlanV2,
     ClipCardFeaturePlanV3,
@@ -1004,6 +1007,35 @@ def test_v3_compact_card_omits_redundant_relation_expansion() -> None:
     assert event["grounding_target_entity_ids"] == ["subject-1"]
 
 
+def test_v3_compact_card_preserves_video_observed_attention_order() -> None:
+    card = _card()
+    card.events[0].portrait_attention_sequence = [
+        FullClipAttentionPhase(
+            phase_id="context-first",
+            anchor_entity_ids=["sign-1"],
+            relation_mode="single_focus",
+            suggested_camera_behavior="hold",
+            observable_predicate="The sign is directly visible before the action.",
+            transition_condition="The subject begins the directly visible action.",
+        ),
+        FullClipAttentionPhase(
+            phase_id="action-second",
+            anchor_entity_ids=["subject-1"],
+            relation_mode="single_focus",
+            suggested_camera_behavior="follow",
+            observable_predicate="The subject performs the visible action.",
+            transition_condition="The visible result is complete.",
+        ),
+    ]
+
+    event = compact_card_v3(card)["events"][0]
+
+    assert [
+        phase["anchor_entity_ids"]
+        for phase in event["portrait_attention_sequence"]
+    ] == [["sign-1"], ["subject-1"]]
+
+
 def test_v3_projects_local_descriptions_and_regions_from_selected_evidence() -> None:
     plan = _v3_plan()
     cards = {ASSET_ID: _card()}
@@ -1046,6 +1078,65 @@ def test_v3_projects_local_descriptions_and_regions_from_selected_evidence() -> 
         relation.startswith("editorial_framing_intent=")
         for relation in tracked.regions[0].observable_relations
     )
+
+
+def test_v3_projects_entity_order_into_virtual_camera_region_order() -> None:
+    payload = _v3_plan().model_dump(mode="python")
+    chapter = payload["chapters"][0]
+    chapter["vertical_candidate_id"] = "candidate-a"
+    chapter["candidates"][0]["virtual_camera_proposal"] = (
+        ClipCardVirtualCameraProposalV1(
+            composition_mode="sequential_focus",
+            phases=[
+                ClipCardVirtualCameraPhaseV1(
+                    phase_id="sign-first",
+                    start_progress=0.0,
+                    end_progress=0.45,
+                    anchor_entity_ids=["sign-1"],
+                    camera_behavior="hold",
+                    observable_predicate="The sign is directly visible first.",
+                    transition_condition="The subject begins the visible action.",
+                    editorial_reason="Establish context before following the action.",
+                ),
+                ClipCardVirtualCameraPhaseV1(
+                    phase_id="subject-second",
+                    start_progress=0.45,
+                    end_progress=1.0,
+                    anchor_entity_ids=["subject-1"],
+                    camera_behavior="follow",
+                    transition_in="smoothstep",
+                    transition_duration_fraction=0.25,
+                    observable_predicate="The subject performs the visible action.",
+                    transition_condition="Hold until the visible result is complete.",
+                    editorial_reason="Follow the evidence order, not screen direction.",
+                ),
+            ],
+            proposal_reason="Visible information hands off from context to action.",
+        ).model_dump(mode="python")
+    )
+    plan = ClipCardFeaturePlanV3.model_validate(payload)
+    cards = {ASSET_ID: _card()}
+    validate_plan_contract_v3(
+        plan,
+        brief=_brief(),
+        catalog=_catalog(),
+        cards=cards,
+    )
+    evidence = build_selected_clip_card_evidence(plan, cards=cards)
+    projected = project_feature_contracts_v3(
+        plan,
+        brief=_brief(),
+        catalog=_catalog(),
+        selected_evidence=evidence,
+    )
+
+    proposal = projected.chapters[0].vertical_candidates[0].virtual_camera_proposal
+    assert proposal is not None
+    assert [phase.anchor_region_ids for phase in proposal.phases] == [
+        ["candidate-a.preferred.sign-1"],
+        ["candidate-a.required.subject-1"],
+    ]
+    assert proposal.phases[0].observable_predicate.startswith("The sign")
 
 
 def test_v3_projection_is_reproducible_from_hash_bound_evidence(

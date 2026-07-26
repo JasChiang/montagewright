@@ -43,6 +43,7 @@ from jascue_video_lab.feature_cut import (
     _requested_render_aspects,
     _required_track_union,
     _resolve_editorial_chapter_durations,
+    _resolve_vertical_camera_phases,
     _resolve_vertical_candidate_intent,
     _segment_variant_fingerprint,
     _soft_extent_visibility_audit,
@@ -941,6 +942,8 @@ from jascue_video_lab.models import (
     SharedSam21SessionTarget,
     SharedSam21SessionTiming,
     TrackingState,
+    VerticalVirtualCameraProposal,
+    VerticalVirtualCameraProposalPhase,
 )
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.sam_tracking import (
@@ -1703,6 +1706,112 @@ def test_runtime_candidates_preserve_rank_but_human_binding_disables_switching()
     assert reviewed[0]["candidate_id"] == "legacy-primary"
     assert reviewed[0]["frame_id"] == "RF000001"
     assert reviewed[0]["target_description"] is None
+
+
+def test_gemini_virtual_camera_proposal_preserves_observed_anchor_order() -> None:
+    regions = [
+        FramingRegionIntent(
+            region_id="result",
+            target_description="the visible result area on the right",
+        ),
+        FramingRegionIntent(
+            region_id="performer",
+            target_description="the visible performer on the left",
+        ),
+    ]
+    proposal = VerticalVirtualCameraProposal(
+        composition_mode="sequential_focus",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="result-first",
+                start_progress=0.0,
+                end_progress=0.4,
+                anchor_region_ids=["result"],
+                camera_behavior="hold",
+                observable_predicate="The result is already fully visible.",
+                transition_condition="The performer begins the next visible action.",
+                editorial_reason="Let the viewer identify the result before the hand-off.",
+            ),
+            VerticalVirtualCameraProposalPhase(
+                phase_id="performer-second",
+                start_progress=0.4,
+                end_progress=1.0,
+                anchor_region_ids=["performer"],
+                camera_behavior="follow",
+                transition_in="smoothstep",
+                transition_duration_fraction=0.25,
+                observable_predicate="The performer carries the next visible action.",
+                transition_condition="Hold through the end of that visible action.",
+                editorial_reason="Follow the action rather than a fixed screen direction.",
+            ),
+        ],
+        proposal_reason="Visible information passes from the result to the performer.",
+    )
+    candidate = FeatureVerticalCandidate(
+        candidate_id="generic-take",
+        rank=1,
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="event-generic",
+        frame_id="RF000001",
+        observed_visual_evidence="A result and performer are visible in one shot.",
+        selection_reason="The visible hand-off supports a sequential portrait crop.",
+        strategy="tracked_crop",
+        regions=regions,
+        virtual_camera_proposal=proposal,
+        confidence=0.8,
+    )
+
+    phases, origin = _resolve_vertical_camera_phases(
+        option_data=candidate.model_dump(mode="python"),
+        reviewed_phases=[],
+    )
+
+    assert origin == "gemini_proposed"
+    assert [phase.anchor_region_ids for phase in phases] == [
+        ["result"],
+        ["performer"],
+    ]
+    assert all(phase.minimum_anchor_visible_fraction == 1.0 for phase in phases)
+    assert "Visible predicate" in phases[0].editorial_reason
+
+
+def test_virtual_camera_proposal_cannot_reference_untracked_or_fit_regions() -> None:
+    proposal = VerticalVirtualCameraProposal(
+        composition_mode="single_anchor_hold",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="only",
+                start_progress=0.0,
+                end_progress=1.0,
+                anchor_region_ids=["missing"],
+                observable_predicate="The visible subject remains the focus.",
+                transition_condition="No hand-off is required.",
+                editorial_reason="Keep a stable composition.",
+            )
+        ],
+        proposal_reason="One stable visible subject.",
+    )
+    base = {
+        "candidate_id": "generic-take",
+        "rank": 1,
+        "source_asset_id": "sha256:" + "a" * 64,
+        "event_id": "event-generic",
+        "frame_id": "RF000001",
+        "observed_visual_evidence": "One visible subject.",
+        "selection_reason": "Stable composition.",
+        "regions": [
+            FramingRegionIntent(
+                region_id="visible",
+                target_description="the directly visible subject",
+            )
+        ],
+        "virtual_camera_proposal": proposal,
+        "confidence": 0.8,
+    }
+    with pytest.raises(ValidationError, match="references unknown regions"):
+        FeatureVerticalCandidate(strategy="tracked_crop", **base)
+    with pytest.raises(ValidationError, match="tracked_crop"):
+        FeatureVerticalCandidate(strategy="fit_with_background", **base)
 
 
 def test_canonical_feature_plan_rejects_topk_aliases_of_same_evidence() -> None:

@@ -128,7 +128,9 @@ Clip Card 的 `MM:SS` event 只負責召回可能可用的區間。真正入選�
 
 9:16 的 crop 決策必須可回放與診斷。除 target、Grounding、SAM track 與 fallback 外，renderer 需保存每個 crop keyframe 的片段相對時間、required-region union、合法 crop interval、containment、可見比例及實際 `crop_x_pixels`。裁切路徑先平滑，再逐 sample 投影回可行區間，不能讓平滑延遲把主體推出畫面。多個必留人物／物件／文字／UI 應分成獨立 required regions，各自取得 bbox 並共用一個 SAM session，不能期待一個複合自然語言 target 產生可靠聯合 mask。
 
-當不同重點不必同時出現時，`vertical_camera_phases` 可在不重做 identity Grounding 的前提下，依序啟用不同的已追蹤 anchor。這份 phase contract 必須來自 content-addressed 人工 reframe policy；模型只能提出建議，不能直接取得執行權。每個 phase 保存 normalized edit progress、anchor IDs、hold／follow、cut／smoothstep、transition span、最低可見比例與 editorial reason。本機以 track sample 的原始 PTS 產生 crop keyframes，量測 steady visibility、transition 中至少一側 anchor 的可見率、速度、加速度、jerk，以及少量短 gap 的插值比例。超過 15% active anchor samples 需要插值、steady visibility 低於核准 floor、或 UI／文字要求低於 100% 時一律 fail closed。Phase camera 也不能把本來必須同時比較的關係拆成誤導性的先後畫面；那類內容應以 joint relation ROI、其他 take 或 layout 解決。
+當不同重點不必同時出現時，Gemini 可在 Clip Card／catalog evidence 中提出 `VerticalVirtualCameraProposal`，依畫面真正的動作、視線、結果揭露或資訊交接決定 anchor 順序。這不是固定左→右規則：右→左、人物→結果、整體→細節或完全不移動都可能成立。proposal 只保存 normalized edit progress、Entity／region IDs、可見 predicate、交接條件、hold／follow 與 cut／smoothstep；它不包含 source timestamp、bbox 或 crop path。
+
+本機先把 Entity 投影成 domain-neutral region，再逐一完成 exact-frame Grounding 與共享 SAM session。自動 proposal 一律要求 active anchor 100% 可見，並量測 steady containment、transition 中至少一側 anchor 的可見率、速度、加速度、jerk，以及少量短 gap 的插值比例；全部通過後才產生 review-required 的 `VerticalVirtualCameraPlan`。超過 15% active anchor samples 需要插值、steady visibility 低於 floor、或 UI／文字未達 100% 時一律 fail closed。只有 content-addressed 人工 reframe policy 能明示非原子物件的 intentional clipping。Phase camera 也不能把本來必須同時比較的關係拆成誤導性的先後畫面；那類內容應以 `joint_relation` ROI、其他 take 或 layout 解決。
 
 同一套 geometry 不應假設來源比例固定。Renderer 以 orientation-corrected display dimensions 建立 aspect-preserving cover transform，並在 x／y 兩軸分別求解合法 crop interval；因此 4:3、直式、超寬來源不會被拉伸。FFmpeg 的 sample aspect ratio 也屬於來源幾何：非方形像素須先正規化成 square-pixel display space；在 tracker 尚未與該座標系綁定前，動態 reframe 必須 fail closed 到 SAR-corrected 靜態版本並留下 review risk。track seed dimensions、analysis aspect 或多 track lineage 不一致時也不得重新解釋 normalized bbox。
 
@@ -190,7 +192,7 @@ Typed recovery 目前同時扮演執行與診斷契約：executor 已會嘗試�
 
 ## 音樂與畫面如何卡點
 
-音樂卡點不是把每個 cut 吸到最近 beat。系統先以本機 PCM 分析建立 MusicMap Proposal，真人核准 BPM、first downbeat 與 meter 後才產生 sample-indexed MusicMap Lock。畫面端另外以 VisualSyncMap 表示 cut、reveal、action apex、UI change、hold 與 ending pose；每個 visual point 必須有來源證據及允許移動的 timing window。
+音樂卡點不是把每個 cut 吸到最近 beat。系統先以本機 PCM 分析建立 MusicMap Proposal，真人核准 BPM、first downbeat 與 meter 後才產生 sample-indexed MusicMap Lock。畫面端另外以 VisualSyncMap 表示 cut、reveal、action apex、UI change、hold、ending pose，以及 geometry 已驗證的虛擬鏡頭交接；每個 visual point 必須有來源證據及允許移動的 timing window。虛擬鏡頭交接只是可配對 accent／downbeat 的候選，不是逐拍移動命令。
 
 零成本 baseline 使用 `narrative`／`balanced`／`montage` 權重，由全局、順序保持的 scheduler 一起安排整段，不逐鏡 greedy snap。選配路徑可讓 Gemini 聽一次音樂，並閱讀 Clip Card／render manifest 衍生的視覺事件語意；模型只能把既有 `visual_event_id` 配對既有 `cue_id`，不能重新偵測時間或輸出秒數。Gemini 的配對只是 local scheduler 的排序加分，不能越過 timing window、改寫 Identity、截斷 Trim Intent、跨 shot 延伸或覆蓋 geometry gate。
 

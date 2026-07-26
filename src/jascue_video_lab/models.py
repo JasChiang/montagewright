@@ -1115,6 +1115,27 @@ class FullClipGroundingTarget(StrictModel):
     purpose: Literal["reframe", "callout", "isolation", "identity_check"]
 
 
+class FullClipAttentionPhase(StrictModel):
+    """Ordered visible attention evidence recorded while Gemini watches a clip."""
+
+    phase_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    anchor_entity_ids: list[str] = Field(min_length=1, max_length=4)
+    relation_mode: Literal["single_focus", "joint_relation"]
+    suggested_camera_behavior: Literal["hold", "follow"]
+    observable_predicate: str = Field(min_length=1, max_length=800)
+    transition_condition: str = Field(min_length=1, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_attention_phase(self) -> "FullClipAttentionPhase":
+        if len(self.anchor_entity_ids) != len(set(self.anchor_entity_ids)):
+            raise ValueError("attention phase entity IDs must be unique")
+        if self.relation_mode == "single_focus" and len(self.anchor_entity_ids) != 1:
+            raise ValueError("single-focus attention phase requires one entity")
+        if self.relation_mode == "joint_relation" and len(self.anchor_entity_ids) < 2:
+            raise ValueError("joint-relation attention phase requires two entities")
+        return self
+
+
 class FullClipEvent(StrictModel):
     """Gemini semantic event with second-level MM:SS anchors, never model milliseconds."""
 
@@ -1153,6 +1174,14 @@ class FullClipEvent(StrictModel):
     dense_refinement: Literal["required", "recommended", "not_needed"]
     dense_refinement_reasons: list[str]
     grounding_targets: list[FullClipGroundingTarget]
+    portrait_attention_sequence: list[FullClipAttentionPhase] = Field(
+        default_factory=list,
+        max_length=8,
+        description=(
+            "Ordered visible attention evidence only; no timestamps, crop "
+            "coordinates, or authorization to execute a virtual camera."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_mmss_interval(self) -> "FullClipEvent":
@@ -1231,6 +1260,11 @@ class FullClipCard(StrictModel):
                 + event.optional_entity_ids
                 + event.avoid_overlay_entity_ids
                 + [target.entity_id for target in event.grounding_targets]
+                + [
+                    entity_id
+                    for phase in event.portrait_attention_sequence
+                    for entity_id in phase.anchor_entity_ids
+                ]
             )
             unknown = sorted(set(references) - known_entities)
             if unknown:
@@ -1894,6 +1928,110 @@ class VerticalVirtualCameraPhase(StrictModel):
             self.transition_duration_fraction <= 0
         ):
             raise ValueError("smoothstep transition requires a positive duration")
+        return self
+
+
+class VerticalVirtualCameraProposalPhase(StrictModel):
+    """Gemini-authored editorial phase before geometry is allowed to execute.
+
+    Progress values describe relative editorial order only.  They are not source
+    timestamps, frame boundaries, crop coordinates, or proof that the requested
+    anchors can coexist inside a portrait crop.
+    """
+
+    phase_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    start_progress: float = Field(ge=0.0, le=1.0)
+    end_progress: float = Field(gt=0.0, le=1.0)
+    anchor_region_ids: list[str] = Field(min_length=1, max_length=4)
+    camera_behavior: Literal["hold", "follow"] = "follow"
+    transition_in: Literal["cut", "smoothstep"] = "cut"
+    transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
+    observable_predicate: str = Field(
+        min_length=1,
+        max_length=800,
+        description=(
+            "Visible condition that makes this anchor relevant; do not use brand "
+            "knowledge, an invented timestamp, or an inferred off-screen state."
+        ),
+    )
+    transition_condition: str = Field(
+        min_length=1,
+        max_length=800,
+        description=(
+            "Visible editorial hand-off condition.  A later dense-frame pass may "
+            "refine it to immutable frame IDs before any source trim changes."
+        ),
+    )
+    editorial_reason: str = Field(min_length=1, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_proposal_phase(self) -> "VerticalVirtualCameraProposalPhase":
+        if self.end_progress <= self.start_progress:
+            raise ValueError("vertical camera proposal phase must have positive duration")
+        if len(self.anchor_region_ids) != len(set(self.anchor_region_ids)):
+            raise ValueError("vertical camera proposal anchor IDs must be unique")
+        if self.transition_in == "cut" and self.transition_duration_fraction != 0:
+            raise ValueError("cut transition cannot have a transition duration")
+        if self.transition_in == "smoothstep" and (
+            self.transition_duration_fraction <= 0
+        ):
+            raise ValueError("smoothstep transition requires a positive duration")
+        return self
+
+
+class VerticalVirtualCameraProposal(StrictModel):
+    """Evidence-only Gemini proposal; local geometry remains authoritative."""
+
+    contract_version: Literal["vertical-virtual-camera-proposal-v1"] = (
+        "vertical-virtual-camera-proposal-v1"
+    )
+    composition_mode: Literal[
+        "single_anchor_hold",
+        "single_anchor_follow",
+        "sequential_focus",
+        "joint_relation",
+    ]
+    phases: list[VerticalVirtualCameraProposalPhase] = Field(
+        min_length=1,
+        max_length=8,
+    )
+    proposal_reason: str = Field(min_length=1, max_length=1200)
+    uncertainties: list[str] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_proposal(self) -> "VerticalVirtualCameraProposal":
+        phase_ids = [phase.phase_id for phase in self.phases]
+        if len(phase_ids) != len(set(phase_ids)):
+            raise ValueError("vertical camera proposal phase IDs must be unique")
+        if abs(self.phases[0].start_progress) > 1e-6:
+            raise ValueError("vertical camera proposal must start at progress zero")
+        if abs(self.phases[-1].end_progress - 1.0) > 1e-6:
+            raise ValueError("vertical camera proposal must end at progress one")
+        for prior, current in zip(self.phases[:-1], self.phases[1:], strict=True):
+            if abs(prior.end_progress - current.start_progress) > 1e-6:
+                raise ValueError(
+                    "vertical camera proposal phases must be contiguous"
+                )
+        if self.phases[0].transition_in != "cut":
+            raise ValueError(
+                "the first vertical camera proposal phase must use a cut"
+            )
+        unique_anchor_ids = {
+            region_id
+            for phase in self.phases
+            for region_id in phase.anchor_region_ids
+        }
+        if self.composition_mode == "sequential_focus" and (
+            len(self.phases) < 2 or len(unique_anchor_ids) < 2
+        ):
+            raise ValueError(
+                "sequential focus requires at least two phases and two anchors"
+            )
+        if self.composition_mode in {
+            "single_anchor_hold",
+            "single_anchor_follow",
+        } and len(unique_anchor_ids) != 1:
+            raise ValueError("single-anchor modes must reference exactly one anchor")
         return self
 
 
@@ -3382,6 +3520,7 @@ class FeatureVerticalCandidate(StrictModel):
     crop_mode: Literal["strict", "primary_center"] = "strict"
     target_description: str | None = None
     regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=8)
+    virtual_camera_proposal: VerticalVirtualCameraProposal | None = None
     quality_risks: list[str] = Field(default_factory=list)
     confidence: Confidence
 
@@ -3402,6 +3541,49 @@ class FeatureVerticalCandidate(StrictModel):
         entity_ids = [region.entity_id for region in self.regions if region.entity_id]
         if len(entity_ids) != len(set(entity_ids)):
             raise ValueError("candidate entity references must be unique")
+        if self.virtual_camera_proposal is not None:
+            if self.strategy != "tracked_crop":
+                raise ValueError(
+                    "vertical camera proposal requires tracked_crop geometry"
+                )
+            if not self.regions:
+                raise ValueError(
+                    "vertical camera proposal requires explicit framing regions"
+                )
+            known_region_ids = set(ids)
+            referenced_region_ids = {
+                region_id
+                for phase in self.virtual_camera_proposal.phases
+                for region_id in phase.anchor_region_ids
+            }
+            unknown = sorted(referenced_region_ids - known_region_ids)
+            if unknown:
+                raise ValueError(
+                    "vertical camera proposal references unknown regions: "
+                    + ", ".join(unknown)
+                )
+            keepout_ids = {
+                region.region_id
+                for region in self.regions
+                if region.execution_role == "overlay_keepout"
+            }
+            invalid_keepouts = sorted(referenced_region_ids & keepout_ids)
+            if invalid_keepouts:
+                raise ValueError(
+                    "overlay keepout regions cannot be virtual-camera anchors: "
+                    + ", ".join(invalid_keepouts)
+                )
+            required_ids = {
+                region.region_id
+                for region in self.regions
+                if region.execution_role == "hard_core"
+            }
+            missing_required = sorted(required_ids - referenced_region_ids)
+            if missing_required:
+                raise ValueError(
+                    "every hard-core region must appear in the virtual-camera "
+                    "proposal: " + ", ".join(missing_required)
+                )
         return self
 
 

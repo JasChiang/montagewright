@@ -48,6 +48,7 @@ class VisualSyncPoint(FrozenStrictModel):
         "ui_change",
         "text",
         "punch_in",
+        "camera_transition",
         "hold_start",
         "setup_start",
         "action_start",
@@ -654,6 +655,66 @@ def derive_visual_sync_map(
                 default_flex_ms=default_flex_ms,
             )
         )
+        phase_plan = chapter.get("phase_virtual_camera_plan")
+        if (
+            isinstance(phase_plan, dict)
+            and phase_plan.get("execution_status") == "applied"
+            and isinstance(phase_plan.get("phases"), list)
+        ):
+            for phase_index, phase in enumerate(phase_plan["phases"]):
+                if phase_index == 0 or not isinstance(phase, dict):
+                    continue
+                start_progress = float(phase.get("start_progress", -1))
+                if not 0.0 < start_progress < 1.0:
+                    continue
+                project_time_ms = elapsed + round(duration * start_progress)
+                transition_kind = str(phase.get("transition_in") or "cut")
+                anchor_ids = [
+                    str(value)
+                    for value in phase.get("anchor_region_ids", [])
+                    if str(value).strip()
+                ]
+                phase_origin = str(
+                    chapter.get("phase_virtual_camera_origin")
+                    or "legacy_unspecified"
+                )
+                points.append(
+                    VisualSyncPoint(
+                        visual_event_id=f"vs-{len(points) + 1:04d}",
+                        feature_id=str(chapter.get("feature_id") or "") or None,
+                        phase="camera_transition",
+                        sync_mode="soft",
+                        project_time_ms=project_time_ms,
+                        flex_before_ms=default_flex_ms,
+                        flex_after_ms=default_flex_ms,
+                        priority=VisualSyncPriority.PREFERRED,
+                        allowed_cue_kinds=("downbeat", "accent", "beat"),
+                        evidence_refs=(
+                            "phase-virtual-camera-plan:"
+                            + hashlib.sha256(
+                                json.dumps(
+                                    phase_plan,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                            f"phase-origin:{phase_origin}",
+                        ),
+                        semantic_description=(
+                            f"Geometry-validated {transition_kind} hand-off to "
+                            + (", ".join(anchor_ids) if anchor_ids else "the next anchor")
+                            + ". "
+                            + str(phase.get("editorial_reason") or "")
+                        ).strip(),
+                        editorial_note=(
+                            "An executed virtual-camera phase boundary is an "
+                            "eligible musical accent, not a command to retime the "
+                            "source or cut an incomplete action. Proposal origin: "
+                            f"{phase_origin}."
+                        ),
+                    )
+                )
         elapsed += duration
         if index < len(chapters):
             next_chapter = chapters[index]
