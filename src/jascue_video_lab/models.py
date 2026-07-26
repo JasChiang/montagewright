@@ -3609,11 +3609,10 @@ class SelectedVerticalFramingProposal(StrictModel):
         if self.recommended_action == "tracked_crop" and not self.regions:
             raise ValueError("tracked-crop framing requires explicit regions")
         if self.recommended_action != "tracked_crop":
-            if self.virtual_camera_proposal is not None:
-                raise ValueError(
-                    "fit/layout or alternate-candidate decisions cannot execute "
-                    "a virtual-camera proposal"
-                )
+            # Some Structured Output responses redundantly include a camera
+            # idea even after choosing fit/layout or another candidate.  The
+            # action is authoritative: consumers preserve that surplus field
+            # as evidence but must never execute it.
             return self
         if self.virtual_camera_proposal is None:
             raise ValueError(

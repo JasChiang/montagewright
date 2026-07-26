@@ -120,6 +120,137 @@ def _canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def canonicalize_selected_vertical_framing_output(
+    output_text: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Repair executable camera representation without changing editorial choice."""
+
+    payload = json.loads(output_text)
+    changes: list[dict[str, Any]] = []
+    proposal = payload.get("virtual_camera_proposal")
+    action = payload.get("recommended_action")
+    if action != "tracked_crop" and proposal is not None:
+        payload["virtual_camera_proposal"] = None
+        changes.append(
+            {
+                "field": "virtual_camera_proposal",
+                "reason": "non_executable_surplus_removed_for_non_tracked_action",
+            }
+        )
+    elif isinstance(proposal, dict):
+        phases = proposal.get("phases")
+        if isinstance(phases, list) and phases:
+            for index, phase in enumerate(phases):
+                if (
+                    phase.get("transition_in") == "cut"
+                    and phase.get("transition_duration_fraction", 0) != 0
+                ):
+                    changes.append(
+                        {
+                            "field": (
+                                "virtual_camera_proposal.phases"
+                                f"[{index}].transition_duration_fraction"
+                            ),
+                            "from": phase.get("transition_duration_fraction"),
+                            "to": 0.0,
+                            "reason": "cut_transition_has_zero_duration",
+                        }
+                    )
+                    phase["transition_duration_fraction"] = 0.0
+                if (
+                    phase.get("transition_in") == "smoothstep"
+                    and phase.get("transition_duration_fraction", 0) <= 0
+                ):
+                    changes.append(
+                        {
+                            "field": (
+                                "virtual_camera_proposal.phases"
+                                f"[{index}].transition_duration_fraction"
+                            ),
+                            "from": phase.get("transition_duration_fraction"),
+                            "to": 0.2,
+                            "reason": "smoothstep_transition_requires_positive_duration",
+                        }
+                    )
+                    phase["transition_duration_fraction"] = 0.2
+                if index > 0 and phase.get("start_progress") != phases[
+                    index - 1
+                ].get("end_progress"):
+                    changes.append(
+                        {
+                            "field": (
+                                "virtual_camera_proposal.phases"
+                                f"[{index}].start_progress"
+                            ),
+                            "from": phase.get("start_progress"),
+                            "to": phases[index - 1].get("end_progress"),
+                            "reason": "camera_phases_must_be_contiguous",
+                        }
+                    )
+                    phase["start_progress"] = phases[index - 1].get(
+                        "end_progress"
+                    )
+            if proposal.get("composition_mode") in {
+                "single_anchor_hold",
+                "single_anchor_follow",
+            }:
+                hard_region_ids = [
+                    region.get("region_id")
+                    for region in payload.get("regions", [])
+                    if isinstance(region, dict) and region.get("role") == "required"
+                ]
+                if len(hard_region_ids) == 1:
+                    for index, phase in enumerate(phases):
+                        if phase.get("anchor_region_ids") != hard_region_ids:
+                            changes.append(
+                                {
+                                    "field": (
+                                        "virtual_camera_proposal.phases"
+                                        f"[{index}].anchor_region_ids"
+                                    ),
+                                    "from": phase.get("anchor_region_ids"),
+                                    "to": hard_region_ids,
+                                    "reason": (
+                                        "single_anchor_mode_uses_the_only_hard_core;"
+                                        "_preferred_regions_remain_soft_extents"
+                                    ),
+                                }
+                            )
+                            phase["anchor_region_ids"] = hard_region_ids
+            if phases[0].get("transition_in") != "cut":
+                changes.append(
+                    {
+                        "field": "virtual_camera_proposal.phases[0].transition_in",
+                        "from": phases[0].get("transition_in"),
+                        "to": "cut",
+                        "reason": "first_phase_has_no_preceding_camera_state",
+                    }
+                )
+                phases[0]["transition_in"] = "cut"
+                phases[0]["transition_duration_fraction"] = 0.0
+            if phases[0].get("start_progress") != 0.0:
+                changes.append(
+                    {
+                        "field": "virtual_camera_proposal.phases[0].start_progress",
+                        "from": phases[0].get("start_progress"),
+                        "to": 0.0,
+                        "reason": "proposal_coverage_must_start_at_clip_boundary",
+                    }
+                )
+                phases[0]["start_progress"] = 0.0
+            if phases[-1].get("end_progress") != 1.0:
+                changes.append(
+                    {
+                        "field": "virtual_camera_proposal.phases[-1].end_progress",
+                        "from": phases[-1].get("end_progress"),
+                        "to": 1.0,
+                        "reason": "extend_existing_final_behavior_to_clip_boundary",
+                    }
+                )
+                phases[-1]["end_progress"] = 1.0
+    return json.dumps(payload, ensure_ascii=False), changes
+
+
 def _model_input_payload(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
@@ -3040,8 +3171,24 @@ model_provenance (return it unchanged with interaction_id=null):
                 run_dir / "selected_vertical_framing.raw_output.json",
                 {"output_text": interaction.output_text},
             )
+            canonical_text, normalization_changes = (
+                canonicalize_selected_vertical_framing_output(
+                    interaction.output_text
+                )
+            )
+            write_json(
+                run_dir / "selected_vertical_framing.canonical_output.json",
+                {"output_text": canonical_text},
+            )
+            write_json(
+                run_dir / "selected_vertical_framing.normalization_audit.json",
+                {
+                    "changes": normalization_changes,
+                    "editorial_selection_changed": False,
+                },
+            )
             parsed = SelectedVerticalFramingProposal.model_validate_json(
-                interaction.output_text
+                canonical_text
             )
             expected = {
                 "candidate_id": candidate_id,

@@ -2110,6 +2110,58 @@ def test_selected_vertical_framing_runs_once_then_reuses_content_cache(
     assert client.proposal_calls == 1
 
 
+def test_fit_framing_preserves_but_does_not_execute_surplus_camera_proposal() -> None:
+    surplus = VerticalVirtualCameraProposal(
+        composition_mode="joint_relation",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="hold",
+                start_progress=0.0,
+                end_progress=1.0,
+                anchor_region_ids=["left", "right"],
+                observable_predicate="Both subjects are visible.",
+                transition_condition="No transition is requested.",
+                editorial_reason="A redundant camera idea accompanies a fit decision.",
+            )
+        ],
+        proposal_reason="Surplus evidence that must not override fit_or_layout.",
+    )
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="candidate-fit",
+        source_asset_id="sha256:" + "c" * 64,
+        event_id="event-fit",
+        frame_id="RF000001",
+        semantic_requirement="simultaneous_relation",
+        recommended_action="fit_or_layout",
+        regions=[
+            {
+                "region_id": "left",
+                "target_description": "the left visible subject",
+                "role": "required",
+            },
+            {
+                "region_id": "right",
+                "target_description": "the right visible subject",
+                "role": "required",
+            },
+        ],
+        virtual_camera_proposal=surplus,
+        observed_evidence=["Both subjects form one comparison."],
+        decision_reason="A portrait crop cannot preserve the relation.",
+        confidence=0.8,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    assert proposal.recommended_action == "fit_or_layout"
+    assert proposal.virtual_camera_proposal == surplus
+
+
 def test_virtual_camera_proposal_cannot_reference_untracked_or_fit_regions() -> None:
     proposal = VerticalVirtualCameraProposal(
         composition_mode="single_anchor_hold",

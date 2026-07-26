@@ -30,6 +30,7 @@ from .gemini import (
     GeminiLabClient,
     MODEL_ID,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+    canonicalize_selected_vertical_framing_output,
 )
 from .grounding_selection import (
     require_grounding_request_match,
@@ -6333,6 +6334,8 @@ def _refine_selected_vertical_candidate(
     )
     proposal_path = run_dir / "selected_vertical_framing.json"
     binding_path = run_dir / "selected_vertical_framing.binding.json"
+    raw_output_path = run_dir / "selected_vertical_framing.raw_output.json"
+    raw_interaction_path = run_dir / "selected_vertical_framing.raw_interaction.json"
     reused = False
     if proposal_path.is_file() and binding_path.is_file():
         binding = read_json(binding_path)
@@ -6340,6 +6343,82 @@ def _refine_selected_vertical_candidate(
             raise ValueError("selected vertical framing cache binding mismatch")
         proposal = SelectedVerticalFramingProposal.model_validate(
             read_json(proposal_path)
+        )
+        reused = True
+    elif raw_output_path.is_file() and raw_interaction_path.is_file():
+        # Representation-only recovery after a stricter local validator
+        # rejected an otherwise complete paid response.  Never send another
+        # request merely because the consumer contract was repaired.
+        raw_output = read_json(raw_output_path)
+        canonical_text, normalization_changes = (
+            canonicalize_selected_vertical_framing_output(
+                str(raw_output["output_text"])
+            )
+        )
+        proposal = SelectedVerticalFramingProposal.model_validate_json(
+            canonical_text
+        )
+        immutable = {
+            "candidate_id": candidate_id,
+            "source_asset_id": source_asset_id,
+            "event_id": event_id,
+            "frame_id": frame.frame_id,
+        }
+        mismatches = {
+            key: {"expected": value, "actual": getattr(proposal, key)}
+            for key, value in immutable.items()
+            if getattr(proposal, key) != value
+        }
+        if mismatches:
+            raise ValueError(
+                "saved selected framing response changed immutable selection: "
+                f"{mismatches}"
+            )
+        raw_interaction = read_json(raw_interaction_path)
+        proposal = proposal.model_copy(
+            update={
+                "model_provenance": proposal.model_provenance.model_copy(
+                    update={
+                        "interaction_id": raw_interaction.get("id")
+                        or proposal.model_provenance.interaction_id
+                    }
+                )
+            }
+        )
+        write_json(proposal_path, proposal)
+        write_json(
+            run_dir / "selected_vertical_framing.canonical_output.json",
+            {"output_text": canonical_text},
+        )
+        write_json(
+            run_dir / "selected_vertical_framing.normalization_audit.json",
+            {
+                "changes": normalization_changes,
+                "editorial_selection_changed": False,
+            },
+        )
+        write_json(
+            run_dir / "selected_vertical_framing.raw_output_reuse.json",
+            {
+                "reused": True,
+                "reason": "representation_only_local_contract_repair",
+                "source_raw_output_sha256": sha256_file(raw_output_path),
+                "source_raw_interaction_sha256": sha256_file(
+                    raw_interaction_path
+                ),
+                "reused_at": utc_now(),
+            },
+        )
+        write_json(
+            binding_path,
+            {
+                **fingerprint_payload,
+                "request_fingerprint": request_fingerprint,
+                "file_api_reused": None,
+                "raw_paid_response_reused": True,
+                "proposal_sha256": sha256_file(proposal_path),
+                "created_at": utc_now(),
+            },
         )
         reused = True
     else:
@@ -6389,6 +6468,10 @@ def _refine_selected_vertical_candidate(
         "observed_evidence": proposal.observed_evidence,
         "uncertainties": proposal.uncertainties,
         "confidence": proposal.confidence,
+        "non_executable_virtual_camera_ignored": bool(
+            proposal.recommended_action != "tracked_crop"
+            and proposal.virtual_camera_proposal is not None
+        ),
     }
     if proposal.recommended_action == "tracked_crop":
         refined["strategy"] = "tracked_crop"

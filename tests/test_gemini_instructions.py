@@ -20,6 +20,7 @@ from jascue_video_lab.gemini import (
     GeminiLabClient,
     canonical_interactions_mime_type,
     canonicalize_feature_edit_plan_output,
+    canonicalize_selected_vertical_framing_output,
 )
 from jascue_video_lab.models import (
     FeatureChapterBrief,
@@ -42,6 +43,60 @@ def test_interactions_mime_type_normalizes_common_audio_aliases() -> None:
     assert canonical_interactions_mime_type("audio/vnd.wave") == "audio/wav"
     assert canonical_interactions_mime_type("audio/x-m4a") == "audio/m4a"
     assert canonical_interactions_mime_type("audio/mpeg") == "audio/mpeg"
+
+
+def test_selected_vertical_framing_removes_non_executable_camera() -> None:
+    canonical, changes = canonicalize_selected_vertical_framing_output(
+        json.dumps(
+            {
+                "recommended_action": "fit_or_layout",
+                "virtual_camera_proposal": {
+                    "composition_mode": "joint_relation",
+                    "phases": [],
+                },
+            }
+        )
+    )
+    payload = json.loads(canonical)
+    assert payload["recommended_action"] == "fit_or_layout"
+    assert payload["virtual_camera_proposal"] is None
+    assert [change["reason"] for change in changes] == [
+        "non_executable_surplus_removed_for_non_tracked_action"
+    ]
+
+
+def test_selected_vertical_framing_repairs_camera_phase_representation() -> None:
+    canonical, changes = canonicalize_selected_vertical_framing_output(
+        json.dumps(
+            {
+                "recommended_action": "tracked_crop",
+                "regions": [
+                    {"region_id": "subject", "role": "required"},
+                    {"region_id": "context", "role": "preferred"},
+                ],
+                "virtual_camera_proposal": {
+                    "composition_mode": "single_anchor_follow",
+                    "phases": [
+                        {
+                            "start_progress": 0.1,
+                            "end_progress": 0.8,
+                            "anchor_region_ids": ["subject", "context"],
+                            "transition_in": "smoothstep",
+                            "transition_duration_fraction": 0.0,
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    payload = json.loads(canonical)
+    phase = payload["virtual_camera_proposal"]["phases"][0]
+    assert phase["start_progress"] == 0.0
+    assert phase["end_progress"] == 1.0
+    assert phase["anchor_region_ids"] == ["subject"]
+    assert phase["transition_in"] == "cut"
+    assert phase["transition_duration_fraction"] == 0.0
+    assert changes
 
 
 def test_feature_plan_single_candidate_lists_use_legacy_projection() -> None:
