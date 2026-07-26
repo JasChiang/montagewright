@@ -25,6 +25,8 @@ from scripts.plan_clip_card_open_edit import (
 from jascue_video_lab.feature_cut import (
     _chapter_bounds_with_approved_trim,
     _audit_feature_plan_candidate_recall,
+    _audit_render_source_reuse,
+    _candidate_asset_reference_matches,
     _cover_transform,
     _current_feature_plan_binding,
     _current_external_projection_binding,
@@ -72,6 +74,7 @@ from jascue_video_lab.cli import build_parser
 from jascue_video_lab.models import (
     FeatureChapterBrief,
     FramingRegionIntent,
+    SelectedVerticalFramingProposal,
     VerticalVirtualCameraPhase,
 )
 
@@ -1819,6 +1822,11 @@ def test_runtime_candidates_preserve_rank_but_human_binding_disables_switching()
         horizontal_target_description=None,
         vertical_strategy="fit_with_background",
         vertical_target_description=None,
+        vertical_coverage_intent="group_coverage",
+        vertical_coverage_target_descriptions=[
+            "the first visible group member",
+            "the second visible group member",
+        ],
         quality_risks=[],
         confidence=0.8,
         vertical_candidates=candidates,
@@ -1832,9 +1840,35 @@ def test_runtime_candidates_preserve_rank_but_human_binding_disables_switching()
     )
 
     assert [item["candidate_id"] for item in automatic] == ["take-1", "take-2"]
+    assert all(
+        item["coverage_intent"] == "group_coverage" for item in automatic
+    )
+    assert automatic[0]["coverage_target_descriptions"] == [
+        "the first visible group member",
+        "the second visible group member",
+    ]
     assert reviewed[0]["candidate_id"] == "legacy-primary"
     assert reviewed[0]["frame_id"] == "RF000001"
     assert reviewed[0]["target_description"] is None
+    assert reviewed[0]["coverage_intent"] == "group_coverage"
+
+
+def test_candidate_asset_reference_accepts_catalog_id_or_sha256() -> None:
+    clip = RushClip(
+        clip_id="C0001",
+        path="/tmp/visible.mp4",
+        sha256="a" * 64,
+        duration_ms=1000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=1,
+    )
+
+    assert _candidate_asset_reference_matches("C0001", clip)
+    assert _candidate_asset_reference_matches("sha256:" + "a" * 64, clip)
+    assert _candidate_asset_reference_matches(None, clip)
+    assert not _candidate_asset_reference_matches("C0002", clip)
 
 
 def test_gemini_virtual_camera_proposal_preserves_observed_anchor_order() -> None:
@@ -2064,6 +2098,114 @@ def test_selected_framing_allows_overlapping_multi_subject_handoff() -> None:
         virtual_camera_proposal=sequential,
         observed_evidence=["Three subjects form one visible group."],
         decision_reason="Overlapping phases preserve the group relationship.",
+        confidence=0.8,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    assert proposal.virtual_camera_proposal == sequential
+
+
+def test_selected_framing_group_coverage_requires_multiple_hard_members() -> None:
+    single = VerticalVirtualCameraProposal(
+        composition_mode="single_anchor_hold",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="only",
+                start_progress=0.0,
+                end_progress=1.0,
+                anchor_region_ids=["center"],
+                observable_predicate="The center member is visible.",
+                transition_condition="Hold to the end.",
+                editorial_reason="An invalid group proposal that covers one member.",
+            )
+        ],
+        proposal_reason="This incorrectly collapses a group into one anchor.",
+    )
+    with pytest.raises(ValidationError, match="at least two hard-core member"):
+        SelectedVerticalFramingProposal(
+            candidate_id="candidate-collapsed-group",
+            source_asset_id="sha256:" + "f" * 64,
+            event_id="event-collapsed-group",
+            frame_id="RF000001",
+            semantic_requirement="group_coverage",
+            recommended_action="tracked_crop",
+            regions=[
+                {
+                    "region_id": "center",
+                    "target_description": "the center visible group member",
+                    "role": "required",
+                },
+                {
+                    "region_id": "flanking-members",
+                    "target_description": "the other visible group members",
+                    "role": "preferred",
+                    "minimum_visible_fraction": 0.3,
+                },
+            ],
+            virtual_camera_proposal=single,
+            observed_evidence=["Multiple members form one visible lineup."],
+            decision_reason="Convenient centering does not satisfy group coverage.",
+            confidence=0.8,
+            model_provenance=ModelProvenance(
+                model_id=MODEL_ID,
+                api="gemini_interactions",
+                sdk="google-genai",
+                sdk_version="test",
+                run_id="test",
+                generated_at="test",
+            ),
+        )
+
+
+def test_selected_framing_group_coverage_accepts_overlapping_sequence() -> None:
+    sequential = VerticalVirtualCameraProposal(
+        composition_mode="sequential_focus",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="first-pair",
+                start_progress=0.0,
+                end_progress=0.5,
+                anchor_region_ids=["first", "middle"],
+                observable_predicate="The first and middle members are visible.",
+                transition_condition="Attention passes toward the final member.",
+                editorial_reason="Cover the first part of the group.",
+            ),
+            VerticalVirtualCameraProposalPhase(
+                phase_id="second-pair",
+                start_progress=0.5,
+                end_progress=1.0,
+                anchor_region_ids=["middle", "last"],
+                observable_predicate="The middle and last members are visible.",
+                transition_condition="Hold through the end.",
+                editorial_reason="Complete coverage with an overlapping anchor.",
+            ),
+        ],
+        proposal_reason="Every meaning-bearing member is covered once.",
+    )
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="candidate-group",
+        source_asset_id="sha256:" + "c" * 64,
+        event_id="event-group",
+        frame_id="RF000001",
+        semantic_requirement="group_coverage",
+        recommended_action="tracked_crop",
+        regions=[
+            {
+                "region_id": region_id,
+                "target_description": f"the {region_id} visible member",
+                "role": "required",
+            }
+            for region_id in ("first", "middle", "last")
+        ],
+        virtual_camera_proposal=sequential,
+        observed_evidence=["Three distinct members form one visible group."],
+        decision_reason="The portrait camera covers the complete group over time.",
         confidence=0.8,
         model_provenance=ModelProvenance(
             model_id=MODEL_ID,
@@ -4558,3 +4700,216 @@ def test_feature_plan_candidate_audit_exposes_rank_one_and_unexplained_reuse() -
         "closing",
     ]
     assert len(audit["audit_sha256"]) == 64
+
+
+def test_render_source_reuse_allows_audited_reprise_but_not_silent_padding() -> None:
+    chapters = [
+        FeatureChapterSelect(
+            feature_id="opening",
+            evidence_status="supported",
+            observed_visual_evidence="A visible establishing view.",
+            selection_reason="Establishes the location.",
+            horizontal_frame_id="RF000001",
+            horizontal_strategy="original",
+            horizontal_zoom_intent="none",
+            horizontal_target_description=None,
+            vertical_frame_id="RF000001",
+            vertical_strategy="fit_with_background",
+            vertical_target_description=None,
+            quality_risks=[],
+            confidence=0.9,
+        ),
+        FeatureChapterSelect(
+            feature_id="closing",
+            evidence_status="supported",
+            observed_visual_evidence="The establishing view returns.",
+            selection_reason="Closes the sequence.",
+            horizontal_frame_id="RF000002",
+            horizontal_strategy="original",
+            horizontal_zoom_intent="none",
+            horizontal_target_description=None,
+            vertical_frame_id="RF000002",
+            vertical_strategy="fit_with_background",
+            vertical_target_description=None,
+            quality_risks=[],
+            confidence=0.9,
+            source_reuse_mode="editorial_reprise",
+            source_reuse_justification=(
+                "The return forms an observable opening/closing callback."
+            ),
+        ),
+    ]
+    plan = FeatureEditPlan(
+        project_id="generic-project",
+        catalog_id="generic-catalog",
+        title="Generic",
+        chapters=chapters,
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    rendered = [
+        {
+            "feature_id": "opening",
+            "source_clip_id": "clip-a",
+            "source_in_ms": 1000,
+            "source_out_ms": 3000,
+            "segment_render_fingerprint": "same",
+        },
+        {
+            "feature_id": "closing",
+            "source_clip_id": "clip-a",
+            "source_in_ms": 1000,
+            "source_out_ms": 3000,
+            "segment_render_fingerprint": "same",
+        },
+    ]
+
+    audit = _audit_render_source_reuse(plan, rendered, aspect="9x16")
+
+    assert audit["status"] == "passed"
+    assert audit["requires_human_review"] is True
+    assert audit["rows"][0]["exact_interval_repeat"] is True
+    assert audit["rows"][0]["reuse_mode"] == "editorial_reprise"
+
+    blocked_plan = plan.model_copy(
+        update={
+            "chapters": [
+                chapters[0],
+                chapters[1].model_copy(
+                    update={
+                        "source_reuse_mode": "none",
+                        "source_reuse_justification": None,
+                    }
+                ),
+            ]
+        }
+    )
+    blocked = _audit_render_source_reuse(
+        blocked_plan,
+        rendered,
+        aspect="9x16",
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["violations"][0]["feature_id"] == "closing"
+
+
+def test_render_source_reuse_distinct_interval_cannot_overlap() -> None:
+    first = FeatureChapterSelect(
+        feature_id="first",
+        evidence_status="supported",
+        observed_visual_evidence="First action.",
+        selection_reason="Introduces the action.",
+        horizontal_frame_id="RF000001",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000001",
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+    )
+    second = first.model_copy(
+        update={
+            "feature_id": "second",
+            "horizontal_frame_id": "RF000002",
+            "vertical_frame_id": "RF000002",
+            "source_reuse_mode": "distinct_interval",
+            "source_reuse_justification": "Shows a different later action.",
+        }
+    )
+    plan = FeatureEditPlan(
+        project_id="generic-project",
+        catalog_id="generic-catalog",
+        title="Generic",
+        chapters=[first, second],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    rendered = [
+        {
+            "feature_id": "first",
+            "source_clip_id": "clip-a",
+            "source_in_ms": 1000,
+            "source_out_ms": 3000,
+            "segment_render_fingerprint": "first",
+        },
+        {
+            "feature_id": "second",
+            "source_clip_id": "clip-a",
+            "source_in_ms": 2500,
+            "source_out_ms": 4000,
+            "segment_render_fingerprint": "second",
+        },
+    ]
+
+    audit = _audit_render_source_reuse(plan, rendered, aspect="16x9")
+
+    assert audit["status"] == "blocked"
+    assert audit["violations"][0]["overlap_ms"] == 500
+
+
+def test_simultaneous_relation_accepts_one_atomic_groundable_core() -> None:
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="generic-comparison",
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="comparison",
+        frame_id="RF000001",
+        semantic_requirement="simultaneous_relation",
+        recommended_action="tracked_crop",
+        regions=[
+            {
+                "region_id": "contact-core",
+                "target_description": "the visible contact boundary",
+                "role": "required",
+                "atomic": True,
+                "observable_relations": ["reference touches subject edge"],
+            }
+        ],
+        virtual_camera_proposal={
+            "composition_mode": "single_anchor_hold",
+            "phases": [
+                {
+                    "phase_id": "hold",
+                    "start_progress": 0,
+                    "end_progress": 1,
+                    "anchor_region_ids": ["contact-core"],
+                    "observable_predicate": "The relation is directly visible.",
+                    "transition_condition": "Hold while directly visible.",
+                    "editorial_reason": "Preserve the minimal relational evidence.",
+                    "camera_behavior": "hold",
+                    "transition_in": "cut",
+                    "transition_duration_fraction": 0,
+                }
+            ],
+            "proposal_reason": "One indivisible groundable relation core.",
+        },
+        observed_evidence=["A visible reference touches a visible subject edge."],
+        decision_reason="The contact itself is the smallest evidence-bearing core.",
+        confidence=0.9,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    assert proposal.semantic_requirement == "simultaneous_relation"
+    assert len(proposal.regions) == 1

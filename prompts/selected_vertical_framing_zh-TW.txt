@@ -7,8 +7,17 @@ SAM 追蹤與本機 solver 驗證。
 
 ## 判斷順序
 
-1. 先判斷 brief 要表達的是單一主要目標、先後轉移的注意力，還是必須同時
-   看見多個目標之間的關係。
+1. 先判斷本章的 coverage intent：
+   - `single_primary`：只有一個主體承擔本章意義，其他可見物件只是可犧牲背景。
+   - `group_coverage`：多個人物、物件、區域或狀態共同承擔本章意義；每個必要
+     成員至少要在一個 phase 清楚出現，但不要求全程同框。
+   - `sequential_attention`：畫面本身存在可觀察的動作、視線、揭露或資訊交接順序。
+   - `simultaneous_relation`：接觸、距離、相對位置或同時狀態等意義必須在同一
+     個關鍵 phase 直接成立。
+   畫面有多個主體不會自動變成 group；反過來，也不得只因中央主體最方便裁切，
+   就把共同承擔 lineup、團體、集合、對照或交接意義的其他成員降成 preferred。
+   catalog 的 current target／coverage 只是上游暫定提示，必須用完整片段與 brief
+   重新核對，不能把它當不可變身分。
 2. 只建立能從影片直接觀察並可在單張原始影格 Grounding 的 region。
 3. 若單一 portrait crop 能合理呈現，回傳 `tracked_crop`，並且一定提供
    regions 與 virtual_camera_proposal。即使鏡頭不應移動，也要用
@@ -16,7 +25,9 @@ SAM 追蹤與本機 solver 驗證。
 4. 若畫面注意力有可觀察的先後轉移，可使用 `sequential_focus`。phase 順序
    必須由實際動作、揭露、視線、UI 狀態或資訊交接決定，不能套用固定的
    左到右、右到左或中央優先規則。
-5. 多主體不等於必須把整張橫式畫面縮進直式畫布。群體、陳列或交接關係
+5. 多主體不等於必須把整張橫式畫面縮進直式畫布。`group_coverage` 中每個
+   意義必要成員都必須建立獨立 required region，並至少出現在一個 phase；
+   群體、陳列或交接關係
    可優先使用有重疊錨點的 phase，例如「左＋中 → 中＋右」。A 與 B 的
    外觀或尺寸比較也可依序呈現，即使 phase 沒有共同 anchor，但所有
    comparison phase 必須使用不改變數位縮放的 `hold`、`follow_deadband`
@@ -25,7 +36,14 @@ SAM 追蹤與本機 solver 驗證。
 6. 只有物理比較、接觸、距離、相對大小或同時狀態等證據，才必須在關鍵
    phase 讓相關目標真正同框；即使如此，也應先裁掉不影響證據的外圍，
    不要把整個人物或整件產品自動視為不可裁切的原子區域。
-7. 本專案偏好滿版 9:16。依序嘗試：穩定滿版 crop、追蹤 crop、有重疊
+   關係中的兩個參與者若能各自可靠 Grounding，通常建立兩個 required
+   region 並用 `joint_relation`。若真正不可分割的最小證據本身就是一個
+   可單次 Grounding 的接觸點、交界、組合或關係核心，也可建立一個 atomic
+   required region、在 `observable_relations` 說明關係，並使用
+   `single_anchor_hold`／`single_anchor_follow`；不要為了湊兩個 region
+   把非必要的整件外圍升為 required。
+7. 本專案偏好滿版 9:16。依序嘗試：符合 coverage intent 的穩定滿版 crop、
+   追蹤 crop、有重疊
    錨點的虛擬鏡頭、可接受的外圍裁切、下一個候選。只有必要的 atomic
    證據無法以任何上述方式保留時，才回傳 `fit_or_layout`。
    若這個候選本身不適合而應試下一個素材，回傳 `try_next_candidate`。
@@ -40,8 +58,10 @@ SAM 追蹤與本機 solver 驗證。
 10. preferred region 是加分範圍，不是執行前提。虛擬鏡頭的任何 phase
     都必須在 preferred region 無法 Grounding 時，仍可只靠 required
     region 表達主要意義。
-11. camera behavior 要反映畫面目的：
-   - `hold`：穩定閱讀、比較或結果展示。
+11. camera behavior 要反映畫面目的。來源素材靜止只表示不需要 `follow`，
+    不代表一定要 `hold`；如果固定 portrait crop 不能完成 group coverage，
+    仍應使用有證據的多 phase 平移或切換：
+   - `hold`：穩定閱讀、比較或結果展示，而且目前構圖已完成 coverage intent。
    - `follow_deadband`：主體移動但小幅移動不應造成鏡頭抖動。
    - `follow`：連續且明確的移動需要跟隨。
    - `push_in`／`pull_out`：只有在資訊揭露或視覺關係確實改變時使用。

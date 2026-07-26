@@ -129,6 +129,13 @@ def canonicalize_selected_vertical_framing_output(
     changes: list[dict[str, Any]] = []
     proposal = payload.get("virtual_camera_proposal")
     action = payload.get("recommended_action")
+    regions_value = payload.get("regions")
+    hard_region_ids = {
+        region.get("region_id")
+        for region in (regions_value if isinstance(regions_value, list) else [])
+        if isinstance(region, dict)
+        and region.get("role") == "required"
+    }
     if (
         action == "tracked_crop"
         and payload.get("semantic_requirement") == "simultaneous_relation"
@@ -138,7 +145,11 @@ def canonicalize_selected_vertical_framing_output(
     ):
         phases_value = proposal.get("phases")
         if isinstance(phases_value, list) and any(
-            len(phase.get("anchor_region_ids") or []) > 1
+            len(
+                set(phase.get("anchor_region_ids") or [])
+                & hard_region_ids
+            )
+            > 1
             for phase in phases_value
             if isinstance(phase, dict)
         ):
@@ -165,6 +176,57 @@ def canonicalize_selected_vertical_framing_output(
     elif isinstance(proposal, dict):
         phases = proposal.get("phases")
         if isinstance(phases, list) and phases:
+            referenced_region_ids = {
+                region_id
+                for phase in phases
+                if isinstance(phase, dict)
+                for region_id in (phase.get("anchor_region_ids") or [])
+            }
+            regions = payload.get("regions")
+            if isinstance(regions, list):
+                canonical_regions: list[dict[str, Any]] = []
+                for index, region in enumerate(regions):
+                    if not isinstance(region, dict):
+                        canonical_regions.append(region)
+                        continue
+                    is_zero_preferred = (
+                        region.get("role") == "preferred"
+                        and region.get("minimum_visible_fraction") is not None
+                        and float(region["minimum_visible_fraction"]) <= 0
+                    )
+                    if not is_zero_preferred:
+                        canonical_regions.append(region)
+                        continue
+                    region_id = region.get("region_id")
+                    if region_id in referenced_region_ids:
+                        changes.append(
+                            {
+                                "field": (
+                                    f"regions[{index}].minimum_visible_fraction"
+                                ),
+                                "from": region.get("minimum_visible_fraction"),
+                                "to": None,
+                                "reason": (
+                                    "zero_fraction_preferred_is_an_active_anchor;"
+                                    "_phase_containment_remains_authoritative"
+                                ),
+                            }
+                        )
+                        region["minimum_visible_fraction"] = None
+                        canonical_regions.append(region)
+                    else:
+                        changes.append(
+                            {
+                                "field": f"regions[{index}]",
+                                "from": region,
+                                "to": None,
+                                "reason": (
+                                    "unreferenced_zero_fraction_preferred_region_"
+                                    "is_not_an_executable_constraint"
+                                ),
+                            }
+                        )
+                payload["regions"] = canonical_regions
             for index, phase in enumerate(phases):
                 if (
                     phase.get("transition_in") == "cut"
@@ -3076,12 +3138,20 @@ model_provenance (return it unchanged with interaction_id=null):
                             "source_clip_id": source_clip_id,
                             "frame_id": frame_id,
                             "same_frame_reused": prior_same_frame is not None,
+                            "reuse_mode": chapter.source_reuse_mode,
                             "justification": chapter.source_reuse_justification,
                         }
                         reuse_rows.append(row)
-                        if prior_same_frame is not None or not (
-                            chapter.source_reuse_justification
-                            and chapter.source_reuse_justification.strip()
+                        if (
+                            chapter.source_reuse_mode == "none"
+                            or not (
+                                chapter.source_reuse_justification
+                                and chapter.source_reuse_justification.strip()
+                            )
+                            or (
+                                prior_same_frame is not None
+                                and chapter.source_reuse_mode == "distinct_interval"
+                            )
                         ):
                             reuse_violations.append(row)
                     else:
@@ -3099,8 +3169,8 @@ model_provenance (return it unchanged with interaction_id=null):
             )
             if reuse_violations:
                 raise GeminiContractError(
-                    "Feature Edit Plan reused source evidence without an explicit "
-                    f"non-duplicate rationale: {reuse_violations}"
+                    "Feature Edit Plan reused source evidence without compatible "
+                    f"typed editorial authority: {reuse_violations}"
                 )
             final = parsed.model_copy(
                 update={

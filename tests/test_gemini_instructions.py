@@ -131,6 +131,104 @@ def test_selected_vertical_framing_repairs_joint_hold_mode() -> None:
     )
 
 
+def test_selected_vertical_framing_keeps_atomic_relational_core_single_anchor() -> None:
+    canonical, changes = canonicalize_selected_vertical_framing_output(
+        json.dumps(
+            {
+                "semantic_requirement": "simultaneous_relation",
+                "recommended_action": "tracked_crop",
+                "regions": [
+                    {
+                        "region_id": "contact-core",
+                        "role": "required",
+                        "atomic": True,
+                        "observable_relations": ["reference touches subject edge"],
+                    },
+                    {
+                        "region_id": "outer-context",
+                        "role": "preferred",
+                        "atomic": False,
+                        "minimum_visible_fraction": 0.5,
+                    },
+                ],
+                "virtual_camera_proposal": {
+                    "composition_mode": "single_anchor_hold",
+                    "phases": [
+                        {
+                            "phase_id": "hold",
+                            "start_progress": 0,
+                            "end_progress": 1,
+                            "anchor_region_ids": [
+                                "contact-core",
+                                "outer-context",
+                            ],
+                            "transition_in": "cut",
+                            "transition_duration_fraction": 0,
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    payload = json.loads(canonical)
+
+    assert (
+        payload["virtual_camera_proposal"]["composition_mode"]
+        == "single_anchor_hold"
+    )
+    assert payload["virtual_camera_proposal"]["phases"][0][
+        "anchor_region_ids"
+    ] == ["contact-core"]
+    assert any(
+        "single_anchor_mode_uses_the_only_hard_core" in change["reason"]
+        for change in changes
+    )
+
+
+def test_selected_vertical_framing_removes_zero_fraction_soft_non_constraint() -> None:
+    canonical, changes = canonicalize_selected_vertical_framing_output(
+        json.dumps(
+            {
+                "recommended_action": "tracked_crop",
+                "regions": [
+                    {
+                        "region_id": "subject",
+                        "role": "required",
+                        "minimum_visible_fraction": 1,
+                    },
+                    {
+                        "region_id": "unused-context",
+                        "role": "preferred",
+                        "minimum_visible_fraction": 0,
+                    },
+                ],
+                "virtual_camera_proposal": {
+                    "composition_mode": "single_anchor_hold",
+                    "phases": [
+                        {
+                            "phase_id": "hold",
+                            "start_progress": 0,
+                            "end_progress": 1,
+                            "anchor_region_ids": ["subject"],
+                            "transition_in": "cut",
+                            "transition_duration_fraction": 0,
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    payload = json.loads(canonical)
+
+    assert [region["region_id"] for region in payload["regions"]] == ["subject"]
+    assert any(
+        change["reason"].startswith(
+            "unreferenced_zero_fraction_preferred_region"
+        )
+        for change in changes
+    )
+
+
 def test_feature_plan_single_candidate_lists_use_legacy_projection() -> None:
     canonical, changes = canonicalize_feature_edit_plan_output(
         json.dumps(

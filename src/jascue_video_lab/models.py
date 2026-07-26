@@ -2053,6 +2053,12 @@ class VerticalVirtualCameraProposal(StrictModel):
             "single_anchor_follow",
         } and len(unique_anchor_ids) != 1:
             raise ValueError("single-anchor modes must reference exactly one anchor")
+        if self.composition_mode == "joint_relation" and not any(
+            len(phase.anchor_region_ids) >= 2 for phase in self.phases
+        ):
+            raise ValueError(
+                "joint-relation composition requires at least one multi-anchor phase"
+            )
         return self
 
 
@@ -3580,6 +3586,7 @@ class SelectedVerticalFramingProposal(StrictModel):
     frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
     semantic_requirement: Literal[
         "single_primary",
+        "group_coverage",
         "sequential_attention",
         "simultaneous_relation",
     ]
@@ -3642,6 +3649,41 @@ class SelectedVerticalFramingProposal(StrictModel):
             raise ValueError(
                 "every hard-core selected framing region must be referenced: "
                 + ", ".join(missing_required)
+            )
+        if (
+            self.semantic_requirement == "group_coverage"
+            and len(required) < 2
+        ):
+            raise ValueError(
+                "group coverage requires at least two hard-core member regions"
+            )
+        if (
+            self.semantic_requirement == "group_coverage"
+            and proposal.composition_mode
+            not in {"sequential_focus", "joint_relation"}
+        ):
+            raise ValueError(
+                "group coverage requires sequential-focus or joint-relation phases"
+            )
+        compound_relational_core = (
+            len(required) == 1
+            and any(
+                region.region_id in required
+                and region.atomic
+                and bool(region.observable_relations)
+                for region in self.regions
+            )
+            and proposal.composition_mode
+            in {"single_anchor_hold", "single_anchor_follow"}
+        )
+        if (
+            self.semantic_requirement == "simultaneous_relation"
+            and len(required) < 2
+            and not compound_relational_core
+        ):
+            raise ValueError(
+                "a simultaneous relation requires at least two hard-core regions "
+                "or one atomic relational core"
             )
         if (
             self.semantic_requirement == "sequential_attention"
@@ -3972,6 +4014,20 @@ class FeatureChapterSelect(StrictModel):
     horizontal_target_description: str | None
     vertical_strategy: Literal["tracked_crop", "fit_with_background"]
     vertical_target_description: str | None
+    vertical_coverage_intent: Literal[
+        "single_primary",
+        "group_coverage",
+        "sequential_attention",
+        "simultaneous_relation",
+    ] = "single_primary"
+    vertical_coverage_target_descriptions: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description=(
+            "Distinct visible subjects or regions whose coverage carries the "
+            "chapter meaning. This is editorial identity, not geometry."
+        ),
+    )
     quality_risks: list[str]
     confidence: Confidence
     recommended_duration_seconds: float | None = Field(
@@ -3992,11 +4048,24 @@ class FeatureChapterSelect(StrictModel):
         ),
     )
     attention_observation: AttentionObservation | None = None
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = Field(
+        default="none",
+        description=(
+            "Typed editorial authority for intentionally selecting a source clip "
+            "already used by another chapter. It does not create additional "
+            "unique source capacity."
+        ),
+    )
     source_reuse_justification: str | None = Field(
         default=None,
         description=(
-            "Required only when this chapter intentionally reuses a source clip "
-            "already selected by another chapter."
+            "Observable editorial reason required when source_reuse_mode is not "
+            "none. Reuse solely to fill project duration is forbidden."
         ),
     )
     horizontal_candidates: list[FeatureHorizontalCandidate] = Field(
@@ -4008,6 +4077,32 @@ class FeatureChapterSelect(StrictModel):
 
     @model_validator(mode="after")
     def validate_evidence(self) -> "FeatureChapterSelect":
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "source reuse justification requires a non-none reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError("intentional source reuse requires a justification")
+        if self.vertical_coverage_intent in {
+            "group_coverage",
+            "sequential_attention",
+            "simultaneous_relation",
+        } and len(self.vertical_coverage_target_descriptions) < 2:
+            raise ValueError(
+                "multi-subject vertical coverage intent requires at least two "
+                "distinct target descriptions"
+            )
+        if (
+            self.vertical_coverage_intent == "single_primary"
+            and len(self.vertical_coverage_target_descriptions) > 1
+        ):
+            raise ValueError(
+                "single-primary vertical coverage cannot require multiple targets"
+            )
         if self.recommended_duration_seconds is not None and not (
             self.duration_rationale and self.duration_rationale.strip()
         ):

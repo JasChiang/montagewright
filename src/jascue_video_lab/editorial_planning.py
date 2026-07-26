@@ -126,6 +126,136 @@ def build_attention_profile(
     )
 
 
+def reconcile_attention_delivery_floor(
+    attention: AttentionProfile,
+    *,
+    delivery_floor_seconds: float,
+    maximum_shortfall_tolerance_seconds: float = 1.0,
+) -> tuple[AttentionProfile, dict[str, object]]:
+    """Resolve a tiny cross-chapter rounding conflict without hiding it.
+
+    Gemini proposes subjective per-chapter maximum dwell values independently.
+    Their sum can miss an explicit delivery floor by a fraction even when local
+    QualitySafeInterval capacity is ample.  This function may distribute only
+    a small, configured shortfall to the strongest hold/read chapters.  It
+    never exceeds quality-safe capacity and records every adjustment.
+    """
+
+    if delivery_floor_seconds <= 0:
+        raise ValueError("delivery floor must be positive")
+    if maximum_shortfall_tolerance_seconds < 0:
+        raise ValueError("maximum shortfall tolerance cannot be negative")
+    original_total = round(
+        sum(chapter.maximum_dwell_seconds for chapter in attention.chapters),
+        3,
+    )
+    shortfall = round(max(0.0, delivery_floor_seconds - original_total), 3)
+    audit: dict[str, object] = {
+        "contract_version": "attention-delivery-floor-reconciliation-v1",
+        "delivery_floor_seconds": delivery_floor_seconds,
+        "original_attention_maximum_seconds": original_total,
+        "maximum_shortfall_tolerance_seconds": (
+            maximum_shortfall_tolerance_seconds
+        ),
+        "shortfall_seconds": shortfall,
+        "applied": False,
+        "adjustments": [],
+        "interpretation": (
+            "local_reconciliation_of_small_subjective_dwell_rounding_only"
+        ),
+    }
+    if shortfall <= 0.001:
+        audit["resolved_attention_maximum_seconds"] = original_total
+        return attention, audit
+    if shortfall > maximum_shortfall_tolerance_seconds + 0.001:
+        raise ValueError(
+            "attention and QualitySafeInterval capacity cannot reach the "
+            f"{delivery_floor_seconds:g}-second delivery floor; "
+            f"shortfall={shortfall:.3f}s exceeds local reconciliation tolerance"
+        )
+
+    def hold_value(chapter: AttentionChapterProfile) -> float:
+        values = (
+            (0.30, chapter.emotional_hold_value),
+            (0.25, chapter.reading_load),
+            (0.20, chapter.semantic_novelty),
+            (0.15, chapter.unresolved_tension),
+            (-0.10, chapter.repetition_pressure),
+        )
+        return sum(weight * float(value or 0.0) for weight, value in values)
+
+    ordered = sorted(
+        enumerate(attention.chapters),
+        key=lambda item: (
+            -hold_value(item[1]),
+            -(
+                float(item[1].quality_safe_capacity_seconds or 0.0)
+                - item[1].maximum_dwell_seconds
+            ),
+            item[0],
+        ),
+    )
+    remaining = shortfall
+    replacements: dict[int, AttentionChapterProfile] = {}
+    adjustments: list[dict[str, object]] = []
+    for index, chapter in ordered:
+        if remaining <= 0.001:
+            break
+        capacity = chapter.quality_safe_capacity_seconds
+        if capacity is None:
+            continue
+        headroom = max(0.0, capacity - chapter.maximum_dwell_seconds)
+        if headroom <= 0.001:
+            continue
+        added = round(min(headroom, remaining), 3)
+        if added <= 0:
+            continue
+        resolved_maximum = round(chapter.maximum_dwell_seconds + added, 3)
+        replacements[index] = chapter.model_copy(
+            update={
+                "maximum_dwell_seconds": resolved_maximum,
+                "uncertainties": [
+                    *chapter.uncertainties,
+                    "maximum_dwell_extended_by_local_delivery_floor_reconciliation",
+                ],
+                "requires_human_review": True,
+            }
+        )
+        adjustments.append(
+            {
+                "feature_id": chapter.feature_id,
+                "from_maximum_dwell_seconds": chapter.maximum_dwell_seconds,
+                "to_maximum_dwell_seconds": resolved_maximum,
+                "added_seconds": added,
+                "quality_safe_capacity_seconds": capacity,
+                "selection_reason": (
+                    "highest_generalized_hold_read_value_with_safe_capacity"
+                ),
+            }
+        )
+        remaining = round(max(0.0, remaining - added), 3)
+    if remaining > 0.001:
+        raise ValueError(
+            "attention delivery-floor reconciliation has insufficient "
+            f"QualitySafeInterval headroom; remaining={remaining:.3f}s"
+        )
+    chapters = [
+        replacements.get(index, chapter)
+        for index, chapter in enumerate(attention.chapters)
+    ]
+    resolved = attention.model_copy(update={"chapters": chapters})
+    audit.update(
+        {
+            "applied": True,
+            "adjustments": adjustments,
+            "resolved_attention_maximum_seconds": round(
+                sum(chapter.maximum_dwell_seconds for chapter in chapters), 3
+            ),
+        }
+    )
+    return resolved, audit
+
+
 def _cut_pressure(chapter: AttentionChapterProfile) -> float | None:
     values = (
         chapter.semantic_novelty,

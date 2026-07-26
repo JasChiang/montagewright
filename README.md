@@ -43,7 +43,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
    若完整 Top-K Structured Output 太大，應先保存已驗證的 evidence-bound plan，再用一次精簡的 actual-audio reranker 只選既有 candidate ID。這個降載 call 不能新增素材、frame、entity、bbox 或 region；本機再從上游 artifact 投影回完整執行計畫，避免為了聽音樂重送或重寫全部視覺證據。
 3. 16:9 與 9:16 可有不同排名；橫式最好的 take 不必強迫成為直式首選。
 4. 實際 geometry 只按排名逐一驗證，第一個通過者即停止；API／tracker 不會為全部候選預先付費。
-5. manifest 會列出 Top-K 是否完整、實際嘗試與換帶次數、rank-1 source reuse，以及重複是否有明確 editorial justification。重複本身只觸發 review，不會為了「看起來比較多樣」強迫換成較差素材。
+5. manifest 會列出 Top-K 是否完整、實際嘗試與換帶次數、rank-1 source reuse，以及重複是否有 typed editorial authority。重用不是一律禁止：同來源不同區間、不同構圖重點，或有意的 montage／前後呼應都可以保留；但 planner 必須標明 `distinct_interval`、`alternate_presentation` 或 `editorial_reprise` 與理由。渲染前再以實際 source PTS 檢查區間重疊，無理由補秒數、把重疊區間冒充不同段，或完全相同 presentation 冒充新構圖都會 fail closed。
 
 ### 9:16 不是「全部保留」與「隨便裁掉」二選一
 
@@ -73,7 +73,7 @@ Top-K 直式候選
 
 本機的 phase transition 使用 smoothstep easing，並依實際移動距離同時估算速度、加速度與 jerk 所需的最低時間；Gemini 建議的 transition 若太短，不能直接把鏡頭加速。能安全完成時才移動，距離太遠或 phase 太短時改成有稽核紀錄的硬切，微小 tracker 位移則由 deadband 吸收。scale 也受來源解析度與最多 1.12× 的保守上限約束。若幾何失敗就改試下一個 take 或安全 fallback，不會硬做模型要求的移動。
 
-這也不是把「兩個都必須同時看見」改成任意裁切：接觸、距離或相對位置必須同時成立時，proposal 必須在關鍵 phase 使用 `joint_relation`；群體關係可用相鄰 phase 的重疊 anchor 延續脈絡；A／B 外觀或尺寸比較可使用不重疊的 sequential phases，但不得使用 push-in、pull-out 或 punch-in 改變比較尺度。自動 proposal 永遠不能授權裁掉 active hard core；若 brief 明示 `center_crop`，所有 geometry 候選仍失敗時才可輸出 `full_bleed_center_crop_review`，並保存被裁風險與人工複核要求。artifact 也會分清 geometry success、Gemini proposal、真人 policy 與待審 fallback，避免把預覽冒充正式核准。
+這也不是把「兩個都必須同時看見」改成任意裁切。規劃器先把 coverage intent 分成 `single_primary`、`group_coverage`、`sequential_attention` 與 `simultaneous_relation`：單一主角可以穩定 hold；群組展示要求每個意義必要成員至少在一個 phase 清楚出現，不能只因中央成員方便裁切就把其餘成員降成背景；畫面本身有可觀察交接時依該順序移動；接觸、距離或相對位置必須同時成立時，proposal 才必須在關鍵 phase 使用 `joint_relation`。群體關係可用相鄰 phase 的重疊 anchor 延續脈絡；A／B 外觀或尺寸比較可使用不重疊的 sequential phases，但不得使用 push-in、pull-out 或 punch-in 改變比較尺度。來源素材靜止只代表不必跟拍，不代表可跳過群組覆蓋義務。自動 proposal 永遠不能授權裁掉 active hard core；若 brief 明示 `center_crop`，所有 geometry 候選仍失敗時才可輸出 `full_bleed_center_crop_review`，並保存被裁風險與人工複核要求。artifact 也會分清 geometry success、Gemini proposal、真人 policy 與待審 fallback，避免把預覽冒充正式核准。
 
 `feature-cut` 是人工審核用成片，因此 policy 將兩類未完成事項保留為 advisory：尚未做中後段獨立身分複核的 `identity_verification_pending`，以及 preferred／soft extent 未達建議可見比例。兩者都會寫入 artifact 並要求 review，但不再淘汰 hard core、SAM coverage 與運動 gate 已通過的候選；optional region 無法 Grounding 時也只移除該 optional track，不能拖垮 required 主體。正式 unattended delivery 仍要求 identity checkpoint 通過。研究用的 `--allow-unverified-geometry-preview` 則另允許在上游選擇 `primary_center`、hard core 非 atomic／文字／UI／graphic，且 required 最小可見面積至少 90% 時，輸出略裁 hard-core 邊緣的受控預覽；它不會改變 production 的 100% containment 規則。
 
@@ -401,7 +401,7 @@ Feature renderer 同樣接受無音軌來源：有原音時保留並淡入淡出
 
 這個 segment-level 音軌只為了讓 FFmpeg concat contract 穩定，不是最終混音。指定音樂的 delivery 會明確只 map 核准的 continuous music track，排除所有 rush source audio，因此不會出現毛片原音彼此重疊或和背景音樂疊成突兀的雙重音軌。Picture 與 music 長度超過容差時會 fail closed，不以 `-shortest` 的副作用冒充已完成音樂剪輯。
 
-每章停留時間也不是按內容類別寫死。Gemini 先根據 brief、實際畫面、動作完整性、資訊密度與已提供的音樂提出 `recommended_duration_seconds` 與理由；本機只把這些數值當成**相對權重**，再受單一 shot 的合法 source capacity、核准總長與 MusicMap cue 約束。若某個 selected shot 太短，系統只能把剩餘時間分配給其他有足夠合法素材的章節，不能重播、freeze 或跨 shot 偷延長；全部容量不足時會先寫出 `editorial-duration-capacity-shortfall.json` 再停止。舊 brief 的逐章秒數只作缺少模型建議時的 legacy fallback，不能被解讀成「某類畫面一律停留幾秒」。
+每章停留時間也不是按內容類別寫死。Gemini 先根據 brief、實際畫面、動作完整性、資訊密度與已提供的音樂提出 `recommended_duration_seconds` 與理由；本機只把這些數值當成**相對權重**，再受單一 shot 的合法 source capacity、核准總長與 MusicMap cue 約束。若某個 selected shot 太短，系統只能把剩餘時間分配給其他有足夠合法素材的章節，不能未經授權地重播、freeze 或跨 shot 偷延長；全部容量不足時會先寫出 `editorial-duration-capacity-shortfall.json` 再停止。有剪輯作用的 montage、不同時間區間、不同觀看重點或前後呼應可以作為成片輸出，但必須由 typed reuse policy 明示並在實際 PTS audit 中保存；它們不會被冒充為新增的獨立原始素材。舊 brief 的逐章秒數只作缺少模型建議時的 legacy fallback，不能被解讀成「某類畫面一律停留幾秒」。
 
 #### Quality-safe interval 規劃
 

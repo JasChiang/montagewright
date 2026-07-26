@@ -18,7 +18,11 @@
 6. 對 supported／partial chapter 提出 `recommended_duration_seconds` 與 `duration_rationale`。停留長度必須依本次畫面真正包含的資訊量、動作 setup／action／result、brief 中的敘事重要性，以及本次實際提供的音樂流動綜合判斷；不得套用「靜態畫面固定幾秒」或「動作畫面固定幾秒」之類的硬規則。這只是相對剪輯建議，不是原片 timestamp；本機會依總長、shot、原始 PTS 與合法 handles 校正。
    - 同時填寫 `attention_observation`，分開評估 semantic novelty、動作在片段結尾是否已完成、visual motion、composition change、reading load、尚未解決的動作／懸念、刻意停留價值、重複壓力與音樂轉場機會。每個值 0–1，只代表本次可見證據下的相對判斷，不是客觀真值。
    - `minimum_dwell_seconds` 是辨認主體、看懂必要文字、完成動作或保留必要情緒停頓所需的下限；`maximum_dwell_seconds` 是在資訊開始重複前仍合理的上限。`recommended_duration_seconds` 必須位於兩者之間。全部仍是待審 editorial proposal，不是 source timestamp。
-7. 不同 chapter 原則上應選不同 source clip／take。只有同一來源的另一段確實提供不可替代、且視覺上有意義不同的證據時才可重用，並填寫 `source_reuse_justification`。不得只因第一候選 confidence 較高而重複使用幾乎相同的構圖。
+7. 不同 chapter 原則上應選不同 source clip／take；重用不是一律禁止，但必須是可說明的剪輯選擇，不得用來湊滿交付秒數。未重用時使用 `source_reuse_mode=none` 且 justification 為 null；重用時必須填寫非空的 `source_reuse_justification`，並依真正目的選擇：
+   - `distinct_interval`：同一來源的另一段時間，提供不同動作、狀態或環境資訊；不可重播相同區間。
+   - `alternate_presentation`：同一證據以不同構圖、景別或視覺重點再次呈現，第二次必須讓觀眾看到不同資訊，不只是換比例。
+   - `editorial_reprise`：為前後呼應、回顧、章節間隔或 montage 節奏而有意重現；即使內容相同，也必須具有清楚的全片結構作用。
+   同一來源的空景、人物、表演、操作、細節或任何其他內容都適用相同規則。不得只因第一候選 confidence 較高而重複使用幾乎相同的構圖，也不得把重用冒充新的獨立素材容量。
 8. 每個 supported／partial chapter 的 `horizontal_candidates` 與
    `vertical_candidates` 都必須各保留 2–4 個不同 source event／RF frame 的
    可執行候選，rank 從 1 連續排列；rank-1 必須與外層相容欄位完全一致。
@@ -40,6 +44,15 @@
 
 不能再只回答 left／center／right。
 
+- 先輸出 `vertical_coverage_intent`。`single_primary` 只適用於一個主體即可
+  完整承擔章節意義；`group_coverage` 表示多個可見成員都必須至少被清楚呈現
+  一次；`sequential_attention` 表示畫面本身具有可觀察的交接順序；
+  `simultaneous_relation` 只用於接觸、距離、相對位置或同時狀態必須直接同框
+  才成立的情況。多主體本身不強迫運鏡，但不得為了方便直式裁切，把共同承擔
+  lineup、團體、集合、對照或交接意義的成員任意降為背景。
+- `vertical_coverage_target_descriptions` 列出真正承擔 coverage intent 的可見
+  實例或局部；多主體 intent 至少列出兩個可區分的描述。它們是後續完整片段
+  構圖複核的輸入，不是 bbox、座標或追蹤結果。
 - 如果一個可持續辨識的主要實例或局部能由 bbox seed + mask tracking 保留，使用 `tracked_crop`，並寫出精確、可區分相似實例的 `vertical_target_description`。
 - 若 brief 提供 `vertical_primary_target_description`，它是人工指定的直式主視覺。優先回傳 `tracked_crop`，不得為保留次要人物或背景而自行改成 `fit_with_background`。
 - 未指定人工主視覺時，若同時要保留的必要主體太寬、兩人分居左右、物件無法可靠追蹤，或單一 9:16 crop 會切掉必要資訊，才使用 `fit_with_background`。

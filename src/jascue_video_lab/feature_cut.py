@@ -102,7 +102,11 @@ from .shot_quality import (
     build_render_quality_report,
     load_shot_quality_map,
 )
-from .editorial_planning import build_attention_profile, build_rhythm_plan
+from .editorial_planning import (
+    build_attention_profile,
+    build_rhythm_plan,
+    reconcile_attention_delivery_floor,
+)
 from .storage import read_json, utc_now, write_json
 
 
@@ -6416,6 +6420,10 @@ def _refine_selected_vertical_candidate(
         "selection_reason": option_data.get("selection_reason"),
         "current_strategy": option_data.get("strategy"),
         "current_target_description": option_data.get("target_description"),
+        "current_coverage_intent": option_data.get("coverage_intent"),
+        "current_coverage_target_descriptions": option_data.get(
+            "coverage_target_descriptions", []
+        ),
         "current_regions": option_data.get("regions", []),
         "quality_risks": option_data.get("quality_risks", []),
         "delivery_preference": {
@@ -6649,12 +6657,17 @@ def _vertical_runtime_candidate_options(
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
     if selected.vertical_candidates and not human_policy_binding_present:
-        return [
-            candidate.model_dump(mode="python")
-            for candidate in sorted(
-                selected.vertical_candidates, key=lambda item: item.rank
-            )[:max_candidates]
-        ]
+        options = []
+        for candidate in sorted(
+            selected.vertical_candidates, key=lambda item: item.rank
+        )[:max_candidates]:
+            option = candidate.model_dump(mode="python")
+            option["coverage_intent"] = selected.vertical_coverage_intent
+            option["coverage_target_descriptions"] = list(
+                selected.vertical_coverage_target_descriptions
+            )
+            options.append(option)
+        return options
     return [
         {
             "candidate_id": "legacy-primary",
@@ -6667,11 +6680,29 @@ def _vertical_runtime_candidate_options(
             "strategy": selected.vertical_strategy,
             "crop_mode": "strict",
             "target_description": selected.vertical_target_description,
+            "coverage_intent": selected.vertical_coverage_intent,
+            "coverage_target_descriptions": list(
+                selected.vertical_coverage_target_descriptions
+            ),
             "regions": [],
             "quality_risks": selected.quality_risks,
             "confidence": selected.confidence,
         }
     ]
+
+
+def _candidate_asset_reference_matches(
+    expected_asset: str | None,
+    clip: RushClip,
+) -> bool:
+    """Accept either catalog identity or its content-addressed projection."""
+
+    if expected_asset is None:
+        return True
+    return expected_asset in {
+        clip.clip_id,
+        f"sha256:{clip.sha256}",
+    }
 
 
 def _resolve_vertical_camera_phases(
@@ -6775,6 +6806,7 @@ def _audit_feature_plan_candidate_recall(
                 ),
                 "horizontal_selected_source_asset_id": horizontal_selected_source,
                 "vertical_selected_source_asset_id": vertical_selected_source,
+                "source_reuse_mode": chapter.source_reuse_mode,
                 "source_reuse_justification": chapter.source_reuse_justification,
             }
         )
@@ -6794,7 +6826,10 @@ def _audit_feature_plan_candidate_recall(
                 "all_reuses_explained": all(
                     bool(
                         next(
-                            chapter.source_reuse_justification
+                            (
+                                chapter.source_reuse_mode != "none"
+                                and chapter.source_reuse_justification
+                            )
                             for chapter in plan.chapters
                             if chapter.feature_id == feature_id
                         )
@@ -6828,6 +6863,117 @@ def _audit_feature_plan_candidate_recall(
         ),
         "reuse_groups": reuse_groups,
         "chapters": rows,
+    }
+    return {**body, "audit_sha256": _stable_fingerprint(body)}
+
+
+def _audit_render_source_reuse(
+    plan: FeatureEditPlan,
+    chapters: Sequence[Mapping[str, Any]],
+    *,
+    aspect: Literal["16x9", "9x16"],
+) -> dict[str, Any]:
+    """Validate typed reuse authority against the rendered source intervals.
+
+    A representative catalog frame cannot prove whether two final trims overlap.
+    This audit therefore runs after exact source intervals and presentation
+    fingerprints are known. Deliberate reprises remain reviewable; silent
+    duration padding and falsely claimed distinct intervals fail closed.
+    """
+
+    plan_by_id = {chapter.feature_id: chapter for chapter in plan.chapters}
+    prior_by_source: dict[str, list[Mapping[str, Any]]] = {}
+    rows: list[dict[str, Any]] = []
+    violations: list[dict[str, Any]] = []
+    skipped_non_source_chapters: list[str] = []
+    for chapter in chapters:
+        feature_id = str(chapter["feature_id"])
+        if (
+            chapter.get("source_clip_id") is None
+            or chapter.get("source_in_ms") is None
+            or chapter.get("source_out_ms") is None
+        ):
+            skipped_non_source_chapters.append(feature_id)
+            continue
+        source_clip_id = str(chapter["source_clip_id"])
+        selected = plan_by_id[feature_id]
+        current_start = int(chapter["source_in_ms"])
+        current_end = int(chapter["source_out_ms"])
+        current_fingerprint = chapter.get("segment_render_fingerprint")
+        for prior in prior_by_source.get(source_clip_id, []):
+            prior_start = int(prior["source_in_ms"])
+            prior_end = int(prior["source_out_ms"])
+            overlap_ms = max(
+                0,
+                min(current_end, prior_end) - max(current_start, prior_start),
+            )
+            exact_interval = (
+                current_start == prior_start and current_end == prior_end
+            )
+            same_presentation = (
+                exact_interval
+                and current_fingerprint
+                == prior.get("segment_render_fingerprint")
+            )
+            row = {
+                "aspect": aspect,
+                "feature_id": feature_id,
+                "prior_feature_id": prior["feature_id"],
+                "source_clip_id": source_clip_id,
+                "source_in_ms": current_start,
+                "source_out_ms": current_end,
+                "prior_source_in_ms": prior_start,
+                "prior_source_out_ms": prior_end,
+                "overlap_ms": overlap_ms,
+                "exact_interval_repeat": exact_interval,
+                "same_presentation": same_presentation,
+                "reuse_mode": selected.source_reuse_mode,
+                "justification": selected.source_reuse_justification,
+                "requires_human_review": (
+                    selected.source_reuse_mode
+                    in {"alternate_presentation", "editorial_reprise"}
+                    or overlap_ms > 0
+                ),
+            }
+            row_violates = (
+                selected.source_reuse_mode == "none"
+                or not (
+                    selected.source_reuse_justification
+                    and selected.source_reuse_justification.strip()
+                )
+                or (
+                    selected.source_reuse_mode == "distinct_interval"
+                    and overlap_ms > 0
+                )
+                or (
+                    selected.source_reuse_mode == "alternate_presentation"
+                    and same_presentation
+                )
+            )
+            row["status"] = "blocked" if row_violates else "authorized_review"
+            rows.append(row)
+            if row_violates:
+                violations.append(row)
+        prior_by_source.setdefault(source_clip_id, []).append(chapter)
+    body = {
+        "contract_version": "render-source-reuse-audit-v1",
+        "aspect": aspect,
+        "status": "blocked" if violations else "passed",
+        "rows": rows,
+        "violations": violations,
+        "requires_human_review": any(
+            bool(row["requires_human_review"]) for row in rows
+        ),
+        "unique_source_clip_count": len(prior_by_source),
+        "rendered_chapter_count": len(chapters),
+        "audited_source_chapter_count": sum(
+            len(items) for items in prior_by_source.values()
+        ),
+        "skipped_non_source_chapters": skipped_non_source_chapters,
+        "capacity_policy": (
+            "authorized reuse may contribute output duration but never increases "
+            "the reported unique source capacity"
+        ),
     }
     return {**body, "audit_sha256": _stable_fingerprint(body)}
 
@@ -6966,6 +7112,8 @@ def _horizontal_manifest_entry(
         ),
         "observed_visual_evidence": selected.observed_visual_evidence,
         "selection_reason": selected.selection_reason,
+        "source_reuse_mode": selected.source_reuse_mode,
+        "source_reuse_justification": selected.source_reuse_justification,
         "source_frame_id": frame.frame_id,
         "source_clip_id": clip.clip_id,
         "source_in_ms": start_ms,
@@ -8291,7 +8439,6 @@ def run_feature_cut_experiment(
             source_feature_plan_sha256=sha256_file(plan_path),
             quality_safe_capacity_seconds=source_capacity_seconds,
         )
-        write_json(attention_path, attention_profile)
         project_duration_seconds = brief.target_duration_seconds
         duration_resolution_authority = "brief_preferred_duration"
         attention_maximum_seconds = round(
@@ -8308,14 +8455,30 @@ def run_feature_cut_experiment(
             and not fixed_duration_seconds
         ):
             if attention_maximum_seconds < 60.0:
-                raise ValueError(
-                    "attention and QualitySafeInterval capacity cannot reach "
-                    "the 60-second delivery floor"
+                attention_profile, floor_reconciliation = (
+                    reconcile_attention_delivery_floor(
+                        attention_profile,
+                        delivery_floor_seconds=60.0,
+                        maximum_shortfall_tolerance_seconds=1.0,
+                    )
+                )
+                write_json(
+                    editorial_dir
+                    / "attention-delivery-floor-reconciliation.json",
+                    floor_reconciliation,
+                )
+                attention_maximum_seconds = round(
+                    sum(
+                        chapter.maximum_dwell_seconds
+                        for chapter in attention_profile.chapters
+                    ),
+                    3,
                 )
             project_duration_seconds = attention_maximum_seconds
             duration_resolution_authority = (
                 "operator_authorized_shorter_attention_maximum"
             )
+        write_json(attention_path, attention_profile)
         write_json(
             editorial_dir / "project-duration-resolution.json",
             {
@@ -8782,8 +8945,9 @@ def run_feature_cut_experiment(
                     candidate_frame = frames[frame_id]
                     candidate_clip = clips[candidate_frame.clip_id]
                     expected_asset = option_data.get("source_asset_id")
-                    if expected_asset is not None and expected_asset != (
-                        f"sha256:{candidate_clip.sha256}"
+                    if not _candidate_asset_reference_matches(
+                        expected_asset,
+                        candidate_clip,
                     ):
                         raise ValueError(
                             f"vertical candidate frame belongs to another asset: {frame_id}"
@@ -9468,6 +9632,10 @@ def run_feature_cut_experiment(
                     ),
                     "observed_visual_evidence": selected.observed_visual_evidence,
                     "selection_reason": selected.selection_reason,
+                    "source_reuse_mode": selected.source_reuse_mode,
+                    "source_reuse_justification": (
+                        selected.source_reuse_justification
+                    ),
                     "source_frame_id": vertical_frame.frame_id,
                     "source_clip_id": vertical_clip.clip_id,
                     "source_in_ms": v_start,
@@ -9511,6 +9679,37 @@ def run_feature_cut_experiment(
             if render_vertical:
                 vertical_segments.append(vertical_segment)
                 manifest["vertical"]["chapters"].append(vertical_entry)
+        source_reuse_audits: dict[str, Any] = {}
+        if render_horizontal:
+            source_reuse_audits["16x9"] = _audit_render_source_reuse(
+                plan,
+                manifest["horizontal"]["chapters"],
+                aspect="16x9",
+            )
+        if render_vertical:
+            source_reuse_audits["9x16"] = _audit_render_source_reuse(
+                plan,
+                manifest["vertical"]["chapters"],
+                aspect="9x16",
+            )
+        write_json(
+            output_dir / "render-source-reuse-audit.json",
+            {
+                "contract_version": "render-source-reuse-audit-bundle-v1",
+                "aspects": source_reuse_audits,
+            },
+        )
+        blocked_reuse = [
+            violation
+            for audit in source_reuse_audits.values()
+            for violation in audit["violations"]
+        ]
+        if blocked_reuse:
+            raise ValueError(
+                "rendered source intervals violate the typed source reuse "
+                "contract; inspect render-source-reuse-audit.json"
+            )
+        manifest["source_reuse_audit"] = source_reuse_audits
         timings["geometry_and_segment_render_seconds"] = round(monotonic() - stage, 3)
     finally:
         try:

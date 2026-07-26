@@ -5,6 +5,7 @@ import pytest
 from jascue_video_lab.editorial_planning import (
     build_attention_profile,
     build_rhythm_plan,
+    reconcile_attention_delivery_floor,
 )
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
@@ -211,4 +212,98 @@ def test_attention_profile_rejects_capacity_shorter_than_minimum(
                 "chapter-1": 2.5,
                 **{f"chapter-{index}": 8.0 for index in range(2, 7)},
             },
+        )
+
+
+def test_attention_floor_reconciliation_uses_only_small_safe_headroom(
+    tmp_path,
+) -> None:
+    brief = _brief()
+    plan = _plan(with_attention=True)
+    brief_path = tmp_path / "brief.json"
+    plan_path = tmp_path / "plan.json"
+    write_json(brief_path, brief)
+    write_json(plan_path, plan)
+    profile = build_attention_profile(
+        brief,
+        plan,
+        source_brief_sha256=sha256_file(brief_path),
+        source_feature_plan_sha256=sha256_file(plan_path),
+        quality_safe_capacity_seconds={
+            f"chapter-{index}": 12.0 for index in range(1, 7)
+        },
+    )
+    shortened = profile.model_copy(
+        update={
+            "chapters": [
+                chapter.model_copy(
+                    update={
+                        "maximum_dwell_seconds": (
+                            9.9 if index == 0 else 10.0
+                        ),
+                        "preferred_dwell_seconds": min(
+                            chapter.preferred_dwell_seconds,
+                            9.9 if index == 0 else 10.0,
+                        ),
+                    }
+                )
+                for index, chapter in enumerate(profile.chapters)
+            ]
+        }
+    )
+
+    resolved, audit = reconcile_attention_delivery_floor(
+        shortened,
+        delivery_floor_seconds=60.0,
+        maximum_shortfall_tolerance_seconds=1.0,
+    )
+
+    assert sum(chapter.maximum_dwell_seconds for chapter in resolved.chapters) == 60
+    assert audit["applied"] is True
+    assert audit["shortfall_seconds"] == 0.1
+    assert audit["adjustments"]
+    assert any(
+        "maximum_dwell_extended_by_local_delivery_floor_reconciliation"
+        in chapter.uncertainties
+        for chapter in resolved.chapters
+    )
+
+
+def test_attention_floor_reconciliation_rejects_material_shortfall(
+    tmp_path,
+) -> None:
+    brief = _brief()
+    plan = _plan(with_attention=True)
+    brief_path = tmp_path / "brief.json"
+    plan_path = tmp_path / "plan.json"
+    write_json(brief_path, brief)
+    write_json(plan_path, plan)
+    profile = build_attention_profile(
+        brief,
+        plan,
+        source_brief_sha256=sha256_file(brief_path),
+        source_feature_plan_sha256=sha256_file(plan_path),
+        quality_safe_capacity_seconds={
+            f"chapter-{index}": 12.0 for index in range(1, 7)
+        },
+    )
+    shortened = profile.model_copy(
+        update={
+            "chapters": [
+                chapter.model_copy(
+                    update={
+                        "maximum_dwell_seconds": 9.0,
+                        "preferred_dwell_seconds": 9.0,
+                    }
+                )
+                for chapter in profile.chapters
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="exceeds local reconciliation tolerance"):
+        reconcile_attention_delivery_floor(
+            shortened,
+            delivery_floor_seconds=60.0,
+            maximum_shortfall_tolerance_seconds=1.0,
         )
