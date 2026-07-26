@@ -14,6 +14,7 @@ from jascue_video_lab.models import (
     ShotQualityMap,
 )
 from jascue_video_lab.shot_quality import (
+    _decode_analysis_frames,
     build_candidate_capacity,
     build_quality_safe_intervals,
     scan_shot_quality,
@@ -183,6 +184,23 @@ def test_source_fps_scan_detects_black_and_freeze_without_editing(
     assert black.intent == "unknown"
     assert black.evidence_frame_ids
     assert result.decoded_frame_count >= 70
+
+
+def test_analysis_decode_emits_only_shortlisted_frame_interval(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "three-parts.mp4"
+    _render_three_part_fixture(video)
+    frames, warning = _decode_analysis_frames(
+        video,
+        analysis_width=160,
+        analysis_height=90,
+        first_frame_index=30,
+        last_frame_index=47,
+        expected_count=18,
+    )
+    assert len(frames) == 18
+    assert warning == ""
 
 
 def test_locked_camera_with_sensor_noise_is_not_exact_freeze(

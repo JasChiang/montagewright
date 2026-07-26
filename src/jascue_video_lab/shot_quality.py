@@ -176,10 +176,21 @@ def _decode_analysis_frames(
     *,
     analysis_width: int,
     analysis_height: int,
+    first_frame_index: int,
+    last_frame_index: int,
     expected_count: int,
 ) -> tuple[list[bytes], str]:
+    if expected_count == 0:
+        return [], ""
+    if (
+        first_frame_index < 0
+        or last_frame_index < first_frame_index
+        or last_frame_index - first_frame_index + 1 != expected_count
+    ):
+        raise ValueError("shot-quality frame-index interval is inconsistent")
     frame_size = analysis_width * analysis_height
     filter_graph = (
+        f"select='between(n\\,{first_frame_index}\\,{last_frame_index})',"
         f"scale={analysis_width}:{analysis_height}:"
         "force_original_aspect_ratio=decrease,"
         f"pad={analysis_width}:{analysis_height}:(ow-iw)/2:(oh-ih)/2,"
@@ -202,6 +213,8 @@ def _decode_analysis_frames(
             filter_graph,
             "-fps_mode",
             "passthrough",
+            "-frames:v",
+            str(expected_count),
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -607,26 +620,31 @@ def scan_shot_quality(
     source_start_pts, time_base, all_metas, warnings = _probe_source_frames(
         resolved_video
     )
+    selected_metas = [
+        meta
+        for meta in all_metas
+        if shot.start_time_ms <= meta.local_time_ms < shot.end_time_ms
+    ]
     raw_frames, decode_warning = _decode_analysis_frames(
         resolved_video,
         analysis_width=analysis_width,
         analysis_height=analysis_height,
-        expected_count=len(all_metas),
+        first_frame_index=(
+            selected_metas[0].global_index if selected_metas else 0
+        ),
+        last_frame_index=(
+            selected_metas[-1].global_index if selected_metas else -1
+        ),
+        expected_count=len(selected_metas),
     )
-    probed_frame_count = len(all_metas)
+    probed_frame_count = len(selected_metas)
     raw_decode_frame_count = len(raw_frames)
-    paired_count = min(len(all_metas), len(raw_frames))
-    all_metas = all_metas[:paired_count]
+    paired_count = min(len(selected_metas), len(raw_frames))
+    selected_metas = selected_metas[:paired_count]
     raw_frames = raw_frames[:paired_count]
     if decode_warning:
         warnings.append(decode_warning)
-    selected_pairs = [
-        (meta, payload)
-        for meta, payload in zip(all_metas, raw_frames, strict=True)
-        if shot.start_time_ms <= meta.local_time_ms < shot.end_time_ms
-    ]
-    selected_metas = [item[0] for item in selected_pairs]
-    selected_payloads = [item[1] for item in selected_pairs]
+    selected_payloads = raw_frames
     request = {
         "scanner_version": SHOT_QUALITY_SCANNER_VERSION,
         "source_sha256": source_sha256,
