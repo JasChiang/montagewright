@@ -91,7 +91,7 @@ Top-K 直式候選
 
 這也不是把「兩個都必須同時看見」改成任意裁切。規劃器先把 coverage intent 分成 `single_primary`、`group_coverage`、`sequential_attention` 與 `simultaneous_relation`：單一主角可以穩定 hold；群組展示要求每個意義必要成員至少在一個 phase 清楚出現，不能只因中央成員方便裁切就把其餘成員降成背景；畫面本身有可觀察交接時依該順序移動；接觸、距離或相對位置必須同時成立時，proposal 才必須在關鍵 phase 使用 `joint_relation`。群體關係可用相鄰 phase 的重疊 anchor 延續脈絡；A／B 外觀或尺寸比較可使用不重疊的 sequential phases，但不得使用 push-in、pull-out 或 punch-in 改變比較尺度。來源素材靜止只代表不必跟拍，不代表可跳過群組覆蓋義務。自動 proposal 永遠不能授權裁掉 active hard core；若 brief 明示 `center_crop`，所有 geometry 候選仍失敗時才可輸出 `full_bleed_center_crop_review`，並保存被裁風險與人工複核要求。artifact 也會分清 geometry success、Gemini proposal、真人 policy 與待審 fallback，避免把預覽冒充正式核准。
 
-`feature-cut` 是人工審核用成片，因此 policy 將兩類未完成事項保留為 advisory：尚未做中後段獨立身分複核的 `identity_verification_pending`，以及 preferred／soft extent 未達建議可見比例。兩者都會寫入 artifact 並要求 review，但不再淘汰 hard core、SAM coverage 與運動 gate 已通過的候選；optional region 無法 Grounding 時也只移除該 optional track，不能拖垮 required 主體。正式 unattended delivery 仍要求 identity checkpoint 通過。研究用的 `--allow-unverified-geometry-preview` 則另允許在上游選擇 `primary_center`、hard core 非 atomic／文字／UI／graphic，且 required 最小可見面積至少 90% 時，輸出略裁 hard-core 邊緣的受控預覽；它不會改變 production 的 100% containment 規則。
+`feature-cut` 是人工審核用成片，但 tracked crop 已不再只看 seed frame。只要實際執行 SAM tracking，本機便依遮擋後重現、切鏡與幾何狀態規劃有限數量的 identity checkpoint，按保存的 source PTS 抽出 exact frame，再讓 Gemini 只判斷 tracked region 是否仍為鎖定身分；它不能修改 bbox、時間或 crop。`mismatch` 會淘汰候選，`ambiguous`／verifier failure 會保留為待審狀態；若整段沒有任何非 seed checkpoint 的必要性，也必須明示 `not_required_by_policy`，不能把未執行的空值當作成功。preferred／soft extent 未達建議可見比例仍屬 advisory；optional region 無法 Grounding 時也只移除該 optional track，不能拖垮 required 主體。正式 unattended delivery 仍要求 identity、coverage、quality 與 final QA 全部形成完整 execution evidence。研究用的 `--allow-unverified-geometry-preview` 則另允許在上游選擇 `primary_center`、hard core 非 atomic／文字／UI／graphic，且 required 最小可見面積至少 90% 時，輸出略裁 hard-core 邊緣的受控預覽；它不會改變 production 的 100% containment 規則。
 
 ### 用到哪些技術
 
@@ -284,7 +284,7 @@ uv run jascue-video-lab full-library /path/to/rushes \
 1. **已完成核心 contract**：SAM predictor 的實際輸入只含 `允許區間 ∩ seed shot`，不跨切鏡傳播。
 2. **已完成核心 contract**：多候選不取最高 model confidence；自動 seed 只接受唯一 `matched` candidate，其餘必須人工指定。
 3. **部分完成**：QueryLock v2 已把 temporal（identity＋predicate＋catalog）、Grounding（identity＋exact frame）、SAM（identity＋seed／interval）與 framing lineage 分開；較早的 proxy、shot 與部分 dense cache 仍要補齊全鏈路 fingerprint。
-4. **部分完成且已 fail closed**：每個新 SAM sample 可回映原始 decoded source PTS，並會以零 API 成本規劃 bounded identity checkpoints；exact-frame Gemini verifier 與有界 executor contract 已存在，錯誤、不可見與歧義會保存成明確狀態。Renderer 尚未自動解析 checkpoint frames 並執行 verifier，因此 tracked crop 目前記為 `required_pending`，不能再把未執行的 `None` 當成通過。遮擋後自動 re-identification 與完整 renderer 核准仍未完成。
+4. **已接入 tracked-crop candidate gate，完整交付仍部分完成**：每個新 SAM sample 可回映原始 decoded source PTS；renderer 會規劃 bounded identity checkpoints、抽出 exact source frames、執行 Gemini identity-only verifier 並保存 cache／raw response。`mismatch` 會淘汰候選，`ambiguous` 或 verifier error 不會轉成成功，沒有必要 checkpoint 時則保存明確的 `not_required_by_policy`。遮擋後自動 re-identification、所有影片型態上的 recall 驗證，以及把這些結果升級為全流程 delivery eligibility 仍未完成。
 5. **已完成效率／一致性 contract**：同一 shot 內的多個 bbox target 可共用一次 decoded-frame catalog、predictor 與 SAM inference state；每個 target 仍保存獨立 seed、mask、狀態與 provenance。共享與獨立執行可用逐格 mask agreement 自動比較，但 agreement 不是 ground truth。
 
 另外，silent source 不得生成 audio evidence、失敗但已有 usage 的 API response 仍必須計價、公開匯出需採 allowlist sanitizer。完整測試還要加入 non-zero PTS、VFR、B-frame、rotation/edit-list、快速 UI 命中，以及相似物件跨鏡 identity-switch 等 fixture。
@@ -319,7 +319,7 @@ uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
 
 v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 verbose resolved regions。本機會把模型選出的 entity IDs 對回一份 hash-bound `selected-clip-card-evidence.json`，確定性補出 target descriptions、相容欄位與 executable region contracts；projection 可由原始模型輸出和這份證據快照完整重現。相較 v2，送入模型的 Clip Card payload 約縮小 30%，response schema 字元數約縮小 44%，也移除了先前造成付費整批重試的 mirror-field 不一致來源。
 
-目前自動 candidate routing 已接到 9:16 路徑：renderer 依候選順序，先核對 asset／event／frame lineage 與單一 shot 邊界；只有真的要跑 geometry 的候選，才由 `policy:full-auto-topk-lazy-geometry-querylock-v2:v1` 建立具真實 `auto_policy` provenance 的 QueryLock。接著從原始來源抽 exact frame，以 identity-only Gemini bbox 建立 SAM seed，完成 shot-local tracking 與實際 crop path，最後才執行本機 preflight。16:9 的 Top-K 也會保存在 schema 與 provenance 中，但目前仍採投影後的選定候選，尚未執行同等的 runtime geometry switching。
+目前自動 candidate routing 已接到 9:16 路徑：renderer 依候選順序，先核對 asset／event／frame lineage 與單一 shot 邊界；只有真的要跑 geometry 的候選，才由 `policy:full-auto-topk-lazy-geometry-querylock-v2:v1` 建立具真實 `auto_policy` provenance 的 QueryLock。接著從原始來源抽 exact frame，以 identity-only Gemini bbox 建立 SAM seed，完成 shot-local tracking、identity checkpoints 與實際 crop path，最後才執行本機 preflight。selected-clip framing 若 schema 合法但無法維持上游 coverage obligation，會記為候選級失敗並嘗試下一個候選；HTTP 429／quota 類錯誤則仍立即中止，避免用更多付費呼叫掩蓋服務問題。16:9 的 Top-K 也會保存在 schema 與 provenance 中，但目前仍採投影後的選定候選，尚未執行同等的 runtime geometry switching。
 
 構圖需求使用領域中立的 region contract：
 
@@ -338,7 +338,7 @@ v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 
 
 429／quota failure 不屬於候選內容問題。為了避免隱藏成本，SDK 明確設成每個 Gemini operation 只嘗試一次；若上游回傳真正的 HTTP 429、`RESOURCE_EXHAUSTED` 或 spending-cap error，geometry executor 會立即寫出 `geometry-model-circuit-breaker.json` 並中止整次 render，不再換候選、不再繼續輸出看似完成但沒有 Gemini geometry 證據的 fallback 成片。一般的 target 不可見、tracking coverage 或構圖不可行才會繼續嘗試下一個候選。
 
-Full Auto v2 目前仍有清楚限制：已有風險導向、固定預算的 identity checkpoint 規劃器、exact-frame Gemini verifier 與 executor artifact，但尚未把 frame extraction／verifier execution 自動接入每個 candidate preflight；因此 tracked crop 會保持 `required_pending` 並要求人工處理，而不會自動通過。遮擋後自動 re-identification 與自動圖卡避讓也尚未完成；`overlay_keepout` 在有字卡但沒有 layout solver 時會 fail closed。獨立的成片 QA 可以提出語意 review，但不會替 preflight 補造證據或覆蓋 geometry gate。Safe-fit 只是方便人工觀看的預覽，不是核准構圖；模型 rank、confidence、SAM mask 與 schema validation 也都不是 human ground truth。
+Full Auto v2 目前仍有清楚限制：風險導向、固定預算的 identity checkpoint 規劃器、exact-frame extraction、Gemini verifier 與 candidate gate 已接通，但 verifier 只是 bounded semantic checkpoint，不等於逐幀 re-identification，也尚未在完整的真實影片 corpus 上證明 recall。遮擋後自動重新取得 seed 與自動圖卡避讓尚未完成；`overlay_keepout` 在有字卡但沒有 layout solver 時會 fail closed。獨立的成片 QA 可以提出語意 review，但還不是 feature-cut 必經的單一 orchestrator，也不會替 preflight 補造證據或覆蓋 geometry gate。Safe-fit 只是方便人工觀看的預覽，不是核准構圖；模型 rank、confidence、SAM mask 與 schema validation 也都不是 human ground truth。
 
 每個 tracked 9:16 segment 現在保存 renderer 真正使用的 crop keyframes、required-region union、逐時刻合法 crop interval、containment、可見寬度比例、首尾／中段 tracking coverage、crop speed 與 acceleration。裁切器不再先平滑 target 中心後直接裁切，而是先由每一個 required bbox 算出合法範圍，再把平滑路徑投影回該範圍；這可避免平滑延遲把快速移動主體推出畫面。正式路徑中的 `primary_center` 只會放寬 target 外圍的 8% safety margin，不暗中授權裁掉 target；只有前述明示的 review-only preview gate 可接受有量測下限的有限裁切。
 
@@ -483,7 +483,7 @@ P1 不再把 Gemini 的 `recommended_duration_seconds` 當成孤立數字。每�
 
 P2 將 reframe 從固定倍率升級為可稽核的 `VirtualCameraPlan`。16:9 與 9:16 都能使用 Gemini 基於素材證據提出的 `hold`、`follow_deadband`、`follow`、`punch_in_cut`、`push_in` 或 `pull_out`；多 anchor 直式鏡頭另可依 phase 順序交接注意力。實際 keyframe scale、center、containment、deadband、速度、加速度與 jerk 由本機 track 和 geometry solver 決定，不能由模型直接填數值。每個執行結果保存 sidecar 與 track fingerprint；phase 間若沒有足夠時間完成安全移動，就轉為 hard cut 而不是快速掃過。這套 16:9 剪輯運鏡與 9:16 版型 reframe 共用 tracking evidence，但分屬不同 editorial contract。
 
-若使用者授權的交付範圍是 60–90 秒，而 Gemini 的各章 AttentionProfile 在 QualitySafeInterval 內的最大連續容量總和略短於 brief 偏好秒數，可明示 `--allow-shorter-within-delivery-range`。程式只會把 project duration 降到仍在交付範圍內的 attention maximum，並保存 `project-duration-resolution.json`；它不會重播、停格、穿過髒畫面或偷偷延長任何章節。若已核准的同一首連續音樂最多只比新 project timeline 長 2 秒，scheduler 可只使用其合法 prefix cue 來調整畫面章節邊界，音樂交付仍另做一次連續 trim 與自然淡出；不切碎、交疊或 time-stretch 音樂。預設仍 fail closed。
+若使用者授權的交付範圍是 60–90 秒，而 Gemini 的各章 AttentionProfile 在 QualitySafeInterval 內的最大連續容量總和略短於 brief 偏好秒數，可明示 `--allow-shorter-within-delivery-range`。程式只會把 project duration 降到仍在交付範圍內的 attention maximum，並保存 `project-duration-resolution.json`；它不會重播、停格、穿過髒畫面或偷偷延長任何章節。容量依 requested aspect、候選與 evidence anchor 分開計算：只計算包含該 anchor 的連續 safe interval，並以至少一個可執行候選能承擔的容量規劃；runtime 換候選時仍須重新確認該候選能承擔已配置時長。若已核准的同一首音樂長於縮短後的 project timeline，scheduler 可在使用者明示允許縮短交付時使用其合法 prefix cues 來調整畫面章節邊界；最終音樂仍須另由 assembly 階段產生單一連續區段與自然淡出，不切碎、交疊或 time-stretch 音樂。picture→music→final QA 尚未成為單一必經 executor，因此此類輸出在完整 mux 與 QA 前仍只屬 review workflow。預設仍 fail closed。
 
 ```bash
 uv run jascue-video-lab feature-cut CATALOG.json BRIEF.json \

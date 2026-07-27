@@ -3514,8 +3514,6 @@ class FramingRegionIntent(StrictModel):
                 raise ValueError(f"{field_name} values must be non-empty")
             if len(values) != len(set(values)):
                 raise ValueError(f"{field_name} values must be unique")
-        if self.role == "required" and self.minimum_visible_fraction not in (None, 1.0):
-            raise ValueError("required regions must be fully visible")
         if self.atomic and self.minimum_visible_fraction not in (None, 1.0):
             raise ValueError("atomic regions must be fully visible")
         if self.role == "avoid_overlay" and self.minimum_visible_fraction is not None:
@@ -3532,10 +3530,16 @@ class FramingRegionIntent(StrictModel):
 
     @property
     def effective_minimum_visible_fraction(self) -> float:
-        if self.execution_role == "hard_core":
+        if self.atomic:
             return 1.0
         if self.execution_role == "overlay_keepout":
             return 0.0
+        if self.role == "required":
+            return (
+                self.minimum_visible_fraction
+                if self.minimum_visible_fraction is not None
+                else 1.0
+            )
         return self.minimum_visible_fraction if self.minimum_visible_fraction is not None else 0.72
 
 
@@ -3728,37 +3732,41 @@ class SelectedVerticalFramingProposal(StrictModel):
         if (
             self.semantic_requirement == "group_coverage"
             and len(required) < 2
+            and not any(
+                region.atomic
+                for region in self.regions
+                if region.execution_role == "hard_core"
+            )
         ):
             raise ValueError(
-                "group coverage requires at least two hard-core member regions"
+                "group coverage requires at least two hard-core member regions "
+                "or one explicitly atomic compound group region"
             )
         if (
             self.semantic_requirement == "group_coverage"
             and proposal.composition_mode
             not in {"sequential_focus", "joint_relation"}
+            and not (
+                len(required) == 1
+                and any(
+                    region.atomic
+                    for region in self.regions
+                    if region.execution_role == "hard_core"
+                )
+                and proposal.composition_mode == "single_anchor_hold"
+            )
         ):
             raise ValueError(
-                "group coverage requires sequential-focus or joint-relation phases"
+                "group coverage requires sequential-focus, joint-relation, or "
+                "one held atomic compound group"
             )
-        compound_relational_core = (
-            len(required) == 1
-            and any(
-                region.region_id in required
-                and region.atomic
-                and bool(region.observable_relations)
-                for region in self.regions
-            )
-            and proposal.composition_mode
-            in {"single_anchor_hold", "single_anchor_follow"}
-        )
         if (
             self.semantic_requirement == "simultaneous_relation"
             and len(required) < 2
-            and not compound_relational_core
         ):
             raise ValueError(
-                "a simultaneous relation requires at least two hard-core regions "
-                "or one atomic relational core"
+                "a simultaneous relation requires at least two independently "
+                "grounded hard-core participant regions"
             )
         if (
             self.semantic_requirement == "sequential_attention"
@@ -3846,8 +3854,18 @@ class FeatureVerticalCandidate(StrictModel):
             self.target_description or hard_regions
         ):
             raise ValueError("tracked_crop candidate requires a target or hard-core region")
-        if self.regions and self.strategy != "tracked_crop":
-            raise ValueError("region constraints require tracked_crop")
+        if (
+            self.strategy == "tracked_crop"
+            and self.crop_mode == "strict"
+            and any(
+                region.execution_role == "hard_core"
+                and region.effective_minimum_visible_fraction < 1.0
+                for region in self.regions
+            )
+        ):
+            raise ValueError(
+                "strict tracked crops require full visibility for every hard-core region"
+            )
         ids = [region.region_id for region in self.regions]
         if len(ids) != len(set(ids)):
             raise ValueError("candidate region IDs must be unique")
@@ -4162,14 +4180,27 @@ class FeatureChapterSelect(StrictModel):
             and self.source_reuse_justification.strip()
         ):
             raise ValueError("intentional source reuse requires a justification")
+        atomic_compound_group = (
+            self.vertical_coverage_intent == "group_coverage"
+            and bool(self.vertical_candidates)
+            and all(
+                len(candidate.regions) == 1
+                and candidate.regions[0].atomic
+                and candidate.regions[0].execution_role == "hard_core"
+                for candidate in self.vertical_candidates
+            )
+        )
         if self.vertical_coverage_intent in {
             "group_coverage",
             "sequential_attention",
             "simultaneous_relation",
-        } and len(self.vertical_coverage_target_descriptions) < 2:
+        } and len(self.vertical_coverage_target_descriptions) < 2 and not (
+            atomic_compound_group
+        ):
             raise ValueError(
                 "multi-subject vertical coverage intent requires at least two "
-                "distinct target descriptions"
+                "distinct target descriptions unless group coverage is bound "
+                "to one explicitly atomic compound group region"
             )
         if (
             self.vertical_coverage_intent == "single_primary"

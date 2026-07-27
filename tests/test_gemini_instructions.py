@@ -229,6 +229,116 @@ def test_selected_vertical_framing_removes_zero_fraction_soft_non_constraint() -
     )
 
 
+def test_feature_plan_normalizes_strict_hard_core_and_atomic_compound_group() -> None:
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "horizontal_frame_id": "RF000001",
+                        "vertical_frame_id": "RF000001",
+                        "vertical_coverage_intent": "simultaneous_relation",
+                        "vertical_coverage_target_descriptions": [
+                            "The complete visible group"
+                        ],
+                        "vertical_candidates": [
+                            {
+                                "candidate_id": "strict-candidate",
+                                "rank": 1,
+                                "strategy": "tracked_crop",
+                                "crop_mode": "strict",
+                                "regions": [
+                                    {
+                                        "region_id": "strict-group",
+                                        "role": "required",
+                                        "atomic": False,
+                                        "minimum_visible_fraction": 0.8,
+                                    }
+                                ],
+                            },
+                            {
+                                "candidate_id": "compound-candidate",
+                                "rank": 2,
+                                "strategy": "fit_with_background",
+                                "crop_mode": "primary_center",
+                                "regions": [
+                                    {
+                                        "region_id": "compound-group",
+                                        "role": "required",
+                                        "atomic": True,
+                                        "minimum_visible_fraction": 1.0,
+                                        "observable_relations": [],
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    payload = json.loads(canonical)
+
+    assert payload["chapters"][0]["vertical_candidates"][0]["regions"][0][
+        "minimum_visible_fraction"
+    ] == 1.0
+    # The candidates are not uniformly atomic compounds, so a claimed
+    # simultaneous relation is not silently weakened.
+    assert (
+        payload["chapters"][0]["vertical_coverage_intent"]
+        == "simultaneous_relation"
+    )
+    assert any(
+        change["rule"] == "strict_crop_system_policy_requires_full_hard_core"
+        for change in changes
+    )
+
+
+def test_feature_plan_reclassifies_relationless_atomic_compound_as_group() -> None:
+    candidate = {
+        "strategy": "fit_with_background",
+        "regions": [
+            {
+                "region_id": "compound-group",
+                "role": "required",
+                "atomic": True,
+                "minimum_visible_fraction": 1.0,
+                "observable_relations": [],
+            }
+        ],
+    }
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "horizontal_frame_id": "RF000001",
+                        "vertical_frame_id": "RF000001",
+                        "vertical_coverage_intent": "simultaneous_relation",
+                        "vertical_coverage_target_descriptions": [
+                            "The complete visible group"
+                        ],
+                        "vertical_candidates": [
+                            {"candidate_id": "a", "rank": 1, **candidate},
+                            {"candidate_id": "b", "rank": 2, **candidate},
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    payload = json.loads(canonical)
+
+    assert payload["chapters"][0]["vertical_coverage_intent"] == "group_coverage"
+    assert any(
+        change["rule"]
+        == "atomic_compound_without_relation_is_group_coverage"
+        for change in changes
+    )
+
+
 def test_feature_plan_single_candidate_lists_use_legacy_projection() -> None:
     canonical, changes = canonicalize_feature_edit_plan_output(
         json.dumps(

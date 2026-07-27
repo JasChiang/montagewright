@@ -4,7 +4,12 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
-from jascue_video_lab.media import create_analysis_proxy, extract_frame, probe_video
+from jascue_video_lab.media import (
+    create_analysis_proxy,
+    extract_frame,
+    extract_frame_at_pts,
+    probe_video,
+)
 
 
 def test_probe_and_extract_preserve_semantic_request_vs_pts(tmp_path: Path) -> None:
@@ -26,6 +31,29 @@ def test_probe_and_extract_preserve_semantic_request_vs_pts(tmp_path: Path) -> N
     assert frame.frame_time_ms == 600
     assert frame.frame_pts != frame.frame_time_ms
     assert (frame.width, frame.height) == (320, 180)
+
+
+def test_extract_frame_at_pts_reselects_exact_decoded_frame(tmp_path: Path) -> None:
+    video = tmp_path / "exact-pts.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+            "-i", "testsrc2=s=320x180:r=10:d=2", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", str(video),
+        ],
+        check=True,
+    )
+    semantic = extract_frame(video, 555, tmp_path / "semantic.png")
+
+    exact = extract_frame_at_pts(
+        video,
+        semantic.frame_pts,
+        tmp_path / "exact.png",
+    )
+
+    assert exact.frame_pts == semantic.frame_pts
+    assert exact.frame_time_ms == semantic.frame_time_ms
+    assert exact.requested_time_ms == exact.frame_time_ms
 
 
 def test_probe_preserves_non_square_sample_aspect_ratio(tmp_path: Path) -> None:

@@ -184,3 +184,15 @@ def test_static_presentation_can_explicitly_record_not_required() -> None:
     )
 
     assert failure_codes_for_preflight(candidate, AutoReframePolicy()) == []
+
+
+def test_single_sample_track_can_explicitly_record_not_required() -> None:
+    candidate = preflight().model_copy(
+        update={
+            "semantic_checkpoint_status": (
+                SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY
+            ),
+        }
+    )
+
+    assert failure_codes_for_preflight(candidate, AutoReframePolicy()) == []

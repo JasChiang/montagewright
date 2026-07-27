@@ -687,6 +687,80 @@ def canonicalize_feature_edit_plan_output(
                         ),
                     }
                 )
+        vertical_candidates = chapter.get("vertical_candidates")
+        if isinstance(vertical_candidates, list):
+            coverage_targets = chapter.get(
+                "vertical_coverage_target_descriptions"
+            )
+            atomic_compound_candidates = bool(vertical_candidates) and all(
+                isinstance(candidate, dict)
+                and isinstance(candidate.get("regions"), list)
+                and len(candidate["regions"]) == 1
+                and isinstance(candidate["regions"][0], dict)
+                and candidate["regions"][0].get("role") == "required"
+                and candidate["regions"][0].get("atomic") is True
+                and not candidate["regions"][0].get("observable_relations")
+                for candidate in vertical_candidates
+            )
+            if (
+                chapter.get("vertical_coverage_intent")
+                == "simultaneous_relation"
+                and isinstance(coverage_targets, list)
+                and len(coverage_targets) == 1
+                and atomic_compound_candidates
+            ):
+                chapter["vertical_coverage_intent"] = "group_coverage"
+                changes.append(
+                    {
+                        "json_path": (
+                            f"$.chapters[{chapter_index}]"
+                            ".vertical_coverage_intent"
+                        ),
+                        "before": "simultaneous_relation",
+                        "after": "group_coverage",
+                        "rule": (
+                            "atomic_compound_without_relation_is_group_coverage"
+                        ),
+                    }
+                )
+            for candidate_index, candidate in enumerate(vertical_candidates):
+                if (
+                    not isinstance(candidate, dict)
+                    or candidate.get("strategy") != "tracked_crop"
+                    or candidate.get("crop_mode") != "strict"
+                ):
+                    continue
+                regions = candidate.get("regions")
+                if not isinstance(regions, list):
+                    continue
+                for region_index, region in enumerate(regions):
+                    if (
+                        not isinstance(region, dict)
+                        or region.get("role") != "required"
+                        or region.get("atomic") is True
+                    ):
+                        continue
+                    visible_fraction = region.get("minimum_visible_fraction")
+                    if (
+                        not isinstance(visible_fraction, (int, float))
+                        or float(visible_fraction) >= 1.0
+                    ):
+                        continue
+                    region["minimum_visible_fraction"] = 1.0
+                    changes.append(
+                        {
+                            "json_path": (
+                                f"$.chapters[{chapter_index}].vertical_candidates"
+                                f"[{candidate_index}].regions[{region_index}]"
+                                ".minimum_visible_fraction"
+                            ),
+                            "before": visible_fraction,
+                            "after": 1.0,
+                            "rule": (
+                                "strict_crop_system_policy_requires_full_hard_core"
+                            ),
+                        }
+                    )
     return (
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         changes,

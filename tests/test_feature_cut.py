@@ -52,11 +52,13 @@ from jascue_video_lab.feature_cut import (
     _resolve_vertical_candidate_intent,
     _refine_selected_vertical_candidate,
     _segment_variant_fingerprint,
+    _selected_source_capacity_seconds,
     _soft_extent_visibility_audit,
     _summarize_automatic_reframe,
     _tracking_seed_request_ms,
     _tracked_crop_geometry,
     _usable_track_centers,
+    _validate_selected_framing_coverage_invariant,
     _validate_feature_plan_binding,
     _validate_shared_sam_session_cache,
     _vertical_crop_geometry,
@@ -544,6 +546,212 @@ def test_editorial_dwell_refuses_approved_trim_beyond_safe_capacity() -> None:
             },
             fixed_duration_seconds={"opening": 4.2},
         )
+
+
+def test_source_capacity_uses_only_requested_aspect() -> None:
+    plan = FeatureEditPlan(
+        project_id="capacity",
+        catalog_id="catalog",
+        title="Capacity",
+        chapters=[
+            FeatureChapterSelect(
+                feature_id="chapter",
+                evidence_status="supported",
+                horizontal_frame_id="RF000001",
+                vertical_frame_id="RF000002",
+                observed_visual_evidence="Visible evidence.",
+                selection_reason="Compare requested aspect capacity.",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                quality_risks=[],
+                confidence=0.9,
+            )
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    clips = {
+        "short": RushClip(
+            clip_id="short",
+            path="/tmp/short.mp4",
+            sha256="a" * 64,
+            duration_ms=2_000,
+            width=1920,
+            height=1080,
+            frame_rate="30/1",
+            size_bytes=1,
+        ),
+        "long": RushClip(
+            clip_id="long",
+            path="/tmp/long.mp4",
+            sha256="b" * 64,
+            duration_ms=10_000,
+            width=1920,
+            height=1080,
+            frame_rate="30/1",
+            size_bytes=1,
+        ),
+    }
+    frames = {
+        "RF000001": RushFrame(
+            frame_id="RF000001",
+            clip_id="short",
+            requested_time_ms=1_000,
+            image_path="/tmp/a.jpg",
+        ),
+        "RF000002": RushFrame(
+            frame_id="RF000002",
+            clip_id="long",
+            requested_time_ms=5_000,
+            image_path="/tmp/b.jpg",
+        ),
+    }
+    shot_cache = {
+        "short": SimpleNamespace(
+            shots=[
+                SimpleNamespace(
+                    shot_id="short-shot",
+                    start_time_ms=0,
+                    end_time_ms=2_000,
+                )
+            ]
+        ),
+        "long": SimpleNamespace(
+            shots=[
+                SimpleNamespace(
+                    shot_id="long-shot",
+                    start_time_ms=0,
+                    end_time_ms=10_000,
+                )
+            ]
+        ),
+    }
+
+    vertical = _selected_source_capacity_seconds(
+        plan,
+        aspect="9x16",
+        frames=frames,
+        clips=clips,
+        shot_cache=shot_cache,
+        shots_dir=Path("/tmp"),
+        scdet_threshold=4,
+    )
+    both = _selected_source_capacity_seconds(
+        plan,
+        aspect="both",
+        frames=frames,
+        clips=clips,
+        shot_cache=shot_cache,
+        shots_dir=Path("/tmp"),
+        scdet_threshold=4,
+    )
+
+    assert vertical["chapter"] == 10
+    assert both["chapter"] == 10
+
+
+def test_source_capacity_requires_safe_interval_containing_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mov"
+    source.write_bytes(b"source")
+    source_sha = hashlib.sha256(b"source").hexdigest()
+    quality_path = tmp_path / "quality.json"
+    quality_path.write_text("{}", encoding="utf-8")
+    quality_map = SimpleNamespace(
+        source_asset_id=f"sha256:{source_sha}",
+        source_path=str(source),
+        shot_id="shot",
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "build_quality_safe_intervals",
+        lambda *_args, **_kwargs: [
+            SimpleNamespace(start_ms=0, end_ms=6_000),
+            SimpleNamespace(start_ms=7_000, end_ms=10_000),
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id="capacity",
+        catalog_id="catalog",
+        title="Capacity",
+        chapters=[
+            FeatureChapterSelect(
+                feature_id="chapter",
+                evidence_status="supported",
+                horizontal_frame_id="RF000001",
+                vertical_frame_id="RF000001",
+                observed_visual_evidence="Visible evidence.",
+                selection_reason="Anchor is in the shorter safe pocket.",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                quality_risks=[],
+                confidence=0.9,
+            )
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    clip = RushClip(
+        clip_id="clip",
+        path=str(source),
+        sha256=source_sha,
+        duration_ms=10_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=len(b"source"),
+    )
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id="clip",
+        requested_time_ms=8_000,
+        image_path="/tmp/frame.jpg",
+    )
+
+    capacity = _selected_source_capacity_seconds(
+        plan,
+        aspect="9x16",
+        frames={frame.frame_id: frame},
+        clips={clip.clip_id: clip},
+        shot_cache={
+            clip.clip_id: SimpleNamespace(
+                shots=[
+                    SimpleNamespace(
+                        shot_id="shot",
+                        start_time_ms=0,
+                        end_time_ms=10_000,
+                    )
+                ]
+            )
+        },
+        shots_dir=tmp_path,
+        scdet_threshold=4,
+        quality_maps=[(quality_path, quality_map)],
+    )
+
+    assert capacity["chapter"] == 3
 
 
 def test_editorial_dwell_saves_generic_shortfall_audit_before_fail_closed(
@@ -2219,6 +2427,54 @@ def test_selected_framing_group_coverage_requires_multiple_hard_members() -> Non
         )
 
 
+def test_selected_framing_group_coverage_accepts_atomic_compound_group() -> None:
+    hold = VerticalVirtualCameraProposal(
+        composition_mode="single_anchor_hold",
+        phases=[
+            VerticalVirtualCameraProposalPhase(
+                phase_id="whole-group",
+                start_progress=0.0,
+                end_progress=1.0,
+                anchor_region_ids=["compound-group"],
+                observable_predicate="The indivisible group remains visible.",
+                transition_condition="Hold to the end.",
+                editorial_reason="Preserve the complete compound group.",
+            )
+        ],
+        proposal_reason="The group is one indivisible visible composition.",
+    )
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="candidate-compound-group",
+        source_asset_id="sha256:" + "e" * 64,
+        event_id="event-compound-group",
+        frame_id="RF000001",
+        semantic_requirement="group_coverage",
+        recommended_action="tracked_crop",
+        regions=[
+            {
+                "region_id": "compound-group",
+                "target_description": "the complete indivisible visible group",
+                "role": "required",
+                "atomic": True,
+            }
+        ],
+        virtual_camera_proposal=hold,
+        observed_evidence=["The complete group forms one bounded composition."],
+        decision_reason="Partial clipping would change the group meaning.",
+        confidence=0.8,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    assert proposal.regions[0].atomic is True
+
+
 def test_selected_framing_group_coverage_accepts_overlapping_sequence() -> None:
     sequential = VerticalVirtualCameraProposal(
         composition_mode="sequential_focus",
@@ -2513,6 +2769,47 @@ def test_virtual_camera_proposal_cannot_reference_untracked_or_fit_regions() -> 
         FeatureVerticalCandidate(strategy="tracked_crop", **base)
     with pytest.raises(ValidationError, match="tracked_crop"):
         FeatureVerticalCandidate(strategy="fit_with_background", **base)
+
+
+def test_vertical_candidate_allows_controlled_required_clipping_and_fit_regions() -> None:
+    common = {
+        "candidate_id": "generic-take",
+        "rank": 1,
+        "source_asset_id": "sha256:" + "a" * 64,
+        "event_id": "event-generic",
+        "frame_id": "RF000001",
+        "observed_visual_evidence": "One visible subject.",
+        "selection_reason": "Stable composition.",
+        "regions": [
+            FramingRegionIntent(
+                region_id="visible",
+                target_description="the directly visible non-atomic subject",
+                role="required",
+                atomic=False,
+                minimum_visible_fraction=0.8,
+            )
+        ],
+        "confidence": 0.8,
+    }
+
+    controlled = FeatureVerticalCandidate(
+        strategy="tracked_crop",
+        crop_mode="primary_center",
+        **common,
+    )
+    assert controlled.regions[0].effective_minimum_visible_fraction == 0.8
+    with pytest.raises(ValidationError, match="strict tracked crops"):
+        FeatureVerticalCandidate(
+            strategy="tracked_crop",
+            crop_mode="strict",
+            **common,
+        )
+    fit = FeatureVerticalCandidate(
+        strategy="fit_with_background",
+        crop_mode="primary_center",
+        **common,
+    )
+    assert fit.regions[0].region_id == "visible"
 
 
 def test_canonical_feature_plan_rejects_topk_aliases_of_same_evidence() -> None:
@@ -5137,21 +5434,76 @@ def test_render_source_reuse_distinct_interval_cannot_overlap() -> None:
     assert audit["violations"][0]["overlap_ms"] == 500
 
 
-def test_simultaneous_relation_accepts_one_atomic_groundable_core() -> None:
+def test_simultaneous_relation_rejects_one_unbound_atomic_core() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="two independently grounded hard-core participant regions",
+    ):
+        SelectedVerticalFramingProposal(
+            candidate_id="generic-comparison",
+            source_asset_id="sha256:" + "a" * 64,
+            event_id="comparison",
+            frame_id="RF000001",
+            semantic_requirement="simultaneous_relation",
+            recommended_action="tracked_crop",
+            regions=[
+                {
+                    "region_id": "contact-core",
+                    "target_description": "the visible contact boundary",
+                    "role": "required",
+                    "atomic": True,
+                    "observable_relations": ["reference touches subject edge"],
+                }
+            ],
+            virtual_camera_proposal={
+                "composition_mode": "single_anchor_hold",
+                "phases": [
+                    {
+                        "phase_id": "hold",
+                        "start_progress": 0,
+                        "end_progress": 1,
+                        "anchor_region_ids": ["contact-core"],
+                        "observable_predicate": "The relation is directly visible.",
+                        "transition_condition": "Hold while directly visible.",
+                        "editorial_reason": "Preserve the minimal relational evidence.",
+                        "camera_behavior": "hold",
+                        "transition_in": "cut",
+                        "transition_duration_fraction": 0,
+                    }
+                ],
+                "proposal_reason": "One unbound compound region is insufficient.",
+            },
+            observed_evidence=[
+                "A visible reference touches a visible subject edge."
+            ],
+            decision_reason=(
+                "The relation participants are not independently grounded."
+            ),
+            confidence=0.9,
+            model_provenance=ModelProvenance(
+                model_id=MODEL_ID,
+                api="gemini_interactions",
+                sdk="google-genai",
+                sdk_version="test",
+                run_id="test",
+                generated_at="test",
+            ),
+        )
+
+
+def test_selected_framing_cannot_weaken_group_coverage() -> None:
     proposal = SelectedVerticalFramingProposal(
-        candidate_id="generic-comparison",
+        candidate_id="group",
         source_asset_id="sha256:" + "a" * 64,
-        event_id="comparison",
+        event_id="group",
         frame_id="RF000001",
-        semantic_requirement="simultaneous_relation",
+        semantic_requirement="single_primary",
         recommended_action="tracked_crop",
         regions=[
             {
-                "region_id": "contact-core",
-                "target_description": "the visible contact boundary",
+                "region_id": "one",
+                "target_description": "one visible participant",
                 "role": "required",
-                "atomic": True,
-                "observable_relations": ["reference touches subject edge"],
             }
         ],
         virtual_camera_proposal={
@@ -5161,19 +5513,19 @@ def test_simultaneous_relation_accepts_one_atomic_groundable_core() -> None:
                     "phase_id": "hold",
                     "start_progress": 0,
                     "end_progress": 1,
-                    "anchor_region_ids": ["contact-core"],
-                    "observable_predicate": "The relation is directly visible.",
-                    "transition_condition": "Hold while directly visible.",
-                    "editorial_reason": "Preserve the minimal relational evidence.",
+                    "anchor_region_ids": ["one"],
+                    "observable_predicate": "One participant is visible.",
+                    "transition_condition": "Hold.",
+                    "editorial_reason": "Follow one participant.",
                     "camera_behavior": "hold",
                     "transition_in": "cut",
                     "transition_duration_fraction": 0,
                 }
             ],
-            "proposal_reason": "One indivisible groundable relation core.",
+            "proposal_reason": "Single participant crop.",
         },
-        observed_evidence=["A visible reference touches a visible subject edge."],
-        decision_reason="The contact itself is the smallest evidence-bearing core.",
+        observed_evidence=["One participant is visible."],
+        decision_reason="Center one participant.",
         confidence=0.9,
         model_provenance=ModelProvenance(
             model_id=MODEL_ID,
@@ -5185,5 +5537,9 @@ def test_simultaneous_relation_accepts_one_atomic_groundable_core() -> None:
         ),
     )
 
-    assert proposal.semantic_requirement == "simultaneous_relation"
-    assert len(proposal.regions) == 1
+    with pytest.raises(ValueError, match="weakens the upstream coverage"):
+        _validate_selected_framing_coverage_invariant(
+            upstream_intent="group_coverage",
+            upstream_target_descriptions=["participant A", "participant B"],
+            proposal=proposal,
+        )

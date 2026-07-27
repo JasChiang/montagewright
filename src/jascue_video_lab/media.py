@@ -258,6 +258,83 @@ def extract_frame(
     )
 
 
+def extract_frame_at_pts(
+    source: Path,
+    frame_pts: int,
+    output: Path,
+    *,
+    max_width: int | None = None,
+) -> ExtractedFrame:
+    """Extract one exact decoded source frame by immutable stream PTS.
+
+    This is the authoritative path for semantic checkpoints and render-boundary
+    evidence.  Milliseconds remain a derived display value and are never used to
+    re-select the requested frame.
+    """
+
+    resolved_source = source.expanduser().resolve(strict=True)
+    stat = resolved_source.stat()
+    source_start_pts, source_time_base = _cached_video_stream_timing(
+        str(resolved_source),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+    if frame_pts < source_start_pts:
+        raise ValueError("frame_pts precedes the video stream start PTS")
+    if max_width is not None and max_width < 64:
+        raise ValueError("max_width must be at least 64 when provided")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    filters = [f"select=eq(pts\\,{frame_pts})"]
+    if max_width is not None:
+        filters.append(f"scale='min({max_width},iw)':-2")
+    filters.append("showinfo")
+    completed = _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-copyts",
+            "-i",
+            str(resolved_source),
+            "-map",
+            "0:v:0",
+            "-vf",
+            ",".join(filters),
+            "-fps_mode",
+            "vfr",
+            "-frames:v",
+            "1",
+            "-y",
+            str(output),
+        ]
+    )
+    match = _SHOWINFO_RE.search(completed.stderr)
+    if not match:
+        raise MediaCommandError(
+            f"could not decode requested source PTS {frame_pts}"
+        )
+    decoded_pts = int(match.group("pts"))
+    if decoded_pts != frame_pts:
+        raise MediaCommandError(
+            f"decoded frame PTS {decoded_pts} differs from requested {frame_pts}"
+        )
+    frame_time_ms = round(
+        Fraction(decoded_pts - source_start_pts) * source_time_base * 1000
+    )
+    with Image.open(output) as image:
+        width, height = image.size
+    return ExtractedFrame(
+        path=str(output.resolve()),
+        requested_time_ms=frame_time_ms,
+        frame_time_ms=frame_time_ms,
+        frame_pts=decoded_pts,
+        frame_hash=sha256_file(output),
+        width=width,
+        height=height,
+    )
+
+
 def create_analysis_proxy(
     source: Path,
     output: Path,

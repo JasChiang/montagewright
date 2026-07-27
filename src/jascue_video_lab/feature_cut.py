@@ -28,6 +28,7 @@ from .billing import summarize_usage_and_list_price, summarize_usage_files
 from .gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
     GeminiLabClient,
+    GroundingIdentityReference,
     MODEL_ID,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
     canonicalize_selected_vertical_framing_output,
@@ -36,7 +37,18 @@ from .grounding_selection import (
     require_grounding_request_match,
     require_tracking_seed_candidate,
 )
-from .media import extract_frame, has_audio_stream, probe_video, sha256_file
+from .identity_checkpoints import (
+    IdentityCheckpointExecution,
+    execute_identity_checkpoints,
+    plan_identity_checkpoints,
+)
+from .media import (
+    extract_frame,
+    extract_frame_at_pts,
+    has_audio_stream,
+    probe_video,
+    sha256_file,
+)
 from .music import MusicMapLock
 from .multi_tracking import validate_segmentation_track_alignment
 from .models import (
@@ -5882,6 +5894,175 @@ def _build_required_region_tracks(
     )
 
 
+def _identity_seed_reference(
+    *,
+    track: SegmentationTrack,
+    target_id: str,
+    target_description: str,
+    output_dir: Path,
+) -> GroundingIdentityReference:
+    """Create a positive identity crop from the exact grounded seed PTS."""
+
+    if track.seed_frame_pts is None:
+        raise ValueError("tracked identity seed has no decoded source PTS")
+    seed_frame = extract_frame_at_pts(
+        Path(track.video_path),
+        track.seed_frame_pts,
+        output_dir / "seed-frame.png",
+    )
+    x_min, y_min, x_max, y_max = track.semantic_seed_box
+    crop_path = output_dir / "seed-positive.png"
+    with Image.open(seed_frame.path).convert("RGB") as image:
+        crop_box = (
+            max(0, round(x_min * image.width / 1000)),
+            max(0, round(y_min * image.height / 1000)),
+            min(image.width, round(x_max * image.width / 1000)),
+            min(image.height, round(y_max * image.height / 1000)),
+        )
+        if crop_box[0] >= crop_box[2] or crop_box[1] >= crop_box[3]:
+            raise ValueError("identity seed bbox produces an empty reference crop")
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+        image.crop(crop_box).save(crop_path)
+    return GroundingIdentityReference(
+        reference_id=f"seed-positive:{target_id}",
+        role="positive",
+        target_id=target_id,
+        description=(
+            "Exact grounded seed crop for the locked target identity: "
+            + target_description
+        ),
+        path=crop_path,
+        sha256=sha256_file(crop_path),
+    )
+
+
+def _execute_feature_track_identity_checkpoints(
+    *,
+    client: GeminiLabClient,
+    track: SegmentationTrack,
+    target_id: str,
+    target_description: str,
+    output_dir: Path,
+    identity_sha256: str,
+    max_model_checks: int = 1,
+) -> IdentityCheckpointExecution:
+    """Run or reuse bounded exact-PTS identity checks for one SAM track."""
+
+    track_fingerprint = _track_geometry_fingerprint(track)
+    plan = plan_identity_checkpoints(
+        track.samples,
+        asset_id=track.asset_id,
+        track_fingerprint=track_fingerprint,
+        identity_sha256=identity_sha256,
+        max_model_checks=max_model_checks,
+        seed_sample_index=track.seed_sample_index,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / "identity-checkpoint-plan.json", plan)
+    checkpoint_frames = {}
+    for candidate in plan.candidates:
+        if not candidate.selected_for_verification:
+            continue
+        if candidate.source_pts is None:
+            raise ValueError(
+                "semantic identity checkpoint has no decoded source PTS"
+            )
+        checkpoint_frames[candidate.sample_index] = extract_frame_at_pts(
+            Path(track.video_path),
+            candidate.source_pts,
+            output_dir
+            / "exact-frames"
+            / f"{candidate.sample_index:06d}-{candidate.source_pts}.png",
+        )
+    reference = _identity_seed_reference(
+        track=track,
+        target_id=target_id,
+        target_description=target_description,
+        output_dir=output_dir / "references",
+    )
+    verifier_id = f"{MODEL_ID}:interactions:semantic-identity-medium:v1"
+    current_pointer = output_dir / "identity-checkpoint-execution.current.json"
+    if current_pointer.is_file():
+        pointer = read_json(current_pointer)
+        cached_path = Path(str(pointer.get("path", "")))
+        if cached_path.is_file():
+            cached = IdentityCheckpointExecution.model_validate(
+                read_json(cached_path)
+            )
+            cached_hashes = {
+                result.sample_index: result.frame_hash
+                for result in cached.results
+            }
+            current_hashes = {
+                sample_index: frame.frame_hash
+                for sample_index, frame in checkpoint_frames.items()
+            }
+            if (
+                cached.track_fingerprint == track_fingerprint
+                and cached.identity_sha256 == identity_sha256
+                and cached.planning_request_sha256
+                == plan.planning_request_sha256
+                and cached.verifier_id == verifier_id
+                and cached_hashes == current_hashes
+            ):
+                return cached
+
+    def verifier(candidate, exact_frame):
+        return client.verify_identity_checkpoint(
+            frame=exact_frame,
+            target_id=target_id,
+            target_description=target_description,
+            run_id=f"feature-identity-{uuid.uuid4().hex[:8]}",
+            output_dir=(
+                output_dir
+                / "model-checks"
+                / f"sample-{candidate.sample_index:06d}"
+            ),
+            identity_references=(reference,),
+        )
+
+    execution = execute_identity_checkpoints(
+        plan,
+        frames_by_sample_index=checkpoint_frames,
+        verifier=verifier,
+        verifier_id=verifier_id,
+        abort_on_error=_is_exhausted_model_quota_error,
+    )
+    execution_path = (
+        output_dir
+        / "executions"
+        / f"execution-{execution.execution_request_sha256[:16]}.json"
+    )
+    write_json(execution_path, execution)
+    write_json(
+        current_pointer,
+        {
+            "artifact_type": "identity_checkpoint_execution_pointer_v1",
+            "path": str(execution_path.resolve()),
+            "execution_request_sha256": execution.execution_request_sha256,
+        },
+    )
+    return execution
+
+
+def _combined_semantic_checkpoint_status(
+    executions: Sequence[IdentityCheckpointExecution],
+) -> SemanticCheckpointStatus:
+    statuses = {
+        execution.semantic_checkpoint_status for execution in executions
+    }
+    if SemanticCheckpointStatus.FAILED in statuses:
+        return SemanticCheckpointStatus.FAILED
+    if (
+        SemanticCheckpointStatus.AMBIGUOUS in statuses
+        or SemanticCheckpointStatus.REQUIRED_PENDING in statuses
+    ):
+        return SemanticCheckpointStatus.AMBIGUOUS
+    if statuses == {SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY}:
+        return SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY
+    return SemanticCheckpointStatus.PASSED
+
+
 def _vertical_candidate_geometry(
     *,
     client: GeminiLabClient,
@@ -5926,6 +6107,7 @@ def _vertical_candidate_geometry(
     debug_paths: list[Path] = []
     track_fingerprint: str | None = None
     optional_region_failures: list[dict[str, str]] = []
+    identity_tracks: list[tuple[str, str, SegmentationTrack]] = []
     if crop_regions:
         if not hard_regions:
             raise ValueError("candidate region contract has no hard core")
@@ -5952,6 +6134,14 @@ def _vertical_candidate_geometry(
             region.region_id: track
             for region, track in zip(hard_regions, hard_tracks, strict=True)
         }
+        identity_tracks.extend(
+            (
+                region.entity_id or region.region_id,
+                region.target_description,
+                track,
+            )
+            for region, track in zip(hard_regions, hard_tracks, strict=True)
+        )
         available_soft_regions: list[FramingRegionIntent] = []
         soft_tracks: list[SegmentationTrack] = []
         for soft_region in soft_regions:
@@ -6091,6 +6281,18 @@ def _vertical_candidate_geometry(
             )
             track_cache[cache_key] = (proposal, track, output_dir)
         _, track, cached_root = track_cache[cache_key]
+        identity_tracks.append(
+            (
+                (
+                    query_lock_v2.identity.targets[0].target_id
+                    if query_lock_v2 is not None
+                    and len(query_lock_v2.identity.targets) == 1
+                    else "reframe_subject"
+                ),
+                target,
+                track,
+            )
+        )
         if query_lock_v2 is not None:
             matching_targets = [
                 locked_target
@@ -6127,6 +6329,65 @@ def _vertical_candidate_geometry(
             fallback_strategy=fallback_strategy,
             display_sample_aspect_ratio=display_sample_aspect_ratio,
         )
+
+    identity_executions: list[IdentityCheckpointExecution] = []
+    if geometry.get("applied_strategy") == "tracked_crop":
+        for target_id, locked_description, identity_track in identity_tracks:
+            identity_sha256 = _stable_fingerprint(
+                {
+                    "query_identity_sha256": (
+                        query_lock_v2.component_hashes()["identity_sha256"]
+                        if query_lock_v2 is not None
+                        else None
+                    ),
+                    "target_id": target_id,
+                    "target_description": locked_description,
+                    "seed_frame_pts": identity_track.seed_frame_pts,
+                    "semantic_seed_box": identity_track.semantic_seed_box,
+                }
+            )
+            identity_executions.append(
+                _execute_feature_track_identity_checkpoints(
+                    client=client,
+                    track=identity_track,
+                    target_id=target_id,
+                    target_description=locked_description,
+                    output_dir=output_dir
+                    / "identity-checkpoints"
+                    / target_id,
+                    identity_sha256=identity_sha256,
+                )
+            )
+        semantic_checkpoint_status = _combined_semantic_checkpoint_status(
+            identity_executions
+        )
+    else:
+        semantic_checkpoint_status = (
+            SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY
+        )
+    geometry["semantic_checkpoint_status"] = semantic_checkpoint_status.value
+    geometry["identity_checkpoint_executions"] = (
+        [
+            {
+                "target_id": target_id,
+                "target_description": target_description,
+                "track_fingerprint": execution.track_fingerprint,
+                "identity_sha256": execution.identity_sha256,
+                "semantic_checkpoint_status": (
+                    execution.semantic_checkpoint_status.value
+                ),
+                "execution_request_sha256": execution.execution_request_sha256,
+                "model_calls_made": execution.model_calls_made,
+            }
+            for (target_id, target_description, _), execution in zip(
+                identity_tracks,
+                identity_executions,
+                strict=True,
+            )
+        ]
+        if identity_executions
+        else []
+    )
 
     semantic_review_reasons: list[str] = []
     if len(hard_regions) > 1:
@@ -6275,7 +6536,12 @@ def _vertical_candidate_preflight(
         ),
         tracking_coverage_passed=bool(geometry.get("coverage_passed", True)),
         semantic_checkpoint_status=(
-            SemanticCheckpointStatus.REQUIRED_PENDING
+            SemanticCheckpointStatus(
+                geometry.get(
+                    "semantic_checkpoint_status",
+                    SemanticCheckpointStatus.REQUIRED_PENDING.value,
+                )
+            )
             if geometry.get("applied_strategy") == "tracked_crop"
             else SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY
         ),
@@ -6397,6 +6663,60 @@ def _resolve_vertical_candidate_intent(
     else:
         target = None
     return regions, target
+
+
+def _validate_selected_framing_coverage_invariant(
+    *,
+    upstream_intent: str,
+    upstream_target_descriptions: Sequence[str],
+    proposal: SelectedVerticalFramingProposal,
+) -> None:
+    """Prevent selected-clip refinement from weakening planner obligations.
+
+    Until every planner target description has a stable entity ID, the local
+    contract conservatively preserves the semantic mode and the number of
+    independently tracked hard-core participants.  It never relies on a
+    paraphrased description to prove that a required participant survived.
+    """
+
+    stronger_or_equal: dict[str, set[str]] = {
+        "single_primary": {
+            "single_primary",
+            "group_coverage",
+            "sequential_attention",
+            "simultaneous_relation",
+        },
+        "group_coverage": {"group_coverage", "simultaneous_relation"},
+        "sequential_attention": {
+            "sequential_attention",
+            "simultaneous_relation",
+        },
+        "simultaneous_relation": {"simultaneous_relation"},
+    }
+    if upstream_intent not in stronger_or_equal:
+        raise ValueError(f"unknown upstream coverage intent: {upstream_intent}")
+    if proposal.recommended_action != "tracked_crop":
+        # Fit/layout and try-next do not claim that a weaker crop is safe.
+        return
+    if proposal.semantic_requirement not in stronger_or_equal[upstream_intent]:
+        raise ValueError(
+            "selected framing weakens the upstream coverage obligation: "
+            f"{upstream_intent} -> {proposal.semantic_requirement}"
+        )
+    required_participant_count = max(
+        len(upstream_target_descriptions),
+        2 if upstream_intent != "single_primary" else 1,
+    )
+    hard_regions = [
+        region
+        for region in proposal.regions
+        if region.execution_role == "hard_core"
+    ]
+    if len(hard_regions) < required_participant_count:
+        raise ValueError(
+            "selected framing does not retain enough independently grounded "
+            "hard-core participants for the upstream coverage obligation"
+        )
 
 
 def _refine_selected_vertical_candidate(
@@ -6582,6 +6902,18 @@ def _refine_selected_vertical_candidate(
             },
         )
 
+    _validate_selected_framing_coverage_invariant(
+        upstream_intent=str(
+            option_data.get("coverage_intent") or "single_primary"
+        ),
+        upstream_target_descriptions=[
+            str(value)
+            for value in option_data.get(
+                "coverage_target_descriptions", []
+            )
+        ],
+        proposal=proposal,
+    )
     refined = dict(option_data)
     refined["source_asset_id"] = source_asset_id
     refined["event_id"] = event_id
@@ -7659,6 +7991,7 @@ def _render_review_html(
 def _selected_source_capacity_seconds(
     plan: FeatureEditPlan,
     *,
+    aspect: RenderAspect,
     frames: Mapping[str, RushFrame],
     clips: Mapping[str, RushClip],
     shot_cache: dict[str, ShotManifest],
@@ -7667,24 +8000,43 @@ def _selected_source_capacity_seconds(
     approved_decisions: Sequence[tuple[Path, TrimIntentDecision]] = (),
     quality_maps: Sequence[tuple[Path, ShotQualityMap]] = (),
 ) -> dict[str, float]:
-    """Return the shortest continuous safe capacity for each chapter.
+    """Return the largest executable capacity among requested-aspect candidates.
 
-    The same editorial duration is used by both aspect renders. When their
-    selected evidence frames differ, the shorter approved/quality-safe interval
-    is authoritative so neither render silently truncates the chapter.
+    Every candidate is measured against the interval containing its own evidence
+    anchor.  Planning may use the largest candidate capacity because the runtime
+    router rejects shorter candidates for the assigned dwell and tries the next
+    option.  It must never collapse the chapter to the shortest fallback.
     """
 
+    render_horizontal, render_vertical = _requested_render_aspects(aspect)
     capacities: dict[str, float] = {}
     for selected in plan.chapters:
         if selected.evidence_status == "not_found":
             continue
-        aspect_frames = [
-            ("16:9", selected.horizontal_frame_id),
-            ("9:16", selected.vertical_frame_id),
-        ]
+        aspect_frames: list[tuple[str, str | None, str | None]] = []
+        if render_horizontal:
+            if selected.horizontal_candidates:
+                aspect_frames.extend(
+                    ("16:9", candidate.frame_id, candidate.event_id)
+                    for candidate in selected.horizontal_candidates
+                )
+            else:
+                aspect_frames.append(
+                    ("16:9", selected.horizontal_frame_id, None)
+                )
+        if render_vertical:
+            if selected.vertical_candidates:
+                aspect_frames.extend(
+                    ("9:16", candidate.frame_id, candidate.event_id)
+                    for candidate in selected.vertical_candidates
+                )
+            else:
+                aspect_frames.append(
+                    ("9:16", selected.vertical_frame_id, None)
+                )
         chapter_capacities: list[int] = []
         seen: set[tuple[str, str, str | None]] = set()
-        for aspect, frame_id in aspect_frames:
+        for selected_aspect, frame_id, candidate_event_id in aspect_frames:
             if frame_id is None:
                 continue
             frame = frames[frame_id]
@@ -7702,10 +8054,10 @@ def _selected_source_capacity_seconds(
                 <= frame.requested_time_ms
                 < item.end_time_ms
             )
-            event_id = _selected_event_id(
+            event_id = candidate_event_id or _selected_event_id(
                 selected,
                 frame_id=frame_id,
-                aspect=aspect,
+                aspect=selected_aspect,
             )
             source_asset_id = f"sha256:{clip.sha256}"
             identity = (source_asset_id, shot.shot_id, event_id)
@@ -7752,6 +8104,9 @@ def _selected_source_capacity_seconds(
                     (
                         interval.end_ms - interval.start_ms
                         for interval in safe_intervals
+                        if interval.start_ms
+                        <= frame.requested_time_ms
+                        < interval.end_ms
                     ),
                     default=0,
                 )
@@ -7759,13 +8114,14 @@ def _selected_source_capacity_seconds(
                 capacity_ms = interval_end - interval_start
             chapter_capacities.append(max(0, capacity_ms))
         if chapter_capacities:
-            capacities[selected.feature_id] = min(chapter_capacities) / 1000
+            capacities[selected.feature_id] = max(chapter_capacities) / 1000
     return capacities
 
 
 def _selected_fixed_trim_durations_seconds(
     plan: FeatureEditPlan,
     *,
+    aspect: RenderAspect,
     frames: Mapping[str, RushFrame],
     clips: Mapping[str, RushClip],
     shot_cache: dict[str, ShotManifest],
@@ -7777,16 +8133,19 @@ def _selected_fixed_trim_durations_seconds(
 
     if not approved_decisions:
         return {}
+    render_horizontal, render_vertical = _requested_render_aspects(aspect)
     fixed: dict[str, float] = {}
     for selected in plan.chapters:
         if selected.evidence_status == "not_found":
             continue
         durations_ms: list[int] = []
         seen: set[tuple[str, str, str | None]] = set()
-        for aspect, frame_id in (
-            ("16:9", selected.horizontal_frame_id),
-            ("9:16", selected.vertical_frame_id),
-        ):
+        aspect_frames: list[tuple[str, str | None]] = []
+        if render_horizontal:
+            aspect_frames.append(("16:9", selected.horizontal_frame_id))
+        if render_vertical:
+            aspect_frames.append(("9:16", selected.vertical_frame_id))
+        for selected_aspect, frame_id in aspect_frames:
             if frame_id is None:
                 continue
             frame = frames[frame_id]
@@ -7807,7 +8166,7 @@ def _selected_fixed_trim_durations_seconds(
             event_id = _selected_event_id(
                 selected,
                 frame_id=frame_id,
-                aspect=aspect,
+                aspect=selected_aspect,
             )
             identity = (clip.sha256, shot.shot_id, event_id)
             if identity in seen:
@@ -8201,7 +8560,6 @@ def _resolve_editorial_chapter_durations(
         music_lock_prefix_used = (
             allow_music_lock_prefix
             and music_lock.duration_ms >= target_duration_ms
-            and music_lock.duration_ms - target_duration_ms <= 2000
         )
         if (
             abs(music_lock.duration_ms - target_duration_ms) > 80
@@ -8886,6 +9244,7 @@ def _run_feature_cut_experiment_impl(
                 )
         source_capacity_seconds = _selected_source_capacity_seconds(
             plan,
+            aspect=aspect,
             frames=frames,
             clips=clips,
             shot_cache=shot_cache,
@@ -8896,6 +9255,7 @@ def _run_feature_cut_experiment_impl(
         )
         fixed_duration_seconds = _selected_fixed_trim_durations_seconds(
             plan,
+            aspect=aspect,
             frames=frames,
             clips=clips,
             shot_cache=shot_cache,
@@ -9486,7 +9846,38 @@ def _run_feature_cut_experiment_impl(
                             )
                         except Exception as error:
                             abort_for_geometry_quota(error)
-                            raise
+                            failure_codes = _failure_codes_from_geometry_error(
+                                error
+                            )
+                            recovery = choose_recovery(
+                                failure_codes,
+                                candidates_remaining=(
+                                    option_index + 1 < len(vertical_options)
+                                ),
+                            )
+                            candidate_attempts.append(
+                                {
+                                    "candidate_id": candidate_id,
+                                    "rank": candidate_rank,
+                                    "frame_id": frame_id,
+                                    "source_asset_id": (
+                                        f"sha256:{candidate_clip.sha256}"
+                                    ),
+                                    "event_id": option_data.get("event_id"),
+                                    "strategy": option_data["strategy"],
+                                    "decision": "try_next",
+                                    "reason_code": (
+                                        "selected_framing_contract_failed"
+                                    ),
+                                    "failure_codes": [
+                                        failure.value
+                                        for failure in failure_codes
+                                    ],
+                                    "recovery_action": recovery.value,
+                                    "error": str(error),
+                                }
+                            )
+                            continue
                         framing_recommended_action = (
                             framing_proposal.recommended_action
                         )

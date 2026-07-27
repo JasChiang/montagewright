@@ -229,7 +229,11 @@ def failure_codes_for_preflight(
         failures.append(FailureCode.IDENTITY_VERIFICATION_PENDING)
     elif (
         checkpoint_required
-        and checkpoint_status != SemanticCheckpointStatus.PASSED
+        and checkpoint_status
+        not in {
+            SemanticCheckpointStatus.PASSED,
+            SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY,
+        }
     ):
         failures.append(FailureCode.IDENTITY_VERIFICATION_PENDING)
     for region in preflight.regions:
