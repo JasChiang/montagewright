@@ -3666,6 +3666,20 @@ SelectedFramingRegion = Annotated[
 ]
 
 
+class VerticalPresentationOptionAssessment(StrictModel):
+    """One evidence-based alternative considered before portrait fallback."""
+
+    mode: Literal[
+        "single_full_bleed_crop",
+        "sequential_virtual_camera",
+        "controlled_clipping",
+        "fit_or_layout",
+        "try_next_candidate",
+    ]
+    verdict: Literal["feasible", "not_feasible", "uncertain", "not_applicable"]
+    observable_reason: str = Field(min_length=1, max_length=800)
+
+
 class SelectedVerticalFramingProposal(StrictModel):
     """Full-clip semantic framing decision made after editorial selection.
 
@@ -3674,8 +3688,8 @@ class SelectedVerticalFramingProposal(StrictModel):
     identity.  Exact coordinates and motion remain downstream local work.
     """
 
-    contract_version: Literal["selected-vertical-framing-proposal-v1"] = (
-        "selected-vertical-framing-proposal-v1"
+    contract_version: Literal["selected-vertical-framing-proposal-v2"] = (
+        "selected-vertical-framing-proposal-v2"
     )
     candidate_id: str = Field(
         pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=64
@@ -3689,6 +3703,11 @@ class SelectedVerticalFramingProposal(StrictModel):
         "sequential_attention",
         "simultaneous_relation",
     ]
+    relation_temporal_mode: Literal[
+        "not_applicable",
+        "simultaneous_required",
+        "sequentially_reconstructable",
+    ]
     recommended_action: Literal[
         "tracked_crop",
         "fit_or_layout",
@@ -3696,6 +3715,10 @@ class SelectedVerticalFramingProposal(StrictModel):
     ]
     regions: list[SelectedFramingRegion] = Field(default_factory=list, max_length=8)
     virtual_camera_proposal: VerticalVirtualCameraProposal | None = None
+    presentation_options: list[VerticalPresentationOptionAssessment] = Field(
+        min_length=1,
+        max_length=5,
+    )
     observed_evidence: list[str] = Field(min_length=1, max_length=12)
     decision_reason: str = Field(min_length=1, max_length=1200)
     uncertainties: list[str] = Field(default_factory=list, max_length=12)
@@ -3712,6 +3735,74 @@ class SelectedVerticalFramingProposal(StrictModel):
         ]
         if len(entity_ids) != len(set(entity_ids)):
             raise ValueError("selected framing entity IDs must be unique")
+        option_modes = [option.mode for option in self.presentation_options]
+        if len(option_modes) != len(set(option_modes)):
+            raise ValueError("portrait presentation option modes must be unique")
+        option_by_mode = {
+            option.mode: option for option in self.presentation_options
+        }
+        if "single_full_bleed_crop" not in option_by_mode:
+            raise ValueError(
+                "portrait framing must assess a single full-bleed crop"
+            )
+        multi_subject_requirement = self.semantic_requirement in {
+            "group_coverage",
+            "sequential_attention",
+            "simultaneous_relation",
+        }
+        if multi_subject_requirement:
+            missing_modes = sorted(
+                {
+                    "sequential_virtual_camera",
+                    "controlled_clipping",
+                    "fit_or_layout",
+                }
+                - set(option_by_mode)
+            )
+            if missing_modes:
+                raise ValueError(
+                    "multi-subject portrait framing must assess alternatives: "
+                    + ", ".join(missing_modes)
+                )
+        if (
+            self.semantic_requirement == "single_primary"
+            and self.relation_temporal_mode != "not_applicable"
+        ):
+            raise ValueError(
+                "single-primary framing cannot claim a temporal relation"
+            )
+        if (
+            self.semantic_requirement == "sequential_attention"
+            and self.relation_temporal_mode != "sequentially_reconstructable"
+        ):
+            raise ValueError(
+                "sequential attention must be sequentially reconstructable"
+            )
+        if (
+            self.semantic_requirement == "simultaneous_relation"
+            and self.relation_temporal_mode == "not_applicable"
+        ):
+            raise ValueError(
+                "a simultaneous relation must declare whether simultaneity is "
+                "strictly required or sequentially reconstructable"
+            )
+        if self.recommended_action == "fit_or_layout":
+            fit_assessment = option_by_mode.get("fit_or_layout")
+            if fit_assessment is None or fit_assessment.verdict != "feasible":
+                raise ValueError(
+                    "fit-or-layout action requires a feasible fit/layout assessment"
+                )
+            for mode in (
+                "single_full_bleed_crop",
+                "sequential_virtual_camera",
+                "controlled_clipping",
+            ):
+                assessment = option_by_mode.get(mode)
+                if assessment is not None and assessment.verdict == "feasible":
+                    raise ValueError(
+                        "fit-or-layout cannot bypass a feasible full-bleed "
+                        f"presentation option: {mode}"
+                    )
         if self.recommended_action == "tracked_crop" and not self.regions:
             raise ValueError("tracked-crop framing requires explicit regions")
         if self.recommended_action != "tracked_crop":
@@ -3794,6 +3885,22 @@ class SelectedVerticalFramingProposal(StrictModel):
         ):
             raise ValueError(
                 "sequential attention requires sequential-focus camera phases"
+            )
+        if (
+            self.relation_temporal_mode == "sequentially_reconstructable"
+            and multi_subject_requirement
+            and proposal.composition_mode != "sequential_focus"
+        ):
+            raise ValueError(
+                "a sequentially reconstructable multi-subject relation requires "
+                "sequential-focus camera phases"
+            )
+        if (
+            self.relation_temporal_mode == "simultaneous_required"
+            and proposal.composition_mode == "sequential_focus"
+        ):
+            raise ValueError(
+                "a strictly simultaneous relation cannot use sequential focus"
             )
         if (
             self.semantic_requirement == "simultaneous_relation"

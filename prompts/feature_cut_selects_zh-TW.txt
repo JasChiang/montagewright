@@ -47,15 +47,22 @@
 - 先輸出 `vertical_coverage_intent`。`single_primary` 只適用於一個主體即可
   完整承擔章節意義；`group_coverage` 表示多個可見成員都必須至少被清楚呈現
   一次；`sequential_attention` 表示畫面本身具有可觀察的交接順序；
-  `simultaneous_relation` 只用於接觸、距離、相對位置或同時狀態必須直接同框
-  才成立的情況。多主體本身不強迫運鏡，但不得為了方便直式裁切，把共同承擔
+  `simultaneous_relation` 只用於接觸、交接、重疊、不可拆的精確空間關係或
+  同時狀態必須直接同框才成立的情況。一般外觀、功能、UI、人物或物件比較，
+  即使原片並排，也應優先分類為 `group_coverage`；若畫面有可觀察的順序則用
+  `sequential_attention`。相對大小本身不會自動要求全程同框，只要後續能在
+  同一來源尺度下依序呈現或保留短暫關係畫面。多主體本身不強迫運鏡，但不得
+  為了方便直式裁切，把共同承擔
   lineup、團體、集合、對照或交接意義的成員任意降為背景。
 - `vertical_coverage_target_descriptions` 列出真正承擔 coverage intent 的可見
   實例或局部；多主體 intent 至少列出兩個可區分的描述。它們是後續完整片段
   構圖複核的輸入，不是 bbox、座標或追蹤結果。
 - 如果一個可持續辨識的主要實例或局部能由 bbox seed + mask tracking 保留，使用 `tracked_crop`，並寫出精確、可區分相似實例的 `vertical_target_description`。
 - 若 brief 提供 `vertical_primary_target_description`，它是人工指定的直式主視覺。優先回傳 `tracked_crop`，不得為保留次要人物或背景而自行改成 `fit_with_background`。
-- 未指定人工主視覺時，若同時要保留的必要主體太寬、兩人分居左右、物件無法可靠追蹤，或單一 9:16 crop 會切掉必要資訊，才使用 `fit_with_background`。
+- 未指定人工主視覺時，單一 9:16 crop 放不下多個必要主體，不代表應立刻使用
+  `fit_with_background`。先判斷能否使用相同來源尺度依序觀看、虛擬鏡頭、
+  punch-in cut，或只裁掉不承載意義的外圍；這些都不可行，而且關係確實必須
+  同框時，才使用 `fit_with_background` 或改選更適合直式的候選。
 - `primary_center` 代表可以犧牲明確標示為次要的 context，但指定的主要實例、局部、狀態或事件證據仍須可見；不得把它誤解成可任意截斷主要證據。
 - 不得為了強行使用 crop 而犧牲任何 required entity 或 required evidence。
 - `vertical_target_description` 必須指定實例、物件層級、可見辨識特徵與排除條件；不可只寫寬泛類別名稱。
@@ -94,6 +101,9 @@
   推測，或一次 9:16 無法保留必需的 joint relation，請將
   `virtual_camera_proposal` 留空，改選其他 take、`fit_with_background`、
   split／PiP 候選或人工 review。
+- 若 A 與 B 的關係可依序重建，候選不得只因橫向過寬就留空 proposal。應建立
+  兩個可 Grounding 的 required region 與 `sequential_focus` phases；順序由
+  畫面實際資訊流決定，不得固定左→右。
 - 自動 proposal 不得授權裁掉 anchor。本機只會以 100% active-anchor
   containment 執行；任何 intentional clipping 都必須另有人工 policy。
 

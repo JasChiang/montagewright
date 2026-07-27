@@ -41,6 +41,24 @@ class _StopRequest(RuntimeError):
     pass
 
 
+def test_portrait_prompts_require_relation_timing_and_presentation_alternatives() -> None:
+    prompt_root = Path(__file__).resolve().parents[1] / "prompts"
+    selected = (
+        prompt_root / "selected_vertical_framing_zh-TW.txt"
+    ).read_text(encoding="utf-8")
+    coarse = (
+        prompt_root / "feature_cut_selects_zh-TW.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "relation_temporal_mode" in selected
+    assert "sequentially_reconstructable" in selected
+    assert "presentation_options" in selected
+    assert "sequential_virtual_camera" in selected
+    assert "不得只說「太寬」就跳到固定中央裁切" in selected
+    assert "相對大小本身不會自動要求全程同框" in coarse
+    assert "不得固定左→右" in coarse
+
+
 def test_interactions_mime_type_normalizes_common_audio_aliases() -> None:
     assert canonical_interactions_mime_type("audio/x-wav") == "audio/wav"
     assert canonical_interactions_mime_type("audio/vnd.wave") == "audio/wav"

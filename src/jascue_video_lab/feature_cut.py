@@ -7108,6 +7108,11 @@ def _refine_selected_vertical_candidate(
         "reused": reused,
         "recommended_action": proposal.recommended_action,
         "semantic_requirement": proposal.semantic_requirement,
+        "relation_temporal_mode": proposal.relation_temporal_mode,
+        "presentation_options": [
+            option.model_dump(mode="json")
+            for option in proposal.presentation_options
+        ],
         "decision_reason": proposal.decision_reason,
         "observed_evidence": proposal.observed_evidence,
         "uncertainties": proposal.uncertainties,
@@ -10807,11 +10812,14 @@ def _run_feature_cut_experiment_impl(
                         if (
                             not hard_gate_passed
                             and deferred_required_scope_fit is None
-                            and brief.vertical_fallback_strategy
-                            != "center_crop"
                             and FailureCode.NO_FEASIBLE_PRESENTATION
                             in failure_codes
                         ):
+                            # A project preference for full bleed cannot turn a
+                            # known semantic failure into a safe center crop.
+                            # Preserve the tracked required-scope envelope as a
+                            # deliberate solid-matte review layout when no
+                            # full-bleed candidate can contain the evidence.
                             scoped_fit = _vertical_required_scope_fit_filter(
                                 candidate_geometry
                             )

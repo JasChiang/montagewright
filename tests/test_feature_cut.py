@@ -1378,6 +1378,29 @@ from jascue_video_lab.shots import ShotManifest, ShotSegment
 from jascue_video_lab.storage import read_json, write_json
 
 
+def _portrait_presentation_options(
+    *,
+    single: str = "not_feasible",
+    sequential: str = "not_feasible",
+    controlled: str = "not_feasible",
+    fit: str = "not_feasible",
+) -> list[dict[str, str]]:
+    verdicts = {
+        "single_full_bleed_crop": single,
+        "sequential_virtual_camera": sequential,
+        "controlled_clipping": controlled,
+        "fit_or_layout": fit,
+    }
+    return [
+        {
+            "mode": mode,
+            "verdict": verdict,
+            "observable_reason": f"{mode} is {verdict} in this fixture.",
+        }
+        for mode, verdict in verdicts.items()
+    ]
+
+
 def test_open_edit_hard_region_canonicalization_preserves_soft_visibility() -> None:
     payload = {
         "shots": [
@@ -2259,7 +2282,11 @@ def test_selected_framing_allows_scale_locked_sequential_comparison() -> None:
         event_id="event-a",
         frame_id="RF000001",
         semantic_requirement="simultaneous_relation",
+        relation_temporal_mode="sequentially_reconstructable",
         recommended_action="tracked_crop",
+        presentation_options=_portrait_presentation_options(
+            sequential="feasible",
+        ),
         regions=[
             {
                 "region_id": "subject-a",
@@ -2321,7 +2348,11 @@ def test_sequential_comparison_rejects_scale_changing_phase() -> None:
             event_id="event-scale-change",
             frame_id="RF000001",
             semantic_requirement="simultaneous_relation",
+            relation_temporal_mode="sequentially_reconstructable",
             recommended_action="tracked_crop",
+            presentation_options=_portrait_presentation_options(
+                sequential="feasible",
+            ),
             regions=[
                 {
                     "region_id": region_id,
@@ -2376,7 +2407,11 @@ def test_selected_framing_allows_overlapping_multi_subject_handoff() -> None:
         event_id="event-overlap",
         frame_id="RF000001",
         semantic_requirement="simultaneous_relation",
+        relation_temporal_mode="sequentially_reconstructable",
         recommended_action="tracked_crop",
+        presentation_options=_portrait_presentation_options(
+            sequential="feasible",
+        ),
         regions=[
             {
                 "region_id": region_id,
@@ -2424,7 +2459,11 @@ def test_selected_framing_group_coverage_requires_multiple_hard_members() -> Non
             event_id="event-collapsed-group",
             frame_id="RF000001",
             semantic_requirement="group_coverage",
+            relation_temporal_mode="not_applicable",
             recommended_action="tracked_crop",
+            presentation_options=_portrait_presentation_options(
+                single="feasible",
+            ),
             regions=[
                 {
                     "region_id": "center",
@@ -2475,7 +2514,11 @@ def test_selected_framing_group_coverage_accepts_atomic_compound_group() -> None
         event_id="event-compound-group",
         frame_id="RF000001",
         semantic_requirement="group_coverage",
+        relation_temporal_mode="not_applicable",
         recommended_action="tracked_crop",
+        presentation_options=_portrait_presentation_options(
+            single="feasible",
+        ),
         regions=[
             {
                 "region_id": "compound-group",
@@ -2532,7 +2575,11 @@ def test_selected_framing_group_coverage_accepts_overlapping_sequence() -> None:
         event_id="event-group",
         frame_id="RF000001",
         semantic_requirement="group_coverage",
+        relation_temporal_mode="sequentially_reconstructable",
         recommended_action="tracked_crop",
+        presentation_options=_portrait_presentation_options(
+            sequential="feasible",
+        ),
         regions=[
             {
                 "region_id": region_id,
@@ -2566,7 +2613,11 @@ def test_selected_vertical_framing_runs_once_then_reuses_content_cache(
         event_id="catalog-scene",
         frame_id="RF000001",
         semantic_requirement="single_primary",
+        relation_temporal_mode="not_applicable",
         recommended_action="tracked_crop",
+        presentation_options=_portrait_presentation_options(
+            single="feasible",
+        ),
         regions=[
             {
                 "region_id": "primary",
@@ -2728,7 +2779,11 @@ def test_fit_framing_preserves_but_does_not_execute_surplus_camera_proposal() ->
         event_id="event-fit",
         frame_id="RF000001",
         semantic_requirement="simultaneous_relation",
+        relation_temporal_mode="simultaneous_required",
         recommended_action="fit_or_layout",
+        presentation_options=_portrait_presentation_options(
+            fit="feasible",
+        ),
         regions=[
             {
                 "region_id": "left",
@@ -2756,6 +2811,117 @@ def test_fit_framing_preserves_but_does_not_execute_surplus_camera_proposal() ->
     )
     assert proposal.recommended_action == "fit_or_layout"
     assert proposal.virtual_camera_proposal == surplus
+
+
+def test_fit_framing_cannot_bypass_feasible_sequential_virtual_camera() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="cannot bypass a feasible full-bleed presentation option",
+    ):
+        SelectedVerticalFramingProposal(
+            candidate_id="candidate-premature-fit",
+            source_asset_id="sha256:" + "c" * 64,
+            event_id="event-comparison",
+            frame_id="RF000001",
+            semantic_requirement="simultaneous_relation",
+            relation_temporal_mode="sequentially_reconstructable",
+            recommended_action="fit_or_layout",
+            regions=[
+                {
+                    "region_id": "first",
+                    "target_description": "the first visible comparison subject",
+                    "role": "required",
+                },
+                {
+                    "region_id": "second",
+                    "target_description": "the second visible comparison subject",
+                    "role": "required",
+                },
+            ],
+            presentation_options=_portrait_presentation_options(
+                sequential="feasible",
+                fit="feasible",
+            ),
+            observed_evidence=[
+                "Both subjects can be inspected independently in one source shot."
+            ],
+            decision_reason="Sequential viewing remains a full-bleed option.",
+            confidence=0.8,
+            model_provenance=ModelProvenance(
+                model_id=MODEL_ID,
+                api="gemini_interactions",
+                sdk="google-genai",
+                sdk_version="test",
+                run_id="test",
+                generated_at="test",
+            ),
+        )
+
+
+def test_strictly_simultaneous_relation_rejects_sequential_focus() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="strictly simultaneous relation cannot use sequential focus",
+    ):
+        SelectedVerticalFramingProposal(
+            candidate_id="candidate-contact",
+            source_asset_id="sha256:" + "d" * 64,
+            event_id="event-contact",
+            frame_id="RF000001",
+            semantic_requirement="simultaneous_relation",
+            relation_temporal_mode="simultaneous_required",
+            recommended_action="tracked_crop",
+            regions=[
+                {
+                    "region_id": "giver",
+                    "target_description": "the visible giver at contact",
+                    "role": "required",
+                },
+                {
+                    "region_id": "receiver",
+                    "target_description": "the visible receiver at contact",
+                    "role": "required",
+                },
+            ],
+            virtual_camera_proposal=VerticalVirtualCameraProposal(
+                composition_mode="sequential_focus",
+                phases=[
+                    VerticalVirtualCameraProposalPhase(
+                        phase_id="giver",
+                        start_progress=0.0,
+                        end_progress=0.5,
+                        anchor_region_ids=["giver"],
+                        observable_predicate="The giver is visible.",
+                        transition_condition="The receiver becomes relevant.",
+                        editorial_reason="Show the giver.",
+                    ),
+                    VerticalVirtualCameraProposalPhase(
+                        phase_id="receiver",
+                        start_progress=0.5,
+                        end_progress=1.0,
+                        anchor_region_ids=["receiver"],
+                        observable_predicate="The receiver is visible.",
+                        transition_condition="Hold to the end.",
+                        editorial_reason="Show the receiver.",
+                    ),
+                ],
+                proposal_reason="This would hide the required contact relation.",
+            ),
+            presentation_options=_portrait_presentation_options(
+                sequential="feasible",
+            ),
+            observed_evidence=["The transfer exists only while both people touch it."],
+            decision_reason="The exact contact must remain simultaneous.",
+            confidence=0.8,
+            model_provenance=ModelProvenance(
+                model_id=MODEL_ID,
+                api="gemini_interactions",
+                sdk="google-genai",
+                sdk_version="test",
+                run_id="test",
+                generated_at="test",
+            ),
+        )
 
 
 def test_virtual_camera_proposal_cannot_reference_untracked_or_fit_regions() -> None:
@@ -5503,7 +5669,11 @@ def test_simultaneous_relation_rejects_one_unbound_atomic_core() -> None:
             event_id="comparison",
             frame_id="RF000001",
             semantic_requirement="simultaneous_relation",
+            relation_temporal_mode="simultaneous_required",
             recommended_action="tracked_crop",
+            presentation_options=_portrait_presentation_options(
+                single="feasible",
+            ),
             regions=[
                 {
                     "region_id": "contact-core",
@@ -5556,7 +5726,11 @@ def test_selected_framing_cannot_weaken_group_coverage() -> None:
         event_id="group",
         frame_id="RF000001",
         semantic_requirement="single_primary",
+        relation_temporal_mode="not_applicable",
         recommended_action="tracked_crop",
+        presentation_options=_portrait_presentation_options(
+            single="feasible",
+        ),
         regions=[
             {
                 "region_id": "one",
