@@ -8,14 +8,18 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from .media import sha256_file
-from .models import MusicAssemblyRenderManifest
+from .models import MusicAssemblyRenderManifest, MusicEditPlanV2
+from .models import MusicEditRenderManifestV2
 from .music_assembly import (
     MUSIC_ASSEMBLY_BINDING_FILENAME,
     MUSIC_ASSEMBLY_PLAN_FILENAME,
     MUSIC_ASSEMBLY_RENDER_FILENAME,
+    MUSIC_EDIT_PLAN_V2_FILENAME,
+    MUSIC_EDIT_RENDER_V2_FILENAME,
     MusicAssemblyError,
     load_music_assembly_artifacts,
     music_assembly_plan_sha256,
+    music_edit_plan_v2_sha256,
 )
 from .storage import read_json, utc_now, write_json
 
@@ -124,10 +128,19 @@ def _validate_music_assembly_evidence(
     music_probe: Mapping[str, Any],
     artifact_dir: Path,
 ) -> dict[str, Any]:
-    """Validate the immutable plan → binding → render → PCM evidence chain."""
+    """Validate a reviewed v1 or v2 plan → render → PCM evidence chain."""
+
+    resolved_dir = artifact_dir.expanduser().resolve(strict=True)
+    v2_plan_path = resolved_dir / MUSIC_EDIT_PLAN_V2_FILENAME
+    v2_render_path = resolved_dir / MUSIC_EDIT_RENDER_V2_FILENAME
+    if v2_plan_path.is_file() or v2_render_path.is_file():
+        return _validate_music_edit_v2_evidence(
+            music_path=music_path,
+            music_probe=music_probe,
+            artifact_dir=resolved_dir,
+        )
 
     try:
-        resolved_dir = artifact_dir.expanduser().resolve(strict=True)
         plan, binding = load_music_assembly_artifacts(resolved_dir)
         plan_path = resolved_dir / MUSIC_ASSEMBLY_PLAN_FILENAME
         binding_path = resolved_dir / MUSIC_ASSEMBLY_BINDING_FILENAME
@@ -234,6 +247,116 @@ def _validate_music_assembly_evidence(
     }
 
 
+def _validate_music_edit_v2_evidence(
+    *,
+    music_path: Path,
+    music_probe: Mapping[str, Any],
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    """Validate the reviewed multi-passage plan and deterministic PCM render."""
+
+    plan_path = artifact_dir / MUSIC_EDIT_PLAN_V2_FILENAME
+    render_path = artifact_dir / MUSIC_EDIT_RENDER_V2_FILENAME
+    try:
+        plan = MusicEditPlanV2.model_validate(read_json(plan_path))
+        render = MusicEditRenderManifestV2.model_validate(read_json(render_path))
+    except (OSError, ValueError) as error:
+        raise FinalDeliveryError(
+            "music edit v2 evidence could not be loaded and validated"
+        ) from error
+
+    errors: list[str] = []
+    music_sha256 = sha256_file(music_path)
+    canonical_plan_sha256 = music_edit_plan_v2_sha256(plan)
+    lock_path = Path(plan.music_lock_path).expanduser().resolve()
+    if render.edit_id != plan.edit_id:
+        errors.append("render edit ID does not match the plan")
+    if render.edit_plan_canonical_sha256 != canonical_plan_sha256:
+        errors.append("render canonical plan hash does not match the saved plan")
+    if Path(render.output_audio_path).expanduser().resolve() != music_path:
+        errors.append("render manifest output path is not the supplied music file")
+    if render.output_audio_sha256 != music_sha256:
+        errors.append("render manifest output hash does not match the music file")
+    if plan.music_id != f"sha256:{render.source_audio_sha256}":
+        errors.append("render source hash is not the source music locked by the plan")
+    if not lock_path.is_file() or sha256_file(lock_path) != plan.music_lock_sha256:
+        errors.append("reviewed music lock no longer matches the edit plan")
+    if not render.qc_passed or render.qc_errors:
+        errors.append("music edit render manifest did not pass its own QC")
+    if render.internal_join_count != len(plan.joins):
+        errors.append("render join count does not match the edit plan")
+
+    music_stream = _single_stream(
+        music_probe,
+        "audio",
+        source_label="rendered music",
+    )
+    try:
+        probed_sample_rate = int(str(music_stream["sample_rate"]))
+        probed_channels = int(str(music_stream["channels"]))
+    except (KeyError, TypeError, ValueError) as error:
+        raise FinalDeliveryError(
+            "ffprobe omitted rendered-music channel metadata"
+        ) from error
+    probed_samples = _stream_duration_samples(music_stream)
+    if probed_sample_rate != 48_000:
+        errors.append("music edit v2 must render at 48 kHz")
+    if probed_channels != 2:
+        errors.append("music edit v2 must render stereo PCM")
+    if abs(probed_samples - render.probed_output_samples) > (
+        render.duration_tolerance_samples
+    ):
+        errors.append("rendered music sample duration differs from its manifest")
+    if render.expected_output_samples != plan.output_duration_samples:
+        errors.append("render expected duration does not match the edit plan")
+    if errors:
+        raise FinalDeliveryError(
+            "music edit v2 evidence validation failed: " + "; ".join(errors)
+        )
+
+    return {
+        "status": "validated",
+        "artifact_dir": str(artifact_dir),
+        "assembly_id": plan.edit_id,
+        "assembly_mode": "reviewed_multi_passage_v2",
+        "join_count": len(plan.joins),
+        "ending_policy": plan.ending.mode,
+        "source_spans": [
+            {
+                "span_id": span.span_id,
+                "section_id": span.section_id,
+                "source_start_sample": span.source_start_sample,
+                "source_end_sample": span.source_end_sample,
+                "output_start_sample": span.output_start_sample,
+                "output_end_sample": span.output_end_sample,
+            }
+            for span in plan.spans
+        ],
+        "joins": [join.model_dump(mode="json") for join in plan.joins],
+        "plan": {
+            "path": str(plan_path),
+            "sha256": sha256_file(plan_path),
+            "canonical_sha256": canonical_plan_sha256,
+            "music_lock_path": str(lock_path),
+            "music_lock_sha256": plan.music_lock_sha256,
+        },
+        "binding": None,
+        "render": {
+            "path": str(render_path),
+            "sha256": sha256_file(render_path),
+            "render_id": render.render_id,
+            "output_audio_sha256": render.output_audio_sha256,
+            "sample_rate": probed_sample_rate,
+            "channels": probed_channels,
+            "expected_output_samples": render.expected_output_samples,
+            "probed_output_samples": render.probed_output_samples,
+            "duration_tolerance_samples": render.duration_tolerance_samples,
+            "fade_out_samples": render.fade_out_samples,
+            "qc_passed": render.qc_passed,
+        },
+    }
+
+
 def assemble_music_only_delivery(
     *,
     picture_path: Path,
@@ -245,7 +368,7 @@ def assemble_music_only_delivery(
     artifact_bindings: Mapping[str, str] | None = None,
     duration_tolerance_ms: int = 100,
 ) -> FinalDeliveryResult:
-    """Mux one continuous soundtrack without altering editorial picture timing.
+    """Mux one reviewed soundtrack without altering editorial picture timing.
 
     This stage is intentionally not an editor. It refuses materially different
     picture/music durations instead of trimming music, repeating picture, or
@@ -385,7 +508,7 @@ def assemble_music_only_delivery(
             "probe": music_probe,
             "assembly_mode": assembly_evidence["assembly_mode"],
             "join_count": assembly_evidence["join_count"],
-            "internal_music_edits": [],
+            "internal_music_edits": assembly_evidence.get("joins", []),
             "assembly_evidence": assembly_evidence,
         },
         "synchronization": {
@@ -407,8 +530,8 @@ def assemble_music_only_delivery(
             "delivery_audio": "continuous_music_only",
             "reason": (
                 "prevent overlapping rush audio and preserve the approved "
-                "single-interval soundtrack flow validated by MusicAssembly "
-                "plan, binding, and render evidence"
+                "reviewed soundtrack flow validated by immutable planning and "
+                "render evidence"
             ),
         },
         "artifact_bindings": dict(artifact_bindings or {}),

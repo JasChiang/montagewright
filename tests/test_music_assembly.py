@@ -433,6 +433,43 @@ def test_render_single_interval_is_48k_stereo_and_preserves_natural_end(
     assert abs(last_left) > 1_000
 
 
+def test_render_single_interval_reuses_exact_hash_bound_render(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-tone.wav"
+    _write_tone(source, duration_seconds=6.2)
+    music_lock, lock_path = _saved_lock(
+        tmp_path,
+        duration_seconds=6.2,
+        music_id=f"sha256:{sha256_file(source)}",
+        section_start_sample=round(SAMPLE_RATE * 2.2),
+    )
+    plan = plan_single_interval_music_assembly(
+        music_lock,
+        music_lock_path=lock_path,
+        target_duration_ms=4_000,
+        minimum_duration_ms=3_500,
+        maximum_duration_ms=4_500,
+        preferred_phrase_bars=(2, 1),
+    )
+    output = tmp_path / "rendered" / "music.wav"
+    first = render_single_interval_music_assembly(
+        source,
+        plan,
+        output,
+        tmp_path / "artifacts",
+    )
+    second = render_single_interval_music_assembly(
+        source,
+        plan,
+        output,
+        tmp_path / "artifacts",
+    )
+
+    assert second.manifest == first.manifest
+    assert second.output_audio_path == first.output_audio_path
+
+
 def test_render_phrase_grid_ending_applies_short_fade_and_ends_near_zero(
     tmp_path: Path,
 ) -> None:
@@ -644,3 +681,12 @@ def test_render_music_edit_v2_crossfades_and_preserves_exact_duration(
         assert output_wave.getframerate() == SAMPLE_RATE
         assert output_wave.getnchannels() == 2
         assert abs(output_wave.getnframes() - (SAMPLE_RATE * 8 - 480)) <= 8
+
+    reused = render_reviewed_music_edit_v2(
+        source,
+        plan,
+        output,
+        tmp_path / "music-edit-artifacts",
+    )
+    assert reused.manifest == result.manifest
+    assert reused.output_audio_path == result.output_audio_path

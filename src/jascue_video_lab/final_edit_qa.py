@@ -20,7 +20,7 @@ from .storage import read_json, utc_now, write_json
 
 FINAL_EDIT_QA_CONTRACT_VERSION = "final-edit-qa-v1"
 FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v1"
-FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v1"
+FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v2"
 FINAL_EDIT_QA_GENERATION_CONFIG = {
     "thinking_level": "low",
     "max_output_tokens": 8192,
@@ -672,13 +672,14 @@ def _validate_result(
                 raise ValueError(
                     "crop QA text-integrity applicability changed the manifest contract"
                 )
-            tracking_expected = bool(expected["tracking_expected"])
-            if (
-                observation.tracking_stability.assessment == "not_applicable"
-            ) == tracking_expected:
-                raise ValueError(
-                    "crop QA tracking applicability changed the manifest contract"
-                )
+            # ``tracking_expected`` records the renderer's declared intent; it
+            # is not proof that visible camera motion survived the completed
+            # render.  A crop reviewer returning ``not_applicable`` for an
+            # expected tracked segment (or observing motion in an otherwise
+            # static-intent segment) is therefore a useful QA discrepancy, not
+            # an attempt to mutate the manifest contract.  Keep the finding
+            # intact for human review instead of rejecting an already-paid
+            # response and asking the model again.
 
 
 def _normalize_application_owned_fields(

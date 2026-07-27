@@ -424,6 +424,163 @@ def music_edit_plan_v2_sha256(plan: MusicEditPlanV2) -> str:
     return _canonical_hash(validated)
 
 
+def plan_contiguous_reviewed_music_edit_v2(
+    music_lock: MusicMapLock,
+    *,
+    music_lock_path: Path,
+    target_duration_ms: int,
+    minimum_duration_ms: int,
+    maximum_duration_ms: int,
+    ending_fade_out_ms: int = 120,
+) -> MusicEditPlanV2:
+    """Fit a continuous reviewed section run with bounded micro-crossfades.
+
+    This is the deterministic fallback when no single phrase-grid interval can
+    match picture duration closely enough. It never reorders or repeats source
+    audio. Up to four adjacent reviewed sections are retained in source order;
+    a locked cue may close the final section and tiny crossfades distributed
+    across section boundaries absorb only the residual duration mismatch.
+    """
+
+    if not minimum_duration_ms <= target_duration_ms <= maximum_duration_ms:
+        raise ValueError("target duration must lie inside the requested range")
+    sample_rate = music_lock.master_sample_rate
+    target_samples = _milliseconds_to_samples(target_duration_ms, sample_rate)
+    minimum_samples = _milliseconds_to_samples(minimum_duration_ms, sample_rate)
+    maximum_samples = _milliseconds_to_samples(maximum_duration_ms, sample_rate)
+    cue_candidates_by_section: dict[str, list[tuple[int, str | None]]] = {}
+    for section in music_lock.sections:
+        candidates_by_sample = {
+            cue.sample_index: cue.cue_id
+            for cue in music_lock.cues
+            if section.start_sample < cue.sample_index <= section.end_sample
+        }
+        candidates_by_sample.setdefault(section.end_sample, None)
+        cue_candidates_by_section[section.section_id] = sorted(
+            candidates_by_sample.items()
+        )
+
+    candidates: list[
+        tuple[
+            tuple[int, int, int, int],
+            list[MusicEditSegmentRequestV2],
+            list[MusicEditJoinRequestV2],
+        ]
+    ] = []
+    sections = list(music_lock.sections)
+    for start_index, start_section in enumerate(sections):
+        for end_index in range(
+            start_index + 1,
+            min(len(sections), start_index + 4),
+        ):
+            end_section = sections[end_index]
+            join_count = end_index - start_index
+            source_start = start_section.start_sample
+            for source_end, end_cue_id in cue_candidates_by_section[
+                end_section.section_id
+            ]:
+                raw_duration = source_end - source_start
+                if raw_duration < minimum_samples:
+                    continue
+                desired_reduction_samples = max(
+                    0,
+                    raw_duration - target_samples,
+                )
+                desired_reduction_ms = round(
+                    desired_reduction_samples * 1000 / sample_rate
+                )
+                if desired_reduction_ms > join_count * 200:
+                    continue
+                if 0 < desired_reduction_ms < 5:
+                    desired_reduction_ms = 0
+                crossfade_ms = [0] * join_count
+                if desired_reduction_ms:
+                    base, remainder = divmod(
+                        desired_reduction_ms,
+                        join_count,
+                    )
+                    crossfade_ms = [
+                        base + (1 if index < remainder else 0)
+                        for index in range(join_count)
+                    ]
+                    if any(
+                        value != 0 and not 5 <= value <= 200
+                        for value in crossfade_ms
+                    ):
+                        continue
+                reduction_samples = sum(
+                    round(Fraction(value * sample_rate, 1000))
+                    for value in crossfade_ms
+                )
+                output_duration = raw_duration - reduction_samples
+                if not minimum_samples <= output_duration <= maximum_samples:
+                    continue
+                selected_sections = sections[start_index : end_index + 1]
+                segment_requests = [
+                    MusicEditSegmentRequestV2(
+                        section_id=section.section_id,
+                        semantic_role=(
+                            "intro"
+                            if index == 0
+                            else "release"
+                            if index == len(selected_sections) - 1
+                            else "build"
+                        ),
+                        energy_band="unknown",
+                        end_cue_id=(
+                            end_cue_id
+                            if index == len(selected_sections) - 1
+                            and source_end != section.end_sample
+                            else None
+                        ),
+                    )
+                    for index, section in enumerate(selected_sections)
+                ]
+                join_requests = [
+                    MusicEditJoinRequestV2(
+                        join_type=(
+                            "micro_crossfade" if duration_ms else "cut"
+                        ),
+                        alignment="section_boundary",
+                        energy_transition="unknown",
+                        editorial_reason=(
+                            "Preserve adjacent reviewed source sections while "
+                            "absorbing only the picture-duration residual."
+                        ),
+                        crossfade_ms=duration_ms,
+                    )
+                    for duration_ms in crossfade_ms
+                ]
+                candidates.append(
+                    (
+                        (
+                            start_index,
+                            abs(output_duration - target_samples),
+                            join_count,
+                            source_end,
+                        ),
+                        segment_requests,
+                        join_requests,
+                    )
+                )
+    if not candidates:
+        raise MusicAssemblyError(
+            "no contiguous reviewed-section music edit satisfies the requested duration"
+        )
+    _, segments, joins = min(candidates, key=lambda item: item[0])
+    return plan_reviewed_music_edit_v2(
+        music_lock,
+        music_lock_path=music_lock_path,
+        segments=segments,
+        joins=joins,
+        target_duration_ms=target_duration_ms,
+        minimum_duration_ms=minimum_duration_ms,
+        maximum_duration_ms=maximum_duration_ms,
+        ending_mode="phrase_fade_out",
+        ending_fade_out_ms=ending_fade_out_ms,
+    )
+
+
 def plan_reviewed_music_edit_v2(
     music_lock: MusicMapLock,
     *,
@@ -921,10 +1078,32 @@ def render_single_interval_music_assembly(
         raise ValueError("source and rendered music paths must differ")
     resolved_artifact_dir = output_dir.expanduser().resolve()
     manifest_path = resolved_artifact_dir / MUSIC_ASSEMBLY_RENDER_FILENAME
-    if resolved_output.exists():
-        raise FileExistsError("refusing to overwrite an existing rendered audio file")
-    if manifest_path.exists():
-        raise FileExistsError("refusing to overwrite an existing render manifest")
+    if resolved_output.exists() or manifest_path.exists():
+        if not resolved_output.is_file() or not manifest_path.is_file():
+            raise FileExistsError(
+                "incomplete existing music assembly cannot be resumed safely"
+            )
+        existing = MusicAssemblyRenderManifest.model_validate(
+            read_json(manifest_path)
+        )
+        expected_plan_hash = music_assembly_plan_sha256(validated)
+        if (
+            existing.assembly_id != validated.assembly_id
+            or existing.assembly_plan_canonical_sha256 != expected_plan_hash
+            or existing.source_audio_sha256 != source_sha256
+            or Path(existing.output_audio_path).resolve() != resolved_output
+            or existing.output_audio_sha256 != sha256_file(resolved_output)
+            or not existing.qc_passed
+        ):
+            raise FileExistsError(
+                "existing music assembly is not bound to the requested "
+                "source, plan, output, and passing QC"
+            )
+        return MusicAssemblyRenderResult(
+            output_audio_path=resolved_output,
+            manifest_path=manifest_path,
+            manifest=existing,
+        )
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
     resolved_artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1132,10 +1311,42 @@ def render_reviewed_music_edit_v2(
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
     plan_path = artifact_dir / MUSIC_EDIT_PLAN_V2_FILENAME
     manifest_path = artifact_dir / MUSIC_EDIT_RENDER_V2_FILENAME
-    if resolved_output.exists():
-        raise FileExistsError("refusing to overwrite an existing music edit")
-    if manifest_path.exists():
-        raise FileExistsError("refusing to overwrite an existing render manifest")
+    if resolved_output.exists() or manifest_path.exists():
+        if not resolved_output.is_file() or not manifest_path.is_file():
+            raise FileExistsError(
+                "incomplete existing music edit cannot be resumed safely"
+            )
+        existing = MusicEditRenderManifestV2.model_validate(
+            read_json(manifest_path)
+        )
+        expected_plan_hash = music_edit_plan_v2_sha256(validated)
+        if (
+            existing.edit_id != validated.edit_id
+            or existing.edit_plan_canonical_sha256 != expected_plan_hash
+            or existing.source_audio_sha256 != source_sha256
+            or Path(existing.output_audio_path).resolve() != resolved_output
+            or existing.output_audio_sha256 != sha256_file(resolved_output)
+            or not existing.qc_passed
+        ):
+            raise FileExistsError(
+                "existing music edit is not bound to the requested source, "
+                "plan, output, and passing QC"
+            )
+        if plan_path.is_file():
+            saved_plan = MusicEditPlanV2.model_validate(read_json(plan_path))
+            if saved_plan != validated:
+                raise FileExistsError(
+                    "existing music edit plan differs from the requested plan"
+                )
+        else:
+            raise FileExistsError(
+                "existing music edit is missing its immutable plan artifact"
+            )
+        return MusicEditRenderResultV2(
+            output_audio_path=resolved_output,
+            manifest_path=manifest_path,
+            manifest=existing,
+        )
     if plan_path.exists():
         saved_plan = MusicEditPlanV2.model_validate(read_json(plan_path))
         if saved_plan != validated:

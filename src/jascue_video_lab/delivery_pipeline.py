@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -10,7 +12,10 @@ from .gemini import GeminiLabClient, MODEL_ID
 from .media import probe_video, sha256_file
 from .music import MusicMapLock
 from .music_assembly import (
+    MusicAssemblyError,
+    plan_contiguous_reviewed_music_edit_v2,
     plan_single_interval_music_assembly,
+    render_reviewed_music_edit_v2,
     render_single_interval_music_assembly,
     write_music_assembly_artifacts,
 )
@@ -57,6 +62,79 @@ def _qa_disposition(execution: Any) -> str:
     return disposition
 
 
+def _picture_video_duration_ms(path: Path) -> int:
+    """Return authoritative picture duration from the video stream timeline."""
+
+    media = probe_video(path)
+    video = getattr(media, "video", None)
+    duration_ts = getattr(video, "duration_ts", None)
+    if duration_ts is None:
+        return media.duration_ms
+    time_base = Fraction(
+        video.time_base.numerator,
+        video.time_base.denominator,
+    )
+    return round(duration_ts * time_base * 1000)
+
+
+def _load_reusable_picture_result(
+    picture_dir: Path,
+    *,
+    catalog_path: Path,
+    brief_path: Path,
+    music_path: Path,
+) -> dict[str, Any]:
+    """Resume downstream delivery only from a completed, hash-bound picture run."""
+
+    result_path = picture_dir / "result.json"
+    status_path = picture_dir / "run-status.json"
+    manifest_path = picture_dir / "render-manifest.json"
+    result = read_json(result_path)
+    status = read_json(status_path)
+    manifest = read_json(manifest_path)
+    if not isinstance(result, dict) or not isinstance(status, dict):
+        raise DeliveryPipelineBlocked("reusable picture artifacts are malformed")
+    if (
+        status.get("stage") != "completed"
+        or status.get("terminal") is not True
+        or status.get("media_rendered") is not True
+        or result.get("media_rendered") is not True
+    ):
+        raise DeliveryPipelineBlocked(
+            "picture resume requires a completed, rendered feature-cut run"
+        )
+    binding_path = Path(str(manifest["feature_plan_binding"])).resolve(strict=True)
+    binding = read_json(binding_path)
+    expected_hashes = {
+        "catalog_sha256": sha256_file(catalog_path.expanduser().resolve(strict=True)),
+        "brief_sha256": sha256_file(brief_path.expanduser().resolve(strict=True)),
+        "music_sha256": sha256_file(music_path.expanduser().resolve(strict=True)),
+    }
+    for field, expected in expected_hashes.items():
+        if binding.get(field) != expected:
+            raise DeliveryPipelineBlocked(
+                f"picture resume rejected because {field} changed"
+            )
+    if Path(str(result["manifest_path"])).resolve(strict=True) != manifest_path:
+        raise DeliveryPipelineBlocked(
+            "picture result references an unexpected render manifest"
+        )
+    for aspect_key, manifest_key in (
+        ("horizontal", "horizontal"),
+        ("vertical", "vertical"),
+    ):
+        output_value = result.get(f"{aspect_key}_output")
+        if output_value is None:
+            continue
+        output_path = Path(str(output_value)).resolve(strict=True)
+        media = manifest.get(manifest_key, {}).get("media", {})
+        if media.get("sha256") != sha256_file(output_path):
+            raise DeliveryPipelineBlocked(
+                f"picture resume rejected because {aspect_key} output changed"
+            )
+    return result
+
+
 def run_feature_delivery_pipeline(
     *,
     feature_cut_kwargs: Mapping[str, Any],
@@ -66,6 +144,7 @@ def run_feature_delivery_pipeline(
     output_dir: Path,
     model_id: str = MODEL_ID,
     execution_profile: str = "production_review",
+    reuse_picture_result: bool = False,
 ) -> dict[str, Any]:
     """Run picture → continuous music → final mux → final QA as one chain.
 
@@ -94,7 +173,15 @@ def run_feature_delivery_pipeline(
         kwargs["music_path"] = music_path
         kwargs["music_lock_path"] = music_lock_path
         kwargs["execution_profile"] = execution_profile
-        feature_result = run_feature_cut_experiment(**kwargs)
+        if reuse_picture_result:
+            feature_result = _load_reusable_picture_result(
+                resolved_output / "picture",
+                catalog_path=Path(kwargs["catalog_path"]),
+                brief_path=brief_path,
+                music_path=music_path,
+            )
+        else:
+            feature_result = run_feature_cut_experiment(**kwargs)
         outputs["feature_cut"] = feature_result
         picture_media_rendered = bool(feature_result.get("media_rendered"))
         picture_outputs_present = any(
@@ -130,23 +217,48 @@ def run_feature_delivery_pipeline(
             if picture_value is None:
                 continue
             picture = Path(str(picture_value)).resolve(strict=True)
-            picture_duration_ms = probe_video(picture).duration_ms
+            picture_duration_ms = _picture_video_duration_ms(picture)
             aspect_dir = resolved_output / "aspects" / aspect_key
-            assembly_dir = aspect_dir / "music-assembly"
-            plan = plan_single_interval_music_assembly(
-                music_lock,
-                music_lock_path=resolved_lock_path,
-                target_duration_ms=picture_duration_ms,
-                minimum_duration_ms=max(1, picture_duration_ms - 100),
-                maximum_duration_ms=picture_duration_ms + 100,
+            assembly_key = hashlib.sha256(
+                (
+                    "feature-delivery-music-assembly-v2:"
+                    f"{sha256_file(picture)}:"
+                    f"{picture_duration_ms}:"
+                    f"{sha256_file(resolved_lock_path)}"
+                ).encode("utf-8")
+            ).hexdigest()
+            assembly_dir = (
+                aspect_dir / "music-assembly" / "runs" / assembly_key
             )
-            write_music_assembly_artifacts(plan, output_dir=assembly_dir)
-            rendered_music = render_single_interval_music_assembly(
-                resolved_music,
-                plan,
-                assembly_dir / "music.wav",
-                assembly_dir,
-            )
+            try:
+                plan = plan_single_interval_music_assembly(
+                    music_lock,
+                    music_lock_path=resolved_lock_path,
+                    target_duration_ms=picture_duration_ms,
+                    minimum_duration_ms=max(1, picture_duration_ms - 100),
+                    maximum_duration_ms=picture_duration_ms + 100,
+                )
+                write_music_assembly_artifacts(plan, output_dir=assembly_dir)
+                rendered_music = render_single_interval_music_assembly(
+                    resolved_music,
+                    plan,
+                    assembly_dir / "music.wav",
+                    assembly_dir,
+                )
+            except MusicAssemblyError:
+                edit_plan = plan_contiguous_reviewed_music_edit_v2(
+                    music_lock,
+                    music_lock_path=resolved_lock_path,
+                    target_duration_ms=picture_duration_ms,
+                    minimum_duration_ms=max(1, picture_duration_ms - 100),
+                    maximum_duration_ms=picture_duration_ms + 100,
+                )
+                rendered_music = render_reviewed_music_edit_v2(
+                    resolved_music,
+                    edit_plan,
+                    assembly_dir / "music.wav",
+                    assembly_dir,
+                )
             delivery = assemble_music_only_delivery(
                 picture_path=picture,
                 music_path=rendered_music.output_audio_path,

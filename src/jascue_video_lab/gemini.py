@@ -67,6 +67,9 @@ from .storage import append_error, read_json, utc_now, write_json
 MODEL_ID = os.environ.get("JASCUE_GEMINI_MODEL", "gemini-3.6-flash")
 API_NAME = "gemini_interactions"
 SDK_NAME = "google-genai"
+SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION = (
+    "selected-vertical-framing-normalization-v2"
+)
 
 
 def canonical_interactions_mime_type(mime_type: str) -> str:
@@ -136,6 +139,59 @@ def canonicalize_selected_vertical_framing_output(
         if isinstance(region, dict)
         and region.get("role") == "required"
     }
+    controlled_clipping_feasible = any(
+        isinstance(option, dict)
+        and option.get("mode") == "controlled_clipping"
+        and option.get("verdict") == "feasible"
+        for option in payload.get("presentation_options", [])
+    )
+    if (
+        action == "tracked_crop"
+        and payload.get("semantic_requirement") == "simultaneous_relation"
+        and controlled_clipping_feasible
+        and isinstance(regions_value, list)
+    ):
+        for index, region in enumerate(regions_value):
+            if (
+                not isinstance(region, dict)
+                or region.get("role") != "required"
+                or region.get("kind")
+                in {"text_region", "ui_region", "graphic"}
+            ):
+                continue
+            if (
+                region.get("entity_id") is not None
+                and region.get("evidence_role") != "relation_carrier"
+                and region.get("evidence_role") != "relation_participant"
+            ):
+                changes.append(
+                    {
+                        "field": f"regions[{index}].evidence_role",
+                        "from": region.get("evidence_role"),
+                        "to": "relation_participant",
+                        "reason": (
+                            "bound_required_regions_in_an_explicit_simultaneous_"
+                            "relation_are_relation_participants"
+                        ),
+                    }
+                )
+                region["evidence_role"] = "relation_participant"
+            if (
+                region.get("atomic") is True
+                and region.get("evidence_role") != "relation_carrier"
+            ):
+                changes.append(
+                    {
+                        "field": f"regions[{index}].atomic",
+                        "from": True,
+                        "to": False,
+                        "reason": (
+                            "controlled_clipping_cannot_treat_an_ordinary_"
+                            "relation_participant_as_an_indivisible_region"
+                        ),
+                    }
+                )
+                region["atomic"] = False
     if (
         action == "tracked_crop"
         and payload.get("semantic_requirement") == "simultaneous_relation"

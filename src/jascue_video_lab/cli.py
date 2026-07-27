@@ -848,6 +848,7 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
         output_dir=args.output_dir,
         model_id=args.model,
         execution_profile=args.execution_profile,
+        reuse_picture_result=args.reuse_picture_result,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2425,6 +2426,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--scdet-threshold", type=float, default=4.0
     )
     feature_delivery_parser.add_argument("--reuse-feature-plan", action="store_true")
+    feature_delivery_parser.add_argument(
+        "--reuse-picture-result",
+        action="store_true",
+        help=(
+            "Resume music assembly, final mux, and QA from the completed "
+            "hash-bound picture result in the same output directory"
+        ),
+    )
     feature_delivery_parser.add_argument(
         "--reuse-feature-plan-raw-output",
         action="store_true",

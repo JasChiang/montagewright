@@ -129,13 +129,39 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
     assert vertical.aspect == "9x16"
 
 
-def test_direct_video_projection_does_not_repeat_selected_clip_semantic_pass() -> None:
-    assert not _should_refine_selected_vertical_candidate(
+def test_direct_video_projection_enriches_missing_camera_capability_fields() -> None:
+    assert _should_refine_selected_vertical_candidate(
         auto_vertical_framing=True,
         human_reframe_policy_requested=False,
         feature_plan_origin="external_projection",
         external_projection_contract_id="direct-video-edit-plan-v1",
-        option_data={"virtual_camera_proposal": None},
+        option_data={
+            "virtual_camera_proposal": None,
+            "strategy": "fit_with_background",
+            "regions": [],
+        },
+    )
+    assert _should_refine_selected_vertical_candidate(
+        auto_vertical_framing=True,
+        human_reframe_policy_requested=False,
+        feature_plan_origin="external_projection",
+        external_projection_contract_id="direct-video-edit-plan-v2",
+        option_data={
+            "virtual_camera_proposal": None,
+            "strategy": "tracked_crop",
+            "regions": [{"role": "required"}],
+        },
+    )
+    assert not _should_refine_selected_vertical_candidate(
+        auto_vertical_framing=True,
+        human_reframe_policy_requested=False,
+        feature_plan_origin="external_projection",
+        external_projection_contract_id="direct-video-edit-plan-v2",
+        option_data={
+            "virtual_camera_proposal": {"composition_mode": "single_anchor_hold"},
+            "strategy": "tracked_crop",
+            "regions": [{"role": "required"}],
+        },
     )
 
 
@@ -2089,6 +2115,16 @@ def test_controlled_primary_center_preview_is_bounded_and_non_atomic() -> None:
         regions=[subject],
         failure_codes=failures,
     )
+    assert _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry={
+            **geometry,
+            "applied_strategy": "phase_virtual_camera",
+            "minimum_visible_required_area_fraction": 2 / 3,
+        },
+        regions=[subject],
+        failure_codes=failures,
+    )
     assert not _controlled_primary_center_preview_allowed(
         crop_mode="primary_center",
         geometry=geometry,
@@ -2098,6 +2134,92 @@ def test_controlled_primary_center_preview_is_bounded_and_non_atomic() -> None:
             )
         ],
         failure_codes=failures,
+    )
+
+
+def test_controlled_preview_allows_only_bound_atomic_relation_carrier() -> None:
+    relation_core = FramingRegionIntent(
+        region_id="relation-core",
+        target_description="the directly visible relation zone",
+        kind="subject",
+        evidence_role="relation_carrier",
+        role="required",
+        atomic=True,
+        observable_relations=["participant A visibly contacts participant B"],
+    )
+    participants = [
+        FramingRegionIntent(
+            region_id=f"participant-{suffix}",
+            entity_id=f"entity-{suffix}",
+            target_description=f"visible participant {suffix}",
+            evidence_role="relation_participant",
+            role="preferred",
+            minimum_visible_fraction=0.8,
+        )
+        for suffix in ("a", "b")
+    ]
+    geometry = {
+        "applied_strategy": "tracked_crop",
+        "fallback_reason": None,
+        "minimum_visible_required_area_fraction": 0.84,
+    }
+
+    assert _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry=geometry,
+        regions=[relation_core, *participants],
+        failure_codes=[FailureCode.ATOMIC_REGION_CLIPPED],
+    )
+    assert not _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry=geometry,
+        regions=[relation_core, participants[0]],
+        failure_codes=[FailureCode.ATOMIC_REGION_CLIPPED],
+    )
+    assert not _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry=geometry,
+        regions=[
+            relation_core.model_copy(update={"kind": "text_region"}),
+            *participants,
+        ],
+        failure_codes=[FailureCode.ATOMIC_REGION_CLIPPED],
+    )
+
+
+def test_controlled_preview_allows_bound_relation_group_outer_clipping() -> None:
+    participants = [
+        FramingRegionIntent(
+            region_id=f"participant-{suffix}",
+            entity_id=f"entity-{suffix}",
+            target_description=f"visible participant {suffix}",
+            evidence_role="relation_participant",
+            role="required",
+            atomic=False,
+            observable_relations=["visibly forms the selected relation"],
+        )
+        for suffix in ("a", "b")
+    ]
+    geometry = {
+        "applied_strategy": "tracked_crop",
+        "fallback_reason": None,
+        "minimum_visible_required_area_fraction": 0.77,
+    }
+
+    assert _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry=geometry,
+        regions=participants,
+        failure_codes=[FailureCode.HARD_CORE_NOT_FULLY_RETAINED],
+    )
+    assert not _controlled_primary_center_preview_allowed(
+        crop_mode="primary_center",
+        geometry={
+            **geometry,
+            "minimum_visible_required_area_fraction": 0.65,
+        },
+        regions=participants,
+        failure_codes=[FailureCode.HARD_CORE_NOT_FULLY_RETAINED],
     )
 
 
@@ -2181,17 +2303,110 @@ def test_runtime_candidates_preserve_rank_but_human_binding_disables_switching()
     )
 
     assert [item["candidate_id"] for item in automatic] == ["take-1", "take-2"]
-    assert all(
-        item["coverage_intent"] == "group_coverage" for item in automatic
-    )
+    assert automatic[0]["coverage_intent"] == "group_coverage"
     assert automatic[0]["coverage_target_descriptions"] == [
         "the first visible group member",
         "the second visible group member",
     ]
+    assert automatic[1]["coverage_intent"] == "single_primary"
+    assert automatic[1]["coverage_target_descriptions"] == []
     assert reviewed[0]["candidate_id"] == "legacy-primary"
     assert reviewed[0]["frame_id"] == "RF000001"
     assert reviewed[0]["target_description"] is None
     assert reviewed[0]["coverage_intent"] == "group_coverage"
+
+
+def test_runtime_fallback_binds_its_own_clip_card_entities() -> None:
+    candidates = [
+        FeatureVerticalCandidate(
+            candidate_id=f"take-{rank}",
+            rank=rank,
+            source_asset_id="sha256:" + ("a" if rank == 1 else "b") * 64,
+            event_id=f"event-{rank}",
+            frame_id=f"RF{rank:06d}",
+            observed_visual_evidence=f"Visible evidence {rank}",
+            selection_reason=f"Reason {rank}",
+            strategy="fit_with_background",
+            target_description=None,
+            confidence=0.8,
+        )
+        for rank in (1, 2)
+    ]
+    selected = FeatureChapterSelect(
+        feature_id="scene",
+        evidence_status="supported",
+        horizontal_frame_id="RF000001",
+        vertical_frame_id="RF000001",
+        observed_visual_evidence="The first take shows two unrelated subjects.",
+        selection_reason="Rank one was selected first.",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        vertical_coverage_intent="group_coverage",
+        vertical_coverage_target_descriptions=["rank-one A", "rank-one B"],
+        quality_risks=[],
+        confidence=0.8,
+        vertical_candidates=candidates,
+    )
+    fallback_event = {
+        "source_asset_id": candidates[1].source_asset_id,
+        "event_id": candidates[1].event_id,
+        "required_entity_ids": ["entity-object", "entity-reference"],
+        "primary_entity_ids": ["entity-object", "entity-reference"],
+        "entities": [
+            {
+                "entity_id": "entity-object",
+                "kind": "device",
+                "label": "visible object",
+                "distinguishing_features": "the larger visible object",
+            },
+            {
+                "entity_id": "entity-reference",
+                "kind": "object",
+                "label": "visible reference",
+                "distinguishing_features": "the smaller comparison reference",
+            },
+        ],
+        "grounding_targets": [
+            {
+                "entity_id": "entity-object",
+                "target_description": "the larger visible object",
+            },
+            {
+                "entity_id": "entity-reference",
+                "target_description": "the smaller visible comparison reference",
+            },
+        ],
+    }
+
+    options = _vertical_runtime_candidate_options(
+        selected,
+        human_policy_binding_present=False,
+        candidate_evidence_events={
+            (candidates[1].source_asset_id, candidates[1].event_id): fallback_event
+        },
+    )
+
+    fallback = options[1]
+    assert fallback["coverage_intent"] == "single_primary"
+    assert fallback["coverage_target_descriptions"] == [
+        "the larger visible object",
+    ]
+    assert {
+        region["entity_id"] for region in fallback["regions"]
+    } == {"entity-object", "entity-reference"}
+    roles = {
+        region["entity_id"]: (
+            region["role"],
+            region["evidence_role"],
+        )
+        for region in fallback["regions"]
+    }
+    assert roles["entity-object"] == ("required", "primary_subject")
+    assert roles["entity-reference"] == ("preferred", "context_reference")
+    assert "rank-one A" not in json.dumps(fallback, ensure_ascii=False)
 
 
 def test_candidate_asset_reference_accepts_catalog_id_or_sha256() -> None:
@@ -2277,6 +2492,24 @@ def test_gemini_virtual_camera_proposal_preserves_observed_anchor_order() -> Non
     ]
     assert all(phase.minimum_anchor_visible_fraction == 1.0 for phase in phases)
     assert "Visible predicate" in phases[0].editorial_reason
+
+    controlled_phases, controlled_origin = _resolve_vertical_camera_phases(
+        option_data=candidate.model_copy(
+            update={
+                "crop_mode": "primary_center",
+                "allow_controlled_clip": True,
+            }
+        ).model_dump(mode="python"),
+        reviewed_phases=[],
+        regions=regions,
+        allow_controlled_clip=True,
+    )
+
+    assert controlled_origin == "gemini_proposed"
+    assert all(
+        phase.minimum_anchor_visible_fraction == 2 / 3
+        for phase in controlled_phases
+    )
 
 
 def test_selected_framing_allows_scale_locked_sequential_comparison() -> None:
@@ -5970,6 +6203,92 @@ def test_simultaneous_relation_rejects_one_unbound_atomic_core() -> None:
                 generated_at="test",
             ),
         )
+
+
+def test_simultaneous_relation_accepts_bound_atomic_relation_core() -> None:
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="generic-comparison",
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="comparison",
+        frame_id="RF000001",
+        semantic_requirement="simultaneous_relation",
+        relation_temporal_mode="simultaneous_required",
+        recommended_action="tracked_crop",
+        presentation_options=_portrait_presentation_options(
+            single="feasible",
+        ),
+        regions=[
+            {
+                "region_id": "contact-core",
+                "target_description": "the indivisible visible relation zone",
+                "evidence_role": "relation_carrier",
+                "role": "required",
+                "atomic": True,
+                "observable_relations": [
+                    "the two participants form a directly visible relation"
+                ],
+            },
+            {
+                "region_id": "participant-a",
+                "entity_id": "entity-a",
+                "target_description": "the first visible participant",
+                "evidence_role": "relation_participant",
+                "role": "preferred",
+            },
+            {
+                "region_id": "participant-b",
+                "entity_id": "entity-b",
+                "target_description": "the second visible participant",
+                "evidence_role": "relation_participant",
+                "role": "preferred",
+            },
+        ],
+        virtual_camera_proposal={
+            "composition_mode": "single_anchor_hold",
+            "phases": [
+                {
+                    "phase_id": "hold",
+                    "start_progress": 0,
+                    "end_progress": 1,
+                    "anchor_region_ids": ["contact-core"],
+                    "observable_predicate": (
+                        "Both participants and their relation remain visible."
+                    ),
+                    "transition_condition": "Hold while the relation is visible.",
+                    "editorial_reason": (
+                        "Preserve the smallest complete relational evidence."
+                    ),
+                    "camera_behavior": "hold",
+                    "transition_in": "cut",
+                    "transition_duration_fraction": 0,
+                }
+            ],
+            "proposal_reason": (
+                "The compound carrier preserves the bound relation."
+            ),
+        },
+        observed_evidence=[
+            "Both bound participants and their relation are directly visible."
+        ],
+        decision_reason=(
+            "The compound carrier is smaller than either complete participant."
+        ),
+        confidence=0.9,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    _validate_selected_framing_coverage_invariant(
+        upstream_intent="simultaneous_relation",
+        upstream_target_descriptions=["first participant", "second participant"],
+        proposal=proposal,
+    )
 
 
 def test_selected_framing_cannot_weaken_group_coverage() -> None:

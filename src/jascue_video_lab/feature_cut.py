@@ -32,6 +32,7 @@ from .gemini import (
     GeminiLabClient,
     GroundingIdentityReference,
     MODEL_ID,
+    SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
     canonicalize_selected_vertical_framing_output,
 )
@@ -96,6 +97,7 @@ from .models import (
     VerticalVirtualCameraPhase,
     VerticalVirtualCameraPlan,
     VerticalVirtualCameraProposal,
+    VerticalVirtualCameraProposalPhase,
     VirtualCameraKeyframe,
     VirtualCameraPlan,
     approve_evidence_query_proposal_v2,
@@ -146,6 +148,7 @@ _PORTRAIT_DEADBAND_VIEWPORT_FRACTION = 0.08
 _PORTRAIT_MAX_SPEED_PX_S = 720.0
 _PORTRAIT_MAX_ACCELERATION_PX_S2 = 1800.0
 _PORTRAIT_MAX_JERK_PX_S3 = 7200.0
+_CONTROLLED_PHASE_MIN_VISIBLE_FRACTION = 2 / 3
 _FEATURE_PLAN_BINDING_VERSION = "feature-plan-binding-v1"
 _EXTERNAL_PROJECTION_SIDECAR_VERSION = "external-feature-plan-projection-v1"
 _EXTERNAL_PROJECTION_POINTER_NAME = "feature-plan.external-projection.json"
@@ -4529,6 +4532,7 @@ def _vertical_virtual_camera_filter_from_tracks(
     phases: Sequence[VerticalVirtualCameraPhase],
     phase_origin: Literal["human_reviewed", "gemini_proposed"] = "human_reviewed",
     display_sample_aspect_ratio: float = 1.0,
+    _simplify_unsafe_motion: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Build a review-only phase-based 9:16 virtual camera.
 
@@ -5041,6 +5045,55 @@ def _vertical_virtual_camera_filter_from_tracks(
         scale_values,
         cut_before_indexes=cut_before_indexes,
     )
+    motion_gate_failed = (
+        max_velocity > _PORTRAIT_MAX_SPEED_PX_S + 1e-6
+        or max_acceleration > _PORTRAIT_MAX_ACCELERATION_PX_S2 + 1e-6
+        or max_jerk > _PORTRAIT_MAX_JERK_PX_S3 + 1e-6
+    )
+    if (
+        _simplify_unsafe_motion
+        and motion_gate_failed
+        and any(phase.transition_in == "smoothstep" for phase in phases)
+    ):
+        simplified_phases = [
+            (
+                phase.model_copy(
+                    update={
+                        "transition_in": "cut",
+                        "transition_duration_fraction": 0.0,
+                    }
+                )
+                if phase.transition_in == "smoothstep"
+                else phase
+            )
+            for phase in phases
+        ]
+        filter_graph, geometry = _vertical_virtual_camera_filter_from_tracks(
+            tracks_by_region=tracks_by_region,
+            phases=simplified_phases,
+            phase_origin=phase_origin,
+            display_sample_aspect_ratio=display_sample_aspect_ratio,
+            _simplify_unsafe_motion=False,
+        )
+        geometry.setdefault("risk_codes", []).append(
+            "unsafe_smooth_transition_converted_to_cut"
+        )
+        geometry["motion_simplification_audit"] = {
+            "policy": "convert_cross_anchor_smoothstep_to_cut_v1",
+            "original_max_velocity": round(max_velocity, 6),
+            "original_max_acceleration": round(max_acceleration, 6),
+            "original_max_jerk": round(max_jerk, 6),
+            "speed_limit": _PORTRAIT_MAX_SPEED_PX_S,
+            "acceleration_limit": _PORTRAIT_MAX_ACCELERATION_PX_S2,
+            "jerk_limit": _PORTRAIT_MAX_JERK_PX_S3,
+            "converted_phase_ids": [
+                phase.phase_id
+                for phase in phases
+                if phase.transition_in == "smoothstep"
+            ],
+        }
+        geometry["requires_gemini_review"] = True
+        return filter_graph, geometry
     keyframes = [
         VirtualCameraKeyframe(
             time_seconds=round(time, 6),
@@ -6367,6 +6420,7 @@ def _vertical_candidate_geometry(
     ],
     model_request_block_reason: str | None = None,
     query_lock_v2: EvidenceQueryLockV2 | None = None,
+    allow_review_sequential_fallback: bool = False,
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
     """Evaluate one immutable vertical candidate without rendering a segment."""
 
@@ -6497,22 +6551,117 @@ def _vertical_candidate_geometry(
                     )
                 )
             except ValueError as error:
-                filter_graph, geometry = _vertical_filter_from_track(
-                    hard_tracks,
-                    allow_subject_clipping=crop_mode == "primary_center",
-                    overflow_policy=overflow_policy,
-                    edge_priority=edge_priority,
-                    region_ids=[region.region_id for region in hard_regions],
-                    fallback_strategy=fallback_strategy,
-                    display_sample_aspect_ratio=display_sample_aspect_ratio,
-                    preferred_tracks=soft_tracks,
-                    preferred_regions=available_soft_regions,
-                )
-                geometry.setdefault("risk_codes", []).append(
-                    "phase_virtual_camera_preflight_failed"
-                )
-                geometry["phase_virtual_camera_fallback_reason"] = str(error)
-                geometry["requires_gemini_review"] = True
+                sequential_geometry = None
+                if allow_review_sequential_fallback and len(hard_regions) >= 2:
+                    phase_count = len(hard_regions)
+                    sequential_phases = [
+                        VerticalVirtualCameraPhase(
+                            phase_id=f"geometry-repair-{index + 1}",
+                            start_progress=index / phase_count,
+                            end_progress=(index + 1) / phase_count,
+                            anchor_region_ids=[region.region_id],
+                            camera_behavior="follow_deadband",
+                            transition_in=("cut" if index == 0 else "smoothstep"),
+                            transition_duration_fraction=(
+                                0.0 if index == 0 else 0.2
+                            ),
+                            minimum_anchor_visible_fraction=(
+                                _CONTROLLED_PHASE_MIN_VISIBLE_FRACTION
+                                if (
+                                    crop_mode == "primary_center"
+                                    and not region.atomic
+                                    and region.kind
+                                    not in {
+                                        "text_region",
+                                        "ui_region",
+                                        "graphic",
+                                    }
+                                )
+                                else 1.0
+                            ),
+                            editorial_reason=(
+                                "Geometry-aware review fallback presents each "
+                                "already-bound relation participant in the "
+                                "Gemini-approved order after joint containment "
+                                "proved infeasible."
+                            ),
+                        )
+                        for index, region in enumerate(hard_regions)
+                    ]
+                    try:
+                        filter_graph, sequential_geometry = (
+                            _vertical_virtual_camera_filter_from_tracks(
+                                tracks_by_region=tracks_by_region,
+                                phases=sequential_phases,
+                                phase_origin="gemini_proposed",
+                                display_sample_aspect_ratio=(
+                                    display_sample_aspect_ratio
+                                ),
+                            )
+                        )
+                    except ValueError as sequential_error:
+                        cut_phases = [
+                            phase.model_copy(
+                                update={
+                                    "transition_in": "cut",
+                                    "transition_duration_fraction": 0.0,
+                                }
+                            )
+                            for phase in sequential_phases
+                        ]
+                        try:
+                            filter_graph, sequential_geometry = (
+                                _vertical_virtual_camera_filter_from_tracks(
+                                    tracks_by_region=tracks_by_region,
+                                    phases=cut_phases,
+                                    phase_origin="gemini_proposed",
+                                    display_sample_aspect_ratio=(
+                                        display_sample_aspect_ratio
+                                    ),
+                                )
+                            )
+                            sequential_phases = cut_phases
+                            sequential_geometry.setdefault(
+                                "risk_codes", []
+                            ).append(
+                                "unsafe_sequential_pan_converted_to_reframe_cut"
+                            )
+                            sequential_geometry[
+                                "sequential_pan_failure_reason"
+                            ] = str(sequential_error)
+                        except ValueError:
+                            sequential_geometry = None
+                    if sequential_geometry is not None:
+                        geometry = sequential_geometry
+                        geometry.setdefault("risk_codes", []).extend(
+                            [
+                                "joint_relation_geometry_infeasible",
+                                "review_only_sequential_relation_reconstruction",
+                            ]
+                        )
+                        geometry["joint_geometry_failure_reason"] = str(error)
+                        geometry["vertical_camera_phases"] = [
+                            phase.model_dump(mode="json")
+                            for phase in sequential_phases
+                        ]
+                        geometry["requires_gemini_review"] = True
+                if sequential_geometry is None:
+                    filter_graph, geometry = _vertical_filter_from_track(
+                        hard_tracks,
+                        allow_subject_clipping=crop_mode == "primary_center",
+                        overflow_policy=overflow_policy,
+                        edge_priority=edge_priority,
+                        region_ids=[region.region_id for region in hard_regions],
+                        fallback_strategy=fallback_strategy,
+                        display_sample_aspect_ratio=display_sample_aspect_ratio,
+                        preferred_tracks=soft_tracks,
+                        preferred_regions=available_soft_regions,
+                    )
+                    geometry.setdefault("risk_codes", []).append(
+                        "phase_virtual_camera_preflight_failed"
+                    )
+                    geometry["phase_virtual_camera_fallback_reason"] = str(error)
+                    geometry["requires_gemini_review"] = True
         else:
             filter_graph, geometry = _vertical_filter_from_track(
                 hard_tracks,
@@ -6606,7 +6755,10 @@ def _vertical_candidate_geometry(
         )
 
     identity_executions: list[IdentityCheckpointExecution] = []
-    if geometry.get("applied_strategy") == "tracked_crop":
+    if geometry.get("applied_strategy") in {
+        "tracked_crop",
+        "phase_virtual_camera",
+    }:
         for target_id, locked_description, identity_track in identity_tracks:
             identity_sha256 = _stable_fingerprint(
                 {
@@ -6701,9 +6853,10 @@ def _vertical_candidate_geometry(
         }
         for region in regions
     ]
-    geometry["vertical_camera_phases"] = [
-        phase.model_dump(mode="json") for phase in camera_phases
-    ]
+    geometry.setdefault(
+        "vertical_camera_phases",
+        [phase.model_dump(mode="json") for phase in camera_phases],
+    )
     return filter_graph, geometry, debug_paths, track_fingerprint
 
 
@@ -6793,7 +6946,10 @@ def _vertical_candidate_preflight(
         rank=rank,
         presentation=(
             "tracked_crop"
-            if geometry.get("applied_strategy") == "tracked_crop"
+            if geometry.get("applied_strategy")
+            in {"tracked_crop", "phase_virtual_camera"}
+            else "phase_virtual_camera"
+            if geometry.get("applied_strategy") == "phase_virtual_camera"
             else "static_anchor"
             if geometry.get("applied_strategy") == "seed_anchor_crop"
             else "center_crop"
@@ -6861,25 +7017,74 @@ def _controlled_primary_center_preview_allowed(
 
     if crop_mode != "primary_center":
         return False
-    if geometry.get("applied_strategy") != "tracked_crop":
+    applied_strategy = geometry.get("applied_strategy")
+    if applied_strategy not in {
+        "tracked_crop",
+        "phase_virtual_camera",
+    }:
         return False
     if geometry.get("fallback_reason") is not None:
         return False
-    if any(
-        region.atomic or region.kind in {"text_region", "ui_region", "graphic"}
+    hard_regions = [
+        region for region in regions if region.execution_role == "hard_core"
+    ]
+    bound_relation_participants = {
+        region.entity_id
         for region in regions
-        if region.execution_role == "hard_core"
+        if (
+            region.evidence_role == "relation_participant"
+            and region.entity_id is not None
+        )
+    }
+    reviewable_atomic_relation_core = (
+        bool(hard_regions)
+        and all(
+            region.atomic
+            and region.evidence_role == "relation_carrier"
+            and bool(region.observable_relations)
+            and region.kind not in {"text_region", "ui_region", "graphic"}
+            for region in hard_regions
+        )
+        and len(bound_relation_participants) >= 2
+    )
+    reviewable_bound_relation_group = (
+        len(hard_regions) >= 2
+        and all(
+            not region.atomic
+            and region.kind not in {"text_region", "ui_region", "graphic"}
+            and region.evidence_role == "relation_participant"
+            and region.entity_id is not None
+            and bool(region.observable_relations)
+            for region in hard_regions
+        )
+        and len(bound_relation_participants) >= 2
+    )
+    if any(
+        region.kind in {"text_region", "ui_region", "graphic"}
+        or (region.atomic and not reviewable_atomic_relation_core)
+        for region in hard_regions
     ):
         return False
     visible = float(
         geometry.get("minimum_visible_required_area_fraction", 0.0)
     )
-    if visible + 1e-6 < minimum_visible_fraction:
+    effective_minimum = (
+        _CONTROLLED_PHASE_MIN_VISIBLE_FRACTION
+        if (
+            applied_strategy == "phase_virtual_camera"
+            or reviewable_atomic_relation_core
+            or reviewable_bound_relation_group
+        )
+        else minimum_visible_fraction
+    )
+    if visible + 1e-6 < effective_minimum:
         return False
     allowed_failures = {
         FailureCode.HARD_CORE_NOT_FULLY_RETAINED,
         FailureCode.IDENTITY_VERIFICATION_PENDING,
     }
+    if reviewable_atomic_relation_core:
+        allowed_failures.add(FailureCode.ATOMIC_REGION_CLIPPED)
     return bool(failure_codes) and set(failure_codes).issubset(allowed_failures)
 
 
@@ -6988,10 +7193,18 @@ def _validate_selected_framing_coverage_invariant(
         for region in proposal.regions
         if region.execution_role == "hard_core"
     ]
-    if len(hard_regions) < required_participant_count:
+    atomic_relation_core_preserves_obligation = (
+        upstream_intent == "simultaneous_relation"
+        and proposal._has_bound_atomic_relation_core(required_participant_count)
+    )
+    if (
+        len(hard_regions) < required_participant_count
+        and not atomic_relation_core_preserves_obligation
+    ):
         raise ValueError(
             "selected framing does not retain enough independently grounded "
-            "hard-core participants for the upstream coverage obligation"
+            "hard-core participants or a bound atomic relation core for the "
+            "upstream coverage obligation"
         )
 
 
@@ -7065,9 +7278,64 @@ def _refine_selected_vertical_candidate(
         binding = read_json(binding_path)
         if binding.get("request_fingerprint") != request_fingerprint:
             raise ValueError("selected vertical framing cache binding mismatch")
-        proposal = SelectedVerticalFramingProposal.model_validate(
-            read_json(proposal_path)
-        )
+        if (
+            binding.get("normalization_version")
+            != SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION
+            and raw_output_path.is_file()
+        ):
+            raw_output = read_json(raw_output_path)
+            canonical_text, normalization_changes = (
+                canonicalize_selected_vertical_framing_output(
+                    str(raw_output["output_text"])
+                )
+            )
+            proposal = SelectedVerticalFramingProposal.model_validate_json(
+                canonical_text
+            )
+            immutable = {
+                "candidate_id": candidate_id,
+                "source_asset_id": source_asset_id,
+                "event_id": event_id,
+                "frame_id": frame.frame_id,
+            }
+            mismatches = {
+                key: {"expected": value, "actual": getattr(proposal, key)}
+                for key, value in immutable.items()
+                if getattr(proposal, key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "saved selected framing response changed immutable selection: "
+                    f"{mismatches}"
+                )
+            write_json(proposal_path, proposal)
+            write_json(
+                run_dir / "selected_vertical_framing.canonical_output.json",
+                {"output_text": canonical_text},
+            )
+            write_json(
+                run_dir / "selected_vertical_framing.normalization_audit.json",
+                {
+                    "normalization_version": (
+                        SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION
+                    ),
+                    "changes": normalization_changes,
+                    "editorial_selection_changed": False,
+                },
+            )
+            binding = {
+                **binding,
+                "normalization_version": (
+                    SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION
+                ),
+                "proposal_sha256": sha256_file(proposal_path),
+                "normalization_reapplied_at": utc_now(),
+            }
+            write_json(binding_path, binding)
+        else:
+            proposal = SelectedVerticalFramingProposal.model_validate(
+                read_json(proposal_path)
+            )
         reused = True
     elif raw_output_path.is_file() and raw_interaction_path.is_file():
         # Representation-only recovery after a stricter local validator
@@ -7138,6 +7406,9 @@ def _refine_selected_vertical_candidate(
             {
                 **fingerprint_payload,
                 "request_fingerprint": request_fingerprint,
+                "normalization_version": (
+                    SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION
+                ),
                 "file_api_reused": None,
                 "raw_paid_response_reused": True,
                 "proposal_sha256": sha256_file(proposal_path),
@@ -7172,6 +7443,9 @@ def _refine_selected_vertical_candidate(
             {
                 **fingerprint_payload,
                 "request_fingerprint": request_fingerprint,
+                "normalization_version": (
+                    SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION
+                ),
                 "file_api_reused": file_api_reused,
                 "proposal_sha256": sha256_file(proposal_path),
                 "created_at": utc_now(),
@@ -7220,8 +7494,16 @@ def _refine_selected_vertical_candidate(
         ),
     }
     if proposal.recommended_action == "tracked_crop":
+        controlled_clip_feasible = any(
+            option.mode == "controlled_clipping"
+            and option.verdict == "feasible"
+            for option in proposal.presentation_options
+        )
         refined["strategy"] = "tracked_crop"
-        refined["crop_mode"] = "strict"
+        refined["crop_mode"] = (
+            "primary_center" if controlled_clip_feasible else "strict"
+        )
+        refined["allow_controlled_clip"] = controlled_clip_feasible
         refined["regions"] = [
             region.model_dump(mode="python") for region in proposal.regions
         ]
@@ -7273,9 +7555,19 @@ def _vertical_runtime_candidate_options(
     selected: FeatureChapterSelect,
     *,
     human_policy_binding_present: bool,
+    candidate_evidence_events: Mapping[
+        tuple[str, str], Mapping[str, Any]
+    ] | None = None,
     max_candidates: int = 4,
 ) -> list[dict[str, Any]]:
-    """Return immutable auto options or one legacy/human-reviewed selection."""
+    """Return immutable auto options or one legacy/human-reviewed selection.
+
+    Coverage belongs to the concrete candidate event, not to the chapter's
+    rank-one mirror.  When a Top-K fallback has not yet received a
+    brief-specific crop contract, locally validated Clip Card entity IDs seed
+    its own conservative contract before the selected-clip Gemini pass.  This
+    prevents a fallback take from inheriting unrelated subjects from rank one.
+    """
 
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
@@ -7285,9 +7577,14 @@ def _vertical_runtime_candidate_options(
             selected.vertical_candidates, key=lambda item: item.rank
         )[:max_candidates]:
             option = candidate.model_dump(mode="python")
-            option["coverage_intent"] = selected.vertical_coverage_intent
-            option["coverage_target_descriptions"] = list(
-                selected.vertical_coverage_target_descriptions
+            option = _bind_runtime_candidate_coverage(
+                option,
+                selected=selected,
+                evidence_event=(
+                    (candidate_evidence_events or {}).get(
+                        (candidate.source_asset_id, candidate.event_id)
+                    )
+                ),
             )
             options.append(option)
         return options
@@ -7312,6 +7609,212 @@ def _vertical_runtime_candidate_options(
             "confidence": selected.confidence,
         }
     ]
+
+
+def _bind_runtime_candidate_coverage(
+    option: Mapping[str, Any],
+    *,
+    selected: FeatureChapterSelect,
+    evidence_event: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind one Top-K option to its own entity-backed coverage obligation."""
+
+    bound = dict(option)
+    raw_regions = list(bound.get("regions") or [])
+    if raw_regions:
+        regions = [
+            region
+            if isinstance(region, FramingRegionIntent)
+            else FramingRegionIntent.model_validate(region)
+            for region in raw_regions
+        ]
+        hard = [
+            region
+            for region in regions
+            if region.execution_role == "hard_core"
+        ]
+        coverage_mode = str(bound.get("coverage_mode") or "simultaneous")
+        intent_by_mode = {
+            "simultaneous": (
+                "simultaneous_relation"
+                if any(
+                    region.evidence_role
+                    in {"relation_participant", "relation_carrier"}
+                    for region in hard
+                )
+                else "group_coverage"
+            ),
+            "sequential": "sequential_attention",
+            "relation_core": "simultaneous_relation",
+            "primary_with_context": "single_primary",
+            "independent_detail": "single_primary",
+        }
+        bound["coverage_intent"] = intent_by_mode[coverage_mode]
+        bound["coverage_target_descriptions"] = [
+            region.target_description for region in hard
+        ]
+        return bound
+
+    if evidence_event is not None:
+        entities = {
+            str(entity["entity_id"]): entity
+            for entity in evidence_event.get("entities", [])
+            if isinstance(entity, Mapping) and entity.get("entity_id")
+        }
+        grounding = {
+            str(target["entity_id"]): str(target["target_description"])
+            for target in evidence_event.get("grounding_targets", [])
+            if (
+                isinstance(target, Mapping)
+                and target.get("entity_id")
+                and target.get("target_description")
+            )
+        }
+        required_ids = [
+            str(entity_id)
+            for entity_id in evidence_event.get("required_entity_ids", [])
+            if str(entity_id) in entities
+        ]
+        if not required_ids:
+            required_ids = [
+                str(entity_id)
+                for entity_id in evidence_event.get("primary_entity_ids", [])
+                if str(entity_id) in entities
+            ][:1]
+        preferred_ids = [
+            str(entity_id)
+            for entity_id in evidence_event.get("primary_entity_ids", [])
+            if str(entity_id) in entities and str(entity_id) not in required_ids
+        ]
+
+        def description(entity_id: str) -> str:
+            if entity_id in grounding:
+                return grounding[entity_id]
+            entity = entities[entity_id]
+            label = str(entity.get("label") or entity_id)
+            details = str(entity.get("distinguishing_features") or "").strip()
+            return f"{label}; {details}" if details else label
+
+        # Clip Card required entities describe what makes the *source event*
+        # useful.  They are not automatically an immutable crop obligation for
+        # every brief-specific fallback.  The selected-clip pass may promote
+        # co-visible entities into a relation/group contract after watching the
+        # bounded video.  Until then, bind the first primary as the conservative
+        # identity lock and expose the remaining entities as reviewable context.
+        primary_id = required_ids[0] if required_ids else None
+        contextual_ids = [
+            entity_id for entity_id in required_ids[1:]
+            if entity_id not in preferred_ids
+        ]
+        preferred_ids = contextual_ids + preferred_ids
+        regions: list[FramingRegionIntent] = []
+        for role, ids in (
+            ("required", [primary_id] if primary_id is not None else []),
+            ("preferred", preferred_ids),
+        ):
+            for entity_id in ids:
+                kind_value = str(entities[entity_id].get("kind") or "other")
+                kind = (
+                    "text_region"
+                    if kind_value == "text_region"
+                    else (
+                        "ui_region"
+                        if kind_value in {"phone_screen", "screen", "ui_element"}
+                        else ("graphic" if kind_value == "logo" else "subject")
+                    )
+                )
+                regions.append(
+                    FramingRegionIntent(
+                        region_id=(
+                            f"candidate-evidence.{role}."
+                            + re.sub(
+                                r"[^A-Za-z0-9_.:-]+",
+                                "-",
+                                entity_id,
+                            ).strip("-.")
+                        ),
+                        entity_id=entity_id,
+                        target_description=description(entity_id),
+                        kind=kind,
+                        evidence_role=(
+                            "primary_subject"
+                            if role == "required"
+                            else "context_reference"
+                        ),
+                        role=role,
+                        atomic=(
+                            role == "required"
+                            and kind in {"text_region", "ui_region", "graphic"}
+                        ),
+                        minimum_visible_fraction=(
+                            1.0 if role == "required" else None
+                        ),
+                        observable_relations=[
+                            "entity is bound to the selected Clip Card event",
+                            *(
+                                ["co-visible context in the selected event"]
+                                if role == "preferred"
+                                else []
+                            ),
+                        ],
+                    )
+                )
+        if regions:
+            bound["regions"] = [
+                region.model_dump(mode="python") for region in regions
+            ]
+            bound["coverage_intent"] = "single_primary"
+            bound["coverage_target_descriptions"] = [
+                description(primary_id)
+            ] if primary_id is not None else []
+            bound["candidate_coverage_source"] = (
+                "hash_bound_selected_clip_card_event"
+            )
+            return bound
+
+    # Legacy candidate-free plans intentionally keep their reviewed chapter
+    # contract.  Sparse rank-one artifacts also preserve the old mirror, while
+    # rank-N candidates without bound evidence do not inherit unrelated prose.
+    if int(bound.get("rank", 1)) == 1:
+        bound["coverage_intent"] = selected.vertical_coverage_intent
+        bound["coverage_target_descriptions"] = list(
+            selected.vertical_coverage_target_descriptions
+        )
+    else:
+        bound["coverage_intent"] = "single_primary"
+        bound["coverage_target_descriptions"] = []
+    return bound
+
+
+def _load_runtime_candidate_evidence_events(
+    plan_dir: Path,
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    """Load the already hash-validated selected Clip Card event snapshot."""
+
+    path = plan_dir / "selected-clip-card-evidence.json"
+    if not path.is_file():
+        return {}
+    payload = read_json(path)
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("contract_version")
+        != "clip-card-feature-cut-selected-evidence-v1"
+        or not isinstance(payload.get("events"), list)
+    ):
+        raise ValueError("selected Clip Card evidence has an unsupported contract")
+    events: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for event in payload["events"]:
+        if not isinstance(event, Mapping):
+            raise ValueError("selected Clip Card evidence event must be an object")
+        source_asset_id = event.get("source_asset_id")
+        event_id = event.get("event_id")
+        if not isinstance(source_asset_id, str) or not isinstance(event_id, str):
+            raise ValueError("selected Clip Card evidence event lacks immutable IDs")
+        key = (source_asset_id, event_id)
+        if key in events:
+            raise ValueError(f"duplicate selected Clip Card evidence event: {key}")
+        events[key] = event
+    return events
 
 
 def _horizontal_runtime_candidate_options(
@@ -7358,21 +7861,30 @@ def _should_refine_selected_vertical_candidate(
     external_projection_contract_id: str | None,
     option_data: Mapping[str, Any],
 ) -> bool:
-    """Return whether the legacy selected-clip semantic pass is still needed.
+    """Return whether a selected clip still lacks an executable camera plan.
 
-    The compact direct-video contract has already inspected the bounded
-    candidate video and supplied the editorial framing/attention decision. Its
-    downstream work is exact-frame Grounding, SAM propagation, and local
-    geometry—not a second paid VLM reinterpretation of the same candidate.
+    Direct-video planning avoids a second paid pass only when it already
+    supplied enough geometry intent for the capabilities available at runtime.
+    Older or sparse plan artifacts must be enriched whenever they lack a
+    virtual-camera decision.  A list of targets is geometry input, not an
+    editorial camera plan: without the selected-clip pass, newly added hold,
+    follow, controlled-clip, relation-core, and phase-camera capabilities
+    remain invisible and the renderer can fall back to a mechanical center
+    crop.  The immutable candidate/event/frame identity and upstream coverage
+    obligation are checked after enrichment, so this cannot silently replace
+    the selected evidence.
     """
 
     if not auto_vertical_framing or human_reframe_policy_requested:
         return False
+    missing_executable_camera_intent = (
+        option_data.get("virtual_camera_proposal") is None
+    )
     if external_projection_contract_id in {
         "direct-video-edit-plan-v1",
         "direct-video-edit-plan-v2",
     }:
-        return False
+        return missing_executable_camera_intent
     return (
         feature_plan_origin != "external_projection"
         or option_data.get("virtual_camera_proposal") is None
@@ -7570,12 +8082,16 @@ def _resolve_vertical_camera_phases(
     *,
     option_data: Mapping[str, Any],
     reviewed_phases: Sequence[VerticalVirtualCameraPhase],
+    regions: Sequence[FramingRegionIntent] = (),
+    allow_controlled_clip: bool = False,
 ) -> tuple[list[VerticalVirtualCameraPhase], Literal["human_reviewed", "gemini_proposed"]]:
     """Convert an editorial proposal into fail-closed executable phase inputs.
 
-    Human-reviewed phases take precedence.  Automatic proposals can only request
-    full anchor visibility; they cannot authorize clipping, invent coordinates,
-    or bypass the downstream Grounding/SAM and motion gates.
+    Human-reviewed phases take precedence.  An automatic proposal may use the
+    candidate's already-saved controlled-clipping permission for ordinary,
+    non-atomic visual subjects. Text, UI, graphics and atomic relation cores
+    remain fully visible. The model still cannot invent coordinates or bypass
+    downstream Grounding/SAM, identity and motion gates.
     """
 
     if reviewed_phases:
@@ -7584,6 +8100,34 @@ def _resolve_vertical_camera_phases(
     if raw_proposal is None:
         return [], "gemini_proposed"
     proposal = VerticalVirtualCameraProposal.model_validate(raw_proposal)
+    regions_by_id = {region.region_id: region for region in regions}
+
+    def minimum_visible_fraction(
+        phase: VerticalVirtualCameraProposalPhase,
+    ) -> float:
+        anchors = [
+            regions_by_id.get(region_id)
+            for region_id in phase.anchor_region_ids
+        ]
+        controlled_clip_is_safe = (
+            allow_controlled_clip
+            and all(anchor is not None for anchor in anchors)
+            and all(
+                not anchor.atomic
+                and anchor.kind not in {"text_region", "ui_region", "graphic"}
+                for anchor in anchors
+                if anchor is not None
+            )
+        )
+        # A controlled phase is a review composition, never unattended
+        # delivery. Keep a fixed, domain-neutral recognition floor rather than
+        # adapting the threshold to whichever fixture happens to be running.
+        return (
+            _CONTROLLED_PHASE_MIN_VISIBLE_FRACTION
+            if controlled_clip_is_safe
+            else 1.0
+        )
+
     phases = [
         VerticalVirtualCameraPhase(
             phase_id=phase.phase_id,
@@ -7593,7 +8137,7 @@ def _resolve_vertical_camera_phases(
             camera_behavior=phase.camera_behavior,
             transition_in=phase.transition_in,
             transition_duration_fraction=phase.transition_duration_fraction,
-            minimum_anchor_visible_fraction=1.0,
+            minimum_anchor_visible_fraction=minimum_visible_fraction(phase),
             editorial_reason=(
                 f"{phase.editorial_reason} Visible predicate: "
                 f"{phase.observable_predicate} Transition condition: "
@@ -9877,6 +10421,9 @@ def _run_feature_cut_experiment_impl(
             )
             write_json(plan_binding_path, binding)
             plan_reused = False
+        candidate_evidence_events = _load_runtime_candidate_evidence_events(
+            plan_dir
+        )
         shot_cache: dict[str, ShotManifest] = {}
         shots_dir = output_dir / "shots"
         requested_candidate_recall_audit = (
@@ -10510,6 +11057,7 @@ def _run_feature_cut_experiment_impl(
                 vertical_options = _vertical_runtime_candidate_options(
                     selected,
                     human_policy_binding_present=human_reframe_policy_requested,
+                    candidate_evidence_events=candidate_evidence_events,
                     max_candidates=auto_reframe_policy.max_candidates,
                 )
                 candidate_attempts: list[dict[str, Any]] = []
@@ -10684,10 +11232,24 @@ def _run_feature_cut_experiment_impl(
                             ),
                         )
                     )
+                    candidate_crop_mode = str(
+                        option_data.get(
+                            "crop_mode", brief_chapter.vertical_crop_mode
+                        )
+                    )
+                    controlled_preview_requested = (
+                        candidate_crop_mode == "primary_center"
+                        and bool(
+                            option_data.get("allow_controlled_clip", False)
+                        )
+                        and not human_reframe_policy_requested
+                    )
                     candidate_camera_phases, candidate_camera_phase_origin = (
                         _resolve_vertical_camera_phases(
                             option_data=option_data,
                             reviewed_phases=brief_chapter.vertical_camera_phases,
+                            regions=candidate_regions,
+                            allow_controlled_clip=controlled_preview_requested,
                         )
                     )
                     attempt: dict[str, Any] = {
@@ -10776,18 +11338,6 @@ def _run_feature_cut_experiment_impl(
                         / f"candidate-{candidate_rank:02d}-{candidate_id}"
                     )
                     try:
-                        candidate_crop_mode = str(
-                            option_data.get(
-                                "crop_mode", brief_chapter.vertical_crop_mode
-                            )
-                        )
-                        controlled_preview_requested = (
-                            candidate_crop_mode == "primary_center"
-                            and bool(
-                                option_data.get("allow_controlled_clip", False)
-                            )
-                            and not human_reframe_policy_requested
-                        )
                         candidate_query_lock: EvidenceQueryLockV2 | None = None
                         if (
                             selected.vertical_candidates
@@ -10869,6 +11419,24 @@ def _run_feature_cut_experiment_impl(
                             track_cache=track_cache,
                             model_request_block_reason=gemini_geometry_block_reason,
                             query_lock_v2=candidate_query_lock,
+                            allow_review_sequential_fallback=any(
+                                assessment.get("mode")
+                                == "sequential_virtual_camera"
+                                and assessment.get("verdict") == "feasible"
+                                for assessment in (
+                                    option_data.get(
+                                        "framing_refinement", {}
+                                    ).get("presentation_options", [])
+                                    if isinstance(
+                                        option_data.get(
+                                            "framing_refinement", {}
+                                        ),
+                                        Mapping,
+                                    )
+                                    else []
+                                )
+                                if isinstance(assessment, Mapping)
+                            ),
                         )
                         auto_audit = None
                         failure_codes: list[FailureCode] = []
@@ -10944,6 +11512,15 @@ def _run_feature_cut_experiment_impl(
                                     ).append(
                                         "review_only_controlled_primary_center_clip"
                                     )
+                                    if (
+                                        FailureCode.ATOMIC_REGION_CLIPPED
+                                        in failure_codes
+                                    ):
+                                        candidate_geometry.setdefault(
+                                            "risk_codes", []
+                                        ).append(
+                                            "review_only_atomic_relation_bbox_clip"
+                                        )
                                 candidate_geometry["requires_gemini_review"] = True
                                 candidate_geometry.setdefault("risk_codes", []).append(
                                     "explicit_unverified_geometry_preview"

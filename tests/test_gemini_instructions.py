@@ -159,6 +159,59 @@ def test_selected_vertical_framing_repairs_joint_hold_mode() -> None:
     )
 
 
+def test_selected_vertical_framing_normalizes_clippable_relation_participants() -> None:
+    canonical, changes = canonicalize_selected_vertical_framing_output(
+        json.dumps(
+            {
+                "semantic_requirement": "simultaneous_relation",
+                "recommended_action": "tracked_crop",
+                "presentation_options": [
+                    {
+                        "mode": "controlled_clipping",
+                        "verdict": "feasible",
+                        "observable_reason": "Only non-semantic outer extent is clipped.",
+                    }
+                ],
+                "regions": [
+                    {
+                        "region_id": "subject",
+                        "entity_id": "entity-subject",
+                        "kind": "subject",
+                        "evidence_role": "primary_subject",
+                        "role": "required",
+                        "atomic": True,
+                    },
+                    {
+                        "region_id": "reference",
+                        "entity_id": "entity-reference",
+                        "kind": "subject",
+                        "evidence_role": "context_reference",
+                        "role": "required",
+                        "atomic": True,
+                    },
+                ],
+                "virtual_camera_proposal": {
+                    "composition_mode": "joint_relation",
+                    "phases": [],
+                },
+            }
+        )
+    )
+    payload = json.loads(canonical)
+
+    assert all(
+        region["evidence_role"] == "relation_participant"
+        for region in payload["regions"]
+    )
+    assert all(region["atomic"] is False for region in payload["regions"])
+    assert {
+        change["reason"] for change in changes
+    } >= {
+        "bound_required_regions_in_an_explicit_simultaneous_relation_are_relation_participants",
+        "controlled_clipping_cannot_treat_an_ordinary_relation_participant_as_an_indivisible_region",
+    }
+
+
 def test_selected_vertical_framing_keeps_atomic_relational_core_single_anchor() -> None:
     canonical, changes = canonicalize_selected_vertical_framing_output(
         json.dumps(

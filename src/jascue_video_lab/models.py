@@ -3863,6 +3863,39 @@ class SelectedVerticalFramingProposal(StrictModel):
     confidence: Confidence
     model_provenance: ModelProvenance
 
+    def _has_bound_atomic_relation_core(self, required_count: int = 2) -> bool:
+        """Return whether one compound core is backed by bound participants.
+
+        Some observable relations are spatially smaller than either complete
+        participant (for example a contact point, an interface state next to
+        the hand operating it, or two adjacent edges used for comparison).
+        Tracking both complete participants can make a full-bleed portrait
+        crop impossible even though one indivisible relation carrier preserves
+        the evidence.  The carrier is only valid when it names an observable
+        relation and the proposal separately binds enough participant entity
+        IDs; prose alone is never sufficient.
+        """
+
+        carriers = [
+            region
+            for region in self.regions
+            if (
+                region.execution_role == "hard_core"
+                and region.atomic
+                and region.evidence_role == "relation_carrier"
+                and region.observable_relations
+            )
+        ]
+        participant_entity_ids = {
+            region.entity_id
+            for region in self.regions
+            if (
+                region.evidence_role == "relation_participant"
+                and region.entity_id is not None
+            )
+        }
+        return bool(carriers) and len(participant_entity_ids) >= required_count
+
     @model_validator(mode="after")
     def validate_selected_framing(self) -> "SelectedVerticalFramingProposal":
         region_ids = [region.region_id for region in self.regions]
@@ -4026,10 +4059,12 @@ class SelectedVerticalFramingProposal(StrictModel):
         if (
             self.semantic_requirement == "simultaneous_relation"
             and len(required) < 2
+            and not self._has_bound_atomic_relation_core()
         ):
             raise ValueError(
                 "a simultaneous relation requires at least two independently "
-                "grounded hard-core participant regions"
+                "grounded hard-core participant regions, or one atomic relation "
+                "carrier backed by at least two bound participant entities"
             )
         if (
             self.semantic_requirement == "sequential_attention"

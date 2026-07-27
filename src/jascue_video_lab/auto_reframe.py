@@ -93,7 +93,11 @@ class CandidatePreflight(StrictModel):
     candidate_id: str = Field(min_length=1)
     rank: int = Field(ge=1, le=4)
     presentation: Literal[
-        "tracked_crop", "center_crop", "fit_with_background", "static_anchor"
+        "tracked_crop",
+        "phase_virtual_camera",
+        "center_crop",
+        "fit_with_background",
+        "static_anchor",
     ]
     source_lineage_valid: bool
     within_single_shot: bool
@@ -216,7 +220,7 @@ def failure_codes_for_preflight(
     checkpoint_status = preflight.semantic_checkpoint_status
     checkpoint_required = (
         policy.require_semantic_checkpoints_for_tracked_crop
-        and preflight.presentation == "tracked_crop"
+        and preflight.presentation in {"tracked_crop", "phase_virtual_camera"}
     )
     if checkpoint_status == SemanticCheckpointStatus.FAILED:
         failures.append(FailureCode.IDENTITY_SWITCH_DETECTED)
