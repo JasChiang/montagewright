@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import re
 import subprocess
 import uuid
 from collections import defaultdict
@@ -14,38 +15,23 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .billing import summarize_usage_and_list_price
 from .gemini import GeminiLabClient
-from .media import probe_video, sha256_file
+from .media import extract_frame, probe_video, sha256_file
 from .models import RushClip, RushFrame, RushesCatalog, RushesEditPlan
 from .shots import ShotManifest, detect_shots_ffmpeg
 from .storage import read_json, utc_now, write_json
 
 
 def _probe_clip(path: Path) -> dict[str, Any]:
-    completed = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "format=duration,size:stream=width,height,r_frame_rate",
-            "-of",
-            "json",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    payload = json.loads(completed.stdout)
-    stream = payload["streams"][0]
+    media = probe_video(path)
+    rate = media.video.average_frame_rate or media.video.real_frame_rate
     return {
-        "duration_ms": round(float(payload["format"]["duration"]) * 1000),
-        "size_bytes": int(payload["format"]["size"]),
-        "width": int(stream["width"]),
-        "height": int(stream["height"]),
-        "frame_rate": stream["r_frame_rate"],
+        "duration_ms": media.duration_ms,
+        "size_bytes": media.size_bytes,
+        "width": media.video.display_width,
+        "height": media.video.display_height,
+        "frame_rate": (
+            f"{rate.numerator}/{rate.denominator}" if rate is not None else "0/0"
+        ),
     }
 
 
@@ -98,53 +84,136 @@ def _extract_catalog_frames(
     *,
     sample_interval_ms: int,
     max_width: int,
-) -> list[Path]:
-    """Extract RGB PNGs so short clips and limited-range YUV remain catalogable."""
-    fps_value = 1000 / sample_interval_ms
-    output_pattern = raw_dir / "%06d.png"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            clip.path,
-            "-vf",
-            f"fps={fps_value},scale={max_width}:-2,format=rgb24",
-            "-start_number",
-            "0",
-            str(output_pattern),
-        ],
-        check=True,
-    )
-    raw_paths = sorted(raw_dir.glob("*.png"), key=lambda path: int(path.stem))
-    if raw_paths:
-        return raw_paths
+) -> list[tuple[Path, Any]]:
+    """Extract immutable decoded frames and preserve their real source PTS."""
 
-    # Some sub-interval clips contain fewer decoded frames than the sampling
-    # filter can emit. They still need one auditable RF frame rather than being
-    # silently absent from the library.
-    first_frame = raw_dir / "000000.png"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            clip.path,
-            "-frames:v",
-            "1",
-            "-vf",
-            f"scale={max_width}:-2,format=rgb24",
-            str(first_frame),
-        ],
-        check=True,
+    records: list[tuple[Path, Any]] = []
+    requested_times = list(range(0, clip.duration_ms, sample_interval_ms)) or [0]
+    for local_index, requested_time_ms in enumerate(requested_times):
+        output = raw_dir / f"{local_index:06d}.png"
+        frame = extract_frame(
+            Path(clip.path),
+            requested_time_ms,
+            output,
+            max_width=max_width,
+        )
+        records.append((output, frame))
+    return records
+
+
+def _discover_sources(
+    source_directory: Path,
+    *,
+    excluded_directory: Path | None = None,
+) -> list[Path]:
+    root = source_directory.expanduser().resolve(strict=True)
+    excluded = (
+        excluded_directory.expanduser().resolve()
+        if excluded_directory is not None
+        else None
     )
-    return [first_frame] if first_frame.exists() else []
+    sources: list[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {
+            ".mp4",
+            ".mov",
+            ".m4v",
+        }:
+            continue
+        resolved = path.resolve()
+        if excluded is not None and (
+            resolved == excluded or excluded in resolved.parents
+        ):
+            continue
+        sources.append(resolved)
+    return sorted(sources, key=lambda path: str(path.relative_to(root)).casefold())
+
+
+def _clip_id_for_path(
+    path: Path,
+    *,
+    source_directory: Path,
+    used: set[str],
+) -> str:
+    relative = str(path.relative_to(source_directory.resolve()))
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", path.stem).strip("_") or "clip"
+    candidate = base
+    if candidate in used:
+        suffix = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:10]
+        candidate = f"{base}-{suffix}"
+    used.add(candidate)
+    return candidate
+
+
+def validate_rushes_catalog_sources(
+    catalog: RushesCatalog,
+    *,
+    source_directory: Path | None = None,
+    sample_interval_ms: int | None = None,
+    excluded_directory: Path | None = None,
+) -> dict[str, Any]:
+    """Reject a stale catalog before model calls or rendering."""
+
+    # A deliberately empty catalog can still be used to produce an auditable
+    # missing-evidence review package. It has no source bytes whose lineage can
+    # become stale, so do not require its informational root path to exist.
+    if not catalog.clips:
+        return {
+            "contract_version": "rushes-catalog-source-validation-v1",
+            "catalog_id": catalog.catalog_id,
+            "source_directory": catalog.source_directory,
+            "status": "validated_empty_catalog",
+            "source_count": 0,
+            "added": [],
+            "removed": [],
+            "changed": [],
+        }
+
+    expected_root = Path(catalog.source_directory).expanduser().resolve(strict=True)
+    if source_directory is not None:
+        supplied_root = source_directory.expanduser().resolve(strict=True)
+        if supplied_root != expected_root:
+            raise ValueError("catalog source directory differs from the requested source")
+    if sample_interval_ms is not None and sample_interval_ms != catalog.sample_interval_ms:
+        raise ValueError("catalog sample interval differs from the requested interval")
+    catalog_by_path = {
+        str(Path(clip.path).expanduser().resolve()): clip for clip in catalog.clips
+    }
+    current_paths = _discover_sources(
+        expected_root,
+        excluded_directory=excluded_directory,
+    )
+    current_set = {str(path) for path in current_paths}
+    catalog_set = set(catalog_by_path)
+    added = sorted(current_set - catalog_set)
+    removed = sorted(catalog_set - current_set)
+    changed: list[dict[str, str]] = []
+    for path_string in sorted(current_set & catalog_set):
+        current_hash = sha256_file(Path(path_string))
+        saved_hash = catalog_by_path[path_string].sha256
+        if current_hash != saved_hash:
+            changed.append(
+                {
+                    "path": path_string,
+                    "catalog_sha256": saved_hash,
+                    "current_sha256": current_hash,
+                }
+            )
+    result = {
+        "contract_version": "rushes-catalog-source-validation-v1",
+        "catalog_id": catalog.catalog_id,
+        "source_directory": str(expected_root),
+        "added_paths": added,
+        "removed_paths": removed,
+        "changed_paths": changed,
+        "valid": not (added or removed or changed),
+        "validated_at": utc_now(),
+    }
+    if not result["valid"]:
+        raise ValueError(
+            "rushes catalog is stale: source files were added, removed or changed"
+        )
+    return result
 
 
 def create_rushes_catalog(
@@ -156,20 +225,25 @@ def create_rushes_catalog(
 ) -> RushesCatalog:
     if sample_interval_ms < 500:
         raise ValueError("sample_interval_ms must be at least 500")
-    sources = sorted(
-        path
-        for path in source_directory.iterdir()
-        if path.is_file() and path.suffix.lower() in {".mp4", ".mov", ".m4v"}
+    resolved_source_directory = source_directory.expanduser().resolve(strict=True)
+    sources = _discover_sources(
+        resolved_source_directory,
+        excluded_directory=output_dir,
     )
     if not sources:
         raise ValueError(f"no video files found in {source_directory}")
     output_dir.mkdir(parents=True, exist_ok=True)
     clips: list[RushClip] = []
+    used_clip_ids: set[str] = set()
     for path in sources:
         metadata = _probe_clip(path)
         clips.append(
             RushClip(
-                clip_id=path.stem,
+                clip_id=_clip_id_for_path(
+                    path,
+                    source_directory=resolved_source_directory,
+                    used=used_clip_ids,
+                ),
                 path=str(path.resolve()),
                 sha256=sha256_file(path),
                 **metadata,
@@ -189,7 +263,7 @@ def create_rushes_catalog(
             sample_interval_ms=sample_interval_ms,
             max_width=max_width,
         )
-        for local_index, raw_path in enumerate(raw_paths):
+        for local_index, (raw_path, extracted) in enumerate(raw_paths):
             requested_time_ms = local_index * sample_interval_ms
             if requested_time_ms >= clip.duration_ms:
                 continue
@@ -206,6 +280,12 @@ def create_rushes_catalog(
                     clip_id=clip.clip_id,
                     requested_time_ms=requested_time_ms,
                     image_path=str(Path("catalog-frames") / output_path.name),
+                    source_image_path=str(
+                        Path("catalog-raw") / clip.clip_id / raw_path.name
+                    ),
+                    frame_time_ms=extracted.frame_time_ms,
+                    frame_pts=extracted.frame_pts,
+                    frame_hash=extracted.frame_hash,
                 )
             )
             frame_paths.append(output_path)
@@ -243,7 +323,7 @@ def create_rushes_catalog(
     _render_contact_sheets(frame_paths, output_dir / "contact-sheets")
     catalog = RushesCatalog(
         catalog_id=_catalog_fingerprint(clips, sample_interval_ms),
-        source_directory=str(source_directory.resolve()),
+        source_directory=str(resolved_source_directory),
         sample_interval_ms=sample_interval_ms,
         total_duration_ms=sum(clip.duration_ms for clip in clips),
         clips=clips,
@@ -462,6 +542,13 @@ def run_rushes_experiment(
     catalog_path = output_dir / "catalog.json"
     if catalog_path.exists():
         catalog = RushesCatalog.model_validate(read_json(catalog_path))
+        validation = validate_rushes_catalog_sources(
+            catalog,
+            source_directory=source_directory,
+            sample_interval_ms=sample_interval_ms,
+            excluded_directory=output_dir,
+        )
+        write_json(output_dir / "catalog-source-validation.json", validation)
     else:
         stage = monotonic()
         catalog = create_rushes_catalog(

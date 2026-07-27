@@ -14,6 +14,7 @@ from PIL import Image
 from .ab_review import render_grounding_ab_review
 from .billing import summarize_usage_and_list_price
 from .compare import compare_runs
+from .delivery_pipeline import run_feature_delivery_pipeline
 from .feature_cut import run_feature_cut_experiment
 from .fixtures import generate_fixtures
 from .full_v1 import (
@@ -811,6 +812,38 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         ),
         auto_vertical_framing=args.auto_vertical_framing,
         execution_profile=args.execution_profile,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_feature_delivery(args: argparse.Namespace) -> int:
+    result = run_feature_delivery_pipeline(
+        feature_cut_kwargs={
+            "catalog_path": args.catalog_json,
+            "checkpoint_path": args.sam_checkpoint,
+            "plan_prompt": _load_prompt("feature_cut_selects_zh-TW.txt"),
+            "grounding_prompt": _load_prompt(
+                "grounding_native_yxyx_zh-TW.txt"
+            ),
+            "vertical_framing_prompt": _load_prompt(
+                "selected_vertical_framing_zh-TW.txt"
+            ),
+            "aspect": args.aspect,
+            "sam_analysis_fps": args.sam_analysis_fps,
+            "scdet_threshold": args.scdet_threshold,
+            "reuse_feature_plan": args.reuse_feature_plan,
+            "allow_shorter_within_delivery_range": (
+                args.allow_shorter_within_delivery_range
+            ),
+            "auto_vertical_framing": True,
+            "post_render_quality_qc": True,
+        },
+        brief_path=args.brief_json,
+        music_path=args.music,
+        music_lock_path=args.music_map_lock,
+        output_dir=args.output_dir,
+        model_id=args.model,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2363,6 +2396,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feature_cut_parser.add_argument("--output-dir", type=Path, required=True)
     feature_cut_parser.set_defaults(handler=command_feature_cut)
+
+    feature_delivery_parser = subparsers.add_parser(
+        "feature-delivery",
+        help=(
+            "Run the production-review picture cut, continuous music assembly, "
+            "final mux and Gemini final QA as one hash-bound pipeline"
+        ),
+    )
+    feature_delivery_parser.add_argument("catalog_json", type=Path)
+    feature_delivery_parser.add_argument("brief_json", type=Path)
+    feature_delivery_parser.add_argument("--sam-checkpoint", type=Path, required=True)
+    feature_delivery_parser.add_argument("--music", type=Path, required=True)
+    feature_delivery_parser.add_argument(
+        "--music-map-lock", type=Path, required=True
+    )
+    feature_delivery_parser.add_argument(
+        "--aspect", choices=["both", "9x16", "16x9"], default="both"
+    )
+    feature_delivery_parser.add_argument(
+        "--sam-analysis-fps", type=float, default=2.0
+    )
+    feature_delivery_parser.add_argument(
+        "--scdet-threshold", type=float, default=4.0
+    )
+    feature_delivery_parser.add_argument("--reuse-feature-plan", action="store_true")
+    feature_delivery_parser.add_argument(
+        "--allow-shorter-within-delivery-range", action="store_true"
+    )
+    feature_delivery_parser.add_argument("--model", default=MODEL_ID)
+    feature_delivery_parser.add_argument("--output-dir", type=Path, required=True)
+    feature_delivery_parser.set_defaults(handler=command_feature_delivery)
 
     analyze_music_parser = subparsers.add_parser(
         "analyze-music",

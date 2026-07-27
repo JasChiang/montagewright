@@ -1199,6 +1199,11 @@ def test_feature_cut_single_aspect_found_evidence_never_runs_other_geometry(
         output_path.write_bytes(b"render")
 
     monkeypatch.setattr(feature_cut_module, "GeminiLabClient", FakeClient)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "validate_rushes_catalog_sources",
+        lambda _catalog: {"status": "validated_test_fixture"},
+    )
     monkeypatch.setattr(feature_cut_module, "probe_video", fake_probe)
     monkeypatch.setattr(feature_cut_module, "has_audio_stream", lambda _path: False)
     monkeypatch.setattr(
@@ -1240,6 +1245,26 @@ def test_feature_cut_single_aspect_found_evidence_never_runs_other_geometry(
         feature_cut_module,
         "_render_source_segment",
         fake_render_source_segment,
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_exact_render_source_interval",
+        lambda **_kwargs: {
+            "contract_version": "source-pts-interval-v1",
+            "source_start_pts": 3500,
+            "source_end_pts_exclusive": 6500,
+            "time_base": {"numerator": 1, "denominator": 1000},
+            "display_start_ms": 3500,
+            "display_end_ms": 6500,
+        },
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_write_render_boundary_lineage",
+        lambda **_kwargs: {
+            "contract_version": "render-boundary-lineage-v1",
+            "status": "validated_test_fixture",
+        },
     )
     monkeypatch.setattr(feature_cut_module, "_concat_segments", fake_concat)
     monkeypatch.setattr(

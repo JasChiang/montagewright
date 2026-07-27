@@ -8,7 +8,12 @@ import pytest
 
 from jascue_video_lab.media import probe_video
 from jascue_video_lab.models import RushesEditPlan
-from jascue_video_lab.rushes import _crop_filter, _segment_bounds, create_rushes_catalog
+from jascue_video_lab.rushes import (
+    _crop_filter,
+    _segment_bounds,
+    create_rushes_catalog,
+    validate_rushes_catalog_sources,
+)
 from jascue_video_lab.sam_tracking import _normalize_shot_manifest
 from jascue_video_lab.shots import ShotSegment, detect_shots_ffmpeg
 
@@ -20,6 +25,7 @@ def _make_color_video(path: Path, color: str, duration: float = 2) -> None:
             "-hide_banner",
             "-loglevel",
             "error",
+            "-y",
             "-f",
             "lavfi",
             "-i",
@@ -157,6 +163,44 @@ def test_catalog_uses_immutable_frame_ids_without_model_timestamps(tmp_path: Pat
     ]
     assert Path(catalog.analysis_reel_path).exists()
     assert all((tmp_path / "catalog" / frame.image_path).exists() for frame in catalog.frames)
+    assert all(frame.frame_pts is not None for frame in catalog.frames)
+    assert all(frame.frame_hash is not None for frame in catalog.frames)
+    assert all(frame.source_image_path is not None for frame in catalog.frames)
+    assert validate_rushes_catalog_sources(catalog)["valid"] is True
+
+
+def test_catalog_recurses_and_disambiguates_same_stem_assets(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    (source / "camera-a").mkdir(parents=True)
+    (source / "camera-b").mkdir(parents=True)
+    _make_color_video(source / "camera-a" / "A001.MP4", "red")
+    _make_color_video(source / "camera-b" / "A001.MP4", "blue")
+
+    catalog = create_rushes_catalog(
+        source,
+        tmp_path / "catalog",
+        sample_interval_ms=2000,
+    )
+
+    assert len(catalog.clips) == 2
+    assert len({clip.clip_id for clip in catalog.clips}) == 2
+    assert all(clip.clip_id.startswith("A001") for clip in catalog.clips)
+
+
+def test_catalog_validation_rejects_source_replacement(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    video = source / "A001.MP4"
+    _make_color_video(video, "red")
+    catalog = create_rushes_catalog(
+        source,
+        tmp_path / "catalog",
+        sample_interval_ms=2000,
+    )
+    _make_color_video(video, "blue")
+
+    with pytest.raises(ValueError, match="catalog is stale"):
+        validate_rushes_catalog_sources(catalog)
 
 
 def test_catalog_keeps_one_frame_for_sub_interval_clip(tmp_path: Path) -> None:

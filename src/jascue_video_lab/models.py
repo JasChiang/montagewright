@@ -3411,6 +3411,26 @@ class RushFrame(StrictModel):
     clip_id: str
     requested_time_ms: int = Field(ge=0)
     image_path: str
+    source_image_path: str | None = None
+    frame_time_ms: int | None = Field(default=None, ge=0)
+    frame_pts: int | None = None
+    frame_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_exact_frame_lineage(self) -> "RushFrame":
+        exact = (
+            self.source_image_path,
+            self.frame_time_ms,
+            self.frame_pts,
+            self.frame_hash,
+        )
+        if any(value is not None for value in exact) and not all(
+            value is not None for value in exact
+        ):
+            raise ValueError(
+                "rush frame exact lineage requires time, PTS and hash together"
+            )
+        return self
 
 
 class RushesCatalog(StrictModel):

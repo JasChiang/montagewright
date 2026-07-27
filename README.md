@@ -14,6 +14,7 @@
 6. **確認真正可用的秒數**：只對入選 shot 逐幀量測黑白格、freeze、解碼／PTS 異常及需複核的失焦、模糊與晃動，先算出連續的安全區間，再分配章節片長；不拿包含髒畫面的整個 shot 長度冒充可用容量。
 7. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨目標、做有目的的 push-in／pull-out／punch-in，或避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。VirtualCameraPlan 只接受已鎖定的實例與通過 containment gate 的路徑；沒有兩個獨立 anchor 時，`pan_reveal` 會明確 fallback，不會拿單一 track 猜第二個目標。多主體會先嘗試帶共同錨點的 phase，例如「左＋中 → 中＋右」；同源畫面的 A→B 比較也可依序呈現，但必須由本機鎖定相同數位縮放，避免鏡頭倍率偽造大小差異。必要主體無法安全裝進滿版 9:16 時，renderer 依 brief 明示的交付偏好選擇待審的滿版中心裁切或純色 scope-preserving fit；不使用模糊背景，也不把 review fallback 冒充成正式 geometry success。
 8. **保留連續音樂，不拿毛片原音疊上去**：review delivery 只使用已核准的一段連續音樂，優先保留自然收尾；不把同一首歌切成數段交疊、不 time-stretch，也不混入每顆毛片原音造成突兀重疊。若畫面長度與連續音樂無法在容差內對齊，會停止而不是硬裁或 freeze 畫面。
+9. **完成版一定走同一條交付鏈**：`feature-delivery` 依序執行 production picture gate、連續音樂 assembly、最終 mux 與 Gemini 成片 QA。任何一層失敗只會留下可稽核的 blocked／review artifact，不會因 MP4 能播放就宣稱完成；QA 通過後仍須真人核准。
 9. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。Gemini 可用一次有聲 16:9 call 檢查 brief、資訊停留、重複、轉場及音樂 flow；9:16 另以靜音 proxy 只檢查裁切、文字與追蹤。QA 只提出觀察，不會自行改片；真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
 
 ```text
@@ -91,7 +92,7 @@ Top-K 直式候選
 
 這也不是把「兩個都必須同時看見」改成任意裁切。規劃器先把 coverage intent 分成 `single_primary`、`group_coverage`、`sequential_attention` 與 `simultaneous_relation`：單一主角可以穩定 hold；群組展示要求每個意義必要成員至少在一個 phase 清楚出現，不能只因中央成員方便裁切就把其餘成員降成背景；畫面本身有可觀察交接時依該順序移動；接觸、距離或相對位置必須同時成立時，proposal 才必須在關鍵 phase 使用 `joint_relation`。群體關係可用相鄰 phase 的重疊 anchor 延續脈絡；A／B 外觀或尺寸比較可使用不重疊的 sequential phases，但不得使用 push-in、pull-out 或 punch-in 改變比較尺度。來源素材靜止只代表不必跟拍，不代表可跳過群組覆蓋義務。自動 proposal 永遠不能授權裁掉 active hard core；若 brief 明示 `center_crop`，所有 geometry 候選仍失敗時才可輸出 `full_bleed_center_crop_review`，並保存被裁風險與人工複核要求。artifact 也會分清 geometry success、Gemini proposal、真人 policy 與待審 fallback，避免把預覽冒充正式核准。
 
-`feature-cut` 是人工審核用成片，但 tracked crop 已不再只看 seed frame。只要實際執行 SAM tracking，本機便依遮擋後重現、切鏡與幾何狀態規劃有限數量的 identity checkpoint，按保存的 source PTS 抽出 exact frame，再讓 Gemini 只判斷 tracked region 是否仍為鎖定身分；它不能修改 bbox、時間或 crop。`mismatch` 會淘汰候選，`ambiguous`／verifier failure 會保留為待審狀態；若整段沒有任何非 seed checkpoint 的必要性，也必須明示 `not_required_by_policy`，不能把未執行的空值當作成功。preferred／soft extent 未達建議可見比例仍屬 advisory；optional region 無法 Grounding 時也只移除該 optional track，不能拖垮 required 主體。正式 unattended delivery 仍要求 identity、coverage、quality 與 final QA 全部形成完整 execution evidence。研究用的 `--allow-unverified-geometry-preview` 則另允許在上游選擇 `primary_center`、hard core 非 atomic／文字／UI／graphic，且 required 最小可見面積至少 90% 時，輸出略裁 hard-core 邊緣的受控預覽；它不會改變 production 的 100% containment 規則。
+`feature-cut` 是人工審核用成片，但 tracked crop 已不再只看 seed frame。只要實際執行 SAM tracking，本機便依遮擋後重現、切鏡與幾何狀態規劃有限數量的 identity checkpoint，按保存的 source PTS 抽出 exact frame，再讓 Gemini 只判斷 tracked region 是否仍為鎖定身分；它不能修改 bbox、時間或 crop。`mismatch` 會淘汰候選，`ambiguous`／verifier failure 會保留為待審狀態；若整段沒有任何非 seed checkpoint 的必要性，也必須明示 `not_required_by_policy`，不能把未執行的空值當作成功。preferred／soft extent 未達建議可見比例仍屬 advisory；optional region 無法 Grounding 時也只移除該 optional track，不能拖垮 required 主體。`feature-delivery` 會把 identity、coverage、quality、continuous music mux 與 final QA 串成同一條 hash-bound execution chain；即使全部通過仍只會升級到 `ready_for_human_review`，不會替真人做最終交付核准。研究用的 `--allow-unverified-geometry-preview` 則另允許在上游選擇 `primary_center`、hard core 非 atomic／文字／UI／graphic，且 required 最小可見面積至少 90% 時，輸出略裁 hard-core 邊緣的受控預覽；它不會改變 production 的 100% containment 規則。
 
 ### 用到哪些技術
 
@@ -483,7 +484,7 @@ P1 不再把 Gemini 的 `recommended_duration_seconds` 當成孤立數字。每�
 
 P2 將 reframe 從固定倍率升級為可稽核的 `VirtualCameraPlan`。16:9 與 9:16 都能使用 Gemini 基於素材證據提出的 `hold`、`follow_deadband`、`follow`、`punch_in_cut`、`push_in` 或 `pull_out`；多 anchor 直式鏡頭另可依 phase 順序交接注意力。實際 keyframe scale、center、containment、deadband、速度、加速度與 jerk 由本機 track 和 geometry solver 決定，不能由模型直接填數值。每個執行結果保存 sidecar 與 track fingerprint；phase 間若沒有足夠時間完成安全移動，就轉為 hard cut 而不是快速掃過。這套 16:9 剪輯運鏡與 9:16 版型 reframe 共用 tracking evidence，但分屬不同 editorial contract。
 
-若使用者授權的交付範圍是 60–90 秒，而 Gemini 的各章 AttentionProfile 在 QualitySafeInterval 內的最大連續容量總和略短於 brief 偏好秒數，可明示 `--allow-shorter-within-delivery-range`。程式只會把 project duration 降到仍在交付範圍內的 attention maximum，並保存 `project-duration-resolution.json`；它不會重播、停格、穿過髒畫面或偷偷延長任何章節。容量依 requested aspect、候選與 evidence anchor 分開計算：只計算包含該 anchor 的連續 safe interval，並以至少一個可執行候選能承擔的容量規劃；runtime 換候選時仍須重新確認該候選能承擔已配置時長。若已核准的同一首音樂長於縮短後的 project timeline，scheduler 可在使用者明示允許縮短交付時使用其合法 prefix cues 來調整畫面章節邊界；最終音樂仍須另由 assembly 階段產生單一連續區段與自然淡出，不切碎、交疊或 time-stretch 音樂。picture→music→final QA 尚未成為單一必經 executor，因此此類輸出在完整 mux 與 QA 前仍只屬 review workflow。預設仍 fail closed。
+若使用者授權的交付範圍是 60–90 秒，而 Gemini 的各章 AttentionProfile 在 QualitySafeInterval 內的最大連續容量總和略短於 brief 偏好秒數，可明示 `--allow-shorter-within-delivery-range`。程式只會把 project duration 降到仍在交付範圍內的 attention maximum，並保存 `project-duration-resolution.json`；它不會重播、停格、穿過髒畫面或偷偷延長任何章節。容量依 requested aspect、候選與 evidence anchor 分開計算：只計算包含該 anchor 的連續 safe interval，並以至少一個可執行候選能承擔的容量規劃；runtime 換候選時仍須重新確認該候選能承擔已配置時長。若已核准的同一首音樂長於縮短後的 project timeline，scheduler 可在使用者明示允許縮短交付時使用其合法 prefix cues 來調整畫面章節邊界；`feature-delivery` 接著強制由 assembly 產生單一連續區段與自然淡出，不切碎、交疊或 time-stretch 音樂，再對 final mux 執行成片 QA。任何長度或 lineage 不一致都會 fail closed。
 
 ```bash
 uv run jascue-video-lab feature-cut CATALOG.json BRIEF.json \
@@ -629,7 +630,19 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab review-cue-plan \
 
 這是刻意的 fail-closed 邊界：render manifest 只有既有 segment duration，不能證明把 cut 移動 250 ms 仍保留完整 setup／action／result、合法 source handle、同一 shot、可用構圖與片尾 hold。正式下一階段必須讓經核准的 Trim Intent 提供 action-safe timing window，通過 geometry preflight 後才可將 CuePlan 套入新的 RenderPlan；不會直接用 `setpts` 變速或裁掉動作來製造「有卡拍」的假象。
 
-完成 picture cut 後，可用下列獨立工具組裝連續音樂與執行唯讀 QA。組裝器會驗證 MusicAssembly plan／binding／render manifest、實際音樂 hash 與 picture／music 各自的 stream 長度；任何證據不一致或超出容差都會拒絕，不會用 `-shortest` 暗中截斷。QA 會保存影片、manifest、brief、prompt、schema、raw response、usage 與成本 hash，重跑相同輸入不會再次付費：
+正式測試建議直接用單一交付命令。它會強制使用 `production_review`，自動補齊入選候選的 ShotQualityMap，完成 picture→continuous music→final mux→FinalEditQA；輸出最高只會是 `ready_for_human_review`：
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab feature-delivery \
+  CATALOG.json BRIEF.json \
+  --sam-checkpoint CHECKPOINT.pt \
+  --music MUSIC.wav \
+  --music-map-lock MUSIC_MAP.lock.json \
+  --aspect both \
+  --output-dir artifacts/my-delivery
+```
+
+需要逐層研究時，仍可用下列獨立工具組裝連續音樂與執行唯讀 QA。組裝器會驗證 MusicAssembly plan／binding／render manifest、實際音樂 hash 與 picture／music 各自的 stream 長度；任何證據不一致或超出容差都會拒絕，不會用 `-shortest` 暗中截斷。QA 會保存影片、manifest、brief、prompt、schema、raw response、usage 與成本 hash，重跑相同輸入不會再次付費：
 
 ```bash
 UV_CACHE_DIR=.uv-cache uv run python scripts/assemble_music_delivery.py \

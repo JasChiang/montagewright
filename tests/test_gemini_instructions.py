@@ -27,10 +27,13 @@ from jascue_video_lab.models import (
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
+    MediaInfo,
     ModelProvenance,
+    Rational,
     RushClip,
     RushFrame,
     RushesCatalog,
+    VideoStreamInfo,
 )
 
 
@@ -1466,3 +1469,63 @@ def test_identity_checkpoint_is_exact_frame_verify_only_request(
         for item in saved_request["input"]
         if item["type"] == "image"
     )
+
+
+def test_content_map_transport_failure_never_triggers_paid_schema_repair(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def fail_request(**_request: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("503 service unavailable")
+
+    client = object.__new__(GeminiLabClient)
+    client.model_id = MODEL_ID
+    client.client = SimpleNamespace(
+        interactions=SimpleNamespace(create=fail_request)
+    )
+    media = MediaInfo(
+        path=str(tmp_path / "source.mp4"),
+        sha256="a" * 64,
+        asset_id="sha256:" + "a" * 64,
+        format_name="mp4",
+        duration_ms=1000,
+        size_bytes=1,
+        format_metadata={},
+        video=VideoStreamInfo(
+            index=0,
+            codec_name="h264",
+            coded_width=1920,
+            coded_height=1080,
+            display_width=1920,
+            display_height=1080,
+            rotation_degrees=0,
+            average_frame_rate=Rational(numerator=30, denominator=1),
+            real_frame_rate=Rational(numerator=30, denominator=1),
+            time_base=Rational(numerator=1, denominator=30),
+            start_pts=0,
+            duration_ts=30,
+            metadata={},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="503"):
+        client.analyze_video(
+            media=media,
+            uploaded=SimpleNamespace(uri="files/source", mime_type="video/mp4"),
+            prompt_template="Analyze only visible evidence.",
+            run_id="transport-failure",
+            run_dir=tmp_path / "run",
+            repair_attempts=3,
+        )
+
+    assert calls == 1
+    validation = json.loads(
+        (tmp_path / "run" / "content_map.schema_validation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert validation["attempts"][0]["failure_stage"] == "interaction_request"
+    assert validation["attempts"][0]["paid_repair_allowed"] is False

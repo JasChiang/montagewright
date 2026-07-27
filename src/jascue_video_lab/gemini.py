@@ -960,6 +960,16 @@ class GeminiLabClient:
         try:
             if not path.exists():
                 raise FileNotFoundError(path)
+            source = path.expanduser().resolve(strict=True)
+            source_binding = {
+                "contract_version": "file-api-local-source-binding-v1",
+                "resolved_path": str(source),
+                "sha256": sha256_file(source),
+                "size_bytes": source.stat().st_size,
+                "mtime_ns": source.stat().st_mtime_ns,
+                "bound_at": utc_now(),
+            }
+            write_json(artifact_dir / "local_source_binding.json", source_binding)
             # Do not resolve an ASCII artifact symlink back to a non-ASCII
             # source basename: the SDK puts the basename in an HTTP header.
             guessed_mime_type = mimetypes.guess_type(str(path))[0]
@@ -1025,51 +1035,75 @@ class GeminiLabClient:
         *,
         force_reupload: bool = False,
     ) -> tuple[Any, bool]:
-        """Reuse an ACTIVE saved File API object; reupload only after a confirmed 404."""
+        """Reuse an ACTIVE File API object only for the same immutable bytes."""
+        source = path.expanduser().resolve(strict=True)
+        source_sha256 = sha256_file(source)
+        source_binding_path = artifact_dir / "local_source_binding.json"
         initial_path = artifact_dir / "file_upload_initial.json"
         if initial_path.exists() and not force_reupload:
-            try:
-                uploaded = self.resume_video_upload(artifact_dir, timeout_seconds)
-                expected_mime_type = mimetypes.guess_type(str(path))[0]
-                expected_mime_type = (
-                    canonical_interactions_mime_type(expected_mime_type)
-                    if expected_mime_type
-                    else None
-                )
-                saved_mime_type = getattr(uploaded, "mime_type", None)
-                if (
-                    expected_mime_type
-                    and isinstance(saved_mime_type, str)
-                    and saved_mime_type.strip().lower() != expected_mime_type
-                ):
-                    reason = "saved_file_api_mime_type_is_not_canonical"
-                else:
-                    write_json(
-                        artifact_dir / "file_cache.json",
-                        {
-                            "reused": True,
-                            "reason": "saved_file_api_object_is_active",
-                            "checked_at": utc_now(),
-                        },
+            saved_binding = (
+                read_json(source_binding_path)
+                if source_binding_path.is_file()
+                else None
+            )
+            if not isinstance(saved_binding, dict):
+                reason = "saved_file_api_object_has_no_local_source_binding"
+            elif saved_binding.get("sha256") != source_sha256:
+                reason = "saved_file_api_object_local_source_hash_mismatch"
+            else:
+                try:
+                    uploaded = self.resume_video_upload(artifact_dir, timeout_seconds)
+                    expected_mime_type = mimetypes.guess_type(str(path))[0]
+                    expected_mime_type = (
+                        canonical_interactions_mime_type(expected_mime_type)
+                        if expected_mime_type
+                        else None
                     )
-                    return uploaded, True
-            except Exception as error:
-                if not _is_file_api_not_found(error):
-                    raise
-                reason = "saved_file_api_object_expired_or_deleted"
+                    saved_mime_type = getattr(uploaded, "mime_type", None)
+                    if (
+                        expected_mime_type
+                        and isinstance(saved_mime_type, str)
+                        and saved_mime_type.strip().lower() != expected_mime_type
+                    ):
+                        reason = "saved_file_api_mime_type_is_not_canonical"
+                    else:
+                        write_json(
+                            artifact_dir / "file_cache.json",
+                            {
+                                "reused": True,
+                                "reason": "saved_file_api_object_is_active_and_source_bound",
+                                "source_sha256": source_sha256,
+                                "checked_at": utc_now(),
+                            },
+                        )
+                        return uploaded, True
+                except Exception as error:
+                    if not _is_file_api_not_found(error):
+                        raise
+                    reason = "saved_file_api_object_expired_or_deleted"
         else:
             reason = "force_reupload" if force_reupload else "no_saved_file_api_object"
 
         if initial_path.exists():
             history_dir = artifact_dir / "history" / utc_now().replace(":", "-")
-            for filename in ("file_upload_initial.json", "file_upload_final.json", "file_cache.json"):
+            for filename in (
+                "file_upload_initial.json",
+                "file_upload_final.json",
+                "file_cache.json",
+                "local_source_binding.json",
+            ):
                 old_path = artifact_dir / filename
                 if old_path.exists():
                     write_json(history_dir / filename, json.loads(old_path.read_text(encoding="utf-8")))
         uploaded = self.upload_video(path, artifact_dir, timeout_seconds)
         write_json(
             artifact_dir / "file_cache.json",
-            {"reused": False, "reason": reason, "checked_at": utc_now()},
+            {
+                "reused": False,
+                "reason": reason,
+                "source_sha256": source_sha256,
+                "checked_at": utc_now(),
+            },
         )
         return uploaded, False
 
@@ -1202,16 +1236,49 @@ class GeminiLabClient:
                 write_json(run_dir / "content_map.request.json", request_record)
             try:
                 interaction = self.client.interactions.create(**request_record)
-                previous_output = interaction.output_text
-                raw_interaction = _raw_dump(interaction)
-                raw_output = {"output_text": previous_output}
-                _record_interaction_attempt(
-                    run_dir=run_dir,
-                    operation=f"content_map_attempt_{attempt_number:02d}",
-                    canonical_filename="content_map.raw_interaction.json",
-                    interaction=interaction,
+            except Exception as error:
+                detail = {"type": type(error).__name__, "message": str(error)}
+                attempt_results.append(
+                    {
+                        "attempt": attempt_number,
+                        "ok": False,
+                        "failure_stage": "interaction_request",
+                        "paid_repair_allowed": False,
+                        "errors": [detail],
+                    }
                 )
-                write_json(attempt_output, raw_output)
+                append_error(
+                    run_dir,
+                    f"content_map_attempt_{attempt_number:02d}_request",
+                    error,
+                )
+                write_json(
+                    run_dir / "content_map.schema_validation.json",
+                    {
+                        "ok": False,
+                        "recovered_by_repair": False,
+                        "successful_attempt": None,
+                        "attempts": attempt_results,
+                        "errors": [detail],
+                    },
+                )
+                # 429, 503, timeout, transport, authentication and other
+                # request failures produced no model output to repair. A
+                # second paid full-video request would be unrelated to schema
+                # recovery, so only an explicit later user run may retry it.
+                raise
+
+            previous_output = interaction.output_text
+            raw_interaction = _raw_dump(interaction)
+            raw_output = {"output_text": previous_output}
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation=f"content_map_attempt_{attempt_number:02d}",
+                canonical_filename="content_map.raw_interaction.json",
+                interaction=interaction,
+            )
+            write_json(attempt_output, raw_output)
+            try:
                 parsed = ContentMap.model_validate_json(previous_output)
                 if parsed.asset_id != media.asset_id or parsed.duration_ms != media.duration_ms:
                     raise GeminiContractError("Content Map echoed asset_id or duration_ms incorrectly")
@@ -1241,7 +1308,15 @@ class GeminiLabClient:
             except Exception as error:
                 previous_error = error
                 detail = {"type": type(error).__name__, "message": str(error)}
-                attempt_results.append({"attempt": attempt_number, "ok": False, "errors": [detail]})
+                attempt_results.append(
+                    {
+                        "attempt": attempt_number,
+                        "ok": False,
+                        "failure_stage": "local_contract_validation",
+                        "paid_repair_allowed": attempt_number < total_attempts,
+                        "errors": [detail],
+                    }
+                )
                 append_error(run_dir, f"content_map_attempt_{attempt_number:02d}", error)
 
         write_json(

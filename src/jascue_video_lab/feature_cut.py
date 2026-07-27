@@ -5,6 +5,7 @@ import html
 import importlib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -102,7 +103,7 @@ from .reframe_policy import (
     REFRAME_POLICY_BINDING_ORIGIN,
     validate_reframe_policy_bundle,
 )
-from .rushes import _segment_bounds
+from .rushes import _segment_bounds, validate_rushes_catalog_sources
 from .sam_tracking import (
     SAM21_CONFIG,
     SAM21_IMPLEMENTATION_REVISION,
@@ -118,6 +119,7 @@ from .shot_quality import (
     build_quality_safe_intervals,
     build_render_quality_report,
     load_shot_quality_map,
+    scan_shot_quality,
 )
 from .editorial_planning import (
     build_attention_profile,
@@ -132,7 +134,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v14-gemini-phase-proposal"
+_RENDER_PIPELINE_VERSION = "feature-cut-v15-pts-topk-delivery-chain"
 RenderAspect = Literal["both", "9x16", "16x9"]
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
@@ -1294,7 +1296,7 @@ def _selected_event_id(
     matches = [
         candidate.event_id
         for candidate in candidates
-        if candidate.frame_id == frame_id and candidate.rank == 1
+        if candidate.frame_id == frame_id
     ]
     if len(set(matches)) > 1:
         raise ValueError("rank-one candidate event mapping is ambiguous")
@@ -1356,6 +1358,8 @@ def _chapter_bounds_with_approved_trim(
                 "trim_event_id": None,
                 "trim_tail_intent": None,
                 "trim_human_review": None,
+                "source_in_pts": None,
+                "source_out_pts": None,
                 "quality_map_path": None,
                 "quality_safe_interval_id": None,
             }
@@ -1395,6 +1399,8 @@ def _chapter_bounds_with_approved_trim(
             "trim_event_id": None,
             "trim_tail_intent": None,
             "trim_human_review": None,
+            "source_in_pts": None,
+            "source_out_pts": None,
             "quality_map_path": str(quality_path),
             "quality_map_sha256": sha256_file(quality_path),
             "quality_safe_interval_id": interval.interval_id,
@@ -1440,6 +1446,8 @@ def _chapter_bounds_with_approved_trim(
         "trim_decision_path": str(path),
         "trim_event_id": decision.event_id,
         "trim_tail_intent": decision.tail_intent,
+        "source_in_pts": decision.source_in_pts,
+        "source_out_pts": decision.source_out_pts,
         "trim_requires_human_review": decision.requires_human_review,
         "trim_human_review": (
             decision.human_review.model_dump(mode="json")
@@ -1475,6 +1483,103 @@ def _run_segment_encoder(command: list[str]) -> None:
         _run_ffmpeg(fallback)
 
 
+def _exact_render_source_interval(
+    *,
+    source_path: Path,
+    source_sha256: str,
+    start_ms: int,
+    end_ms: int,
+    trim: Mapping[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Bind requested editorial bounds to exact decoded source PTS and frames."""
+
+    source = source_path.expanduser().resolve(strict=True)
+    if sha256_file(source) != source_sha256:
+        raise ValueError("render source bytes differ from the catalog")
+    media = probe_video(source)
+    start_pts = trim.get("source_in_pts")
+    end_pts = trim.get("source_out_pts")
+    boundary_dir = output_dir / source_sha256[:16]
+    if isinstance(start_pts, int):
+        start_frame = extract_frame_at_pts(
+            source,
+            start_pts,
+            boundary_dir / f"start-{start_pts}.png",
+        )
+    else:
+        start_frame = extract_frame(
+            source,
+            start_ms,
+            boundary_dir / f"start-ms-{start_ms}.png",
+        )
+        start_pts = start_frame.frame_pts
+    if isinstance(end_pts, int):
+        end_frame = extract_frame_at_pts(
+            source,
+            end_pts,
+            boundary_dir / f"end-exclusive-{end_pts}.png",
+        )
+    else:
+        try:
+            end_frame = extract_frame(
+                source,
+                end_ms,
+                boundary_dir / f"end-exclusive-ms-{end_ms}.png",
+            )
+            end_pts = end_frame.frame_pts
+        except Exception:
+            stream_start_pts = media.video.start_pts or 0
+            if media.video.duration_ts is None:
+                raise
+            end_pts = stream_start_pts + media.video.duration_ts
+            end_frame = None
+    if end_pts <= start_pts:
+        raise ValueError("exact render source interval must be non-empty")
+    time_base = media.video.time_base
+    stream_start_pts = media.video.start_pts or 0
+    exact_start_ms = round(
+        (start_pts - stream_start_pts)
+        * time_base.numerator
+        * 1000
+        / time_base.denominator
+    )
+    exact_end_ms = round(
+        (end_pts - stream_start_pts)
+        * time_base.numerator
+        * 1000
+        / time_base.denominator
+    )
+    return {
+        "contract_version": "source-pts-interval-v1",
+        "source_path": str(source),
+        "source_sha256": source_sha256,
+        "video_stream_index": media.video.index,
+        "source_start_pts": stream_start_pts,
+        "source_time_base": time_base.model_dump(mode="json"),
+        "start_pts": start_pts,
+        "end_pts_exclusive": end_pts,
+        "start_ms_display": exact_start_ms,
+        "end_ms_display": exact_end_ms,
+        "start_frame_sha256": start_frame.frame_hash,
+        "end_exclusive_frame_sha256": (
+            end_frame.frame_hash if end_frame is not None else None
+        ),
+        "start_frame_path": start_frame.path,
+        "end_exclusive_frame_path": (
+            end_frame.path if end_frame is not None else None
+        ),
+        "display_transform": {
+            "rotation_degrees": media.video.rotation_degrees,
+            "display_width": media.video.display_width,
+            "display_height": media.video.display_height,
+            "display_sample_aspect_ratio": (
+                media.video.display_sample_aspect_ratio.model_dump(mode="json")
+            ),
+        },
+    }
+
+
 def _render_source_segment(
     *,
     source_path: Path,
@@ -1484,17 +1589,56 @@ def _render_source_segment(
     base_filter: str,
     output_path: Path,
     source_has_audio: bool | None = None,
+    source_interval: Mapping[str, Any] | None = None,
 ) -> str:
-    duration = (end_ms - start_ms) / 1000
+    if source_interval is None:
+        duration = (end_ms - start_ms) / 1000
+        source_input = [
+            "-ss",
+            f"{start_ms / 1000:.3f}",
+            "-i",
+            str(source_path),
+        ]
+        video_filter = base_filter
+        source_audio_trim = ""
+    else:
+        start_pts = int(source_interval["start_pts"])
+        end_pts = int(source_interval["end_pts_exclusive"])
+        time_base = source_interval["source_time_base"]
+        source_start_pts = int(source_interval["source_start_pts"])
+        numerator = int(time_base["numerator"])
+        denominator = int(time_base["denominator"])
+        duration = (end_pts - start_pts) * numerator / denominator
+        relative_start = (
+            (start_pts - source_start_pts) * numerator / denominator
+        )
+        relative_end = (
+            (end_pts - source_start_pts) * numerator / denominator
+        )
+        source_input = ["-copyts", "-i", str(source_path)]
+        trim_prefix = (
+            "[0:v]select="
+            f"'gte(pts\\,{start_pts})*lt(pts\\,{end_pts})',"
+            "setpts=PTS-STARTPTS[src_exact];"
+        )
+        video_filter = trim_prefix + base_filter.replace(
+            "[0:v]",
+            "[src_exact]",
+            1,
+        )
+        source_audio_trim = (
+            f"atrim=start={relative_start:.9f}:end={relative_end:.9f},"
+            "asetpts=N/SR/TB,"
+        )
     audio_fade_out = max(0.0, duration - 0.12)
     if source_has_audio is None:
         source_has_audio = has_audio_stream(source_path)
     if overlay_path is None:
-        filter_graph = base_filter + ";[base]null[v]"
+        filter_graph = video_filter + ";[base]null[v]"
         overlay_input: list[str] = []
     else:
         filter_graph = (
-            base_filter
+            video_filter
             + ";[1:v]format=rgba[card];"
             + "[base][card]overlay=0:0:shortest=1[v]"
         )
@@ -1517,10 +1661,7 @@ def _render_source_segment(
             "-loglevel",
             "error",
             "-y",
-            "-ss",
-            f"{start_ms / 1000:.3f}",
-            "-i",
-            str(source_path),
+            *source_input,
             *overlay_input,
             *audio_input,
             "-t",
@@ -1533,7 +1674,8 @@ def _render_source_segment(
             audio_map,
             "-af",
             (
-                "volume=0.58,afade=t=in:st=0:d=0.08,"
+                source_audio_trim
+                + "volume=0.58,afade=t=in:st=0:d=0.08,"
                 f"afade=t=out:st={audio_fade_out:.3f}:d=0.12"
             ),
             "-c:v",
@@ -1576,6 +1718,43 @@ def _render_source_segment(
     )
     temporary_path.replace(output_path)
     return audio_origin
+
+
+def _write_render_boundary_lineage(
+    *,
+    segment_path: Path,
+    source_interval: Mapping[str, Any],
+    output_path: Path,
+) -> dict[str, Any]:
+    """Bind a rendered segment's decoded boundary frames to its source interval."""
+
+    media = probe_video(segment_path)
+    first = extract_frame(
+        segment_path,
+        0,
+        output_path.parent / f"{output_path.stem}-output-first.png",
+    )
+    last = extract_frame(
+        segment_path,
+        max(0, media.duration_ms - 1),
+        output_path.parent / f"{output_path.stem}-output-last.png",
+    )
+    body = {
+        "contract_version": "render-boundary-lineage-v1",
+        "segment_path": str(segment_path.resolve()),
+        "segment_sha256": media.sha256,
+        "source_interval": dict(source_interval),
+        "output_first_frame": first.model_dump(mode="json"),
+        "output_last_frame": last.model_dump(mode="json"),
+        "verified": True,
+        "generated_at": utc_now(),
+    }
+    write_json(output_path, body)
+    return {
+        "path": str(output_path.resolve()),
+        "sha256": sha256_file(output_path),
+        "verified": True,
+    }
 
 
 def _render_missing_segment(
@@ -2303,6 +2482,7 @@ def _segment_variant_fingerprint(
     filter_graph: str,
     geometry: dict[str, Any],
     track_fingerprint: str | None,
+    source_interval: Mapping[str, Any] | None = None,
 ) -> str:
     return _stable_fingerprint(
         {
@@ -2310,6 +2490,7 @@ def _segment_variant_fingerprint(
             "source_sha256": source_sha256,
             "start_ms": start_ms,
             "end_ms": end_ms,
+            "source_interval": source_interval,
             "filter_graph": filter_graph,
             "geometry": geometry,
             "track_fingerprint": track_fingerprint,
@@ -7028,6 +7209,190 @@ def _vertical_runtime_candidate_options(
     ]
 
 
+def _horizontal_runtime_candidate_options(
+    selected: FeatureChapterSelect,
+    *,
+    max_candidates: int = 4,
+) -> list[dict[str, Any]]:
+    """Return ordered 16:9 candidates under the same runtime routing contract."""
+
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
+    if selected.horizontal_candidates:
+        return [
+            candidate.model_dump(mode="python")
+            for candidate in sorted(
+                selected.horizontal_candidates,
+                key=lambda item: item.rank,
+            )[:max_candidates]
+        ]
+    return [
+        {
+            "candidate_id": "legacy-primary",
+            "rank": 1,
+            "source_asset_id": None,
+            "event_id": None,
+            "frame_id": selected.horizontal_frame_id,
+            "observed_visual_evidence": selected.observed_visual_evidence,
+            "selection_reason": selected.selection_reason,
+            "strategy": selected.horizontal_strategy,
+            "zoom_intent": selected.horizontal_zoom_intent,
+            "camera_intent": selected.horizontal_camera_intent,
+            "target_description": selected.horizontal_target_description,
+            "quality_risks": selected.quality_risks,
+            "confidence": selected.confidence,
+        }
+    ]
+
+
+def _prepare_horizontal_runtime_candidate(
+    *,
+    option: Mapping[str, Any],
+    selected: FeatureChapterSelect,
+    brief_chapter: FeatureChapterBrief,
+    chapter_duration_seconds: float,
+    frames: Mapping[str, RushFrame],
+    clips: Mapping[str, RushClip],
+    shot_cache: dict[str, ShotManifest],
+    shots_dir: Path,
+    scdet_threshold: float,
+    trim_decisions: Sequence[tuple[Path, TrimIntentDecision]],
+    shot_quality_maps: Sequence[tuple[Path, ShotQualityMap]],
+    source_audio_cache: dict[str, bool],
+    source_media_cache: dict[str, MediaInfo],
+    track_cache: dict[
+        tuple[str, str, int, int],
+        tuple[GroundingProposal, SegmentationTrack, Path],
+    ],
+    client: GeminiLabClient,
+    checkpoint_path: Path,
+    grounding_prompt: str,
+    output_dir: Path,
+    sam_analysis_fps: float,
+    model_request_block_reason: str | None,
+) -> dict[str, Any]:
+    frame_id = option.get("frame_id")
+    if not isinstance(frame_id, str) or frame_id not in frames:
+        raise ValueError("horizontal candidate references an unknown frame")
+    frame = frames[frame_id]
+    clip = clips[frame.clip_id]
+    if not _candidate_asset_reference_matches(
+        option.get("source_asset_id"),
+        clip,
+    ):
+        raise ValueError("horizontal candidate source asset differs from its frame")
+    start_ms, end_ms, shot_id, trim = _chapter_bounds_with_approved_trim(
+        frame,
+        clip,
+        chapter_duration_seconds,
+        shot_cache,
+        shots_dir,
+        scdet_threshold,
+        trim_decisions,
+        expected_event_id=(
+            str(option["event_id"]) if option.get("event_id") else None
+        ),
+        quality_maps=shot_quality_maps,
+    )
+    source_audio_cache.setdefault(
+        clip.sha256,
+        has_audio_stream(Path(clip.path)),
+    )
+    source_media_cache.setdefault(
+        clip.sha256,
+        probe_video(Path(clip.path)),
+    )
+    media = source_media_cache[clip.sha256]
+    display_sar = (
+        media.video.display_sample_aspect_ratio.numerator
+        / media.video.display_sample_aspect_ratio.denominator
+    )
+    geometry: dict[str, Any] = {
+        "requested_zoom": None,
+        "geometry_safe_max_zoom": None,
+        "applied_zoom": 1.0,
+        "fallback_reason": None,
+        "risk_codes": [],
+        "requires_gemini_review": False,
+    }
+    filter_graph = _horizontal_original_filter()
+    debug: Path | None = None
+    track_fingerprint: str | None = None
+    strategy = str(option.get("strategy") or "original")
+    if strategy == "tracked_reframe":
+        target = str(option.get("target_description") or "").strip()
+        if not target:
+            raise ValueError("tracked horizontal candidate has no target")
+        cache_key = (frame.frame_id, target, start_ms, end_ms)
+        track_root = (
+            output_dir
+            / "geometry"
+            / selected.feature_id
+            / "horizontal"
+            / str(option.get("candidate_id") or "candidate")
+        )
+        if cache_key not in track_cache:
+            proposal, track = _build_track(
+                client=client,
+                clip=clip,
+                frame=frame,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                feature_id=selected.feature_id,
+                event_description=(
+                    brief_chapter.title
+                    + "；"
+                    + str(
+                        option.get("observed_visual_evidence")
+                        or selected.observed_visual_evidence
+                    )
+                ),
+                target_description=target,
+                checkpoint_path=checkpoint_path,
+                grounding_prompt=grounding_prompt,
+                output_dir=track_root,
+                run_id=f"feature-h-{uuid.uuid4().hex[:8]}",
+                analysis_fps=sam_analysis_fps,
+                scdet_threshold=scdet_threshold,
+                model_request_block_reason=model_request_block_reason,
+            )
+            track_cache[cache_key] = (proposal, track, track_root)
+        _, track, track_root = track_cache[cache_key]
+        track_fingerprint = _track_geometry_fingerprint(track)
+        filter_graph, geometry = _horizontal_filter_from_track(
+            track,
+            str(option.get("zoom_intent") or "subtle"),
+            display_sample_aspect_ratio=display_sar,
+            camera_intent=str(option.get("camera_intent") or "hold"),
+        )
+        if geometry.get("fallback_reason") is not None:
+            raise ValueError(
+                "horizontal candidate geometry could not execute: "
+                + str(geometry["fallback_reason"])
+            )
+        if "virtual_camera_plan" in geometry:
+            write_json(
+                track_root / "virtual-camera-plan.json",
+                geometry["virtual_camera_plan"],
+            )
+        debug = track_root / "grounding-debug.png"
+    return {
+        "option": dict(option),
+        "frame": frame,
+        "clip": clip,
+        "media": media,
+        "source_has_audio": source_audio_cache[clip.sha256],
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "shot_id": shot_id,
+        "trim": trim,
+        "filter": filter_graph,
+        "geometry": geometry,
+        "debug": debug,
+        "track_fingerprint": track_fingerprint,
+    }
+
+
 def _candidate_asset_reference_matches(
     expected_asset: str | None,
     clip: RushClip,
@@ -7535,6 +7900,94 @@ def _audit_requested_quality_map_coverage(
     return {**body, "audit_sha256": _stable_fingerprint(body)}
 
 
+def _ensure_requested_quality_maps(
+    plan: FeatureEditPlan,
+    *,
+    aspect: RenderAspect,
+    frames: Mapping[str, RushFrame],
+    clips: Mapping[str, RushClip],
+    shot_cache: dict[str, ShotManifest],
+    shots_dir: Path,
+    scdet_threshold: float,
+    quality_maps: Sequence[tuple[Path, ShotQualityMap]],
+    human_policy_binding_present: bool,
+    output_dir: Path,
+) -> list[tuple[Path, ShotQualityMap]]:
+    """Create missing deterministic maps for every production candidate shot."""
+
+    render_horizontal, render_vertical = _requested_render_aspects(aspect)
+    frame_ids: list[str] = []
+    for chapter in plan.chapters:
+        if chapter.evidence_status == "not_found":
+            continue
+        if render_horizontal:
+            frame_ids.extend(
+                candidate.frame_id for candidate in chapter.horizontal_candidates
+            )
+            if not chapter.horizontal_candidates and chapter.horizontal_frame_id:
+                frame_ids.append(chapter.horizontal_frame_id)
+        if render_vertical:
+            vertical_candidates = (
+                []
+                if human_policy_binding_present
+                else list(chapter.vertical_candidates)
+            )
+            frame_ids.extend(candidate.frame_id for candidate in vertical_candidates)
+            if not vertical_candidates and chapter.vertical_frame_id:
+                frame_ids.append(chapter.vertical_frame_id)
+
+    resolved = list(quality_maps)
+    generated_dir = output_dir / "auto-shot-quality"
+    for frame_id in dict.fromkeys(frame_ids):
+        frame = frames[frame_id]
+        clip = clips[frame.clip_id]
+        if clip.clip_id not in shot_cache:
+            shot_cache[clip.clip_id] = detect_shots_ffmpeg(
+                Path(clip.path),
+                threshold=scdet_threshold,
+                output_path=shots_dir / f"{clip.clip_id}.json",
+            )
+        shot_manifest = shot_cache[clip.clip_id]
+        shot = next(
+            item
+            for item in shot_manifest.shots
+            if item.start_time_ms
+            <= frame.requested_time_ms
+            < item.end_time_ms
+        )
+        source_asset_id = f"sha256:{clip.sha256}"
+        if _quality_map_for_shot(
+            resolved,
+            source_asset_id=source_asset_id,
+            shot_id=shot.shot_id,
+        ) is not None:
+            continue
+        output_path = (
+            generated_dir
+            / clip.sha256[:16]
+            / f"{shot.shot_id}.quality-map.json"
+        )
+        if output_path.is_file():
+            quality_map = load_shot_quality_map(output_path)[1]
+            if (
+                quality_map.source_asset_id != source_asset_id
+                or quality_map.shot_id != shot.shot_id
+                or sha256_file(Path(quality_map.source_path)) != clip.sha256
+            ):
+                raise ValueError(
+                    "cached automatic ShotQualityMap has stale source lineage"
+                )
+        else:
+            quality_map = scan_shot_quality(
+                Path(clip.path),
+                shot_manifest=shot_manifest,
+                shot_id=shot.shot_id,
+                output_path=output_path,
+            )
+        resolved.append((output_path.resolve(), quality_map))
+    return resolved
+
+
 def _production_review_preflight_failures(
     candidate_recall_audit: Mapping[str, Any],
     quality_map_coverage_audit: Mapping[str, Any],
@@ -7862,6 +8315,8 @@ def _horizontal_manifest_entry(
     grounding_debug: Path | None,
     trim: Mapping[str, Any],
     geometry: Mapping[str, Any],
+    source_interval: Mapping[str, Any],
+    render_boundary_lineage: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "feature_id": selected.feature_id,
@@ -7883,6 +8338,8 @@ def _horizontal_manifest_entry(
         "source_out_ms": end_ms,
         "duration_ms": end_ms - start_ms,
         "source_shot_id": shot_id,
+        "source_interval": dict(source_interval),
+        "render_boundary_lineage": dict(render_boundary_lineage),
         "segment_render_fingerprint": segment_fingerprint,
         "track_geometry_fingerprint": track_fingerprint,
         "segment_path": str(segment.resolve()),
@@ -8186,10 +8643,14 @@ def _selected_fixed_trim_durations_seconds(
             durations_ms.append(decision.source_out_ms - decision.source_in_ms)
         if durations_ms:
             if max(durations_ms) - min(durations_ms) > 1:
-                raise ValueError(
-                    "aspect-specific approved trims for one chapter have "
-                    "different exact durations"
-                )
+                # Horizontal and vertical are independent deliverables unless a
+                # later synchronization contract explicitly binds them. Their
+                # approved evidence intervals may therefore have different
+                # editorial lengths. Do not invent one shared fixed duration;
+                # each renderer consumes its own approved half-open interval,
+                # and the delivery pipeline assembles music against each final
+                # picture duration separately.
+                continue
             fixed[selected.feature_id] = durations_ms[0] / 1000
     return fixed
 
@@ -8856,6 +9317,11 @@ def _run_feature_cut_experiment_impl(
         for path in output_dir.rglob("errors.json")
     }
     catalog = RushesCatalog.model_validate(read_json(catalog_path))
+    catalog_source_validation = validate_rushes_catalog_sources(catalog)
+    write_json(
+        output_dir / "catalog-source-validation.json",
+        catalog_source_validation,
+    )
     brief = FeatureEditBrief.model_validate(read_json(brief_path))
     controlled_reframe_requested = render_vertical and any(
         chapter.vertical_overflow_policy == "controlled_clip"
@@ -9213,6 +9679,24 @@ def _run_feature_cut_experiment_impl(
             output_dir / "requested-candidate-recall-audit.json",
             requested_candidate_recall_audit,
         )
+        if execution_profile == FeatureCutExecutionProfile.PRODUCTION_REVIEW:
+            quality_stage = monotonic()
+            shot_quality_maps = _ensure_requested_quality_maps(
+                plan,
+                aspect=aspect,
+                frames=frames,
+                clips=clips,
+                shot_cache=shot_cache,
+                shots_dir=shots_dir,
+                scdet_threshold=scdet_threshold,
+                quality_maps=shot_quality_maps,
+                human_policy_binding_present=human_reframe_policy_requested,
+                output_dir=output_dir,
+            )
+            timings["automatic_shot_quality_seconds"] = round(
+                monotonic() - quality_stage,
+                3,
+            )
         quality_map_coverage_audit = (
             _audit_requested_quality_map_coverage(
                 plan,
@@ -9580,6 +10064,105 @@ def _run_feature_cut_experiment_impl(
                         _render_text_layer(
                             brief_chapter, vertical_overlay, dimensions=(1080, 1920)
                         )
+                horizontal_candidate_attempts: list[dict[str, Any]] = []
+                horizontal_selected_option: dict[str, Any] | None = None
+                if render_horizontal:
+                    prepared_horizontal: dict[str, Any] | None = None
+                    for horizontal_option in _horizontal_runtime_candidate_options(
+                        selected
+                    ):
+                        try:
+                            prepared_horizontal = (
+                                _prepare_horizontal_runtime_candidate(
+                                    option=horizontal_option,
+                                    selected=selected,
+                                    brief_chapter=brief_chapter,
+                                    chapter_duration_seconds=(
+                                        chapter_duration_seconds
+                                    ),
+                                    frames=frames,
+                                    clips=clips,
+                                    shot_cache=shot_cache,
+                                    shots_dir=shots_dir,
+                                    scdet_threshold=scdet_threshold,
+                                    trim_decisions=trim_decisions,
+                                    shot_quality_maps=shot_quality_maps,
+                                    source_audio_cache=source_audio_cache,
+                                    source_media_cache=source_media_cache,
+                                    track_cache=track_cache,
+                                    client=client,
+                                    checkpoint_path=checkpoint_path,
+                                    grounding_prompt=grounding_prompt,
+                                    output_dir=output_dir,
+                                    sam_analysis_fps=sam_analysis_fps,
+                                    model_request_block_reason=(
+                                        gemini_geometry_block_reason
+                                    ),
+                                )
+                            )
+                        except Exception as error:
+                            abort_for_geometry_quota(error)
+                            horizontal_candidate_attempts.append(
+                                {
+                                    "candidate_id": horizontal_option.get(
+                                        "candidate_id"
+                                    ),
+                                    "rank": horizontal_option.get("rank"),
+                                    "status": "rejected",
+                                    "reason": (
+                                        f"{type(error).__name__}:{error}"
+                                    ),
+                                }
+                            )
+                            continue
+                        horizontal_selected_option = dict(horizontal_option)
+                        horizontal_candidate_attempts.append(
+                            {
+                                "candidate_id": horizontal_option.get(
+                                    "candidate_id"
+                                ),
+                                "rank": horizontal_option.get("rank"),
+                                "status": "selected",
+                                "reason": None,
+                            }
+                        )
+                        break
+                    if (
+                        prepared_horizontal is None
+                        or horizontal_selected_option is None
+                    ):
+                        raise ValueError(
+                            "all 16:9 candidates failed quality, capacity, "
+                            "geometry or lineage preflight"
+                        )
+                    # The immutable plan remains unchanged on disk. This local
+                    # projection lets the established renderer consume the
+                    # runtime-selected candidate while the manifest records
+                    # every attempt.
+                    selected = selected.model_copy(
+                        update={
+                            "horizontal_frame_id": prepared_horizontal[
+                                "frame"
+                            ].frame_id,
+                            "horizontal_strategy": (
+                                horizontal_selected_option["strategy"]
+                            ),
+                            "horizontal_zoom_intent": (
+                                horizontal_selected_option["zoom_intent"]
+                            ),
+                            "horizontal_camera_intent": (
+                                horizontal_selected_option.get(
+                                    "camera_intent",
+                                    "hold",
+                                )
+                            ),
+                            "horizontal_target_description": (
+                                horizontal_selected_option.get(
+                                    "target_description"
+                                )
+                            ),
+                        }
+                    )
                 if render_horizontal:
                     horizontal_frame = frames[selected.horizontal_frame_id or ""]
                     horizontal_clip = clips[horizontal_frame.clip_id]
@@ -9696,6 +10279,33 @@ def _run_feature_cut_experiment_impl(
                                 ),
                                 risk_code="tracking_or_grounding_failed",
                             )
+                    horizontal_geometry["automatic_candidate_selection"] = {
+                        "contract_version": "full-auto-candidate-routing-v2",
+                        "enabled": bool(selected.horizontal_candidates),
+                        "planned_candidate_count": len(
+                            selected.horizontal_candidates
+                        ),
+                        "selected_candidate_id": (
+                            horizontal_selected_option or {}
+                        ).get("candidate_id"),
+                        "selected_candidate_rank": (
+                            horizontal_selected_option or {}
+                        ).get("rank"),
+                        "attempts": horizontal_candidate_attempts,
+                    }
+                    horizontal_source_interval = _exact_render_source_interval(
+                        source_path=Path(horizontal_clip.path),
+                        source_sha256=horizontal_clip.sha256,
+                        start_ms=h_start,
+                        end_ms=h_end,
+                        trim=horizontal_trim,
+                        output_dir=(
+                            output_dir
+                            / "render-boundary-evidence"
+                            / selected.feature_id
+                            / "16x9"
+                        ),
+                    )
                     horizontal_segment_fingerprint = _segment_variant_fingerprint(
                         source_sha256=horizontal_clip.sha256,
                         start_ms=h_start,
@@ -9703,6 +10313,7 @@ def _run_feature_cut_experiment_impl(
                         filter_graph=horizontal_filter,
                         geometry=horizontal_geometry,
                         track_fingerprint=horizontal_track_fingerprint,
+                        source_interval=horizontal_source_interval,
                     )
                     horizontal_segment = (
                         output_dir
@@ -9728,7 +10339,18 @@ def _run_feature_cut_experiment_impl(
                             base_filter=horizontal_filter,
                             output_path=horizontal_segment,
                             source_has_audio=horizontal_source_has_audio,
+                            source_interval=horizontal_source_interval,
                         )
+                    horizontal_boundary_lineage = _write_render_boundary_lineage(
+                        segment_path=horizontal_segment,
+                        source_interval=horizontal_source_interval,
+                        output_path=(
+                            output_dir
+                            / "render-boundary-lineage"
+                            / selected.feature_id
+                            / "16x9.json"
+                        ),
+                    )
                 if not render_vertical:
                     horizontal_entry = _horizontal_manifest_entry(
                         selected=selected,
@@ -9746,6 +10368,8 @@ def _run_feature_cut_experiment_impl(
                         grounding_debug=horizontal_debug,
                         trim=horizontal_trim,
                         geometry=horizontal_geometry,
+                        source_interval=horizontal_source_interval,
+                        render_boundary_lineage=horizontal_boundary_lineage,
                     )
                     horizontal_segments.append(horizontal_segment)
                     manifest["horizontal"]["chapters"].append(horizontal_entry)
@@ -10451,6 +11075,19 @@ def _run_feature_cut_experiment_impl(
                         }
                     ),
                 }
+                vertical_source_interval = _exact_render_source_interval(
+                    source_path=Path(vertical_clip.path),
+                    source_sha256=vertical_clip.sha256,
+                    start_ms=v_start,
+                    end_ms=v_end,
+                    trim=vertical_trim,
+                    output_dir=(
+                        output_dir
+                        / "render-boundary-evidence"
+                        / selected.feature_id
+                        / "9x16"
+                    ),
+                )
                 vertical_segment_fingerprint = _segment_variant_fingerprint(
                     source_sha256=vertical_clip.sha256,
                     start_ms=v_start,
@@ -10458,6 +11095,7 @@ def _run_feature_cut_experiment_impl(
                     filter_graph=vertical_filter,
                     geometry=vertical_geometry,
                     track_fingerprint=vertical_track_fingerprint,
+                    source_interval=vertical_source_interval,
                 )
                 vertical_segment = (
                     output_dir
@@ -10479,7 +11117,18 @@ def _run_feature_cut_experiment_impl(
                         base_filter=vertical_filter,
                         output_path=vertical_segment,
                         source_has_audio=vertical_source_has_audio,
+                        source_interval=vertical_source_interval,
                     )
+                vertical_boundary_lineage = _write_render_boundary_lineage(
+                    segment_path=vertical_segment,
+                    source_interval=vertical_source_interval,
+                    output_path=(
+                        output_dir
+                        / "render-boundary-lineage"
+                        / selected.feature_id
+                        / "9x16.json"
+                    ),
+                )
                 if render_horizontal:
                     horizontal_entry = _horizontal_manifest_entry(
                         selected=selected,
@@ -10497,6 +11146,8 @@ def _run_feature_cut_experiment_impl(
                         grounding_debug=horizontal_debug,
                         trim=horizontal_trim,
                         geometry=horizontal_geometry,
+                        source_interval=horizontal_source_interval,
+                        render_boundary_lineage=horizontal_boundary_lineage,
                     )
                 vertical_entry = {
                     "feature_id": selected.feature_id,
@@ -10516,6 +11167,8 @@ def _run_feature_cut_experiment_impl(
                     "source_out_ms": v_end,
                     "duration_ms": v_end - v_start,
                     "source_shot_id": v_shot,
+                    "source_interval": vertical_source_interval,
+                    "render_boundary_lineage": vertical_boundary_lineage,
                     "segment_render_fingerprint": vertical_segment_fingerprint,
                     "track_geometry_fingerprint": vertical_track_fingerprint,
                     "segment_path": str(vertical_segment.resolve()),
@@ -10772,10 +11425,42 @@ def run_feature_cut_experiment(
     profile = FeatureCutExecutionProfile(execution_profile)
     output_dir.mkdir(parents=True, exist_ok=True)
     status_path = output_dir / "run-status.json"
+    if status_path.is_file():
+        previous_status = read_json(status_path)
+        if (
+            isinstance(previous_status, dict)
+            and previous_status.get("stage") == "running"
+            and not bool(previous_status.get("terminal"))
+        ):
+            abandoned = {
+                **previous_status,
+                "stage": "abandoned",
+                "terminal": True,
+                "run_state": FeatureCutRunState.FAILED.value,
+                "delivery_eligible": False,
+                "error": {
+                    "type": "AbandonedRun",
+                    "message": (
+                        "a prior process ended without writing terminal state; "
+                        "this new explicit run reconciled it before resuming"
+                    ),
+                },
+                "reconciled_at": utc_now(),
+            }
+            write_json(
+                output_dir
+                / "run-status-events"
+                / f"abandoned-{uuid.uuid4().hex}.json",
+                abandoned,
+            )
+    started_at = utc_now()
+    run_instance_id = uuid.uuid4().hex
     write_json(
         status_path,
         {
             "contract_version": "feature-cut-run-status-v1",
+            "run_instance_id": run_instance_id,
+            "pid": os.getpid(),
             "execution_profile": profile.value,
             "stage": "running",
             "terminal": False,
@@ -10783,7 +11468,8 @@ def run_feature_cut_experiment(
             "run_state": None,
             "delivery_eligible": False,
             "error": None,
-            "updated_at": utc_now(),
+            "started_at": started_at,
+            "updated_at": started_at,
         },
     )
     try:
@@ -10825,6 +11511,8 @@ def run_feature_cut_experiment(
             status_path,
             {
                 "contract_version": "feature-cut-run-status-v1",
+                "run_instance_id": run_instance_id,
+                "pid": os.getpid(),
                 "execution_profile": profile.value,
                 "stage": "failed",
                 "terminal": True,
@@ -10837,6 +11525,7 @@ def run_feature_cut_experiment(
                     "type": type(error).__name__,
                     "message": str(error),
                 },
+                "started_at": started_at,
                 "updated_at": utc_now(),
             },
         )
@@ -10845,6 +11534,8 @@ def run_feature_cut_experiment(
         status_path,
         {
             "contract_version": "feature-cut-run-status-v1",
+            "run_instance_id": run_instance_id,
+            "pid": os.getpid(),
             "execution_profile": profile.value,
             "stage": "completed",
             "terminal": True,
@@ -10852,6 +11543,7 @@ def run_feature_cut_experiment(
             "run_state": result["run_state"],
             "delivery_eligible": bool(result["delivery_eligible"]),
             "error": None,
+            "started_at": started_at,
             "updated_at": utc_now(),
         },
     )
