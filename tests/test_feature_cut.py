@@ -25,6 +25,8 @@ from scripts.plan_clip_card_open_edit import (
 from jascue_video_lab.feature_cut import (
     _chapter_bounds_with_approved_trim,
     _audit_feature_plan_candidate_recall,
+    _audit_requested_candidate_recall,
+    _build_feature_cut_eligibility_report,
     _audit_render_source_reuse,
     _candidate_asset_reference_matches,
     _cover_transform,
@@ -37,6 +39,7 @@ from jascue_video_lab.feature_cut import (
     _load_trim_decisions,
     _migrate_legacy_feature_plan_binding,
     _piecewise_expression,
+    _production_review_preflight_failures,
     _prompt_binds_sha256,
     _concat_segments,
     _controlled_primary_center_preview_allowed,
@@ -72,6 +75,8 @@ from jascue_video_lab.feature_cut import (
 from jascue_video_lab.auto_reframe import FailureCode
 from jascue_video_lab.cli import build_parser
 from jascue_video_lab.models import (
+    FeatureCutExecutionProfile,
+    FeatureCutRunState,
     FeatureChapterBrief,
     FramingRegionIntent,
     SelectedVerticalFramingProposal,
@@ -103,6 +108,7 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
     assert defaults.rhythm_style == "standard"
     assert defaults.allow_shorter_within_delivery_range is False
     assert defaults.auto_vertical_framing is True
+    assert defaults.execution_profile == "review_preview"
     vertical = build_parser().parse_args(
         [
             "feature-cut",
@@ -117,6 +123,53 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
         ]
     )
     assert vertical.aspect == "9x16"
+
+
+def test_feature_cut_failure_writes_terminal_run_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_impl(**_kwargs: object) -> dict[str, object]:
+        raise ValueError("production_review preflight failed")
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_run_feature_cut_experiment_impl",
+        fail_impl,
+    )
+
+    with pytest.raises(ValueError, match="production_review preflight"):
+        run_feature_cut_experiment(
+            catalog_path=tmp_path / "catalog.json",
+            brief_path=tmp_path / "brief.json",
+            checkpoint_path=tmp_path / "model.pt",
+            output_dir=tmp_path / "output",
+            plan_prompt="plan",
+            grounding_prompt="ground",
+            execution_profile="production_review",
+        )
+
+    status = json.loads(
+        (tmp_path / "output" / "run-status.json").read_text(encoding="utf-8")
+    )
+    assert status["terminal"] is True
+    assert status["run_state"] == "failed"
+    assert status["delivery_eligible"] is False
+    assert status["error"]["type"] == "ValueError"
+
+
+def test_production_review_preflight_requires_candidates_and_quality() -> None:
+    assert _production_review_preflight_failures(
+        {"complete": False},
+        {"complete": False},
+    ) == [
+        "candidate_recall_incomplete",
+        "quality_map_coverage_incomplete",
+    ]
+    assert _production_review_preflight_failures(
+        {"complete": True},
+        {"complete": True},
+    ) == []
 
 
 def test_prompt_sha256_binding_accepts_delimiters_but_not_near_matches() -> None:
@@ -751,6 +804,9 @@ def test_feature_cut_single_aspect_skips_unrequested_segments_and_concat(
     }
     assert result[f"{requested_key}_output"] is not None
     assert result[f"{skipped_key}_output"] is None
+    assert result["media_rendered"] is True
+    assert result["run_state"] == "partial"
+    assert result["delivery_eligible"] is False
 
 
 @pytest.mark.parametrize(
@@ -4700,6 +4756,224 @@ def test_feature_plan_candidate_audit_exposes_rank_one_and_unexplained_reuse() -
         "closing",
     ]
     assert len(audit["audit_sha256"]) == 64
+
+
+def test_requested_candidate_recall_ignores_unrequested_aspect() -> None:
+    chapter = FeatureChapterSelect(
+        feature_id="chapter",
+        evidence_status="supported",
+        observed_visual_evidence="Observable evidence.",
+        selection_reason="Selected evidence.",
+        horizontal_frame_id="RF000001",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000002",
+        vertical_strategy="tracked_crop",
+        vertical_target_description="the visible subject",
+        vertical_candidates=[
+            {
+                "candidate_id": "vertical-a",
+                "rank": 1,
+                "source_asset_id": "asset-a",
+                "event_id": "event-a",
+                "frame_id": "RF000002",
+                "observed_visual_evidence": "First vertical option.",
+                "selection_reason": "Primary.",
+                "strategy": "tracked_crop",
+                "target_description": "the visible subject",
+                "confidence": 0.9,
+            },
+            {
+                "candidate_id": "vertical-b",
+                "rank": 2,
+                "source_asset_id": "asset-b",
+                "event_id": "event-b",
+                "frame_id": "RF000003",
+                "observed_visual_evidence": "Second vertical option.",
+                "selection_reason": "Fallback.",
+                "strategy": "tracked_crop",
+                "target_description": "the other visible subject",
+                "confidence": 0.8,
+            },
+        ],
+        quality_risks=[],
+        confidence=0.9,
+    )
+    plan = FeatureEditPlan(
+        project_id="generic-project",
+        catalog_id="generic-catalog",
+        title="Generic",
+        chapters=[chapter],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    vertical = _audit_requested_candidate_recall(plan, aspect="9x16")
+    horizontal = _audit_requested_candidate_recall(plan, aspect="16x9")
+
+    assert vertical["complete"] is True
+    assert horizontal["complete"] is False
+    assert vertical["rows"][0]["candidate_counts"] == {"9x16": 2}
+
+
+def test_missing_evidence_render_is_partial_not_delivery_success() -> None:
+    manifest = {
+        "horizontal": {
+            "requested": True,
+            "status": "rendered",
+            "chapters": [
+                {
+                    "feature_id": "missing",
+                    "source_clip_id": None,
+                    "fallback_reason": "catalog_evidence_not_found",
+                }
+            ],
+        },
+        "vertical": {"requested": False, "status": "not_requested", "chapters": []},
+        "requested_candidate_recall_audit": {"complete": True},
+        "quality_map_coverage_audit": {"complete": True},
+        "reframe_policy_binding": None,
+        "post_render_quality_qc": {
+            "requested": True,
+            "technical_qc_passed": True,
+        },
+    }
+
+    report = _build_feature_cut_eligibility_report(
+        manifest,
+        execution_profile=FeatureCutExecutionProfile.PRODUCTION_REVIEW,
+    )
+
+    assert report.media_rendered is True
+    assert report.run_state == FeatureCutRunState.PARTIAL
+    assert report.delivery_eligible is False
+    assert report.ready_for_human_review is False
+    assert "required_evidence_incomplete" in report.blocking_reasons
+
+
+def test_review_preview_exposes_unfinished_gates_without_claiming_delivery() -> None:
+    manifest = {
+        "horizontal": {
+            "requested": True,
+            "status": "rendered",
+            "chapters": [
+                {
+                    "feature_id": "supported",
+                    "source_clip_id": "clip-a",
+                    "source_in_ms": 0,
+                    "source_out_ms": 3000,
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                }
+            ],
+        },
+        "vertical": {"requested": False, "status": "not_requested", "chapters": []},
+        "requested_candidate_recall_audit": {"complete": False},
+        "quality_map_coverage_audit": {"complete": False},
+        "reframe_policy_binding": None,
+        "post_render_quality_qc": {
+            "requested": True,
+            "technical_qc_passed": True,
+        },
+    }
+
+    review = _build_feature_cut_eligibility_report(
+        manifest,
+        execution_profile=FeatureCutExecutionProfile.REVIEW_PREVIEW,
+    )
+    production = _build_feature_cut_eligibility_report(
+        manifest,
+        execution_profile=FeatureCutExecutionProfile.PRODUCTION_REVIEW,
+    )
+
+    assert review.run_state == FeatureCutRunState.REVIEW_PREVIEW
+    assert review.ready_for_human_review is False
+    assert review.delivery_eligible is False
+    assert "candidate_recall_incomplete" in review.review_reasons
+    assert production.run_state == FeatureCutRunState.REVIEW_PREVIEW
+    assert production.ready_for_human_review is False
+
+
+def test_all_automatic_gates_only_reach_ready_for_human_review() -> None:
+    manifest = {
+        "horizontal": {
+            "requested": True,
+            "status": "rendered",
+            "chapters": [
+                {
+                    "feature_id": "supported",
+                    "source_clip_id": "clip-a",
+                    "source_in_ms": 0,
+                    "source_out_ms": 3000,
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                }
+            ],
+        },
+        "vertical": {"requested": False, "status": "not_requested", "chapters": []},
+        "requested_candidate_recall_audit": {"complete": True},
+        "quality_map_coverage_audit": {"complete": True},
+        "reframe_policy_binding": None,
+        "post_render_quality_qc": {
+            "requested": True,
+            "technical_qc_passed": True,
+        },
+    }
+
+    report = _build_feature_cut_eligibility_report(
+        manifest,
+        execution_profile=FeatureCutExecutionProfile.PRODUCTION_REVIEW,
+    )
+
+    assert report.run_state == FeatureCutRunState.READY_FOR_HUMAN_REVIEW
+    assert report.ready_for_human_review is True
+    assert report.delivery_eligible is False
+    assert report.editorial_contract.final_sequence_qa_passed == "not_run"
+    assert report.editorial_contract.human_approval_passed == "not_run"
+
+
+def test_human_intent_does_not_replace_execution_verification() -> None:
+    manifest = {
+        "horizontal": {"requested": False, "status": "not_requested", "chapters": []},
+        "vertical": {
+            "requested": True,
+            "status": "rendered",
+            "chapters": [
+                {
+                    "feature_id": "reviewed-intent",
+                    "source_clip_id": "clip-a",
+                    "source_in_ms": 0,
+                    "source_out_ms": 3000,
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                    "human_policy_execution_verified": False,
+                }
+            ],
+        },
+        "requested_candidate_recall_audit": {"complete": True},
+        "quality_map_coverage_audit": {"complete": True},
+        "reframe_policy_binding": {"policy_id": "human-intent"},
+        "post_render_quality_qc": {
+            "requested": True,
+            "technical_qc_passed": True,
+        },
+    }
+
+    report = _build_feature_cut_eligibility_report(
+        manifest,
+        execution_profile=FeatureCutExecutionProfile.PRODUCTION_REVIEW,
+    )
+
+    assert report.run_state == FeatureCutRunState.REVIEW_PREVIEW
+    assert "human_intent_execution_not_verified" in report.blocking_reasons
 
 
 def test_render_source_reuse_allows_audited_reprise_but_not_silent_padding() -> None:

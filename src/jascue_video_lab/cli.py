@@ -810,6 +810,7 @@ def command_feature_cut(args: argparse.Namespace) -> int:
             args.allow_shorter_within_delivery_range
         ),
         auto_vertical_framing=args.auto_vertical_framing,
+        execution_profile=args.execution_profile,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2255,6 +2256,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Run the same deterministic technical scan on completed aspect "
             "renders. Hard decoder/PTS defects fail closed; subjective visual "
             "risks remain review evidence."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--execution-profile",
+        choices=["review_preview", "production_review"],
+        default="review_preview",
+        help=(
+            "review_preview preserves auditable media even when production "
+            "prerequisites are incomplete. production_review requires complete "
+            "requested-aspect Top-K recall and ShotQualityMap coverage before "
+            "rendering. Neither profile makes feature-cut delivery eligible "
+            "without downstream final QA and human approval."
         ),
     )
     feature_cut_parser.add_argument(

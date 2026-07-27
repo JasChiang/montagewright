@@ -2692,6 +2692,81 @@ class RunStatus(StrictModel):
     errors: list[dict[str, object]] = Field(default_factory=list)
 
 
+class FeatureCutExecutionProfile(StrEnum):
+    """How strictly feature-cut prerequisites are enforced before rendering."""
+
+    REVIEW_PREVIEW = "review_preview"
+    PRODUCTION_REVIEW = "production_review"
+
+
+class FeatureCutRunState(StrEnum):
+    """Editorial state; independent from whether an MP4 was encoded."""
+
+    FAILED = "failed"
+    PARTIAL = "partial"
+    REVIEW_PREVIEW = "review_preview"
+    READY_FOR_HUMAN_REVIEW = "ready_for_human_review"
+    DELIVERY_ELIGIBLE = "delivery_eligible"
+
+
+class EligibilityGateStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    NOT_RUN = "not_run"
+    NOT_REQUIRED = "not_required"
+
+
+class FeatureCutEditorialContract(StrictModel):
+    evidence_complete: EligibilityGateStatus
+    candidate_recall_complete: EligibilityGateStatus
+    candidate_resolution_passed: EligibilityGateStatus
+    quality_coverage_complete: EligibilityGateStatus
+    geometry_execution_passed: EligibilityGateStatus
+    human_intent_execution_verified: EligibilityGateStatus
+    technical_quality_passed: EligibilityGateStatus
+    final_sequence_qa_passed: EligibilityGateStatus
+    human_approval_passed: EligibilityGateStatus
+
+
+class FeatureCutEligibilityReport(StrictModel):
+    """Machine-readable handoff state for one feature-cut review render."""
+
+    contract_version: Literal["feature-cut-delivery-eligibility-v1"] = (
+        "feature-cut-delivery-eligibility-v1"
+    )
+    execution_profile: FeatureCutExecutionProfile
+    media_rendered: bool
+    run_state: FeatureCutRunState
+    ready_for_human_review: bool
+    delivery_eligible: bool
+    editorial_contract: FeatureCutEditorialContract
+    blocking_reasons: list[str] = Field(default_factory=list)
+    review_reasons: list[str] = Field(default_factory=list)
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_state(self) -> "FeatureCutEligibilityReport":
+        if self.delivery_eligible:
+            if self.run_state != FeatureCutRunState.DELIVERY_ELIGIBLE:
+                raise ValueError(
+                    "delivery eligibility requires delivery-eligible run state"
+                )
+            if not self.ready_for_human_review:
+                raise ValueError(
+                    "delivery-eligible output must also be review-ready"
+                )
+        if self.ready_for_human_review and self.run_state not in {
+            FeatureCutRunState.READY_FOR_HUMAN_REVIEW,
+            FeatureCutRunState.DELIVERY_ELIGIBLE,
+        }:
+            raise ValueError(
+                "review-ready flag conflicts with the feature-cut run state"
+            )
+        if not self.media_rendered and self.run_state != FeatureCutRunState.FAILED:
+            raise ValueError("a non-rendered run must remain failed")
+        return self
+
+
 class TrackingState(StrEnum):
     """Geometry state; it must not be mistaken for semantic identity confidence."""
 

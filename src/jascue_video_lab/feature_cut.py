@@ -52,8 +52,13 @@ from .models import (
     EvidenceQueryProvenanceV2,
     EvidenceTargetIdentityV2,
     EvidenceTargetVisibilityConstraintV2,
+    EligibilityGateStatus,
     FeatureChapterBrief,
     FeatureChapterSelect,
+    FeatureCutEditorialContract,
+    FeatureCutEligibilityReport,
+    FeatureCutExecutionProfile,
+    FeatureCutRunState,
     FeatureEditBrief,
     FeatureEditPlan,
     FeatureVerticalCandidate,
@@ -6978,6 +6983,432 @@ def _audit_render_source_reuse(
     return {**body, "audit_sha256": _stable_fingerprint(body)}
 
 
+def _audit_requested_candidate_recall(
+    plan: FeatureEditPlan,
+    *,
+    aspect: RenderAspect,
+) -> dict[str, Any]:
+    """Measure executable Top-K depth only for requested delivery aspects."""
+
+    render_horizontal, render_vertical = _requested_render_aspects(aspect)
+    rows: list[dict[str, Any]] = []
+    for chapter in plan.chapters:
+        if chapter.evidence_status == "not_found":
+            continue
+        aspect_counts: dict[str, int] = {}
+        if render_horizontal:
+            aspect_counts["16x9"] = (
+                len(chapter.horizontal_candidates)
+                if chapter.horizontal_candidates
+                else int(chapter.horizontal_frame_id is not None)
+            )
+        if render_vertical:
+            aspect_counts["9x16"] = (
+                len(chapter.vertical_candidates)
+                if chapter.vertical_candidates
+                else int(chapter.vertical_frame_id is not None)
+            )
+        incomplete = [
+            requested_aspect
+            for requested_aspect, count in aspect_counts.items()
+            if count < 2
+        ]
+        rows.append(
+            {
+                "feature_id": chapter.feature_id,
+                "evidence_status": chapter.evidence_status,
+                "candidate_counts": aspect_counts,
+                "incomplete_aspects": incomplete,
+                "complete": not incomplete,
+            }
+        )
+    body = {
+        "contract_version": "requested-candidate-recall-audit-v1",
+        "requested_aspect": aspect,
+        "complete": all(bool(row["complete"]) for row in rows),
+        "rows": rows,
+        "policy": (
+            "production-review requires at least two evidence-bound candidates "
+            "for every requested aspect until a typed only-evidence exception "
+            "contract exists"
+        ),
+    }
+    return {**body, "audit_sha256": _stable_fingerprint(body)}
+
+
+def _audit_requested_quality_map_coverage(
+    plan: FeatureEditPlan,
+    *,
+    aspect: RenderAspect,
+    frames: Mapping[str, RushFrame],
+    clips: Mapping[str, RushClip],
+    shot_cache: dict[str, ShotManifest],
+    shots_dir: Path,
+    scdet_threshold: float,
+    quality_maps: Sequence[tuple[Path, ShotQualityMap]],
+    human_policy_binding_present: bool,
+) -> dict[str, Any]:
+    """Require quality evidence for every candidate the runtime may attempt."""
+
+    render_horizontal, render_vertical = _requested_render_aspects(aspect)
+    requested_frames: list[tuple[str, str, int, str]] = []
+    for chapter in plan.chapters:
+        if chapter.evidence_status == "not_found":
+            continue
+        if render_horizontal:
+            horizontal_candidates = (
+                list(chapter.horizontal_candidates)
+                if chapter.horizontal_candidates
+                else []
+            )
+            if horizontal_candidates:
+                requested_frames.extend(
+                    (
+                        chapter.feature_id,
+                        "16x9",
+                        candidate.rank,
+                        candidate.frame_id,
+                    )
+                    for candidate in horizontal_candidates
+                )
+            elif chapter.horizontal_frame_id is not None:
+                requested_frames.append(
+                    (
+                        chapter.feature_id,
+                        "16x9",
+                        1,
+                        chapter.horizontal_frame_id,
+                    )
+                )
+        if render_vertical:
+            vertical_candidates = (
+                list(chapter.vertical_candidates)
+                if chapter.vertical_candidates
+                and not human_policy_binding_present
+                else []
+            )
+            if vertical_candidates:
+                requested_frames.extend(
+                    (
+                        chapter.feature_id,
+                        "9x16",
+                        candidate.rank,
+                        candidate.frame_id,
+                    )
+                    for candidate in vertical_candidates
+                )
+            elif chapter.vertical_frame_id is not None:
+                requested_frames.append(
+                    (
+                        chapter.feature_id,
+                        "9x16",
+                        1,
+                        chapter.vertical_frame_id,
+                    )
+                )
+
+    rows: list[dict[str, Any]] = []
+    if not quality_maps:
+        rows = [
+            {
+                "feature_id": feature_id,
+                "aspect": requested_aspect,
+                "candidate_rank": rank,
+                "frame_id": frame_id,
+                "source_asset_id": None,
+                "shot_id": None,
+                "covered": False,
+                "quality_map_path": None,
+            }
+            for feature_id, requested_aspect, rank, frame_id in requested_frames
+        ]
+        body = {
+            "contract_version": "requested-quality-map-coverage-v1",
+            "requested_aspect": aspect,
+            "complete": not rows,
+            "quality_map_count": 0,
+            "candidate_shot_count": len(rows),
+            "missing": rows,
+            "rows": rows,
+            "resolution_status": "not_resolved_without_any_quality_maps",
+        }
+        return {**body, "audit_sha256": _stable_fingerprint(body)}
+    seen: set[tuple[str, str, str]] = set()
+    for feature_id, requested_aspect, rank, frame_id in requested_frames:
+        frame = frames[frame_id]
+        clip = clips[frame.clip_id]
+        if clip.clip_id not in shot_cache:
+            shot_cache[clip.clip_id] = detect_shots_ffmpeg(
+                Path(clip.path),
+                threshold=scdet_threshold,
+                output_path=shots_dir / f"{clip.clip_id}.json",
+            )
+        shot = next(
+            item
+            for item in shot_cache[clip.clip_id].shots
+            if item.start_time_ms
+            <= frame.requested_time_ms
+            < item.end_time_ms
+        )
+        source_asset_id = f"sha256:{clip.sha256}"
+        identity = (requested_aspect, source_asset_id, shot.shot_id)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        match = _quality_map_for_shot(
+            quality_maps,
+            source_asset_id=source_asset_id,
+            shot_id=shot.shot_id,
+        )
+        quality_source_lineage_valid = False
+        quality_source_lineage_error: str | None = None
+        if match is not None:
+            _, quality_map = match
+            quality_source_path = Path(quality_map.source_path)
+            if not quality_source_path.is_file():
+                quality_source_lineage_error = "quality_map_source_missing"
+            elif sha256_file(quality_source_path) != clip.sha256:
+                quality_source_lineage_error = "quality_map_source_hash_mismatch"
+            else:
+                quality_source_lineage_valid = True
+        rows.append(
+            {
+                "feature_id": feature_id,
+                "aspect": requested_aspect,
+                "candidate_rank": rank,
+                "frame_id": frame_id,
+                "source_asset_id": source_asset_id,
+                "shot_id": shot.shot_id,
+                "covered": match is not None and quality_source_lineage_valid,
+                "quality_map_path": (
+                    str(match[0].resolve()) if match is not None else None
+                ),
+                "quality_source_lineage_valid": (
+                    quality_source_lineage_valid
+                    if match is not None
+                    else None
+                ),
+                "quality_source_lineage_error": quality_source_lineage_error,
+            }
+        )
+    body = {
+        "contract_version": "requested-quality-map-coverage-v1",
+        "requested_aspect": aspect,
+        "complete": all(bool(row["covered"]) for row in rows),
+        "quality_map_count": len(quality_maps),
+        "candidate_shot_count": len(rows),
+        "missing": [row for row in rows if not bool(row["covered"])],
+        "rows": rows,
+    }
+    return {**body, "audit_sha256": _stable_fingerprint(body)}
+
+
+def _production_review_preflight_failures(
+    candidate_recall_audit: Mapping[str, Any],
+    quality_map_coverage_audit: Mapping[str, Any],
+) -> list[str]:
+    failures: list[str] = []
+    if not bool(candidate_recall_audit.get("complete")):
+        failures.append("candidate_recall_incomplete")
+    if not bool(quality_map_coverage_audit.get("complete")):
+        failures.append("quality_map_coverage_incomplete")
+    return failures
+
+
+def _build_feature_cut_eligibility_report(
+    manifest: Mapping[str, Any],
+    *,
+    execution_profile: FeatureCutExecutionProfile,
+) -> FeatureCutEligibilityReport:
+    """Separate playable review media from semantic delivery eligibility."""
+
+    requested_aspects = [
+        aspect_name
+        for aspect_name in ("horizontal", "vertical")
+        if bool(manifest.get(aspect_name, {}).get("requested"))
+    ]
+    media_rendered = bool(requested_aspects) and all(
+        manifest.get(aspect_name, {}).get("status") == "rendered"
+        for aspect_name in requested_aspects
+    )
+    chapters = [
+        chapter
+        for aspect_name in requested_aspects
+        for chapter in manifest.get(aspect_name, {}).get("chapters", [])
+        if isinstance(chapter, Mapping)
+    ]
+    evidence_complete = not any(
+        chapter.get("fallback_reason") == "catalog_evidence_not_found"
+        or chapter.get("source_clip_id") is None
+        for chapter in chapters
+    )
+    candidate_recall_audit = manifest.get("requested_candidate_recall_audit", {})
+    candidate_recall_complete = bool(
+        candidate_recall_audit.get("complete")
+    )
+    candidate_resolution_passed = not any(
+        "automatic_candidate_exhaustion"
+        in (chapter.get("risk_codes") or [])
+        or chapter.get("fallback_reason") == "all_automatic_candidates_exhausted"
+        or bool(
+            (
+                chapter.get("automatic_candidate_selection")
+                if isinstance(
+                    chapter.get("automatic_candidate_selection"), Mapping
+                )
+                else {}
+            ).get("center_crop_used_as_unverified_fallback")
+        )
+        for chapter in chapters
+    )
+    quality_audit = manifest.get("quality_map_coverage_audit", {})
+    quality_complete = bool(quality_audit.get("complete"))
+    quality_status = (
+        EligibilityGateStatus.PASSED
+        if quality_complete
+        else (
+            EligibilityGateStatus.FAILED
+            if execution_profile
+            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            else EligibilityGateStatus.NOT_RUN
+        )
+    )
+    geometry_execution_passed = not any(
+        chapter.get("unverified_geometry_preview_override") is True
+        or chapter.get("human_policy_execution_verified") is False
+        or "human_policy_geometry_failed" in (chapter.get("risk_codes") or [])
+        or "tracking_or_grounding_failed" in (chapter.get("risk_codes") or [])
+        or (
+            isinstance(chapter.get("auto_bounded_clip_audit"), Mapping)
+            and not bool(
+                chapter["auto_bounded_clip_audit"].get("approved")
+            )
+        )
+        for chapter in chapters
+    )
+    human_policy_present = manifest.get("reframe_policy_binding") is not None
+    human_execution_verified = (
+        all(
+            chapter.get("source_clip_id") is None
+            or chapter.get("human_policy_execution_verified") is True
+            for chapter in manifest.get("vertical", {}).get("chapters", [])
+        )
+        if human_policy_present
+        else True
+    )
+    technical = manifest.get("post_render_quality_qc", {})
+    technical_requested = bool(technical.get("requested"))
+    technical_passed = bool(technical.get("technical_qc_passed"))
+    technical_status = (
+        EligibilityGateStatus.PASSED
+        if technical_requested and technical_passed
+        else (
+            EligibilityGateStatus.FAILED
+            if technical_requested
+            or execution_profile
+            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            else EligibilityGateStatus.NOT_RUN
+        )
+    )
+    contract = FeatureCutEditorialContract(
+        evidence_complete=(
+            EligibilityGateStatus.PASSED
+            if evidence_complete
+            else EligibilityGateStatus.FAILED
+        ),
+        candidate_recall_complete=(
+            EligibilityGateStatus.PASSED
+            if candidate_recall_complete
+            else EligibilityGateStatus.FAILED
+        ),
+        candidate_resolution_passed=(
+            EligibilityGateStatus.PASSED
+            if candidate_resolution_passed
+            else EligibilityGateStatus.FAILED
+        ),
+        quality_coverage_complete=quality_status,
+        geometry_execution_passed=(
+            EligibilityGateStatus.PASSED
+            if geometry_execution_passed
+            else EligibilityGateStatus.FAILED
+        ),
+        human_intent_execution_verified=(
+            (
+                EligibilityGateStatus.PASSED
+                if human_execution_verified
+                else EligibilityGateStatus.FAILED
+            )
+            if human_policy_present
+            else EligibilityGateStatus.NOT_REQUIRED
+        ),
+        technical_quality_passed=technical_status,
+        final_sequence_qa_passed=EligibilityGateStatus.NOT_RUN,
+        human_approval_passed=EligibilityGateStatus.NOT_RUN,
+    )
+    blocking_reasons: list[str] = []
+    review_reasons = [
+        "final_sequence_qa_not_run",
+        "human_approval_not_run",
+    ]
+    if not evidence_complete:
+        blocking_reasons.append("required_evidence_incomplete")
+    if not candidate_resolution_passed:
+        blocking_reasons.append("candidate_resolution_failed")
+    if not geometry_execution_passed:
+        blocking_reasons.append("geometry_execution_unverified")
+    if human_policy_present and not human_execution_verified:
+        blocking_reasons.append("human_intent_execution_not_verified")
+    if not candidate_recall_complete:
+        (
+            blocking_reasons
+            if execution_profile
+            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            else review_reasons
+        ).append("candidate_recall_incomplete")
+    if quality_status != EligibilityGateStatus.PASSED:
+        (
+            blocking_reasons
+            if execution_profile
+            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            else review_reasons
+        ).append("quality_map_coverage_incomplete")
+    if technical_status != EligibilityGateStatus.PASSED:
+        (
+            blocking_reasons
+            if execution_profile
+            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            else review_reasons
+        ).append("technical_quality_not_verified")
+
+    if not media_rendered:
+        run_state = FeatureCutRunState.FAILED
+    elif not evidence_complete:
+        run_state = FeatureCutRunState.PARTIAL
+    elif (
+        blocking_reasons
+        or not candidate_recall_complete
+        or quality_status != EligibilityGateStatus.PASSED
+        or technical_status != EligibilityGateStatus.PASSED
+    ):
+        run_state = FeatureCutRunState.REVIEW_PREVIEW
+    else:
+        run_state = FeatureCutRunState.READY_FOR_HUMAN_REVIEW
+    ready_for_human_review = (
+        run_state == FeatureCutRunState.READY_FOR_HUMAN_REVIEW
+    )
+    return FeatureCutEligibilityReport(
+        execution_profile=execution_profile,
+        media_rendered=media_rendered,
+        run_state=run_state,
+        ready_for_human_review=ready_for_human_review,
+        delivery_eligible=False,
+        editorial_contract=contract,
+        blocking_reasons=blocking_reasons,
+        review_reasons=review_reasons,
+        generated_at=utc_now(),
+    )
+
+
 def _summarize_automatic_reframe(
     vertical_chapters: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -8022,7 +8453,7 @@ def _resolve_editorial_chapter_durations(
     return resolved, audit
 
 
-def run_feature_cut_experiment(
+def _run_feature_cut_experiment_impl(
     *,
     catalog_path: Path,
     brief_path: Path,
@@ -8046,6 +8477,9 @@ def run_feature_cut_experiment(
     rhythm_style: Literal["calm", "standard", "energetic"] = "standard",
     allow_shorter_within_delivery_range: bool = False,
     auto_vertical_framing: bool = True,
+    execution_profile: FeatureCutExecutionProfile = (
+        FeatureCutExecutionProfile.REVIEW_PREVIEW
+    ),
 ) -> dict[str, Any]:
     resolved_vertical_framing_prompt = vertical_framing_prompt or (
         "Inspect the complete selected clip and propose a generic evidence-only "
@@ -8411,6 +8845,45 @@ def run_feature_cut_experiment(
             plan_reused = False
         shot_cache: dict[str, ShotManifest] = {}
         shots_dir = output_dir / "shots"
+        requested_candidate_recall_audit = (
+            _audit_requested_candidate_recall(
+                plan,
+                aspect=aspect,
+            )
+        )
+        write_json(
+            output_dir / "requested-candidate-recall-audit.json",
+            requested_candidate_recall_audit,
+        )
+        quality_map_coverage_audit = (
+            _audit_requested_quality_map_coverage(
+                plan,
+                aspect=aspect,
+                frames=frames,
+                clips=clips,
+                shot_cache=shot_cache,
+                shots_dir=shots_dir,
+                scdet_threshold=scdet_threshold,
+                quality_maps=shot_quality_maps,
+                human_policy_binding_present=human_reframe_policy_requested,
+            )
+        )
+        write_json(
+            output_dir / "quality-map-coverage-audit.json",
+            quality_map_coverage_audit,
+        )
+        if execution_profile == FeatureCutExecutionProfile.PRODUCTION_REVIEW:
+            preflight_failures = _production_review_preflight_failures(
+                requested_candidate_recall_audit,
+                quality_map_coverage_audit,
+            )
+            if preflight_failures:
+                raise ValueError(
+                    "production_review preflight failed: "
+                    + ", ".join(preflight_failures)
+                    + "; use review_preview only when an auditable preview is "
+                    "intended"
+                )
         source_capacity_seconds = _selected_source_capacity_seconds(
             plan,
             frames=frames,
@@ -8571,6 +9044,7 @@ def run_feature_cut_experiment(
             "render_pipeline_version": _RENDER_PIPELINE_VERSION,
             "render_cache_key": render_key,
             "requested_aspect": aspect,
+            "execution_profile": execution_profile.value,
             "feature_plan_reused": plan_reused,
             "music_supplied_to_feature_planner": resolved_music_path is not None,
             "music_sha256": music_sha256,
@@ -8581,6 +9055,10 @@ def run_feature_cut_experiment(
                     for frame in catalog.frames
                 },
             ),
+            "requested_candidate_recall_audit": (
+                requested_candidate_recall_audit
+            ),
+            "quality_map_coverage_audit": quality_map_coverage_audit,
             "editorial_duration_plan": duration_audit,
             "project_duration_resolution": {
                 "brief_preferred_duration_seconds": brief.target_duration_seconds,
@@ -9219,9 +9697,8 @@ def run_feature_cut_experiment(
                         )
                         auto_audit = None
                         failure_codes: list[FailureCode] = []
-                        if human_reframe_policy_requested:
-                            hard_gate_passed = True
-                        elif candidate_geometry.get("fallback_reason") is not None:
+                        candidate_execution_verified = False
+                        if candidate_geometry.get("fallback_reason") is not None:
                             hard_gate_passed = False
                             failure_codes = _failure_codes_from_geometry_error(
                                 ValueError(str(candidate_geometry["fallback_reason"]))
@@ -9250,6 +9727,7 @@ def run_feature_cut_experiment(
                                 ),
                             )
                             hard_gate_passed = auto_audit.approved
+                            candidate_execution_verified = auto_audit.approved
                             failure_codes = list(auto_audit.failure_codes)
                             preview_allowed_failures = {
                                 FailureCode.IDENTITY_VERIFICATION_PENDING,
@@ -9310,6 +9788,10 @@ def run_feature_cut_experiment(
                                 candidate_geometry["automatic_policy_label"] = (
                                     "auto_bounded_clip_v1"
                                 )
+                        if human_reframe_policy_requested:
+                            candidate_geometry[
+                                "human_policy_execution_verified"
+                            ] = candidate_execution_verified
                         recovery = (
                             None
                             if hard_gate_passed
@@ -9397,7 +9879,7 @@ def run_feature_cut_experiment(
                             }
                         )
                         candidate_attempts.append(attempt)
-                        if hard_gate_passed or human_reframe_policy_requested:
+                        if hard_gate_passed:
                             selected_vertical = {
                                 "option": option_data,
                                 "frame": candidate_frame,
@@ -9465,6 +9947,7 @@ def run_feature_cut_experiment(
                                         "tracking_or_grounding_failed",
                                         "human_policy_geometry_failed",
                                     ],
+                                    "human_policy_execution_verified": False,
                                     "requires_gemini_review": True,
                                 },
                                 "debugs": [],
@@ -9797,7 +10280,16 @@ def run_feature_cut_experiment(
                 for report in post_render_reports.values()
             ),
         }
+        eligibility = _build_feature_cut_eligibility_report(
+            manifest,
+            execution_profile=execution_profile,
+        )
+        manifest["media_rendered"] = eligibility.media_rendered
+        manifest["run_state"] = eligibility.run_state.value
+        manifest["delivery_eligible"] = eligibility.delivery_eligible
+        manifest["delivery_eligibility"] = eligibility.model_dump(mode="json")
         manifest["generated_at"] = utc_now()
+        write_json(output_dir / "delivery-eligibility.json", eligibility)
         write_json(output_dir / "render-manifest.json", manifest)
         if post_render_quality_qc and not manifest["post_render_quality_qc"][
             "technical_qc_passed"
@@ -9826,6 +10318,13 @@ def run_feature_cut_experiment(
         _render_review_html(output_dir, brief, plan, manifest)
         result = {
             "requested_aspect": aspect,
+            "media_rendered": eligibility.media_rendered,
+            "run_state": eligibility.run_state.value,
+            "ready_for_human_review": eligibility.ready_for_human_review,
+            "delivery_eligible": eligibility.delivery_eligible,
+            "delivery_eligibility_path": str(
+                (output_dir / "delivery-eligibility.json").resolve()
+            ),
             "horizontal_output": (
                 str(horizontal_output.resolve()) if horizontal_output is not None else None
             ),
@@ -9847,3 +10346,122 @@ def run_feature_cut_experiment(
             prior_interaction_hashes=prior_interaction_hashes,
             prior_error_hashes=prior_error_hashes,
         )
+
+
+def run_feature_cut_experiment(
+    *,
+    catalog_path: Path,
+    brief_path: Path,
+    checkpoint_path: Path,
+    output_dir: Path,
+    plan_prompt: str,
+    grounding_prompt: str,
+    vertical_framing_prompt: str | None = None,
+    scdet_threshold: float = 4.0,
+    sam_analysis_fps: float = 2.0,
+    trim_decision_paths: Sequence[Path] = (),
+    shot_quality_map_paths: Sequence[Path] = (),
+    allow_proposed_trim_preview: bool = False,
+    reuse_feature_plan: bool = False,
+    reuse_feature_plan_raw_output: bool = False,
+    allow_unverified_geometry_preview: bool = False,
+    aspect: RenderAspect = "both",
+    music_path: Path | None = None,
+    music_lock_path: Path | None = None,
+    post_render_quality_qc: bool = True,
+    rhythm_style: Literal["calm", "standard", "energetic"] = "standard",
+    allow_shorter_within_delivery_range: bool = False,
+    auto_vertical_framing: bool = True,
+    execution_profile: FeatureCutExecutionProfile | str = (
+        FeatureCutExecutionProfile.REVIEW_PREVIEW
+    ),
+) -> dict[str, Any]:
+    """Run feature-cut while atomically preserving terminal editorial state."""
+
+    profile = FeatureCutExecutionProfile(execution_profile)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    status_path = output_dir / "run-status.json"
+    write_json(
+        status_path,
+        {
+            "contract_version": "feature-cut-run-status-v1",
+            "execution_profile": profile.value,
+            "stage": "running",
+            "terminal": False,
+            "media_rendered": False,
+            "run_state": None,
+            "delivery_eligible": False,
+            "error": None,
+            "updated_at": utc_now(),
+        },
+    )
+    try:
+        result = _run_feature_cut_experiment_impl(
+            catalog_path=catalog_path,
+            brief_path=brief_path,
+            checkpoint_path=checkpoint_path,
+            output_dir=output_dir,
+            plan_prompt=plan_prompt,
+            grounding_prompt=grounding_prompt,
+            vertical_framing_prompt=vertical_framing_prompt,
+            scdet_threshold=scdet_threshold,
+            sam_analysis_fps=sam_analysis_fps,
+            trim_decision_paths=trim_decision_paths,
+            shot_quality_map_paths=shot_quality_map_paths,
+            allow_proposed_trim_preview=allow_proposed_trim_preview,
+            reuse_feature_plan=reuse_feature_plan,
+            reuse_feature_plan_raw_output=reuse_feature_plan_raw_output,
+            allow_unverified_geometry_preview=allow_unverified_geometry_preview,
+            aspect=aspect,
+            music_path=music_path,
+            music_lock_path=music_lock_path,
+            post_render_quality_qc=post_render_quality_qc,
+            rhythm_style=rhythm_style,
+            allow_shorter_within_delivery_range=(
+                allow_shorter_within_delivery_range
+            ),
+            auto_vertical_framing=auto_vertical_framing,
+            execution_profile=profile,
+        )
+    except Exception as error:
+        saved_eligibility_path = output_dir / "delivery-eligibility.json"
+        saved_eligibility = (
+            read_json(saved_eligibility_path)
+            if saved_eligibility_path.is_file()
+            else {}
+        )
+        write_json(
+            status_path,
+            {
+                "contract_version": "feature-cut-run-status-v1",
+                "execution_profile": profile.value,
+                "stage": "failed",
+                "terminal": True,
+                "media_rendered": bool(
+                    saved_eligibility.get("media_rendered", False)
+                ),
+                "run_state": FeatureCutRunState.FAILED.value,
+                "delivery_eligible": False,
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+                "updated_at": utc_now(),
+            },
+        )
+        raise
+    write_json(
+        status_path,
+        {
+            "contract_version": "feature-cut-run-status-v1",
+            "execution_profile": profile.value,
+            "stage": "completed",
+            "terminal": True,
+            "media_rendered": bool(result["media_rendered"]),
+            "run_state": result["run_state"],
+            "delivery_eligible": bool(result["delivery_eligible"]),
+            "error": None,
+            "updated_at": utc_now(),
+        },
+    )
+    return result

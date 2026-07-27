@@ -32,6 +32,22 @@
 
 Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主題、長度或比例時，可以先查既有資料，只重新分析真正入選且需要精確畫面座標的片段。AI 的選片、時間、bbox、mask 與 confidence 都只是待審建議，不會因為 schema 合法就自動成為正式剪輯資料。
 
+### 可播放不等於可交付
+
+`feature-cut` 現在把媒體生成與剪輯資格拆開。`horizontal.status=rendered`／
+`vertical.status=rendered` 只表示 MP4 已成功編碼；真正狀態另存於
+`delivery-eligibility.json`、`render-manifest.json` 與 `run-status.json`：
+
+- `partial`：必要 chapter 沒有直接證據；可以輸出缺證據圖卡供審查，但不能冒充完成 brief。
+- `review_preview`：媒體可看，但候選、QualityMap、geometry 或 human-intent execution 尚未完整驗證。
+- `ready_for_human_review`：本次 execution profile 要求的自動 gate 已通過，可以進入正式人工審核。
+- `delivery_eligible`：必須再有 final-sequence QA 與人工核准；單獨執行 `feature-cut` 不會自行宣稱可交付。
+
+預設 `--execution-profile review_preview` 保留實驗便利性。要在付費 geometry／
+render 前強制 requested-aspect Top-K 與所有可嘗試候選的 ShotQualityMap coverage，
+使用 `--execution-profile production_review`。Human reframe policy 只核准
+構圖 intent，不會再直接把某次 Grounding、SAM 或 crop execution 標成通過。
+
 ### 為什麼重跑可能仍選到相似素材
 
 同一批毛片、相同 brief 與相同音樂，重跑後仍選中幾個相同 hero shot 不一定是錯誤；若那些鏡頭的內容證據、動作完整度與技術品質明顯最好，穩定選中反而是合理結果。真正需要警戒的是「每章只保存 rank 1」，導致後續發現 9:16 不可行、畫面重複或品質不佳時，renderer 已沒有可回溯的替代素材。
@@ -447,6 +463,7 @@ uv run jascue-video-lab build-candidate-capacity \
 # feature-cut 要求所有可能實際嘗試的 source shot 都有 quality map
 uv run jascue-video-lab feature-cut CATALOG.json BRIEF.json \
   --sam-checkpoint SAM_CHECKPOINT.pt \
+  --execution-profile production_review \
   --shot-quality-map artifacts/quality/shot-0003.quality-map.json \
   --output-dir FEATURE_OUTPUT
 ```
