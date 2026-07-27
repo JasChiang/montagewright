@@ -624,6 +624,41 @@ def canonicalize_feature_edit_plan_output(
                     "rule": "system_owned_attention_review_gate_is_always_true",
                 }
             )
+        reuse_mode = chapter.get("source_reuse_mode")
+        reuse_justification = chapter.get("source_reuse_justification")
+        selection_reason = chapter.get("selection_reason")
+        if (
+            reuse_mode in {
+                "distinct_interval",
+                "alternate_presentation",
+                "editorial_reprise",
+            }
+            and not (
+                isinstance(reuse_justification, str)
+                and reuse_justification.strip()
+            )
+            and isinstance(selection_reason, str)
+            and selection_reason.strip()
+        ):
+            # This does not invent a new editorial reason. It only projects
+            # the model's already generated chapter-selection rationale into
+            # the required reuse-reason field when both describe the same
+            # selected chapter and source interval.
+            chapter["source_reuse_justification"] = selection_reason
+            changes.append(
+                {
+                    "json_path": (
+                        f"$.chapters[{chapter_index}]"
+                        ".source_reuse_justification"
+                    ),
+                    "before": reuse_justification,
+                    "after": selection_reason,
+                    "rule": (
+                        "existing_selection_reason_projects_to_missing_"
+                        "reuse_justification"
+                    ),
+                }
+            )
         candidate_mirrors = {
             "horizontal_candidates": {
                 "horizontal_frame_id": "frame_id",
@@ -692,6 +727,77 @@ def canonicalize_feature_edit_plan_output(
             coverage_targets = chapter.get(
                 "vertical_coverage_target_descriptions"
             )
+            if (
+                chapter.get("vertical_coverage_intent") == "group_coverage"
+                and isinstance(coverage_targets, list)
+                and len(coverage_targets) == 1
+                and isinstance(coverage_targets[0], str)
+                and coverage_targets[0].strip()
+                and vertical_candidates
+                and all(
+                    isinstance(candidate, dict)
+                    and isinstance(candidate.get("regions"), list)
+                    and len(candidate["regions"]) == 1
+                    and isinstance(candidate["regions"][0], dict)
+                    and candidate["regions"][0].get("role") == "required"
+                    for candidate in vertical_candidates
+                )
+            ):
+                # A single descriptor under an explicit group-coverage intent
+                # denotes one compound visual unit. Preserve that stronger
+                # upstream obligation instead of silently weakening it to the
+                # candidate's single-person wording.
+                compound_target = coverage_targets[0].strip()
+                before_target = chapter.get("vertical_target_description")
+                chapter["vertical_target_description"] = compound_target
+                changes.append(
+                    {
+                        "json_path": (
+                            f"$.chapters[{chapter_index}]"
+                            ".vertical_target_description"
+                        ),
+                        "before": before_target,
+                        "after": compound_target,
+                        "rule": (
+                            "explicit_group_coverage_projects_to_compound_"
+                            "vertical_target"
+                        ),
+                    }
+                )
+                for candidate_index, candidate in enumerate(
+                    vertical_candidates
+                ):
+                    region = candidate["regions"][0]
+                    before = {
+                        "candidate_target_description": candidate.get(
+                            "target_description"
+                        ),
+                        "region_target_description": region.get(
+                            "target_description"
+                        ),
+                        "atomic": region.get("atomic"),
+                    }
+                    candidate["target_description"] = compound_target
+                    region["target_description"] = compound_target
+                    region["atomic"] = True
+                    changes.append(
+                        {
+                            "json_path": (
+                                f"$.chapters[{chapter_index}]"
+                                f".vertical_candidates[{candidate_index}]"
+                            ),
+                            "before": before,
+                            "after": {
+                                "candidate_target_description": compound_target,
+                                "region_target_description": compound_target,
+                                "atomic": True,
+                            },
+                            "rule": (
+                                "single_required_region_under_explicit_group_"
+                                "coverage_is_atomic_compound"
+                            ),
+                        }
+                    )
             atomic_compound_candidates = bool(vertical_candidates) and all(
                 isinstance(candidate, dict)
                 and isinstance(candidate.get("regions"), list)
@@ -3231,6 +3337,65 @@ model_provenance (return it unchanged with interaction_id=null):
             canonical_text, normalization_changes = (
                 canonicalize_feature_edit_plan_output(output_text)
             )
+            recovered_by_paid_schema_repair = False
+            try:
+                parsed = FeatureEditPlan.model_validate_json(canonical_text)
+            except Exception as validation_error:
+                # A response was successfully generated and paid for, but it
+                # does not satisfy the local cross-field contract. This is the
+                # only failure class where one paid repair is useful: request
+                # failures such as 429/503/timeout never reach this block.
+                #
+                # Keep the original video/music inputs attached so the repair
+                # cannot fill omissions from the prior JSON alone, and require
+                # a complete replacement rather than a patch document.
+                repair_record = dict(request_record)
+                repair_record["input"] = [
+                    *list(request_record["input"]),
+                    {
+                        "type": "text",
+                        "text": (
+                            "## Contract 修正重試（僅一次）\n"
+                            "前一次完整輸出已成功產生，但未通過本機 Pydantic "
+                            "與跨欄位 contract。請重新檢視同一份影片、音樂、"
+                            "brief 與 catalog 標籤，輸出一份完整 FeatureEditPlan。\n"
+                            "只修正驗證錯誤與其直接造成的內部矛盾；能保留的 "
+                            "frame selection、可觀察證據與敘事順序都應保留。"
+                            "不得新增未在影片中看見的證據，不得輸出 JSON patch。\n"
+                            f"本機驗證錯誤：{validation_error}\n"
+                            "以下前次輸出只供定位 contract 錯誤，不是新的"
+                            "證據來源：\n"
+                            + output_text
+                        ),
+                    },
+                ]
+                write_json(
+                    run_dir / "feature_edit_plan.repair.request.json",
+                    repair_record,
+                )
+                write_json(
+                    run_dir / "feature_edit_plan.pre_repair.raw_output.json",
+                    {"output_text": output_text},
+                )
+                repair_interaction = self.client.interactions.create(
+                    **repair_record
+                )
+                _record_interaction_attempt(
+                    run_dir=run_dir,
+                    operation="feature_edit_plan_repair",
+                    canonical_filename=(
+                        "feature_edit_plan.raw_interaction.json"
+                    ),
+                    interaction=repair_interaction,
+                )
+                output_text = repair_interaction.output_text
+                interaction_id = repair_interaction.id
+                write_json(raw_output_path, {"output_text": output_text})
+                canonical_text, normalization_changes = (
+                    canonicalize_feature_edit_plan_output(output_text)
+                )
+                parsed = FeatureEditPlan.model_validate_json(canonical_text)
+                recovered_by_paid_schema_repair = True
             write_json(
                 run_dir / "feature_edit_plan.canonical_output.json",
                 {"output_text": canonical_text},
@@ -3241,9 +3406,11 @@ model_provenance (return it unchanged with interaction_id=null):
                     "contract_version": "feature-edit-plan-normalization-v1",
                     "changes": normalization_changes,
                     "editorial_selection_changed": False,
+                    "recovered_by_paid_schema_repair": (
+                        recovered_by_paid_schema_repair
+                    ),
                 },
             )
-            parsed = FeatureEditPlan.model_validate_json(canonical_text)
             expected_ids = [chapter.feature_id for chapter in brief.chapters]
             actual_ids = [chapter.feature_id for chapter in parsed.chapters]
             if parsed.project_id != brief.project_id or parsed.catalog_id != catalog.catalog_id:

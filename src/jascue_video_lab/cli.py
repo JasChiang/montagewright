@@ -847,6 +847,7 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
         music_lock_path=args.music_map_lock,
         output_dir=args.output_dir,
         model_id=args.model,
+        execution_profile=args.execution_profile,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2434,6 +2435,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feature_delivery_parser.add_argument(
         "--allow-shorter-within-delivery-range", action="store_true"
+    )
+    feature_delivery_parser.add_argument(
+        "--execution-profile",
+        choices=["production_review", "review_preview"],
+        default="production_review",
+        help=(
+            "Keep production_review as the strict default; use review_preview "
+            "only to render an explicitly non-deliverable audit preview."
+        ),
     )
     feature_delivery_parser.add_argument("--model", default=MODEL_ID)
     feature_delivery_parser.add_argument("--output-dir", type=Path, required=True)

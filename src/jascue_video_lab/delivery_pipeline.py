@@ -65,6 +65,7 @@ def run_feature_delivery_pipeline(
     music_lock_path: Path,
     output_dir: Path,
     model_id: str = MODEL_ID,
+    execution_profile: str = "production_review",
 ) -> dict[str, Any]:
     """Run picture → continuous music → final mux → final QA as one chain.
 
@@ -92,7 +93,7 @@ def run_feature_delivery_pipeline(
         kwargs["brief_path"] = brief_path
         kwargs["music_path"] = music_path
         kwargs["music_lock_path"] = music_lock_path
-        kwargs["execution_profile"] = "production_review"
+        kwargs["execution_profile"] = execution_profile
         feature_result = run_feature_cut_experiment(**kwargs)
         outputs["feature_cut"] = feature_result
         picture_media_rendered = bool(feature_result.get("media_rendered"))
