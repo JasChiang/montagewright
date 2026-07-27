@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import importlib
@@ -233,6 +234,31 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
             "selected_clip_card_evidence",
         ],
     },
+    "direct-video-edit-plan-v1": {
+        "source": (
+            "compact rank-based editorial intent over hash-bound bounded "
+            "candidate videos and supplied music"
+        ),
+        "transform": (
+            "chapter, candidate, and entity integer indices are resolved "
+            "locally into a validated ClipCardFeaturePlanV3 before the "
+            "existing deterministic renderer projection"
+        ),
+        "target": "FeatureEditPlan",
+        "module": "scripts.plan_clip_card_feature_cut",
+        "source_model": "DirectVideoEditPlan",
+        "source_plan_has_model_provenance": False,
+        "projector": "reproject_direct_video_edit_plan",
+        "raw_output_role": "source_raw_output",
+        "required_artifact_roles": [
+            "source_raw_interaction",
+            "source_raw_output",
+            "derived_clip_card_feature_plan",
+            "selected_clip_card_evidence",
+            "feature_shortlist",
+            "candidate_video_evidence_manifest",
+        ],
+    },
     "clip-card-feature-music-rerank-v1": {
         "source": (
             "music-aware aspect selections over an existing validated Top-K "
@@ -397,14 +423,17 @@ def _validate_external_projection_semantics(
         if not isinstance(output_text, str):
             raise ValueError("external projection raw output has no output_text")
         raw_plan = source_model.model_validate_json(output_text)
-        source_interaction_id = source_plan.model_provenance.interaction_id
-        normalized_raw_plan = raw_plan.model_copy(
-            update={
-                "model_provenance": raw_plan.model_provenance.model_copy(
-                    update={"interaction_id": source_interaction_id}
-                )
-            }
-        )
+        if contract.get("source_plan_has_model_provenance", True):
+            source_interaction_id = source_plan.model_provenance.interaction_id
+            normalized_raw_plan = raw_plan.model_copy(
+                update={
+                    "model_provenance": raw_plan.model_provenance.model_copy(
+                        update={"interaction_id": source_interaction_id}
+                    )
+                }
+            )
+        else:
+            normalized_raw_plan = raw_plan
         if normalized_raw_plan.model_dump(mode="json") != source_plan.model_dump(
             mode="json"
         ):
@@ -504,14 +533,17 @@ def write_external_feature_plan_projection(
     if not isinstance(source_plan, dict):
         raise ValueError("external projection source plan must be an object")
     request_claims = _external_request_claims(source_request_path)
-    source_provenance = source_plan.get("model_provenance")
-    if (
-        not isinstance(source_provenance, dict)
-        or source_provenance.get("model_id") != request_claims["source_model_id"]
-    ):
-        raise ValueError(
-            "external projection source plan provenance does not match its request"
-        )
+    contract = _EXTERNAL_PROJECTION_CONTRACTS[projection_contract_id]
+    if contract.get("source_plan_has_model_provenance", True):
+        source_provenance = source_plan.get("model_provenance")
+        if (
+            not isinstance(source_provenance, dict)
+            or source_provenance.get("model_id")
+            != request_claims["source_model_id"]
+        ):
+            raise ValueError(
+                "external projection source plan provenance does not match its request"
+            )
     artifacts = [
         _hashed_artifact(role, path)
         for role, path in sorted((source_artifacts or {}).items())
@@ -666,16 +698,22 @@ def _current_external_projection_binding(
         if record.get(key) != value:
             raise ValueError(f"external projection request claim changed: {key}")
     source_plan = read_json(Path(str(record["source_plan_path"])))
-    source_provenance = (
-        source_plan.get("model_provenance") if isinstance(source_plan, dict) else None
-    )
-    if (
-        not isinstance(source_provenance, dict)
-        or source_provenance.get("model_id") != request_claims["source_model_id"]
-    ):
-        raise ValueError(
-            "external projection source plan provenance no longer matches its request"
+    contract = _EXTERNAL_PROJECTION_CONTRACTS[contract_id]
+    if contract.get("source_plan_has_model_provenance", True):
+        source_provenance = (
+            source_plan.get("model_provenance")
+            if isinstance(source_plan, dict)
+            else None
         )
+        if (
+            not isinstance(source_provenance, dict)
+            or source_provenance.get("model_id")
+            != request_claims["source_model_id"]
+        ):
+            raise ValueError(
+                "external projection source plan provenance no longer "
+                "matches its request"
+            )
     artifact_claims: list[dict[str, str]] = []
     artifact_roles: set[str] = set()
     artifact_paths: dict[str, Path] = {}
@@ -732,22 +770,46 @@ def _current_external_projection_binding(
             "external projection source_music does not match the paid request "
             "audio presence"
         )
-    source_prompt = next(
-        (
-            str(item.get("text"))
-            for item in source_inputs
-            if isinstance(item, dict) and item.get("type") == "text"
-        ),
-        "",
+    source_prompt = "\n".join(
+        str(item.get("text"))
+        for item in source_inputs
+        if isinstance(item, dict) and item.get("type") == "text"
     )
     if source_music_sha256 is not None and not _prompt_binds_sha256(
         source_prompt,
         "music_sha256",
         source_music_sha256,
     ):
-        raise ValueError(
-            "external projection paid request does not bind the source music hash"
-        )
+        if contract_id != "direct-video-edit-plan-v1":
+            raise ValueError(
+                "external projection paid request does not bind the source music hash"
+            )
+        upload_path = artifact_paths.get("source_music_upload")
+        if upload_path is None:
+            raise ValueError(
+                "direct-video projection requires its File API music binding"
+            )
+        upload = read_json(upload_path)
+        upload_uri = str(upload.get("uri") or "")
+        request_audio_uris = {
+            str(item.get("uri") or "")
+            for item in source_inputs
+            if isinstance(item, dict) and item.get("type") == "audio"
+        }
+        encoded_hash = str(upload.get("sha256_hash") or "")
+        try:
+            decoded_hash = base64.b64decode(encoded_hash).decode("ascii")
+        except Exception as error:
+            raise ValueError("music upload has an invalid source hash") from error
+        if (
+            not upload_uri
+            or upload_uri not in request_audio_uris
+            or decoded_hash != source_music_sha256
+        ):
+            raise ValueError(
+                "direct-video paid request music does not match its "
+                "hash-bound File API object"
+            )
     if music_sha256 != source_music_sha256:
         raise ValueError(
             "external projection music differs from the current render input; "
@@ -7286,6 +7348,32 @@ def _horizontal_runtime_candidate_options(
     ]
 
 
+def _should_refine_selected_vertical_candidate(
+    *,
+    auto_vertical_framing: bool,
+    human_reframe_policy_requested: bool,
+    feature_plan_origin: str,
+    external_projection_contract_id: str | None,
+    option_data: Mapping[str, Any],
+) -> bool:
+    """Return whether the legacy selected-clip semantic pass is still needed.
+
+    The compact direct-video contract has already inspected the bounded
+    candidate video and supplied the editorial framing/attention decision. Its
+    downstream work is exact-frame Grounding, SAM propagation, and local
+    geometry—not a second paid VLM reinterpretation of the same candidate.
+    """
+
+    if not auto_vertical_framing or human_reframe_policy_requested:
+        return False
+    if external_projection_contract_id == "direct-video-edit-plan-v1":
+        return False
+    return (
+        feature_plan_origin != "external_projection"
+        or option_data.get("virtual_camera_proposal") is None
+    )
+
+
 def _prepare_horizontal_runtime_candidate(
     *,
     option: Mapping[str, Any],
@@ -8112,6 +8200,9 @@ def _build_feature_cut_eligibility_report(
         )
         for chapter in chapters
     )
+    source_reuse_contract_passed = bool(
+        manifest.get("source_reuse_contract_passed", True)
+    )
     quality_audit = manifest.get("quality_map_coverage_audit", {})
     quality_complete = bool(quality_audit.get("complete"))
     quality_status = (
@@ -8205,6 +8296,8 @@ def _build_feature_cut_eligibility_report(
         blocking_reasons.append("required_evidence_incomplete")
     if not candidate_resolution_passed:
         blocking_reasons.append("candidate_resolution_failed")
+    if not source_reuse_contract_passed:
+        blocking_reasons.append("source_reuse_contract_failed")
     if not geometry_execution_passed:
         blocking_reasons.append("geometry_execution_unverified")
     if human_policy_present and not human_execution_verified:
@@ -9486,6 +9579,7 @@ def _run_feature_cut_experiment_impl(
         raise ValueError("music file does not match the supplied MusicMap lock")
     client = GeminiLabClient()
     feature_plan_origin = "generated"
+    external_projection_contract_id: str | None = None
     plan_reuse_record_path: Path | None = None
     gemini_geometry_block_reason: str | None = None
     geometry_circuit_run_id = uuid.uuid4().hex
@@ -9648,6 +9742,10 @@ def _run_feature_cut_experiment_impl(
                 current_binding["origin"] = saved_binding["origin"]
             _validate_feature_plan_binding(saved_binding, current_binding)
             feature_plan_origin = str(current_binding["origin"])
+            contract_id = current_binding.get("external_projection_contract_id")
+            external_projection_contract_id = (
+                str(contract_id) if isinstance(contract_id, str) else None
+            )
             reuse_event_dir = plan_dir / "feature-plan-reuse-events"
             plan_reuse_record_path = (
                 reuse_event_dir / f"reuse-{uuid.uuid4().hex}.json"
@@ -10465,13 +10563,16 @@ def _run_feature_cut_experiment_impl(
                         continue
                     framing_refinement: dict[str, Any] | None = None
                     framing_recommended_action: str | None = None
-                    if (
-                        auto_vertical_framing
-                        and not human_reframe_policy_requested
-                        and (
-                            feature_plan_origin != "external_projection"
-                            or option_data.get("virtual_camera_proposal") is None
-                        )
+                    if _should_refine_selected_vertical_candidate(
+                        auto_vertical_framing=auto_vertical_framing,
+                        human_reframe_policy_requested=(
+                            human_reframe_policy_requested
+                        ),
+                        feature_plan_origin=feature_plan_origin,
+                        external_projection_contract_id=(
+                            external_projection_contract_id
+                        ),
+                        option_data=option_data,
                     ):
                         try:
                             (
@@ -11003,78 +11104,52 @@ def _run_feature_cut_experiment_impl(
                         deferred_required_scope_fit or deferred_fit
                     )
                 if selected_vertical is None:
-                    # All evidence-bound crop candidates failed. Honor the
-                    # explicitly selected project fallback, but keep it marked
-                    # as an unverified human-review preview.
-                    first_data = vertical_options[0]
-                    vertical_frame = frames[str(first_data["frame_id"])]
-                    vertical_clip = clips[vertical_frame.clip_id]
-                    if vertical_clip.sha256 not in source_audio_cache:
-                        source_audio_cache[vertical_clip.sha256] = has_audio_stream(
-                            Path(vertical_clip.path)
-                        )
-                    if vertical_clip.sha256 not in source_media_cache:
-                        source_media_cache[vertical_clip.sha256] = probe_video(
-                            Path(vertical_clip.path)
-                        )
-                    vertical_source_media = source_media_cache[vertical_clip.sha256]
-                    v_start, v_end, v_shot, vertical_trim = (
-                        _chapter_bounds_with_approved_trim(
-                            vertical_frame,
-                            vertical_clip,
-                            chapter_duration_seconds,
-                            shot_cache,
-                            shots_dir,
-                            scdet_threshold,
-                            trim_decisions,
-                            expected_event_id=_selected_event_id(
-                                selected,
-                                frame_id=vertical_frame.frame_id,
-                                aspect="9:16",
+                    # Do not retry the first candidate outside the audited
+                    # candidate loop. That previously masked the real geometry
+                    # or schema failure with a second, misleading capacity
+                    # exception. A caller may still produce a review-only
+                    # fallback in a separate typed execution profile, but the
+                    # production path must fail with the complete attempt
+                    # ledger intact.
+                    write_json(
+                        output_dir
+                        / "candidate-attempts"
+                        / selected.feature_id
+                        / "9x16.exhausted.json",
+                        {
+                            "contract_version": (
+                                "automatic-candidate-exhaustion-v1"
                             ),
-                            quality_maps=shot_quality_maps,
-                        )
+                            "feature_id": selected.feature_id,
+                            "attempts": candidate_attempts,
+                            "delivery_eligible": False,
+                        },
                     )
-                    vertical_regions = list(brief_chapter.vertical_regions)
-                    vertical_target_description = (
-                        selected.vertical_target_description
-                        or brief_chapter.vertical_primary_target_description
+                    raise ValueError(
+                        "all 9:16 evidence-bound candidates failed quality, "
+                        "capacity, geometry, identity or lineage preflight"
                     )
-                    vertical_filter, vertical_geometry = (
-                        _vertical_delivery_fallback(
-                            brief.vertical_fallback_strategy,
-                            reason="all_automatic_candidates_exhausted",
-                        )
-                    )
-                    vertical_geometry.setdefault("risk_codes", []).append(
-                        "automatic_candidate_exhaustion"
-                    )
-                    vertical_debugs = []
-                    vertical_track_fingerprint = None
-                    selected_candidate_id = str(first_data["candidate_id"])
-                    selected_candidate_rank = int(first_data["rank"])
-                else:
-                    vertical_frame = selected_vertical["frame"]
-                    vertical_clip = selected_vertical["clip"]
-                    vertical_source_media = selected_vertical["media"]
-                    v_start = selected_vertical["start_ms"]
-                    v_end = selected_vertical["end_ms"]
-                    v_shot = selected_vertical["shot_id"]
-                    vertical_trim = selected_vertical["trim"]
-                    vertical_regions = selected_vertical["regions"]
-                    vertical_target_description = selected_vertical["target"]
-                    vertical_filter = selected_vertical["filter"]
-                    vertical_geometry = selected_vertical["geometry"]
-                    vertical_debugs = selected_vertical["debugs"]
-                    vertical_track_fingerprint = selected_vertical[
-                        "track_fingerprint"
-                    ]
-                    selected_candidate_id = str(
-                        selected_vertical["option"]["candidate_id"]
-                    )
-                    selected_candidate_rank = int(
-                        selected_vertical["option"]["rank"]
-                    )
+                vertical_frame = selected_vertical["frame"]
+                vertical_clip = selected_vertical["clip"]
+                vertical_source_media = selected_vertical["media"]
+                v_start = selected_vertical["start_ms"]
+                v_end = selected_vertical["end_ms"]
+                v_shot = selected_vertical["shot_id"]
+                vertical_trim = selected_vertical["trim"]
+                vertical_regions = selected_vertical["regions"]
+                vertical_target_description = selected_vertical["target"]
+                vertical_filter = selected_vertical["filter"]
+                vertical_geometry = selected_vertical["geometry"]
+                vertical_debugs = selected_vertical["debugs"]
+                vertical_track_fingerprint = selected_vertical[
+                    "track_fingerprint"
+                ]
+                selected_candidate_id = str(
+                    selected_vertical["option"]["candidate_id"]
+                )
+                selected_candidate_rank = int(
+                    selected_vertical["option"]["rank"]
+                )
                 vertical_source_has_audio = source_audio_cache[vertical_clip.sha256]
                 vertical_debug = next(
                     (path for path in vertical_debugs if path.exists()), None
@@ -11259,12 +11334,17 @@ def _run_feature_cut_experiment_impl(
             for audit in source_reuse_audits.values()
             for violation in audit["violations"]
         ]
-        if blocked_reuse:
-            raise ValueError(
-                "rendered source intervals violate the typed source reuse "
-                "contract; inspect render-source-reuse-audit.json"
-            )
         manifest["source_reuse_audit"] = source_reuse_audits
+        manifest["source_reuse_contract_passed"] = not blocked_reuse
+        # Source reuse is an editorial contract, not a decoder failure. Keep
+        # the deterministic media available for the required human review, but
+        # never let an unauthorised overlap become delivery eligible. This also
+        # preserves the full rendered evidence needed to decide whether the
+        # recurrence is a legitimate callback/recap or an accidental repeat.
+        if blocked_reuse:
+            manifest.setdefault("review_flags", []).append(
+                "source_reuse_contract_failed"
+            )
         timings["geometry_and_segment_render_seconds"] = round(monotonic() - stage, 3)
     finally:
         try:

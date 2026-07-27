@@ -7,6 +7,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from jascue_video_lab.clip_card_retrieval import (
+    FeatureChapterShortlist,
+    FeatureShortlistCandidate,
+    FeatureShortlistPlan,
+)
 from jascue_video_lab.clip_card_observations import (
     AssessmentStatus,
     ClipObservationSupplement,
@@ -54,6 +59,11 @@ from scripts.plan_clip_card_feature_cut import (
     ClipCardFeatureSelect,
     ClipCardFeatureSelectV2,
     ClipCardFeatureSelectV3,
+    DirectVideoAttentionStep,
+    DirectVideoChapterDecision,
+    DirectVideoEditPlan,
+    DirectVideoHorizontalDecision,
+    DirectVideoVerticalDecision,
     ResolvedEntityRef,
     ResolvedFramingRegion,
     SelectedClipCardEvidence,
@@ -73,10 +83,133 @@ from scripts.plan_clip_card_feature_cut import (
     validate_plan_contract,
     validate_plan_contract_v3,
     main as feature_planner_main,
+    planning_candidate_id,
+    planning_candidate_slice,
+    project_direct_video_edit_plan,
+    validate_candidate_video_budget,
 )
 
 
 ASSET_ID = "sha256:" + "a" * 64
+
+
+def test_direct_video_planning_only_selects_candidates_actually_attached() -> None:
+    candidates = ["rank-1", "rank-2", "rank-3"]
+
+    assert planning_candidate_slice(
+        candidates,
+        direct_video_evidence=True,
+        depth=2,
+    ) == ["rank-1", "rank-2"]
+    assert planning_candidate_slice(
+        candidates,
+        direct_video_evidence=False,
+        depth=2,
+    ) == candidates
+    assert planning_candidate_id(1) == "rank-01"
+    assert planning_candidate_id(4) == "rank-04"
+
+
+def test_candidate_video_budget_fails_before_upload_or_paid_planning() -> None:
+    validate_candidate_video_budget(
+        total_duration_ms=359_999,
+        maximum_duration_ms=360_000,
+    )
+    with pytest.raises(ValueError, match="before upload or paid planning"):
+        validate_candidate_video_budget(
+            total_duration_ms=360_001,
+            maximum_duration_ms=360_000,
+        )
+
+
+def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> None:
+    shortlist = FeatureShortlistPlan(
+        project_id="project-1",
+        catalog_id="catalog-1",
+        chapters=[
+            FeatureChapterShortlist(
+                feature_id="feature-1",
+                evidence_status="partial",
+                candidates=[
+                    FeatureShortlistCandidate(
+                        source_asset_id=ASSET_ID,
+                        event_id="demo",
+                        retrieval_reason="Visible demonstration.",
+                    )
+                ],
+            )
+        ],
+        uncertainties=[],
+        model_provenance=_provenance(),
+    )
+    direct = DirectVideoEditPlan(
+        contract_version="direct-video-edit-plan-v1",
+        title="Generic feature cut",
+        strategy_summary="Use the visible demonstration.",
+        chapters=[
+            DirectVideoChapterDecision(
+                chapter_index=1,
+                evidence_status="partial",
+                observed_visual_evidence="The subject demonstrates beside a sign.",
+                selection_reason="The action is directly visible.",
+                quality_risks=[],
+                horizontal=DirectVideoHorizontalDecision(
+                    candidate_rank=1,
+                    strategy="original",
+                    zoom_intent="none",
+                    camera_intent="hold",
+                ),
+                vertical=DirectVideoVerticalDecision(
+                    candidate_rank=1,
+                    strategy="tracked_crop",
+                    crop_mode="strict",
+                    framing_intent="Keep the subject and sign.",
+                    required_entity_indices=[1],
+                    preferred_entity_indices=[2],
+                    attention_sequence=[
+                        DirectVideoAttentionStep(
+                            start_progress=0,
+                            end_progress=1,
+                            anchor_entity_indices=[1],
+                            camera_behavior="hold",
+                        )
+                    ],
+                ),
+                recommended_duration_seconds=6,
+                duration_rationale="Allow the complete action to read.",
+                confidence=0.8,
+            )
+        ],
+        uncertainties=[],
+    )
+
+    projected = project_direct_video_edit_plan(
+        direct,
+        shortlist=shortlist,
+        candidate_depth=2,
+        brief=_brief(),
+        catalog=_catalog(),
+        cards={ASSET_ID: _card()},
+        provenance=_provenance(),
+    )
+
+    candidate = projected.chapters[0].candidates[0]
+    assert candidate.candidate_id == "rank-01"
+    assert candidate.source_asset_id == ASSET_ID
+    assert candidate.event_id == "demo"
+    assert candidate.frame_id == "RF000001"
+    assert projected.chapters[0].horizontal_candidate_id == "rank-01"
+    assert projected.chapters[0].vertical_candidate_id == "rank-01"
+    direct_schema = json.dumps(gemini_response_schema(DirectVideoEditPlan))
+    assert '"candidate_rank"' in direct_schema
+    assert '"chapter_index"' in direct_schema
+    assert '"entity_index"' not in direct_schema
+    assert '"required_entity_indices"' in direct_schema
+    assert '"candidate_id"' not in direct_schema
+    assert '"source_asset_id"' not in direct_schema
+    assert '"frame_id"' not in direct_schema
+    assert '"project_id"' not in direct_schema
+    assert '"model_provenance"' not in direct_schema
 
 
 def _provenance() -> ModelProvenance:

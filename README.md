@@ -60,7 +60,7 @@ render 前強制 requested-aspect Top-K 與所有可嘗試候選的 ShotQualityM
    若完整 Top-K Structured Output 太大，應先保存已驗證的 evidence-bound plan，再用一次精簡的 actual-audio reranker 只選既有 candidate ID。這個降載 call 不能新增素材、frame、entity、bbox 或 region；本機再從上游 artifact 投影回完整執行計畫，避免為了聽音樂重送或重寫全部視覺證據。
 3. 16:9 與 9:16 可有不同排名；橫式最好的 take 不必強迫成為直式首選。
 4. 實際 geometry 只按排名逐一驗證，第一個通過者即停止；API／tracker 不會為全部候選預先付費。
-5. manifest 會列出 Top-K 是否完整、實際嘗試與換帶次數、rank-1 source reuse，以及重複是否有 typed editorial authority。重用不是一律禁止：同來源不同區間、不同構圖重點，或有意的 montage／前後呼應都可以保留；但 planner 必須標明 `distinct_interval`、`alternate_presentation` 或 `editorial_reprise` 與理由。渲染前再以實際 source PTS 檢查區間重疊，無理由補秒數、把重疊區間冒充不同段，或完全相同 presentation 冒充新構圖都會 fail closed。
+5. manifest 會列出 Top-K 是否完整、實際嘗試與換帶次數、rank-1 source reuse，以及重複是否有 typed editorial authority。重用不是一律禁止：同來源不同區間、不同構圖重點，或有意的 montage／前後呼應都可以保留；但 planner 必須標明 `distinct_interval`、`alternate_presentation` 或 `editorial_reprise` 與理由。渲染後再以實際 source PTS 檢查區間重疊；無理由補秒數、把重疊區間冒充不同段，或完全相同 presentation 冒充新構圖時，仍保留可觀看的 review media 與完整 audit，但狀態固定降為 `review_preview`，不得成為 `delivery_eligible`。
 
 ### 9:16 不是「全部保留」與「隨便裁掉」二選一
 
@@ -92,7 +92,7 @@ Clip Card 現在分成「不可變 Base Card」與按需產生的 `ClipObservati
 
 只有 brief／比例／音樂已知後，選片 planner 才能把已評估的 `observable_beats` 編譯成 `hold`、帶 deadband 的 `follow`、連續 `follow`、`push_in`、`pull_out`、硬切式 `punch_in_cut` 或其他允許策略。Capability 為 `not_assessed`、`assessed_absent` 或 `not_applicable` 時不得自行發明注意力順序；`simultaneous_required`、`shared_context_required` 與 `relative_scale_required` 也會限制 planner 不得用獨立特寫破壞關係或比較。方向仍不是固定的左→中→右，可以是右→左、人物→結果、整體→細節或完全不動。本機會再次驗證任何 `sequential_focus`／`joint_relation` proposal 是否真的有相對應的 observation evidence；不合法的模型輸出不能進入 Grounding。後續仍須對各 anchor 做 exact-frame Grounding、SAM 追蹤、containment、可讀性與速度／加速度／jerk gate，通過後才會產生可執行 `VerticalVirtualCameraPlan`。
 
-`feature-cut` 現在也預設補上一個 **selected-clip framing refinement**：catalog reel 先負責選片，但 renderer 不會因為 reel 沒產生 camera proposal 就直接退回背景補邊。每個實際嘗試的 9:16 候選會在 Grounding／SAM 之前讓 Gemini 完整觀看該片段，鎖定原本的 asset／event／frame identity，只能決定 `tracked_crop`、`fit_or_layout` 或 `try_next_candidate`。`selected-vertical-framing-proposal-v3` 另外要求 `relation_temporal_mode`，明確區分真正必須同框、可依序重建、不同 phase 混合要求與證據不足；多主體還必須逐項保存滿版 crop、依序虛擬鏡頭、可控外圍裁切與 fit/layout 的可行性理由。只要依序滿版可行，就不能提前選 fit/layout；證據不足也不能授權 tracked crop。任何依序或混合呈現都要另存 `sequential_reconstruction`，指出共同 establishing phase、共享追蹤 anchor、可見交接、狀態順序或鎖定尺度比較，避免幾何上能移動卻切斷語意關係。它同時保存 regions、phase predicate、理由、不確定性、raw response、usage 與 content-addressed cache。已有完整 Clip Card projection且帶相容 proposal 時可直接沿用，避免重複付費；File API 物件也按來源 SHA-256 重用。可用 `--no-auto-vertical-framing` 做受控舊路徑比較，但不是預設交付流程。
+舊式 catalog／feature plan 若缺少可執行構圖意圖，`feature-cut` 仍可補做一次 **selected-clip framing refinement**：Gemini 只觀看實際入選片段，判斷 `tracked_crop`、`fit_or_layout` 或換候選，再交給 Grounding／SAM／geometry 執行。新的 `direct-video-edit-plan-v1` 路徑已在同一個 brief＋候選影片＋音樂 planning call 中完成選片、停留與注意力意圖，因此不會再付費重看同一片段；下游只做單幀 Gemini bbox、SAM 傳播、identity checkpoint 與本機運鏡。這可避免新版 plan 被舊 schema 重新解讀，也把 production call topology 收斂成「shortlist → 一次 direct plan → 必要 geometry → optional final QA」。舊 refinement 僅保留作 legacy／研究相容路徑。
 
 本機的 phase transition 使用 smoothstep easing，並依實際移動距離同時估算速度、加速度與 jerk 所需的最低時間；Gemini 建議的 transition 若太短，不能直接把鏡頭加速。能安全完成時才移動，距離太遠或 phase 太短時改成有稽核紀錄的硬切，微小 tracker 位移則由 deadband 吸收。scale 也受來源解析度與最多 1.12× 的保守上限約束。若幾何失敗就改試下一個 take 或安全 fallback，不會硬做模型要求的移動。
 
@@ -510,6 +510,27 @@ uv run jascue-video-lab feature-cut CATALOG.json BRIEF.json \
 `scripts/plan_clip_card_feature_cut.py` 將這個方法延伸到完整 feature cut：模型可閱讀整個已驗證 Clip Card library，但只能選 catalog 中既有的 asset／event／entity／RF frame ID；本機會再次驗證影格確實屬於該素材、位在事件區間，且每個 brief-specific entity priority 都能回溯到 event，再以 hash-bound Clip Card evidence 投影出 `feature-cut` 可使用的 target 與 region contract。選片階段不產生 bbox 或剪點，只有真正入選、需要動態構圖的區間才執行 exact-frame Grounding 與 SAM。新版保留每章 2–4 個候選，9:16 renderer 會先試可驗證的 tracked candidates，再考慮 planner 明列的 safe-fit；所有候選均失敗時只輸出待審 preview，不會把中心裁切冒充成成功追蹤。
 
 當素材庫大到無法在單次 narrative planner request 中穩定放入所有 Clip Card 時，先以 `scripts/shortlist_clip_card_feature_candidates.py` 做一次 text-only 階層召回：每個 brief chapter 只保留可回溯至原始 Clip Card 的少量候選，再交給完整 planner 決定順序、framing intent 與 Top-K。這不是只取 rank 1 的捷徑，也不會跳過後續 evidence／geometry gate；它把「高召回找素材」和「跨章節敘事與構圖決策」拆成兩個可稽核任務，避免一個超大回應失敗後整批重送。
+
+正式的簡化路徑不要求 Gemini 預先替所有素材補寫動作節點、閱讀負荷、關係或運鏡資料。Clip Card 只作為可重用的素材索引；text-only shortlist 完成後，`--candidate-video-evidence` 只把每章前幾名候選裁成有上下文的短代理片段，連同實際音樂交給**同一次**剪輯規劃 call。Gemini 的回應只負責：
+
+- 挑選各章候選並說明可見證據與風險；
+- 建議相對停留時間和章節順序；
+- 指出橫式是否值得推近；
+- 指出直式必須保留、可犧牲的可見 entity，以及注意力應固定、跟隨或依序轉移。
+
+Gemini 不回傳 bbox、mask、逐幀座標、精確剪點、運鏡速度或 easing。本機仍以 decoded PTS 決定真正 trim，僅對入選片段執行 exact-frame Grounding、bbox-seeded SAM、containment 與 virtual-camera motion gate。若 bounded videos 超過預設總秒數，程式會在上傳和付費規劃前停止；重新規劃會依 proxy SHA 重用 File API object，但必須建立新的 model response，不能重播不相容的舊 raw output。
+
+```bash
+uv run python scripts/plan_clip_card_feature_cut.py \
+  CATALOG.json BRIEF.json PREPARED_CLIP_CARDS PLAN_OUTPUT \
+  --shortlist FEATURE_SHORTLIST.json \
+  --music MUSIC.wav \
+  --candidate-video-evidence \
+  --candidate-video-depth 2 \
+  --maximum-candidate-video-seconds 360
+```
+
+這條 production path 的付費語意階段預期是「一次 shortlist、一次看 shortlisted videos＋聽音樂的 edit plan、必要時一次 final QA」；`clip_card_observations.py` 與 supplement runner 保留給研究和針對性診斷，不是正式剪輯前的全庫必經步驟。
 
 Clip Card plan 轉成 renderer plan 時會另寫不可變的 external-projection sidecar，保存來源 catalog、brief、模型 request／raw response、projection contract 與輸出 plan 的 hash。candidate override 也必須接續並驗證這條 provenance；任一上游內容改變就 fail closed。早於此 contract 的舊 artifact 不可手動複製 plan 冒充可重用結果，必須從仍保存的原始 artifact 重新投影。
 

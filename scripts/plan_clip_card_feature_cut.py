@@ -34,6 +34,10 @@ from jascue_video_lab.clip_card_observations import (
     assess_editing_claim,
     effective_event_observations,
 )
+from jascue_video_lab.clip_card_supplement_runner import (
+    bounded_event_window_ms,
+    render_bounded_event_proxy,
+)
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.gemini import (
     GeminiLabClient,
@@ -589,6 +593,160 @@ class ClipCardFeaturePlanV3(StrictModel):
     model_provenance: ModelProvenance
 
 
+class DirectVideoAttentionStep(StrictModel):
+    start_progress: float = Field(ge=0.0, le=1.0)
+    end_progress: float = Field(gt=0.0, le=1.0)
+    anchor_entity_indices: list[int] = Field(min_length=1, max_length=4)
+    camera_behavior: Literal[
+        "hold",
+        "follow",
+        "follow_deadband",
+        "push_in",
+        "pull_out",
+        "punch_in_cut",
+    ]
+
+    @model_validator(mode="after")
+    def validate_step(self) -> "DirectVideoAttentionStep":
+        if self.end_progress <= self.start_progress:
+            raise ValueError("attention step must have positive duration")
+        if any(index < 1 for index in self.anchor_entity_indices):
+            raise ValueError("attention step entity indices must be positive")
+        if len(self.anchor_entity_indices) != len(set(self.anchor_entity_indices)):
+            raise ValueError("attention step entity indices must be unique")
+        return self
+
+
+class DirectVideoHorizontalDecision(StrictModel):
+    candidate_rank: int = Field(ge=1, le=4)
+    strategy: Literal["original", "tracked_reframe"]
+    zoom_intent: Literal["none", "subtle", "detail"]
+    camera_intent: VirtualCameraIntent
+    focus_entity_index: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_horizontal(self) -> "DirectVideoHorizontalDecision":
+        if self.strategy == "original":
+            if (
+                self.zoom_intent != "none"
+                or self.camera_intent != "hold"
+                or self.focus_entity_index is not None
+            ):
+                raise ValueError(
+                    "original horizontal framing must hold without zoom or focus"
+                )
+        elif self.zoom_intent == "none" or self.focus_entity_index is None:
+            raise ValueError(
+                "tracked horizontal framing requires zoom and a focus entity"
+            )
+        return self
+
+
+class DirectVideoVerticalDecision(StrictModel):
+    candidate_rank: int = Field(ge=1, le=4)
+    strategy: Literal["tracked_crop", "fit_with_background"]
+    crop_mode: Literal["strict", "primary_center"]
+    framing_intent: str = Field(min_length=1, max_length=300)
+    required_entity_indices: list[int] = Field(default_factory=list, max_length=4)
+    preferred_entity_indices: list[int] = Field(default_factory=list, max_length=4)
+    sacrificable_entity_indices: list[int] = Field(default_factory=list, max_length=4)
+    attention_sequence: list[DirectVideoAttentionStep] = Field(
+        default_factory=list,
+        max_length=4,
+    )
+
+    @model_validator(mode="after")
+    def validate_vertical(self) -> "DirectVideoVerticalDecision":
+        classified = (
+            self.required_entity_indices
+            + self.preferred_entity_indices
+            + self.sacrificable_entity_indices
+        )
+        if any(index < 1 for index in classified):
+            raise ValueError("vertical entity indices must be positive")
+        if len(classified) != len(set(classified)):
+            raise ValueError("vertical entity roles must be disjoint")
+        if self.strategy == "tracked_crop" and not self.required_entity_indices:
+            raise ValueError("tracked crop requires a visible required entity")
+        if self.strategy == "fit_with_background" and self.attention_sequence:
+            raise ValueError("fit-with-background cannot declare camera movement")
+        if self.attention_sequence:
+            if abs(self.attention_sequence[0].start_progress) > 1e-6:
+                raise ValueError("attention sequence must start at zero")
+            if abs(self.attention_sequence[-1].end_progress - 1.0) > 1e-6:
+                raise ValueError("attention sequence must end at one")
+            for prior, current in zip(
+                self.attention_sequence[:-1],
+                self.attention_sequence[1:],
+                strict=True,
+            ):
+                if abs(prior.end_progress - current.start_progress) > 1e-6:
+                    raise ValueError("attention sequence must be contiguous")
+            referenced = {
+                entity_id
+                for step in self.attention_sequence
+                for entity_id in step.anchor_entity_indices
+            }
+            allowed = set(
+                self.required_entity_indices + self.preferred_entity_indices
+            )
+            if referenced - allowed:
+                raise ValueError(
+                    "attention sequence may only use required or preferred entities"
+                )
+            if set(self.required_entity_indices) - referenced:
+                raise ValueError(
+                    "attention sequence must represent every required entity"
+                )
+        return self
+
+
+class DirectVideoChapterDecision(StrictModel):
+    chapter_index: int = Field(ge=1)
+    evidence_status: Literal["supported", "partial", "not_found"]
+    observed_visual_evidence: str
+    selection_reason: str
+    quality_risks: list[str] = Field(default_factory=list, max_length=8)
+    horizontal: DirectVideoHorizontalDecision | None = None
+    vertical: DirectVideoVerticalDecision | None = None
+    recommended_duration_seconds: float | None = Field(
+        default=None,
+        ge=1.0,
+        le=15.0,
+    )
+    duration_rationale: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_chapter(self) -> "DirectVideoChapterDecision":
+        if self.evidence_status == "not_found":
+            if (
+                self.horizontal is not None
+                or self.vertical is not None
+                or self.recommended_duration_seconds is not None
+            ):
+                raise ValueError("not-found chapter cannot contain edit decisions")
+            return self
+        if (
+            self.horizontal is None
+            or self.vertical is None
+            or self.recommended_duration_seconds is None
+            or not self.duration_rationale
+        ):
+            raise ValueError(
+                "supported or partial chapter requires aspect and duration decisions"
+            )
+        return self
+
+
+class DirectVideoEditPlan(StrictModel):
+    contract_version: Literal["direct-video-edit-plan-v1"]
+    title: str
+    strategy_summary: str
+    chapters: list[DirectVideoChapterDecision]
+    uncertainties: list[str]
+
+
 class SelectedEvidenceEntity(StrictModel):
     entity_id: str
     kind: str
@@ -698,6 +856,123 @@ def canonicalize_feature_plan_output(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), changes
 
 
+def canonicalize_direct_video_edit_plan_output(
+    output_text: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Apply conservative, domain-neutral precedence to the compact plan.
+
+    The model chooses ranks, entity roles, and attention intent. Local
+    canonicalization only removes contradictory duplicate classifications,
+    keeps every required entity visible through every declared attention
+    phase, and defaults an omitted 16:9 decision to the unmodified source
+    composition.
+    """
+
+    payload = json.loads(output_text)
+    if not isinstance(payload, dict):
+        raise ValueError("direct-video planner output must be a JSON object")
+    chapters = payload.get("chapters")
+    if not isinstance(chapters, list):
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), []
+    changes: list[dict[str, Any]] = []
+    for chapter_index, chapter in enumerate(chapters):
+        if not isinstance(chapter, dict) or chapter.get("evidence_status") == "not_found":
+            continue
+        vertical = chapter.get("vertical")
+        if not isinstance(vertical, dict):
+            continue
+        base = f"chapters[{chapter_index}]"
+        if not isinstance(chapter.get("horizontal"), dict):
+            fallback_rank = vertical.get("candidate_rank")
+            chapter["horizontal"] = {
+                "candidate_rank": fallback_rank,
+                "strategy": "original",
+                "zoom_intent": "none",
+                "camera_intent": "hold",
+                "focus_entity_index": None,
+            }
+            changes.append(
+                {
+                    "json_path": f"{base}.horizontal",
+                    "before": None,
+                    "after": chapter["horizontal"],
+                    "rule": "missing_horizontal_uses_source_hold",
+                }
+            )
+        required_before = list(vertical.get("required_entity_indices") or [])
+        preferred_before = list(vertical.get("preferred_entity_indices") or [])
+        sacrificable_before = list(
+            vertical.get("sacrificable_entity_indices") or []
+        )
+        required = list(dict.fromkeys(required_before))
+        preferred = [
+            index
+            for index in dict.fromkeys(preferred_before)
+            if index not in required
+        ]
+        sacrificable = [
+            index
+            for index in dict.fromkeys(sacrificable_before)
+            if index not in required and index not in preferred
+        ]
+        sequence = vertical.get("attention_sequence")
+        if not isinstance(sequence, list):
+            sequence = []
+            vertical["attention_sequence"] = sequence
+        if vertical.get("strategy") == "fit_with_background" and sequence:
+            changes.append(
+                {
+                    "json_path": f"{base}.vertical.attention_sequence",
+                    "before": sequence,
+                    "after": [],
+                    "rule": "fit_with_background_has_no_virtual_camera",
+                }
+            )
+            sequence = []
+            vertical["attention_sequence"] = []
+        for step_index, step in enumerate(sequence):
+            if not isinstance(step, dict):
+                continue
+            anchors_before = list(step.get("anchor_entity_indices") or [])
+            anchors = list(dict.fromkeys(anchors_before + required))
+            step["anchor_entity_indices"] = anchors
+            for index in anchors:
+                if index not in required and index not in preferred:
+                    preferred.append(index)
+                if index in sacrificable:
+                    sacrificable.remove(index)
+            if anchors != anchors_before:
+                changes.append(
+                    {
+                        "json_path": (
+                            f"{base}.vertical.attention_sequence"
+                            f"[{step_index}].anchor_entity_indices"
+                        ),
+                        "before": anchors_before,
+                        "after": anchors,
+                        "rule": "required_entities_remain_visible_in_attention_phase",
+                    }
+                )
+        normalized_roles = {
+            "required_entity_indices": required,
+            "preferred_entity_indices": preferred,
+            "sacrificable_entity_indices": sacrificable,
+        }
+        for field, after in normalized_roles.items():
+            before = list(vertical.get(field) or [])
+            vertical[field] = after
+            if before != after:
+                changes.append(
+                    {
+                        "json_path": f"{base}.vertical.{field}",
+                        "before": before,
+                        "after": after,
+                        "rule": "entity_role_precedence_required_preferred_sacrificable",
+                    }
+                )
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), changes
+
+
 def _text_sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -708,8 +983,14 @@ def _write_feature_normalization_artifacts(
     artifact_stem: str,
     raw_output_path: Path,
     raw_output_text: str,
+    direct_video_plan: bool = False,
 ) -> tuple[str, Path, Path]:
-    canonical_text, changes = canonicalize_feature_plan_output(raw_output_text)
+    canonicalizer = (
+        canonicalize_direct_video_edit_plan_output
+        if direct_video_plan
+        else canonicalize_feature_plan_output
+    )
+    canonical_text, changes = canonicalizer(raw_output_text)
     canonical_path = output_dir / f"{artifact_stem}.canonical_output.json"
     audit_path = output_dir / f"{artifact_stem}.normalization-audit.json"
     write_json(canonical_path, {"output_text": canonical_text})
@@ -717,7 +998,11 @@ def _write_feature_normalization_artifacts(
         audit_path,
         {
             "contract_version": FEATURE_PLAN_NORMALIZATION_VERSION,
-            "interpretation": "conditional_schema_contradictions_only",
+            "interpretation": (
+                "compact_direct_video_plan_conservative_precedence"
+                if direct_video_plan
+                else "conditional_schema_contradictions_only"
+            ),
             "raw_output_path": str(raw_output_path.resolve()),
             "raw_output_artifact_sha256": sha256_file(raw_output_path),
             "input_output_text_sha256": _text_sha256(raw_output_text),
@@ -809,6 +1094,345 @@ def _assert_projection_request_hash(
 def mmss(milliseconds: int) -> str:
     total = max(0, milliseconds // 1000)
     return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def planning_candidate_slice(
+    candidates: list[Any],
+    *,
+    direct_video_evidence: bool,
+    depth: int,
+) -> list[Any]:
+    """Return exactly the candidates the paid planning call may select.
+
+    Text-only planning can use the complete validated shortlist. Once direct
+    bounded videos are enabled, the selectable set must equal the videos
+    actually attached to the request.
+    """
+
+    if direct_video_evidence:
+        return candidates[:depth]
+    return candidates
+
+
+def planning_candidate_id(rank: int) -> str:
+    """Return the local, chapter-scoped ID Gemini must copy verbatim."""
+
+    if rank < 1:
+        raise ValueError("candidate rank must be positive")
+    return f"rank-{rank:02d}"
+
+
+def validate_candidate_video_budget(
+    *,
+    total_duration_ms: int,
+    maximum_duration_ms: int,
+) -> None:
+    """Fail before File API upload or a paid planning interaction."""
+
+    if total_duration_ms > maximum_duration_ms:
+        raise ValueError(
+            "candidate direct-video budget exceeded before upload or paid "
+            f"planning: {total_duration_ms / 1000:.1f}s > "
+            f"{maximum_duration_ms / 1000:.1f}s"
+        )
+
+
+def project_direct_video_edit_plan(
+    plan: DirectVideoEditPlan,
+    *,
+    shortlist: FeatureShortlistPlan,
+    candidate_depth: int,
+    brief: FeatureEditBrief,
+    catalog: RushesCatalog,
+    cards: dict[str, FullClipCard],
+    provenance: ModelProvenance,
+) -> ClipCardFeaturePlanV3:
+    """Resolve integer candidate ranks into the existing local renderer plan.
+
+    Gemini never generates candidate IDs, asset IDs, event IDs, frame IDs, or
+    geometry. Those values are copied or selected locally from validated
+    shortlist and catalog artifacts.
+    """
+
+    expected_indices = list(range(1, len(brief.chapters) + 1))
+    if [chapter.chapter_index for chapter in plan.chapters] != expected_indices:
+        raise ValueError(
+            "direct-video plan must preserve every brief chapter index in order"
+        )
+    catalog_clips = {clip.clip_id: clip for clip in catalog.clips}
+
+    def event_frame_id(source_asset_id: str, event_id: str) -> str:
+        card = cards[source_asset_id]
+        event = next(item for item in card.events if item.event_id == event_id)
+        minute, second = (int(part) for part in event.recommended_keyframe_mmss.split(":"))
+        requested_ms = (minute * 60 + second) * 1000
+        candidates = [
+            frame
+            for frame in catalog.frames
+            if (
+                f"sha256:{catalog_clips[frame.clip_id].sha256}" == source_asset_id
+                and event.start_mmss
+                <= mmss(frame.requested_time_ms)
+                < event.end_mmss
+            )
+        ]
+        if not candidates:
+            raise ValueError(
+                f"no catalog frame inside selected event: {source_asset_id}/{event_id}"
+            )
+        return min(
+            candidates,
+            key=lambda frame: (
+                abs(frame.requested_time_ms - requested_ms),
+                frame.requested_time_ms,
+                frame.frame_id,
+            ),
+        ).frame_id
+
+    def event_entity_ids(source_asset_id: str, event_id: str) -> list[str]:
+        card = cards[source_asset_id]
+        event = next(item for item in card.events if item.event_id == event_id)
+        event_ids = set(
+            event.entity_ids
+            + event.primary_entity_ids
+            + event.required_entity_ids
+            + event.optional_entity_ids
+            + event.avoid_overlay_entity_ids
+            + [target.entity_id for target in event.grounding_targets]
+        )
+        return [
+            entity.entity_id
+            for entity in card.entities
+            if entity.entity_id in event_ids
+        ]
+
+    def resolve_entity_indices(
+        *,
+        source_asset_id: str,
+        event_id: str,
+        indices: list[int],
+    ) -> list[str]:
+        ids = event_entity_ids(source_asset_id, event_id)
+        unknown = [index for index in indices if index > len(ids)]
+        if unknown:
+            raise ValueError(
+                f"direct-video plan selected unseen entity indices: {unknown}"
+            )
+        return [ids[index - 1] for index in indices]
+
+    def camera_proposal(
+        decision: DirectVideoVerticalDecision,
+        *,
+        source_asset_id: str,
+        event_id: str,
+    ) -> ClipCardVirtualCameraProposalV1 | None:
+        if not decision.attention_sequence:
+            return None
+        unique_entities = {
+            entity_id
+            for step in decision.attention_sequence
+            for entity_id in step.anchor_entity_indices
+        }
+        if len(unique_entities) == 1:
+            composition_mode = (
+                "single_anchor_hold"
+                if all(
+                    step.camera_behavior == "hold"
+                    for step in decision.attention_sequence
+                )
+                else "single_anchor_follow"
+            )
+        elif len(decision.attention_sequence) >= 2:
+            composition_mode = "sequential_focus"
+        else:
+            composition_mode = "joint_relation"
+        phases = []
+        for index, step in enumerate(decision.attention_sequence, start=1):
+            transition_in = (
+                "cut"
+                if index == 1 or step.camera_behavior == "punch_in_cut"
+                else "smoothstep"
+            )
+            phases.append(
+                ClipCardVirtualCameraPhaseV1(
+                    phase_id=f"phase-{index:02d}",
+                    start_progress=step.start_progress,
+                    end_progress=step.end_progress,
+                    anchor_entity_ids=resolve_entity_indices(
+                        source_asset_id=source_asset_id,
+                        event_id=event_id,
+                        indices=step.anchor_entity_indices,
+                    ),
+                    camera_behavior=step.camera_behavior,
+                    transition_in=transition_in,
+                    transition_duration_fraction=(
+                        0.0 if transition_in == "cut" else 0.15
+                    ),
+                    observable_predicate=(
+                        "The attached bounded video directly shows the listed "
+                        "anchor entities in this relative phase."
+                    ),
+                    transition_condition=(
+                        "Advance at the locally resolved boundary between "
+                        "contiguous relative attention phases."
+                    ),
+                    editorial_reason=decision.framing_intent,
+                )
+            )
+        return ClipCardVirtualCameraProposalV1(
+            composition_mode=composition_mode,
+            phases=phases,
+            proposal_reason=decision.framing_intent,
+            uncertainties=[],
+        )
+
+    chapters: list[ClipCardFeatureSelectV3] = []
+    for chapter_offset, direct_chapter in enumerate(plan.chapters):
+        brief_chapter = brief.chapters[chapter_offset]
+        shortlist_chapter = shortlist.chapters[chapter_offset]
+        if shortlist_chapter.feature_id != brief_chapter.feature_id:
+            raise ValueError("shortlist and brief chapter order differ")
+        allowed = planning_candidate_slice(
+            shortlist_chapter.candidates,
+            direct_video_evidence=True,
+            depth=candidate_depth,
+        )
+        if direct_chapter.evidence_status == "not_found":
+            chapters.append(
+                ClipCardFeatureSelectV3(
+                    feature_id=brief_chapter.feature_id,
+                    evidence_status="not_found",
+                    candidates=[],
+                    horizontal_candidate_id=None,
+                    vertical_candidate_id=None,
+                )
+            )
+            continue
+        assert direct_chapter.horizontal is not None
+        assert direct_chapter.vertical is not None
+        selected_ranks = {
+            direct_chapter.horizontal.candidate_rank,
+            direct_chapter.vertical.candidate_rank,
+        }
+        if any(rank > len(allowed) for rank in selected_ranks):
+            raise ValueError(
+                f"direct-video plan selected unseen rank for "
+                f"{brief_chapter.feature_id}: {sorted(selected_ranks)}"
+            )
+        candidates: list[ClipCardFeatureCandidateV3] = []
+        for rank, shortlisted in enumerate(allowed, start=1):
+            card = cards[shortlisted.source_asset_id]
+            event = next(
+                item for item in card.events if item.event_id == shortlisted.event_id
+            )
+            horizontal_strategy: Literal["original", "tracked_reframe"] = "original"
+            horizontal_zoom_intent: Literal["none", "subtle", "detail"] = "none"
+            horizontal_camera_intent: VirtualCameraIntent = "hold"
+            horizontal_focus_entity_id: str | None = None
+            vertical_strategy: Literal[
+                "tracked_crop", "fit_with_background"
+            ] = "fit_with_background"
+            vertical_crop_mode: Literal["strict", "primary_center"] = (
+                "primary_center"
+            )
+            framing_intent = "Preserve the validated source composition."
+            required_entity_ids: list[str] = []
+            preferred_entity_ids: list[str] = []
+            sacrificable_entity_ids: list[str] = []
+            virtual_camera_proposal = None
+            if rank == direct_chapter.horizontal.candidate_rank:
+                horizontal_strategy = direct_chapter.horizontal.strategy
+                horizontal_zoom_intent = direct_chapter.horizontal.zoom_intent
+                horizontal_camera_intent = direct_chapter.horizontal.camera_intent
+                horizontal_focus_entity_id = (
+                    resolve_entity_indices(
+                        source_asset_id=shortlisted.source_asset_id,
+                        event_id=shortlisted.event_id,
+                        indices=[
+                            direct_chapter.horizontal.focus_entity_index
+                        ],
+                    )[0]
+                    if direct_chapter.horizontal.focus_entity_index is not None
+                    else None
+                )
+            if rank == direct_chapter.vertical.candidate_rank:
+                vertical_strategy = direct_chapter.vertical.strategy
+                vertical_crop_mode = direct_chapter.vertical.crop_mode
+                framing_intent = direct_chapter.vertical.framing_intent
+                required_entity_ids = resolve_entity_indices(
+                    source_asset_id=shortlisted.source_asset_id,
+                    event_id=shortlisted.event_id,
+                    indices=direct_chapter.vertical.required_entity_indices,
+                )
+                preferred_entity_ids = resolve_entity_indices(
+                    source_asset_id=shortlisted.source_asset_id,
+                    event_id=shortlisted.event_id,
+                    indices=direct_chapter.vertical.preferred_entity_indices,
+                )
+                sacrificable_entity_ids = resolve_entity_indices(
+                    source_asset_id=shortlisted.source_asset_id,
+                    event_id=shortlisted.event_id,
+                    indices=direct_chapter.vertical.sacrificable_entity_indices,
+                )
+                virtual_camera_proposal = camera_proposal(
+                    direct_chapter.vertical,
+                    source_asset_id=shortlisted.source_asset_id,
+                    event_id=shortlisted.event_id,
+                )
+            candidates.append(
+                ClipCardFeatureCandidateV3(
+                    candidate_id=planning_candidate_id(rank),
+                    source_asset_id=shortlisted.source_asset_id,
+                    event_id=shortlisted.event_id,
+                    frame_id=event_frame_id(
+                        shortlisted.source_asset_id,
+                        shortlisted.event_id,
+                    ),
+                    observed_visual_evidence=event.observable_evidence,
+                    selection_reason=shortlisted.retrieval_reason,
+                    quality_risks=event.quality_risks,
+                    horizontal_strategy=horizontal_strategy,
+                    horizontal_zoom_intent=horizontal_zoom_intent,
+                    horizontal_camera_intent=horizontal_camera_intent,
+                    horizontal_focus_entity_id=horizontal_focus_entity_id,
+                    vertical_strategy=vertical_strategy,
+                    vertical_crop_mode=vertical_crop_mode,
+                    framing_intent=framing_intent,
+                    required_entity_ids=required_entity_ids,
+                    preferred_entity_ids=preferred_entity_ids,
+                    sacrificable_entity_ids=sacrificable_entity_ids,
+                    virtual_camera_proposal=virtual_camera_proposal,
+                    confidence=direct_chapter.confidence,
+                )
+            )
+        chapters.append(
+            ClipCardFeatureSelectV3(
+                feature_id=brief_chapter.feature_id,
+                evidence_status=direct_chapter.evidence_status,
+                candidates=candidates,
+                horizontal_candidate_id=planning_candidate_id(
+                    direct_chapter.horizontal.candidate_rank
+                ),
+                vertical_candidate_id=planning_candidate_id(
+                    direct_chapter.vertical.candidate_rank
+                ),
+                recommended_duration_seconds=(
+                    direct_chapter.recommended_duration_seconds
+                ),
+                duration_rationale=direct_chapter.duration_rationale,
+                attention_observation=None,
+            )
+        )
+    return ClipCardFeaturePlanV3(
+        contract_version="clip-card-feature-cut-v3",
+        project_id=brief.project_id,
+        catalog_id=catalog.catalog_id,
+        title=plan.title,
+        strategy_summary=plan.strategy_summary,
+        chapters=chapters,
+        uncertainties=plan.uncertainties,
+        model_provenance=provenance,
+    )
 
 
 def compact_card(card: FullClipCard) -> dict[str, object]:
@@ -1089,6 +1713,7 @@ def validate_plan_contract_v3(
     catalog: RushesCatalog,
     cards: dict[str, FullClipCard],
     supplements: dict[str, list[ClipObservationSupplement]] | None = None,
+    direct_video_observed_events: set[tuple[str, str]] | None = None,
 ) -> None:
     """Validate model choices while deriving no semantic values from the model."""
 
@@ -1100,6 +1725,7 @@ def validate_plan_contract_v3(
     frames = {frame.frame_id: frame for frame in catalog.frames}
     clips = {clip.clip_id: clip for clip in catalog.clips}
     supplements = supplements or {}
+    direct_video_observed_events = direct_video_observed_events or set()
     observations_by_asset = {
         asset_id: effective_event_observations(
             card,
@@ -1167,7 +1793,14 @@ def validate_plan_contract_v3(
                     else EditingClaim.SIMULTANEOUS_RELATION
                 )
                 decision = assess_editing_claim(observation, claim)
-                if decision.decision != ClaimDecision.READY:
+                direct_observed = (
+                    candidate.source_asset_id,
+                    candidate.event_id,
+                ) in direct_video_observed_events
+                if (
+                    decision.decision != ClaimDecision.READY
+                    and not direct_observed
+                ):
                     raise ValueError(
                         "virtual camera claim lacks assessed observation evidence: "
                         f"{candidate.candidate_id}/{claim.value}/"
@@ -1180,6 +1813,8 @@ def validate_plan_contract_v3(
                     for phase in proposal.phases
                     for entity_id in phase.anchor_entity_ids
                 }
+                if direct_observed:
+                    continue
                 if proposal.composition_mode == "sequential_focus":
                     observed_entity_ids = {
                         entity_id
@@ -1873,6 +2508,178 @@ def reproject_external_feature_plan_v3(
     )
 
 
+def reproject_direct_video_edit_plan(
+    *,
+    source_plan: DirectVideoEditPlan,
+    catalog: RushesCatalog,
+    brief: FeatureEditBrief,
+    source_artifacts: dict[str, Path],
+) -> tuple[FeatureEditBrief, FeatureEditPlan]:
+    """Verify rank/index resolution before reusing the v3 local projection."""
+
+    derived_path = source_artifacts.get("derived_clip_card_feature_plan")
+    evidence_path = source_artifacts.get("selected_clip_card_evidence")
+    shortlist_path = source_artifacts.get("feature_shortlist")
+    manifest_path = source_artifacts.get("candidate_video_evidence_manifest")
+    if any(
+        path is None
+        for path in (derived_path, evidence_path, shortlist_path, manifest_path)
+    ):
+        raise ValueError("direct-video projection is missing local resolution artifacts")
+    derived = ClipCardFeaturePlanV3.model_validate(read_json(derived_path))
+    selected_evidence = SelectedClipCardEvidence.model_validate(
+        read_json(evidence_path)
+    )
+    shortlist = FeatureShortlistPlan.model_validate(read_json(shortlist_path))
+    manifest = read_json(manifest_path)
+    depth = int(manifest["selection_policy"]["rank_depth_per_chapter"])
+    if len(source_plan.chapters) != len(brief.chapters):
+        raise ValueError("direct-video plan chapter count differs from brief")
+    if len(derived.chapters) != len(brief.chapters):
+        raise ValueError("derived feature plan chapter count differs from brief")
+    events = {
+        (event.source_asset_id, event.event_id): event
+        for event in selected_evidence.events
+    }
+    catalog_clips = {clip.clip_id: clip for clip in catalog.clips}
+    catalog_frames = {frame.frame_id: frame for frame in catalog.frames}
+
+    for offset, (direct, derived_chapter, brief_chapter, shortlisted) in enumerate(
+        zip(
+            source_plan.chapters,
+            derived.chapters,
+            brief.chapters,
+            shortlist.chapters,
+            strict=True,
+        ),
+        start=1,
+    ):
+        if direct.chapter_index != offset:
+            raise ValueError("direct-video chapter indices are not contiguous")
+        if (
+            derived_chapter.feature_id != brief_chapter.feature_id
+            or shortlisted.feature_id != brief_chapter.feature_id
+        ):
+            raise ValueError("direct-video chapter mapping changed feature identity")
+        if direct.evidence_status == "not_found":
+            if derived_chapter.evidence_status != "not_found":
+                raise ValueError("derived plan changed a not-found decision")
+            continue
+        assert direct.horizontal is not None and direct.vertical is not None
+        allowed = shortlisted.candidates[:depth]
+        if len(derived_chapter.candidates) != len(allowed):
+            raise ValueError("derived candidate count differs from bounded shortlist")
+        by_rank = {
+            rank: candidate
+            for rank, candidate in enumerate(
+                derived_chapter.candidates,
+                start=1,
+            )
+        }
+        for rank, (candidate, shortlist_candidate) in enumerate(
+            zip(derived_chapter.candidates, allowed, strict=True),
+            start=1,
+        ):
+            if candidate.candidate_id != planning_candidate_id(rank):
+                raise ValueError("derived candidate ID is not locally ranked")
+            if (
+                candidate.source_asset_id,
+                candidate.event_id,
+            ) != (
+                shortlist_candidate.source_asset_id,
+                shortlist_candidate.event_id,
+            ):
+                raise ValueError("derived candidate escaped the bounded shortlist")
+            frame = catalog_frames.get(candidate.frame_id)
+            if frame is None:
+                raise ValueError("derived candidate references an unknown frame")
+            clip = catalog_clips.get(frame.clip_id)
+            if (
+                clip is None
+                or f"sha256:{clip.sha256}" != candidate.source_asset_id
+            ):
+                raise ValueError("derived frame does not belong to candidate source")
+        horizontal = by_rank[direct.horizontal.candidate_rank]
+        vertical = by_rank[direct.vertical.candidate_rank]
+        if derived_chapter.horizontal_candidate_id != horizontal.candidate_id:
+            raise ValueError("derived horizontal rank differs from direct decision")
+        if derived_chapter.vertical_candidate_id != vertical.candidate_id:
+            raise ValueError("derived vertical rank differs from direct decision")
+        expected_horizontal = (
+            direct.horizontal.strategy,
+            direct.horizontal.zoom_intent,
+            direct.horizontal.camera_intent,
+        )
+        actual_horizontal = (
+            horizontal.horizontal_strategy,
+            horizontal.horizontal_zoom_intent,
+            horizontal.horizontal_camera_intent,
+        )
+        if actual_horizontal != expected_horizontal:
+            raise ValueError("derived horizontal intent differs from direct decision")
+        if (
+            vertical.vertical_strategy,
+            vertical.vertical_crop_mode,
+            vertical.framing_intent,
+        ) != (
+            direct.vertical.strategy,
+            direct.vertical.crop_mode,
+            direct.vertical.framing_intent,
+        ):
+            raise ValueError("derived vertical intent differs from direct decision")
+        selected_event = events[(vertical.source_asset_id, vertical.event_id)]
+        known_entity_ids = {
+            entity.entity_id for entity in selected_event.entities
+        }
+        if (
+            set(
+                vertical.required_entity_ids
+                + vertical.preferred_entity_ids
+                + vertical.sacrificable_entity_ids
+                + (
+                    [horizontal.horizontal_focus_entity_id]
+                    if horizontal.horizontal_focus_entity_id is not None
+                    else []
+                )
+            )
+            - known_entity_ids
+        ):
+            raise ValueError("derived entity resolution escaped selected evidence")
+        proposal = vertical.virtual_camera_proposal
+        if direct.vertical.attention_sequence:
+            if proposal is None or len(proposal.phases) != len(
+                direct.vertical.attention_sequence
+            ):
+                raise ValueError("derived attention sequence is missing or changed")
+            for step, phase in zip(
+                direct.vertical.attention_sequence,
+                proposal.phases,
+                strict=True,
+            ):
+                if (
+                    phase.start_progress,
+                    phase.end_progress,
+                    phase.camera_behavior,
+                ) != (
+                    step.start_progress,
+                    step.end_progress,
+                    step.camera_behavior,
+                ):
+                    raise ValueError("derived attention phase differs from direct plan")
+                if set(phase.anchor_entity_ids) - known_entity_ids:
+                    raise ValueError(
+                        "derived attention anchors escaped selected evidence"
+                    )
+        elif proposal is not None:
+            raise ValueError("derived plan invented a virtual camera proposal")
+    return brief, project_feature_contracts_v3(
+        derived,
+        brief=brief,
+        catalog=catalog,
+        selected_evidence=selected_evidence,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("catalog_json", type=Path)
@@ -1941,9 +2748,42 @@ def main() -> int:
             "Defaults to OUTPUT_DIR/../file-cache."
         ),
     )
+    parser.add_argument(
+        "--candidate-video-evidence",
+        action="store_true",
+        help=(
+            "Attach bounded direct-video evidence for shortlisted candidates "
+            "to the single music-aware planning call."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-video-depth",
+        type=int,
+        default=2,
+        help="Maximum ranked shortlist candidates per chapter sent as video evidence.",
+    )
+    parser.add_argument(
+        "--candidate-video-context-seconds",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--maximum-candidate-video-seconds",
+        type=float,
+        default=360.0,
+        help="Fail before upload or paid planning when direct video exceeds this total.",
+    )
     args = parser.parse_args()
     if args.repair_attempts < 0:
         parser.error("--repair-attempts must be zero or greater")
+    if not 1 <= args.candidate_video_depth <= 4:
+        parser.error("--candidate-video-depth must be between 1 and 4")
+    if args.candidate_video_context_seconds < 0:
+        parser.error("--candidate-video-context-seconds must be non-negative")
+    if args.maximum_candidate_video_seconds <= 0:
+        parser.error("--maximum-candidate-video-seconds must be positive")
+    if args.candidate_video_evidence and args.shortlist is None:
+        parser.error("--candidate-video-evidence requires --shortlist")
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not args.reuse_raw_output and not api_key:
@@ -1985,6 +2825,7 @@ def main() -> int:
     shortlist: FeatureShortlistPlan | None = None
     shortlist_path: Path | None = None
     shortlist_allowed: dict[str, set[tuple[str, str]]] = {}
+    shortlist_candidate_ids: dict[str, dict[tuple[str, str], str]] = {}
     if args.shortlist is not None:
         shortlist_path = args.shortlist.expanduser().resolve(strict=True)
         shortlist = FeatureShortlistPlan.model_validate(read_json(shortlist_path))
@@ -1997,7 +2838,25 @@ def main() -> int:
         shortlist_allowed = {
             chapter.feature_id: {
                 (candidate.source_asset_id, candidate.event_id)
-                for candidate in chapter.candidates
+                for candidate in planning_candidate_slice(
+                    chapter.candidates,
+                    direct_video_evidence=args.candidate_video_evidence,
+                    depth=args.candidate_video_depth,
+                )
+            }
+            for chapter in shortlist.chapters
+        }
+        shortlist_candidate_ids = {
+            chapter.feature_id: {
+                (candidate.source_asset_id, candidate.event_id): planning_candidate_id(rank)
+                for rank, candidate in enumerate(
+                    planning_candidate_slice(
+                        chapter.candidates,
+                        direct_video_evidence=args.candidate_video_evidence,
+                        depth=args.candidate_video_depth,
+                    ),
+                    start=1,
+                )
             }
             for chapter in shortlist.chapters
         }
@@ -2016,6 +2875,24 @@ def main() -> int:
             if unknown:
                 raise ValueError(
                     f"plan escaped shortlist for {chapter.feature_id}: {unknown}"
+                )
+            mismatched_ids = sorted(
+                (
+                    candidate.candidate_id,
+                    shortlist_candidate_ids[chapter.feature_id].get(
+                        (candidate.source_asset_id, candidate.event_id)
+                    ),
+                )
+                for candidate in chapter.candidates
+                if candidate.candidate_id
+                != shortlist_candidate_ids[chapter.feature_id].get(
+                    (candidate.source_asset_id, candidate.event_id)
+                )
+            )
+            if mismatched_ids:
+                raise ValueError(
+                    f"plan changed local candidate IDs for {chapter.feature_id}: "
+                    f"{mismatched_ids}"
                 )
 
     frame_map: dict[str, list[dict[str, object]]] = {}
@@ -2055,40 +2932,100 @@ def main() -> int:
         )
     else:
         evidence = []
-        for chapter in shortlist.chapters:
+        for chapter_index, chapter in enumerate(shortlist.chapters, start=1):
             candidate_events: list[dict[str, object]] = []
-            for candidate in chapter.candidates:
+            planning_candidates = planning_candidate_slice(
+                chapter.candidates,
+                direct_video_evidence=args.candidate_video_evidence,
+                depth=args.candidate_video_depth,
+            )
+            for rank, candidate in enumerate(planning_candidates, start=1):
                 card = cards[candidate.source_asset_id]
-                compact = compact_card_v3(
-                    card,
-                    tuple(supplements.get(candidate.source_asset_id, [])),
-                )
-                compact["events"] = [
-                    event
-                    for event in compact["events"]  # type: ignore[index]
-                    if event["event_id"] == candidate.event_id  # type: ignore[index]
-                ]
                 event = next(
                     item
                     for item in card.events
                     if item.event_id == candidate.event_id
                 )
-                candidate_events.append(
-                    {
-                        "retrieval_reason": candidate.retrieval_reason,
-                        "clip_id": asset_to_clip[candidate.source_asset_id].clip_id,
-                        "clip_card": compact,
-                        "available_catalog_frames": [
-                            frame
-                            for frame in frame_map[candidate.source_asset_id]
-                            if event.start_mmss
-                            <= str(frame["local_mmss"])
-                            < event.end_mmss
+                if args.candidate_video_evidence:
+                    event_entity_ids = set(
+                        event.entity_ids
+                        + event.primary_entity_ids
+                        + event.required_entity_ids
+                        + event.optional_entity_ids
+                        + event.avoid_overlay_entity_ids
+                        + [target.entity_id for target in event.grounding_targets]
+                    )
+                    compact: dict[str, object] = {
+                        "source_asset_id": card.source_asset_id,
+                        "clip_summary": card.summary,
+                        "entities": [
+                            {
+                                "entity_index": entity_index,
+                                "entity_id": entity.entity_id,
+                                "kind": entity.kind,
+                                "label": entity.label,
+                                "distinguishing_features": (
+                                    entity.distinguishing_features
+                                ),
+                            }
+                            for entity_index, entity in enumerate(
+                                (
+                                    entity
+                                    for entity in card.entities
+                                    if entity.entity_id in event_entity_ids
+                                ),
+                                start=1,
+                            )
                         ],
+                        "event": {
+                            "event_id": event.event_id,
+                            "label": event.label,
+                            "observable_evidence": event.observable_evidence,
+                            "action_completeness": event.action_completeness,
+                            "quality_risks": event.quality_risks,
+                            "entity_ids": event.entity_ids,
+                            "primary_entity_ids": event.primary_entity_ids,
+                            "required_entity_ids": event.required_entity_ids,
+                            "optional_entity_ids": event.optional_entity_ids,
+                            "avoid_overlay_entity_ids": (
+                                event.avoid_overlay_entity_ids
+                            ),
+                            "grounding_target_entity_ids": [
+                                target.entity_id
+                                for target in event.grounding_targets
+                            ],
+                        },
                     }
-                )
+                else:
+                    compact = compact_card_v3(
+                        card,
+                        tuple(supplements.get(candidate.source_asset_id, [])),
+                    )
+                    compact["events"] = [
+                        compact_event
+                        for compact_event in compact["events"]  # type: ignore[index]
+                        if compact_event["event_id"]  # type: ignore[index]
+                        == candidate.event_id
+                    ]
+                candidate_event: dict[str, object] = {
+                    "candidate_id": planning_candidate_id(rank),
+                    "candidate_rank": rank,
+                    "retrieval_reason": candidate.retrieval_reason,
+                    "clip_id": asset_to_clip[candidate.source_asset_id].clip_id,
+                    "clip_card": compact,
+                }
+                if not args.candidate_video_evidence:
+                    candidate_event["available_catalog_frames"] = [
+                        frame
+                        for frame in frame_map[candidate.source_asset_id]
+                        if event.start_mmss
+                        <= str(frame["local_mmss"])
+                        < event.end_mmss
+                    ]
+                candidate_events.append(candidate_event)
             evidence.append(
                 {
+                    "chapter_index": chapter_index,
                     "feature_id": chapter.feature_id,
                     "retrieval_status": chapter.evidence_status,
                     "retrieval_uncertainty": chapter.uncertainty,
@@ -2105,7 +3042,7 @@ def main() -> int:
 
 規則：
 1. brief 是允許使用的產品 claim，不是畫面證據；observed_visual_evidence 只能寫 Clip Card 直接支持的內容。
-2. 每個 brief feature_id 必須依原順序恰好回傳一次。supported chapter 必須保留 2–4 個、partial chapter 保留 1–4 個依品質排序且 evidence frame 不重複的 candidates；優先完整動作、清楚結果、低遮擋、低反光與不同 take。not_found 不得虛構候選。
+2. 每個 brief feature_id 必須依原順序恰好回傳一次。supported chapter 必須保留 2–4 個、partial chapter 保留 1–4 個依品質排序且 evidence frame 不重複的 candidates；優先完整動作、清楚結果、低遮擋、低反光與不同 take。candidate_id 必須從該章 candidate_events 逐字複製，不得自行命名。not_found 不得虛構候選。
 2a. {evidence_scope_rule}
 3. selected frame 的 local_mmss 必須位於所引用 event 的 [start_mmss,end_mmss)；不得自行創造 frame ID 或 timestamp。RF frame_id 必須從 available_catalog_frames 逐字複製並保留全部六位數與前導零，例如 RF000204 不可縮成 RF00204。
 4. 若可見型號、文字、數字或物件身分與 brief 衝突，優先改選沒有衝突的 take；沒有可靠 take 時用 partial 或 not_found 並保存風險。
@@ -2116,7 +3053,7 @@ def main() -> int:
 6. 9:16 應把 brief 的 vertical_primary_target_description 視為內容優先序，不是強制演算法。只有需要動態跟隨且存在可靠 target 時才用 tracked_crop；若穩定構圖已可保留內容，或窄裁切無法安全包含必要範圍，可以使用 fit_with_background。不得只因 brief 有 primary target 就強制 tracked_crop。
 7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。只分類與這次構圖決策直接相關的 entity；未列入者不會被程式偷偷視為 required 或 sacrificable。不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
 8. framing_intent 只需簡潔描述本候選的構圖取捨；不得輸出座標、bbox、mask、target description 或 verbose region contract。程式會把這些 entity priority ID 與 Clip Card entity/grounding target 資料轉成 domain-neutral hard-core、soft-extent 與 overlay keepout regions。
-8a. 若同一個 source event 有兩個以上「依序重要、但不必同時出現在單一 9:16 crop」的可追蹤 entity，可以提出 virtual_camera_proposal；否則必須為 null。順序只能引用 Clip Card 的 observable_beats 與 evidence_roles；observable_beats capability 若為 not_assessed、assessed_absent 或 not_applicable，不得自行發明注意力順序或 camera behavior。方向可以左→右、右→左、人物→結果、整體→細節或完全不動，不得使用固定方向模板。simultaneous_required beat 的 entity 必須在同一 phase 共同保留；shared_context_required 或 relative_scale_required 時，不得用會破壞共同參照或相對尺度的獨立特寫取代。phase 的 anchor_entity_ids 只能引用同 candidate 的 required_entity_ids 或 preferred_entity_ids；observable_predicate 與 transition_condition 必須描述可直接觀察的條件，不能引用常識、品牌知識或自創 timestamp。start_progress／end_progress 只表達連續覆蓋 0–1 的相對敘事順序。一般跟隨優先使用 follow_deadband，只有每一段移動都承載動作證據時才使用 follow；push_in 用於可見細節／結果逐漸成為重點，pull_out 用於回到整體關係，punch_in_cut 用於明確資訊落點的硬切放大，hold 用於固定構圖。不得輸出倍率、速度、easing 或曲線；本機會依來源解析度、距離、時長、速度、加速度與 jerk 決定安全運鏡，必要時將過短的遠距平移改為 cut。自動 proposal 不授權裁切 active anchor；後續 Grounding、SAM、containment 與 motion gate 失敗時會改試下一個候選或回退。
+8a. 若同一個 source event 有兩個以上「依序重要、但不必同時出現在單一 9:16 crop」的可追蹤 entity，可以提出 virtual_camera_proposal；否則必須為 null。{"本次另附帶 candidate_id 標籤的 bounded direct-video evidence；可只依該影片中實際可見的狀態順序提出 proposal。Clip Card 未評估 camera capability 不代表 direct video 中不存在順序。" if args.candidate_video_evidence else "順序只能引用 Clip Card 的 observable_beats 與 evidence_roles；observable_beats capability 若為 not_assessed、assessed_absent 或 not_applicable，不得自行發明注意力順序或 camera behavior。"}方向可以左→右、右→左、人物→結果、整體→細節或完全不動，不得使用固定方向模板。必須同時可見的 entity 應在同一 phase 共同保留；共同上下文或相對尺度是內容意義時，不得用會破壞參照的獨立特寫取代。phase 的 anchor_entity_ids 只能引用同 candidate 的 required_entity_ids 或 preferred_entity_ids；observable_predicate 與 transition_condition 必須描述可直接觀察的條件，不能引用常識、品牌知識或自創 timestamp。start_progress／end_progress 只表達連續覆蓋 0–1 的相對敘事順序。一般跟隨優先使用 follow_deadband，只有每一段移動都承載動作證據時才使用 follow；push_in 用於可見細節／結果逐漸成為重點，pull_out 用於回到整體關係，punch_in_cut 用於明確資訊落點的硬切放大，hold 用於固定構圖。不得輸出倍率、速度、easing 或曲線；本機會依來源解析度、距離、時長、速度、加速度與 jerk 決定安全運鏡，必要時將過短的遠距平移改為 cut。自動 proposal 不授權裁切 active anchor；後續 Grounding、SAM、containment 與 motion gate 失敗時會改試下一個候選或回退。
 9. 每個 supported／partial chapter 應依可見資訊、動作完整性、閱讀需求、情緒停留、重複壓力與音樂角色提出 recommended_duration_seconds、duration_rationale 與 attention_observation。minimum／recommended／maximum dwell 必須依序排列；attention 各分量 0–1，只是待審相對判斷，不是 source timestamp 或客觀真值。action_progress 表示到片段結尾時動作／結果已完成、適合轉場的程度。
 9a. {"本次另附實際音樂，music_sha256=" + music_sha256 + "。你必須實際聆聽音訊，依可聽見的段落、能量、留白與收尾安排候選及相對停留；不得只依文字猜音樂，也不得輸出自創 beat timestamp。" if music_sha256 is not None else "本次沒有附音樂；不得推測不存在的節拍、段落或能量變化。"}
 10. bbox、mask、crop 座標與精確 cut point 均由後續 Grounding／tracker／FFmpeg 處理；本階段不得輸出座標。
@@ -2134,9 +3071,231 @@ model_provenance 必須先原樣回傳：
 ## {evidence_heading}
 {json.dumps(evidence, ensure_ascii=False, indent=2)}
 """.strip()
+    if args.candidate_video_evidence:
+        prompt = f"""
+你是 evidence-bound 的資深短影音剪輯師。請同時閱讀 brief、精簡候選索引，
+觀看後續每個有 feature_id 與 candidate_rank 標籤的 bounded candidate video，
+並實際聆聽最後附上的完整音樂。你的任務是提出一份精簡的剪輯意圖；
+不是產生剪點、座標或追蹤結果。
+
+只能回傳：
+1. 每個 chapter_index 的橫式與直式各選哪一個 candidate_rank。
+2. 選擇理由、直接可見的證據、風險與建議停留秒數。
+3. 橫式是否保持原構圖，或對一個可見 entity 做有目的的推近／跟隨。
+4. 直式必須保留、最好保留、可犧牲的 entity_index。
+5. 若注意力確實依序轉移，使用 0–1 相對進度列出 attention_sequence；
+   若主體需同時比較或共同證明關係，放在同一 step，不得拆開。
+
+禁止回傳或推測：
+- project_id、catalog_id、feature_id、source_asset_id、event_id、frame_id、
+  candidate_id、entity_id 或 model_provenance；
+- MM:SS 以外的時間，更不得輸出毫秒；
+- bbox、mask、crop center、逐幀座標；
+- 運鏡倍率、速度、加速度、easing 或 jerk；
+- 影片、brief 與候選索引沒有直接支持的品牌、型號、數字或功能。
+
+構圖規則：
+- 9:16 優先採可安全滿版的 tracked_crop。只有必要關係或必要範圍無法在
+  9:16 同時成立時，才使用 fit_with_background；不要因為邊緣略有裁切就退回補邊。
+- attention_sequence 只描述「看誰」與「hold/follow/push/pull/punch」；
+  後續本機會以 Gemini 單幀 bbox Grounding、SAM 與 geometry solver 執行。
+- 沒有可見注意力轉移時，sequence 可以是空陣列；不得為了看起來有運鏡而發明移動。
+- candidate_rank 必須直接複製該章候選索引中的整數，不得引用未附影片的 rank。
+- chapter_index 與 entity_index 也只能複製輸入中的整數；本機會解析成不可變 ID。
+- 音樂只影響章節順序、相對停留與視覺落點意圖；不得自創 beat timestamp。
+
+contract_version 必須原樣回傳：direct-video-edit-plan-v1
+
+## 使用者 brief
+{brief.model_dump_json(indent=2)}
+
+## 每章可選的 bounded candidate 索引
+{json.dumps(evidence, ensure_ascii=False, indent=2)}
+""".strip()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     request_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    candidate_video_manifest_path: Path | None = None
+    direct_video_observed_events: set[tuple[str, str]] = set()
+    if args.candidate_video_evidence and not args.reuse_raw_output:
+        assert shortlist is not None
+        context_ms = round(args.candidate_video_context_seconds * 1000)
+        selected_direct_evidence: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
+        for chapter in shortlist.chapters:
+            for rank, candidate in enumerate(
+                planning_candidate_slice(
+                    chapter.candidates,
+                    direct_video_evidence=True,
+                    depth=args.candidate_video_depth,
+                ),
+                start=1,
+            ):
+                key = (candidate.source_asset_id, candidate.event_id)
+                row = selected_direct_evidence.setdefault(
+                    key,
+                    {
+                        "source_asset_id": candidate.source_asset_id,
+                        "event_id": candidate.event_id,
+                        "references": [],
+                    },
+                )
+                row["references"].append(
+                    {
+                        "feature_id": chapter.feature_id,
+                        "rank": rank,
+                        "candidate_id": planning_candidate_id(rank),
+                        "retrieval_reason": candidate.retrieval_reason,
+                    }
+                )
+        total_evidence_ms = 0
+        for row in selected_direct_evidence.values():
+            card = cards[row["source_asset_id"]]
+            event = next(
+                item
+                for item in card.events
+                if item.event_id == row["event_id"]
+            )
+            start_ms, end_ms = bounded_event_window_ms(
+                card,
+                event,
+                context_ms=context_ms,
+            )
+            row["start_ms"] = start_ms
+            row["end_ms"] = end_ms
+            row["duration_ms"] = end_ms - start_ms
+            total_evidence_ms += end_ms - start_ms
+        maximum_evidence_ms = round(
+            args.maximum_candidate_video_seconds * 1000
+        )
+        validate_candidate_video_budget(
+            total_duration_ms=total_evidence_ms,
+            maximum_duration_ms=maximum_evidence_ms,
+        )
+        file_cache_root = (
+            args.file_cache_root.expanduser().resolve()
+            if args.file_cache_root is not None
+            else args.output_dir.parent / "file-cache"
+        )
+        direct_root = args.output_dir / "candidate-video-evidence"
+        direct_rows: list[dict[str, Any]] = []
+        upload_client = GeminiLabClient(api_key=api_key)
+        try:
+            for row in selected_direct_evidence.values():
+                clip = asset_to_clip[row["source_asset_id"]]
+                proxy_path = (
+                    direct_root
+                    / clip.sha256[:16]
+                    / row["event_id"]
+                    / "bounded.mp4"
+                )
+                audio_included = render_bounded_event_proxy(
+                    Path(clip.path),
+                    proxy_path,
+                    start_ms=row["start_ms"],
+                    end_ms=row["end_ms"],
+                )
+                proxy_sha256 = sha256_file(proxy_path)
+                uploaded, reused = upload_client.ensure_video_upload(
+                    proxy_path,
+                    file_cache_root
+                    / proxy_sha256
+                    / "candidate-video-upload",
+                )
+                candidate_label = " | ".join(
+                    (
+                        f"{item['feature_id']}#{item['candidate_id']}"
+                        f"(rank={item['rank']})"
+                    )
+                    for item in row["references"]
+                )
+                request_input.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            "DIRECT CANDIDATE VIDEO EVIDENCE\n"
+                            f"candidate_scope={candidate_label}\n"
+                            f"source_asset_id={row['source_asset_id']}\n"
+                            f"event_id={row['event_id']}\n"
+                            "Only use what is directly visible/audible here."
+                        ),
+                    }
+                )
+                request_input.append(
+                    {
+                        "type": "video",
+                        "uri": uploaded.uri,
+                        "mime_type": canonical_interactions_mime_type(
+                            str(uploaded.mime_type)
+                        ),
+                    }
+                )
+                direct_rows.append(
+                    {
+                        **row,
+                        "proxy_path": str(proxy_path.resolve()),
+                        "proxy_sha256": proxy_sha256,
+                        "audio_included": audio_included,
+                        "file_api_reused": reused,
+                    }
+                )
+        finally:
+            upload_client.close()
+        candidate_video_manifest_path = (
+            args.output_dir / "candidate-video-evidence.manifest.json"
+        )
+        direct_video_observed_events = {
+            (str(row["source_asset_id"]), str(row["event_id"]))
+            for row in direct_rows
+        }
+        write_json(
+            candidate_video_manifest_path,
+            {
+                "contract_version": "candidate-video-evidence-manifest-v1",
+                "selection_policy": {
+                    "rank_depth_per_chapter": args.candidate_video_depth,
+                    "context_ms": context_ms,
+                    "maximum_total_ms": maximum_evidence_ms,
+                },
+                "total_duration_ms": total_evidence_ms,
+                "candidate_count": len(direct_rows),
+                "candidates": direct_rows,
+            },
+        )
+        request_input.append(
+            {
+                "type": "text",
+                "text": (
+                    "DIRECT CANDIDATE VIDEO MANIFEST\n"
+                    f"sha256={sha256_file(candidate_video_manifest_path)}\n"
+                    "The manifest binds the bounded videos above to immutable "
+                    "shortlist candidate IDs."
+                ),
+            }
+        )
+    elif args.candidate_video_evidence and args.reuse_raw_output:
+        candidate_video_manifest_path = (
+            args.output_dir / "candidate-video-evidence.manifest.json"
+        )
+        if not candidate_video_manifest_path.exists():
+            raise FileNotFoundError(
+                "--reuse-raw-output with direct videos requires the original "
+                "candidate-video-evidence.manifest.json"
+            )
+        candidate_video_manifest = read_json(candidate_video_manifest_path)
+        manifest_policy = candidate_video_manifest.get("selection_policy", {})
+        if (
+            manifest_policy.get("rank_depth_per_chapter")
+            != args.candidate_video_depth
+        ):
+            raise ValueError(
+                "direct-video candidate depth differs from the paid request"
+            )
+        direct_video_observed_events = {
+            (str(row["source_asset_id"]), str(row["event_id"]))
+            for row in candidate_video_manifest.get("candidates", [])
+        }
     if music_path is not None and not args.reuse_raw_output:
         file_cache_root = (
             args.file_cache_root.expanduser().resolve()
@@ -2165,31 +3324,38 @@ model_provenance 必須先原樣回傳：
                 ),
             }
         )
+    response_model: type[BaseModel] = (
+        DirectVideoEditPlan
+        if args.candidate_video_evidence
+        else ClipCardFeaturePlanV3
+    )
     request = {
         "model": MODEL_ID,
         "system_instruction": (
-            "Provided Clip Cards and RF frame maps are the only evidence. "
+            "Provided Clip Cards, candidate indexes, explicitly labeled direct "
+            "candidate videos, and supplied music are the only evidence. "
             "Never replace visible evidence with model memory or likely product knowledge. "
-            "Preserve 2-4 auditable alternatives for every supported chapter. Return concise "
-            "brief-specific entity priorities, but never duplicate descriptions, rank-one "
-            "mirror fields, or verbose crop regions that local Clip Cards can derive. A brief "
-            "target is editorial intent, not authorization to force a tracked crop. "
-            "For original horizontal framing, zoom must be none and focus entity must be null; "
-            "only tracked_reframe may name a horizontal focus entity."
+            "Return editorial selection, relative dwell, and attention intent only. "
+            "Never return exact time, candidate IDs, asset/event/frame IDs, bounding "
+            "boxes, masks, coordinates, or motion curves. A brief target is "
+            "editorial intent, not authorization to force a tracked crop."
         ),
         "store": False,
         "input": request_input,
         "generation_config": {
             "thinking_level": args.thinking_level,
-            "max_output_tokens": 32_000,
+            "max_output_tokens": (
+                12_000 if args.candidate_video_evidence else 32_000
+            ),
         },
         "response_format": {
             "type": "text",
             "mime_type": "application/json",
-            "schema": gemini_response_schema(ClipCardFeaturePlanV3),
+            "schema": gemini_response_schema(response_model),
         },
     }
     plan: ClipCardFeaturePlanV3 | None = None
+    direct_video_plan: DirectVideoEditPlan | None = None
     interaction_id = ""
     source_request_path: Path
     source_raw_output_path: Path
@@ -2217,20 +3383,55 @@ model_provenance 必須先原樣回傳：
             raise ValueError(
                 "--reuse-raw-output music presence differs from the paid request"
             )
-        original_text = next(
-            (
-                str(item.get("text"))
-                for item in original_inputs
-                if isinstance(item, dict) and item.get("type") == "text"
-            ),
-            "",
+        original_text = "\n".join(
+            str(item.get("text"))
+            for item in original_inputs
+            if isinstance(item, dict) and item.get("type") == "text"
         )
+        if candidate_video_manifest_path is not None and (
+            f"sha256={sha256_file(candidate_video_manifest_path)}"
+            not in original_text
+        ):
+            raise ValueError(
+                "--reuse-raw-output candidate video manifest differs from "
+                "the paid request"
+            )
         if music_sha256 is not None and (
             f"music_sha256={music_sha256}" not in original_text
         ):
-            raise ValueError(
-                "--reuse-raw-output music hash differs from the paid request"
+            if not args.candidate_video_evidence:
+                raise ValueError(
+                    "--reuse-raw-output music hash differs from the paid request"
+                )
+            file_cache_root = (
+                args.file_cache_root.expanduser().resolve()
+                if args.file_cache_root is not None
+                else args.output_dir.parent / "file-cache"
             )
+            music_upload_path = (
+                file_cache_root
+                / music_sha256
+                / "music-upload"
+                / "file_upload_final.json"
+            )
+            if not music_upload_path.exists():
+                raise FileNotFoundError(
+                    "direct-video raw reuse cannot verify the original music "
+                    "File API object"
+                )
+            expected_music_uri = str(
+                read_json(music_upload_path).get("uri") or ""
+            )
+            original_music_uris = {
+                str(item.get("uri") or "")
+                for item in original_inputs
+                if isinstance(item, dict) and item.get("type") == "audio"
+            }
+            if not expected_music_uri or expected_music_uri not in original_music_uris:
+                raise ValueError(
+                    "--reuse-raw-output music File API object differs from "
+                    "the paid request"
+                )
         raw_interaction = read_json(source_raw_interaction_path)
         artifact_models = {
             "original_request": str(original_request.get("model") or ""),
@@ -2262,6 +3463,7 @@ model_provenance 必須先原樣回傳：
                 artifact_stem="clip-card-feature-plan",
                 raw_output_path=source_raw_output_path,
                 raw_output_text=output_text,
+                direct_video_plan=args.candidate_video_evidence,
             )
         )
         reuse_record_path = args.output_dir / "clip-card-feature-plan.raw-output-reuse.json"
@@ -2291,13 +3493,33 @@ model_provenance 必須先原樣回傳：
             },
         )
         interaction_id = str(raw_interaction.get("id") or "")
-        plan = ClipCardFeaturePlanV3.model_validate_json(output_text)
+        if args.candidate_video_evidence:
+            assert shortlist is not None
+            direct_video_plan = DirectVideoEditPlan.model_validate_json(
+                output_text
+            )
+            plan = project_direct_video_edit_plan(
+                direct_video_plan,
+                shortlist=shortlist,
+                candidate_depth=args.candidate_video_depth,
+                brief=brief,
+                catalog=catalog,
+                cards=cards,
+                provenance=provenance,
+            )
+            write_json(
+                args.output_dir / "direct-video-edit-plan.json",
+                direct_video_plan,
+            )
+        else:
+            plan = ClipCardFeaturePlanV3.model_validate_json(output_text)
         validate_plan_contract_v3(
             plan,
             brief=brief,
             catalog=catalog,
             cards=cards,
             supplements=supplements,
+            direct_video_observed_events=direct_video_observed_events,
         )
         validate_shortlist_membership(plan)
         if plan.model_provenance.model_id != MODEL_ID:
@@ -2356,15 +3578,36 @@ model_provenance 必須先原樣回傳：
                             artifact_stem=attempt_stem,
                             raw_output_path=attempt_raw_output_path,
                             raw_output_text=current.output_text,
+                            direct_video_plan=args.candidate_video_evidence,
                         )
                     )
-                    plan = ClipCardFeaturePlanV3.model_validate_json(canonical_text)
+                    if args.candidate_video_evidence:
+                        assert shortlist is not None
+                        direct_video_plan = DirectVideoEditPlan.model_validate_json(
+                            canonical_text
+                        )
+                        plan = project_direct_video_edit_plan(
+                            direct_video_plan,
+                            shortlist=shortlist,
+                            candidate_depth=args.candidate_video_depth,
+                            brief=brief,
+                            catalog=catalog,
+                            cards=cards,
+                            provenance=provenance,
+                        )
+                    else:
+                        plan = ClipCardFeaturePlanV3.model_validate_json(
+                            canonical_text
+                        )
                     validate_plan_contract_v3(
                         plan,
                         brief=brief,
                         catalog=catalog,
                         cards=cards,
                         supplements=supplements,
+                        direct_video_observed_events=(
+                            direct_video_observed_events
+                        ),
                     )
                     validate_shortlist_membership(plan)
                     interaction_id = getattr(current, "id", None) or ""
@@ -2384,8 +3627,14 @@ model_provenance 必須先原樣回傳：
                             artifact_stem="clip-card-feature-plan",
                             raw_output_path=source_raw_output_path,
                             raw_output_text=current.output_text,
+                            direct_video_plan=args.candidate_video_evidence,
                         )
                     )
+                    if direct_video_plan is not None:
+                        write_json(
+                            args.output_dir / "direct-video-edit-plan.json",
+                            direct_video_plan,
+                        )
                     break
                 except (ValidationError, ValueError) as error:
                     plan = None
@@ -2435,13 +3684,46 @@ model_provenance 必須先原樣回傳：
     )
     if shortlist_path is not None:
         extra_projection_artifacts["feature_shortlist"] = shortlist_path
+    if music_path is not None:
+        extra_projection_artifacts["source_music"] = music_path
+    if candidate_video_manifest_path is not None:
+        extra_projection_artifacts[
+            "candidate_video_evidence_manifest"
+        ] = candidate_video_manifest_path
+    direct_video_plan_path = args.output_dir / "direct-video-edit-plan.json"
+    if direct_video_plan_path.exists():
+        extra_projection_artifacts["derived_clip_card_feature_plan"] = (
+            args.output_dir / "clip-card-feature-plan.json"
+        )
+        if music_sha256 is not None:
+            file_cache_root = (
+                args.file_cache_root.expanduser().resolve()
+                if args.file_cache_root is not None
+                else args.output_dir.parent / "file-cache"
+            )
+            extra_projection_artifacts["source_music_upload"] = (
+                file_cache_root
+                / music_sha256
+                / "music-upload"
+                / "file_upload_final.json"
+            )
+    projection_contract_id = (
+        "direct-video-edit-plan-v1"
+        if direct_video_plan_path.exists()
+        else "clip-card-feature-cut-v3"
+    )
+    source_plan_path = (
+        direct_video_plan_path
+        if direct_video_plan_path.exists()
+        else args.output_dir / "clip-card-feature-plan.json"
+    )
     projection_pointer = write_external_feature_plan_projection(
         plan_dir=args.output_dir,
-        projection_contract_id="clip-card-feature-cut-v3",
+        projection_contract_id=projection_contract_id,
         catalog_path=args.catalog_json,
         brief_path=args.brief_json,
         feature_plan_path=args.output_dir / "feature_edit_plan.json",
-        source_plan_path=args.output_dir / "clip-card-feature-plan.json",
+        source_plan_path=source_plan_path,
         source_request_path=source_request_path,
         source_artifacts={
             "source_raw_interaction": source_raw_interaction_path,

@@ -54,6 +54,7 @@ from jascue_video_lab.feature_cut import (
     _refine_selected_vertical_candidate,
     _segment_variant_fingerprint,
     _selected_source_capacity_seconds,
+    _should_refine_selected_vertical_candidate,
     _soft_extent_visibility_audit,
     _summarize_automatic_reframe,
     _tracking_seed_request_ms,
@@ -126,6 +127,33 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
         ]
     )
     assert vertical.aspect == "9x16"
+
+
+def test_direct_video_projection_does_not_repeat_selected_clip_semantic_pass() -> None:
+    assert not _should_refine_selected_vertical_candidate(
+        auto_vertical_framing=True,
+        human_reframe_policy_requested=False,
+        feature_plan_origin="external_projection",
+        external_projection_contract_id="direct-video-edit-plan-v1",
+        option_data={"virtual_camera_proposal": None},
+    )
+
+
+def test_legacy_plan_can_still_request_missing_selected_clip_framing() -> None:
+    assert _should_refine_selected_vertical_candidate(
+        auto_vertical_framing=True,
+        human_reframe_policy_requested=False,
+        feature_plan_origin="generated",
+        external_projection_contract_id=None,
+        option_data={"virtual_camera_proposal": None},
+    )
+    assert not _should_refine_selected_vertical_candidate(
+        auto_vertical_framing=True,
+        human_reframe_policy_requested=True,
+        feature_plan_origin="generated",
+        external_projection_contract_id=None,
+        option_data={"virtual_camera_proposal": None},
+    )
 
 
 def test_feature_cut_failure_writes_terminal_run_status(
@@ -5645,6 +5673,44 @@ def test_all_automatic_gates_only_reach_ready_for_human_review() -> None:
     assert report.delivery_eligible is False
     assert report.editorial_contract.final_sequence_qa_passed == "not_run"
     assert report.editorial_contract.human_approval_passed == "not_run"
+
+
+def test_unauthorized_source_overlap_keeps_review_media_but_blocks_readiness() -> None:
+    manifest = {
+        "horizontal": {
+            "requested": True,
+            "status": "rendered",
+            "chapters": [
+                {
+                    "feature_id": "opening",
+                    "source_clip_id": "clip-a",
+                    "source_in_ms": 0,
+                    "source_out_ms": 3000,
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                }
+            ],
+        },
+        "vertical": {"requested": False, "status": "not_requested", "chapters": []},
+        "requested_candidate_recall_audit": {"complete": True},
+        "quality_map_coverage_audit": {"complete": True},
+        "source_reuse_contract_passed": False,
+        "reframe_policy_binding": None,
+        "post_render_quality_qc": {
+            "requested": True,
+            "technical_qc_passed": True,
+        },
+    }
+
+    report = _build_feature_cut_eligibility_report(
+        manifest,
+        execution_profile=FeatureCutExecutionProfile.PRODUCTION_REVIEW,
+    )
+
+    assert report.media_rendered is True
+    assert report.run_state == FeatureCutRunState.REVIEW_PREVIEW
+    assert report.ready_for_human_review is False
+    assert "source_reuse_contract_failed" in report.blocking_reasons
 
 
 def test_human_intent_does_not_replace_execution_verification() -> None:
