@@ -737,7 +737,6 @@ def canonicalize_feature_edit_plan_output(
                     if (
                         not isinstance(region, dict)
                         or region.get("role") != "required"
-                        or region.get("atomic") is True
                     ):
                         continue
                     visible_fraction = region.get("minimum_visible_fraction")

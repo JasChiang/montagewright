@@ -8,9 +8,18 @@ import pytest
 from jascue_video_lab.media import sha256_file
 
 
+@pytest.mark.parametrize(
+    ("picture_ready", "expected_state"),
+    [
+        (True, "ready_for_human_review"),
+        (False, "review_required"),
+    ],
+)
 def test_delivery_pipeline_hash_binds_mux_and_runs_qa_on_final_media(
     tmp_path: Path,
     monkeypatch,
+    picture_ready: bool,
+    expected_state: str,
 ) -> None:
     brief = tmp_path / "brief.json"
     music = tmp_path / "music.wav"
@@ -30,7 +39,13 @@ def test_delivery_pipeline_hash_binds_mux_and_runs_qa_on_final_media(
         pipeline,
         "run_feature_cut_experiment",
         lambda **_kwargs: {
-            "ready_for_human_review": True,
+            "ready_for_human_review": picture_ready,
+            "media_rendered": True,
+            "run_state": (
+                "ready_for_human_review"
+                if picture_ready
+                else "review_preview"
+            ),
             "horizontal_output": str(picture),
             "vertical_output": None,
             "manifest_path": str(render_manifest),
@@ -132,7 +147,8 @@ def test_delivery_pipeline_hash_binds_mux_and_runs_qa_on_final_media(
         output_dir=tmp_path / "delivery",
     )
 
-    assert result["state"] == "ready_for_human_review"
+    assert result["state"] == expected_state
+    assert result["picture_ready_for_human_review"] is picture_ready
     assert result["delivery_eligible"] is False
     assert result["human_approval_status"] == "not_run"
     assert Path(result["aspects"]["horizontal"]["final_output"]).read_bytes() == (
@@ -140,7 +156,7 @@ def test_delivery_pipeline_hash_binds_mux_and_runs_qa_on_final_media(
     )
 
 
-def test_delivery_pipeline_stops_before_music_when_picture_gates_fail(
+def test_delivery_pipeline_stops_before_music_when_picture_media_is_missing(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -149,6 +165,7 @@ def test_delivery_pipeline_stops_before_music_when_picture_gates_fail(
         "run_feature_cut_experiment",
         lambda **_kwargs: {
             "ready_for_human_review": False,
+            "media_rendered": False,
             "run_state": "partial",
         },
     )
@@ -166,7 +183,7 @@ def test_delivery_pipeline_stops_before_music_when_picture_gates_fail(
     )
     with pytest.raises(
         pipeline.DeliveryPipelineBlocked,
-        match="did not satisfy",
+        match="did not produce reviewable picture media",
     ):
         pipeline.run_feature_delivery_pipeline(
             feature_cut_kwargs={},

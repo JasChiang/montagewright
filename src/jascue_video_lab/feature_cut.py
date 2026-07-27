@@ -47,6 +47,7 @@ from .media import (
     extract_frame,
     extract_frame_at_pts,
     has_audio_stream,
+    last_decoded_video_frame_pts,
     probe_video,
     sha256_file,
 )
@@ -1734,9 +1735,10 @@ def _write_render_boundary_lineage(
         0,
         output_path.parent / f"{output_path.stem}-output-first.png",
     )
-    last = extract_frame(
+    last_pts = last_decoded_video_frame_pts(segment_path)
+    last = extract_frame_at_pts(
         segment_path,
-        max(0, media.duration_ms - 1),
+        last_pts,
         output_path.parent / f"{output_path.stem}-output-last.png",
     )
     body = {
@@ -1746,6 +1748,7 @@ def _write_render_boundary_lineage(
         "source_interval": dict(source_interval),
         "output_first_frame": first.model_dump(mode="json"),
         "output_last_frame": last.model_dump(mode="json"),
+        "output_last_frame_pts_source": "ffprobe_decoded_frame_enumeration",
         "verified": True,
         "generated_at": utc_now(),
     }
@@ -7365,10 +7368,21 @@ def _prepare_horizontal_runtime_candidate(
             display_sample_aspect_ratio=display_sar,
             camera_intent=str(option.get("camera_intent") or "hold"),
         )
-        if geometry.get("fallback_reason") is not None:
+        fallback_reason = geometry.get("fallback_reason")
+        if fallback_reason == "mask_geometry_left_no_safe_zoom_margin":
+            # A horizontal virtual-camera move is an editorial enhancement,
+            # not an evidence-containment requirement. The geometry solver
+            # already returns the original full-frame filter when no safe zoom
+            # exists, so keep the valid evidence and expose the unapplied move
+            # for review instead of exhausting Top-K.
+            geometry.setdefault("risk_codes", []).append(
+                "horizontal_virtual_camera_fallback_to_original"
+            )
+            geometry["requires_gemini_review"] = True
+        elif fallback_reason is not None:
             raise ValueError(
                 "horizontal candidate geometry could not execute: "
-                + str(geometry["fallback_reason"])
+                + str(fallback_reason)
             )
         if "virtual_camera_plan" in geometry:
             write_json(
@@ -7405,6 +7419,20 @@ def _candidate_asset_reference_matches(
         clip.clip_id,
         f"sha256:{clip.sha256}",
     }
+
+
+def _feature_vertical_candidate_from_runtime_option(
+    option_data: Mapping[str, Any],
+) -> FeatureVerticalCandidate:
+    """Validate the immutable candidate without transient runtime audit fields."""
+
+    return FeatureVerticalCandidate.model_validate(
+        {
+            field_name: option_data[field_name]
+            for field_name in FeatureVerticalCandidate.model_fields
+            if field_name in option_data
+        }
+    )
 
 
 def _resolve_vertical_camera_phases(
@@ -8491,7 +8519,10 @@ def _selected_source_capacity_seconds(
                 aspect_frames.append(
                     ("9:16", selected.vertical_frame_id, None)
                 )
-        chapter_capacities: list[int] = []
+        chapter_capacities: dict[str, list[int]] = {
+            "16:9": [],
+            "9:16": [],
+        }
         seen: set[tuple[str, str, str | None]] = set()
         for selected_aspect, frame_id, candidate_event_id in aspect_frames:
             if frame_id is None:
@@ -8569,9 +8600,21 @@ def _selected_source_capacity_seconds(
                 )
             else:
                 capacity_ms = interval_end - interval_start
-            chapter_capacities.append(max(0, capacity_ms))
-        if chapter_capacities:
-            capacities[selected.feature_id] = max(chapter_capacities) / 1000
+            chapter_capacities[selected_aspect].append(max(0, capacity_ms))
+        requested_maxima = [
+            max(chapter_capacities[selected_aspect])
+            for selected_aspect, requested in (
+                ("16:9", render_horizontal),
+                ("9:16", render_vertical),
+            )
+            if requested and chapter_capacities[selected_aspect]
+        ]
+        if requested_maxima:
+            # One shared chapter duration must be executable in every requested
+            # aspect, while each aspect may independently choose its own best
+            # Top-K candidate. A global max would let a long horizontal take
+            # over-allocate a chapter that no vertical candidate can sustain.
+            capacities[selected.feature_id] = min(requested_maxima) / 1000
     return capacities
 
 
@@ -10164,121 +10207,28 @@ def _run_feature_cut_experiment_impl(
                         }
                     )
                 if render_horizontal:
-                    horizontal_frame = frames[selected.horizontal_frame_id or ""]
-                    horizontal_clip = clips[horizontal_frame.clip_id]
-                    h_start, h_end, h_shot, horizontal_trim = (
-                        _chapter_bounds_with_approved_trim(
-                            horizontal_frame,
-                            horizontal_clip,
-                            chapter_duration_seconds,
-                            shot_cache,
-                            shots_dir,
-                            scdet_threshold,
-                            trim_decisions,
-                            expected_event_id=_selected_event_id(
-                                selected,
-                                frame_id=horizontal_frame.frame_id,
-                                aspect="16:9",
-                            ),
-                            quality_maps=shot_quality_maps,
+                    if prepared_horizontal is None:
+                        raise AssertionError(
+                            "horizontal renderer requires a preflighted candidate"
                         )
+                    horizontal_frame = prepared_horizontal["frame"]
+                    horizontal_clip = prepared_horizontal["clip"]
+                    h_start = int(prepared_horizontal["start_ms"])
+                    h_end = int(prepared_horizontal["end_ms"])
+                    h_shot = str(prepared_horizontal["shot_id"])
+                    horizontal_trim = prepared_horizontal["trim"]
+                    horizontal_source_has_audio = bool(
+                        prepared_horizontal["source_has_audio"]
                     )
-                    if horizontal_clip.sha256 not in source_audio_cache:
-                        source_audio_cache[horizontal_clip.sha256] = has_audio_stream(
-                            Path(horizontal_clip.path)
-                        )
-                    if horizontal_clip.sha256 not in source_media_cache:
-                        source_media_cache[horizontal_clip.sha256] = probe_video(
-                            Path(horizontal_clip.path)
-                        )
-                    horizontal_source_has_audio = source_audio_cache[
-                        horizontal_clip.sha256
-                    ]
-                    horizontal_source_media = source_media_cache[
-                        horizontal_clip.sha256
-                    ]
-                    horizontal_display_sar = (
-                        horizontal_source_media.video.display_sample_aspect_ratio.numerator
-                        / horizontal_source_media.video.display_sample_aspect_ratio.denominator
+                    horizontal_source_media = prepared_horizontal["media"]
+                    horizontal_filter = str(prepared_horizontal["filter"])
+                    horizontal_geometry = dict(
+                        prepared_horizontal["geometry"]
                     )
-                    horizontal_filter = _horizontal_original_filter()
-                    horizontal_geometry = {
-                        "requested_zoom": None,
-                        "geometry_safe_max_zoom": None,
-                        "applied_zoom": 1.0,
-                        "fallback_reason": None,
-                        "risk_codes": [],
-                        "requires_gemini_review": False,
-                    }
-                    horizontal_debug: Path | None = None
-                    horizontal_track_fingerprint: str | None = None
-                    if selected.horizontal_strategy == "tracked_reframe":
-                        target = selected.horizontal_target_description or ""
-                        cache_key = (horizontal_frame.frame_id, target, h_start, h_end)
-                        track_root = (
-                            output_dir
-                            / "geometry"
-                            / selected.feature_id
-                            / "horizontal"
-                        )
-                        try:
-                            if cache_key not in track_cache:
-                                proposal, track = _build_track(
-                                    client=client,
-                                    clip=horizontal_clip,
-                                    frame=horizontal_frame,
-                                    start_ms=h_start,
-                                    end_ms=h_end,
-                                    feature_id=selected.feature_id,
-                                    event_description=(
-                                        brief_chapter.title
-                                        + "；"
-                                        + selected.observed_visual_evidence
-                                    ),
-                                    target_description=target,
-                                    checkpoint_path=checkpoint_path,
-                                    grounding_prompt=grounding_prompt,
-                                    output_dir=track_root,
-                                    run_id=f"feature-h-{uuid.uuid4().hex[:8]}",
-                                    analysis_fps=sam_analysis_fps,
-                                    scdet_threshold=scdet_threshold,
-                                    model_request_block_reason=(
-                                        gemini_geometry_block_reason
-                                    ),
-                                )
-                                track_cache[cache_key] = (proposal, track, track_root)
-                            _, track, track_root = track_cache[cache_key]
-                            horizontal_track_fingerprint = (
-                                _track_geometry_fingerprint(track)
-                            )
-                            horizontal_filter, horizontal_geometry = (
-                                _horizontal_filter_from_track(
-                                    track,
-                                    selected.horizontal_zoom_intent,
-                                    display_sample_aspect_ratio=horizontal_display_sar,
-                                    camera_intent=(
-                                        selected.horizontal_camera_intent
-                                    ),
-                                )
-                            )
-                            if "virtual_camera_plan" in horizontal_geometry:
-                                write_json(
-                                    track_root / "virtual-camera-plan.json",
-                                    horizontal_geometry[
-                                        "virtual_camera_plan"
-                                    ],
-                                )
-                            horizontal_debug = track_root / "grounding-debug.png"
-                        except Exception as error:
-                            abort_for_geometry_quota(error)
-                            horizontal_geometry = _horizontal_reframe_failure_geometry(
-                                selected.horizontal_zoom_intent,
-                                fallback_reason=(
-                                    "tracking_or_grounding_failed:"
-                                    f"{type(error).__name__}:{error}"
-                                ),
-                                risk_code="tracking_or_grounding_failed",
-                            )
+                    horizontal_debug = prepared_horizontal["debug"]
+                    horizontal_track_fingerprint = prepared_horizontal[
+                        "track_fingerprint"
+                    ]
                     horizontal_geometry["automatic_candidate_selection"] = {
                         "contract_version": "full-auto-candidate-routing-v2",
                         "enabled": bool(selected.horizontal_candidates),
@@ -10404,31 +10354,39 @@ def _run_feature_cut_experiment_impl(
                     candidate_id = str(option_data["candidate_id"])
                     candidate_rank = int(option_data["rank"])
                     frame_id = str(option_data["frame_id"])
-                    candidate_frame = frames[frame_id]
-                    candidate_clip = clips[candidate_frame.clip_id]
-                    expected_asset = option_data.get("source_asset_id")
-                    if not _candidate_asset_reference_matches(
-                        expected_asset,
-                        candidate_clip,
-                    ):
-                        raise ValueError(
-                            f"vertical candidate frame belongs to another asset: {frame_id}"
+                    try:
+                        candidate_frame = frames[frame_id]
+                        candidate_clip = clips[candidate_frame.clip_id]
+                        expected_asset = option_data.get("source_asset_id")
+                        if not _candidate_asset_reference_matches(
+                            expected_asset,
+                            candidate_clip,
+                        ):
+                            raise ValueError(
+                                "vertical candidate source asset differs from "
+                                f"its frame: {frame_id}"
+                            )
+                        if candidate_clip.sha256 not in source_audio_cache:
+                            source_audio_cache[candidate_clip.sha256] = (
+                                has_audio_stream(Path(candidate_clip.path))
+                            )
+                        if candidate_clip.sha256 not in source_media_cache:
+                            source_media_cache[candidate_clip.sha256] = probe_video(
+                                Path(candidate_clip.path)
+                            )
+                        candidate_media = source_media_cache[
+                            candidate_clip.sha256
+                        ]
+                        candidate_display_sar = (
+                            candidate_media.video.display_sample_aspect_ratio.numerator
+                            / candidate_media.video.display_sample_aspect_ratio.denominator
                         )
-                    if candidate_clip.sha256 not in source_audio_cache:
-                        source_audio_cache[candidate_clip.sha256] = has_audio_stream(
-                            Path(candidate_clip.path)
-                        )
-                    if candidate_clip.sha256 not in source_media_cache:
-                        source_media_cache[candidate_clip.sha256] = probe_video(
-                            Path(candidate_clip.path)
-                        )
-                    candidate_media = source_media_cache[candidate_clip.sha256]
-                    candidate_display_sar = (
-                        candidate_media.video.display_sample_aspect_ratio.numerator
-                        / candidate_media.video.display_sample_aspect_ratio.denominator
-                    )
-                    candidate_start, candidate_end, candidate_shot, candidate_trim = (
-                        _chapter_bounds_with_approved_trim(
+                        (
+                            candidate_start,
+                            candidate_end,
+                            candidate_shot,
+                            candidate_trim,
+                        ) = _chapter_bounds_with_approved_trim(
                             candidate_frame,
                             candidate_clip,
                             chapter_duration_seconds,
@@ -10439,7 +10397,34 @@ def _run_feature_cut_experiment_impl(
                             expected_event_id=option_data.get("event_id"),
                             quality_maps=shot_quality_maps,
                         )
-                    )
+                    except Exception as error:
+                        abort_for_geometry_quota(error)
+                        candidate_attempts.append(
+                            {
+                                "candidate_id": candidate_id,
+                                "rank": candidate_rank,
+                                "frame_id": frame_id,
+                                "source_asset_id": option_data.get(
+                                    "source_asset_id"
+                                ),
+                                "event_id": option_data.get("event_id"),
+                                "strategy": option_data.get("strategy"),
+                                "decision": "try_next",
+                                "reason_code": (
+                                    "candidate_lineage_quality_or_capacity_failed"
+                                ),
+                                "failure_codes": [
+                                    FailureCode.NO_FEASIBLE_PRESENTATION.value
+                                ],
+                                "recovery_action": (
+                                    "try_next_candidate"
+                                    if option_index + 1 < len(vertical_options)
+                                    else "fallback_requires_review"
+                                ),
+                                "error": f"{type(error).__name__}:{error}",
+                            }
+                        )
+                        continue
                     framing_refinement: dict[str, Any] | None = None
                     framing_recommended_action: str | None = None
                     if (
@@ -10637,7 +10622,9 @@ def _run_feature_cut_experiment_impl(
                         ):
                             candidate_query_lock = (
                                 _load_or_create_feature_candidate_query_lock_v2(
-                                    FeatureVerticalCandidate.model_validate(option_data),
+                                    _feature_vertical_candidate_from_runtime_option(
+                                        option_data
+                                    ),
                                     feature_id=selected.feature_id,
                                     output_dir=candidate_root,
                                 )

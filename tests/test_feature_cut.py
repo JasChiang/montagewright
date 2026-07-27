@@ -29,6 +29,7 @@ from jascue_video_lab.feature_cut import (
     _build_feature_cut_eligibility_report,
     _audit_render_source_reuse,
     _candidate_asset_reference_matches,
+    _feature_vertical_candidate_from_runtime_option,
     _cover_transform,
     _current_feature_plan_binding,
     _current_external_projection_binding,
@@ -657,7 +658,7 @@ def test_source_capacity_uses_only_requested_aspect() -> None:
     )
 
     assert vertical["chapter"] == 10
-    assert both["chapter"] == 10
+    assert both["chapter"] == 2
 
 
 def test_source_capacity_requires_safe_interval_containing_anchor(
@@ -2835,6 +2836,38 @@ def test_vertical_candidate_allows_controlled_required_clipping_and_fit_regions(
         **common,
     )
     assert fit.regions[0].region_id == "visible"
+
+
+def test_runtime_vertical_candidate_ignores_transient_audit_fields() -> None:
+    candidate = FeatureVerticalCandidate(
+        candidate_id="generic-take",
+        rank=1,
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="event-generic",
+        frame_id="RF000001",
+        observed_visual_evidence="One directly visible subject.",
+        selection_reason="The selected evidence supports a tracked portrait crop.",
+        strategy="tracked_crop",
+        regions=[
+            FramingRegionIntent(
+                region_id="visible",
+                target_description="the directly visible subject",
+            )
+        ],
+        confidence=0.8,
+    )
+    runtime_option = candidate.model_dump(mode="python")
+    runtime_option.update(
+        {
+            "coverage_intent": "single_primary",
+            "coverage_target_descriptions": ["the directly visible subject"],
+            "framing_refinement": {"status": "accepted"},
+        }
+    )
+
+    parsed = _feature_vertical_candidate_from_runtime_option(runtime_option)
+
+    assert parsed == candidate
 
 
 def test_canonical_feature_plan_rejects_topk_aliases_of_same_evidence() -> None:

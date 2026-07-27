@@ -833,6 +833,9 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
             "sam_analysis_fps": args.sam_analysis_fps,
             "scdet_threshold": args.scdet_threshold,
             "reuse_feature_plan": args.reuse_feature_plan,
+            "reuse_feature_plan_raw_output": (
+                args.reuse_feature_plan_raw_output
+            ),
             "allow_shorter_within_delivery_range": (
                 args.allow_shorter_within_delivery_range
             ),
@@ -2421,6 +2424,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--scdet-threshold", type=float, default=4.0
     )
     feature_delivery_parser.add_argument("--reuse-feature-plan", action="store_true")
+    feature_delivery_parser.add_argument(
+        "--reuse-feature-plan-raw-output",
+        action="store_true",
+        help=(
+            "Revalidate the already paid raw feature-plan response after a "
+            "representation-only canonicalizer fix; sends no new planning call"
+        ),
+    )
     feature_delivery_parser.add_argument(
         "--allow-shorter-within-delivery-range", action="store_true"
     )

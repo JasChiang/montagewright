@@ -335,6 +335,51 @@ def extract_frame_at_pts(
     )
 
 
+def last_decoded_video_frame_pts(source: Path) -> int:
+    """Return the last decoded video-frame PTS without guessing from duration.
+
+    Container duration is often rounded and may point just beyond the final
+    frame, especially after concat or with variable frame rates. Enumerating
+    best-effort timestamps is slower than a duration seek but authoritative for
+    the short rendered segments whose lineage we verify.
+    """
+
+    resolved_source = source.expanduser().resolve(strict=True)
+    completed = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=best_effort_timestamp",
+            "-of",
+            "json",
+            str(resolved_source),
+        ]
+    )
+    payload = json.loads(completed.stdout)
+    frames = payload.get("frames")
+    if not isinstance(frames, list):
+        raise MediaCommandError("ffprobe omitted decoded video frames")
+    timestamps: list[int] = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        value = frame.get("best_effort_timestamp")
+        if value in {None, "N/A"}:
+            continue
+        try:
+            timestamps.append(int(str(value)))
+        except ValueError:
+            continue
+    if not timestamps:
+        raise MediaCommandError("ffprobe omitted decoded video-frame PTS values")
+    return timestamps[-1]
+
+
 def create_analysis_proxy(
     source: Path,
     output: Path,

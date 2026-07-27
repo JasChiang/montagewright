@@ -95,11 +95,18 @@ def run_feature_delivery_pipeline(
         kwargs["execution_profile"] = "production_review"
         feature_result = run_feature_cut_experiment(**kwargs)
         outputs["feature_cut"] = feature_result
-        if not feature_result.get("ready_for_human_review"):
+        picture_media_rendered = bool(feature_result.get("media_rendered"))
+        picture_outputs_present = any(
+            feature_result.get(f"{aspect_key}_output") is not None
+            for aspect_key in ("horizontal", "vertical")
+        )
+        if not picture_media_rendered or not picture_outputs_present:
             raise DeliveryPipelineBlocked(
-                "feature-cut did not satisfy production evidence, candidate, "
-                "quality, geometry and technical gates"
+                "feature-cut did not produce reviewable picture media"
             )
+        picture_ready_for_review = bool(
+            feature_result.get("ready_for_human_review")
+        )
 
         resolved_music = music_path.expanduser().resolve(strict=True)
         resolved_lock_path = music_lock_path.expanduser().resolve(strict=True)
@@ -193,7 +200,10 @@ def run_feature_delivery_pipeline(
         }
         state = (
             "ready_for_human_review"
-            if dispositions == {"ready_for_human_review"}
+            if (
+                picture_ready_for_review
+                and dispositions == {"ready_for_human_review"}
+            )
             else "review_required"
         )
         result = {
@@ -205,6 +215,8 @@ def run_feature_delivery_pipeline(
             "final_sequence_qa_completed": True,
             "human_approval_status": "not_run",
             "delivery_eligible": False,
+            "picture_ready_for_human_review": picture_ready_for_review,
+            "picture_run_state": feature_result.get("run_state"),
             "feature_cut": feature_result,
             "aspects": final_results,
         }

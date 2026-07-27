@@ -275,6 +275,21 @@ def test_feature_plan_normalizes_strict_hard_core_and_atomic_compound_group() ->
                                     }
                                 ],
                             },
+                            {
+                                "candidate_id": "strict-atomic-candidate",
+                                "rank": 3,
+                                "strategy": "tracked_crop",
+                                "crop_mode": "strict",
+                                "regions": [
+                                    {
+                                        "region_id": "strict-atomic-screen",
+                                        "role": "required",
+                                        "atomic": True,
+                                        "minimum_visible_fraction": 0.8,
+                                        "observable_relations": [],
+                                    }
+                                ],
+                            },
                         ],
                     }
                 ]
@@ -284,6 +299,9 @@ def test_feature_plan_normalizes_strict_hard_core_and_atomic_compound_group() ->
     payload = json.loads(canonical)
 
     assert payload["chapters"][0]["vertical_candidates"][0]["regions"][0][
+        "minimum_visible_fraction"
+    ] == 1.0
+    assert payload["chapters"][0]["vertical_candidates"][2]["regions"][0][
         "minimum_visible_fraction"
     ] == 1.0
     # The candidates are not uniformly atomic compounds, so a claimed
