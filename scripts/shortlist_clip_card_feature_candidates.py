@@ -19,6 +19,7 @@ from jascue_video_lab.clip_card_retrieval import (
     compact_retrieval_card,
     validate_feature_shortlist,
 )
+from jascue_video_lab.clip_card_observations import ClipObservationSupplement
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
 from jascue_video_lab.models import (
     FeatureEditBrief,
@@ -37,6 +38,13 @@ def main() -> int:
     parser.add_argument("prepared_library", type=Path)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--thinking-level", choices=["low", "high"], default="low")
+    parser.add_argument(
+        "--supplement",
+        type=Path,
+        action="append",
+        default=[],
+        help="Repeatable validated ClipObservationSupplement JSON.",
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
@@ -56,6 +64,10 @@ def main() -> int:
         )
         card = FullClipCard.model_validate(read_json(card_path))
         cards[card.source_asset_id] = card
+    supplements: dict[str, list[ClipObservationSupplement]] = {}
+    for path in args.supplement:
+        supplement = ClipObservationSupplement.model_validate(read_json(path))
+        supplements.setdefault(supplement.source_asset_id, []).append(supplement)
 
     provenance = ModelProvenance(
         model_id=MODEL_ID,
@@ -66,7 +78,10 @@ def main() -> int:
         generated_at=utc_now(),
         interaction_id=None,
     )
-    evidence = [compact_retrieval_card(card) for card in cards.values()]
+    evidence = [
+        compact_retrieval_card(card, supplements.get(card.source_asset_id, []))
+        for card in cards.values()
+    ]
     prompt = f"""
 你是 evidence-bound 的影片素材召回器。請先為每個 brief chapter 從完整 Clip Card
 library 找出值得進入精細選片的 event 候選。本階段只做高召回 retrieval，不決定
@@ -81,6 +96,8 @@ frame、bbox、crop、剪點或最終排名。
 4. source_asset_id 與 event_id 只能逐字引用下方 library。
 5. retrieval_reason 簡要說明畫面為何可能符合 brief，並保留衝突與風險。
 6. 不輸出 frame ID、時間、座標、模型規格或未觀察到的功能。
+7. capability 為 not_assessed 時只代表尚未補件，不能據此否定候選；
+   也不得自行補出 action、result、relation、readability 或 audio role。
 
 contract_version 必須原樣回傳：clip-card-feature-shortlist-v1
 project_id 必須原樣回傳：{brief.project_id}

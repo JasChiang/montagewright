@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Iterable, Literal
 
 from pydantic import Field, model_validator
 
@@ -11,6 +11,10 @@ from .models import (
     ModelProvenance,
     RushesCatalog,
     StrictModel,
+)
+from .clip_card_observations import (
+    ClipObservationSupplement,
+    effective_event_observations,
 )
 
 
@@ -62,17 +66,28 @@ class FeatureShortlistPlan(StrictModel):
     model_provenance: ModelProvenance
 
 
-def compact_retrieval_card(card: FullClipCard) -> dict[str, object]:
+def compact_retrieval_card(
+    card: FullClipCard,
+    supplements: Iterable[ClipObservationSupplement] = (),
+) -> dict[str, object]:
     """High-recall text evidence only; exact geometry remains a later stage."""
 
+    observations = effective_event_observations(card, supplements)
     return {
         "source_asset_id": card.source_asset_id,
         "duration_ms": card.duration_ms,
         "summary": card.summary,
         "content_type": card.content_type,
         "clip_uses": card.clip_uses,
-        "portrait_reframe_feasibility": card.portrait_reframe_feasibility,
         "uncertainties": card.uncertainties,
+        "entities": {
+            entity.entity_id: {
+                "kind": entity.kind.value,
+                "label": entity.label,
+                "distinguishing_features": entity.distinguishing_features,
+            }
+            for entity in card.entities
+        },
         "events": [
             {
                 "event_id": event.event_id,
@@ -81,13 +96,39 @@ def compact_retrieval_card(card: FullClipCard) -> dict[str, object]:
                 "action_completeness": event.action_completeness,
                 "editing_uses": event.editing_uses,
                 "quality_risks": event.quality_risks,
-                "entity_kinds": sorted(
+                "entity_ids": event.entity_ids,
+                "capabilities": observations[
+                    event.event_id
+                ].capabilities.model_dump(mode="json"),
+                "source_action_completeness": observations[
+                    event.event_id
+                ].source_action_completeness,
+                "clean_entry": observations[event.event_id].clean_entry,
+                "clean_exit": observations[event.event_id].clean_exit,
+                "evidence_roles": observations[
+                    event.event_id
+                ].evidence_roles.model_dump(mode="json"),
+                "observable_beats": [
                     {
-                        entity.kind.value
-                        for entity in card.entities
-                        if entity.entity_id in event.entity_ids
+                        "kind": beat.kind,
+                        "entity_ids": beat.entity_ids,
+                        "relation_mode": beat.relation_mode,
+                        "observable_predicate": beat.observable_predicate,
                     }
+                    for beat in observations[event.event_id].observable_beats
+                ],
+                "readability": [
+                    item.model_dump(mode="json")
+                    for item in observations[event.event_id].readability
+                ],
+                "audio_role": (
+                    observations[event.event_id].audio_role.model_dump(mode="json")
+                    if observations[event.event_id].audio_role
+                    else None
                 ),
+                "observation_uncertainties": observations[
+                    event.event_id
+                ].uncertainties,
             }
             for event in card.events
         ],

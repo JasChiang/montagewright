@@ -27,6 +27,13 @@ from jascue_video_lab.clip_card_retrieval import (
     FeatureShortlistPlan,
     validate_feature_shortlist,
 )
+from jascue_video_lab.clip_card_observations import (
+    ClaimDecision,
+    ClipObservationSupplement,
+    EditingClaim,
+    assess_editing_claim,
+    effective_event_observations,
+)
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.gemini import (
     GeminiLabClient,
@@ -894,7 +901,10 @@ def compact_card(card: FullClipCard) -> dict[str, object]:
     }
 
 
-def compact_card_v3(card: FullClipCard) -> dict[str, object]:
+def compact_card_v3(
+    card: FullClipCard,
+    supplements: tuple[ClipObservationSupplement, ...] = (),
+) -> dict[str, object]:
     """Compact selection evidence without locally derivable relation mirrors.
 
     The model still sees every event and the entity IDs needed to choose a take,
@@ -902,6 +912,7 @@ def compact_card_v3(card: FullClipCard) -> dict[str, object]:
     or card-layout records that are irrelevant to editorial ranking.
     """
 
+    observations = effective_event_observations(card, supplements)
     return {
         "source_asset_id": card.source_asset_id,
         "duration_ms": card.duration_ms,
@@ -937,10 +948,25 @@ def compact_card_v3(card: FullClipCard) -> dict[str, object]:
                 "required_entity_ids": event.required_entity_ids,
                 "optional_entity_ids": event.optional_entity_ids,
                 "avoid_overlay_entity_ids": event.avoid_overlay_entity_ids,
-                "portrait_attention_sequence": [
-                    phase.model_dump(mode="json")
-                    for phase in event.portrait_attention_sequence
+                "observation_capabilities": observations[
+                    event.event_id
+                ].capabilities.model_dump(mode="json"),
+                "observable_beats": [
+                    beat.model_dump(mode="json")
+                    for beat in observations[event.event_id].observable_beats
                 ],
+                "evidence_roles": observations[
+                    event.event_id
+                ].evidence_roles.model_dump(mode="json"),
+                "readability": [
+                    item.model_dump(mode="json")
+                    for item in observations[event.event_id].readability
+                ],
+                "audio_role": (
+                    observations[event.event_id].audio_role.model_dump(mode="json")
+                    if observations[event.event_id].audio_role
+                    else None
+                ),
                 "grounding_target_entity_ids": [
                     target.entity_id for target in event.grounding_targets
                 ],
@@ -1062,6 +1088,7 @@ def validate_plan_contract_v3(
     brief: FeatureEditBrief,
     catalog: RushesCatalog,
     cards: dict[str, FullClipCard],
+    supplements: dict[str, list[ClipObservationSupplement]] | None = None,
 ) -> None:
     """Validate model choices while deriving no semantic values from the model."""
 
@@ -1072,6 +1099,14 @@ def validate_plan_contract_v3(
         raise ValueError("plan must preserve every brief chapter exactly once and in order")
     frames = {frame.frame_id: frame for frame in catalog.frames}
     clips = {clip.clip_id: clip for clip in catalog.clips}
+    supplements = supplements or {}
+    observations_by_asset = {
+        asset_id: effective_event_observations(
+            card,
+            supplements.get(asset_id, ()),
+        )
+        for asset_id, card in cards.items()
+    }
     for chapter in plan.chapters:
         if chapter.evidence_status == "not_found":
             continue
@@ -1118,6 +1153,71 @@ def validate_plan_contract_v3(
                     f"candidate focus entities are not backed by its event: "
                     f"{candidate.candidate_id}/{unknown}"
                 )
+            proposal = candidate.virtual_camera_proposal
+            if proposal is not None and proposal.composition_mode in {
+                "sequential_focus",
+                "joint_relation",
+            }:
+                observation = observations_by_asset[candidate.source_asset_id][
+                    candidate.event_id
+                ]
+                claim = (
+                    EditingClaim.SEQUENTIAL_VIRTUAL_CAMERA
+                    if proposal.composition_mode == "sequential_focus"
+                    else EditingClaim.SIMULTANEOUS_RELATION
+                )
+                decision = assess_editing_claim(observation, claim)
+                if decision.decision != ClaimDecision.READY:
+                    raise ValueError(
+                        "virtual camera claim lacks assessed observation evidence: "
+                        f"{candidate.candidate_id}/{claim.value}/"
+                        f"{decision.decision.value}/"
+                        f"missing={decision.missing_capabilities}/"
+                        f"unavailable={decision.unavailable_capabilities}"
+                    )
+                phase_entity_ids = {
+                    entity_id
+                    for phase in proposal.phases
+                    for entity_id in phase.anchor_entity_ids
+                }
+                if proposal.composition_mode == "sequential_focus":
+                    observed_entity_ids = {
+                        entity_id
+                        for beat in observation.observable_beats
+                        for entity_id in beat.entity_ids
+                    }
+                    unobserved = sorted(phase_entity_ids - observed_entity_ids)
+                    if unobserved:
+                        raise ValueError(
+                            "sequential virtual camera references anchors without "
+                            f"observable beats: {candidate.candidate_id}/{unobserved}"
+                        )
+                    simultaneous_conflicts = [
+                        beat.beat_id
+                        for beat in observation.observable_beats
+                        if beat.relation_mode == "simultaneous_required"
+                        and len(set(beat.entity_ids) & phase_entity_ids) >= 2
+                    ]
+                    if simultaneous_conflicts:
+                        raise ValueError(
+                            "sequential virtual camera would split a simultaneous "
+                            "evidence obligation: "
+                            f"{candidate.candidate_id}/{simultaneous_conflicts}"
+                        )
+                else:
+                    simultaneous_sets = [
+                        set(beat.entity_ids)
+                        for beat in observation.observable_beats
+                        if beat.relation_mode == "simultaneous_required"
+                    ]
+                    required = set(candidate.required_entity_ids) or phase_entity_ids
+                    if not any(
+                        required <= entity_ids for entity_ids in simultaneous_sets
+                    ):
+                        raise ValueError(
+                            "joint relation lacks one observable beat containing "
+                            f"all required entities: {candidate.candidate_id}"
+                        )
             # Clip Card primary/required roles describe the source event, not
             # an immutable crop contract for every downstream brief.  A
             # brief-specific candidate may intentionally focus on a subset.
@@ -1817,6 +1917,13 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--supplement",
+        type=Path,
+        action="append",
+        default=[],
+        help="Repeatable validated ClipObservationSupplement JSON.",
+    )
+    parser.add_argument(
         "--music",
         type=Path,
         help=(
@@ -1870,6 +1977,10 @@ def main() -> int:
         if card.source_asset_id != expected_asset:
             raise ValueError(f"Clip Card asset mismatch for {clip.clip_id}")
         cards[expected_asset] = card
+    supplements: dict[str, list[ClipObservationSupplement]] = {}
+    for path in args.supplement:
+        supplement = ClipObservationSupplement.model_validate(read_json(path))
+        supplements.setdefault(supplement.source_asset_id, []).append(supplement)
 
     shortlist: FeatureShortlistPlan | None = None
     shortlist_path: Path | None = None
@@ -1931,7 +2042,9 @@ def main() -> int:
         evidence: list[dict[str, object]] = [
             {
                 "clip_id": asset_to_clip[asset_id].clip_id,
-                "clip_card": compact_card_v3(card),
+                "clip_card": compact_card_v3(
+                    card, tuple(supplements.get(asset_id, []))
+                ),
                 "available_catalog_frames": frame_map[asset_id],
             }
             for asset_id, card in cards.items()
@@ -1946,7 +2059,10 @@ def main() -> int:
             candidate_events: list[dict[str, object]] = []
             for candidate in chapter.candidates:
                 card = cards[candidate.source_asset_id]
-                compact = compact_card_v3(card)
+                compact = compact_card_v3(
+                    card,
+                    tuple(supplements.get(candidate.source_asset_id, [])),
+                )
                 compact["events"] = [
                     event
                     for event in compact["events"]  # type: ignore[index]
@@ -2000,7 +2116,7 @@ def main() -> int:
 6. 9:16 應把 brief 的 vertical_primary_target_description 視為內容優先序，不是強制演算法。只有需要動態跟隨且存在可靠 target 時才用 tracked_crop；若穩定構圖已可保留內容，或窄裁切無法安全包含必要範圍，可以使用 fit_with_background。不得只因 brief 有 primary target 就強制 tracked_crop。
 7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。只分類與這次構圖決策直接相關的 entity；未列入者不會被程式偷偷視為 required 或 sacrificable。不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
 8. framing_intent 只需簡潔描述本候選的構圖取捨；不得輸出座標、bbox、mask、target description 或 verbose region contract。程式會把這些 entity priority ID 與 Clip Card entity/grounding target 資料轉成 domain-neutral hard-core、soft-extent 與 overlay keepout regions。
-8a. 若同一個 source event 有兩個以上「依序重要、但不必同時出現在單一 9:16 crop」的可追蹤 entity，可以提出 virtual_camera_proposal；否則必須為 null。順序必須引用 Clip Card 的 portrait_attention_sequence 或其他直接可見的動作、視線、結果揭露／資訊交接證據；evidence 沒有記錄順序時不得自行發明。方向可以左→右、右→左、人物→結果、整體→細節或完全不動，不得使用固定方向模板。phase 的 anchor_entity_ids 只能引用同 candidate 的 required_entity_ids 或 preferred_entity_ids；observable_predicate 與 transition_condition 必須描述可直接觀察的條件，不能引用常識、品牌知識或自創 timestamp。start_progress／end_progress 只表達連續覆蓋 0–1 的相對敘事順序。一般跟隨優先使用 follow_deadband，只有每一段移動都承載動作證據時才使用 follow；push_in 用於可見細節／結果逐漸成為重點，pull_out 用於回到整體關係，punch_in_cut 用於明確資訊落點的硬切放大，hold 用於固定構圖。不得輸出倍率、速度、easing 或曲線；本機會依來源解析度、距離、時長、速度、加速度與 jerk 決定安全運鏡，必要時將過短的遠距平移改為 cut。兩個 entity 的關係必須同時可見時用 joint_relation 並在同一 phase 引用兩者，不可假裝可依序裁掉。自動 proposal 不授權裁切 active anchor；後續 Grounding、SAM、containment 與 motion gate 失敗時會改試下一個候選或回退。
+8a. 若同一個 source event 有兩個以上「依序重要、但不必同時出現在單一 9:16 crop」的可追蹤 entity，可以提出 virtual_camera_proposal；否則必須為 null。順序只能引用 Clip Card 的 observable_beats 與 evidence_roles；observable_beats capability 若為 not_assessed、assessed_absent 或 not_applicable，不得自行發明注意力順序或 camera behavior。方向可以左→右、右→左、人物→結果、整體→細節或完全不動，不得使用固定方向模板。simultaneous_required beat 的 entity 必須在同一 phase 共同保留；shared_context_required 或 relative_scale_required 時，不得用會破壞共同參照或相對尺度的獨立特寫取代。phase 的 anchor_entity_ids 只能引用同 candidate 的 required_entity_ids 或 preferred_entity_ids；observable_predicate 與 transition_condition 必須描述可直接觀察的條件，不能引用常識、品牌知識或自創 timestamp。start_progress／end_progress 只表達連續覆蓋 0–1 的相對敘事順序。一般跟隨優先使用 follow_deadband，只有每一段移動都承載動作證據時才使用 follow；push_in 用於可見細節／結果逐漸成為重點，pull_out 用於回到整體關係，punch_in_cut 用於明確資訊落點的硬切放大，hold 用於固定構圖。不得輸出倍率、速度、easing 或曲線；本機會依來源解析度、距離、時長、速度、加速度與 jerk 決定安全運鏡，必要時將過短的遠距平移改為 cut。自動 proposal 不授權裁切 active anchor；後續 Grounding、SAM、containment 與 motion gate 失敗時會改試下一個候選或回退。
 9. 每個 supported／partial chapter 應依可見資訊、動作完整性、閱讀需求、情緒停留、重複壓力與音樂角色提出 recommended_duration_seconds、duration_rationale 與 attention_observation。minimum／recommended／maximum dwell 必須依序排列；attention 各分量 0–1，只是待審相對判斷，不是 source timestamp 或客觀真值。action_progress 表示到片段結尾時動作／結果已完成、適合轉場的程度。
 9a. {"本次另附實際音樂，music_sha256=" + music_sha256 + "。你必須實際聆聽音訊，依可聽見的段落、能量、留白與收尾安排候選及相對停留；不得只依文字猜音樂，也不得輸出自創 beat timestamp。" if music_sha256 is not None else "本次沒有附音樂；不得推測不存在的節拍、段落或能量變化。"}
 10. bbox、mask、crop 座標與精確 cut point 均由後續 Grounding／tracker／FFmpeg 處理；本階段不得輸出座標。
@@ -2176,7 +2292,13 @@ model_provenance 必須先原樣回傳：
         )
         interaction_id = str(raw_interaction.get("id") or "")
         plan = ClipCardFeaturePlanV3.model_validate_json(output_text)
-        validate_plan_contract_v3(plan, brief=brief, catalog=catalog, cards=cards)
+        validate_plan_contract_v3(
+            plan,
+            brief=brief,
+            catalog=catalog,
+            cards=cards,
+            supplements=supplements,
+        )
         validate_shortlist_membership(plan)
         if plan.model_provenance.model_id != MODEL_ID:
             raise ValueError(
@@ -2242,6 +2364,7 @@ model_provenance 必須先原樣回傳：
                         brief=brief,
                         catalog=catalog,
                         cards=cards,
+                        supplements=supplements,
                     )
                     validate_shortlist_membership(plan)
                     interaction_id = getattr(current, "id", None) or ""

@@ -106,6 +106,22 @@ Local derived schema
 
 即使第二個模型只讀 Clip Cards，也必須另設 claim validator：逐條比對輸出旁白中的型號、畫素、倍率與功能名稱是否能從 brief deterministic 對回。模型在 uncertainties 中指出素材型號衝突，不代表衝突本身一定正確，也不代表它不會同時寫出肯定旁白；Structured Output 通過同樣不代表 OCR 或數值換算正確。任何疑似錯型號、可見浮水印或不一致標牌都應 fail closed，進入 `needs_human_review`，再由 orientation-corrected 原始影格確認。不得只憑 Clip Card OCR 自動淘汰素材，也不得由 narrative planner 自行決定採用。
 
+### 4.6 Base Clip Card＋capability supplement
+
+Base Clip Card 維持跨 brief 可重用，只回答內容召回需要的事實；空的 legacy attention 欄位一律代表 `not_assessed`，不能推論成「事件中沒有注意力轉移」。剪輯需求形成後才建立 Top‑K frontier，並對其中確實需要完整動作、多人關係、可讀區域或現場音判斷的事件，製作含前後上下文的 bounded proxy。一次 Gemini observation 可同時補齊多個 capability，不會為每個 capability 重送一次影片。
+
+補件保存 observation basis、Base Card hash、event fingerprint、prompt／schema hash與 File API source binding。只有完整影片或含前後上下文的 bounded video 可以產生 `assessed_absent`；抽樣格與 contact sheet 只能產生 `not_assessed` 或直接觀察到的 `assessed_present`。多份 active supplement 對同一 capability 的 payload 不一致時 fail closed；新版本只能以明確 `supersedes` 取代舊版本，不能使用 created time 或 confidence 自動選勝者。
+
+能力 gate 以主張為單位，而不是素材為單位：
+
+- Topical retrieval 不要求 supplement。
+- 宣稱有完整 trim 才要求 action structure。
+- 多 anchor 依序虛擬鏡頭要求 evidence roles＋observable beats。
+- 同框關係要求 evidence roles，且 joint proposal 必須有包含所有必要 Entity 的 simultaneous beat。
+- 可讀內容與 source audio 主張各自要求 readability／audio role。
+
+因此缺少多人順序資料時，素材仍可留在語意候選庫，但 planner 不得自行發明 `sequential_focus`。本機 contract 會再次檢查 proposal anchor 是否存在於已評估 beats，並阻擋把 `simultaneous_required` 關係拆成先後特寫。
+
 ### 5. Adaptive dense refinement
 
 對每個候選區間建立第二層影格 ID：

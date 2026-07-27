@@ -7,6 +7,17 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from jascue_video_lab.clip_card_observations import (
+    AssessmentStatus,
+    ClipObservationSupplement,
+    EventCapabilityManifest,
+    EventObservationSupplement,
+    EvidenceRoleMap,
+    ObservationBasis,
+    ObservableBeat,
+    clip_card_sha256,
+    event_fingerprint,
+)
 from jascue_video_lab.models import (
     BoundaryPrecision,
     CardOpportunity,
@@ -185,6 +196,53 @@ def _catalog() -> RushesCatalog:
         ],
         analysis_reel_path="/analysis.mp4",
         generated_at="2026-07-22T00:00:00+00:00",
+    )
+
+
+def _camera_supplement(card: FullClipCard) -> ClipObservationSupplement:
+    event = card.events[0]
+    return ClipObservationSupplement(
+        supplement_id="camera-observation",
+        source_asset_id=card.source_asset_id,
+        proxy_asset_id=card.proxy_asset_id,
+        base_card_sha256=clip_card_sha256(card),
+        supplement_prompt_sha256="c" * 64,
+        response_schema_sha256="d" * 64,
+        event_observations=[
+            EventObservationSupplement(
+                event_id=event.event_id,
+                event_fingerprint=event_fingerprint(event),
+                observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+                capabilities=EventCapabilityManifest(
+                    evidence_roles=AssessmentStatus.ASSESSED_PRESENT,
+                    observable_beats=AssessmentStatus.ASSESSED_PRESENT,
+                ),
+                evidence_roles=EvidenceRoleMap(
+                    primary_subject_ids=["subject-1"],
+                    context_anchor_ids=["sign-1"],
+                    observable_reason="The sign establishes context before the action.",
+                ),
+                observable_beats=[
+                    ObservableBeat(
+                        beat_id="sign-first",
+                        kind="setup",
+                        entity_ids=["sign-1"],
+                        relation_mode="sequentially_reconstructable",
+                        observable_predicate="The sign is directly visible first.",
+                        transition_condition="The subject begins the visible action.",
+                    ),
+                    ObservableBeat(
+                        beat_id="subject-second",
+                        kind="interaction",
+                        entity_ids=["subject-1"],
+                        relation_mode="sequentially_reconstructable",
+                        observable_predicate="The subject performs the visible action.",
+                        transition_condition="The visible action reaches a result.",
+                    ),
+                ],
+            )
+        ],
+        model_provenance=card.model_provenance,
     )
 
 
@@ -1007,7 +1065,7 @@ def test_v3_compact_card_omits_redundant_relation_expansion() -> None:
     assert event["grounding_target_entity_ids"] == ["subject-1"]
 
 
-def test_v3_compact_card_preserves_video_observed_attention_order() -> None:
+def test_v3_compact_card_preserves_observation_but_drops_camera_advice() -> None:
     card = _card()
     card.events[0].portrait_attention_sequence = [
         FullClipAttentionPhase(
@@ -1031,9 +1089,11 @@ def test_v3_compact_card_preserves_video_observed_attention_order() -> None:
     event = compact_card_v3(card)["events"][0]
 
     assert [
-        phase["anchor_entity_ids"]
-        for phase in event["portrait_attention_sequence"]
+        beat["entity_ids"]
+        for beat in event["observable_beats"]
     ] == [["sign-1"], ["subject-1"]]
+    assert event["observation_capabilities"]["observable_beats"] == "assessed_present"
+    assert all("suggested_camera_behavior" not in beat for beat in event["observable_beats"])
 
 
 def test_v3_projects_local_descriptions_and_regions_from_selected_evidence() -> None:
@@ -1121,6 +1181,7 @@ def test_v3_projects_entity_order_into_virtual_camera_region_order() -> None:
         brief=_brief(),
         catalog=_catalog(),
         cards=cards,
+        supplements={ASSET_ID: [_camera_supplement(cards[ASSET_ID])]},
     )
     evidence = build_selected_clip_card_evidence(plan, cards=cards)
     projected = project_feature_contracts_v3(
@@ -1137,6 +1198,50 @@ def test_v3_projects_entity_order_into_virtual_camera_region_order() -> None:
         ["candidate-a.required.subject-1"],
     ]
     assert proposal.phases[0].observable_predicate.startswith("The sign")
+
+
+def test_v3_rejects_sequential_camera_without_observation_supplement() -> None:
+    payload = _v3_plan().model_dump(mode="python")
+    chapter = payload["chapters"][0]
+    chapter["vertical_candidate_id"] = "candidate-a"
+    chapter["candidates"][0]["virtual_camera_proposal"] = (
+        ClipCardVirtualCameraProposalV1(
+            composition_mode="sequential_focus",
+            phases=[
+                ClipCardVirtualCameraPhaseV1(
+                    phase_id="sign-first",
+                    start_progress=0.0,
+                    end_progress=0.5,
+                    anchor_entity_ids=["sign-1"],
+                    camera_behavior="hold",
+                    observable_predicate="The sign is directly visible.",
+                    transition_condition="The subject begins the action.",
+                    editorial_reason="Establish context.",
+                ),
+                ClipCardVirtualCameraPhaseV1(
+                    phase_id="subject-second",
+                    start_progress=0.5,
+                    end_progress=1.0,
+                    anchor_entity_ids=["subject-1"],
+                    camera_behavior="follow",
+                    transition_in="smoothstep",
+                    transition_duration_fraction=0.25,
+                    observable_predicate="The subject performs the action.",
+                    transition_condition="The action reaches its result.",
+                    editorial_reason="Follow the visible action.",
+                ),
+            ],
+            proposal_reason="Present context before action.",
+        ).model_dump(mode="python")
+    )
+    plan = ClipCardFeaturePlanV3.model_validate(payload)
+    with pytest.raises(ValueError, match="lacks assessed observation evidence"):
+        validate_plan_contract_v3(
+            plan,
+            brief=_brief(),
+            catalog=_catalog(),
+            cards={ASSET_ID: _card()},
+        )
 
 
 def test_v3_projection_is_reproducible_from_hash_bound_evidence(
