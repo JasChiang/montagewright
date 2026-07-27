@@ -2291,14 +2291,22 @@ def test_selected_framing_allows_scale_locked_sequential_comparison() -> None:
             {
                 "region_id": "subject-a",
                 "target_description": "the first visible subject",
+                "evidence_role": "relation_participant",
                 "role": "required",
             },
             {
                 "region_id": "subject-b",
                 "target_description": "the second visible subject",
+                "evidence_role": "relation_participant",
                 "role": "required",
             },
         ],
+        sequential_reconstruction={
+            "linkage_type": "scale_locked_comparison",
+            "linkage_region_ids": ["subject-a", "subject-b"],
+            "preserve_scale": True,
+            "observable_reason": "Both subjects share one source-camera scale.",
+        },
         virtual_camera_proposal=sequential,
         observed_evidence=["Both subjects are visible in the same source shot."],
         decision_reason="The same-scale views support a sequential comparison.",
@@ -2357,10 +2365,17 @@ def test_sequential_comparison_rejects_scale_changing_phase() -> None:
                 {
                     "region_id": region_id,
                     "target_description": f"the {region_id} visible subject",
+                    "evidence_role": "relation_participant",
                     "role": "required",
                 }
                 for region_id in ("subject-a", "subject-b")
             ],
+            sequential_reconstruction={
+                "linkage_type": "scale_locked_comparison",
+                "linkage_region_ids": ["subject-a", "subject-b"],
+                "preserve_scale": True,
+                "observable_reason": "Both subjects share one source-camera scale.",
+            },
             virtual_camera_proposal=sequential,
             observed_evidence=["Both subjects are visible."],
             decision_reason="Changing scale would invalidate the comparison.",
@@ -2416,10 +2431,16 @@ def test_selected_framing_allows_overlapping_multi_subject_handoff() -> None:
             {
                 "region_id": region_id,
                 "target_description": f"the {region_id} visible subject",
+                "evidence_role": "relation_participant",
                 "role": "required",
             }
             for region_id in ("left", "center", "right")
         ],
+        sequential_reconstruction={
+            "linkage_type": "shared_tracked_anchor",
+            "linkage_region_ids": ["center"],
+            "observable_reason": "The center subject appears in both phases.",
+        },
         virtual_camera_proposal=sequential,
         observed_evidence=["Three subjects form one visible group."],
         decision_reason="Overlapping phases preserve the group relationship.",
@@ -2468,11 +2489,13 @@ def test_selected_framing_group_coverage_requires_multiple_hard_members() -> Non
                 {
                     "region_id": "center",
                     "target_description": "the center visible group member",
+                    "evidence_role": "primary_subject",
                     "role": "required",
                 },
                 {
                     "region_id": "flanking-members",
                     "target_description": "the other visible group members",
+                    "evidence_role": "relation_participant",
                     "role": "preferred",
                     "minimum_visible_fraction": 0.3,
                 },
@@ -2523,6 +2546,7 @@ def test_selected_framing_group_coverage_accepts_atomic_compound_group() -> None
             {
                 "region_id": "compound-group",
                 "target_description": "the complete indivisible visible group",
+                "evidence_role": "primary_subject",
                 "role": "required",
                 "atomic": True,
             }
@@ -2584,10 +2608,16 @@ def test_selected_framing_group_coverage_accepts_overlapping_sequence() -> None:
             {
                 "region_id": region_id,
                 "target_description": f"the {region_id} visible member",
+                "evidence_role": "relation_participant",
                 "role": "required",
             }
             for region_id in ("first", "middle", "last")
         ],
+        sequential_reconstruction={
+            "linkage_type": "shared_tracked_anchor",
+            "linkage_region_ids": ["middle"],
+            "observable_reason": "The middle member appears in both phases.",
+        },
         virtual_camera_proposal=sequential,
         observed_evidence=["Three distinct members form one visible group."],
         decision_reason="The portrait camera covers the complete group over time.",
@@ -2622,6 +2652,7 @@ def test_selected_vertical_framing_runs_once_then_reuses_content_cache(
             {
                 "region_id": "primary",
                 "target_description": "the directly visible primary subject",
+                "evidence_role": "primary_subject",
                 "role": "required",
             }
         ],
@@ -2788,11 +2819,13 @@ def test_fit_framing_preserves_but_does_not_execute_surplus_camera_proposal() ->
             {
                 "region_id": "left",
                 "target_description": "the left visible subject",
+                "evidence_role": "relation_participant",
                 "role": "required",
             },
             {
                 "region_id": "right",
                 "target_description": "the right visible subject",
+                "evidence_role": "relation_participant",
                 "role": "required",
             },
         ],
@@ -2830,11 +2863,13 @@ def test_fit_framing_cannot_bypass_feasible_sequential_virtual_camera() -> None:
                 {
                     "region_id": "first",
                     "target_description": "the first visible comparison subject",
+                    "evidence_role": "relation_participant",
                     "role": "required",
                 },
                 {
                     "region_id": "second",
                     "target_description": "the second visible comparison subject",
+                    "evidence_role": "relation_participant",
                     "role": "required",
                 },
             ],
@@ -2875,11 +2910,13 @@ def test_strictly_simultaneous_relation_rejects_sequential_focus() -> None:
                 {
                     "region_id": "giver",
                     "target_description": "the visible giver at contact",
+                    "evidence_role": "relation_participant",
                     "role": "required",
                 },
                 {
                     "region_id": "receiver",
                     "target_description": "the visible receiver at contact",
+                    "evidence_role": "relation_participant",
                     "role": "required",
                 },
             ],
@@ -2913,6 +2950,133 @@ def test_strictly_simultaneous_relation_rejects_sequential_focus() -> None:
             observed_evidence=["The transfer exists only while both people touch it."],
             decision_reason="The exact contact must remain simultaneous.",
             confidence=0.8,
+            model_provenance=ModelProvenance(
+                model_id=MODEL_ID,
+                api="gemini_interactions",
+                sdk="google-genai",
+                sdk_version="test",
+                run_id="test",
+                generated_at="test",
+            ),
+        )
+
+
+def test_phase_mixed_relation_requires_joint_and_single_anchor_phases() -> None:
+    proposal = SelectedVerticalFramingProposal(
+        candidate_id="candidate-mixed-interaction",
+        source_asset_id="sha256:" + "f" * 64,
+        event_id="event-mixed-interaction",
+        frame_id="RF000001",
+        semantic_requirement="simultaneous_relation",
+        relation_temporal_mode="phase_mixed",
+        recommended_action="tracked_crop",
+        regions=[
+            {
+                "region_id": "speaker",
+                "target_description": "the visible speaking participant",
+                "evidence_role": "relation_participant",
+                "role": "required",
+            },
+            {
+                "region_id": "listener",
+                "target_description": "the visible reacting participant",
+                "evidence_role": "relation_participant",
+                "role": "required",
+            },
+        ],
+        virtual_camera_proposal=VerticalVirtualCameraProposal(
+            composition_mode="mixed_relation",
+            phases=[
+                VerticalVirtualCameraProposalPhase(
+                    phase_id="shared-reaction",
+                    start_progress=0.0,
+                    end_progress=0.4,
+                    anchor_region_ids=["speaker", "listener"],
+                    observable_predicate="Both participants visibly react together.",
+                    transition_condition="One participant begins a solo answer.",
+                    editorial_reason="Preserve the simultaneous reaction.",
+                ),
+                VerticalVirtualCameraProposalPhase(
+                    phase_id="solo-answer",
+                    start_progress=0.4,
+                    end_progress=1.0,
+                    anchor_region_ids=["speaker"],
+                    observable_predicate="The speaker continues the answer.",
+                    transition_condition="Hold through the end.",
+                    editorial_reason="Use a readable single-person portrait.",
+                ),
+            ],
+            proposal_reason="The interaction mixes joint and solo evidence.",
+        ),
+        sequential_reconstruction={
+            "linkage_type": "shared_tracked_anchor",
+            "linkage_region_ids": ["speaker"],
+            "observable_reason": "The speaker remains visible across both phases.",
+        },
+        presentation_options=_portrait_presentation_options(
+            sequential="feasible",
+        ),
+        observed_evidence=[
+            "A shared reaction is followed by a solo answer in the same shot."
+        ],
+        decision_reason="The temporal requirement changes between phases.",
+        confidence=0.8,
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    assert proposal.virtual_camera_proposal is not None
+    assert proposal.virtual_camera_proposal.composition_mode == "mixed_relation"
+
+
+def test_uncertain_relation_cannot_authorize_tracked_crop() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="uncertain temporal relation cannot authorize tracked crop",
+    ):
+        SelectedVerticalFramingProposal(
+            candidate_id="candidate-uncertain",
+            source_asset_id="sha256:" + "0" * 64,
+            event_id="event-uncertain",
+            frame_id="RF000001",
+            semantic_requirement="simultaneous_relation",
+            relation_temporal_mode="uncertain",
+            recommended_action="tracked_crop",
+            regions=[
+                {
+                    "region_id": "subject",
+                    "target_description": "the visible subject",
+                    "evidence_role": "primary_subject",
+                    "role": "required",
+                }
+            ],
+            virtual_camera_proposal=VerticalVirtualCameraProposal(
+                composition_mode="single_anchor_hold",
+                phases=[
+                    VerticalVirtualCameraProposalPhase(
+                        phase_id="hold",
+                        start_progress=0.0,
+                        end_progress=1.0,
+                        anchor_region_ids=["subject"],
+                        observable_predicate="The subject remains visible.",
+                        transition_condition="No reliable transition is visible.",
+                        editorial_reason="This crop must not be authorized.",
+                    )
+                ],
+                proposal_reason="The relation evidence is insufficient.",
+            ),
+            presentation_options=_portrait_presentation_options(
+                single="feasible",
+            ),
+            observed_evidence=["The wider relationship cannot be confirmed."],
+            decision_reason="Insufficient evidence requires review.",
+            confidence=0.5,
             model_provenance=ModelProvenance(
                 model_id=MODEL_ID,
                 api="gemini_interactions",
@@ -5678,6 +5842,7 @@ def test_simultaneous_relation_rejects_one_unbound_atomic_core() -> None:
                 {
                     "region_id": "contact-core",
                     "target_description": "the visible contact boundary",
+                    "evidence_role": "relation_carrier",
                     "role": "required",
                     "atomic": True,
                     "observable_relations": ["reference touches subject edge"],
@@ -5735,6 +5900,7 @@ def test_selected_framing_cannot_weaken_group_coverage() -> None:
             {
                 "region_id": "one",
                 "target_description": "one visible participant",
+                "evidence_role": "primary_subject",
                 "role": "required",
             }
         ],

@@ -104,6 +104,12 @@
 - 若 A 與 B 的關係可依序重建，候選不得只因橫向過寬就留空 proposal。應建立
   兩個可 Grounding 的 required region 與 `sequential_focus` phases；順序由
   畫面實際資訊流決定，不得固定左→右。
+- 若同一候選先後包含可依序觀看與必須同框的語意區段，不得以單一全片
+  `hold` 或全片 sequential 隱藏差異；保留可觀察的 phase 切換證據，讓
+  selected-clip refinement 使用 `phase_mixed` 與 joint／single-anchor phases。
+- required region 不只可以是人物或主要物件。若手勢、移動物、指向、UI 結果、
+  計分、標誌、終點線、圖表或共同尺度參照被裁掉後會改變事件意義，也必須
+  以可 Grounding 的最小 required region 保存；不得只保住主體本身。
 - 自動 proposal 不得授權裁掉 anchor。本機只會以 100% active-anchor
   containment 執行；任何 intentional clipping 都必須另有人工 policy。
 

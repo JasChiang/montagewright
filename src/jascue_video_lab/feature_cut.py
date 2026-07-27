@@ -7109,6 +7109,11 @@ def _refine_selected_vertical_candidate(
         "recommended_action": proposal.recommended_action,
         "semantic_requirement": proposal.semantic_requirement,
         "relation_temporal_mode": proposal.relation_temporal_mode,
+        "sequential_reconstruction": (
+            proposal.sequential_reconstruction.model_dump(mode="json")
+            if proposal.sequential_reconstruction is not None
+            else None
+        ),
         "presentation_options": [
             option.model_dump(mode="json")
             for option in proposal.presentation_options

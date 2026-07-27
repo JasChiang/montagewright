@@ -2011,6 +2011,7 @@ class VerticalVirtualCameraProposal(StrictModel):
         "single_anchor_follow",
         "sequential_focus",
         "joint_relation",
+        "mixed_relation",
     ]
     phases: list[VerticalVirtualCameraProposalPhase] = Field(
         min_length=1,
@@ -2059,6 +2060,16 @@ class VerticalVirtualCameraProposal(StrictModel):
             raise ValueError(
                 "joint-relation composition requires at least one multi-anchor phase"
             )
+        if self.composition_mode == "mixed_relation":
+            if not any(
+                len(phase.anchor_region_ids) >= 2 for phase in self.phases
+            ) or not any(
+                len(phase.anchor_region_ids) == 1 for phase in self.phases
+            ):
+                raise ValueError(
+                    "mixed-relation composition requires both joint and "
+                    "single-anchor phases"
+                )
         return self
 
 
@@ -3504,6 +3515,13 @@ class FramingRegionIntent(StrictModel):
     kind: Literal["subject", "text_region", "ui_region", "graphic", "other"] = (
         "subject"
     )
+    evidence_role: Literal[
+        "primary_subject",
+        "relation_participant",
+        "relation_carrier",
+        "state_evidence",
+        "context_reference",
+    ] = "primary_subject"
     role: Literal["required", "preferred", "avoid_overlay"] = "required"
     atomic: bool = Field(
         default=False,
@@ -3611,6 +3629,13 @@ class _SelectedFramingRegionBase(StrictModel):
     kind: Literal["subject", "text_region", "ui_region", "graphic", "other"] = (
         "subject"
     )
+    evidence_role: Literal[
+        "primary_subject",
+        "relation_participant",
+        "relation_carrier",
+        "state_evidence",
+        "context_reference",
+    ]
     observable_relations: list[str] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
 
@@ -3680,6 +3705,34 @@ class VerticalPresentationOptionAssessment(StrictModel):
     observable_reason: str = Field(min_length=1, max_length=800)
 
 
+class SequentialReconstructionContract(StrictModel):
+    """Evidence needed to preserve meaning across separate portrait phases."""
+
+    linkage_type: Literal[
+        "joint_establishing_phase",
+        "shared_tracked_anchor",
+        "visible_transition",
+        "ordered_state_change",
+        "scale_locked_comparison",
+    ]
+    linkage_region_ids: list[str] = Field(min_length=1, max_length=4)
+    preserve_scale: bool = False
+    observable_reason: str = Field(min_length=1, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_reconstruction(self) -> "SequentialReconstructionContract":
+        if len(self.linkage_region_ids) != len(set(self.linkage_region_ids)):
+            raise ValueError("sequential linkage region IDs must be unique")
+        if (
+            self.linkage_type == "scale_locked_comparison"
+            and not self.preserve_scale
+        ):
+            raise ValueError(
+                "scale-locked comparison reconstruction must preserve scale"
+            )
+        return self
+
+
 class SelectedVerticalFramingProposal(StrictModel):
     """Full-clip semantic framing decision made after editorial selection.
 
@@ -3688,8 +3741,8 @@ class SelectedVerticalFramingProposal(StrictModel):
     identity.  Exact coordinates and motion remain downstream local work.
     """
 
-    contract_version: Literal["selected-vertical-framing-proposal-v2"] = (
-        "selected-vertical-framing-proposal-v2"
+    contract_version: Literal["selected-vertical-framing-proposal-v3"] = (
+        "selected-vertical-framing-proposal-v3"
     )
     candidate_id: str = Field(
         pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=64
@@ -3707,6 +3760,8 @@ class SelectedVerticalFramingProposal(StrictModel):
         "not_applicable",
         "simultaneous_required",
         "sequentially_reconstructable",
+        "phase_mixed",
+        "uncertain",
     ]
     recommended_action: Literal[
         "tracked_crop",
@@ -3715,6 +3770,7 @@ class SelectedVerticalFramingProposal(StrictModel):
     ]
     regions: list[SelectedFramingRegion] = Field(default_factory=list, max_length=8)
     virtual_camera_proposal: VerticalVirtualCameraProposal | None = None
+    sequential_reconstruction: SequentialReconstructionContract | None = None
     presentation_options: list[VerticalPresentationOptionAssessment] = Field(
         min_length=1,
         max_length=5,
@@ -3783,8 +3839,22 @@ class SelectedVerticalFramingProposal(StrictModel):
             and self.relation_temporal_mode == "not_applicable"
         ):
             raise ValueError(
-                "a simultaneous relation must declare whether simultaneity is "
-                "strictly required or sequentially reconstructable"
+                "a simultaneous relation must declare a strict, sequential, "
+                "mixed, or uncertain temporal mode"
+            )
+        if (
+            self.relation_temporal_mode == "phase_mixed"
+            and not multi_subject_requirement
+        ):
+            raise ValueError(
+                "phase-mixed temporal relations require a multi-subject framing"
+            )
+        if (
+            self.relation_temporal_mode == "uncertain"
+            and self.recommended_action == "tracked_crop"
+        ):
+            raise ValueError(
+                "an uncertain temporal relation cannot authorize tracked crop"
             )
         if self.recommended_action == "fit_or_layout":
             fit_assessment = option_by_mode.get("fit_or_layout")
@@ -3856,7 +3926,7 @@ class SelectedVerticalFramingProposal(StrictModel):
         if (
             self.semantic_requirement == "group_coverage"
             and proposal.composition_mode
-            not in {"sequential_focus", "joint_relation"}
+            not in {"sequential_focus", "joint_relation", "mixed_relation"}
             and not (
                 len(required) == 1
                 and any(
@@ -3869,7 +3939,7 @@ class SelectedVerticalFramingProposal(StrictModel):
         ):
             raise ValueError(
                 "group coverage requires sequential-focus, joint-relation, or "
-                "one held atomic compound group"
+                "mixed-relation phases, or one held atomic compound group"
             )
         if (
             self.semantic_requirement == "simultaneous_relation"
@@ -3896,12 +3966,78 @@ class SelectedVerticalFramingProposal(StrictModel):
                 "sequential-focus camera phases"
             )
         if (
+            self.relation_temporal_mode == "phase_mixed"
+            and proposal.composition_mode != "mixed_relation"
+        ):
+            raise ValueError(
+                "a phase-mixed temporal relation requires mixed-relation camera "
+                "phases"
+            )
+        if (
             self.relation_temporal_mode == "simultaneous_required"
             and proposal.composition_mode == "sequential_focus"
         ):
             raise ValueError(
                 "a strictly simultaneous relation cannot use sequential focus"
             )
+        if self.relation_temporal_mode in {
+            "sequentially_reconstructable",
+            "phase_mixed",
+        }:
+            reconstruction = self.sequential_reconstruction
+            if reconstruction is None:
+                raise ValueError(
+                    "sequential or phase-mixed framing requires an explicit "
+                    "reconstruction contract"
+                )
+            linkage_ids = set(reconstruction.linkage_region_ids)
+            unknown_linkage = sorted(linkage_ids - known_region_ids)
+            if unknown_linkage:
+                raise ValueError(
+                    "sequential reconstruction references unknown regions: "
+                    + ", ".join(unknown_linkage)
+                )
+            unreferenced_linkage = sorted(linkage_ids - referenced)
+            if unreferenced_linkage:
+                raise ValueError(
+                    "sequential reconstruction linkage regions must be used by "
+                    "camera phases: "
+                    + ", ".join(unreferenced_linkage)
+                )
+            if reconstruction.linkage_type == "joint_establishing_phase":
+                if not any(
+                    linkage_ids.issubset(set(phase.anchor_region_ids))
+                    for phase in proposal.phases
+                ):
+                    raise ValueError(
+                        "joint establishing reconstruction requires one phase "
+                        "that contains every linkage region"
+                    )
+            if reconstruction.linkage_type == "shared_tracked_anchor":
+                appearances = {
+                    region_id: sum(
+                        region_id in phase.anchor_region_ids
+                        for phase in proposal.phases
+                    )
+                    for region_id in linkage_ids
+                }
+                if not any(count >= 2 for count in appearances.values()):
+                    raise ValueError(
+                        "shared-anchor reconstruction requires a linkage region "
+                        "in at least two phases"
+                    )
+            if reconstruction.preserve_scale:
+                scale_changing = [
+                    phase.phase_id
+                    for phase in proposal.phases
+                    if phase.camera_behavior
+                    in {"push_in", "pull_out", "punch_in_cut"}
+                ]
+                if scale_changing:
+                    raise ValueError(
+                        "scale-preserving reconstruction cannot use scale-changing "
+                        f"phases: {scale_changing}"
+                    )
         if (
             self.semantic_requirement == "simultaneous_relation"
             and proposal.composition_mode == "sequential_focus"

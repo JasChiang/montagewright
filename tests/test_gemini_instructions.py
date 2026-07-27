@@ -52,11 +52,18 @@ def test_portrait_prompts_require_relation_timing_and_presentation_alternatives(
 
     assert "relation_temporal_mode" in selected
     assert "sequentially_reconstructable" in selected
+    assert "phase_mixed" in selected
+    assert "uncertain" in selected
+    assert "sequential_reconstruction" in selected
+    assert "relation_carrier" in selected
+    assert "state_evidence" in selected
+    assert "context_reference" in selected
     assert "presentation_options" in selected
     assert "sequential_virtual_camera" in selected
     assert "不得只說「太寬」就跳到固定中央裁切" in selected
     assert "相對大小本身不會自動要求全程同框" in coarse
     assert "不得固定左→右" in coarse
+    assert "required region 不只可以是人物或主要物件" in coarse
 
 
 def test_interactions_mime_type_normalizes_common_audio_aliases() -> None:
