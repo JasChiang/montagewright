@@ -39,6 +39,10 @@ from jascue_video_lab.clip_card_supplement_runner import (
     render_bounded_event_proxy,
 )
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
+from jascue_video_lab.editing_capabilities import (
+    EditingCapabilityCatalog,
+    simple_production_capability_catalog,
+)
 from jascue_video_lab.gemini import (
     GeminiLabClient,
     MODEL_ID,
@@ -57,6 +61,7 @@ from jascue_video_lab.models import (
     FullClipCard,
     ModelProvenance,
     RushesCatalog,
+    ShotFlowIntent,
     VerticalVirtualCameraProposal,
     VerticalVirtualCameraProposalPhase,
     VirtualCameraIntent,
@@ -463,6 +468,14 @@ class ClipCardFeatureCandidateV3(StrictModel):
     horizontal_focus_entity_id: str | None = None
     vertical_strategy: Literal["tracked_crop", "fit_with_background"]
     vertical_crop_mode: Literal["strict", "primary_center"] = "strict"
+    coverage_mode: Literal[
+        "simultaneous",
+        "sequential",
+        "relation_core",
+        "primary_with_context",
+        "independent_detail",
+    ] = "simultaneous"
+    allow_controlled_clip: bool = False
     framing_intent: str = Field(min_length=1, max_length=300)
     required_entity_ids: list[str] = Field(default_factory=list, max_length=4)
     preferred_entity_ids: list[str] = Field(default_factory=list, max_length=4)
@@ -484,6 +497,14 @@ class ClipCardFeatureCandidateV3(StrictModel):
             raise ValueError("original horizontal candidate must hold the camera")
         if self.vertical_strategy == "tracked_crop" and not self.required_entity_ids:
             raise ValueError("tracked_crop requires at least one required entity")
+        if self.allow_controlled_clip and self.vertical_crop_mode != "primary_center":
+            raise ValueError(
+                "controlled clipping requires primary_center crop mode"
+            )
+        if self.vertical_strategy == "fit_with_background" and self.allow_controlled_clip:
+            raise ValueError(
+                "fit-with-background cannot request controlled clipping"
+            )
         classified = (
             self.required_entity_ids
             + self.preferred_entity_ids
@@ -538,6 +559,7 @@ class ClipCardFeatureSelectV3(StrictModel):
     )
     duration_rationale: str | None = None
     attention_observation: AttentionObservation | None = None
+    flow_intent: ShotFlowIntent | None = None
 
     @model_validator(mode="after")
     def validate_selection(self) -> "ClipCardFeatureSelectV3":
@@ -605,6 +627,7 @@ class DirectVideoAttentionStep(StrictModel):
         "pull_out",
         "punch_in_cut",
     ]
+    transition_preference: Literal["auto", "continuous", "cut"] = "auto"
 
     @model_validator(mode="after")
     def validate_step(self) -> "DirectVideoAttentionStep":
@@ -646,6 +669,14 @@ class DirectVideoVerticalDecision(StrictModel):
     candidate_rank: int = Field(ge=1, le=4)
     strategy: Literal["tracked_crop", "fit_with_background"]
     crop_mode: Literal["strict", "primary_center"]
+    coverage_mode: Literal[
+        "simultaneous",
+        "sequential",
+        "relation_core",
+        "primary_with_context",
+        "independent_detail",
+    ]
+    allow_controlled_clip: bool = False
     framing_intent: str = Field(min_length=1, max_length=300)
     required_entity_indices: list[int] = Field(default_factory=list, max_length=4)
     preferred_entity_indices: list[int] = Field(default_factory=list, max_length=4)
@@ -670,6 +701,39 @@ class DirectVideoVerticalDecision(StrictModel):
             raise ValueError("tracked crop requires a visible required entity")
         if self.strategy == "fit_with_background" and self.attention_sequence:
             raise ValueError("fit-with-background cannot declare camera movement")
+        if self.strategy == "fit_with_background" and self.allow_controlled_clip:
+            raise ValueError("fit-with-background cannot request controlled clipping")
+        if self.coverage_mode == "simultaneous" and len(self.attention_sequence) > 1:
+            raise ValueError(
+                "simultaneous coverage cannot split evidence across phases"
+            )
+        if self.coverage_mode == "sequential":
+            if len(self.attention_sequence) < 2:
+                raise ValueError(
+                    "sequential coverage requires at least two attention phases"
+                )
+            unique_phase_anchors = {
+                index
+                for step in self.attention_sequence
+                for index in step.anchor_entity_indices
+            }
+            if len(unique_phase_anchors) < 2:
+                raise ValueError(
+                    "sequential coverage requires at least two distinct anchors"
+                )
+        if self.coverage_mode in {
+            "relation_core",
+            "primary_with_context",
+            "independent_detail",
+        } and self.strategy == "tracked_crop":
+            if self.crop_mode != "primary_center":
+                raise ValueError(
+                    "semantic-core coverage requires primary_center crop mode"
+                )
+            if not self.allow_controlled_clip:
+                raise ValueError(
+                    "semantic-core coverage must explicitly allow controlled clipping"
+                )
         if self.attention_sequence:
             if abs(self.attention_sequence[0].start_progress) > 1e-6:
                 raise ValueError("attention sequence must start at zero")
@@ -715,6 +779,8 @@ class DirectVideoChapterDecision(StrictModel):
         le=15.0,
     )
     duration_rationale: str | None = None
+    attention_observation: AttentionObservation | None = None
+    flow_intent: ShotFlowIntent | None = None
     confidence: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
@@ -724,6 +790,8 @@ class DirectVideoChapterDecision(StrictModel):
                 self.horizontal is not None
                 or self.vertical is not None
                 or self.recommended_duration_seconds is not None
+                or self.attention_observation is not None
+                or self.flow_intent is not None
             ):
                 raise ValueError("not-found chapter cannot contain edit decisions")
             return self
@@ -732,15 +800,24 @@ class DirectVideoChapterDecision(StrictModel):
             or self.vertical is None
             or self.recommended_duration_seconds is None
             or not self.duration_rationale
+            or self.attention_observation is None
+            or self.flow_intent is None
         ):
             raise ValueError(
-                "supported or partial chapter requires aspect and duration decisions"
+                "supported or partial chapter requires aspect, flow, and duration decisions"
             )
+        if not (
+            self.attention_observation.minimum_dwell_seconds
+            <= self.recommended_duration_seconds
+            <= self.attention_observation.maximum_dwell_seconds
+        ):
+            raise ValueError("recommended dwell lies outside attention bounds")
         return self
 
 
 class DirectVideoEditPlan(StrictModel):
-    contract_version: Literal["direct-video-edit-plan-v1"]
+    contract_version: Literal["direct-video-edit-plan-v2"]
+    capability_catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     title: str
     strategy_summary: str
     chapters: list[DirectVideoChapterDecision]
@@ -862,10 +939,11 @@ def canonicalize_direct_video_edit_plan_output(
     """Apply conservative, domain-neutral precedence to the compact plan.
 
     The model chooses ranks, entity roles, and attention intent. Local
-    canonicalization only removes contradictory duplicate classifications,
-    keeps every required entity visible through every declared attention
-    phase, and defaults an omitted 16:9 decision to the unmodified source
-    composition.
+    canonicalization only removes contradictory duplicate classifications and
+    defaults an omitted 16:9 decision to the unmodified source composition.
+    It deliberately preserves phase-local anchors: global coverage means that
+    every required entity must be observed somewhere, not that every entity
+    must remain visible in every phase.
     """
 
     payload = json.loads(output_text)
@@ -934,7 +1012,7 @@ def canonicalize_direct_video_edit_plan_output(
             if not isinstance(step, dict):
                 continue
             anchors_before = list(step.get("anchor_entity_indices") or [])
-            anchors = list(dict.fromkeys(anchors_before + required))
+            anchors = list(dict.fromkeys(anchors_before))
             step["anchor_entity_indices"] = anchors
             for index in anchors:
                 if index not in required and index not in preferred:
@@ -950,7 +1028,7 @@ def canonicalize_direct_video_edit_plan_output(
                         ),
                         "before": anchors_before,
                         "after": anchors,
-                        "rule": "required_entities_remain_visible_in_attention_phase",
+                        "rule": "phase_anchor_deduplication_without_global_injection",
                     }
                 )
         normalized_roles = {
@@ -1154,6 +1232,12 @@ def project_direct_video_edit_plan(
     shortlist and catalog artifacts.
     """
 
+    capability_catalog = simple_production_capability_catalog()
+    if plan.capability_catalog_sha256 != capability_catalog.definition_sha256():
+        raise ValueError(
+            "direct-video plan capability catalog differs from the local "
+            "executable capability set"
+        )
     expected_indices = list(range(1, len(brief.chapters) + 1))
     if [chapter.chapter_index for chapter in plan.chapters] != expected_indices:
         raise ValueError(
@@ -1233,7 +1317,11 @@ def project_direct_video_edit_plan(
             for step in decision.attention_sequence
             for entity_id in step.anchor_entity_indices
         }
-        if len(unique_entities) == 1:
+        if decision.coverage_mode == "simultaneous":
+            composition_mode = "joint_relation"
+        elif decision.coverage_mode == "sequential":
+            composition_mode = "sequential_focus"
+        elif len(unique_entities) == 1:
             composition_mode = (
                 "single_anchor_hold"
                 if all(
@@ -1250,7 +1338,11 @@ def project_direct_video_edit_plan(
         for index, step in enumerate(decision.attention_sequence, start=1):
             transition_in = (
                 "cut"
-                if index == 1 or step.camera_behavior == "punch_in_cut"
+                if (
+                    index == 1
+                    or step.camera_behavior == "punch_in_cut"
+                    or step.transition_preference == "cut"
+                )
                 else "smoothstep"
             )
             phases.append(
@@ -1397,6 +1489,16 @@ def project_direct_video_edit_plan(
                     horizontal_focus_entity_id=horizontal_focus_entity_id,
                     vertical_strategy=vertical_strategy,
                     vertical_crop_mode=vertical_crop_mode,
+                    coverage_mode=(
+                        direct_chapter.vertical.coverage_mode
+                        if rank == direct_chapter.vertical.candidate_rank
+                        else "simultaneous"
+                    ),
+                    allow_controlled_clip=(
+                        direct_chapter.vertical.allow_controlled_clip
+                        if rank == direct_chapter.vertical.candidate_rank
+                        else False
+                    ),
                     framing_intent=framing_intent,
                     required_entity_ids=required_entity_ids,
                     preferred_entity_ids=preferred_entity_ids,
@@ -1419,8 +1521,14 @@ def project_direct_video_edit_plan(
                 recommended_duration_seconds=(
                     direct_chapter.recommended_duration_seconds
                 ),
-                duration_rationale=direct_chapter.duration_rationale,
-                attention_observation=None,
+                duration_rationale=(
+                    f"{direct_chapter.duration_rationale} "
+                    f"Narrative role={direct_chapter.flow_intent.narrative_role}; "
+                    f"transition={direct_chapter.flow_intent.relation_to_previous}; "
+                    f"visible sync={direct_chapter.flow_intent.visual_sync_event}."
+                ),
+                attention_observation=direct_chapter.attention_observation,
+                flow_intent=direct_chapter.flow_intent,
             )
         )
     return ClipCardFeaturePlanV3(
@@ -2200,6 +2308,8 @@ def project_feature_contracts_v3(
                 selection_reason=candidate.selection_reason,
                 strategy=candidate.vertical_strategy,
                 crop_mode=candidate.vertical_crop_mode,
+                coverage_mode=candidate.coverage_mode,
+                allow_controlled_clip=candidate.allow_controlled_clip,
                 target_description=vertical_target(candidate),
                 regions=regions,
                 virtual_camera_proposal=_project_candidate_virtual_camera_v3(
@@ -2222,6 +2332,17 @@ def project_feature_contracts_v3(
         quality_risks = list(
             dict.fromkeys(horizontal_primary.quality_risks + vertical_primary.quality_risks)
         )
+        vertical_coverage_intent = {
+            "sequential": "sequential_attention",
+            "primary_with_context": "single_primary",
+            "independent_detail": "single_primary",
+        }.get(vertical_primary.coverage_mode)
+        if vertical_coverage_intent is None:
+            vertical_coverage_intent = (
+                "simultaneous_relation"
+                if len(vertical_primary.required_entity_ids) >= 2
+                else "single_primary"
+            )
         projected.append(
             FeatureChapterSelect(
                 feature_id=chapter.feature_id,
@@ -2238,6 +2359,14 @@ def project_feature_contracts_v3(
                 horizontal_target_description=horizontal_primary_target,
                 vertical_strategy=vertical_primary.vertical_strategy,
                 vertical_target_description=vertical_primary_target,
+                vertical_coverage_intent=vertical_coverage_intent,
+                vertical_coverage_target_descriptions=[
+                    _target_description(
+                        evidence_event(vertical_primary),
+                        entity_id,
+                    )
+                    for entity_id in vertical_primary.required_entity_ids
+                ],
                 quality_risks=quality_risks,
                 confidence=min(horizontal_primary.confidence, vertical_primary.confidence),
                 recommended_duration_seconds=(
@@ -2245,6 +2374,7 @@ def project_feature_contracts_v3(
                 ),
                 duration_rationale=chapter.duration_rationale,
                 attention_observation=chapter.attention_observation,
+                flow_intent=chapter.flow_intent,
                 horizontal_candidates=[
                     FeatureHorizontalCandidate(
                         candidate_id=candidate.candidate_id,
@@ -2521,11 +2651,32 @@ def reproject_direct_video_edit_plan(
     evidence_path = source_artifacts.get("selected_clip_card_evidence")
     shortlist_path = source_artifacts.get("feature_shortlist")
     manifest_path = source_artifacts.get("candidate_video_evidence_manifest")
+    capability_path = source_artifacts.get("editing_capability_catalog")
     if any(
         path is None
-        for path in (derived_path, evidence_path, shortlist_path, manifest_path)
+        for path in (
+            derived_path,
+            evidence_path,
+            shortlist_path,
+            manifest_path,
+            capability_path,
+        )
     ):
         raise ValueError("direct-video projection is missing local resolution artifacts")
+    bound_capabilities = EditingCapabilityCatalog.model_validate(
+        read_json(capability_path)
+    )
+    current_capabilities = simple_production_capability_catalog()
+    if source_plan.capability_catalog_sha256 != (
+        bound_capabilities.definition_sha256()
+    ):
+        raise ValueError("direct-video plan capability catalog binding changed")
+    if bound_capabilities.definition_sha256() != (
+        current_capabilities.definition_sha256()
+    ):
+        raise ValueError(
+            "saved direct-video plan targets a stale local capability catalog"
+        )
     derived = ClipCardFeaturePlanV3.model_validate(read_json(derived_path))
     selected_evidence = SelectedClipCardEvidence.model_validate(
         read_json(evidence_path)
@@ -2620,13 +2771,23 @@ def reproject_direct_video_edit_plan(
         if (
             vertical.vertical_strategy,
             vertical.vertical_crop_mode,
+            vertical.coverage_mode,
+            vertical.allow_controlled_clip,
             vertical.framing_intent,
         ) != (
             direct.vertical.strategy,
             direct.vertical.crop_mode,
+            direct.vertical.coverage_mode,
+            direct.vertical.allow_controlled_clip,
             direct.vertical.framing_intent,
         ):
             raise ValueError("derived vertical intent differs from direct decision")
+        if (
+            derived_chapter.attention_observation
+            != direct.attention_observation
+            or derived_chapter.flow_intent != direct.flow_intent
+        ):
+            raise ValueError("derived attention or flow intent differs from direct plan")
         selected_event = events[(vertical.source_asset_id, vertical.event_id)]
         known_entity_ids = {
             entity.entity_id for entity in selected_event.entities
@@ -2660,10 +2821,20 @@ def reproject_direct_video_edit_plan(
                     phase.start_progress,
                     phase.end_progress,
                     phase.camera_behavior,
+                    phase.transition_in,
                 ) != (
                     step.start_progress,
                     step.end_progress,
                     step.camera_behavior,
+                    (
+                        "cut"
+                        if (
+                            phase.phase_id == "phase-01"
+                            or step.camera_behavior == "punch_in_cut"
+                            or step.transition_preference == "cut"
+                        )
+                        else "smoothstep"
+                    ),
                 ):
                     raise ValueError("derived attention phase differs from direct plan")
                 if set(phase.anchor_entity_ids) - known_entity_ids:
@@ -3037,6 +3208,11 @@ def main() -> int:
             "每章只能從該 feature_id 下列出的 candidate_events 選擇；"
             "不得跨章引用未召回的 asset/event。"
         )
+    capability_catalog = simple_production_capability_catalog()
+    capability_catalog_path = args.output_dir / "editing-capability-catalog.json"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(capability_catalog_path, capability_catalog)
+    capability_catalog_sha256 = capability_catalog.definition_sha256()
     prompt = f"""
 你是 evidence-bound 的資深短影音挑帶剪輯師。請使用完整 Clip Card library，為使用者 brief 的每個 chapter 保留有排序的候選 take，再分別選出橫式與直式代表。你只能引用輸入列出的 source_asset_id、event_id、entity_id 與 RF frame_id。
 
@@ -3076,15 +3252,24 @@ model_provenance 必須先原樣回傳：
 你是 evidence-bound 的資深短影音剪輯師。請同時閱讀 brief、精簡候選索引，
 觀看後續每個有 feature_id 與 candidate_rank 標籤的 bounded candidate video，
 並實際聆聽最後附上的完整音樂。你的任務是提出一份精簡的剪輯意圖；
-不是產生剪點、座標或追蹤結果。
+不是產生剪點、座標或追蹤結果。你只能使用下方能力目錄列出的剪輯動詞；
+能力目錄說明本機確實能執行什麼，不是要求你每一種都使用。
 
 只能回傳：
 1. 每個 chapter_index 的橫式與直式各選哪一個 candidate_rank。
 2. 選擇理由、直接可見的證據、風險與建議停留秒數。
 3. 橫式是否保持原構圖，或對一個可見 entity 做有目的的推近／跟隨。
-4. 直式必須保留、最好保留、可犧牲的 entity_index。
-5. 若注意力確實依序轉移，使用 0–1 相對進度列出 attention_sequence；
-   若主體需同時比較或共同證明關係，放在同一 step，不得拆開。
+4. 直式 coverage_mode、是否允許 controlled semantic clip，以及全段必須曾被
+   看見、最好保留、可犧牲的 entity_index。
+5. 若注意力確實依序轉移，使用 0–1 相對進度列出 attention_sequence。
+   每個 phase 的 anchor 只代表該 phase 必須看見的主體；全段 required entity
+   不得被本機強塞進每個 phase。若關係必須同時存在，coverage_mode 使用
+   simultaneous 且不得拆成多 phase。
+6. 每章提供 attention_observation 與 flow_intent，描述資訊量、動作完成度、
+   閱讀需求、敘事角色、能量、前後鏡頭關係與 boundary_alignment。
+   visual_sync_event 只在影片中真的有可觀察落點時提供，並同時給
+   visual_sync_predicate 與 music_target；安靜訪談、空景或純 hold 可為 null。
+   這些是相對剪輯意圖，不是精確剪點。
 
 禁止回傳或推測：
 - project_id、catalog_id、feature_id、source_asset_id、event_id、frame_id、
@@ -3096,15 +3281,31 @@ model_provenance 必須先原樣回傳：
 
 構圖規則：
 - 9:16 優先採可安全滿版的 tracked_crop。只有必要關係或必要範圍無法在
-  9:16 同時成立時，才使用 fit_with_background；不要因為邊緣略有裁切就退回補邊。
+  9:16 同時成立，而且換候選也無法成立時，才使用 fit_with_background；
+  它只會產生非交付的人工 review preview。不要因為邊緣略有裁切就退回補邊。
+- coverage_mode=sequential：兩個以上主體可以依序看懂，每個 phase 只鎖自己的
+  anchor；本機可平移或在距離過遠時切換視角。
+- coverage_mode=relation_core：只需保留承載比較、接觸、方向或相對尺度的可見
+  核心，非關鍵物件邊緣可裁，必須 allow_controlled_clip=true。
+- coverage_mode=primary_with_context：主體為硬限制、上下文為軟限制；非必要
+  上下文可部分離開畫面，必須 allow_controlled_clip=true。
+- coverage_mode=independent_detail：細節本身足以成立，不要求整個物件始終完整，
+  必須 allow_controlled_clip=true。
 - attention_sequence 只描述「看誰」與「hold/follow/push/pull/punch」；
   後續本機會以 Gemini 單幀 bbox Grounding、SAM 與 geometry solver 執行。
+- transition_preference 可選 auto、continuous 或 cut。兩個 view 各自成立但距離
+  太遠時，cut 是正式剪輯語法；即使選 continuous，本機 motion gate 仍可改成 cut。
 - 沒有可見注意力轉移時，sequence 可以是空陣列；不得為了看起來有運鏡而發明移動。
 - candidate_rank 必須直接複製該章候選索引中的整數，不得引用未附影片的 rank。
 - chapter_index 與 entity_index 也只能複製輸入中的整數；本機會解析成不可變 ID。
-- 音樂只影響章節順序、相對停留與視覺落點意圖；不得自創 beat timestamp。
+- brief 章節順序必須保留。音樂影響相對停留、章節能量、鏡頭關係與視覺
+  落點意圖；不得自創 beat timestamp。本機 MusicMap 會解析合法影格與音訊點。
 
-contract_version 必須原樣回傳：direct-video-edit-plan-v1
+contract_version 必須原樣回傳：direct-video-edit-plan-v2
+capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
+
+## 本機可執行的版本化剪輯能力
+{capability_catalog.model_dump_json(indent=2)}
 
 ## 使用者 brief
 {brief.model_dump_json(indent=2)}
@@ -3363,6 +3564,9 @@ contract_version 必須原樣回傳：direct-video-edit-plan-v1
     canonical_output_path: Path
     normalization_audit_path: Path
     extra_projection_artifacts: dict[str, Path] = {}
+    extra_projection_artifacts["editing_capability_catalog"] = (
+        capability_catalog_path
+    )
     if music_path is not None:
         extra_projection_artifacts["source_music"] = music_path
     if args.reuse_raw_output:
@@ -3531,6 +3735,7 @@ contract_version 必須原樣回傳：direct-video-edit-plan-v1
             "original_request": artifacts["request"],
             "current_reprojection_request": reprojection_request_path,
             "raw_output_reuse_record": reuse_record_path,
+            "editing_capability_catalog": capability_catalog_path,
         }
     else:
         _assert_fresh_feature_namespace_empty(args.output_dir)
@@ -3708,7 +3913,7 @@ contract_version 必須原樣回傳：direct-video-edit-plan-v1
                 / "file_upload_final.json"
             )
     projection_contract_id = (
-        "direct-video-edit-plan-v1"
+        "direct-video-edit-plan-v2"
         if direct_video_plan_path.exists()
         else "clip-card-feature-cut-v3"
     )

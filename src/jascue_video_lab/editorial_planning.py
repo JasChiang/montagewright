@@ -112,6 +112,7 @@ def build_attention_profile(
                 quality_safe_capacity_seconds=(
                     round(capacity, 3) if capacity is not None else None
                 ),
+                flow_intent=selected.flow_intent,
                 rationale=rationale,
                 uncertainties=uncertainties,
                 requires_human_review=requires_review,
@@ -315,6 +316,15 @@ def build_rhythm_plan(
             priority = "low"
         else:
             priority = "normal"
+        boundary_alignment = (
+            chapter.flow_intent.boundary_alignment
+            if chapter.flow_intent is not None
+            else "free"
+        )
+        if boundary_alignment == "content_locked":
+            priority = "low"
+        elif boundary_alignment == "accent_preferred":
+            priority = "high"
         protected: list[str] = []
         transition: list[str] = []
         for value, reason in (
@@ -339,6 +349,8 @@ def build_rhythm_plan(
                 maximum_duration_seconds=chapter.maximum_dwell_seconds,
                 cut_pressure=pressure,
                 boundary_priority=priority,
+                boundary_alignment=boundary_alignment,
+                flow_intent=chapter.flow_intent,
                 protected_reasons=protected,
                 transition_reasons=transition,
                 evidence_authority=chapter.evidence_authority,

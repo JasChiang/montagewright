@@ -234,7 +234,7 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
             "selected_clip_card_evidence",
         ],
     },
-    "direct-video-edit-plan-v1": {
+    "direct-video-edit-plan-v2": {
         "source": (
             "compact rank-based editorial intent over hash-bound bounded "
             "candidate videos and supplied music"
@@ -257,6 +257,7 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
             "selected_clip_card_evidence",
             "feature_shortlist",
             "candidate_video_evidence_manifest",
+            "editing_capability_catalog",
         ],
     },
     "clip-card-feature-music-rerank-v1": {
@@ -780,7 +781,7 @@ def _current_external_projection_binding(
         "music_sha256",
         source_music_sha256,
     ):
-        if contract_id != "direct-video-edit-plan-v1":
+        if contract_id != "direct-video-edit-plan-v2":
             raise ValueError(
                 "external projection paid request does not bind the source music hash"
             )
@@ -6851,10 +6852,11 @@ def _controlled_primary_center_preview_allowed(
     """Gate a bounded, explicitly review-only portrait crop preview.
 
     Normal unattended delivery still requires complete hard-core containment.
-    This path is only reachable behind ``--allow-unverified-geometry-preview``
-    and an upstream ``primary_center`` framing choice. Eligibility is based on
+    This path is only reachable from an explicit upstream ``primary_center``
+    semantic plan (or the legacy preview switch). Eligibility is based on
     region semantics and measured geometry, never on a product or subject
-    category.
+    category. The result remains review-only and never becomes an unattended
+    delivery approval.
     """
 
     if crop_mode != "primary_center":
@@ -7366,7 +7368,10 @@ def _should_refine_selected_vertical_candidate(
 
     if not auto_vertical_framing or human_reframe_policy_requested:
         return False
-    if external_projection_contract_id == "direct-video-edit-plan-v1":
+    if external_projection_contract_id in {
+        "direct-video-edit-plan-v1",
+        "direct-video-edit-plan-v2",
+    }:
         return False
     return (
         feature_plan_origin != "external_projection"
@@ -9236,16 +9241,41 @@ def _resolve_editorial_chapter_durations(
                 if current_feature_id in rhythm_by_id
                 else "normal"
             )
+            boundary_alignment = (
+                rhythm_by_id[current_feature_id].boundary_alignment
+                if current_feature_id in rhythm_by_id
+                else "free"
+            )
             snap_window_ms = {
                 "low": 250,
                 "normal": 450,
                 "high": 650,
             }[boundary_priority]
-            allowed_cue_kinds = (
-                {"section_boundary", "downbeat"}
-                if boundary_priority == "low"
-                else {"section_boundary", "downbeat", "accent", "ending_hit"}
-            )
+            if boundary_alignment == "content_locked":
+                snap_window_ms = 0
+                allowed_cue_kinds: set[str] = set()
+            elif boundary_alignment == "phrase_preferred":
+                snap_window_ms = max(snap_window_ms, 650)
+                allowed_cue_kinds = {"section_boundary", "downbeat", "ending_hit"}
+            elif boundary_alignment == "accent_preferred":
+                snap_window_ms = max(snap_window_ms, 650)
+                allowed_cue_kinds = {
+                    "section_boundary",
+                    "downbeat",
+                    "accent",
+                    "ending_hit",
+                }
+            else:
+                allowed_cue_kinds = (
+                    {"section_boundary", "downbeat"}
+                    if boundary_priority == "low"
+                    else {
+                        "section_boundary",
+                        "downbeat",
+                        "accent",
+                        "ending_hit",
+                    }
+                )
             eligible = [
                 cue
                 for cue in cue_candidates
@@ -9293,6 +9323,7 @@ def _resolve_editorial_chapter_durations(
                     "music_cue_id": cue_id,
                     "music_cue_kind": cue_kind,
                     "rhythm_boundary_priority": boundary_priority,
+                    "flow_boundary_alignment": boundary_alignment,
                     "rhythm_snap_window_ms": snap_window_ms,
                 }
             )
@@ -10483,6 +10514,7 @@ def _run_feature_cut_experiment_impl(
                 )
                 candidate_attempts: list[dict[str, Any]] = []
                 deferred_fit: dict[str, Any] | None = None
+                deferred_full_bleed: dict[str, Any] | None = None
                 deferred_required_scope_fit: dict[str, Any] | None = None
                 selected_vertical: dict[str, Any] | None = None
                 for option_index, option in enumerate(vertical_options):
@@ -10750,8 +10782,10 @@ def _run_feature_cut_experiment_impl(
                             )
                         )
                         controlled_preview_requested = (
-                            allow_unverified_geometry_preview
-                            and candidate_crop_mode == "primary_center"
+                            candidate_crop_mode == "primary_center"
+                            and bool(
+                                option_data.get("allow_controlled_clip", False)
+                            )
                             and not human_reframe_policy_requested
                         )
                         candidate_query_lock: EvidenceQueryLockV2 | None = None
@@ -10824,7 +10858,7 @@ def _run_feature_cut_experiment_impl(
                             fallback_strategy=(
                                 brief.vertical_fallback_strategy
                                 if human_reframe_policy_requested
-                                else "fit_with_background"
+                                else "center_crop"
                             ),
                             checkpoint_path=checkpoint_path,
                             grounding_prompt=grounding_prompt,
@@ -10882,7 +10916,10 @@ def _run_feature_cut_experiment_impl(
                                 )
                             )
                             controlled_primary_center_allowed = (
-                                allow_unverified_geometry_preview
+                                (
+                                    allow_unverified_geometry_preview
+                                    or controlled_preview_requested
+                                )
                                 and _controlled_primary_center_preview_allowed(
                                     crop_mode=candidate_crop_mode,
                                     geometry=candidate_geometry,
@@ -10945,9 +10982,63 @@ def _run_feature_cut_experiment_impl(
                         )
                         if (
                             not hard_gate_passed
+                            and deferred_full_bleed is None
+                            and FailureCode.NO_FEASIBLE_PRESENTATION
+                            in failure_codes
+                        ):
+                            review_filter, review_geometry = (
+                                _vertical_delivery_fallback(
+                                    "center_crop",
+                                    reason=(
+                                        "all_phase_aware_full_bleed_geometry_"
+                                        "for_this_candidate_failed"
+                                    ),
+                                )
+                            )
+                            deferred_full_bleed = {
+                                "option": option_data,
+                                "frame": candidate_frame,
+                                "clip": candidate_clip,
+                                "media": candidate_media,
+                                "start_ms": candidate_start,
+                                "end_ms": candidate_end,
+                                "shot_id": candidate_shot,
+                                "trim": candidate_trim,
+                                "regions": candidate_regions,
+                                "target": candidate_target,
+                                "filter": review_filter,
+                                "geometry": {
+                                    **review_geometry,
+                                    "source_failed_geometry": {
+                                        "applied_strategy": (
+                                            candidate_geometry.get(
+                                                "applied_strategy"
+                                            )
+                                        ),
+                                        "fallback_reason": (
+                                            candidate_geometry.get(
+                                                "fallback_reason"
+                                            )
+                                        ),
+                                        "track_geometry_fingerprint": (
+                                            candidate_track_fingerprint
+                                        ),
+                                    },
+                                },
+                                "debugs": candidate_debugs,
+                                "track_fingerprint": (
+                                    candidate_track_fingerprint
+                                ),
+                            }
+                        if (
+                            not hard_gate_passed
                             and deferred_required_scope_fit is None
                             and FailureCode.NO_FEASIBLE_PRESENTATION
                             in failure_codes
+                            and option_data.get("strategy")
+                            == "fit_with_background"
+                            and brief.vertical_fallback_strategy
+                            == "fit_with_background"
                         ):
                             # A project preference for full bleed cannot turn a
                             # known semantic failure into a safe center crop.
@@ -11101,7 +11192,9 @@ def _run_feature_cut_experiment_impl(
 
                 if selected_vertical is None:
                     selected_vertical = (
-                        deferred_required_scope_fit or deferred_fit
+                        deferred_full_bleed
+                        or deferred_required_scope_fit
+                        or deferred_fit
                     )
                 if selected_vertical is None:
                     # Do not retry the first candidate outside the audited

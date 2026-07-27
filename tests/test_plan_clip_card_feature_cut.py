@@ -24,6 +24,7 @@ from jascue_video_lab.clip_card_observations import (
     event_fingerprint,
 )
 from jascue_video_lab.models import (
+    AttentionObservation,
     BoundaryPrecision,
     CardOpportunity,
     Entity,
@@ -39,6 +40,10 @@ from jascue_video_lab.models import (
     RushClip,
     RushFrame,
     RushesCatalog,
+    ShotFlowIntent,
+)
+from jascue_video_lab.editing_capabilities import (
+    simple_production_capability_catalog,
 )
 from jascue_video_lab.feature_cut import (
     _current_external_projection_binding,
@@ -72,6 +77,7 @@ from scripts.plan_clip_card_feature_cut import (
     _verified_feature_raw_output_text,
     _write_feature_normalization_artifacts,
     build_selected_clip_card_evidence,
+    canonicalize_direct_video_edit_plan_output,
     canonicalize_feature_plan_output,
     compact_card,
     compact_card_v3,
@@ -143,7 +149,10 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
         model_provenance=_provenance(),
     )
     direct = DirectVideoEditPlan(
-        contract_version="direct-video-edit-plan-v1",
+        contract_version="direct-video-edit-plan-v2",
+        capability_catalog_sha256=(
+            simple_production_capability_catalog().definition_sha256()
+        ),
         title="Generic feature cut",
         strategy_summary="Use the visible demonstration.",
         chapters=[
@@ -163,20 +172,53 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
                     candidate_rank=1,
                     strategy="tracked_crop",
                     crop_mode="strict",
-                    framing_intent="Keep the subject and sign.",
-                    required_entity_indices=[1],
-                    preferred_entity_indices=[2],
+                    coverage_mode="sequential",
+                    framing_intent="Observe the subject, then the sign.",
+                    required_entity_indices=[1, 2],
+                    preferred_entity_indices=[],
                     attention_sequence=[
                         DirectVideoAttentionStep(
                             start_progress=0,
-                            end_progress=1,
+                            end_progress=0.5,
                             anchor_entity_indices=[1],
                             camera_behavior="hold",
-                        )
+                        ),
+                        DirectVideoAttentionStep(
+                            start_progress=0.5,
+                            end_progress=1,
+                            anchor_entity_indices=[2],
+                            camera_behavior="hold",
+                            transition_preference="cut",
+                        ),
                     ],
                 ),
                 recommended_duration_seconds=6,
                 duration_rationale="Allow the complete action to read.",
+                attention_observation=AttentionObservation(
+                    semantic_novelty=0.7,
+                    action_progress=0.9,
+                    visual_motion=0.4,
+                    composition_change=0.2,
+                    reading_load=0.3,
+                    unresolved_tension=0.1,
+                    emotional_hold_value=0.4,
+                    repetition_pressure=0.1,
+                    music_transition_opportunity=0.6,
+                    minimum_dwell_seconds=4,
+                    maximum_dwell_seconds=8,
+                    rationale="The complete visible action needs a short hold.",
+                    uncertainties=[],
+                    requires_human_review=True,
+                ),
+                flow_intent=ShotFlowIntent(
+                    narrative_role="proof",
+                    energy_role="rise",
+                    relation_to_previous="continue_action",
+                    boundary_alignment="phrase_preferred",
+                    visual_sync_event="result_state",
+                    visual_sync_predicate="The visible result becomes stable.",
+                    music_target="phrase_end",
+                ),
                 confidence=0.8,
             )
         ],
@@ -200,6 +242,25 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
     assert candidate.frame_id == "RF000001"
     assert projected.chapters[0].horizontal_candidate_id == "rank-01"
     assert projected.chapters[0].vertical_candidate_id == "rank-01"
+    assert (
+        projected.chapters[0].attention_observation is not None
+    )
+    virtual_camera = projected.chapters[0].candidates[0].virtual_camera_proposal
+    assert virtual_camera is not None
+    assert virtual_camera.phases[1].transition_in == "cut"
+    stale_plan = direct.model_copy(
+        update={"capability_catalog_sha256": "b" * 64}
+    )
+    with pytest.raises(ValueError, match="capability catalog differs"):
+        project_direct_video_edit_plan(
+            stale_plan,
+            shortlist=shortlist,
+            candidate_depth=2,
+            brief=_brief(),
+            catalog=_catalog(),
+            cards={ASSET_ID: _card()},
+            provenance=_provenance(),
+        )
     direct_schema = json.dumps(gemini_response_schema(DirectVideoEditPlan))
     assert '"candidate_rank"' in direct_schema
     assert '"chapter_index"' in direct_schema
@@ -210,6 +271,88 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
     assert '"frame_id"' not in direct_schema
     assert '"project_id"' not in direct_schema
     assert '"model_provenance"' not in direct_schema
+
+
+def test_direct_video_canonicalization_preserves_phase_local_anchors() -> None:
+    payload = {
+        "contract_version": "direct-video-edit-plan-v2",
+        "capability_catalog_sha256": "a" * 64,
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                },
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "tracked_crop",
+                    "crop_mode": "primary_center",
+                    "coverage_mode": "sequential",
+                    "allow_controlled_clip": False,
+                    "framing_intent": "Observe A and then B.",
+                    "required_entity_indices": [1, 2],
+                    "preferred_entity_indices": [],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [
+                        {
+                            "start_progress": 0.0,
+                            "end_progress": 0.5,
+                            "anchor_entity_indices": [1],
+                            "camera_behavior": "hold",
+                        },
+                        {
+                            "start_progress": 0.5,
+                            "end_progress": 1.0,
+                            "anchor_entity_indices": [2],
+                            "camera_behavior": "follow_deadband",
+                        },
+                    ],
+                },
+            }
+        ],
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    vertical = json.loads(canonical)["chapters"][0]["vertical"]
+
+    assert vertical["attention_sequence"][0]["anchor_entity_indices"] == [1]
+    assert vertical["attention_sequence"][1]["anchor_entity_indices"] == [2]
+    assert all(
+        change["rule"] != "required_entities_remain_visible_in_attention_phase"
+        for change in changes
+    )
+
+
+def test_simultaneous_coverage_cannot_be_split_across_phases() -> None:
+    with pytest.raises(ValidationError, match="simultaneous coverage"):
+        DirectVideoVerticalDecision(
+            candidate_rank=1,
+            strategy="tracked_crop",
+            crop_mode="strict",
+            coverage_mode="simultaneous",
+            framing_intent="Keep the relation visible.",
+            required_entity_indices=[1, 2],
+            attention_sequence=[
+                DirectVideoAttentionStep(
+                    start_progress=0,
+                    end_progress=0.5,
+                    anchor_entity_indices=[1, 2],
+                    camera_behavior="hold",
+                ),
+                DirectVideoAttentionStep(
+                    start_progress=0.5,
+                    end_progress=1,
+                    anchor_entity_indices=[1, 2],
+                    camera_behavior="hold",
+                ),
+            ],
+        )
 
 
 def _provenance() -> ModelProvenance:

@@ -15,6 +15,7 @@ from jascue_video_lab.models import (
     FeatureEditBrief,
     FeatureEditPlan,
     ModelProvenance,
+    ShotFlowIntent,
 )
 from jascue_video_lab.storage import write_json
 
@@ -190,6 +191,52 @@ def test_rhythm_plan_uses_vector_without_inventing_cut_timestamp(
         "action_or_result_complete" in chapter.transition_reasons
         for chapter in rhythm.chapters
     )
+
+
+def test_flow_intent_can_lock_content_boundary_without_exact_time(
+    tmp_path,
+) -> None:
+    brief = _brief()
+    plan = _plan(with_attention=True)
+    first = plan.chapters[0].model_copy(
+        update={
+            "flow_intent": ShotFlowIntent(
+                narrative_role="proof",
+                energy_role="rise",
+                relation_to_previous="continue_action",
+                boundary_alignment="content_locked",
+                visual_sync_event=None,
+                visual_sync_predicate=None,
+                music_target=None,
+            )
+        }
+    )
+    plan = plan.model_copy(update={"chapters": [first, *plan.chapters[1:]]})
+    brief_path = tmp_path / "brief.json"
+    plan_path = tmp_path / "plan.json"
+    attention_path = tmp_path / "attention.json"
+    write_json(brief_path, brief)
+    write_json(plan_path, plan)
+    profile = build_attention_profile(
+        brief,
+        plan,
+        source_brief_sha256=sha256_file(brief_path),
+        source_feature_plan_sha256=sha256_file(plan_path),
+        quality_safe_capacity_seconds={
+            f"chapter-{index}": 12.0 for index in range(1, 7)
+        },
+    )
+    write_json(attention_path, profile)
+
+    rhythm = build_rhythm_plan(
+        profile,
+        target_duration_seconds=60,
+        attention_profile_sha256=sha256_file(attention_path),
+    )
+
+    assert rhythm.chapters[0].boundary_alignment == "content_locked"
+    assert rhythm.chapters[0].boundary_priority == "low"
+    assert rhythm.chapters[0].flow_intent == first.flow_intent
 
 
 def test_attention_profile_rejects_capacity_shorter_than_minimum(

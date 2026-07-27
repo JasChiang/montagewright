@@ -1736,6 +1736,7 @@ class AttentionChapterProfile(StrictModel):
     preferred_dwell_seconds: float = Field(gt=0.0)
     maximum_dwell_seconds: float = Field(gt=0.0)
     quality_safe_capacity_seconds: float | None = Field(default=None, ge=0.0)
+    flow_intent: "ShotFlowIntent | None" = None
     rationale: str = Field(min_length=1)
     uncertainties: list[str]
     requires_human_review: bool
@@ -1798,6 +1799,13 @@ class RhythmChapterPlan(StrictModel):
     maximum_duration_seconds: float = Field(gt=0.0)
     cut_pressure: float | None = Field(default=None, ge=0.0, le=1.0)
     boundary_priority: Literal["low", "normal", "high"]
+    boundary_alignment: Literal[
+        "content_locked",
+        "phrase_preferred",
+        "accent_preferred",
+        "free",
+    ] = "free"
+    flow_intent: "ShotFlowIntent | None" = None
     protected_reasons: list[str]
     transition_reasons: list[str]
     evidence_authority: str = Field(min_length=1)
@@ -3617,6 +3625,80 @@ class AttentionObservation(StrictModel):
         return self
 
 
+class ShotFlowIntent(StrictModel):
+    """Gemini's semantic sequence intent; never an EDL or timing curve."""
+
+    narrative_role: Literal[
+        "hook",
+        "setup",
+        "development",
+        "contrast",
+        "proof",
+        "payoff",
+        "breath",
+        "resolution",
+    ]
+    energy_role: Literal[
+        "low_hold",
+        "rise",
+        "peak",
+        "release",
+        "reset",
+    ]
+    relation_to_previous: Literal[
+        "start",
+        "new_context",
+        "continue_action",
+        "answer",
+        "reaction",
+        "contrast",
+        "reveal",
+        "reset",
+    ]
+    boundary_alignment: Literal[
+        "content_locked",
+        "phrase_preferred",
+        "accent_preferred",
+        "free",
+    ]
+    visual_sync_event: Literal[
+        "action_apex",
+        "reveal",
+        "result_state",
+        "gesture",
+        "ui_change",
+        "intentional_hold",
+    ] | None = None
+    visual_sync_predicate: str | None = Field(default=None, max_length=300)
+    music_target: Literal[
+        "phrase_start",
+        "phrase_end",
+        "downbeat",
+        "accent",
+        "section_change",
+    ] | None = None
+
+    @model_validator(mode="after")
+    def validate_sync_event(self) -> "ShotFlowIntent":
+        values = (
+            self.visual_sync_event,
+            self.visual_sync_predicate,
+            self.music_target,
+        )
+        if any(value is not None for value in values) and any(
+            value is None for value in values
+        ):
+            raise ValueError(
+                "visual sync event, observable predicate, and music target "
+                "must be supplied together"
+            )
+        if self.visual_sync_predicate is not None and not (
+            self.visual_sync_predicate.strip()
+        ):
+            raise ValueError("visual sync predicate must be observable and non-empty")
+        return self
+
+
 class _SelectedFramingRegionBase(StrictModel):
     """Response-only region base with role-specific JSON schema branches."""
 
@@ -4102,6 +4184,14 @@ class FeatureVerticalCandidate(StrictModel):
     selection_reason: str = Field(min_length=1)
     strategy: Literal["tracked_crop", "fit_with_background"]
     crop_mode: Literal["strict", "primary_center"] = "strict"
+    coverage_mode: Literal[
+        "simultaneous",
+        "sequential",
+        "relation_core",
+        "primary_with_context",
+        "independent_detail",
+    ] = "simultaneous"
+    allow_controlled_clip: bool = False
     target_description: str | None = None
     regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=8)
     virtual_camera_proposal: VerticalVirtualCameraProposal | None = None
@@ -4117,6 +4207,14 @@ class FeatureVerticalCandidate(StrictModel):
             self.target_description or hard_regions
         ):
             raise ValueError("tracked_crop candidate requires a target or hard-core region")
+        if self.allow_controlled_clip and self.crop_mode != "primary_center":
+            raise ValueError(
+                "controlled clipping requires primary_center crop mode"
+            )
+        if self.strategy == "fit_with_background" and self.allow_controlled_clip:
+            raise ValueError(
+                "fit-with-background cannot request controlled clipping"
+            )
         if (
             self.strategy == "tracked_crop"
             and self.crop_mode == "strict"
@@ -4327,7 +4425,7 @@ class FeatureEditBrief(StrictModel):
     target_duration_seconds: float = Field(ge=60.0, le=90.0)
     render_title_overlays: bool = True
     vertical_fallback_strategy: Literal["fit_with_background", "center_crop"] = (
-        "fit_with_background"
+        "center_crop"
     )
     reframe_policy_binding: ReframePolicyBinding | None = None
     chapters: list[FeatureChapterBrief] = Field(min_length=1, max_length=16)
@@ -4404,6 +4502,7 @@ class FeatureChapterSelect(StrictModel):
         ),
     )
     attention_observation: AttentionObservation | None = None
+    flow_intent: ShotFlowIntent | None = None
     source_reuse_mode: Literal[
         "none",
         "distinct_interval",
