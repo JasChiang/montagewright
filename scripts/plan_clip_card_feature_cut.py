@@ -678,11 +678,10 @@ class DirectVideoVerticalDecision(StrictModel):
     ]
     allow_controlled_clip: bool = False
     framing_intent: str = Field(min_length=1, max_length=300)
-    required_entity_indices: list[int] = Field(default_factory=list, max_length=4)
-    preferred_entity_indices: list[int] = Field(default_factory=list, max_length=4)
-    sacrificable_entity_indices: list[int] = Field(default_factory=list, max_length=4)
+    required_entity_indices: list[int] = Field(max_length=4)
+    preferred_entity_indices: list[int] = Field(max_length=4)
+    sacrificable_entity_indices: list[int] = Field(max_length=4)
     attention_sequence: list[DirectVideoAttentionStep] = Field(
-        default_factory=list,
         max_length=4,
     )
 
@@ -779,8 +778,8 @@ class DirectVideoChapterDecision(StrictModel):
         le=15.0,
     )
     duration_rationale: str | None = None
-    attention_observation: AttentionObservation | None = None
-    flow_intent: ShotFlowIntent | None = None
+    attention_observation: AttentionObservation | None
+    flow_intent: ShotFlowIntent | None
     confidence: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
@@ -956,10 +955,52 @@ def canonicalize_direct_video_edit_plan_output(
     for chapter_index, chapter in enumerate(chapters):
         if not isinstance(chapter, dict) or chapter.get("evidence_status") == "not_found":
             continue
+        flow = chapter.get("flow_intent")
+        if isinstance(flow, dict):
+            sync_keys = (
+                "visual_sync_event",
+                "visual_sync_predicate",
+                "music_target",
+            )
+            sync_values = [flow.get(key) for key in sync_keys]
+            if any(value is None for value in sync_values) and any(
+                value is not None for value in sync_values
+            ):
+                before = {key: flow.get(key) for key in sync_keys}
+                for key in sync_keys:
+                    flow[key] = None
+                changes.append(
+                    {
+                        "json_path": f"chapters[{chapter_index}].flow_intent",
+                        "before": before,
+                        "after": {key: None for key in sync_keys},
+                        "rule": (
+                            "incomplete_optional_visual_sync_is_removed_"
+                            "rather_than_invented"
+                        ),
+                    }
+                )
         vertical = chapter.get("vertical")
         if not isinstance(vertical, dict):
             continue
         base = f"chapters[{chapter_index}]"
+        if (
+            vertical.get("strategy") == "tracked_crop"
+            and vertical.get("allow_controlled_clip") is True
+            and vertical.get("crop_mode") == "strict"
+        ):
+            changes.append(
+                {
+                    "json_path": f"{base}.vertical.crop_mode",
+                    "before": "strict",
+                    "after": "primary_center",
+                    "rule": (
+                        "explicit_controlled_clip_uses_primary_center_"
+                        "representation"
+                    ),
+                }
+            )
+            vertical["crop_mode"] = "primary_center"
         if not isinstance(chapter.get("horizontal"), dict):
             fallback_rank = vertical.get("candidate_rank")
             chapter["horizontal"] = {
@@ -1126,6 +1167,56 @@ def _resolve_feature_reuse_artifacts(output_dir: Path) -> dict[str, Any]:
         "--reuse-raw-output requires one complete canonical or attempt-01 "
         f"request/raw-output/raw-interaction set{detail}"
     )
+
+
+def _resolve_latest_failed_feature_plan_attempt(
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Resolve the newest fully persisted failed paid attempt for one repair.
+
+    This keeps a schema repair from paying for the original multimodal request
+    again. The repair request reuses the exact saved File API URIs and appends
+    only the local contract error to the original planning prompt.
+    """
+
+    attempts: list[tuple[int, dict[str, Any]]] = []
+    for validation_path in output_dir.glob(
+        "clip-card-feature-plan.attempt-*.schema-validation.json"
+    ):
+        stem = validation_path.name.removesuffix(".schema-validation.json")
+        try:
+            attempt_number = int(stem.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        request_path = output_dir / f"{stem}.request.json"
+        raw_output_path = output_dir / f"{stem}.raw_output.json"
+        raw_interaction_path = output_dir / f"{stem}.raw_interaction.json"
+        if not all(
+            path.exists()
+            for path in (request_path, raw_output_path, raw_interaction_path)
+        ):
+            continue
+        validation = read_json(validation_path)
+        if validation.get("ok") is not False:
+            continue
+        attempts.append(
+            (
+                attempt_number,
+                {
+                    "attempt_number": attempt_number,
+                    "request": request_path,
+                    "raw_output": raw_output_path,
+                    "raw_interaction": raw_interaction_path,
+                    "schema_validation": validation_path,
+                    "error": str(validation.get("error") or ""),
+                },
+            )
+        )
+    if not attempts:
+        raise FileNotFoundError(
+            "--resume-failed-plan requires a complete failed paid attempt"
+        )
+    return max(attempts, key=lambda item: item[0])[1]
 
 
 def _verified_feature_raw_output_text(
@@ -2332,12 +2423,19 @@ def project_feature_contracts_v3(
         quality_risks = list(
             dict.fromkeys(horizontal_primary.quality_risks + vertical_primary.quality_risks)
         )
-        vertical_coverage_intent = {
-            "sequential": "sequential_attention",
-            "primary_with_context": "single_primary",
-            "independent_detail": "single_primary",
-        }.get(vertical_primary.coverage_mode)
-        if vertical_coverage_intent is None:
+        if vertical_primary.coverage_mode == "sequential":
+            vertical_coverage_intent = "sequential_attention"
+        elif len(vertical_primary.required_entity_ids) >= 2:
+            # A primary-with-context plan can still declare more than one
+            # evidence-bearing hard entity. Preserve that obligation rather
+            # than silently weakening it to single-primary.
+            vertical_coverage_intent = "simultaneous_relation"
+        elif vertical_primary.coverage_mode in {
+            "primary_with_context",
+            "independent_detail",
+        }:
+            vertical_coverage_intent = "single_primary"
+        else:
             vertical_coverage_intent = (
                 "simultaneous_relation"
                 if len(vertical_primary.required_entity_ids) >= 2
@@ -2886,6 +2984,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--resume-failed-plan",
+        action="store_true",
+        help=(
+            "Send exactly one paid schema/contract repair using the newest "
+            "saved failed attempt and its original File API URIs. The "
+            "original multimodal planning request is not repeated."
+        ),
+    )
+    parser.add_argument(
         "--shortlist",
         type=Path,
         help=(
@@ -2955,6 +3062,8 @@ def main() -> int:
         parser.error("--maximum-candidate-video-seconds must be positive")
     if args.candidate_video_evidence and args.shortlist is None:
         parser.error("--candidate-video-evidence requires --shortlist")
+    if args.reuse_raw_output and args.resume_failed_plan:
+        parser.error("--reuse-raw-output and --resume-failed-plan are exclusive")
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not args.reuse_raw_output and not api_key:
@@ -3318,7 +3427,11 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
     request_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     candidate_video_manifest_path: Path | None = None
     direct_video_observed_events: set[tuple[str, str]] = set()
-    if args.candidate_video_evidence and not args.reuse_raw_output:
+    if (
+        args.candidate_video_evidence
+        and not args.reuse_raw_output
+        and not args.resume_failed_plan
+    ):
         assert shortlist is not None
         context_ms = round(args.candidate_video_context_seconds * 1000)
         selected_direct_evidence: dict[
@@ -3475,7 +3588,9 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                 ),
             }
         )
-    elif args.candidate_video_evidence and args.reuse_raw_output:
+    elif args.candidate_video_evidence and (
+        args.reuse_raw_output or args.resume_failed_plan
+    ):
         candidate_video_manifest_path = (
             args.output_dir / "candidate-video-evidence.manifest.json"
         )
@@ -3497,7 +3612,11 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
             (str(row["source_asset_id"]), str(row["event_id"]))
             for row in candidate_video_manifest.get("candidates", [])
         }
-    if music_path is not None and not args.reuse_raw_output:
+    if (
+        music_path is not None
+        and not args.reuse_raw_output
+        and not args.resume_failed_plan
+    ):
         file_cache_root = (
             args.file_cache_root.expanduser().resolve()
             if args.file_cache_root is not None
@@ -3738,7 +3857,37 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
             "editing_capability_catalog": capability_catalog_path,
         }
     else:
-        _assert_fresh_feature_namespace_empty(args.output_dir)
+        if args.resume_failed_plan:
+            failed_attempt = _resolve_latest_failed_feature_plan_attempt(
+                args.output_dir
+            )
+            request = read_json(failed_attempt["request"])
+            if str(request.get("model") or "") != MODEL_ID:
+                raise ValueError(
+                    "--resume-failed-plan model differs from the current model"
+                )
+            original_inputs = request.get("input")
+            if not isinstance(original_inputs, list) or not original_inputs:
+                raise ValueError(
+                    "--resume-failed-plan requires the complete original inputs"
+                )
+            first_input = original_inputs[0]
+            if (
+                not isinstance(first_input, dict)
+                or first_input.get("type") != "text"
+                or not isinstance(first_input.get("text"), str)
+            ):
+                raise ValueError(
+                    "--resume-failed-plan requires the original planner prompt"
+                )
+            previous_error = str(failed_attempt["error"])
+            attempt_numbers = [
+                int(failed_attempt["attempt_number"]) + 1
+            ]
+        else:
+            _assert_fresh_feature_namespace_empty(args.output_dir)
+            previous_error = ""
+            attempt_numbers = list(range(1, args.repair_attempts + 2))
         client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(
@@ -3746,20 +3895,42 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
             ),
         )
         try:
-            previous_error = ""
-            for attempt in range(1, args.repair_attempts + 2):
+            for attempt in attempt_numbers:
                 attempt_request = request
-                if attempt > 1:
+                if args.resume_failed_plan or attempt > 1:
+                    original_inputs = request.get("input")
+                    if not isinstance(original_inputs, list) or not original_inputs:
+                        raise ValueError(
+                            "schema repair requires the complete original inputs"
+                        )
+                    original_prompt = original_inputs[0]
+                    if (
+                        not isinstance(original_prompt, dict)
+                        or original_prompt.get("type") != "text"
+                        or not isinstance(original_prompt.get("text"), str)
+                    ):
+                        raise ValueError(
+                            "schema repair requires the original text prompt first"
+                        )
                     repair_prompt = (
-                        prompt
+                        str(original_prompt["text"])
                         + "\n\n## 前次輸出未通過本機 contract\n"
                         + previous_error[:6000]
-                        + "\n請重新產生完整結果，不得只回傳修補片段。完整 evidence 已在上方，"
-                        "不要重複沿用前次不合法輸出。"
+                        + "\n請重新產生完整結果，不得只回傳修補片段。"
+                        "所有原始候選影片與音樂仍附在本次 request；"
+                        "必須重新觀看並修正契約錯誤。"
                     )
                     attempt_request = {
                         **request,
-                        "input": [{"type": "text", "text": repair_prompt}],
+                        "input": [
+                            {"type": "text", "text": repair_prompt},
+                            *original_inputs[1:],
+                        ],
+                        "response_format": {
+                            "type": "text",
+                            "mime_type": "application/json",
+                            "schema": gemini_response_schema(response_model),
+                        },
                         "generation_config": {
                             "thinking_level": "low",
                             "max_output_tokens": 32_000,
@@ -3854,8 +4025,8 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                     )
             if plan is None:
                 raise ValueError(
-                    f"Clip Card feature plan failed after {args.repair_attempts + 1} "
-                    f"attempts: {previous_error}"
+                    "Clip Card feature plan failed after "
+                    f"{len(attempt_numbers)} new attempt(s): {previous_error}"
                 )
         finally:
             client.close()

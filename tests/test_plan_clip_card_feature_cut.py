@@ -73,6 +73,7 @@ from scripts.plan_clip_card_feature_cut import (
     ResolvedFramingRegion,
     SelectedClipCardEvidence,
     _assert_fresh_feature_namespace_empty,
+    _resolve_latest_failed_feature_plan_attempt,
     _resolve_feature_reuse_artifacts,
     _verified_feature_raw_output_text,
     _write_feature_normalization_artifacts,
@@ -176,6 +177,7 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
                     framing_intent="Observe the subject, then the sign.",
                     required_entity_indices=[1, 2],
                     preferred_entity_indices=[],
+                    sacrificable_entity_indices=[],
                     attention_sequence=[
                         DirectVideoAttentionStep(
                             start_progress=0,
@@ -329,6 +331,88 @@ def test_direct_video_canonicalization_preserves_phase_local_anchors() -> None:
     )
 
 
+def test_direct_video_canonicalization_only_removes_incomplete_optional_sync() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "flow_intent": {
+                    "narrative_role": "proof",
+                    "energy_role": "rise",
+                    "relation_to_previous": "contrast",
+                    "boundary_alignment": "phrase_preferred",
+                    "visual_sync_event": None,
+                    "visual_sync_predicate": None,
+                    "music_target": "downbeat",
+                },
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                },
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "tracked_crop",
+                    "crop_mode": "strict",
+                    "coverage_mode": "primary_with_context",
+                    "allow_controlled_clip": True,
+                    "required_entity_indices": [1],
+                    "preferred_entity_indices": [2],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [],
+                },
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+
+    assert chapter["vertical"]["crop_mode"] == "primary_center"
+    assert chapter["flow_intent"]["visual_sync_event"] is None
+    assert chapter["flow_intent"]["visual_sync_predicate"] is None
+    assert chapter["flow_intent"]["music_target"] is None
+    assert {
+        change["rule"] for change in changes
+    } >= {
+        "explicit_controlled_clip_uses_primary_center_representation",
+        "incomplete_optional_visual_sync_is_removed_rather_than_invented",
+    }
+
+
+def test_failed_plan_resume_selects_latest_complete_paid_attempt(
+    tmp_path: Path,
+) -> None:
+    for attempt in (1, 2):
+        stem = f"clip-card-feature-plan.attempt-{attempt:02d}"
+        write_json(
+            tmp_path / f"{stem}.request.json",
+            {"model": "gemini-3.6-flash", "input": []},
+        )
+        write_json(
+            tmp_path / f"{stem}.raw_output.json",
+            {"output_text": "{}"},
+        )
+        write_json(
+            tmp_path / f"{stem}.raw_interaction.json",
+            {"output_text": "{}"},
+        )
+        write_json(
+            tmp_path / f"{stem}.schema-validation.json",
+            {"ok": False, "error": f"attempt {attempt} failed"},
+        )
+
+    resolved = _resolve_latest_failed_feature_plan_attempt(tmp_path)
+
+    assert resolved["attempt_number"] == 2
+    assert resolved["error"] == "attempt 2 failed"
+    assert Path(resolved["request"]).name.endswith("attempt-02.request.json")
+
+
 def test_simultaneous_coverage_cannot_be_split_across_phases() -> None:
     with pytest.raises(ValidationError, match="simultaneous coverage"):
         DirectVideoVerticalDecision(
@@ -338,6 +422,8 @@ def test_simultaneous_coverage_cannot_be_split_across_phases() -> None:
             coverage_mode="simultaneous",
             framing_intent="Keep the relation visible.",
             required_entity_indices=[1, 2],
+            preferred_entity_indices=[],
+            sacrificable_entity_indices=[],
             attention_sequence=[
                 DirectVideoAttentionStep(
                     start_progress=0,
