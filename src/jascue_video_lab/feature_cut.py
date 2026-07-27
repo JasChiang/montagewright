@@ -12,7 +12,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from time import monotonic
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Collection, Literal, Mapping, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -3433,38 +3433,65 @@ def _motion_extrema(
     x_values: Sequence[float],
     y_values: Sequence[float],
     scales: Sequence[float],
+    *,
+    cut_before_indexes: Collection[int] = (),
 ) -> tuple[float, float, float]:
-    velocities: list[float] = []
-    for index in range(1, len(times)):
-        delta = max(0.001, times[index] - times[index - 1])
-        velocities.append(
-            math.sqrt(
-                ((x_values[index] - x_values[index - 1]) / delta) ** 2
-                + ((y_values[index] - y_values[index - 1]) / delta) ** 2
-                + (960 * (scales[index] - scales[index - 1]) / delta) ** 2
+    value_count = len(times)
+    if not (
+        len(x_values) == value_count
+        and len(y_values) == value_count
+        and len(scales) == value_count
+    ):
+        raise ValueError("motion samples must have equal lengths")
+    cut_indexes = frozenset(cut_before_indexes)
+    if any(index <= 0 or index >= value_count for index in cut_indexes):
+        raise ValueError("hard-cut indexes must lie inside the sample sequence")
+
+    run_starts = [0, *sorted(cut_indexes)]
+    run_ends = [*sorted(cut_indexes), value_count]
+    maximum_velocity = 0.0
+    maximum_acceleration = 0.0
+    maximum_jerk = 0.0
+    for run_start, run_end in zip(run_starts, run_ends, strict=True):
+        velocities: list[float] = []
+        velocity_times: list[float] = []
+        for index in range(run_start + 1, run_end):
+            delta = max(0.001, times[index] - times[index - 1])
+            velocities.append(
+                math.sqrt(
+                    ((x_values[index] - x_values[index - 1]) / delta) ** 2
+                    + ((y_values[index] - y_values[index - 1]) / delta) ** 2
+                    + (960 * (scales[index] - scales[index - 1]) / delta) ** 2
+                )
             )
+            velocity_times.append(times[index])
+        accelerations = [
+            abs(current - prior)
+            / max(0.001, velocity_times[index] - velocity_times[index - 1])
+            for index, (prior, current) in enumerate(
+                zip(velocities[:-1], velocities[1:], strict=True),
+                start=1,
+            )
+        ]
+        acceleration_times = velocity_times[1:]
+        jerks = [
+            abs(current - prior)
+            / max(
+                0.001,
+                acceleration_times[index] - acceleration_times[index - 1],
+            )
+            for index, (prior, current) in enumerate(
+                zip(accelerations[:-1], accelerations[1:], strict=True),
+                start=1,
+            )
+        ]
+        maximum_velocity = max(maximum_velocity, max(velocities, default=0.0))
+        maximum_acceleration = max(
+            maximum_acceleration,
+            max(accelerations, default=0.0),
         )
-    accelerations = [
-        abs(current - prior)
-        / max(0.001, times[index + 1] - times[index])
-        for index, (prior, current) in enumerate(
-            zip(velocities[:-1], velocities[1:], strict=True),
-            start=1,
-        )
-    ]
-    jerks = [
-        abs(current - prior)
-        / max(0.001, times[index + 2] - times[index + 1])
-        for index, (prior, current) in enumerate(
-            zip(accelerations[:-1], accelerations[1:], strict=True),
-            start=1,
-        )
-    ]
-    return (
-        max(velocities, default=0.0),
-        max(accelerations, default=0.0),
-        max(jerks, default=0.0),
-    )
+        maximum_jerk = max(maximum_jerk, max(jerks, default=0.0))
+    return maximum_velocity, maximum_acceleration, maximum_jerk
 
 
 def _virtual_camera_filter_from_track(
@@ -4930,11 +4957,26 @@ def _vertical_virtual_camera_filter_from_tracks(
         raise ValueError(
             "phase virtual-camera transition loses both anchors"
         )
+    phase_by_id = {phase.phase_id: phase for phase in phases}
+    cut_before_indexes = frozenset(
+        {
+            index
+            for index in range(1, len(crop_keyframes))
+            if (
+                crop_keyframes[index]["phase_id"]
+                != crop_keyframes[index - 1]["phase_id"]
+                and phase_by_id[crop_keyframes[index]["phase_id"]].transition_in
+                == "cut"
+            )
+        }
+        | punch_cut_sample_indexes
+    )
     max_velocity, max_acceleration, max_jerk = _motion_extrema(
         times,
         x_values,
         y_values,
         scale_values,
+        cut_before_indexes=cut_before_indexes,
     )
     keyframes = [
         VirtualCameraKeyframe(
@@ -4989,20 +5031,6 @@ def _vertical_virtual_camera_filter_from_tracks(
             region_id: _track_geometry_fingerprint(tracks_by_region[region_id])
             for region_id in referenced_ids
         },
-    )
-    phase_by_id = {phase.phase_id: phase for phase in phases}
-    cut_before_indexes = frozenset(
-        {
-            index
-            for index in range(1, len(crop_keyframes))
-            if (
-                crop_keyframes[index]["phase_id"]
-                != crop_keyframes[index - 1]["phase_id"]
-                and phase_by_id[crop_keyframes[index]["phase_id"]].transition_in
-                == "cut"
-            )
-        }
-        | punch_cut_sample_indexes
     )
     x_expression = _piecewise_expression(
         times,

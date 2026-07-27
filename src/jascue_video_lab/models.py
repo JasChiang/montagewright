@@ -4887,3 +4887,308 @@ class MusicAssemblyRenderManifest(StrictModel):
         if "concat" in self.ffmpeg_filter_graph.lower():
             raise ValueError("music assembly v1 render graph cannot contain concat")
         return self
+
+
+class MusicEditSpanV2(FrozenStrictModel):
+    """One reviewed source passage mapped without time-stretching."""
+
+    span_id: str = Field(pattern=r"^music-edit-span-[0-9]{3}$")
+    section_id: str = Field(pattern=r"^section-[0-9]{3}$")
+    semantic_role: Literal[
+        "intro",
+        "establish",
+        "build",
+        "climax",
+        "release",
+        "outro",
+        "neutral",
+    ]
+    energy_band: Literal["low", "medium", "high", "unknown"]
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    output_start_sample: int = Field(ge=0)
+    output_end_sample: int = Field(gt=0)
+    start_boundary_kind: Literal[
+        "track_start",
+        "section_boundary",
+        "locked_cue",
+    ]
+    end_boundary_kind: Literal[
+        "section_boundary",
+        "locked_cue",
+        "natural_track_end",
+    ]
+    start_boundary_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+    end_boundary_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_music_edit_span(self) -> "MusicEditSpanV2":
+        source_duration = self.source_end_sample - self.source_start_sample
+        output_duration = self.output_end_sample - self.output_start_sample
+        if source_duration != output_duration:
+            raise ValueError("music edit spans cannot time-stretch source audio")
+        if self.start_boundary_kind == "locked_cue":
+            if self.start_boundary_cue_id is None:
+                raise ValueError("locked-cue start requires its cue ID")
+        elif self.start_boundary_cue_id is not None:
+            raise ValueError("non-cue start cannot claim a locked cue ID")
+        if self.end_boundary_kind == "locked_cue":
+            if self.end_boundary_cue_id is None:
+                raise ValueError("locked-cue end requires its cue ID")
+        elif self.end_boundary_cue_id is not None:
+            raise ValueError("non-cue end cannot claim a locked cue ID")
+        if (
+            self.start_boundary_kind == "track_start"
+            and self.source_start_sample != 0
+        ):
+            raise ValueError("track-start music span must begin at sample zero")
+        return self
+
+
+class MusicEditJoinV2(FrozenStrictModel):
+    """An explicit, reviewable transition between two music passages."""
+
+    join_id: str = Field(pattern=r"^music-edit-join-[0-9]{3}$")
+    left_span_id: str = Field(pattern=r"^music-edit-span-[0-9]{3}$")
+    right_span_id: str = Field(pattern=r"^music-edit-span-[0-9]{3}$")
+    join_type: Literal["cut", "micro_crossfade"]
+    duration_samples: int = Field(ge=0)
+    alignment: Literal[
+        "section_boundary",
+        "phrase_grid",
+        "downbeat",
+        "accent",
+        "transient",
+    ]
+    energy_transition: Literal[
+        "matched",
+        "rising",
+        "falling",
+        "intentional_contrast",
+        "unknown",
+    ]
+    editorial_reason: str = Field(min_length=1, max_length=500)
+    requires_human_review: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_join(self) -> "MusicEditJoinV2":
+        if self.left_span_id == self.right_span_id:
+            raise ValueError("music join must connect two different spans")
+        if self.join_type == "cut" and self.duration_samples != 0:
+            raise ValueError("hard music cut must have zero overlap")
+        if self.join_type == "micro_crossfade" and self.duration_samples <= 0:
+            raise ValueError("micro crossfade requires a positive overlap")
+        return self
+
+
+class MusicDuckingRegionV2(FrozenStrictModel):
+    """An output-timeline gain reduction with a typed editorial purpose."""
+
+    region_id: str = Field(pattern=r"^music-duck-[0-9]{3}$")
+    output_start_sample: int = Field(ge=0)
+    output_end_sample: int = Field(gt=0)
+    gain_db: float = Field(ge=-30.0, le=0.0)
+    reason: Literal[
+        "dialogue",
+        "narration",
+        "ui_focus",
+        "editorial_emphasis",
+    ]
+
+    @model_validator(mode="after")
+    def validate_ducking_region(self) -> "MusicDuckingRegionV2":
+        if self.output_end_sample <= self.output_start_sample:
+            raise ValueError("music ducking region must be non-empty")
+        return self
+
+
+class MusicEditEndingV2(FrozenStrictModel):
+    """The reviewed way a shortened soundtrack resolves."""
+
+    mode: Literal[
+        "natural_track_end",
+        "phrase_fade_out",
+        "reviewed_ending_hit",
+    ]
+    fade_out_samples: int = Field(ge=0)
+    ending_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+    editorial_reason: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_ending(self) -> "MusicEditEndingV2":
+        if self.mode == "natural_track_end":
+            if self.fade_out_samples != 0 or self.ending_cue_id is not None:
+                raise ValueError("natural music ending cannot add a fade or cue")
+        elif self.mode == "phrase_fade_out":
+            if self.fade_out_samples <= 0 or self.ending_cue_id is not None:
+                raise ValueError("phrase fade requires a fade and no ending cue")
+        elif self.ending_cue_id is None:
+            raise ValueError("reviewed ending hit requires its locked cue ID")
+        return self
+
+
+class MusicEditPlanV2(StrictModel):
+    """Reviewed multi-passage soundtrack edit; exact samples remain local."""
+
+    contract_version: Literal["music-edit-plan-v2"] = "music-edit-plan-v2"
+    edit_id: str = Field(pattern=r"^music-edit:[0-9a-f]{64}$")
+    music_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    music_lock_path: str = Field(min_length=1)
+    music_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    master_sample_rate: int = Field(ge=8_000, le=192_000)
+    source_duration_samples: int = Field(gt=0)
+    target_duration_samples: int = Field(gt=0)
+    minimum_duration_samples: int = Field(gt=0)
+    maximum_duration_samples: int = Field(gt=0)
+    output_duration_samples: int = Field(gt=0)
+    target_duration_error_samples: int = Field(ge=0)
+    spans: list[MusicEditSpanV2] = Field(min_length=1, max_length=4)
+    joins: list[MusicEditJoinV2] = Field(max_length=3)
+    ending: MusicEditEndingV2
+    ducking_regions: list[MusicDuckingRegionV2] = Field(max_length=32)
+    uncertainties: list[str]
+    requires_human_review: Literal[True] = True
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_music_edit_plan(self) -> "MusicEditPlanV2":
+        if not (
+            self.minimum_duration_samples
+            <= self.target_duration_samples
+            <= self.maximum_duration_samples
+        ):
+            raise ValueError("target music duration must lie inside its range")
+        if not (
+            self.minimum_duration_samples
+            <= self.output_duration_samples
+            <= self.maximum_duration_samples
+        ):
+            raise ValueError("music edit output duration lies outside its range")
+        if self.target_duration_error_samples != abs(
+            self.output_duration_samples - self.target_duration_samples
+        ):
+            raise ValueError("music edit target duration error is inconsistent")
+        if len(self.joins) != len(self.spans) - 1:
+            raise ValueError("music edit must have exactly one join between spans")
+
+        span_ids = [span.span_id for span in self.spans]
+        if len(span_ids) != len(set(span_ids)):
+            raise ValueError("music edit span IDs must be unique")
+        if self.spans[0].output_start_sample != 0:
+            raise ValueError("music edit output must begin at sample zero")
+        for index, span in enumerate(self.spans):
+            if span.source_end_sample > self.source_duration_samples:
+                raise ValueError("music edit span exceeds the locked source")
+            if index == 0:
+                continue
+            join = self.joins[index - 1]
+            prior = self.spans[index - 1]
+            if join.left_span_id != prior.span_id:
+                raise ValueError("music join left span is not adjacent")
+            if join.right_span_id != span.span_id:
+                raise ValueError("music join right span is not adjacent")
+            if join.join_type == "micro_crossfade":
+                minimum = max(1, round(self.master_sample_rate * 0.005))
+                maximum = round(self.master_sample_rate * 0.200)
+                if not minimum <= join.duration_samples <= maximum:
+                    raise ValueError(
+                        "micro crossfade must remain between 5 and 200 ms"
+                    )
+                if join.duration_samples >= (
+                    span.source_end_sample - span.source_start_sample
+                ):
+                    raise ValueError("crossfade cannot consume the right span")
+                if join.duration_samples >= (
+                    prior.source_end_sample - prior.source_start_sample
+                ):
+                    raise ValueError("crossfade cannot consume the left span")
+            expected_start = prior.output_end_sample - join.duration_samples
+            if span.output_start_sample != expected_start:
+                raise ValueError("music span placement disagrees with its join")
+
+        if self.spans[-1].output_end_sample != self.output_duration_samples:
+            raise ValueError("music spans do not cover the output timeline")
+        source_intervals = sorted(
+            (span.source_start_sample, span.source_end_sample)
+            for span in self.spans
+        )
+        for prior, current in zip(
+            source_intervals[:-1],
+            source_intervals[1:],
+            strict=True,
+        ):
+            if current[0] < prior[1]:
+                raise ValueError(
+                    "music edit cannot silently replay overlapping source passages"
+                )
+        if self.ending.mode == "natural_track_end":
+            if self.spans[-1].source_end_sample != self.source_duration_samples:
+                raise ValueError("natural ending must preserve the source endpoint")
+            if self.spans[-1].end_boundary_kind != "natural_track_end":
+                raise ValueError("natural ending requires a natural-end span")
+        elif self.spans[-1].end_boundary_kind == "natural_track_end":
+            raise ValueError("natural-end span cannot claim an artificial ending")
+        if self.ending.fade_out_samples >= self.output_duration_samples:
+            raise ValueError("music ending fade cannot consume the full edit")
+        if self.ending.mode == "reviewed_ending_hit":
+            if self.spans[-1].end_boundary_cue_id != self.ending.ending_cue_id:
+                raise ValueError("ending hit must match the final locked cue")
+        for region in self.ducking_regions:
+            if region.output_end_sample > self.output_duration_samples:
+                raise ValueError("music ducking region exceeds the output timeline")
+        return self
+
+
+class MusicEditRenderManifestV2(StrictModel):
+    """Deterministic FFmpeg render evidence for a reviewed MusicEditPlanV2."""
+
+    contract_version: Literal["music-edit-render-v2"] = "music-edit-render-v2"
+    render_id: str = Field(pattern=r"^music-edit-render:[0-9a-f]{64}$")
+    edit_id: str = Field(pattern=r"^music-edit:[0-9a-f]{64}$")
+    edit_plan_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_audio_path: str = Field(min_length=1)
+    source_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_audio_path: str = Field(min_length=1)
+    output_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_codec: Literal["pcm_s16le"] = "pcm_s16le"
+    output_sample_rate: Literal[48_000] = 48_000
+    output_channels: Literal[2] = 2
+    expected_output_samples: int = Field(gt=0)
+    probed_output_samples: int = Field(gt=0)
+    duration_delta_samples: int
+    duration_tolerance_samples: int = Field(ge=0, le=16)
+    internal_join_count: int = Field(ge=0, le=3)
+    crossfade_samples: int = Field(ge=0)
+    fade_in_samples: int = Field(gt=0)
+    fade_out_samples: int = Field(ge=0)
+    ducking_region_count: int = Field(ge=0, le=32)
+    ffmpeg_filter_graph: str = Field(min_length=1)
+    ffmpeg_command: list[str] = Field(min_length=1)
+    ffprobe_audio_stream: dict[str, Any]
+    qc_passed: bool
+    qc_errors: list[str]
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_music_edit_render(self) -> "MusicEditRenderManifestV2":
+        if self.duration_delta_samples != (
+            self.probed_output_samples - self.expected_output_samples
+        ):
+            raise ValueError("music edit render duration delta is inconsistent")
+        passed = (
+            abs(self.duration_delta_samples) <= self.duration_tolerance_samples
+            and not self.qc_errors
+        )
+        if self.qc_passed != passed:
+            raise ValueError("music edit render QC status is inconsistent")
+        return self

@@ -118,7 +118,8 @@ Top-K 直式候選
 | Gemini brief＋music selection planning | 使用者有給音樂時，選片 call 必須實際聽音樂並閱讀 brief，提出素材、順序、相對停留與理由 | 不直接產生精確音樂 sample、cut PTS，也不能因總長要求重複或 freeze 片段 |
 | Gemini semantic music pairing（進階選配） | 在完成選片後，再把既有 visual event ID 配對既有 music cue ID，增加語意型卡點線索 | 不重新偵測拍點、不輸出精確時間，也不能創造本機 MusicMap 沒有的 cue |
 | VisualSyncMap＋CuePlan | 把畫面的 cut、reveal、action apex、ending pose 等事件，在明確 timing window 內對到已核准的音樂 cue；可把 Gemini 配對當排序加分 | 不會為了卡拍暗中截斷 setup／action／result，也不會直接改寫選片、trim、identity 或 geometry |
-| Continuous music assembly | 從核准音樂中選一段連續、可稽核且優先自然收尾的區間；delivery 排除毛片原音，避免疊音 | 不拼接多個音樂片段、不 time-stretch、不為補長度硬切音樂或 freeze 畫面 |
+| Continuous music assembly（正式安全 fallback） | 從核准音樂中選一段連續、可稽核且優先自然收尾的區間；delivery 排除毛片原音，避免疊音 | 不拼接多個音樂片段、不 time-stretch、不為補長度硬切音樂或 freeze 畫面 |
+| Reviewed MusicEditPlan V2（實驗） | 讓語意規劃只挑已核准的 section／cue ID，本機再映射成 exact samples；最多四段、三個 join，可使用 hard cut、5–200 ms micro-crossfade、自然結尾或經核准的樂句淡出，並保存 ducking 區間 | 不接受 Gemini 直接提供 sample；不自動 loop、重播重疊來源、time-stretch 或捏造 ending；尚未取代正式 `feature-delivery` 的單段安全路徑 |
 | Final Edit QA | 以一次有聲 16:9 review 檢查 brief、動作完整、資訊停留、重複、轉場與音樂 flow；9:16 另做 crop-only review | 只保存觀察與修正建議，不自動重剪，也不能覆蓋本機 geometry gate 或真人核准 |
 | Pillow | 把 bbox 或 mask 畫回原始影格，產生方便人工檢查的 debug 圖 | 不參與辨識或追蹤 |
 | 本機 HTML／JavaScript review page | 播放事件、候選片段、debug 圖與裁切結果，供真人核准或退回 | 不會因頁面能正常開啟就宣告模型結果正確 |
@@ -641,6 +642,27 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab feature-delivery \
   --aspect both \
   --output-dir artifacts/my-delivery
 ```
+
+### 音樂不是硬截一段：MusicEditPlan V2
+
+正式 `feature-delivery` 目前仍以單一連續音樂區間作為 fail-closed 預設；這能避免第一次自動剪輯就產生不自然的拼歌。實驗性的 `MusicEditPlanV2` 則補上實務剪輯需要的下一層語法：
+
+1. Gemini 或剪輯師只能選擇 reviewed `section_id`、`locked cue ID`、段落語意角色與能量關係。
+2. 本機依 `MusicMapLock` 將 ID 映射成 exact samples，不接受模型自行提供 sample 或毫秒。
+3. 相鄰 passage 明確選擇 hard cut 或 5–200 ms micro-crossfade；join 數量上限為三個。
+4. 結尾只能保留原曲自然結尾、在核准邊界做短 fade-out，或使用已核准 `ending_hit`。
+5. 對白、旁白、UI 重點需要讓位時，可保存 typed ducking region；不把任意音量自動化藏在 FFmpeg command 裡。
+6. V2 plan 永遠標記 `requires_human_review=true`。在完成聽感 A/B、final mux lineage 與 FinalEditQA integration 前，不會自動升級成正式交付路徑。
+
+這裡的 micro-crossfade 只用來消除接縫 click 或柔化已核准的樂句交界，不是把兩段不相容的音樂「糊」在一起。能量、樂句與 ending 不成立時，正確結果是改選 passage 或退回連續音樂，不是增加更長的 crossfade。
+
+### 虛擬鏡頭的 cut 不是高速平移
+
+多主體 phase 若沒有足夠時間完成自然平移，系統會將轉場改成 hard cut。Motion gate 現在會分別量測 cut 兩側的連續攝影機路徑，不再把兩個構圖間的瞬間跳變算成超高速 velocity／acceleration／jerk。這能避免「本來可用兩個滿版構圖硬切，卻因假性速度超標退回黑邊 fit layout」。
+
+若滿版連續運鏡仍不可行，泛用 fallback 順序是：已驗證的構圖 hard cut → establishing／共同 context → phase-aligned sequential views → 經 contract 允許的 controlled clipping → 下一個候選 → 最後才是 fit/layout。不能證明必要關係時則 fail closed，不會用漂亮運鏡掩蓋證據缺失。
+
+完整的剪輯語法與加速策略記錄在 [EDITORIAL-GRAMMAR-V2.md](EDITORIAL-GRAMMAR-V2.md)。
 
 需要逐層研究時，仍可用下列獨立工具組裝連續音樂與執行唯讀 QA。組裝器會驗證 MusicAssembly plan／binding／render manifest、實際音樂 hash 與 picture／music 各自的 stream 長度；任何證據不一致或超出容差都會拒絕，不會用 `-shortest` 暗中截斷。QA 會保存影片、manifest、brief、prompt、schema、raw response、usage 與成本 hash，重跑相同輸入不會再次付費：
 

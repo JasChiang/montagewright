@@ -4690,6 +4690,28 @@ def test_phase_virtual_camera_moves_between_independent_tracked_anchors() -> Non
     plan = audit["phase_virtual_camera_plan"]
     assert plan["anchor_region_ids"] == ["right", "left"]
     assert plan["execution_status"] == "applied"
+    assert plan["max_velocity"] == 0.0
+    assert plan["max_acceleration"] == 0.0
+    assert plan["max_jerk"] == 0.0
+
+
+def test_motion_extrema_excludes_discontinuities_at_editorial_cuts() -> None:
+    with_cut = feature_cut_module._motion_extrema(
+        [0.0, 0.5, 1.0, 1.5],
+        [100.0, 100.0, 900.0, 900.0],
+        [200.0, 200.0, 200.0, 200.0],
+        [1.0, 1.0, 1.0, 1.0],
+        cut_before_indexes={2},
+    )
+    without_cut = feature_cut_module._motion_extrema(
+        [0.0, 0.5, 1.0, 1.5],
+        [100.0, 100.0, 900.0, 900.0],
+        [200.0, 200.0, 200.0, 200.0],
+        [1.0, 1.0, 1.0, 1.0],
+    )
+
+    assert with_cut == (0.0, 0.0, 0.0)
+    assert without_cut[0] > 0.0
 
 
 def test_virtual_camera_deadband_ignores_small_tracker_motion() -> None:

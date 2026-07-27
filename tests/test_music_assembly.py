@@ -18,12 +18,21 @@ from jascue_video_lab.music import (
 )
 from jascue_video_lab.music_assembly import (
     MusicAssemblyError,
+    MusicEditJoinRequestV2,
+    MusicEditSegmentRequestV2,
     load_music_assembly_artifacts,
+    plan_reviewed_music_edit_v2,
     plan_single_interval_music_assembly,
+    render_reviewed_music_edit_v2,
     render_single_interval_music_assembly,
     write_music_assembly_artifacts,
 )
-from jascue_video_lab.models import MusicAssemblyPlan, MusicAssemblyRenderManifest
+from jascue_video_lab.models import (
+    MusicAssemblyPlan,
+    MusicAssemblyRenderManifest,
+    MusicEditPlanV2,
+    MusicEditRenderManifestV2,
+)
 from jascue_video_lab.storage import read_json, write_json
 
 
@@ -164,6 +173,48 @@ def _write_tone(path: Path, *, duration_seconds: float) -> int:
             )
         )
     return frame_count
+
+
+def _saved_three_section_lock(
+    tmp_path: Path,
+    *,
+    source: Path,
+) -> tuple[MusicMapLock, Path]:
+    source_id = f"sha256:{sha256_file(source)}"
+    music_lock = _music_lock(duration_seconds=12, music_id=source_id)
+    music_lock = music_lock.model_copy(
+        update={
+            "sections": [
+                MusicSectionCandidate(
+                    section_id="section-001",
+                    start_sample=0,
+                    end_sample=SAMPLE_RATE * 4,
+                    label="section_001",
+                    boundary_source="energy_change",
+                    confidence=0.9,
+                ),
+                MusicSectionCandidate(
+                    section_id="section-002",
+                    start_sample=SAMPLE_RATE * 4,
+                    end_sample=SAMPLE_RATE * 8,
+                    label="section_002",
+                    boundary_source="energy_change",
+                    confidence=0.9,
+                ),
+                MusicSectionCandidate(
+                    section_id="section-003",
+                    start_sample=SAMPLE_RATE * 8,
+                    end_sample=SAMPLE_RATE * 12,
+                    label="section_003",
+                    boundary_source="energy_change",
+                    confidence=0.9,
+                ),
+            ]
+        }
+    )
+    lock_path = tmp_path / "music-map.lock.json"
+    write_json(lock_path, music_lock)
+    return music_lock, lock_path
 
 
 def test_planner_selects_one_phrase_aligned_continuous_interval(
@@ -440,3 +491,156 @@ def test_render_refuses_source_not_bound_to_plan(tmp_path: Path) -> None:
             tmp_path / "out.wav",
             tmp_path / "render-artifacts",
         )
+
+
+def test_music_edit_v2_maps_reviewed_sections_and_crossfade_samples(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-tone.wav"
+    _write_tone(source, duration_seconds=12)
+    music_lock, lock_path = _saved_three_section_lock(tmp_path, source=source)
+
+    plan = plan_reviewed_music_edit_v2(
+        music_lock,
+        music_lock_path=lock_path,
+        segments=[
+            MusicEditSegmentRequestV2(
+                section_id="section-001",
+                semantic_role="intro",
+                energy_band="low",
+            ),
+            MusicEditSegmentRequestV2(
+                section_id="section-003",
+                semantic_role="climax",
+                energy_band="high",
+            ),
+        ],
+        joins=[
+            MusicEditJoinRequestV2(
+                join_type="micro_crossfade",
+                crossfade_ms=10,
+                alignment="section_boundary",
+                energy_transition="rising",
+                editorial_reason="Move from the reviewed intro to the climax.",
+            )
+        ],
+        target_duration_ms=7_990,
+        minimum_duration_ms=7_500,
+        maximum_duration_ms=8_500,
+    )
+
+    assert plan.contract_version == "music-edit-plan-v2"
+    assert len(plan.spans) == 2
+    assert plan.spans[0].source_start_sample == 0
+    assert plan.spans[0].source_end_sample == SAMPLE_RATE * 4
+    assert plan.spans[1].source_start_sample == SAMPLE_RATE * 8
+    assert plan.spans[1].source_end_sample == SAMPLE_RATE * 12
+    assert plan.joins[0].duration_samples == 480
+    assert plan.spans[1].output_start_sample == SAMPLE_RATE * 4 - 480
+    assert plan.output_duration_samples == SAMPLE_RATE * 8 - 480
+    assert plan.ending.mode == "natural_track_end"
+    assert plan.requires_human_review is True
+
+
+def test_music_edit_v2_rejects_unreviewed_or_unsafe_join_contracts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-tone.wav"
+    _write_tone(source, duration_seconds=12)
+    music_lock, lock_path = _saved_three_section_lock(tmp_path, source=source)
+
+    with pytest.raises(ValidationError, match="between 5 and 200 ms"):
+        plan_reviewed_music_edit_v2(
+            music_lock,
+            music_lock_path=lock_path,
+            segments=[
+                MusicEditSegmentRequestV2(section_id="section-001"),
+                MusicEditSegmentRequestV2(section_id="section-003"),
+            ],
+            joins=[
+                MusicEditJoinRequestV2(
+                    join_type="micro_crossfade",
+                    crossfade_ms=1,
+                    alignment="section_boundary",
+                    energy_transition="unknown",
+                    editorial_reason="Invalidly short transition.",
+                )
+            ],
+            target_duration_ms=7_999,
+            minimum_duration_ms=7_500,
+            maximum_duration_ms=8_500,
+        )
+
+    with pytest.raises(MusicAssemblyError, match="unknown reviewed music section"):
+        plan_reviewed_music_edit_v2(
+            music_lock,
+            music_lock_path=lock_path,
+            segments=[
+                MusicEditSegmentRequestV2(section_id="section-999"),
+            ],
+            joins=[],
+            target_duration_ms=4_000,
+            minimum_duration_ms=3_500,
+            maximum_duration_ms=4_500,
+        )
+
+
+def test_render_music_edit_v2_crossfades_and_preserves_exact_duration(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-tone.wav"
+    _write_tone(source, duration_seconds=12)
+    music_lock, lock_path = _saved_three_section_lock(tmp_path, source=source)
+    plan = plan_reviewed_music_edit_v2(
+        music_lock,
+        music_lock_path=lock_path,
+        segments=[
+            MusicEditSegmentRequestV2(
+                section_id="section-001",
+                semantic_role="intro",
+                energy_band="low",
+            ),
+            MusicEditSegmentRequestV2(
+                section_id="section-003",
+                semantic_role="outro",
+                energy_band="high",
+            ),
+        ],
+        joins=[
+            MusicEditJoinRequestV2(
+                join_type="micro_crossfade",
+                crossfade_ms=10,
+                alignment="section_boundary",
+                energy_transition="rising",
+                editorial_reason="Reviewed phrase transition.",
+            )
+        ],
+        target_duration_ms=7_990,
+        minimum_duration_ms=7_500,
+        maximum_duration_ms=8_500,
+    )
+    output = tmp_path / "rendered" / "music-edit.wav"
+    result = render_reviewed_music_edit_v2(
+        source,
+        plan,
+        output,
+        tmp_path / "music-edit-artifacts",
+    )
+
+    assert result.manifest.qc_passed is True
+    assert result.manifest.internal_join_count == 1
+    assert result.manifest.crossfade_samples == 480
+    assert result.manifest.expected_output_samples == SAMPLE_RATE * 8 - 480
+    assert abs(result.manifest.duration_delta_samples) <= 8
+    assert "acrossfade" in result.manifest.ffmpeg_filter_graph
+    assert "concat" not in result.manifest.ffmpeg_filter_graph
+    assert MusicEditPlanV2.model_validate(
+        read_json(tmp_path / "music-edit-artifacts" / "music-edit-plan.v2.json")
+    ) == plan
+    assert MusicEditRenderManifestV2.model_validate(
+        read_json(result.manifest_path)
+    ) == result.manifest
+    with wave.open(str(output), "rb") as output_wave:
+        assert output_wave.getframerate() == SAMPLE_RATE
+        assert output_wave.getnchannels() == 2
+        assert abs(output_wave.getnframes() - (SAMPLE_RATE * 8 - 480)) <= 8
