@@ -221,51 +221,74 @@ def simple_production_capability_catalog() -> EditingCapabilityCatalog:
     )
 
 
-def autonomous_production_capability_catalog() -> EditingCapabilityCatalog:
-    """Extend the same catalog with policy-gated autonomous presentations."""
+def autonomous_production_capability_catalog(
+    *,
+    allow_two_panel_layout: bool = True,
+    allow_solid_matte_fit: bool = True,
+    allow_intentional_freeze: bool = True,
+) -> EditingCapabilityCatalog:
+    """Extend the same catalog with only the presentations policy authorizes."""
 
     legacy = simple_production_capability_catalog()
+    gated_capabilities = [
+        EditingCapability(
+            capability_id="two_panel_layout",
+            planner_use=(
+                "Declare that simultaneous comparison or context-detail "
+                "presentation is semantically acceptable. Local code "
+                "chooses top/bottom, side-by-side, rectangles and scale."
+            ),
+            local_executor="two-panel geometry compiler + FFmpeg",
+            delivery_scope="delivery_candidate",
+        ),
+        EditingCapability(
+            capability_id="solid_matte_fit",
+            planner_use=(
+                "Preserve an inseparable required scope when the signed "
+                "AutonomousEditPolicy authorizes solid matte delivery."
+            ),
+            local_executor="scope-preserving solid-matte renderer",
+            delivery_scope="delivery_candidate",
+        ),
+        EditingCapability(
+            capability_id="intentional_freeze",
+            planner_use=(
+                "Hold an exact action/reaction frame only when brief and "
+                "policy authorize it and a music cue binds the start."
+            ),
+            local_executor="exact-event PTS freeze renderer",
+            delivery_scope="delivery_candidate",
+        ),
+    ]
+    allowed = {
+        "two_panel_layout": allow_two_panel_layout,
+        "solid_matte_fit": allow_solid_matte_fit,
+        "intentional_freeze": allow_intentional_freeze,
+    }
+    fallback_order = [
+        "static_or_tracked_full_bleed",
+        "phase_virtual_camera_or_hard_cut",
+        "alternate_candidate",
+    ]
+    if allow_two_panel_layout:
+        fallback_order.append("two_panel_layout_when_relation_requires")
+    if allow_solid_matte_fit:
+        fallback_order.append("solid_matte_fit_when_policy_authorized")
+    fallback_order.append("optional_beat_omission_when_policy_authorized")
     return legacy.model_copy(
         update={
             "capabilities": [
                 *legacy.capabilities,
-                EditingCapability(
-                    capability_id="two_panel_layout",
-                    planner_use=(
-                        "Declare that simultaneous comparison or context-detail "
-                        "presentation is semantically acceptable. Local code "
-                        "chooses top/bottom, side-by-side, rectangles and scale."
-                    ),
-                    local_executor="two-panel geometry compiler + FFmpeg",
-                    delivery_scope="delivery_candidate",
-                ),
-                EditingCapability(
-                    capability_id="solid_matte_fit",
-                    planner_use=(
-                        "Preserve an inseparable required scope when the signed "
-                        "AutonomousEditPolicy authorizes solid matte delivery."
-                    ),
-                    local_executor="scope-preserving solid-matte renderer",
-                    delivery_scope="delivery_candidate",
-                ),
-                EditingCapability(
-                    capability_id="intentional_freeze",
-                    planner_use=(
-                        "Hold an exact action/reaction frame only when brief and "
-                        "policy authorize it and a music cue binds the start."
-                    ),
-                    local_executor="exact-event PTS freeze renderer",
-                    delivery_scope="delivery_candidate",
-                ),
+                *[
+                    capability
+                    for capability in gated_capabilities
+                    if allowed[capability.capability_id]
+                ],
             ],
-            "automatic_fallback_order": [
-                "static_or_tracked_full_bleed",
-                "phase_virtual_camera_or_hard_cut",
-                "alternate_candidate",
-                "two_panel_layout_when_relation_requires",
-                "solid_matte_fit_when_policy_authorized",
-                "optional_beat_omission_when_policy_authorized",
+            "automatic_fallback_order": fallback_order,
+            "prohibited_automatic_delivery": [
+                *([] if allow_solid_matte_fit else ["solid_fit"]),
+                "blurred_background",
             ],
-            "prohibited_automatic_delivery": ["blurred_background"],
         }
     )

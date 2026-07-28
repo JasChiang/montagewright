@@ -1207,6 +1207,40 @@ def canonicalize_direct_video_edit_plan_output(
                     "rule": "missing_horizontal_uses_source_hold",
                 }
             )
+        horizontal = chapter.get("horizontal")
+        if isinstance(horizontal, dict):
+            before_horizontal = dict(horizontal)
+            if horizontal.get("strategy") == "original":
+                horizontal["zoom_intent"] = "none"
+                horizontal["camera_intent"] = "hold"
+                horizontal["focus_entity_index"] = None
+            elif (
+                horizontal.get("strategy") == "tracked_reframe"
+                and (
+                    horizontal.get("zoom_intent") == "none"
+                    or horizontal.get("focus_entity_index") is None
+                )
+            ):
+                horizontal.update(
+                    {
+                        "strategy": "original",
+                        "zoom_intent": "none",
+                        "camera_intent": "hold",
+                        "focus_entity_index": None,
+                    }
+                )
+            if horizontal != before_horizontal:
+                changes.append(
+                    {
+                        "json_path": f"{base}.horizontal",
+                        "before": before_horizontal,
+                        "after": dict(horizontal),
+                        "rule": (
+                            "incomplete_horizontal_motion_fails_safe_to_"
+                            "unmodified_source_hold"
+                        ),
+                    }
+                )
         required_before = list(vertical.get("required_entity_indices") or [])
         preferred_before = list(vertical.get("preferred_entity_indices") or [])
         sacrificable_before = list(
@@ -1268,6 +1302,38 @@ def canonicalize_direct_video_edit_plan_output(
             for index in step.get("anchor_entity_indices", [])
             if isinstance(index, int)
         }
+        if (
+            len(required) > 4
+            and vertical.get("crop_mode") == "primary_center"
+            and vertical.get("allow_controlled_clip") is True
+            and 0 < len(referenced) <= 4
+        ):
+            demoted = [index for index in required if index not in referenced]
+            before_required = list(required)
+            required = [index for index in required if index in referenced]
+            demoted_preferences = list(
+                dict.fromkeys([*preferred, *demoted])
+            )
+            preferred = demoted_preferences[:4]
+            sacrificable = list(
+                dict.fromkeys(
+                    [
+                        *sacrificable,
+                        *demoted_preferences[4:],
+                    ]
+                )
+            )
+            changes.append(
+                {
+                    "json_path": f"{base}.vertical.required_entity_indices",
+                    "before": before_required,
+                    "after": required,
+                    "rule": (
+                        "primary_center_attention_anchors_define_bounded_"
+                        "grounding_core"
+                    ),
+                }
+            )
         missing_required = [
             index for index in required if index not in referenced
         ]
@@ -1478,8 +1544,8 @@ def _resolve_latest_failed_feature_plan_attempt(
     """Resolve the newest fully persisted failed paid attempt for one repair.
 
     This keeps a schema repair from paying for the original multimodal request
-    again. The repair request reuses the exact saved File API URIs and appends
-    only the local contract error to the original planning prompt.
+    again. The repair request contains only text: the original text prompt,
+    persisted raw JSON, current capability contract, and validation error.
     """
 
     attempts: list[tuple[int, dict[str, Any]]] = []
@@ -1600,7 +1666,13 @@ def planning_capability_catalog(
     """Expose only the presentation verbs authorized for this planning run."""
 
     return (
-        autonomous_production_capability_catalog()
+        autonomous_production_capability_catalog(
+            allow_two_panel_layout=policy.presentation.allow_two_panel_layout,
+            allow_solid_matte_fit=policy.presentation.allow_solid_matte_fit,
+            allow_intentional_freeze=(
+                policy.presentation.allow_intentional_freeze
+            ),
+        )
         if policy is not None
         else simple_production_capability_catalog()
     )
@@ -4363,19 +4435,49 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                         raise ValueError(
                             "schema repair requires the original text prompt first"
                         )
+                    failed_raw_output = read_json(
+                        failed_attempt["raw_output"]
+                        if args.resume_failed_plan
+                        else args.output_dir
+                        / (
+                            "clip-card-feature-plan."
+                            f"attempt-{attempt - 1:02d}.raw_output.json"
+                        )
+                    )
+                    previous_output_text = failed_raw_output.get("output_text")
+                    if not isinstance(previous_output_text, str):
+                        raise ValueError(
+                            "schema repair requires persisted raw output text"
+                        )
                     repair_prompt = (
                         str(original_prompt["text"])
+                        + "\n\n## 本次是純文字 contract repair\n"
+                        "不得假裝重新觀看影片或音樂；只能依前次已觀察結果"
+                        "修正 JSON 契約。保留所有已通過欄位與語意選擇。\n"
+                        "以下最新能力目錄取代原 prompt 內的能力目錄；不得選擇"
+                        "未列出的 presentation：\n"
+                        + capability_catalog.model_dump_json(indent=2)
+                        + "\n最新能力目錄 SHA256："
+                        + capability_catalog.definition_sha256()
+                        + "\n\n## 前次原始 JSON\n"
+                        + previous_output_text
                         + "\n\n## 前次輸出未通過本機 contract\n"
                         + previous_error[:6000]
-                        + "\n請重新產生完整結果，不得只回傳修補片段。"
-                        "所有原始候選影片與音樂仍附在本次 request；"
-                        "必須重新觀看並修正契約錯誤。"
+                        + "\n請重新產生完整 JSON，不得只回傳修補片段。"
+                        "開場若 full-bleed grounding 上限不足，請依你原先選定的"
+                        "主要 attention anchors，將其餘主體改為 preferred；不得"
+                        "捏造額外 panel。兩台裝置的同時比較在 policy 允許時應用"
+                        " two_panel_layout，不得用已禁止的 solid_matte_fit。"
+                    )
+                    repair_limits = (
+                        policy.gemini_limits.text_only_schema_repair
+                        if policy is not None
+                        else None
                     )
                     attempt_request = {
                         **request,
                         "input": [
                             {"type": "text", "text": repair_prompt},
-                            *original_inputs[1:],
                         ],
                         "response_format": {
                             "type": "text",
@@ -4383,8 +4485,16 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                             "schema": gemini_response_schema(response_model),
                         },
                         "generation_config": {
-                            "thinking_level": "low",
-                            "max_output_tokens": 32_000,
+                            "thinking_level": (
+                                repair_limits.thinking_level
+                                if repair_limits is not None
+                                else "minimal"
+                            ),
+                            "max_output_tokens": (
+                                repair_limits.max_output_tokens
+                                if repair_limits is not None
+                                else 12_288
+                            ),
                         },
                     }
                 attempt_stem = f"clip-card-feature-plan.attempt-{attempt:02d}"

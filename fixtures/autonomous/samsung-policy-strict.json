@@ -17,6 +17,12 @@
     "max_final_qa_passes": 2,
     "reserved_recovery_fraction": 0.2
   },
+  "gemini_limits": {
+    "text_only_schema_repair": {
+      "max_output_tokens": 12288,
+      "thinking_level": "minimal"
+    }
+  },
   "presentation": {
     "allow_two_panel_layout": true,
     "allowed_panel_modes": [

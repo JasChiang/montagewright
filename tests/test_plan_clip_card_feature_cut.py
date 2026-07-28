@@ -138,6 +138,25 @@ def test_autonomous_planner_catalog_exposes_policy_gated_presentations() -> None
         "intentional_freeze",
     } <= autonomous_ids
 
+    restricted = policy.model_copy(
+        update={
+            "presentation": policy.presentation.model_copy(
+                update={
+                    "allow_solid_matte_fit": False,
+                    "allow_intentional_freeze": False,
+                }
+            )
+        }
+    )
+    restricted_catalog = planning_capability_catalog(restricted)
+    restricted_ids = {
+        item.capability_id for item in restricted_catalog.capabilities
+    }
+    assert "two_panel_layout" in restricted_ids
+    assert "solid_matte_fit" not in restricted_ids
+    assert "intentional_freeze" not in restricted_ids
+    assert "solid_fit" in restricted_catalog.prohibited_automatic_delivery
+
 
 def test_direct_video_planning_only_selects_candidates_actually_attached() -> None:
     candidates = ["rank-1", "rank-2", "rank-3"]
