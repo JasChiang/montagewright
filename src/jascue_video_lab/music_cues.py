@@ -10,6 +10,12 @@ from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
+from .autonomous_policy import (
+    AutonomousEditPolicy,
+    DecisionAuthorityV2,
+    validate_authority_binding,
+)
+from .event_lock import AuthorizedTrimIntentDecisionV2
 from .media import sha256_file
 from .models import (
     DenseFrameCatalog,
@@ -434,19 +440,40 @@ class CuePlanReview(StrictModel):
 
 
 class CuePlanLock(StrictModel):
-    contract_version: Literal["cue-plan-lock-v1"] = CUE_PLAN_LOCK_VERSION
+    contract_version: Literal["cue-plan-lock-v1", "cue-plan-lock-v2"] = (
+        CUE_PLAN_LOCK_VERSION
+    )
     cue_plan_path: str
     cue_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    review: CuePlanReview
+    review: CuePlanReview | None = None
+    authority: DecisionAuthorityV2 | None = None
     plan: CuePlanProposal
     definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_lock(self) -> "CuePlanLock":
-        if self.review.decision != "approved":
-            raise ValueError("cue plan lock requires explicit human approval")
-        if self.review.cue_plan_sha256 != self.cue_plan_sha256:
-            raise ValueError("cue plan review is not bound to this plan")
+        if (self.review is None) == (self.authority is None):
+            raise ValueError(
+                "cue plan lock requires exactly one human or AUTO_POLICY authority"
+            )
+        if self.review is not None:
+            if self.contract_version != CUE_PLAN_LOCK_VERSION:
+                raise ValueError("human CuePlan lock must keep the v1 contract")
+            if self.review.decision != "approved":
+                raise ValueError("cue plan lock requires explicit human approval")
+            if self.review.cue_plan_sha256 != self.cue_plan_sha256:
+                raise ValueError("cue plan review is not bound to this plan")
+        else:
+            assert self.authority is not None
+            if self.contract_version != "cue-plan-lock-v2":
+                raise ValueError("AUTO_POLICY CuePlan lock requires v2")
+            if self.authority.decision_scope != "cue_plan":
+                raise ValueError("CuePlan authority scope must be cue_plan")
+            if (
+                f"sha256:{self.cue_plan_sha256}"
+                not in self.authority.input_artifact_hashes
+            ):
+                raise ValueError("CuePlan authority does not bind the proposal")
         return self
 
 
@@ -471,15 +498,31 @@ def _trim_visual_sync_points(
     if not isinstance(decision_value, str) or not decision_value:
         return []
     decision_path = Path(decision_value).expanduser().resolve(strict=True)
-    decision = TrimIntentDecision.model_validate(read_json(decision_path))
+    decision_payload = read_json(decision_path)
+    auto_authorized = (
+        isinstance(decision_payload, dict)
+        and decision_payload.get("contract_version")
+        == "trim-intent-decision-v2"
+    )
+    if auto_authorized:
+        authorized = AuthorizedTrimIntentDecisionV2.model_validate(
+            decision_payload
+        )
+        decision = authorized.decision
+    else:
+        decision = TrimIntentDecision.model_validate(decision_payload)
+    human_authorized = (
+        decision.approval_status == "approved"
+        and not decision.requires_human_review
+        and decision.human_review is not None
+    )
     if (
-        decision.approval_status != "approved"
-        or decision.requires_human_review
-        or decision.human_review is None
+        not (auto_authorized or human_authorized)
         or decision.source_in_ms is None
     ):
         raise ValueError(
-            "VisualSyncMap only accepts phase evidence from a human-approved TrimIntentDecision"
+            "VisualSyncMap only accepts phase evidence from a human or "
+            "AUTO_POLICY approved TrimIntentDecision"
         )
     proposal_path = Path(decision.proposal_path).expanduser().resolve(strict=True)
     catalog_path = Path(decision.catalog_path).expanduser().resolve(strict=True)
@@ -952,8 +995,10 @@ def plan_music_cues(
         raise ValueError("in-memory MusicMap lock differs from the saved lock artifact")
     if saved_visual_map != visual_map:
         raise ValueError("in-memory VisualSyncMap differs from the saved map artifact")
-    if music_lock.review.decision != "approved":
-        raise ValueError("cue scheduling requires an approved MusicMap lock")
+    if music_lock.review is None and music_lock.authority is None:
+        raise ValueError(
+            "cue scheduling requires a human or AUTO_POLICY MusicMap lock"
+        )
     semantic_preferences: dict[str, set[str]] | None = None
     semantic_sync_modes: dict[str, Literal["hard", "soft", "structural"]] = {}
     resolved_semantic: Path | None = None
@@ -1136,6 +1181,40 @@ def review_cue_plan(
         cue_plan_path=str(resolved),
         cue_plan_sha256=digest,
         review=review,
+        plan=plan,
+        definition_sha256=_canonical_hash(definition),
+    )
+
+
+def lock_cue_plan_with_auto_policy(
+    plan: CuePlanProposal,
+    *,
+    cue_plan_path: Path,
+    authority: DecisionAuthorityV2,
+    policy: AutonomousEditPolicy,
+) -> CuePlanLock:
+    """Lock a deterministic CuePlan without manufacturing human review."""
+
+    validate_authority_binding(authority, policy)
+    if authority.decision_scope != "cue_plan":
+        raise ValueError("AUTO_POLICY cue authority scope must be cue_plan")
+    resolved = cue_plan_path.expanduser().resolve(strict=True)
+    digest = sha256_file(resolved)
+    if CuePlanProposal.model_validate(read_json(resolved)) != plan:
+        raise ValueError("in-memory CuePlan differs from the saved proposal")
+    if f"sha256:{digest}" not in authority.input_artifact_hashes:
+        raise ValueError("AUTO_POLICY CuePlan authority does not bind proposal")
+    definition = {
+        "contract_version": "cue-plan-lock-v2",
+        "cue_plan_sha256": digest,
+        "authority": authority.model_dump(mode="json"),
+        "plan": plan.model_dump(mode="json"),
+    }
+    return CuePlanLock(
+        contract_version="cue-plan-lock-v2",
+        cue_plan_path=str(resolved),
+        cue_plan_sha256=digest,
+        authority=authority,
         plan=plan,
         definition_sha256=_canonical_hash(definition),
     )

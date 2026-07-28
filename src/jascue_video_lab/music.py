@@ -13,9 +13,14 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from .autonomous_policy import (
+    AutonomousEditPolicy,
+    DecisionAuthorityV2,
+    validate_authority_binding,
+)
 from .media import sha256_file
 from .models import FrozenStrictModel, StrictModel
-from .storage import utc_now
+from .storage import read_json, utc_now
 
 
 MUSIC_ANALYSIS_VERSION = "local-music-analysis-v1"
@@ -171,11 +176,14 @@ class LockedMusicCue(FrozenStrictModel):
 
 
 class MusicMapLock(StrictModel):
-    contract_version: Literal["music-map-lock-v1"] = MUSIC_LOCK_CONTRACT_VERSION
+    contract_version: Literal["music-map-lock-v1", "music-map-lock-v2"] = (
+        MUSIC_LOCK_CONTRACT_VERSION
+    )
     music_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     proposal_path: str
     proposal_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    review: MusicMapReview
+    review: MusicMapReview | None = None
+    authority: DecisionAuthorityV2 | None = None
     master_sample_rate: int = Field(ge=8_000, le=192_000)
     duration_samples: int = Field(gt=0)
     duration_ms: int = Field(gt=0)
@@ -188,10 +196,28 @@ class MusicMapLock(StrictModel):
 
     @model_validator(mode="after")
     def validate_lock(self) -> "MusicMapLock":
-        if self.review.decision != "approved":
-            raise ValueError("music lock requires an approved human review")
-        if self.review.proposal_sha256 != self.proposal_sha256:
-            raise ValueError("music review is not bound to this proposal")
+        if (self.review is None) == (self.authority is None):
+            raise ValueError(
+                "music lock requires exactly one human or AUTO_POLICY authority"
+            )
+        if self.review is not None:
+            if self.contract_version != MUSIC_LOCK_CONTRACT_VERSION:
+                raise ValueError("human music review must keep the v1 contract")
+            if self.review.decision != "approved":
+                raise ValueError("music lock requires an approved human review")
+            if self.review.proposal_sha256 != self.proposal_sha256:
+                raise ValueError("music review is not bound to this proposal")
+        else:
+            assert self.authority is not None
+            if self.contract_version != "music-map-lock-v2":
+                raise ValueError("AUTO_POLICY music lock requires v2")
+            if self.authority.decision_scope != "music_map":
+                raise ValueError("music lock authority scope must be music_map")
+            if (
+                f"sha256:{self.proposal_sha256}"
+                not in self.authority.input_artifact_hashes
+            ):
+                raise ValueError("music authority does not bind the proposal")
         if self.first_downbeat_sample >= self.duration_samples:
             raise ValueError("first downbeat must remain inside the music timeline")
         samples = [cue.sample_index for cue in self.cues]
@@ -851,3 +877,73 @@ def review_music_map(
         definition_sha256=_canonical_hash(definition),
     )
     return review, lock
+
+
+def lock_music_map_with_auto_policy(
+    proposal: MusicMapProposal,
+    *,
+    proposal_path: Path,
+    authority: DecisionAuthorityV2,
+    policy: AutonomousEditPolicy,
+    bpm: float | None = None,
+    first_downbeat_sample: int | None = None,
+    meter: int | None = None,
+) -> MusicMapLock:
+    """Lock deterministic music analysis under application-owned authority."""
+
+    validate_authority_binding(authority, policy)
+    if authority.decision_scope != "music_map":
+        raise ValueError("AUTO_POLICY music authority scope must be music_map")
+    resolved = proposal_path.expanduser().resolve(strict=True)
+    digest = sha256_file(resolved)
+    if MusicMapProposal.model_validate(read_json(resolved)) != proposal:
+        raise ValueError("in-memory MusicMap differs from the saved proposal")
+    if f"sha256:{digest}" not in authority.input_artifact_hashes:
+        raise ValueError("AUTO_POLICY music authority does not bind proposal")
+    bpm = bpm if bpm is not None else proposal.estimated_bpm
+    first_downbeat_sample = (
+        first_downbeat_sample
+        if first_downbeat_sample is not None
+        else proposal.first_beat_sample
+    )
+    meter = meter if meter is not None else proposal.meter_suggestion
+    if bpm is None or first_downbeat_sample is None or meter is None:
+        raise ValueError("automatic music lock requires resolved tempo and meter")
+    cues = _locked_cues(
+        proposal,
+        bpm=bpm,
+        first_downbeat_sample=first_downbeat_sample,
+        meter=meter,
+    )
+    definition = {
+        "contract_version": "music-map-lock-v2",
+        "music_id": proposal.music_id,
+        "proposal_sha256": digest,
+        "authority": authority.model_dump(mode="json"),
+        "master_sample_rate": proposal.master_sample_rate,
+        "duration_samples": proposal.duration_samples,
+        "duration_ms": proposal.duration_ms,
+        "bpm": bpm,
+        "meter": meter,
+        "first_downbeat_sample": first_downbeat_sample,
+        "cues": [cue.model_dump(mode="json") for cue in cues],
+        "sections": [
+            section.model_dump(mode="json") for section in proposal.sections
+        ],
+    }
+    return MusicMapLock(
+        contract_version="music-map-lock-v2",
+        music_id=proposal.music_id,
+        proposal_path=str(resolved),
+        proposal_sha256=digest,
+        authority=authority,
+        master_sample_rate=proposal.master_sample_rate,
+        duration_samples=proposal.duration_samples,
+        duration_ms=proposal.duration_ms,
+        bpm=bpm,
+        meter=meter,
+        first_downbeat_sample=first_downbeat_sample,
+        cues=cues,
+        sections=proposal.sections,
+        definition_sha256=_canonical_hash(definition),
+    )

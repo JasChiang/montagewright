@@ -7,6 +7,12 @@ from pathlib import Path
 
 import pytest
 
+from jascue_video_lab.autonomous_policy import (
+    AutonomousEditPolicy,
+    BudgetPolicy,
+    DurationPolicy,
+    authorize_decision,
+)
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.music import (
     MusicAnalysisParameters,
@@ -15,6 +21,7 @@ from jascue_video_lab.music import (
     MusicMapProposal,
     MusicSectionCandidate,
     analyze_music,
+    lock_music_map_with_auto_policy,
     review_music_map,
 )
 from jascue_video_lab.music_cues import (
@@ -31,6 +38,7 @@ from jascue_video_lab.music_cues import (
     derive_brief_visual_sync_map,
     derive_visual_sync_map,
     plan_music_cues,
+    lock_cue_plan_with_auto_policy,
     review_cue_plan,
 )
 from jascue_video_lab.models import ModelProvenance
@@ -188,6 +196,91 @@ def test_music_map_requires_explicit_review_before_lock(tmp_path: Path) -> None:
     assert approved.review.reviewer == "editor"
     assert any(cue.kind == "downbeat" for cue in approved.cues)
     assert len({cue.sample_index for cue in approved.cues}) == len(approved.cues)
+
+
+def test_music_and_cue_locks_accept_hash_bound_auto_policy(
+    tmp_path: Path,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=85_000,
+            min_ms=75_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    proposal = _proposal()
+    proposal_path = tmp_path / "music-map.proposal.json"
+    write_json(proposal_path, proposal)
+    music_authority = authorize_decision(
+        policy,
+        decision_scope="music_map",
+        input_artifact_hashes=(
+            "sha256:" + sha256_file(proposal_path),
+        ),
+        deterministic_gate_results={
+            "pcm_analysis": "passed",
+            "tempo_resolved": "passed",
+        },
+        decision_codes=("music_map_analysis_passed",),
+    )
+    music_lock = lock_music_map_with_auto_policy(
+        proposal,
+        proposal_path=proposal_path,
+        authority=music_authority,
+        policy=policy,
+    )
+    assert music_lock.review is None
+    assert music_lock.authority == music_authority
+
+    music_lock_path = tmp_path / "music-map.lock.json"
+    write_json(music_lock_path, music_lock)
+    manifest = tmp_path / "render-manifest.json"
+    _render_manifest(manifest)
+    visual = derive_visual_sync_map(
+        manifest,
+        aspect_ratio="9:16",
+        default_flex_ms=500,
+    )
+    visual_path = tmp_path / "visual-sync-map.json"
+    write_json(visual_path, visual)
+    plan = plan_music_cues(
+        music_lock,
+        visual,
+        music_lock_path=music_lock_path,
+        visual_sync_map_path=visual_path,
+    )
+    plan_path = tmp_path / "cue-plan.proposal.json"
+    write_json(plan_path, plan)
+    cue_authority = authorize_decision(
+        policy,
+        decision_scope="cue_plan",
+        input_artifact_hashes=(
+            "sha256:" + sha256_file(plan_path),
+        ),
+        deterministic_gate_results={
+            "hard_sync_points": "passed",
+            "cue_capacity": "passed",
+        },
+        decision_codes=("cue_plan_hard_points_passed",),
+    )
+
+    cue_lock = lock_cue_plan_with_auto_policy(
+        plan,
+        cue_plan_path=plan_path,
+        authority=cue_authority,
+        policy=policy,
+    )
+
+    assert cue_lock.review is None
+    assert cue_lock.authority == cue_authority
+    assert cue_lock.contract_version == "cue-plan-lock-v2"
 
 
 def test_visual_sync_map_zero_flex_is_read_only(tmp_path: Path) -> None:

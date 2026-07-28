@@ -1,0 +1,116 @@
+{
+  "contract_version": "editorial-beat-fixture-v1",
+  "project_id": "samsung-galaxy-z-autonomous-v1",
+  "beats": [
+    {
+      "beat_id": "camera_gesture",
+      "priority": "preferred",
+      "evidence_query_lock_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "required_target_ids": ["camera_gesture"],
+      "narrative_function": "feature_evidence",
+      "visual_events": [
+        {
+          "event_type": "camera_gesture_apex",
+          "cue_relation": "accent",
+          "tolerance_frames": 4
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 18,
+        "preferred_frames": 36,
+        "maximum_frames": 72
+      },
+      "relation_mode": "single_subject",
+      "allowed_reconstruction": ["continuous", "solid_fit"]
+    },
+    {
+      "beat_id": "ai_generation_payoff",
+      "priority": "hard",
+      "evidence_query_lock_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "required_target_ids": ["generation_result"],
+      "narrative_function": "global_energy_peak",
+      "visual_events": [
+        {
+          "event_type": "generation_result_stable_start",
+          "cue_relation": "principal_downbeat",
+          "tolerance_frames": 2
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 24,
+        "preferred_frames": 54,
+        "maximum_frames": 90
+      },
+      "relation_mode": "single_subject",
+      "allowed_reconstruction": ["continuous", "hard_cut_after_result", "solid_fit"]
+    },
+    {
+      "beat_id": "watch_ui",
+      "priority": "hard",
+      "evidence_query_lock_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "required_target_ids": ["watch_ui"],
+      "narrative_function": "feature_evidence",
+      "visual_events": [
+        {
+          "event_type": "watch_ui_state_change",
+          "cue_relation": "music_emphasis",
+          "tolerance_frames": 2
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 18,
+        "preferred_frames": 42,
+        "maximum_frames": 72
+      },
+      "relation_mode": "context_detail",
+      "allowed_reconstruction": ["continuous", "two_panel_layout", "solid_fit"]
+    },
+    {
+      "beat_id": "underwater_lift",
+      "priority": "preferred",
+      "evidence_query_lock_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "required_target_ids": ["underwater_watch"],
+      "narrative_function": "feature_evidence",
+      "visual_events": [
+        {
+          "event_type": "underwater_lift_apex",
+          "cue_relation": "music_emphasis",
+          "tolerance_frames": 4
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 18,
+        "preferred_frames": 42,
+        "maximum_frames": 84
+      },
+      "relation_mode": "single_subject",
+      "allowed_reconstruction": ["continuous", "solid_fit"]
+    },
+    {
+      "beat_id": "group_laugh_ending",
+      "priority": "preferred",
+      "evidence_query_lock_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "required_target_ids": ["group_laugh"],
+      "narrative_function": "closing",
+      "visual_events": [
+        {
+          "event_type": "group_laugh_reaction_peak",
+          "cue_relation": "phrase_ending",
+          "tolerance_frames": 2
+        },
+        {
+          "event_type": "freeze_start",
+          "cue_relation": "phrase_ending",
+          "tolerance_frames": 2
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 18,
+        "preferred_frames": 45,
+        "maximum_frames": 75
+      },
+      "relation_mode": "simultaneous_relation",
+      "allowed_reconstruction": ["continuous", "intentional_freeze", "solid_fit"]
+    }
+  ]
+}

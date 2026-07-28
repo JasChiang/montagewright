@@ -16,6 +16,13 @@ from typing import Any, Literal, Sequence
 from google import genai
 from google.genai import types
 
+from .event_lock import (
+    EditorialBeatContract,
+    ExactEventLockV2,
+    ExactEventSelectionGroup,
+    bracket_dense_frames_by_difference,
+    resolve_exact_event_locks,
+)
 from .geometry import native_yxyx_to_canonical_xyxy
 from .identity_checkpoints import IdentityCheckpointModelDecision
 from .media import sha256_file
@@ -2753,6 +2760,180 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "clip_card", error)
+            raise
+
+    def select_exact_event_locks(
+        self,
+        *,
+        catalog: DenseFrameCatalog,
+        beat_contracts: Sequence[EditorialBeatContract],
+        run_dir: Path,
+        input_artifact_hashes: tuple[str, ...],
+        max_bracket_frames: int = 12,
+    ) -> tuple[ExactEventLockV2, ...]:
+        """Resolve grouped event locks from supplied IDs without model timecodes."""
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        requested_events = [
+            event
+            for beat in beat_contracts
+            for event in beat.visual_events
+        ]
+        if not requested_events:
+            raise ValueError("exact-event resolution requires a visual event")
+        if len(requested_events) > 8:
+            raise ValueError("one exact-event group supports at most eight events")
+        bracket = bracket_dense_frames_by_difference(
+            catalog,
+            max_frames=max_bracket_frames,
+        )
+        allowed_ids = [frame.frame_id for frame in bracket]
+        prompt = (
+            "## Exact event frame-ID selection\n"
+            "只能從本次提供的原比例影格選擇既有 frame ID。不得輸出、"
+            "推算或改寫 timestamp、PTS、秒數、bbox 或 crop。"
+            "每個 event 必須回傳 selected/support start/support end IDs；"
+            "若證據不足，讓 structured output validation fail closed，"
+            "不得猜測。\n"
+            f"source_asset_id={catalog.source_asset_id}\n"
+            f"catalog_event_id={catalog.event_id}\n"
+            "allowed_frame_ids="
+            + json.dumps(allowed_ids, ensure_ascii=False)
+            + "\neditorial_events="
+            + json.dumps(
+                [
+                    {
+                        "beat_id": beat.beat_id,
+                        "events": [
+                            event.model_dump(mode="json")
+                            for event in beat.visual_events
+                        ],
+                    }
+                    for beat in beat_contracts
+                ],
+                ensure_ascii=False,
+            )
+        )
+        api_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        recorded_input: list[dict[str, Any]] = [
+            {"type": "text", "text": prompt}
+        ]
+        for frame in bracket:
+            path = Path(frame.image_path).expanduser().resolve(strict=True)
+            mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+            label = (
+                f"FRAME_ID={frame.frame_id}; "
+                f"frame_sha256={frame.frame_hash}"
+            )
+            api_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(path.read_bytes()).decode(
+                            "ascii"
+                        ),
+                        "mime_type": mime_type,
+                        "media_resolution": "high",
+                    },
+                ]
+            )
+            recorded_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image",
+                        "mime_type": mime_type,
+                        "sha256": frame.frame_hash,
+                        "frame_id": frame.frame_id,
+                        "media_resolution": "high",
+                    },
+                ]
+            )
+        request = {
+            "model": self.model_id,
+            "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+            "store": False,
+            "input": api_input,
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 2048,
+            },
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(ExactEventSelectionGroup),
+            },
+        }
+        write_json(
+            run_dir / "exact_event.request.json",
+            {**request, "input": recorded_input},
+        )
+        try:
+            interaction = self.client.interactions.create(**request)
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="exact_event_group",
+                canonical_filename="exact_event.raw_interaction.json",
+                interaction=interaction,
+            )
+            write_json(
+                run_dir / "exact_event.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            group = ExactEventSelectionGroup.model_validate_json(
+                interaction.output_text
+            )
+            if (
+                group.source_asset_id != catalog.source_asset_id
+                or group.catalog_event_id != catalog.event_id
+            ):
+                raise GeminiContractError(
+                    "exact-event group changed immutable source metadata"
+                )
+            expected = [
+                event.event_type for event in requested_events
+            ]
+            actual = [selection.event_type for selection in group.selections]
+            if actual != expected:
+                raise GeminiContractError(
+                    "exact-event group changed requested event order"
+                )
+            locks = resolve_exact_event_locks(
+                catalog,
+                group.selections,
+                gemini_interaction_id=interaction.id,
+                input_artifact_hashes=input_artifact_hashes,
+            )
+            write_json(
+                run_dir / "exact_event_locks.json",
+                {
+                    "contract_version": "exact-event-lock-group-v2",
+                    "locks": [
+                        lock.model_dump(mode="json") for lock in locks
+                    ],
+                },
+            )
+            write_json(
+                run_dir / "exact_event.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return locks
+        except Exception as error:
+            write_json(
+                run_dir / "exact_event.schema_validation.json",
+                {
+                    "ok": False,
+                    "repair_attempted": False,
+                    "errors": [
+                        {
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        }
+                    ],
+                },
+            )
+            append_error(run_dir, "exact_event_group", error)
             raise
 
     def select_dense_event_frames(
