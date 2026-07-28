@@ -227,6 +227,69 @@ def _load_reusable_picture_result(
             raise DeliveryPipelineBlocked(
                 f"picture resume rejected because {aspect_key} output changed"
             )
+    saved_context = manifest.get("autonomous_context")
+    result_context = result.get("autonomous_context_paths")
+    if saved_context is not None or result_context is not None:
+        if not isinstance(saved_context, Mapping) or not isinstance(
+            result_context, Mapping
+        ):
+            raise DeliveryPipelineBlocked(
+                "picture resume autonomous context is malformed"
+            )
+        if set(saved_context) != set(result_context):
+            raise DeliveryPipelineBlocked(
+                "picture resume autonomous context keys changed"
+            )
+        for key, value in result_context.items():
+            context_path = Path(str(value)).resolve(strict=True)
+            manifest_row = saved_context.get(key)
+            if (
+                not isinstance(manifest_row, Mapping)
+                or manifest_row.get("path") != str(context_path)
+                or manifest_row.get("sha256") != sha256_file(context_path)
+            ):
+                raise DeliveryPipelineBlocked(
+                    f"picture resume rejected because {key} context changed"
+                )
+    saved_deterministic = manifest.get(
+        "deterministic_delivery_evidence"
+    )
+    result_deterministic = result.get(
+        "deterministic_delivery_evidence_path"
+    )
+    if saved_deterministic is not None or result_deterministic is not None:
+        if not isinstance(saved_deterministic, Mapping) or not isinstance(
+            result_deterministic, str
+        ):
+            raise DeliveryPipelineBlocked(
+                "picture resume deterministic evidence is malformed"
+            )
+        evidence_path = Path(result_deterministic).resolve(strict=True)
+        if (
+            saved_deterministic.get("path") != str(evidence_path)
+            or saved_deterministic.get("sha256")
+            != sha256_file(evidence_path)
+        ):
+            raise DeliveryPipelineBlocked(
+                "picture resume rejected because deterministic evidence changed"
+            )
+    saved_bundle = manifest.get("autonomous_evidence_bundle")
+    result_bundle = result.get("autonomous_evidence_bundle_path")
+    if saved_bundle is not None or result_bundle is not None:
+        if not isinstance(saved_bundle, Mapping) or not isinstance(
+            result_bundle, str
+        ):
+            raise DeliveryPipelineBlocked(
+                "picture resume autonomous evidence bundle is malformed"
+            )
+        bundle_path = Path(result_bundle).resolve(strict=True)
+        if (
+            saved_bundle.get("path") != str(bundle_path)
+            or saved_bundle.get("sha256") != sha256_file(bundle_path)
+        ):
+            raise DeliveryPipelineBlocked(
+                "picture resume rejected because evidence bundle changed"
+            )
     return result
 
 
@@ -244,6 +307,7 @@ def run_feature_delivery_pipeline(
     max_gemini_cost_usd: float | None = None,
     autonomous_context_paths: Mapping[str, Path] | None = None,
     deterministic_delivery_evidence_path: Path | None = None,
+    editorial_beat_contracts_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run picture → continuous music → final mux → final QA as one chain.
 
@@ -307,10 +371,6 @@ def run_feature_delivery_pipeline(
                 policy.budget.reserved_recovery_fraction
             ),
         )
-        if not autonomous_context_paths:
-            raise DeliveryPipelineBlocked(
-                "autonomous delivery requires final-QA context artifacts"
-            )
         required_context_keys = {
             "editorial_beat_contracts",
             "music_map",
@@ -318,44 +378,52 @@ def run_feature_delivery_pipeline(
             "exact_event_locks",
             "reuse_degradation",
         }
-        if set(autonomous_context_paths) != required_context_keys:
+        if autonomous_context_paths is not None:
+            if set(autonomous_context_paths) != required_context_keys:
+                raise DeliveryPipelineBlocked(
+                    "autonomous final-QA context keys are incomplete or unknown"
+                )
+            resolved_autonomous_context = {
+                key: path.expanduser().resolve(strict=True)
+                for key, path in autonomous_context_paths.items()
+            }
+            preflight_degradation = (
+                AutonomousDegradationManifest.model_validate(
+                    read_json(
+                        resolved_autonomous_context["reuse_degradation"]
+                    )
+                )
+            )
+            if preflight_degradation.policy_reference != policy.policy_reference:
+                raise DeliveryPipelineBlocked(
+                    "degradation manifest does not bind the autonomous policy"
+                )
+        elif editorial_beat_contracts_path is None:
             raise DeliveryPipelineBlocked(
-                "autonomous final-QA context keys are incomplete or unknown"
+                "autonomous delivery requires editorial beat contracts so "
+                "feature-cut can generate selected-window context"
             )
-        resolved_autonomous_context = {
-            key: path.expanduser().resolve(strict=True)
-            for key, path in autonomous_context_paths.items()
-        }
-        preflight_degradation = AutonomousDegradationManifest.model_validate(
-            read_json(resolved_autonomous_context["reuse_degradation"])
-        )
-        if preflight_degradation.policy_reference != policy.policy_reference:
-            raise DeliveryPipelineBlocked(
-                "degradation manifest does not bind the autonomous policy"
+        resolved_deterministic_evidence: Path | None = None
+        if deterministic_delivery_evidence_path is not None:
+            resolved_deterministic_evidence = (
+                deterministic_delivery_evidence_path.expanduser().resolve(
+                    strict=True
+                )
             )
-        if deterministic_delivery_evidence_path is None:
-            raise DeliveryPipelineBlocked(
-                "autonomous delivery requires deterministic QA evidence"
+            deterministic_evidence = (
+                DeterministicDeliveryEvidence.model_validate(
+                    read_json(resolved_deterministic_evidence)
+                )
             )
-        resolved_deterministic_evidence = (
-            deterministic_delivery_evidence_path.expanduser().resolve(
-                strict=True
+            deterministic_report = run_deterministic_delivery_qa(
+                deterministic_evidence,
+                policy=policy,
             )
-        )
-        deterministic_evidence = (
-            DeterministicDeliveryEvidence.model_validate(
-                read_json(resolved_deterministic_evidence)
-            )
-        )
-        deterministic_report = run_deterministic_delivery_qa(
-            deterministic_evidence,
-            policy=policy,
-        )
-        if not deterministic_report.passed:
-            raise DeliveryPipelineBlocked(
-                "deterministic autonomous gates failed before paid work: "
-                + ", ".join(deterministic_report.failure_codes)
-            )
+            if not deterministic_report.passed:
+                raise DeliveryPipelineBlocked(
+                    "deterministic autonomous gates failed before paid work: "
+                    + ", ".join(deterministic_report.failure_codes)
+                )
         write_json(
             resolved_output / "autonomous-preflight.json",
             {
@@ -369,8 +437,15 @@ def run_feature_delivery_pipeline(
                     key: str(path)
                     for key, path in resolved_autonomous_context.items()
                 },
-                "deterministic_delivery_evidence_path": str(
-                    resolved_deterministic_evidence
+                "context_source": (
+                    "supplied"
+                    if resolved_autonomous_context
+                    else "selected_window_generation_pending"
+                ),
+                "deterministic_delivery_evidence_path": (
+                    str(resolved_deterministic_evidence)
+                    if resolved_deterministic_evidence is not None
+                    else None
                 ),
                 "paid_call_started": False,
                 "generated_at": utc_now(),
@@ -393,6 +468,14 @@ def run_feature_delivery_pipeline(
         kwargs["music_path"] = music_path
         kwargs["music_lock_path"] = music_lock_path
         kwargs["execution_profile"] = profile.value
+        if policy is not None:
+            kwargs["autonomous_policy_path"] = autonomous_policy_path
+            kwargs["editorial_beat_contracts_path"] = (
+                editorial_beat_contracts_path
+                or resolved_autonomous_context.get(
+                    "editorial_beat_contracts"
+                )
+            )
         if reuse_picture_result:
             feature_result = _load_reusable_picture_result(
                 resolved_output / "picture",
@@ -403,6 +486,48 @@ def run_feature_delivery_pipeline(
         else:
             feature_result = run_feature_cut_experiment(**kwargs)
         outputs["feature_cut"] = feature_result
+        if policy is not None and not resolved_autonomous_context:
+            generated_context = feature_result.get(
+                "autonomous_context_paths"
+            )
+            if not isinstance(generated_context, Mapping):
+                raise DeliveryPipelineBlocked(
+                    "feature-cut did not persist selected-window context"
+                )
+            if set(generated_context) != required_context_keys:
+                raise DeliveryPipelineBlocked(
+                    "generated autonomous context is incomplete"
+                )
+            resolved_autonomous_context = {
+                str(key): Path(str(path)).expanduser().resolve(strict=True)
+                for key, path in generated_context.items()
+            }
+        if policy is not None and deterministic_evidence is None:
+            generated_evidence = feature_result.get(
+                "deterministic_delivery_evidence_path"
+            )
+            if not isinstance(generated_evidence, str):
+                raise DeliveryPipelineBlocked(
+                    "feature-cut did not persist deterministic delivery evidence"
+                )
+            resolved_deterministic_evidence = Path(
+                generated_evidence
+            ).expanduser().resolve(strict=True)
+            deterministic_evidence = (
+                DeterministicDeliveryEvidence.model_validate(
+                    read_json(resolved_deterministic_evidence)
+                )
+            )
+            deterministic_report = run_deterministic_delivery_qa(
+                deterministic_evidence,
+                policy=policy,
+            )
+            if not deterministic_report.passed:
+                raise DeliveryPipelineBlocked(
+                    "generated deterministic autonomous gates failed before "
+                    "final QA: "
+                    + ", ".join(deterministic_report.failure_codes)
+                )
         picture_media_rendered = bool(feature_result.get("media_rendered"))
         picture_outputs_present = any(
             feature_result.get(f"{aspect_key}_output") is not None

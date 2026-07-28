@@ -22,6 +22,7 @@ from jascue_video_lab.full_v1 import (
     _select_query_lock_target,
     _shared_upload_dir,
     create_dense_event_catalog,
+    create_dense_window_catalog,
     create_shot_catalog,
     dense_window_for_event,
     dense_sampling_fps,
@@ -586,6 +587,29 @@ def test_dense_catalog_preserves_exact_pts_and_separate_transport(tmp_path: Path
     assert all(Path(frame.transport_image_path).exists() for frame in catalog.frames)
     assert all(frame.frame_pts >= 0 for frame in catalog.frames)
     assert all(frame.frame_hash != frame.transport_image_hash for frame in catalog.frames)
+
+
+def test_selected_window_dense_catalog_reuses_exact_pts_path(tmp_path: Path) -> None:
+    video = tmp_path / "source.mp4"
+    _make_av_video(video)
+    media = probe_video(video)
+
+    catalog = create_dense_window_catalog(
+        video,
+        media.asset_id,
+        "selected-feature",
+        tmp_path / "selected-dense",
+        sampling_fps=4,
+        start_ms=500,
+        end_ms=1_500,
+        max_width=160,
+    )
+
+    assert catalog.event_id == "selected-feature"
+    assert catalog.source_start_ms == 500
+    assert catalog.source_end_ms == 1_500
+    assert all(500 <= frame.frame_time_ms < 1_500 for frame in catalog.frames)
+    assert (tmp_path / "selected-dense" / "dense-catalog.json").is_file()
 
 
 def test_dense_contact_sheet_letterboxes_without_stretching(tmp_path: Path) -> None:

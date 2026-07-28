@@ -77,6 +77,34 @@ class EditingCapabilityCatalog(_StrictModel):
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def execution_compatible_with(
+        self,
+        current: "EditingCapabilityCatalog",
+    ) -> bool:
+        """Allow hash-bound planner prose to migrate into stricter executors.
+
+        The semantic output never contains executable geometry. A saved plan is
+        reusable only when every capability ID still exists with the same
+        delivery scope and the planner boundary/aspect preference are unchanged.
+        Local executor descriptions and fallback ordering may become stricter.
+        """
+
+        if (
+            self.planner_boundary != current.planner_boundary
+            or self.vertical_delivery_preference
+            != current.vertical_delivery_preference
+        ):
+            return False
+        saved = {
+            capability.capability_id: capability.delivery_scope
+            for capability in self.capabilities
+        }
+        active = {
+            capability.capability_id: capability.delivery_scope
+            for capability in current.capabilities
+        }
+        return all(active.get(key) == scope for key, scope in saved.items())
+
 
 def simple_production_capability_catalog() -> EditingCapabilityCatalog:
     """Return the production planner's executable, domain-neutral verbs."""

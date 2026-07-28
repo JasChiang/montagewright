@@ -840,14 +840,13 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
             raise ValueError(
                 "--max-gemini-cost-usd cannot loosen the signed policy cap"
             )
-        if args.autonomous_context_dir is None:
+        if (
+            args.autonomous_context_dir is None
+            and args.editorial_beat_contracts is None
+        ):
             raise ValueError(
-                "autonomous execution requires --autonomous-context-dir"
-            )
-        if args.deterministic_delivery_evidence is None:
-            raise ValueError(
-                "autonomous execution requires "
-                "--deterministic-delivery-evidence"
+                "autonomous execution requires --editorial-beat-contracts "
+                "unless a complete --autonomous-context-dir is supplied"
             )
     autonomous_context_paths = None
     if args.autonomous_context_dir is not None:
@@ -902,6 +901,7 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
         deterministic_delivery_evidence_path=(
             args.deterministic_delivery_evidence
         ),
+        editorial_beat_contracts_path=args.editorial_beat_contracts,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2528,12 +2528,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     feature_delivery_parser.add_argument(
+        "--editorial-beat-contracts",
+        type=Path,
+        help=(
+            "Beat template bundle with feature_id mappings. In autonomous "
+            "runs feature-cut binds it to the selected EvidenceQueryLock and "
+            "persists grouped ExactEventLocks automatically."
+        ),
+    )
+    feature_delivery_parser.add_argument(
         "--autonomous-context-dir",
         type=Path,
         help=(
             "Directory containing editorial-beat-contracts.json, "
             "music-map.json, cue-plan.json, exact-event-locks.json, and "
-            "reuse-degradation.json. Required by autonomous final QA."
+            "reuse-degradation.json. Optional compatibility override; normal "
+            "autonomous runs generate these from selected windows."
         ),
     )
     feature_delivery_parser.add_argument(
@@ -2541,7 +2551,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "Application-owned containment/identity/relation/cue/motion/"
-            "readability/reuse gate evidence JSON for autonomous delivery."
+            "readability/reuse gate evidence JSON. Optional compatibility "
+            "override; normal autonomous runs generate it."
         ),
     )
     feature_delivery_parser.add_argument("--model", default=MODEL_ID)

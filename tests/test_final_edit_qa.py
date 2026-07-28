@@ -719,6 +719,34 @@ def test_deterministic_qa_measures_cue_delta_and_fails_independently() -> None:
     assert report.gate_results["cue_sync"] == "failed"
 
 
+def test_deterministic_qa_uses_event_specific_cue_tolerance() -> None:
+    report = run_deterministic_delivery_qa(
+        DeterministicDeliveryEvidence(
+            media_playable=True,
+            pts_valid=True,
+            unexpected_freeze_count=0,
+            containment_passed=True,
+            identity_passed=True,
+            relation_passed=True,
+            panel_same_pts_passed=True,
+            relative_scale_lock_passed=True,
+            cue_delta_frames={"preferred-apex": 4},
+            cue_tolerance_frames={"preferred-apex": 4},
+            synthetic_motion_motivated=True,
+            synthetic_reversal_count=0,
+            settle_passed=True,
+            readability_passed=True,
+            reuse_authorized=True,
+            omissions_authorized=True,
+            hard_evidence_passed=True,
+        ),
+        policy=_autonomous_policy(),
+    )
+
+    assert report.passed is True
+    assert report.gate_results["cue_sync"] == "passed"
+
+
 def test_recovery_uses_local_mapping_and_enforces_both_caps(
     tmp_path: Path,
 ) -> None:

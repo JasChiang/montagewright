@@ -202,9 +202,9 @@ Full Auto v2 executor 與 selection planner v3 已完成 Top-K schema、brief-sp
 
 2026-07-28 的 autonomous-delivery-v1 已加入 policy／authority／budget、ExactEventLockV2、multi-target grounding、two-panel／solid-fit／freeze presentation compiler、bounded sequence optimizer、segment render cache，以及有聲 `autonomous_final_9x16` QA。正式 auto approval 不再由 `requires_human_review` 布林值推導，而是由 policy SHA、不可變輸入 hashes、deterministic gate results、Gemini interaction IDs 與 decision codes 組成 `DecisionAuthorityV2`。舊 review profiles 完全保留人工 gate。
 
-歷史 Samsung run 尚未包含 V1 的 beat/cue/exact-event/degradation/deterministic evidence bundle，因此本次未付費重跑，也未將舊 review MP4 冒充 autonomous evidence。完整實作與 benchmark readiness 記錄見 `AUTONOMOUS-DELIVERY-V1.md`。
+selected-window orchestration 現已在最終 source in/out 上重用 dense decoder，依 feature 將多事件合併為一次 grouped ExactEventLock call，並把 template 綁到實際入選候選的 `EvidenceQueryLockV2`。同一 picture run 會產生 beat、music、cue、exact-event、degradation、deterministic QA 六份 evidence 與含路徑／hash 的 bundle index；`feature-delivery` 會直接發現並驗證它們，resume 時也拒絕任何被修改的 context。
 
-尚未完成的是把 selected-window grouped event resolver 與這份六檔 evidence bundle 直接接入歷史 feature-cut orchestration，完成一次真正 end-to-end 的 Samsung paid benchmark；另外仍有長毛片自動 take segmentation／重拍分組、16:9 runtime candidate switching、coarse/dense 統一 review UI、SAM 週期語意重驗、遮擋後 re-identification、overlay layout solver 與三次穩定度報告。本文件同時包含已實作與後續設計；任何缺少對應 authority 的建議都不得當成 production cut 或 SpatialTrack。
+Samsung 9:16 selected-window benchmark 已實際執行：23 次付費 interaction、124,058 input、0 cached input、2,821 output、9,340 thought tokens，估算 US$0.27729450；picture run 產生 82.624 秒有聲 MP4、六個 ExactEventLocks 與完整六份 evidence bundle，技術 QC 通過。`autonomous_strict` 仍正確停在 deterministic cue gate：AI result 對 principal downbeat 差 29 frames，closing reaction／freeze 對 phrase ending 差 38／41 frames，因此沒有呼叫 final semantic QA，也沒有宣稱 `delivery_eligible`。另外仍有 cue-aware trim／duration reconciliation、長毛片自動 take segmentation／重拍分組、16:9 runtime exact-event integration、coarse/dense 統一 review UI、SAM 週期語意重驗、遮擋後 re-identification、overlay layout solver 與三次穩定度報告。本文件同時包含已實作與後續設計；任何缺少對應 authority 的建議都不得當成 production cut 或 SpatialTrack。
 
 ## 官方參考
 

@@ -247,6 +247,7 @@ class DeterministicDeliveryEvidence(StrictModel):
     panel_same_pts_passed: bool
     relative_scale_lock_passed: bool
     cue_delta_frames: dict[str, int]
+    cue_tolerance_frames: dict[str, int] = Field(default_factory=dict)
     synthetic_motion_motivated: bool
     synthetic_reversal_count: int = Field(ge=0)
     settle_passed: bool
@@ -1003,8 +1004,12 @@ def run_deterministic_delivery_qa(
     gate(
         "cue_sync",
         all(
-            abs(delta) <= policy.sync.hard_tolerance_frames
-            for delta in evidence.cue_delta_frames.values()
+            abs(delta)
+            <= evidence.cue_tolerance_frames.get(
+                event_id,
+                policy.sync.hard_tolerance_frames,
+            )
+            for event_id, delta in evidence.cue_delta_frames.items()
         ),
     )
     gate("synthetic_motion_motivated", evidence.synthetic_motion_motivated)

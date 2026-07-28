@@ -24,6 +24,24 @@ deterministic-delivery-evidence.json
 
 缺少任何一份、policy SHA 不符，或 deterministic evidence 有 hard failure，pipeline 會在新的付費工作前停止。歷史 review artifact 不能因為可播放而被自動升級。
 
+`feature-delivery` 的正常 autonomous 路徑不再要求人工準備這六份檔案。呼叫者提供 policy 與含 `feature_id` 的 beat templates 後，入選的最終 source window 會直接重用 dense-frame decoder、以一次 grouped exact-event call 選既有 frame IDs，將 templates 綁到實際 `EvidenceQueryLockV2`，再寫入 `autonomous-evidence-bundle.json`。`--autonomous-context-dir` 與 `--deterministic-delivery-evidence` 只保留作為既有 hash-bound bundle 的相容 override。
+
+首個 Samsung 9:16 selected-window trial 已產生 82.624 秒有聲 MP4 與六個 exact locks；23 次付費 interaction 的估算成本為 US$0.27729450。技術 QC 通過，但 strict delivery 在 final QA 前正確擋下 cue sync：AI result、closing reaction 與 freeze 分別偏離指定 cue 29、38、41 frames。這是可試看的正式 evidence run，不是 `delivery_eligible` 成片；下一步必須用保存的 locks 做本機 cue-aware trim／duration reconciliation，不能放寬 tolerance 或重付費猜時間。
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab feature-delivery \
+  CATALOG.json BRIEF.json \
+  --sam-checkpoint CHECKPOINT.pt \
+  --music MUSIC.mp3 \
+  --music-map-lock MUSIC_MAP.lock.json \
+  --aspect 9x16 \
+  --execution-profile autonomous_strict \
+  --autonomous-policy fixtures/autonomous/samsung-policy-strict.json \
+  --editorial-beat-contracts fixtures/autonomous/samsung-editorial-beats.json \
+  --reuse-feature-plan \
+  --output-dir artifacts/samsung-autonomous-v1
+```
+
 ## 一般人也看得懂的工作流程
 
 假設手上有一整批還沒整理的拍攝毛片，這套實驗流程會先幫忙「看帶、整理、提出剪輯建議」，而不是一開始就直接把影片自動剪完：

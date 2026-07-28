@@ -35,3 +35,35 @@ def test_capability_catalog_exposes_execution_without_geometry_output() -> None:
     assert catalog.planner_boundary == (
         "semantic_intent_only_no_exact_time_or_geometry"
     )
+
+
+def test_capability_prose_migration_requires_same_execution_scope() -> None:
+    current = simple_production_capability_catalog()
+    historical = current.model_copy(
+        update={
+            "capabilities": [
+                capability.model_copy(
+                    update={"planner_use": "Historical planner wording."}
+                )
+                if capability.capability_id == "phase_virtual_camera"
+                else capability
+                for capability in current.capabilities
+            ]
+        }
+    )
+    incompatible = historical.model_copy(
+        update={
+            "capabilities": [
+                capability.model_copy(
+                    update={"delivery_scope": "planning_only"}
+                )
+                if capability.capability_id == "phase_virtual_camera"
+                else capability
+                for capability in historical.capabilities
+            ]
+        }
+    )
+
+    assert historical.definition_sha256() != current.definition_sha256()
+    assert historical.execution_compatible_with(current)
+    assert not incompatible.execution_compatible_with(current)

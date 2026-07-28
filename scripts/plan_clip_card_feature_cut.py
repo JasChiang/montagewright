@@ -2842,9 +2842,11 @@ def reproject_direct_video_edit_plan(
         raise ValueError("direct-video plan capability catalog binding changed")
     if bound_capabilities.definition_sha256() != (
         current_capabilities.definition_sha256()
+    ) and not bound_capabilities.execution_compatible_with(
+        current_capabilities
     ):
         raise ValueError(
-            "saved direct-video plan targets a stale local capability catalog"
+            "saved direct-video plan targets an incompatible local capability catalog"
         )
     derived = ClipCardFeaturePlanV3.model_validate(read_json(derived_path))
     selected_evidence = SelectedClipCardEvidence.model_validate(

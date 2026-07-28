@@ -662,6 +662,7 @@ def _vertical_required_scope_fit_filter(
     geometry: Mapping[str, Any],
     *,
     margin_normalized: float = 45.0,
+    autonomous_policy_reference: str | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     """Build a static solid-matte fit around the tracked required envelope."""
 
@@ -724,6 +725,7 @@ def _vertical_required_scope_fit_filter(
         "scale=1080:1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x0b0e12,setsar=1[base]"
     )
+    policy_authorized = autonomous_policy_reference is not None
     return filter_graph, {
         "applied_strategy": "required_scope_solid_fit",
         "fallback_reason": "required_region_union_too_large_for_safe_9x16_crop",
@@ -740,9 +742,14 @@ def _vertical_required_scope_fit_filter(
         "required_envelope_contained": True,
         "risk_codes": [
             "scope_preserving_solid_fit",
-            "human_review_required",
+            (
+                "auto_policy_authorized"
+                if policy_authorized
+                else "human_review_required"
+            ),
         ],
-        "requires_gemini_review": True,
+        "requires_gemini_review": not policy_authorized,
+        "autonomous_policy_reference": autonomous_policy_reference,
         "source_geometry_lineage_passed": bool(
             geometry.get("source_geometry_lineage_passed")
         ),

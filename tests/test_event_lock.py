@@ -20,7 +20,11 @@ from jascue_video_lab.event_lock import (
     bracket_dense_frames_by_difference,
     build_cue_alignment_evidence,
     authorize_trim_intent_decision,
+    bind_editorial_contract_to_selected_evidence,
+    bind_grouped_event_lock_ids,
+    load_editorial_beat_contracts,
     resolve_exact_event_locks,
+    write_exact_event_bundle,
 )
 from jascue_video_lab.gemini import GeminiLabClient, MODEL_ID
 from jascue_video_lab.models import (
@@ -132,6 +136,150 @@ def test_exact_event_selection_maps_only_existing_ids_to_pts(
             gemini_interaction_id="interaction-2",
             input_artifact_hashes=("sha256:" + "c" * 64,),
         )
+
+
+def test_selected_window_bundle_binds_runtime_query_and_persists(
+    tmp_path: Path,
+) -> None:
+    template_path = tmp_path / "beats.json"
+    template_path.write_text(
+        json.dumps(
+            {
+                "beats": [
+                    {
+                        "beat_id": "watch-ui",
+                        "feature_id": "watch9",
+                        "priority": "hard",
+                        "evidence_query_lock_sha256": "1" * 64,
+                        "required_target_ids": ["placeholder"],
+                        "narrative_function": "feature_evidence",
+                        "visual_events": [
+                            {
+                                "event_type": "watch_ui_state_change",
+                                "cue_relation": "music_emphasis",
+                                "tolerance_frames": 2,
+                            }
+                        ],
+                        "duration": {
+                            "minimum_readable_frames": 18,
+                            "preferred_frames": 42,
+                            "maximum_frames": 72,
+                        },
+                        "relation_mode": "context_detail",
+                        "allowed_reconstruction": ["continuous"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    template = load_editorial_beat_contracts(template_path)[0]
+    bound = bind_editorial_contract_to_selected_evidence(
+        template,
+        evidence_query_lock_sha256="a" * 64,
+        required_target_ids=("watch-face", "watch-face"),
+    )
+    lock = resolve_exact_event_locks(
+        _catalog(tmp_path),
+        [
+            ExactEventSelection(
+                event_id="watch-state",
+                event_type="watch_ui_state_change",
+                selected_frame_id="DF000008",
+                support_start_frame_id="DF000007",
+                support_end_frame_id="DF000009",
+                confidence=0.9,
+            )
+        ],
+        gemini_interaction_id="interaction-1",
+        input_artifact_hashes=("sha256:" + "b" * 64,),
+    )[0]
+
+    paths = write_exact_event_bundle(
+        tmp_path / "context",
+        contracts=(bound,),
+        locks=(lock,),
+        selected_windows=(
+            {
+                "feature_id": "watch9",
+                "source_in_ms": 0,
+                "source_out_ms": 2_000,
+            },
+        ),
+    )
+
+    assert bound.evidence_query_lock_sha256 == "a" * 64
+    assert bound.required_target_ids == ("watch-face",)
+    assert set(paths) == {
+        "editorial_beat_contracts",
+        "exact_event_locks",
+    }
+    saved = json.loads(paths["exact_event_locks"].read_text("utf-8"))
+    assert saved["locks"][0]["source_frame_id"] == "DF000008"
+    assert saved["selected_windows"][0]["feature_id"] == "watch9"
+
+
+def test_grouped_event_ids_bind_by_type_when_model_reorders(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    locks = resolve_exact_event_locks(
+        catalog,
+        [
+            ExactEventSelection(
+                event_id="model-freeze",
+                event_type="freeze_start",
+                selected_frame_id="DF000009",
+                support_start_frame_id="DF000008",
+                support_end_frame_id="DF000010",
+                confidence=0.9,
+            ),
+            ExactEventSelection(
+                event_id="model-reaction",
+                event_type="group_laugh_reaction_peak",
+                selected_frame_id="DF000008",
+                support_start_frame_id="DF000007",
+                support_end_frame_id="DF000009",
+                confidence=0.9,
+            ),
+        ],
+        gemini_interaction_id="interaction-1",
+        input_artifact_hashes=("sha256:" + "b" * 64,),
+    )
+    contract = EditorialBeatContract(
+        beat_id="closing",
+        feature_id="closing",
+        priority="preferred",
+        evidence_query_lock_sha256="a" * 64,
+        required_target_ids=("group",),
+        narrative_function="closing",
+        visual_events=(
+            {
+                "event_type": "group_laugh_reaction_peak",
+                "cue_relation": "phrase_ending",
+                "tolerance_frames": 2,
+            },
+            {
+                "event_type": "freeze_start",
+                "cue_relation": "phrase_ending",
+                "tolerance_frames": 2,
+            },
+        ),
+        duration={
+            "minimum_readable_frames": 18,
+            "preferred_frames": 45,
+            "maximum_frames": 75,
+        },
+        relation_mode="simultaneous_relation",
+        allowed_reconstruction=("continuous", "intentional_freeze"),
+    )
+
+    bound = bind_grouped_event_lock_ids(locks, (contract,))
+
+    assert [lock.event_id for lock in bound] == [
+        "closing:freeze_start",
+        "closing:group_laugh_reaction_peak",
+    ]
 
 
 def test_trim_authority_requires_exact_event_inside_immutable_trim(

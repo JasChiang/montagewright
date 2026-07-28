@@ -10,8 +10,10 @@ from jascue_video_lab.autonomous_policy import (
     AutonomousDegradationManifest,
     AutonomousEditPolicy,
     BudgetPolicy,
+    DegradationRecord,
     DurationPolicy,
     authorize_decision,
+    omissions_are_policy_authorized,
     validate_authority_binding,
 )
 from jascue_video_lab.billing import (
@@ -39,6 +41,40 @@ def _policy(**updates: object) -> AutonomousEditPolicy:
     }
     values.update(updates)
     return AutonomousEditPolicy(**values)
+
+
+def test_solid_fit_degradation_is_not_an_editorial_omission() -> None:
+    policy = _policy()
+
+    assert omissions_are_policy_authorized(
+        policy,
+        (
+            DegradationRecord(
+                beat_id="opening",
+                action="solid_matte_fit_used",
+                reason_code="required_scope_preserved",
+            ),
+        ),
+    )
+
+
+def test_optional_omission_requires_policy_authority() -> None:
+    policy = _policy(
+        editorial=_policy().editorial.model_copy(
+            update={"allow_optional_beat_omission": False}
+        )
+    )
+
+    assert not omissions_are_policy_authorized(
+        policy,
+        (
+            DegradationRecord(
+                beat_id="optional-detail",
+                action="optional_beat_omitted",
+                reason_code="no_candidate",
+            ),
+        ),
+    )
 
 
 def test_policy_hash_is_canonical_and_binds_authority() -> None:
@@ -241,3 +277,84 @@ def test_autonomous_preflight_rejects_hard_gate_before_paid_work(
             deterministic_delivery_evidence_path=deterministic,
         )
     assert called is False
+
+
+def test_autonomous_pipeline_discovers_selected_window_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy()
+    policy_path = tmp_path / "policy.json"
+    beat_templates = tmp_path / "beats.json"
+    write_json(policy_path, policy)
+    write_json(beat_templates, {"beats": []})
+    context_paths: dict[str, str] = {}
+    for key, payload in {
+        "editorial_beat_contracts": {"beats": []},
+        "music_map": {},
+        "cue_plan": {},
+        "exact_event_locks": {"locks": []},
+        "reuse_degradation": AutonomousDegradationManifest(
+            policy_reference=policy.policy_reference,
+            generated_at="now",
+        ).model_dump(mode="json"),
+    }.items():
+        path = tmp_path / f"{key}.json"
+        write_json(path, payload)
+        context_paths[key] = str(path)
+    deterministic = tmp_path / "generated-deterministic.json"
+    write_json(
+        deterministic,
+        {
+            "media_playable": True,
+            "pts_valid": True,
+            "unexpected_freeze_count": 0,
+            "containment_passed": True,
+            "identity_passed": True,
+            "relation_passed": True,
+            "panel_same_pts_passed": True,
+            "relative_scale_lock_passed": True,
+            "cue_delta_frames": {"hard-event": 3},
+            "synthetic_motion_motivated": True,
+            "synthetic_reversal_count": 0,
+            "settle_passed": True,
+            "readability_passed": True,
+            "reuse_authorized": True,
+            "omissions_authorized": True,
+            "hard_evidence_passed": True,
+        },
+    )
+    received: dict[str, object] = {}
+
+    def generated(**kwargs: object) -> object:
+        received.update(kwargs)
+        return {
+            "autonomous_context_paths": context_paths,
+            "deterministic_delivery_evidence_path": str(deterministic),
+            "media_rendered": True,
+            "vertical_output": str(tmp_path / "picture.mp4"),
+        }
+
+    monkeypatch.setattr(
+        delivery_pipeline,
+        "run_feature_cut_experiment",
+        generated,
+    )
+
+    with pytest.raises(
+        delivery_pipeline.DeliveryPipelineBlocked,
+        match="generated deterministic autonomous gates failed.*cue_sync",
+    ):
+        delivery_pipeline.run_feature_delivery_pipeline(
+            feature_cut_kwargs={"aspect": "9x16"},
+            brief_path=tmp_path / "brief.json",
+            music_path=tmp_path / "music.wav",
+            music_lock_path=tmp_path / "music-lock.json",
+            output_dir=tmp_path / "delivery",
+            execution_profile="autonomous_strict",
+            autonomous_policy_path=policy_path,
+            editorial_beat_contracts_path=beat_templates,
+        )
+
+    assert received["autonomous_policy_path"] == policy_path
+    assert received["editorial_beat_contracts_path"] == beat_templates

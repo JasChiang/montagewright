@@ -5677,6 +5677,28 @@ def test_required_scope_fit_removes_only_space_outside_all_sampled_unions() -> N
     assert crop["height"] < 2160
 
 
+def test_required_scope_fit_can_be_policy_authorized_for_delivery() -> None:
+    result = _vertical_required_scope_fit_filter(
+        {
+            "source_display_width": 1920,
+            "source_display_height": 1080,
+            "source_geometry_lineage_passed": True,
+            "tracking_confidence_gate_passed": True,
+            "crop_keyframes": [
+                {"required_union_box": [100, 100, 900, 900]},
+                {"required_union_box": [120, 100, 880, 900]},
+            ],
+        },
+        autonomous_policy_reference="sha256:" + "a" * 64,
+    )
+
+    assert result is not None
+    _, audit = result
+    assert audit["requires_gemini_review"] is False
+    assert "auto_policy_authorized" in audit["risk_codes"]
+    assert audit["autonomous_policy_reference"] == "sha256:" + "a" * 64
+
+
 def test_non_square_pixel_source_fails_closed_to_sar_normalized_static_reframe() -> None:
     track = SimpleNamespace(
         analysis_start_ms=0,

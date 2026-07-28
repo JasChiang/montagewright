@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from PIL import Image, ImageChops, ImageStat
 from pydantic import Field, model_validator
@@ -77,6 +77,7 @@ class EditorialBeatContract(FrozenStrictModel):
         "editorial-beat-contract-v1"
     )
     beat_id: str = Field(min_length=1)
+    feature_id: str | None = Field(default=None, min_length=1)
     priority: Literal["hard", "preferred", "optional"]
     evidence_query_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     required_target_ids: tuple[str, ...] = Field(min_length=1, max_length=8)
@@ -397,6 +398,99 @@ def build_cue_alignment_evidence(
         tolerance_frames=tolerance_frames,
         passed=abs(delta) <= tolerance_frames,
     )
+
+
+def load_editorial_beat_contracts(path: Path) -> tuple[EditorialBeatContract, ...]:
+    """Load either a bare list or the checked-in fixture wrapper."""
+
+    payload = json.loads(path.expanduser().resolve(strict=True).read_text("utf-8"))
+    rows: Any = payload.get("beats") if isinstance(payload, Mapping) else payload
+    if not isinstance(rows, list):
+        raise ValueError("editorial beat contracts must be a list or beats wrapper")
+    contracts = tuple(EditorialBeatContract.model_validate(row) for row in rows)
+    if len({contract.beat_id for contract in contracts}) != len(contracts):
+        raise ValueError("editorial beat IDs must be unique")
+    return contracts
+
+
+def bind_editorial_contract_to_selected_evidence(
+    contract: EditorialBeatContract,
+    *,
+    evidence_query_lock_sha256: str,
+    required_target_ids: Sequence[str],
+) -> EditorialBeatContract:
+    """Replace template placeholders with the selected candidate's evidence."""
+
+    targets = tuple(dict.fromkeys(required_target_ids))
+    if not targets:
+        raise ValueError("selected evidence must expose at least one target ID")
+    return contract.model_copy(
+        update={
+            "evidence_query_lock_sha256": evidence_query_lock_sha256,
+            "required_target_ids": targets,
+        }
+    )
+
+
+def bind_grouped_event_lock_ids(
+    locks: Sequence[ExactEventLockV2],
+    contracts: Sequence[EditorialBeatContract],
+) -> tuple[ExactEventLockV2, ...]:
+    """Bind model-selected events by declared type, independent of return order."""
+
+    expected_by_type: dict[str, list[str]] = {}
+    for contract in contracts:
+        for event in contract.visual_events:
+            expected_by_type.setdefault(event.event_type, []).append(
+                f"{contract.beat_id}:{event.event_type}"
+            )
+    if len(locks) != sum(len(ids) for ids in expected_by_type.values()):
+        raise ValueError("grouped ExactEventLocks omitted a requested event")
+    bound: list[ExactEventLockV2] = []
+    for lock in locks:
+        expected_ids = expected_by_type.get(lock.event_type)
+        if not expected_ids:
+            raise ValueError(
+                "grouped ExactEventLocks returned an undeclared event type: "
+                f"{lock.event_type}"
+            )
+        bound.append(
+            lock.model_copy(update={"event_id": expected_ids.pop(0)})
+        )
+    if any(expected_by_type.values()):
+        raise ValueError("grouped ExactEventLocks omitted a requested event type")
+    return tuple(bound)
+
+
+def write_exact_event_bundle(
+    output_dir: Path,
+    *,
+    contracts: Sequence[EditorialBeatContract],
+    locks: Sequence[ExactEventLockV2],
+    selected_windows: Sequence[Mapping[str, Any]],
+) -> dict[str, Path]:
+    """Persist the two grouped selected-window artifacts atomically by content."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    contracts_path = output_dir / "editorial-beat-contracts.json"
+    locks_path = output_dir / "exact-event-locks.json"
+    contracts_payload = {
+        "contract_version": "editorial-beat-contract-bundle-v1",
+        "beats": [contract.model_dump(mode="json") for contract in contracts],
+    }
+    locks_payload = {
+        "contract_version": "exact-event-lock-bundle-v2",
+        "locks": [lock.model_dump(mode="json") for lock in locks],
+        "selected_windows": [dict(window) for window in selected_windows],
+    }
+    from .storage import write_json
+
+    write_json(contracts_path, contracts_payload)
+    write_json(locks_path, locks_payload)
+    return {
+        "editorial_beat_contracts": contracts_path.resolve(),
+        "exact_event_locks": locks_path.resolve(),
+    }
 
 
 def _evenly_limit_indices(indices: list[int], limit: int) -> list[int]:

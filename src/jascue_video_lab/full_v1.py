@@ -246,8 +246,6 @@ def create_dense_event_catalog(
     window_start_ms: int | None = None,
     window_end_ms: int | None = None,
 ) -> DenseFrameCatalog:
-    if sampling_fps <= 0 or sampling_fps > 8:
-        raise ValueError("dense sampling_fps must be within (0, 8]")
     source_media = probe_video(video_path)
     if source_media.asset_id != source_asset_id:
         raise ValueError("dense source identity differs from Clip Card")
@@ -257,12 +255,51 @@ def create_dense_event_catalog(
     end_ms = event_end_ms if window_end_ms is None else window_end_ms
     if not event_start_ms <= start_ms < end_ms <= event_end_ms:
         raise ValueError("dense window must remain inside the coarse event interval")
+    return create_dense_window_catalog(
+        video_path,
+        source_asset_id,
+        event.event_id,
+        output_dir,
+        sampling_fps=sampling_fps,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        max_width=max_width,
+        requested_keyframe_ms=(
+            mmss_to_ms(event.recommended_keyframe_mmss)
+            if event.recommended_keyframe_mmss is not None
+            else None
+        ),
+    )
+
+
+def create_dense_window_catalog(
+    video_path: Path,
+    source_asset_id: str,
+    event_id: str,
+    output_dir: Path,
+    *,
+    sampling_fps: float,
+    start_ms: int,
+    end_ms: int,
+    max_width: int = 960,
+    requested_keyframe_ms: int | None = None,
+) -> DenseFrameCatalog:
+    """Decode one immutable selected window through the existing dense path."""
+
+    if sampling_fps <= 0 or sampling_fps > 8:
+        raise ValueError("dense sampling_fps must be within (0, 8]")
+    source_media = probe_video(video_path)
+    if source_media.asset_id != source_asset_id:
+        raise ValueError("dense source identity differs from selected window")
+    if not 0 <= start_ms < end_ms <= source_media.duration_ms:
+        raise ValueError("dense selected window lies outside source media")
     interval_ms = max(1, round(1000 / sampling_fps))
     requested_times = set(range(start_ms, end_ms, interval_ms))
-    if event.recommended_keyframe_mmss is not None:
-        keyframe_ms = mmss_to_ms(event.recommended_keyframe_mmss)
-        if start_ms <= keyframe_ms < end_ms:
-            requested_times.add(keyframe_ms)
+    if (
+        requested_keyframe_ms is not None
+        and start_ms <= requested_keyframe_ms < end_ms
+    ):
+        requested_times.add(requested_keyframe_ms)
     requested_times = {
         min(max(0, value), source_media.duration_ms - 1) for value in requested_times
     }
@@ -285,7 +322,7 @@ def create_dense_event_catalog(
         frames.append(
             DenseFrame(
                 frame_id=frame_id,
-                event_id=event.event_id,
+                event_id=event_id,
                 requested_time_ms=requested_ms,
                 frame_time_ms=extracted.frame_time_ms,
                 frame_pts=extracted.frame_pts,
@@ -302,7 +339,7 @@ def create_dense_event_catalog(
     )
     catalog = DenseFrameCatalog(
         source_asset_id=source_asset_id,
-        event_id=event.event_id,
+        event_id=event_id,
         sampling_fps=sampling_fps,
         source_start_ms=start_ms,
         source_end_ms=end_ms,

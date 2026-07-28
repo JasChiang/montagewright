@@ -44,7 +44,7 @@ Legacy `review_preview` and `production_review` continue to normalize final QA t
 The final local suite completed with:
 
 ```text
-612 passed, 1 warning
+622 passed, 1 warning
 ```
 
 The warning is the existing Starlette/httpx deprecation warning and is unrelated to autonomous delivery.
@@ -68,19 +68,40 @@ Acceptance fixtures cover:
 - strict delivery authority without a human approval artifact;
 - best-effort degradation disclosure.
 
-## Paid Samsung benchmark readiness
+## Paid Samsung 9:16 benchmark
 
-No new paid Samsung request was made in this implementation run.
+The first selected-window V1 trial reused the historical
+`direct-video-edit-plan-v2`, quality, geometry, and segment artifacts, then
+created the missing exact-event evidence in the live picture run.
 
-The paid benchmark preflight found:
+| Result | Value |
+| --- | --- |
+| Output | `artifacts/samsung-galaxy-z-autonomous-v1-benchmark-01/picture/renders/feature-cut-9x16-clean.mp4` |
+| Media | 82.624 s, 1080×1920, 30 fps, H.264 + 48 kHz stereo AAC |
+| Paid interactions | 23 |
+| Input / cached input | 124,058 / 0 tokens |
+| Output / thought | 2,821 / 9,340 tokens |
+| Estimated cost | US$0.27729450 |
+| Picture runtime | 1,007.828 s |
+| Technical QC | passed |
+| Exact locks | 6 locks across 5 grouped selected windows |
+| Presentation | 6 solid fits, 4 tracked crops, 2 review center crops, 0 panels |
+| Final semantic QA | not run; deterministic hard gate stopped first |
+| Delivery state | blocked |
 
-- `.env` declares `GEMINI_API_KEY`;
-- the historical Samsung outputs, Clip Card/plan artifacts, render manifests, source quality maps, final muxes, and SAM checkpoint are present;
-- the historical runs do **not** contain V1 `editorial-beat-contracts.json`, `cue-plan.json`, `exact-event-locks.json`, policy-bound `reuse-degradation.json`, or `deterministic-delivery-evidence.json`.
+The trial remained below the 25-interaction warm-run target. It correctly
+failed `autonomous_strict` cue sync: the AI result stable frame was 29 frames
+from its principal downbeat, while the closing reaction and freeze were 38 and
+41 frames from the phrase ending. Gesture, watch UI, and underwater apex were
+within 0, 0, and 4 frames of their contract-specific cues. No tolerance was
+relaxed and no second paid trial was made.
 
-Those artifacts are delivery evidence, not optional metadata. Synthesizing them from a playable historical MP4 would falsely upgrade review evidence into exact autonomous evidence. The pipeline therefore blocks before paid work instead of spending a final-QA call on an ineligible run.
+The run also exposed and fixed a local gate bug: an authorized
+`solid_matte_fit_used` degradation was incorrectly classified as an editorial
+omission. Presentation fallbacks are now independent from optional/preferred
+beat omission authority, with regression tests.
 
-Consequently there is no truthful V1 paid-call/token/cost/runtime/final-QA report yet. Historical comparison baselines remain:
+Historical comparison baselines remain:
 
 | Artifact | Paid interactions | Input | Cached input | Output | Thought | Estimated cost |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -88,8 +109,21 @@ Consequently there is no truthful V1 paid-call/token/cost/runtime/final-QA repor
 | `samsung-galaxy-z-delivery-v11` | 56 | 297,528 | 51,399 | 71,896 | 215 | US$0.91773585 |
 | `samsung-galaxy-z-attention-camera-live-03` | 23 | 128,034 | 0 | 36,080 | 0 | US$0.46265100 |
 
-## Remaining blocking integration
+## Selected-window integration
 
-The new event, presentation, optimizer, cache, QA, recovery, and authority contracts are implemented and tested, but the historical feature-cut orchestration does not yet emit the six required autonomous benchmark inputs as one live run. Until that wiring exists, a paid end-to-end Samsung V1 claim would be misleading.
+The historical feature-cut orchestration now emits the six autonomous inputs in the same picture run:
 
-The next implementation step is therefore narrow: make the selected-window stage persist the grouped ExactEventLocks, compile the beat/cue/degradation/deterministic evidence bundle from those exact artifacts, pass it directly to `feature-delivery`, and then perform one 9:16 paid benchmark under the policy ledger. It must not introduce another semantic planner or revive selected-clip framing refinement.
+1. beat templates are mapped to feature IDs and rebound to the selected candidate's real `EvidenceQueryLockV2`;
+2. the final immutable source in/out is decoded through the existing dense-frame path;
+3. all events for one selected feature are resolved in one grouped exact-frame request;
+4. local PTS mapping, cue delta, degradation, and deterministic evidence are persisted with hashes;
+5. `feature-delivery` discovers the generated paths without a manually assembled context directory;
+6. picture resume validates every context hash and the bundle index before reuse.
+
+`autonomous-evidence-bundle.json` indexes all six artifacts. Hard beats without a selected query lock or exact event fail closed. Preferred/optional omissions require policy authority and are written to the degradation manifest.
+
+The next edit iteration is local cue-aware trim/duration reconciliation before
+framing and render. The saved exact locks and cue deltas are sufficient to
+design that repair without paying Gemini to inspect the same selected windows
+again. Until a repaired render passes deterministic cue sync, final semantic QA
+and `delivery_eligible` remain intentionally unavailable.

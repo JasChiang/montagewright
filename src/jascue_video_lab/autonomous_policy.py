@@ -263,6 +263,26 @@ class AutonomousDegradationManifest(FrozenStrictModel):
     generated_at: str
 
 
+def omissions_are_policy_authorized(
+    policy: AutonomousEditPolicy,
+    records: tuple[DegradationRecord, ...],
+) -> bool:
+    """Validate editorial omissions without treating presentations as omissions."""
+
+    for record in records:
+        if (
+            record.action == "optional_beat_omitted"
+            and not policy.editorial.allow_optional_beat_omission
+        ):
+            return False
+        if (
+            record.action == "preferred_beat_substituted"
+            and not policy.editorial.allow_preferred_beat_substitution
+        ):
+            return False
+    return True
+
+
 def authorize_decision(
     policy: AutonomousEditPolicy,
     *,
