@@ -841,6 +841,29 @@ def canonicalize_feature_edit_plan_output(
     for chapter_index, chapter in enumerate(chapters):
         if not isinstance(chapter, dict):
             continue
+        attention = chapter.get("attention_observation")
+        if (
+            chapter.get("recommended_duration_seconds") is None
+            and isinstance(attention, dict)
+            and isinstance(attention.get("minimum_dwell_seconds"), (int, float))
+            and isinstance(attention.get("maximum_dwell_seconds"), (int, float))
+        ):
+            minimum = float(attention["minimum_dwell_seconds"])
+            maximum = float(attention["maximum_dwell_seconds"])
+            if 0 < minimum <= maximum:
+                preferred = round((minimum + maximum) / 2.0, 3)
+                chapter["recommended_duration_seconds"] = preferred
+                changes.append(
+                    {
+                        "chapter_index": chapter_index,
+                        "field": "recommended_duration_seconds",
+                        "from": None,
+                        "to": preferred,
+                        "reason": (
+                            "deterministic_midpoint_of_model_dwell_envelope"
+                        ),
+                    }
+                )
         evidence_status = chapter.get("evidence_status")
         horizontal_frame = chapter.get("horizontal_frame_id")
         vertical_frame = chapter.get("vertical_frame_id")
@@ -4008,7 +4031,8 @@ model_provenance (return it unchanged with interaction_id=null):
             + "即使兩個比例選用同一張 evidence frame，也要在兩欄各自逐字回傳。"
             + "not_found 才能在兩欄都回傳 RF_NONE；其他狀態不得使用 RF_NONE。"
             + "每個 supported／partial 章節都必須回傳非 null 的 "
-            + "attention_observation、duration_rationale 與 "
+            + "attention_observation、recommended_duration_seconds、"
+            + "duration_rationale 與 "
             + "horizontal_camera_intent；這些是可審核提案，不是精確 cut point。\n"
             + "chapters 必須依 brief 順序完整回傳，一個 feature_id 恰好一次。\n"
             + "每章原先的手填秒數已從下方 model-facing brief 移除，避免形成硬性"
@@ -4200,7 +4224,7 @@ model_provenance (return it unchanged with interaction_id=null):
                     **request_record,
                     "generation_config": {
                         "thinking_level": "minimal",
-                        "max_output_tokens": 4096,
+                        "max_output_tokens": 24576,
                     },
                 }
                 repair_record["input"] = [

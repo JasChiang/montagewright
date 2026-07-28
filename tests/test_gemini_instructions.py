@@ -737,6 +737,43 @@ def test_feature_plan_missing_aspect_fails_closed_without_projection(
     assert payload["chapters"][0]["vertical_frame_id"] == "RF000001"
 
 
+def test_feature_plan_derives_missing_preferred_dwell_from_model_envelope(
+    tmp_path: Path,
+) -> None:
+    _, _, plan = _feature_plan_fixture(tmp_path)
+    payload = plan.model_dump(mode="json")
+    chapter = payload["chapters"][0]
+    chapter["recommended_duration_seconds"] = None
+    chapter["attention_observation"] = {
+        "semantic_novelty": 0.7,
+        "action_progress": 0.5,
+        "visual_motion": 0.2,
+        "composition_change": 0.2,
+        "reading_load": 0.4,
+        "unresolved_tension": 0.1,
+        "emotional_hold_value": 0.5,
+        "repetition_pressure": 0.1,
+        "music_transition_opportunity": 0.6,
+        "minimum_dwell_seconds": 3.0,
+        "maximum_dwell_seconds": 7.0,
+        "rationale": "Bounded model observation.",
+        "uncertainties": [],
+        "requires_human_review": True,
+    }
+
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(payload)
+    )
+
+    parsed = FeatureEditPlan.model_validate_json(canonical)
+    assert parsed.chapters[0].recommended_duration_seconds == 5.0
+    assert any(
+        change["reason"]
+        == "deterministic_midpoint_of_model_dwell_envelope"
+        for change in changes
+    )
+
+
 def test_feature_plan_rf_ids_are_catalog_bound_in_response_schema() -> None:
     legal_ids = ["RF000001", "RF000002"]
     schema = gemini_module._feature_edit_plan_response_schema(legal_ids)
