@@ -4721,8 +4721,12 @@ class FeatureChapterSelect(StrictModel):
                 )
         for field_name in ("horizontal_candidates", "vertical_candidates"):
             candidates = getattr(self, field_name)
-            if candidates and not 2 <= len(candidates) <= 4:
-                raise ValueError(f"{field_name} must preserve 2-4 options when present")
+            minimum_candidates = 1 if self.evidence_status == "partial" else 2
+            if candidates and not minimum_candidates <= len(candidates) <= 4:
+                raise ValueError(
+                    f"{field_name} must preserve {minimum_candidates}-4 options "
+                    "when present"
+                )
             ids = [candidate.candidate_id for candidate in candidates]
             ranks = [candidate.rank for candidate in candidates]
             if len(ids) != len(set(ids)) or len(ranks) != len(set(ranks)):

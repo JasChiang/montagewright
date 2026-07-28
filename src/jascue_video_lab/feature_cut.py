@@ -33,6 +33,7 @@ from .billing import (
     summarize_usage_and_list_price,
     summarize_usage_files,
 )
+from .clip_card_retrieval import FeatureShortlistPlan
 from .autonomous_policy import (
     AutonomousDegradationManifest,
     AutonomousEditPolicy,
@@ -9400,6 +9401,7 @@ def _audit_requested_candidate_recall(
     plan: FeatureEditPlan,
     *,
     aspect: RenderAspect,
+    only_evidence_feature_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Measure executable Top-K depth only for requested delivery aspects."""
 
@@ -9421,16 +9423,22 @@ def _audit_requested_candidate_recall(
                 if chapter.vertical_candidates
                 else int(chapter.vertical_frame_id is not None)
             )
+        only_evidence_exception = (
+            chapter.feature_id in only_evidence_feature_ids
+            and chapter.evidence_status == "partial"
+            and all(count == 1 for count in aspect_counts.values())
+        )
         incomplete = [
             requested_aspect
             for requested_aspect, count in aspect_counts.items()
-            if count < 2
+            if count < 2 and not only_evidence_exception
         ]
         rows.append(
             {
                 "feature_id": chapter.feature_id,
                 "evidence_status": chapter.evidence_status,
                 "candidate_counts": aspect_counts,
+                "only_evidence_exception": only_evidence_exception,
                 "incomplete_aspects": incomplete,
                 "complete": not incomplete,
             }
@@ -9442,11 +9450,52 @@ def _audit_requested_candidate_recall(
         "rows": rows,
         "policy": (
             "production-review requires at least two evidence-bound candidates "
-            "for every requested aspect until a typed only-evidence exception "
-            "contract exists"
+            "for every requested aspect, except a hash-bound exhaustive shortlist "
+            "may declare one partial chapter candidate as the only real evidence"
         ),
     }
     return {**body, "audit_sha256": _stable_fingerprint(body)}
+
+
+def _bound_only_evidence_feature_ids(plan_dir: Path) -> frozenset[str]:
+    """Return typed one-candidate exceptions from a hash-bound direct shortlist."""
+
+    try:
+        _, _, record = load_external_feature_plan_projection(plan_dir)
+    except (FileNotFoundError, ValueError):
+        return frozenset()
+    if record.get("projection_contract_id") != "direct-video-edit-plan-v2":
+        return frozenset()
+    source_artifacts = record.get("source_artifacts")
+    if not isinstance(source_artifacts, list):
+        return frozenset()
+    shortlist_claim = next(
+        (
+            artifact
+            for artifact in source_artifacts
+            if isinstance(artifact, dict)
+            and artifact.get("role") == "feature_shortlist"
+        ),
+        None,
+    )
+    if not isinstance(shortlist_claim, dict):
+        return frozenset()
+    path_value = shortlist_claim.get("path")
+    expected_hash = shortlist_claim.get("sha256")
+    if not isinstance(path_value, str) or not isinstance(expected_hash, str):
+        return frozenset()
+    shortlist_path = Path(path_value).expanduser().resolve()
+    if (
+        not shortlist_path.is_file()
+        or sha256_file(shortlist_path) != expected_hash
+    ):
+        return frozenset()
+    shortlist = FeatureShortlistPlan.model_validate(read_json(shortlist_path))
+    return frozenset(
+        chapter.feature_id
+        for chapter in shortlist.chapters
+        if chapter.evidence_status == "partial" and len(chapter.candidates) == 1
+    )
 
 
 def _audit_requested_quality_map_coverage(
@@ -11739,6 +11788,11 @@ def _run_feature_cut_experiment_impl(
             _audit_requested_candidate_recall(
                 plan,
                 aspect=aspect,
+                only_evidence_feature_ids=(
+                    _bound_only_evidence_feature_ids(plan_dir)
+                    if feature_plan_origin == "external_projection"
+                    else frozenset()
+                ),
             )
         )
         write_json(

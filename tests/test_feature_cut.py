@@ -6410,6 +6410,64 @@ def test_requested_candidate_recall_ignores_unrequested_aspect() -> None:
     assert vertical["rows"][0]["candidate_counts"] == {"9x16": 2}
 
 
+def test_requested_candidate_recall_accepts_typed_only_evidence_exception() -> None:
+    chapter = FeatureChapterSelect(
+        feature_id="watch9",
+        evidence_status="partial",
+        observed_visual_evidence="Only real UI state-change shot in exhaustive shortlist.",
+        selection_reason="Only observed state change.",
+        horizontal_frame_id="RF000001",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000001",
+        vertical_strategy="tracked_crop",
+        vertical_target_description="watch UI",
+        vertical_candidates=[
+            {
+                "candidate_id": "watch-only",
+                "rank": 1,
+                "source_asset_id": "sha256:" + "a" * 64,
+                "event_id": "event-02",
+                "frame_id": "RF000001",
+                "observed_visual_evidence": "Watch UI changes state.",
+                "selection_reason": "Only observed state change.",
+                "strategy": "tracked_crop",
+                "target_description": "watch UI",
+                "confidence": 0.9,
+            }
+        ],
+        quality_risks=[],
+        confidence=0.9,
+    )
+    plan = FeatureEditPlan(
+        project_id="generic-project",
+        catalog_id="generic-catalog",
+        title="Generic",
+        chapters=[chapter],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    blocked = _audit_requested_candidate_recall(plan, aspect="9x16")
+    accepted = _audit_requested_candidate_recall(
+        plan,
+        aspect="9x16",
+        only_evidence_feature_ids=frozenset({"watch9"}),
+    )
+
+    assert blocked["complete"] is False
+    assert accepted["complete"] is True
+    assert accepted["rows"][0]["only_evidence_exception"] is True
+
+
 def test_missing_evidence_render_is_partial_not_delivery_success() -> None:
     manifest = {
         "horizontal": {

@@ -40,6 +40,14 @@ def main() -> int:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--thinking-level", choices=["low", "high"], default="low")
     parser.add_argument(
+        "--reuse-raw-output",
+        action="store_true",
+        help=(
+            "Normalize and validate the saved paid response without another "
+            "Gemini request."
+        ),
+    )
+    parser.add_argument(
         "--editorial-beat-contracts",
         type=Path,
         help=(
@@ -57,7 +65,7 @@ def main() -> int:
     args = parser.parse_args()
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
+    if not args.reuse_raw_output and not api_key:
         raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required")
     catalog = RushesCatalog.model_validate(read_json(args.catalog_json))
     brief = FeatureEditBrief.model_validate(read_json(args.brief_json))
@@ -153,37 +161,74 @@ model_provenance 必須原樣回傳：
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_json(args.output_dir / "feature-shortlist.request.json", request)
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(
-            retry_options=types.HttpRetryOptions(attempts=1)
-        ),
-    )
-    try:
-        try:
-            interaction = client.interactions.create(**request)
-        except Exception as error:
-            append_error(args.output_dir, "feature_shortlist", error)
-            write_json(
-                args.output_dir / "feature-shortlist.schema-validation.json",
-                {
-                    "ok": False,
-                    "error_type": type(error).__name__,
-                    "message": str(error),
-                    "request_sent": True,
-                    "raw_interaction_saved": False,
-                },
-            )
-            raise
-    finally:
-        client.close()
     raw_path = args.output_dir / "feature-shortlist.raw_interaction.json"
-    write_json(raw_path, _raw_dump(interaction))
+    raw_output_path = args.output_dir / "feature-shortlist.raw_output.json"
+    if args.reuse_raw_output:
+        if not raw_path.is_file() or not raw_output_path.is_file():
+            raise FileNotFoundError(
+                "shortlist raw reuse requires saved interaction and output"
+            )
+        raw_interaction = read_json(raw_path)
+        output_text = str(read_json(raw_output_path)["output_text"])
+        interaction_id = str(raw_interaction.get("id") or "")
+    else:
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1)
+            ),
+        )
+        try:
+            try:
+                interaction = client.interactions.create(**request)
+            except Exception as error:
+                append_error(args.output_dir, "feature_shortlist", error)
+                write_json(
+                    args.output_dir / "feature-shortlist.schema-validation.json",
+                    {
+                        "ok": False,
+                        "error_type": type(error).__name__,
+                        "message": str(error),
+                        "request_sent": True,
+                        "raw_interaction_saved": False,
+                    },
+                )
+                raise
+        finally:
+            client.close()
+        raw_interaction = _raw_dump(interaction)
+        output_text = interaction.output_text
+        interaction_id = getattr(interaction, "id", None) or ""
+        write_json(raw_path, raw_interaction)
+        write_json(raw_output_path, {"output_text": output_text})
+    payload = json.loads(output_text)
+    normalization_changes: list[dict[str, object]] = []
+    for chapter in payload.get("chapters", []):
+        candidates = chapter.get("candidates")
+        if (
+            chapter.get("evidence_status") == "supported"
+            and isinstance(candidates, list)
+            and len(candidates) == 1
+        ):
+            chapter["evidence_status"] = "partial"
+            normalization_changes.append(
+                {
+                    "feature_id": chapter.get("feature_id"),
+                    "from": "supported",
+                    "to": "partial",
+                    "reason": "exhaustive_library_returned_one_candidate",
+                }
+            )
     write_json(
-        args.output_dir / "feature-shortlist.raw_output.json",
-        {"output_text": interaction.output_text},
+        args.output_dir / "feature-shortlist.normalization-audit.json",
+        {
+            "contract_version": "feature-shortlist-normalization-v1",
+            "changes": normalization_changes,
+            "paid_media_replayed": False,
+            "reused_raw_output": args.reuse_raw_output,
+        },
     )
-    plan = FeatureShortlistPlan.model_validate_json(interaction.output_text)
+    plan = FeatureShortlistPlan.model_validate(payload)
     validate_feature_shortlist(
         plan,
         brief=brief,
@@ -193,7 +238,7 @@ model_provenance 必須原樣回傳：
     final = plan.model_copy(
         update={
             "model_provenance": plan.model_provenance.model_copy(
-                update={"interaction_id": getattr(interaction, "id", None) or ""}
+                update={"interaction_id": interaction_id}
             )
         }
     )
