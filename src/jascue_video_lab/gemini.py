@@ -4107,7 +4107,12 @@ model_provenance (return it unchanged with interaction_id=null):
                 "input": request_input,
                 "generation_config": {
                     "thinking_level": "low",
-                    "max_output_tokens": 12288,
+                    # A 12-chapter Top-K plan with per-aspect presentation
+                    # intent can legitimately exceed 12k output tokens. A
+                    # truncated JSON document is not safely repairable from
+                    # text because its missing chapters are editorial
+                    # decisions, not representation errors.
+                    "max_output_tokens": 24576,
                 },
                 "response_format": {
                     "type": "text",
@@ -4170,13 +4175,23 @@ model_provenance (return it unchanged with interaction_id=null):
                     raw_output_path,
                     {"output_text": output_text},
                 )
-            canonical_text, normalization_changes = (
-                canonicalize_feature_edit_plan_output(output_text)
-            )
             recovered_by_paid_schema_repair = False
             try:
+                canonical_text, normalization_changes = (
+                    canonicalize_feature_edit_plan_output(output_text)
+                )
                 parsed = FeatureEditPlan.model_validate_json(canonical_text)
             except Exception as validation_error:
+                if (
+                    not reuse_raw_output
+                    and str(_raw_dump(interaction).get("status", "")).lower()
+                    in {"incomplete", "max_tokens", "length"}
+                ):
+                    raise GeminiContractError(
+                        "Feature Edit Plan response was truncated; refusing "
+                        "text-only repair because missing chapters are semantic "
+                        "editorial decisions"
+                    ) from validation_error
                 # A response was successfully generated and paid for, but it
                 # does not satisfy the local cross-field contract. A single
                 # text-only representation repair may normalize the preserved
