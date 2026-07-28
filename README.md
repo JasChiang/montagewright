@@ -2,6 +2,28 @@
 
 這是一個**完全獨立、實驗性**的 Gemini 3.6 Flash 影片理解與單幀 Grounding 驗證專案。它不是 JasCue 正式產品，不引用也不修改任何 JasCue 程式碼；實驗未通過前，不應將這裡的程式合併回 JasCue。
 
+## Autonomous delivery V1
+
+`codex/autonomous-delivery-v1` 在原本的 semantic planner → deterministic compiler → local executors 上新增兩個 fail-closed profile：
+
+- `autonomous_strict`：所有 hard evidence、exact cue、geometry、technical QA 與有聲 final QA 都通過，才由 `AUTO_POLICY` 產生 `DecisionAuthorityV2` 與 `delivery_eligible`。
+- `autonomous_best_effort`：只允許 policy 預先授權的 optional omission、preferred substitution、Top-K 換帶、two-panel 或 solid matte fit；hard evidence 仍不得省略。所有替代寫入 policy-bound degradation manifest。
+
+Gemini 只負責語意計畫、既有 frame ID 的事件選擇、exact-frame multi-target grounding 與成片觀察；它不能授予 approval、輸出任意 final timestamp/bbox，或自行形成 repair loop。本機最多允許一次 scoped semantic replan、兩次 full final QA，並在每次付費 final QA 前由 `BudgetLedger` 先 reserve 成本與 interaction。
+
+Autonomous 9:16 final QA 必須取得有聲成片、brief，以及下列自動產生、不可變的 JSON：
+
+```text
+editorial-beat-contracts.json
+music-map.json
+cue-plan.json
+exact-event-locks.json
+reuse-degradation.json
+deterministic-delivery-evidence.json
+```
+
+缺少任何一份、policy SHA 不符，或 deterministic evidence 有 hard failure，pipeline 會在新的付費工作前停止。歷史 review artifact 不能因為可播放而被自動升級。
+
 ## 一般人也看得懂的工作流程
 
 假設手上有一整批還沒整理的拍攝毛片，這套實驗流程會先幫忙「看帶、整理、提出剪輯建議」，而不是一開始就直接把影片自動剪完：
@@ -62,7 +84,7 @@ Agent 只適合研究、偵錯、比較策略或協助人類改 brief。正式�
 - `partial`：必要 chapter 沒有直接證據；可以輸出缺證據圖卡供審查，但不能冒充完成 brief。
 - `review_preview`：媒體可看，但候選、QualityMap、geometry 或 human-intent execution 尚未完整驗證。
 - `ready_for_human_review`：本次 execution profile 要求的自動 gate 已通過，可以進入正式人工審核。
-- `delivery_eligible`：必須再有 final-sequence QA 與人工核准；單獨執行 `feature-cut` 不會自行宣稱可交付。
+- `delivery_eligible`：review profiles 仍必須有 final-sequence QA 與人工核准；autonomous profiles 則必須有完整 deterministic gates、semantic final QA 與 policy-bound `DecisionAuthorityV2`。單獨執行 `feature-cut` 不會自行宣稱可交付。
 
 預設 `--execution-profile review_preview` 保留實驗便利性。要在付費 geometry／
 render 前強制 requested-aspect Top-K 與所有可嘗試候選的 ShotQualityMap coverage，

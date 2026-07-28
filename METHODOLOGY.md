@@ -263,6 +263,14 @@ Trim Intent 採相同的 evidence-first 邊界：模型先回 coarse `MM:SS`，�
 
 > 影片 AI Grounding 最容易被忽略的問題，不是「框得準不準」，而是「它框的是不是使用者要的那一個」。我的實驗把流程拆成 Target Candidates → Human Query Lock → MM:SS Moment → Exact Frame PTS → Gemini bbox → 選配的 shot-local SAM。沒有指定目標時，AI 只提候選，不替人做最後選擇；多個 bbox 也不靠 confidence 偷選。同一影片在 Gemini File API 的有效期內會重用，只有確認過期才重傳。這讓錯誤更容易被看見，也讓每一步都能獨立驗證。
 
+## Autonomous delivery 的核准方法
+
+Autonomous profile 不把 Gemini 的 `pass`、schema-valid output 或 confidence 當核准。完成版先由本機檢查 media/PTS、unexpected freeze、hard evidence、containment、identity、relation、same-PTS panel、relative scale、actual cue delta、motion motivation/reversal/settle、readability、reuse 與 omission authority。任一 hard gate 失敗即停止。
+
+Gemini 的有聲 final QA 只輸出 typed observation 與有限 repair class，不包含可執行 timestamp、frame/PTS 或 geometry。應用程式再以固定 mapping 選 hold、handle 內 shift、next presentation、two-panel、alternate candidate 或 scoped replan。Replan 最多一次，完整 QA 最多兩次；沒有形成可自由重試的 agent loop。
+
+只有 requested aspects 全部沒有 blocking observation、deterministic report 全通過，且 degradation manifest 綁定同一 policy SHA 時，本機才產生 `DecisionAuthorityV2`。因此可播放 MP4、模型沒報錯、或歷史 human-review artifact 都不能單獨升級成 autonomous delivery。
+
 ## 尚未證明的事
 
 - Gemini timestamp 不是 frame-accurate cut point。

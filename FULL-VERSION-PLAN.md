@@ -200,7 +200,11 @@ Repository 現已有逐片完整 proxy → Structured Clip Card、模型只回 `
 
 Full Auto v2 executor 與 selection planner v3 已完成 Top-K schema、brief-specific entity priorities、entity／event／frame lineage validation、hash-bound local evidence projection、9:16 runtime candidate switching、domain-neutral region roles、exact-frame geometry preflight、版本化 `auto_bounded_clip_v1` audit、typed failure／recovery record，以及候選耗盡後的 fail-closed preview。Clip Card 可跨 brief 重用，planner 預設不做自動完整 repair 重送；geometry artifact 以來源、frame、target、track 與處理參數 fingerprint 分 variant 保存，raw usage 與本機 timing 也分開記錄。SDK 對每個 operation 明確只嘗試一次；真正的 429／quota／spending-cap 會立即中止 render，不再用候選切換製造無效工作；舊 v1／v2 projection contracts 則維持原語意供既有 artifact 重現。
 
-尚未完成的是長毛片自動 take segmentation／重拍分組、可變鏡頭數的全片編排、16:9 runtime candidate switching、coarse/dense 統一 review UI、所有較早 pipeline 階段的完整 cache fingerprint、SAM 週期語意重驗、遮擋後 re-identification、overlay layout solver 與三次穩定度報告。本文件同時包含已實作與後續設計；任何未經人工審核的建議都不得當成 production cut 或 SpatialTrack。
+2026-07-28 的 autonomous-delivery-v1 已加入 policy／authority／budget、ExactEventLockV2、multi-target grounding、two-panel／solid-fit／freeze presentation compiler、bounded sequence optimizer、segment render cache，以及有聲 `autonomous_final_9x16` QA。正式 auto approval 不再由 `requires_human_review` 布林值推導，而是由 policy SHA、不可變輸入 hashes、deterministic gate results、Gemini interaction IDs 與 decision codes 組成 `DecisionAuthorityV2`。舊 review profiles 完全保留人工 gate。
+
+歷史 Samsung run 尚未包含 V1 的 beat/cue/exact-event/degradation/deterministic evidence bundle，因此本次未付費重跑，也未將舊 review MP4 冒充 autonomous evidence。完整實作與 benchmark readiness 記錄見 `AUTONOMOUS-DELIVERY-V1.md`。
+
+尚未完成的是把 selected-window grouped event resolver 與這份六檔 evidence bundle 直接接入歷史 feature-cut orchestration，完成一次真正 end-to-end 的 Samsung paid benchmark；另外仍有長毛片自動 take segmentation／重拍分組、16:9 runtime candidate switching、coarse/dense 統一 review UI、SAM 週期語意重驗、遮擋後 re-identification、overlay layout solver 與三次穩定度報告。本文件同時包含已實作與後續設計；任何缺少對應 authority 的建議都不得當成 production cut 或 SpatialTrack。
 
 ## 官方參考
 

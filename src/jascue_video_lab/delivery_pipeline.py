@@ -259,6 +259,7 @@ def run_feature_delivery_pipeline(
     policy: AutonomousEditPolicy | None = None
     budget_ledger: BudgetLedger | None = None
     deterministic_evidence: DeterministicDeliveryEvidence | None = None
+    deterministic_report: DeterministicDeliveryQaReport | None = None
     resolved_autonomous_context: dict[str, Path] = {}
     if profile in {
         FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
@@ -346,6 +347,15 @@ def run_feature_delivery_pipeline(
                 read_json(resolved_deterministic_evidence)
             )
         )
+        deterministic_report = run_deterministic_delivery_qa(
+            deterministic_evidence,
+            policy=policy,
+        )
+        if not deterministic_report.passed:
+            raise DeliveryPipelineBlocked(
+                "deterministic autonomous gates failed before paid work: "
+                + ", ".join(deterministic_report.failure_codes)
+            )
         write_json(
             resolved_output / "autonomous-preflight.json",
             {
@@ -546,13 +556,9 @@ def run_feature_delivery_pipeline(
                 "feature-cut did not produce any requested picture output"
             )
         delivery_authority: DecisionAuthorityV2 | None = None
-        deterministic_report: DeterministicDeliveryQaReport | None = None
         if policy is not None:
             assert deterministic_evidence is not None
-            deterministic_report = run_deterministic_delivery_qa(
-                deterministic_evidence,
-                policy=policy,
-            )
+            assert deterministic_report is not None
             degradation_path = resolved_autonomous_context.get(
                 "reuse_degradation"
             )

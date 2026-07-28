@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 import jascue_video_lab.delivery_pipeline as delivery_pipeline
 from jascue_video_lab.autonomous_policy import (
+    AutonomousDegradationManifest,
     AutonomousEditPolicy,
     BudgetPolicy,
     DurationPolicy,
@@ -164,5 +165,79 @@ def test_autonomous_preflight_rejects_aspect_mismatch_before_feature_cut(
             output_dir=tmp_path / "delivery",
             execution_profile="autonomous_strict",
             autonomous_policy_path=policy_path,
+        )
+    assert called is False
+
+
+def test_autonomous_preflight_rejects_hard_gate_before_paid_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy()
+    policy_path = tmp_path / "policy.json"
+    write_json(policy_path, policy)
+    context_paths: dict[str, Path] = {}
+    for key, payload in {
+        "editorial_beat_contracts": [],
+        "music_map": {},
+        "cue_plan": {},
+        "exact_event_locks": [],
+        "reuse_degradation": AutonomousDegradationManifest(
+            policy_reference=policy.policy_reference,
+            generated_at="now",
+        ).model_dump(mode="json"),
+    }.items():
+        path = tmp_path / f"{key}.json"
+        write_json(path, payload)
+        context_paths[key] = path
+    deterministic = tmp_path / "deterministic.json"
+    write_json(
+        deterministic,
+        {
+            "media_playable": True,
+            "pts_valid": True,
+            "unexpected_freeze_count": 0,
+            "containment_passed": True,
+            "identity_passed": True,
+            "relation_passed": True,
+            "panel_same_pts_passed": True,
+            "relative_scale_lock_passed": True,
+            "cue_delta_frames": {"hard-event": 3},
+            "synthetic_motion_motivated": True,
+            "synthetic_reversal_count": 0,
+            "settle_passed": True,
+            "readability_passed": True,
+            "reuse_authorized": True,
+            "omissions_authorized": True,
+            "hard_evidence_passed": True,
+        },
+    )
+    called = False
+
+    def forbidden(**_kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("feature-cut must not start after a hard failure")
+
+    monkeypatch.setattr(
+        delivery_pipeline,
+        "run_feature_cut_experiment",
+        forbidden,
+    )
+
+    with pytest.raises(
+        delivery_pipeline.DeliveryPipelineBlocked,
+        match="failed before paid work.*cue_sync",
+    ):
+        delivery_pipeline.run_feature_delivery_pipeline(
+            feature_cut_kwargs={"aspect": "9x16"},
+            brief_path=tmp_path / "brief.json",
+            music_path=tmp_path / "music.wav",
+            music_lock_path=tmp_path / "music-lock.json",
+            output_dir=tmp_path / "delivery",
+            execution_profile="autonomous_strict",
+            autonomous_policy_path=policy_path,
+            autonomous_context_paths=context_paths,
+            deterministic_delivery_evidence_path=deterministic,
         )
     assert called is False
