@@ -4222,6 +4222,62 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
             isinstance(item, dict) and item.get("type") == "audio"
             for item in original_inputs
         )
+        if not original_has_audio and music_sha256 is not None:
+            paid_media_request_path = (
+                args.output_dir
+                / "clip-card-feature-plan.attempt-01.request.json"
+            )
+            failed_validation_path = (
+                args.output_dir
+                / (
+                    "clip-card-feature-plan.attempt-01."
+                    "schema-validation.json"
+                )
+            )
+            current_text = "\n".join(
+                str(item.get("text"))
+                for item in original_inputs
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+            if (
+                "本次是純文字 contract repair" not in current_text
+                or not paid_media_request_path.is_file()
+                or not failed_validation_path.is_file()
+                or read_json(failed_validation_path).get("ok") is not False
+            ):
+                raise ValueError(
+                    "--reuse-raw-output music presence differs from the paid "
+                    "request"
+                )
+            paid_media_request = read_json(paid_media_request_path)
+            paid_media_inputs = paid_media_request.get("input")
+            paid_media_inputs = (
+                paid_media_inputs
+                if isinstance(paid_media_inputs, list)
+                else []
+            )
+            paid_media_has_audio = any(
+                isinstance(item, dict) and item.get("type") == "audio"
+                for item in paid_media_inputs
+            )
+            if (
+                not paid_media_has_audio
+                or paid_media_request.get("model")
+                != original_request.get("model")
+                or paid_media_request.get("response_format")
+                != original_request.get("response_format")
+            ):
+                raise ValueError(
+                    "text-only repair cannot prove its original paid media "
+                    "request"
+                )
+            extra_projection_artifacts["text_only_repair_request"] = (
+                source_request_path
+            )
+            source_request_path = paid_media_request_path
+            original_request = paid_media_request
+            original_inputs = paid_media_inputs
+            original_has_audio = True
         if original_has_audio != (music_sha256 is not None):
             raise ValueError(
                 "--reuse-raw-output music presence differs from the paid request"
@@ -4573,6 +4629,13 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                             args.output_dir / "direct-video-edit-plan.json",
                             direct_video_plan,
                         )
+                    if args.resume_failed_plan:
+                        extra_projection_artifacts[
+                            "text_only_repair_request"
+                        ] = source_request_path
+                        source_request_path = Path(
+                            failed_attempt["request"]
+                        ).resolve(strict=True)
                     break
                 except (ValidationError, ValueError) as error:
                     plan = None
@@ -4682,7 +4745,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         _assert_projection_request_hash(
             pointer_path=projection_pointer,
             plan_dir=args.output_dir,
-            expected_request_path=artifacts["request"],
+            expected_request_path=source_request_path,
         )
     usage_paths = sorted(
         args.output_dir.glob("clip-card-feature-plan.attempt-*.raw_interaction.json")
