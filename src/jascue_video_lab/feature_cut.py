@@ -7100,6 +7100,26 @@ def _combined_semantic_checkpoint_status(
     return SemanticCheckpointStatus.PASSED
 
 
+def _autonomous_panel_fallback_eligible(
+    *,
+    hard_region_count: int,
+    presentation_preference: str,
+    relation_mode: str,
+    policy: AutonomousEditPolicy | None,
+) -> bool:
+    if policy is None or hard_region_count != 2:
+        return False
+    if presentation_preference in {
+        "two_panel_layout",
+        "solid_matte_fit",
+    }:
+        return True
+    return (
+        relation_mode in {"simultaneous", "relation_core"}
+        and policy.presentation.allow_two_panel_layout
+    )
+
+
 def _vertical_candidate_geometry(
     *,
     client: GeminiLabClient,
@@ -7201,12 +7221,13 @@ def _vertical_candidate_geometry(
         )
         autonomous_compilation = None
         geometry: dict[str, Any] = {}
-        if (
-            autonomous_policy is not None
-            and len(hard_regions) == 2
-            and presentation_preference
-            in {"two_panel_layout", "solid_matte_fit"}
+        if _autonomous_panel_fallback_eligible(
+            hard_region_count=len(hard_regions),
+            presentation_preference=presentation_preference,
+            relation_mode=relation_mode,
+            policy=autonomous_policy,
         ):
+            assert autonomous_policy is not None
             resolved_relation_mode: Literal[
                 "single_subject",
                 "sequential_focus",

@@ -36,6 +36,7 @@ from jascue_video_lab.feature_cut import (
     _audit_requested_candidate_recall,
     _build_feature_cut_eligibility_report,
     _audit_render_source_reuse,
+    _autonomous_panel_fallback_eligible,
     _runtime_candidate_reuse_violation,
     _candidate_asset_reference_matches,
     _feature_vertical_candidate_from_runtime_option,
@@ -88,6 +89,36 @@ from jascue_video_lab.feature_cut import (
     write_external_feature_plan_projection,
 )
 from jascue_video_lab.auto_reframe import FailureCode
+
+
+def test_simultaneous_relation_enables_local_two_panel_fallback() -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=75_000,
+            min_ms=60_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+    assert _autonomous_panel_fallback_eligible(
+        hard_region_count=2,
+        presentation_preference="tracked_full_bleed",
+        relation_mode="simultaneous",
+        policy=policy,
+    )
+    assert not _autonomous_panel_fallback_eligible(
+        hard_region_count=3,
+        presentation_preference="tracked_full_bleed",
+        relation_mode="simultaneous",
+        policy=policy,
+    )
 from jascue_video_lab.cli import build_parser
 from jascue_video_lab.models import (
     FeatureCutExecutionProfile,
