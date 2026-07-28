@@ -129,7 +129,7 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
     assert vertical.aspect == "9x16"
 
 
-def test_direct_video_projection_always_refines_selected_clip_camera_plan() -> None:
+def test_direct_video_v2_never_reopens_selected_clip_semantics() -> None:
     assert _should_refine_selected_vertical_candidate(
         auto_vertical_framing=True,
         human_reframe_policy_requested=False,
@@ -141,7 +141,7 @@ def test_direct_video_projection_always_refines_selected_clip_camera_plan() -> N
             "regions": [],
         },
     )
-    assert _should_refine_selected_vertical_candidate(
+    assert not _should_refine_selected_vertical_candidate(
         auto_vertical_framing=True,
         human_reframe_policy_requested=False,
         feature_plan_origin="external_projection",
@@ -152,7 +152,7 @@ def test_direct_video_projection_always_refines_selected_clip_camera_plan() -> N
             "regions": [{"role": "required"}],
         },
     )
-    assert _should_refine_selected_vertical_candidate(
+    assert not _should_refine_selected_vertical_candidate(
         auto_vertical_framing=True,
         human_reframe_policy_requested=False,
         feature_plan_origin="external_projection",

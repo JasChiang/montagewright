@@ -8,11 +8,17 @@ import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .billing import STANDARD_PRICING_USD_PER_MILLION, summarize_usage_files
+from .autonomous_policy import AutonomousEditPolicy
+from .billing import (
+    STANDARD_PRICING_USD_PER_MILLION,
+    BudgetLedger,
+    estimate_paid_call,
+    summarize_usage_files,
+)
 from .media import sha256_file
 from .schema import gemini_response_schema
 from .storage import read_json, utc_now, write_json
@@ -32,8 +38,13 @@ FINAL_EDIT_QA_SYSTEM_INSTRUCTION = """你是 evidence-constrained 完成版影�
 
 CANONICAL_PROMPT_RESOURCE = "final_edit_qa_canonical_zh-TW.txt"
 CROP_PROMPT_RESOURCE = "final_edit_qa_crop_zh-TW.txt"
+AUTONOMOUS_PROMPT_RESOURCE = "final_edit_qa_autonomous_zh-TW.txt"
 
-FinalQaMode = Literal["canonical_16x9", "crop_only_9x16"]
+FinalQaMode = Literal[
+    "canonical_16x9",
+    "crop_only_9x16",
+    "autonomous_final_9x16",
+]
 QaAssessment = Literal[
     "effective",
     "acceptable",
@@ -49,6 +60,13 @@ EvidenceModality = Literal[
     "sequence",
     "insufficient_evidence",
 ]
+AUTONOMOUS_CONTEXT_KEYS = (
+    "editorial_beat_contracts",
+    "music_map",
+    "cue_plan",
+    "exact_event_locks",
+    "reuse_degradation",
+)
 
 _FIXED_SECONDS_RE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:秒|sec(?:ond)?s?)",
@@ -160,7 +178,118 @@ class CropOnlyFinalEditQa(StrictModel):
     requires_human_review: Literal[True] = True
 
 
-FinalEditQaResult = CanonicalFinalEditQa | CropOnlyFinalEditQa
+AutonomousIssueType = Literal[
+    "missing_required_evidence",
+    "action_incomplete",
+    "result_not_readable",
+    "music_sync_miss",
+    "unmotivated_motion",
+    "subject_clipped",
+    "relation_lost",
+    "relative_scale_misleading",
+    "layout_confusing",
+    "repetition_excess",
+    "weak_opening",
+    "weak_ending",
+]
+AutonomousRepairClass = Literal[
+    "hold",
+    "shift_trim_within_handles",
+    "next_presentation",
+    "two_panel_layout",
+    "alternate_candidate",
+    "solid_matte_fit",
+    "earlier_legal_cue",
+    "scoped_semantic_replan",
+    "blocked",
+]
+
+
+class AutonomousQaIssue(StrictModel):
+    issue_id: str = Field(min_length=1)
+    issue_type: AutonomousIssueType
+    severity: Literal["critical", "high", "medium", "low"]
+    segment_id: str | None = None
+    beat_id: str | None = None
+    observation: str = Field(min_length=1)
+    evidence_modality: EvidenceModality
+    repair_class: AutonomousRepairClass
+
+
+class AutonomousFinalEditQa(StrictModel):
+    contract_version: Literal["final-edit-qa-v1"] = FINAL_EDIT_QA_CONTRACT_VERSION
+    mode: Literal["autonomous_final_9x16"]
+    render_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    proxy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    brief_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    context_hashes: dict[str, str]
+    issues: list[AutonomousQaIssue]
+    opening_observation: str = Field(min_length=1)
+    ending_observation: str = Field(min_length=1)
+    sequence_observation: str = Field(min_length=1)
+    qa_observation_status: Literal[
+        "no_blocking_observation",
+        "issues_observed",
+        "insufficient_evidence",
+    ]
+    limitations: list[str]
+    requires_human_review: Literal[False] = False
+
+
+class DeterministicDeliveryEvidence(StrictModel):
+    media_playable: bool
+    pts_valid: bool
+    unexpected_freeze_count: int = Field(ge=0)
+    containment_passed: bool
+    identity_passed: bool
+    relation_passed: bool
+    panel_same_pts_passed: bool
+    relative_scale_lock_passed: bool
+    cue_delta_frames: dict[str, int]
+    synthetic_motion_motivated: bool
+    synthetic_reversal_count: int = Field(ge=0)
+    settle_passed: bool
+    readability_passed: bool
+    reuse_authorized: bool
+    omissions_authorized: bool
+    hard_evidence_passed: bool
+
+
+class DeterministicDeliveryQaReport(StrictModel):
+    contract_version: Literal["deterministic-delivery-qa-v1"] = (
+        "deterministic-delivery-qa-v1"
+    )
+    gate_results: dict[str, Literal["passed", "failed"]]
+    failure_codes: tuple[str, ...]
+    passed: bool
+
+
+class AutonomousRepairAction(StrictModel):
+    issue_id: str
+    segment_id: str | None
+    beat_id: str | None
+    action: AutonomousRepairClass
+    requires_semantic_replan: bool = False
+
+
+class AutonomousRecoveryPlan(StrictModel):
+    contract_version: Literal["autonomous-recovery-plan-v1"] = (
+        "autonomous-recovery-plan-v1"
+    )
+    qa_passes_completed: int = Field(ge=1, le=2)
+    semantic_replans_used: int = Field(ge=0, le=1)
+    actions: tuple[AutonomousRepairAction, ...]
+    requires_another_qa: bool
+    outcome: Literal["complete", "repair", "blocked"]
+    decision_codes: tuple[str, ...]
+
+
+FinalEditQaResult = (
+    CanonicalFinalEditQa
+    | CropOnlyFinalEditQa
+    | AutonomousFinalEditQa
+)
 
 
 @dataclass(frozen=True)
@@ -174,7 +303,13 @@ class PreparedFinalEditQa:
     segment_contract: list[dict[str, Any]]
     prompt: str
     schema: dict[str, Any]
-    result_model: type[CanonicalFinalEditQa] | type[CropOnlyFinalEditQa]
+    result_model: (
+        type[CanonicalFinalEditQa]
+        | type[CropOnlyFinalEditQa]
+        | type[AutonomousFinalEditQa]
+    )
+    autonomous_context_paths: dict[str, Path]
+    autonomous_context_hashes: dict[str, str]
     input_hashes: dict[str, Any]
     cache_key: str
 
@@ -223,11 +358,11 @@ def _raw_dump(value: Any) -> Any:
 def _read_prompt(mode: FinalQaMode, override: Path | None = None) -> str:
     if override is not None:
         return override.expanduser().resolve(strict=True).read_text(encoding="utf-8")
-    resource_name = (
-        CANONICAL_PROMPT_RESOURCE
-        if mode == "canonical_16x9"
-        else CROP_PROMPT_RESOURCE
-    )
+    resource_name = {
+        "canonical_16x9": CANONICAL_PROMPT_RESOURCE,
+        "crop_only_9x16": CROP_PROMPT_RESOURCE,
+        "autonomous_final_9x16": AUTONOMOUS_PROMPT_RESOURCE,
+    }[mode]
     return (
         resources.files("jascue_video_lab.prompts")
         .joinpath(resource_name)
@@ -450,7 +585,11 @@ def _validate_media_mode(metadata: dict[str, Any], mode: FinalQaMode) -> None:
                 "canonical 16:9 QA requires the final render with its music/audio"
             )
     elif width * 16 != height * 9:
-        raise ValueError(f"crop-only QA requires exact 9:16, got {width}x{height}")
+        raise ValueError(f"vertical QA requires exact 9:16, got {width}x{height}")
+    elif mode == "autonomous_final_9x16" and not metadata["has_audio"]:
+        raise ValueError(
+            "autonomous 9:16 QA requires the final render with music/audio"
+        )
 
 
 def _proxy_contract(mode: FinalQaMode, crop_include_audio: bool) -> dict[str, Any]:
@@ -463,7 +602,8 @@ def _proxy_contract(mode: FinalQaMode, crop_include_audio: bool) -> dict[str, An
         "crf": 30,
         "audio": (
             "aac-64k"
-            if mode == "canonical_16x9" or crop_include_audio
+            if mode in {"canonical_16x9", "autonomous_final_9x16"}
+            or crop_include_audio
             else "omitted"
         ),
     }
@@ -503,7 +643,7 @@ def _create_proxy(
         "-crf",
         "30",
     ]
-    if mode == "canonical_16x9":
+    if mode in {"canonical_16x9", "autonomous_final_9x16"}:
         command.extend(["-map", "0:a:0", "-c:a", "aac", "-b:a", "64k"])
     elif crop_include_audio:
         command.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "64k"])
@@ -527,6 +667,7 @@ def _build_prompt(
     brief_sha256: str | None,
     brief: dict[str, Any] | None,
     segment_contract: list[dict[str, Any]],
+    autonomous_context: Mapping[str, Any] | None = None,
 ) -> str:
     immutable = {
         "mode": mode,
@@ -545,6 +686,15 @@ def _build_prompt(
             "## 使用者 brief（待驗證意圖）\n"
             + json.dumps(brief, ensure_ascii=False, indent=2)
         )
+    if autonomous_context is not None:
+        blocks.append(
+            "## 自動剪輯驗收契約與稽核資料\n"
+            + json.dumps(
+                autonomous_context,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     blocks.append(
         "## 依成片順序排列的剪輯單元契約\n"
         + json.dumps(segment_contract, ensure_ascii=False, indent=2)
@@ -562,8 +712,13 @@ def prepare_final_edit_qa(
     brief_path: Path | None = None,
     prompt_override: Path | None = None,
     crop_include_audio: bool = False,
+    autonomous_context_paths: Mapping[str, Path] | None = None,
 ) -> PreparedFinalEditQa:
-    if mode not in {"canonical_16x9", "crop_only_9x16"}:
+    if mode not in {
+        "canonical_16x9",
+        "crop_only_9x16",
+        "autonomous_final_9x16",
+    }:
         raise ValueError(f"unsupported final QA mode: {mode}")
     if model_id not in STANDARD_PRICING_USD_PER_MILLION:
         raise ValueError(
@@ -578,15 +733,46 @@ def prepare_final_edit_qa(
         raise ValueError("final edit manifest must be a JSON object")
     resolved_brief: Path | None = None
     brief: dict[str, Any] | None = None
-    if mode == "canonical_16x9":
+    if mode in {"canonical_16x9", "autonomous_final_9x16"}:
         if brief_path is None:
-            raise ValueError("canonical 16:9 QA requires a brief JSON")
+            raise ValueError(f"{mode} QA requires a brief JSON")
         resolved_brief = brief_path.expanduser().resolve(strict=True)
         brief = read_json(resolved_brief)
         if not isinstance(brief, dict):
             raise ValueError("final edit brief must be a JSON object")
     elif brief_path is not None:
         raise ValueError("crop-only QA intentionally does not consume a brief")
+
+    resolved_context_paths: dict[str, Path] = {}
+    context_hashes: dict[str, str] = {}
+    autonomous_context: dict[str, Any] | None = None
+    if mode == "autonomous_final_9x16":
+        supplied = dict(autonomous_context_paths or {})
+        missing = sorted(set(AUTONOMOUS_CONTEXT_KEYS) - set(supplied))
+        extras = sorted(set(supplied) - set(AUTONOMOUS_CONTEXT_KEYS))
+        if missing or extras:
+            raise ValueError(
+                "autonomous final QA context mismatch: "
+                f"missing={missing}, extras={extras}"
+            )
+        autonomous_context = {}
+        for key in AUTONOMOUS_CONTEXT_KEYS:
+            resolved = supplied[key].expanduser().resolve(strict=True)
+            payload = read_json(resolved)
+            if not isinstance(payload, (dict, list)):
+                raise ValueError(
+                    f"autonomous QA context {key} must be JSON object/list"
+                )
+            resolved_context_paths[key] = resolved
+            context_hashes[key] = sha256_file(resolved)
+            autonomous_context[key] = {
+                "sha256": context_hashes[key],
+                "payload": payload,
+            }
+    elif autonomous_context_paths:
+        raise ValueError(
+            "autonomous context is only valid for autonomous_final_9x16"
+        )
 
     metadata = _probe_media(resolved_render)
     _validate_media_mode(metadata, mode)
@@ -611,11 +797,15 @@ def prepare_final_edit_qa(
     _validate_media_mode(proxy_metadata, mode)
     proxy_hash = sha256_file(proxy_path)
     prompt_template = _read_prompt(mode, prompt_override)
-    result_model: type[CanonicalFinalEditQa] | type[CropOnlyFinalEditQa] = (
-        CanonicalFinalEditQa
-        if mode == "canonical_16x9"
-        else CropOnlyFinalEditQa
-    )
+    result_model: (
+        type[CanonicalFinalEditQa]
+        | type[CropOnlyFinalEditQa]
+        | type[AutonomousFinalEditQa]
+    ) = {
+        "canonical_16x9": CanonicalFinalEditQa,
+        "crop_only_9x16": CropOnlyFinalEditQa,
+        "autonomous_final_9x16": AutonomousFinalEditQa,
+    }[mode]
     schema = gemini_response_schema(result_model)
     prompt = _build_prompt(
         mode=mode,
@@ -626,6 +816,7 @@ def prepare_final_edit_qa(
         brief_sha256=brief_hash,
         brief=brief,
         segment_contract=segment_contract,
+        autonomous_context=autonomous_context,
     )
     input_hashes = {
         "contract_version": FINAL_EDIT_QA_CONTRACT_VERSION,
@@ -637,6 +828,7 @@ def prepare_final_edit_qa(
         "proxy_sha256": proxy_hash,
         "manifest_sha256": manifest_hash,
         "brief_sha256": brief_hash,
+        "autonomous_context_hashes": context_hashes,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "system_instruction_sha256": hashlib.sha256(
             FINAL_EDIT_QA_SYSTEM_INSTRUCTION.encode("utf-8")
@@ -659,6 +851,8 @@ def prepare_final_edit_qa(
         prompt=prompt,
         schema=schema,
         result_model=result_model,
+        autonomous_context_paths=resolved_context_paths,
+        autonomous_context_hashes=context_hashes,
         input_hashes=input_hashes,
         # A validator-only release must find and revalidate the already-paid
         # response instead of creating a new Gemini request namespace.
@@ -683,12 +877,13 @@ def _validate_result(
         (item["order"], item["segment_id"])
         for item in prepared.segment_contract
     ]
-    actual_ids = [(item.order, item.segment_id) for item in result.segments]
-    if actual_ids != expected_ids:
-        raise ValueError(
-            f"Gemini changed or reordered final QA segment identities: "
-            f"{actual_ids} != {expected_ids}"
-        )
+    if not isinstance(result, AutonomousFinalEditQa):
+        actual_ids = [(item.order, item.segment_id) for item in result.segments]
+        if actual_ids != expected_ids:
+            raise ValueError(
+                f"Gemini changed or reordered final QA segment identities: "
+                f"{actual_ids} != {expected_ids}"
+            )
     if isinstance(result, CanonicalFinalEditQa):
         if result.brief_sha256 != hashes["brief_sha256"]:
             raise ValueError("Gemini changed the immutable brief hash")
@@ -698,7 +893,7 @@ def _validate_result(
         actual_brief_ids = [item.brief_item_id for item in result.segments]
         if actual_brief_ids != expected_brief_ids:
             raise ValueError("Gemini changed canonical QA brief item identities")
-    else:
+    elif isinstance(result, CropOnlyFinalEditQa):
         expected_by_id = {
             item["segment_id"]: item for item in prepared.segment_contract
         }
@@ -719,10 +914,38 @@ def _validate_result(
             # an attempt to mutate the manifest contract.  Keep the finding
             # intact for human review instead of rejecting an already-paid
             # response and asking the model again.
+    else:
+        if result.brief_sha256 != hashes["brief_sha256"]:
+            raise ValueError("Gemini changed the autonomous QA brief hash")
+        if result.context_hashes != prepared.autonomous_context_hashes:
+            raise ValueError("Gemini changed autonomous QA context hashes")
+        expected_segment_ids = {
+            item["segment_id"] for item in prepared.segment_contract
+        }
+        for issue in result.issues:
+            if (
+                issue.segment_id is not None
+                and issue.segment_id not in expected_segment_ids
+            ):
+                raise ValueError(
+                    "Gemini referenced an unknown autonomous QA segment"
+                )
+            prohibited = re.search(
+                r"(?i)\b(?:pts|frame|bbox|crop)\s*[:=#]?\s*"
+                r"(?:\d|[\[(])|\b\d{1,2}:\d{2}(?::\d{2})?\b",
+                issue.observation,
+            )
+            if prohibited:
+                raise ValueError(
+                    "autonomous QA observation contains an executable "
+                    "timestamp/frame/geometry reference"
+                )
 
 
 def _normalize_application_owned_fields(
     output_text: str,
+    *,
+    mode: FinalQaMode,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Keep model observations intact while enforcing application policy fields.
 
@@ -737,22 +960,162 @@ def _normalize_application_owned_fields(
     if not isinstance(payload, dict):
         raise ValueError("Gemini final-edit QA output must be a JSON object")
     original = payload.get("requires_human_review")
-    payload["requires_human_review"] = True
+    normalized = mode != "autonomous_final_9x16"
+    payload["requires_human_review"] = normalized
     audit = {
         "contract_version": "final-edit-qa-normalization-v1",
         "application_owned_fields": {
             "requires_human_review": {
                 "model_value": original,
-                "normalized_value": True,
+                "normalized_value": normalized,
                 "reason": (
-                    "human review is an immutable application policy, not a "
-                    "model-authored assessment"
+                    "review authority is application-owned; autonomous QA "
+                    "observations are evaluated later by the policy compiler"
                 ),
             }
         },
         "model_observations_changed": False,
     }
     return payload, audit
+
+
+def run_deterministic_delivery_qa(
+    evidence: DeterministicDeliveryEvidence,
+    *,
+    policy: AutonomousEditPolicy,
+) -> DeterministicDeliveryQaReport:
+    """Evaluate application-owned hard gates independently of Gemini QA."""
+
+    gates: dict[str, Literal["passed", "failed"]] = {}
+
+    def gate(name: str, passed: bool) -> None:
+        gates[name] = "passed" if passed else "failed"
+
+    gate("media_playable", evidence.media_playable)
+    gate("pts_valid", evidence.pts_valid)
+    gate("no_unexpected_freeze", evidence.unexpected_freeze_count == 0)
+    gate("hard_evidence", evidence.hard_evidence_passed)
+    gate("containment", evidence.containment_passed)
+    gate("identity", evidence.identity_passed)
+    gate("relation", evidence.relation_passed)
+    gate("panel_same_pts", evidence.panel_same_pts_passed)
+    gate("relative_scale_lock", evidence.relative_scale_lock_passed)
+    gate(
+        "cue_sync",
+        all(
+            abs(delta) <= policy.sync.hard_tolerance_frames
+            for delta in evidence.cue_delta_frames.values()
+        ),
+    )
+    gate("synthetic_motion_motivated", evidence.synthetic_motion_motivated)
+    gate("no_synthetic_reversal", evidence.synthetic_reversal_count == 0)
+    gate("motion_settle", evidence.settle_passed)
+    gate("readability", evidence.readability_passed)
+    gate("reuse_authorized", evidence.reuse_authorized)
+    gate("omissions_authorized", evidence.omissions_authorized)
+    failures = tuple(
+        name for name, status in gates.items() if status == "failed"
+    )
+    return DeterministicDeliveryQaReport(
+        gate_results=gates,
+        failure_codes=failures,
+        passed=not failures,
+    )
+
+
+_LOCAL_REPAIR_BY_ISSUE: dict[AutonomousIssueType, AutonomousRepairClass] = {
+    "music_sync_miss": "shift_trim_within_handles",
+    "unmotivated_motion": "hold",
+    "subject_clipped": "next_presentation",
+    "relation_lost": "two_panel_layout",
+    "relative_scale_misleading": "alternate_candidate",
+    "layout_confusing": "alternate_candidate",
+    "repetition_excess": "alternate_candidate",
+    "result_not_readable": "shift_trim_within_handles",
+    "action_incomplete": "alternate_candidate",
+    "missing_required_evidence": "alternate_candidate",
+    "weak_opening": "scoped_semantic_replan",
+    "weak_ending": "scoped_semantic_replan",
+}
+
+
+def plan_autonomous_recovery(
+    qa: AutonomousFinalEditQa,
+    *,
+    policy: AutonomousEditPolicy,
+    qa_passes_completed: int,
+    semantic_replans_used: int,
+) -> AutonomousRecoveryPlan:
+    """Map typed observations to bounded local repairs or one scoped replan."""
+
+    if not 1 <= qa_passes_completed <= policy.budget.max_final_qa_passes:
+        raise ValueError("QA pass count is outside policy")
+    if not 0 <= semantic_replans_used <= policy.budget.max_semantic_replans:
+        raise ValueError("semantic replan count is outside policy")
+    if qa.qa_observation_status == "no_blocking_observation" and not qa.issues:
+        return AutonomousRecoveryPlan(
+            qa_passes_completed=qa_passes_completed,
+            semantic_replans_used=semantic_replans_used,
+            actions=(),
+            requires_another_qa=False,
+            outcome="complete",
+            decision_codes=("semantic_qa_no_blocking_observation",),
+        )
+    if qa.qa_observation_status == "insufficient_evidence":
+        return AutonomousRecoveryPlan(
+            qa_passes_completed=qa_passes_completed,
+            semantic_replans_used=semantic_replans_used,
+            actions=(),
+            requires_another_qa=False,
+            outcome="blocked",
+            decision_codes=("semantic_qa_insufficient_evidence",),
+        )
+    if qa_passes_completed >= policy.budget.max_final_qa_passes:
+        return AutonomousRecoveryPlan(
+            qa_passes_completed=qa_passes_completed,
+            semantic_replans_used=semantic_replans_used,
+            actions=(),
+            requires_another_qa=False,
+            outcome="blocked",
+            decision_codes=("final_qa_pass_limit_reached",),
+        )
+
+    actions: list[AutonomousRepairAction] = []
+    next_replans = semantic_replans_used
+    for issue in qa.issues:
+        action = _LOCAL_REPAIR_BY_ISSUE[issue.issue_type]
+        semantic = action == "scoped_semantic_replan"
+        if semantic:
+            if next_replans >= policy.budget.max_semantic_replans:
+                return AutonomousRecoveryPlan(
+                    qa_passes_completed=qa_passes_completed,
+                    semantic_replans_used=next_replans,
+                    actions=tuple(actions),
+                    requires_another_qa=False,
+                    outcome="blocked",
+                    decision_codes=("semantic_replan_limit_reached",),
+                )
+            next_replans += 1
+        actions.append(
+            AutonomousRepairAction(
+                issue_id=issue.issue_id,
+                segment_id=issue.segment_id,
+                beat_id=issue.beat_id,
+                action=action,
+                requires_semantic_replan=semantic,
+            )
+        )
+    return AutonomousRecoveryPlan(
+        qa_passes_completed=qa_passes_completed,
+        semantic_replans_used=next_replans,
+        actions=tuple(actions),
+        requires_another_qa=True,
+        outcome="repair",
+        decision_codes=(
+            "deterministic_repairs_prioritized",
+            "next_full_qa_required",
+        ),
+    )
 
 
 def _next_attempt_dir(run_dir: Path) -> Path:
@@ -834,6 +1197,8 @@ def execute_final_edit_qa(
     client: Any,
     uploaded_video: Any,
     output_dir: Path,
+    budget_ledger: BudgetLedger | None = None,
+    recovery_call: bool = True,
 ) -> FinalEditQaExecutionResult:
     """Make exactly one Interactions request and persist all evidence artifacts."""
 
@@ -900,6 +1265,31 @@ def execute_final_edit_qa(
             "segment_contract": prepared.segment_contract,
         },
     )
+    reservation = None
+    if budget_ledger is not None:
+        media_seconds = float(
+            prepared.input_hashes["proxy_media_metadata"][
+                "duration_seconds"
+            ]
+        )
+        estimate = estimate_paid_call(
+            stage=f"final_qa:{prepared.mode}",
+            model_id=prepared.model_id,
+            media_duration_ms=round(media_seconds * 1_000),
+            media_resolution="low",
+            text_input_tokens=max(1, len(prepared.prompt) // 4),
+            max_output_tokens=int(
+                FINAL_EDIT_QA_GENERATION_CONFIG["max_output_tokens"]
+            ),
+            thinking_level=str(
+                FINAL_EDIT_QA_GENERATION_CONFIG["thinking_level"]
+            ),
+            retry_allowance=0,
+        )
+        reservation = budget_ledger.reserve(
+            estimate,
+            recovery_call=recovery_call,
+        )
     started = time.monotonic()
     try:
         interaction = client.interactions.create(**request)
@@ -949,6 +1339,13 @@ def execute_final_edit_qa(
             "usage": raw_interaction.get("usage"),
         },
     )
+    if budget_ledger is not None and reservation is not None:
+        usage = raw_interaction.get("usage") or {}
+        budget_ledger.reconcile(
+            reservation.reservation_id,
+            usage=usage,
+            model_id=str(raw_interaction.get("model") or prepared.model_id),
+        )
     write_json(
         attempt_dir / "timing.json",
         {
@@ -960,7 +1357,10 @@ def execute_final_edit_qa(
     )
     try:
         normalized_payload, normalization_audit = (
-            _normalize_application_owned_fields(output_text)
+            _normalize_application_owned_fields(
+                output_text,
+                mode=prepared.mode,
+            )
         )
         write_json(
             attempt_dir / "contract_normalization.json",
@@ -1094,7 +1494,10 @@ def _recover_latest_saved_output(
                 continue
             try:
                 normalized_payload, normalization_audit = (
-                    _normalize_application_owned_fields(output_text)
+                    _normalize_application_owned_fields(
+                        output_text,
+                        mode=prepared.mode,
+                    )
                 )
                 result = prepared.result_model.model_validate(
                     normalized_payload

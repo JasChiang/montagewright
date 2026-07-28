@@ -1,0 +1,15 @@
+# autonomous_final_9x16 完整有聲成片 QA
+
+觀看完整 9:16 成片並聆聽實際音樂。逐項對照 brief、EditorialBeatContracts、MusicMap、CuePlan、ExactEventLocks、render/crop/panel/motion manifest，以及 reuse/degradation report。
+
+只回報在完成版媒體中可觀察的問題。契約是待驗證意圖，不是問題已解決的證據。不得核准交付，不得變更 policy，不得輸出任意 timestamp、frame/PTS、bbox、crop 或 panel 座標。
+
+每個 issue 必須：
+
+- 使用 schema 既有 issue_type。
+- 指向既有 segment_id；若能從契約確定，再填 beat_id。
+- 說明實際觀察，不用產品常識補完。
+- 選擇一個有限 repair_class；這只是問題分類，不是可執行指令。
+- music sync 必須同時依可聽音樂與可見事件判斷。
+
+若 hard evidence 無法確認，回報 `missing_required_evidence` 或 `insufficient_evidence`，不得猜測已存在。若沒有 blocking observation，使用 `no_blocking_observation`；這仍不構成交付授權。

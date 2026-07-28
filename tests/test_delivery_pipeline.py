@@ -5,6 +5,18 @@ from types import SimpleNamespace
 
 import jascue_video_lab.delivery_pipeline as pipeline
 import pytest
+from jascue_video_lab.autonomous_policy import (
+    AutonomousDegradationManifest,
+    AutonomousEditPolicy,
+    BudgetPolicy,
+    DegradationRecord,
+    DurationPolicy,
+)
+from jascue_video_lab.final_edit_qa import (
+    AutonomousFinalEditQa,
+    DeterministicDeliveryEvidence,
+    run_deterministic_delivery_qa,
+)
 from jascue_video_lab.media import sha256_file
 
 
@@ -193,3 +205,110 @@ def test_delivery_pipeline_stops_before_music_when_picture_media_is_missing(
             output_dir=tmp_path / "delivery",
         )
     assert called is False
+
+
+def _autonomous_policy(profile: str = "autonomous_strict") -> AutonomousEditPolicy:
+    return AutonomousEditPolicy(
+        execution_profile=profile,
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=50_000,
+            max_ms=70_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+
+def _passing_deterministic_report(policy: AutonomousEditPolicy):
+    return run_deterministic_delivery_qa(
+        DeterministicDeliveryEvidence(
+            media_playable=True,
+            pts_valid=True,
+            unexpected_freeze_count=0,
+            containment_passed=True,
+            identity_passed=True,
+            relation_passed=True,
+            panel_same_pts_passed=True,
+            relative_scale_lock_passed=True,
+            cue_delta_frames={"event": 2},
+            synthetic_motion_motivated=True,
+            synthetic_reversal_count=0,
+            settle_passed=True,
+            readability_passed=True,
+            reuse_authorized=True,
+            omissions_authorized=True,
+            hard_evidence_passed=True,
+        ),
+        policy=policy,
+    )
+
+
+def _passing_autonomous_qa() -> AutonomousFinalEditQa:
+    return AutonomousFinalEditQa(
+        mode="autonomous_final_9x16",
+        render_sha256="a" * 64,
+        proxy_sha256="b" * 64,
+        manifest_sha256="c" * 64,
+        brief_sha256="d" * 64,
+        context_hashes={"editorial_beat_contracts": "e" * 64},
+        issues=[],
+        opening_observation="The subject is established.",
+        ending_observation="The final result resolves with music.",
+        sequence_observation="Required beats remain understandable.",
+        qa_observation_status="no_blocking_observation",
+        limitations=[],
+    )
+
+
+def test_autonomous_strict_reaches_delivery_without_human_artifact() -> None:
+    policy = _autonomous_policy()
+    degradation = AutonomousDegradationManifest(
+        policy_reference=policy.policy_reference,
+        generated_at="now",
+    )
+
+    state, authority = pipeline.authorize_autonomous_delivery(
+        policy=policy,
+        deterministic_qa=_passing_deterministic_report(policy),
+        qa_results={"9:16": _passing_autonomous_qa()},
+        degradation=degradation,
+        input_artifact_hashes=("sha256:" + "f" * 64,),
+        gemini_interaction_ids=("qa-observation-1",),
+    )
+
+    assert state == "delivery_eligible"
+    assert authority.authority_type == "auto_policy"
+    assert authority.policy_reference == policy.policy_reference
+    assert authority.decision_scope == "final_delivery"
+    assert authority.gemini_interaction_ids == ("qa-observation-1",)
+
+
+def test_best_effort_records_degradation_but_never_hard_omission() -> None:
+    policy = _autonomous_policy("autonomous_best_effort")
+    degradation = AutonomousDegradationManifest(
+        policy_reference=policy.policy_reference,
+        records=(
+            DegradationRecord(
+                beat_id="optional-beat",
+                action="optional_beat_omitted",
+                reason_code="duration_reconciliation",
+            ),
+        ),
+        generated_at="now",
+    )
+
+    state, authority = pipeline.authorize_autonomous_delivery(
+        policy=policy,
+        deterministic_qa=_passing_deterministic_report(policy),
+        qa_results={"9:16": _passing_autonomous_qa()},
+        degradation=degradation,
+        input_artifact_hashes=("sha256:" + "f" * 64,),
+    )
+
+    assert state == "best_effort_complete"
+    assert "authorized_degradations_recorded" in authority.decision_codes

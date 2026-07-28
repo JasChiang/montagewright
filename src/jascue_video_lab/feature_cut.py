@@ -8261,28 +8261,20 @@ def _should_refine_selected_vertical_candidate(
     external_projection_contract_id: str | None,
     option_data: Mapping[str, Any],
 ) -> bool:
-    """Return whether a selected clip still lacks an executable camera plan.
+    """Keep legacy refinement only where no v2 semantic intent exists.
 
-    Broad direct-video planning selects evidence and proposes an editorial
-    presentation, but it cannot reliably prove that a phase transition is
-    executable after local tracking, duration, and geometry constraints are
-    known.  Every automatically framed selected clip therefore receives the
-    bounded selected-clip pass, even when the broad plan already contains a
-    virtual-camera proposal.  This lets the model express transition
-    motivation and cut admissibility using the actual selected clip without
-    re-watching the whole rushes set.
-
-    The immutable candidate/event/frame identity and upstream coverage
-    obligation are checked after enrichment, so this cannot silently replace
-    the selected evidence or weaken its semantic contract.
+    ``direct-video-edit-plan-v2`` already owns selection, attention, phase
+    coverage, and music-aware presentation intent in one global call.
+    Exact-event resolution, grounding, geometry, and presentation compilation
+    are downstream local work; they must not trigger a selected-clip semantic
+    rewatch.
     """
 
     if not auto_vertical_framing or human_reframe_policy_requested:
         return False
-    if external_projection_contract_id in {
-        "direct-video-edit-plan-v1",
-        "direct-video-edit-plan-v2",
-    }:
+    if external_projection_contract_id == "direct-video-edit-plan-v2":
+        return False
+    if external_projection_contract_id == "direct-video-edit-plan-v1":
         return True
     return (
         feature_plan_origin != "external_projection"

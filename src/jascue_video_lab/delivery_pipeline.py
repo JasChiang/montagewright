@@ -6,13 +6,23 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .autonomous_policy import (
+    AutonomousDegradationManifest,
     AutonomousEditPolicy,
     AutonomousExecutionProfile,
+    DecisionAuthorityV2,
+    authorize_decision,
 )
 from .billing import BudgetLedger
 from .feature_cut import run_feature_cut_experiment
 from .final_delivery import assemble_music_only_delivery
-from .final_edit_qa import execute_final_edit_qa, prepare_final_edit_qa
+from .final_edit_qa import (
+    AutonomousFinalEditQa,
+    DeterministicDeliveryEvidence,
+    DeterministicDeliveryQaReport,
+    execute_final_edit_qa,
+    prepare_final_edit_qa,
+    run_deterministic_delivery_qa,
+)
 from .gemini import GeminiLabClient, MODEL_ID
 from .media import probe_video, sha256_file
 from .music import MusicMapLock
@@ -40,6 +50,7 @@ def _write_status(
     state: str,
     error: BaseException | None = None,
     outputs: Mapping[str, Any] | None = None,
+    delivery_eligible: bool = False,
 ) -> None:
     write_json(
         path,
@@ -48,7 +59,7 @@ def _write_status(
             "stage": stage,
             "terminal": terminal,
             "state": state,
-            "delivery_eligible": False,
+            "delivery_eligible": delivery_eligible,
             "error": (
                 None
                 if error is None
@@ -66,6 +77,84 @@ def _qa_disposition(execution: Any) -> str:
     if not isinstance(disposition, str):
         raise ValueError("FinalEditQA omitted its typed global disposition")
     return disposition
+
+
+def _autonomous_semantic_qa_passed(result: Any) -> bool:
+    if isinstance(result, AutonomousFinalEditQa):
+        return (
+            result.qa_observation_status == "no_blocking_observation"
+            and not result.issues
+        )
+    review = getattr(result, "global_review", None)
+    return getattr(review, "disposition", None) == "ready_for_human_review"
+
+
+def authorize_autonomous_delivery(
+    *,
+    policy: AutonomousEditPolicy,
+    deterministic_qa: DeterministicDeliveryQaReport,
+    qa_results: Mapping[str, Any],
+    degradation: AutonomousDegradationManifest,
+    input_artifact_hashes: tuple[str, ...],
+    gemini_interaction_ids: tuple[str, ...] = (),
+) -> tuple[str, DecisionAuthorityV2]:
+    """Grant delivery only from local gates bound to immutable artifacts."""
+
+    if not deterministic_qa.passed:
+        raise DeliveryPipelineBlocked(
+            "deterministic autonomous delivery gates did not pass"
+        )
+    if set(qa_results) != set(policy.requested_aspects):
+        raise DeliveryPipelineBlocked(
+            "semantic QA results do not cover every requested aspect"
+        )
+    if not all(
+        _autonomous_semantic_qa_passed(result)
+        for result in qa_results.values()
+    ):
+        raise DeliveryPipelineBlocked(
+            "final semantic QA reported a blocking observation"
+        )
+    if degradation.policy_reference != policy.policy_reference:
+        raise DeliveryPipelineBlocked(
+            "degradation manifest is not bound to the autonomous policy"
+        )
+    gate_results = {
+        **{
+            f"deterministic_{name}": "passed"
+            for name, status in deterministic_qa.gate_results.items()
+            if status == "passed"
+        },
+        "semantic_final_qa": "passed",
+        "hard_evidence_omission_forbidden": "passed",
+        "policy_binding": "passed",
+    }
+    decision_codes = [
+        "hard_evidence_passed",
+        "music_sync_passed",
+        "geometry_passed",
+        "final_qa_passed",
+    ]
+    if degradation.records:
+        decision_codes.append("authorized_degradations_recorded")
+    authority = authorize_decision(
+        policy,
+        decision_scope="final_delivery",
+        input_artifact_hashes=input_artifact_hashes,
+        deterministic_gate_results=gate_results,
+        decision_codes=tuple(decision_codes),
+        gemini_interaction_ids=gemini_interaction_ids,
+    )
+    state = (
+        "best_effort_complete"
+        if (
+            policy.execution_profile
+            == AutonomousExecutionProfile.BEST_EFFORT
+            and degradation.records
+        )
+        else "delivery_eligible"
+    )
+    return state, authority
 
 
 def _picture_video_duration_ms(path: Path) -> int:
@@ -153,6 +242,8 @@ def run_feature_delivery_pipeline(
     reuse_picture_result: bool = False,
     autonomous_policy_path: Path | None = None,
     max_gemini_cost_usd: float | None = None,
+    autonomous_context_paths: Mapping[str, Path] | None = None,
+    deterministic_delivery_evidence_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run picture → continuous music → final mux → final QA as one chain.
 
@@ -167,6 +258,8 @@ def run_feature_delivery_pipeline(
     profile = FeatureCutExecutionProfile(execution_profile)
     policy: AutonomousEditPolicy | None = None
     budget_ledger: BudgetLedger | None = None
+    deterministic_evidence: DeterministicDeliveryEvidence | None = None
+    resolved_autonomous_context: dict[str, Path] = {}
     if profile in {
         FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
         FeatureCutExecutionProfile.AUTONOMOUS_BEST_EFFORT,
@@ -213,6 +306,46 @@ def run_feature_delivery_pipeline(
                 policy.budget.reserved_recovery_fraction
             ),
         )
+        if not autonomous_context_paths:
+            raise DeliveryPipelineBlocked(
+                "autonomous delivery requires final-QA context artifacts"
+            )
+        required_context_keys = {
+            "editorial_beat_contracts",
+            "music_map",
+            "cue_plan",
+            "exact_event_locks",
+            "reuse_degradation",
+        }
+        if set(autonomous_context_paths) != required_context_keys:
+            raise DeliveryPipelineBlocked(
+                "autonomous final-QA context keys are incomplete or unknown"
+            )
+        resolved_autonomous_context = {
+            key: path.expanduser().resolve(strict=True)
+            for key, path in autonomous_context_paths.items()
+        }
+        preflight_degradation = AutonomousDegradationManifest.model_validate(
+            read_json(resolved_autonomous_context["reuse_degradation"])
+        )
+        if preflight_degradation.policy_reference != policy.policy_reference:
+            raise DeliveryPipelineBlocked(
+                "degradation manifest does not bind the autonomous policy"
+            )
+        if deterministic_delivery_evidence_path is None:
+            raise DeliveryPipelineBlocked(
+                "autonomous delivery requires deterministic QA evidence"
+            )
+        resolved_deterministic_evidence = (
+            deterministic_delivery_evidence_path.expanduser().resolve(
+                strict=True
+            )
+        )
+        deterministic_evidence = (
+            DeterministicDeliveryEvidence.model_validate(
+                read_json(resolved_deterministic_evidence)
+            )
+        )
         write_json(
             resolved_output / "autonomous-preflight.json",
             {
@@ -222,6 +355,13 @@ def run_feature_delivery_pipeline(
                 "policy_reference": policy.policy_reference,
                 "requested_aspects": list(policy.requested_aspects),
                 "budget": budget_ledger.report(),
+                "autonomous_context_paths": {
+                    key: str(path)
+                    for key, path in resolved_autonomous_context.items()
+                },
+                "deterministic_delivery_evidence_path": str(
+                    resolved_deterministic_evidence
+                ),
                 "paid_call_started": False,
                 "generated_at": utc_now(),
             },
@@ -278,6 +418,8 @@ def run_feature_delivery_pipeline(
             strict=True
         )
         final_results: dict[str, Any] = {}
+        qa_results_by_aspect: dict[str, Any] = {}
+        qa_interaction_ids: list[str] = []
         client = GeminiLabClient(model_id=model_id)
         for aspect_key, aspect_ratio, qa_mode in (
             ("horizontal", "16:9", "canonical_16x9"),
@@ -344,14 +486,26 @@ def run_feature_delivery_pipeline(
                 },
             )
             qa_dir = aspect_dir / "final-qa"
+            if policy is not None and aspect_ratio == "9:16":
+                qa_mode = "autonomous_final_9x16"
             prepared = prepare_final_edit_qa(
                 mode=qa_mode,
                 render_path=delivery.output_path,
                 manifest_path=render_manifest_path,
                 output_dir=qa_dir,
                 model_id=model_id,
-                brief_path=brief_path if qa_mode == "canonical_16x9" else None,
-                crop_include_audio=qa_mode == "canonical_16x9",
+                brief_path=(
+                    brief_path
+                    if qa_mode
+                    in {"canonical_16x9", "autonomous_final_9x16"}
+                    else None
+                ),
+                crop_include_audio=qa_mode != "crop_only_9x16",
+                autonomous_context_paths=(
+                    resolved_autonomous_context
+                    if qa_mode == "autonomous_final_9x16"
+                    else None
+                ),
             )
             uploaded, file_reused = client.ensure_video_upload(
                 prepared.proxy_path,
@@ -362,6 +516,19 @@ def run_feature_delivery_pipeline(
                 client=client.client,
                 uploaded_video=uploaded,
                 output_dir=qa_dir,
+                budget_ledger=budget_ledger,
+                recovery_call=policy is not None,
+            )
+            qa_results_by_aspect[aspect_ratio] = qa.result
+            raw_path = qa.run_dir / "raw_interaction.json"
+            if raw_path.is_file():
+                interaction_id = read_json(raw_path).get("id")
+                if isinstance(interaction_id, str) and interaction_id:
+                    qa_interaction_ids.append(interaction_id)
+            qa_disposition = (
+                qa.result.qa_observation_status
+                if isinstance(qa.result, AutonomousFinalEditQa)
+                else _qa_disposition(qa)
             )
             final_results[aspect_key] = {
                 "final_output": str(delivery.output_path),
@@ -369,7 +536,7 @@ def run_feature_delivery_pipeline(
                 "delivery_manifest": str(delivery.manifest_path),
                 "music_assembly_manifest": str(rendered_music.manifest_path),
                 "qa_run_dir": str(qa.run_dir),
-                "qa_disposition": _qa_disposition(qa),
+                "qa_disposition": qa_disposition,
                 "qa_cache_hit": qa.cache_hit,
                 "file_api_reused": file_reused,
             }
@@ -378,17 +545,69 @@ def run_feature_delivery_pipeline(
             raise DeliveryPipelineBlocked(
                 "feature-cut did not produce any requested picture output"
             )
-        dispositions = {
-            row["qa_disposition"] for row in final_results.values()
-        }
-        state = (
-            "ready_for_human_review"
-            if (
-                picture_ready_for_review
-                and dispositions == {"ready_for_human_review"}
+        delivery_authority: DecisionAuthorityV2 | None = None
+        deterministic_report: DeterministicDeliveryQaReport | None = None
+        if policy is not None:
+            assert deterministic_evidence is not None
+            deterministic_report = run_deterministic_delivery_qa(
+                deterministic_evidence,
+                policy=policy,
             )
-            else "review_required"
-        )
+            degradation_path = resolved_autonomous_context.get(
+                "reuse_degradation"
+            )
+            if degradation_path is None:
+                raise DeliveryPipelineBlocked(
+                    "autonomous context omitted reuse_degradation"
+                )
+            degradation = AutonomousDegradationManifest.model_validate(
+                read_json(degradation_path)
+            )
+            authority_hashes = {
+                f"sha256:{policy.definition_sha256()}",
+                *(
+                    f"sha256:{sha256_file(path)}"
+                    for path in resolved_autonomous_context.values()
+                ),
+                *(
+                    f"sha256:{row['final_output_sha256']}"
+                    for row in final_results.values()
+                ),
+            }
+            state, delivery_authority = authorize_autonomous_delivery(
+                policy=policy,
+                deterministic_qa=deterministic_report,
+                qa_results=qa_results_by_aspect,
+                degradation=degradation,
+                input_artifact_hashes=tuple(sorted(authority_hashes)),
+                gemini_interaction_ids=tuple(
+                    dict.fromkeys(qa_interaction_ids)
+                ),
+            )
+            write_json(
+                resolved_output / "deterministic-delivery-qa.json",
+                deterministic_report,
+            )
+            write_json(
+                resolved_output / "decision-authority.json",
+                delivery_authority,
+            )
+            delivery_eligible = True
+            human_approval_status = "not_required_auto_policy"
+        else:
+            dispositions = {
+                row["qa_disposition"] for row in final_results.values()
+            }
+            state = (
+                "ready_for_human_review"
+                if (
+                    picture_ready_for_review
+                    and dispositions == {"ready_for_human_review"}
+                )
+                else "review_required"
+            )
+            delivery_eligible = False
+            human_approval_status = "not_run"
         result = {
             "contract_version": "feature-delivery-result-v1",
             "started_at": started_at,
@@ -396,14 +615,24 @@ def run_feature_delivery_pipeline(
             "state": state,
             "media_rendered": True,
             "final_sequence_qa_completed": True,
-            "human_approval_status": "not_run",
-            "delivery_eligible": False,
+            "human_approval_status": human_approval_status,
+            "delivery_eligible": delivery_eligible,
             "autonomous_policy_reference": (
                 policy.policy_reference if policy is not None else None
             ),
             "budget": (
                 budget_ledger.report()
                 if budget_ledger is not None
+                else None
+            ),
+            "decision_authority": (
+                delivery_authority.model_dump(mode="json")
+                if delivery_authority is not None
+                else None
+            ),
+            "deterministic_delivery_qa": (
+                deterministic_report.model_dump(mode="json")
+                if deterministic_report is not None
                 else None
             ),
             "picture_ready_for_human_review": picture_ready_for_review,
@@ -418,6 +647,7 @@ def run_feature_delivery_pipeline(
             terminal=True,
             state=state,
             outputs=final_results,
+            delivery_eligible=delivery_eligible,
         )
         return result
     except Exception as error:

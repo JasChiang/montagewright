@@ -840,6 +840,31 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
             raise ValueError(
                 "--max-gemini-cost-usd cannot loosen the signed policy cap"
             )
+        if args.autonomous_context_dir is None:
+            raise ValueError(
+                "autonomous execution requires --autonomous-context-dir"
+            )
+        if args.deterministic_delivery_evidence is None:
+            raise ValueError(
+                "autonomous execution requires "
+                "--deterministic-delivery-evidence"
+            )
+    autonomous_context_paths = None
+    if args.autonomous_context_dir is not None:
+        autonomous_context_paths = {
+            "editorial_beat_contracts": (
+                args.autonomous_context_dir
+                / "editorial-beat-contracts.json"
+            ),
+            "music_map": args.autonomous_context_dir / "music-map.json",
+            "cue_plan": args.autonomous_context_dir / "cue-plan.json",
+            "exact_event_locks": (
+                args.autonomous_context_dir / "exact-event-locks.json"
+            ),
+            "reuse_degradation": (
+                args.autonomous_context_dir / "reuse-degradation.json"
+            ),
+        }
     result = run_feature_delivery_pipeline(
         feature_cut_kwargs={
             "catalog_path": args.catalog_json,
@@ -873,6 +898,10 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
         reuse_picture_result=args.reuse_picture_result,
         autonomous_policy_path=autonomous_policy_path,
         max_gemini_cost_usd=args.max_gemini_cost_usd,
+        autonomous_context_paths=autonomous_context_paths,
+        deterministic_delivery_evidence_path=(
+            args.deterministic_delivery_evidence
+        ),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2496,6 +2525,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help=(
             "Optional tighter per-run cost cap; it cannot loosen the policy."
+        ),
+    )
+    feature_delivery_parser.add_argument(
+        "--autonomous-context-dir",
+        type=Path,
+        help=(
+            "Directory containing editorial-beat-contracts.json, "
+            "music-map.json, cue-plan.json, exact-event-locks.json, and "
+            "reuse-degradation.json. Required by autonomous final QA."
+        ),
+    )
+    feature_delivery_parser.add_argument(
+        "--deterministic-delivery-evidence",
+        type=Path,
+        help=(
+            "Application-owned containment/identity/relation/cue/motion/"
+            "readability/reuse gate evidence JSON for autonomous delivery."
         ),
     )
     feature_delivery_parser.add_argument("--model", default=MODEL_ID)
