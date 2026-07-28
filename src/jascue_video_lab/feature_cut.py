@@ -48,6 +48,7 @@ from .event_lock import (
     load_editorial_beat_contracts,
     write_exact_event_bundle,
 )
+from .editing_capabilities import EditingCapabilityCatalog
 from .final_edit_qa import DeterministicDeliveryEvidence
 from .full_v1 import create_dense_window_catalog
 from .gemini import (
@@ -76,7 +77,12 @@ from .media import (
     probe_video,
     sha256_file,
 )
-from .music import MusicMapLock
+from .music import LockedMusicCue, MusicMapLock
+from .music_assembly import (
+    MusicAssemblyError,
+    plan_contiguous_reviewed_music_edit_v2,
+    plan_single_interval_music_assembly,
+)
 from .multi_tracking import validate_segmentation_track_alignment
 from .models import (
     EvidenceApprovalSource,
@@ -134,12 +140,15 @@ from .overlay import draw_grounding_overlay
 from .presentation import (
     GroundingTargetRequest,
     MultiTargetGroundingGroup,
+    PresentationTarget,
     _signed_motion_reversal_count,
     _vertical_center_crop_filter,
     _vertical_delivery_fallback,
     _vertical_fit_filter,
     _vertical_required_scope_fit_filter,
+    compile_presentation,
     shared_sam_seeds_from_grounding,
+    two_panel_ffmpeg_filter,
 )
 from .reframe_policy import (
     REFRAME_POLICY_BINDING_ORIGIN,
@@ -2684,6 +2693,44 @@ def _usable_track_centers(
             centers.append(float(sample.center_2d[0]))
             boxes.append([int(value) for value in sample.derived_tracking_box])
     return times, centers, boxes
+
+
+def _presentation_target_from_track(
+    *,
+    target_id: str,
+    track: SegmentationTrack,
+) -> PresentationTarget:
+    """Collapse one immutable same-window track into its required envelope."""
+
+    _, _, boxes = _usable_track_centers(track)
+    if not boxes:
+        raise ValueError(
+            f"two_panel_target_has_no_verified_geometry:{target_id}"
+        )
+    x_min = min(box[0] for box in boxes)
+    y_min = min(box[1] for box in boxes)
+    x_max = max(box[2] for box in boxes)
+    y_max = max(box[3] for box in boxes)
+    source_pts = track.seed_frame_pts
+    if source_pts is None:
+        source_pts = next(
+            (
+                sample.source_pts
+                for sample in track.samples
+                if sample.source_pts is not None
+            ),
+            None,
+        )
+    if source_pts is None:
+        raise ValueError(
+            f"two_panel_target_has_no_exact_pts:{target_id}"
+        )
+    return PresentationTarget(
+        target_id=target_id,
+        source_asset_id=track.asset_id,
+        source_pts=source_pts,
+        box_2d=(x_min, y_min, x_max, y_max),
+    )
 
 
 def _track_confidence_diagnostics(track: SegmentationTrack) -> dict[str, Any]:
@@ -7083,6 +7130,10 @@ def _vertical_candidate_geometry(
     query_lock_v2: EvidenceQueryLockV2 | None = None,
     allow_review_sequential_fallback: bool = False,
     max_identity_model_checks: int = 1,
+    autonomous_policy: AutonomousEditPolicy | None = None,
+    presentation_preference: str = "tracked_full_bleed",
+    relation_mode: str = "single_subject",
+    physical_scale_comparison: bool = False,
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
     """Evaluate one immutable vertical candidate without rendering a segment."""
 
@@ -7147,6 +7198,115 @@ def _vertical_candidate_geometry(
             )
             for region, track in zip(hard_regions, hard_tracks, strict=True)
         )
+        autonomous_compilation = None
+        geometry: dict[str, Any] = {}
+        if (
+            autonomous_policy is not None
+            and len(hard_regions) == 2
+            and presentation_preference
+            in {"two_panel_layout", "solid_matte_fit"}
+        ):
+            resolved_relation_mode: Literal[
+                "single_subject",
+                "sequential_focus",
+                "simultaneous_relation",
+                "context_detail",
+            ]
+            if relation_mode in {"simultaneous", "relation_core"}:
+                resolved_relation_mode = "simultaneous_relation"
+            elif relation_mode == "primary_with_context":
+                resolved_relation_mode = "context_detail"
+            elif relation_mode == "sequential":
+                resolved_relation_mode = "sequential_focus"
+            else:
+                resolved_relation_mode = "single_subject"
+            if presentation_preference == "solid_matte_fit":
+                resolved_relation_mode = "single_subject"
+            source_width, source_height, source_lineage = (
+                _orientation_corrected_track_dimensions(hard_tracks)
+            )
+            presentation_targets = [
+                _presentation_target_from_track(
+                    target_id=region.entity_id or region.region_id,
+                    track=track,
+                )
+                for region, track in zip(
+                    hard_regions,
+                    hard_tracks,
+                    strict=True,
+                )
+            ]
+            autonomous_compilation = compile_presentation(
+                targets=presentation_targets,
+                source_width=source_width,
+                source_height=source_height,
+                relation_mode=resolved_relation_mode,
+                policy=autonomous_policy,
+                physical_scale_comparison=physical_scale_comparison,
+            )
+            if autonomous_compilation.mode == "two_panel_layout":
+                assert autonomous_compilation.panel_layout is not None
+                filter_graph = two_panel_ffmpeg_filter(
+                    autonomous_compilation.panel_layout
+                )
+                geometry = {
+                    "applied_strategy": "two_panel_layout",
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                    "full_bleed": True,
+                    "source_geometry_lineage_passed": True,
+                    "tracking_confidence_gate_passed": all(
+                        _track_confidence_diagnostics(track)[
+                            "tracking_confidence_gate_passed"
+                        ]
+                        for track in hard_tracks
+                    ),
+                    "coverage_passed": True,
+                    "minimum_visible_required_area_fraction": 1.0,
+                    "soft_extent_visibility_passed": True,
+                    "paid_model_calls_added": 0,
+                    "presentation_decision_codes": list(
+                        autonomous_compilation.decision_codes
+                    ),
+                    "panel_layout": (
+                        autonomous_compilation.panel_layout.model_dump(
+                            mode="json"
+                        )
+                    ),
+                    "panel_same_pts": True,
+                    "relative_scale_locked": (
+                        autonomous_compilation.panel_layout.relative_scale_policy
+                        == "locked"
+                    ),
+                    **source_lineage,
+                }
+            elif (
+                autonomous_compilation.mode == "solid_matte_fit"
+                and presentation_preference == "solid_matte_fit"
+            ):
+                assert autonomous_compilation.filter_graph is not None
+                filter_graph = autonomous_compilation.filter_graph
+                geometry = {
+                    "applied_strategy": "solid_matte_fit",
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                    "full_bleed": False,
+                    "source_geometry_lineage_passed": True,
+                    "tracking_confidence_gate_passed": all(
+                        _track_confidence_diagnostics(track)[
+                            "tracking_confidence_gate_passed"
+                        ]
+                        for track in hard_tracks
+                    ),
+                    "coverage_passed": True,
+                    "minimum_visible_required_area_fraction": 1.0,
+                    "soft_extent_visibility_passed": True,
+                    "paid_model_calls_added": 0,
+                    "presentation_decision_codes": list(
+                        autonomous_compilation.decision_codes
+                    ),
+                    **source_lineage,
+                }
         available_soft_regions = list(soft_regions)
         available_regions = [*hard_regions, *available_soft_regions]
         available_region_ids = set(tracks_by_region)
@@ -7180,7 +7340,12 @@ def _vertical_candidate_geometry(
                 "optional_region_failures": optional_region_failures,
             }
         )
-        if effective_camera_phases:
+        if geometry.get("applied_strategy") in {
+            "two_panel_layout",
+            "solid_matte_fit",
+        }:
+            pass
+        elif effective_camera_phases:
             try:
                 filter_graph, geometry = (
                     _vertical_virtual_camera_filter_from_tracks(
@@ -7329,6 +7494,42 @@ def _vertical_candidate_geometry(
     else:
         target = (target_description or "").strip()
         if not target:
+            if (
+                autonomous_policy is not None
+                and presentation_preference == "solid_matte_fit"
+                and autonomous_policy.presentation.allow_solid_matte_fit
+            ):
+                return (
+                    _vertical_fit_filter(),
+                    {
+                        "applied_strategy": "solid_matte_fit",
+                        "fallback_reason": None,
+                        "risk_codes": [],
+                        "full_bleed": False,
+                        "source_geometry_lineage_passed": True,
+                        "tracking_confidence_gate_passed": True,
+                        "coverage_passed": True,
+                        "minimum_visible_required_area_fraction": 1.0,
+                        "soft_extent_visibility_passed": True,
+                        "semantic_checkpoint_status": (
+                            SemanticCheckpointStatus
+                            .NOT_REQUIRED_BY_POLICY.value
+                        ),
+                        "presentation_decision_codes": [
+                            "whole_source_scope_preserved",
+                            "solid_matte_fit_policy_authorized",
+                        ],
+                        "paid_model_calls_added": 0,
+                        "framing_regions": [],
+                        "vertical_camera_phases": [],
+                        "semantic_review_reasons": [
+                            "solid_matte_fit_requires_final_qa"
+                        ],
+                        "requires_gemini_review": True,
+                    },
+                    [],
+                    None,
+                )
             raise ValueError("tracked vertical candidate has no resolved target")
         identity_cache_target = target
         if query_lock_v2 is not None:
@@ -7599,10 +7800,13 @@ def _vertical_candidate_preflight(
         rank=rank,
         presentation=(
             "tracked_crop"
-            if geometry.get("applied_strategy")
-            in {"tracked_crop", "phase_virtual_camera"}
+            if geometry.get("applied_strategy") == "tracked_crop"
             else "phase_virtual_camera"
             if geometry.get("applied_strategy") == "phase_virtual_camera"
+            else "two_panel_layout"
+            if geometry.get("applied_strategy") == "two_panel_layout"
+            else "solid_matte_fit"
+            if geometry.get("applied_strategy") == "solid_matte_fit"
             else "static_anchor"
             if geometry.get("applied_strategy") == "seed_anchor_crop"
             else "center_crop"
@@ -8970,6 +9174,7 @@ def _audit_render_source_reuse(
         current_start = int(chapter["source_in_ms"])
         current_end = int(chapter["source_out_ms"])
         current_fingerprint = chapter.get("segment_render_fingerprint")
+        source_use_index = len(prior_by_source.get(source_clip_id, [])) + 1
         for prior in prior_by_source.get(source_clip_id, []):
             prior_start = int(prior["source_in_ms"])
             prior_end = int(prior["source_out_ms"])
@@ -8999,6 +9204,8 @@ def _audit_render_source_reuse(
                 "same_presentation": same_presentation,
                 "reuse_mode": selected.source_reuse_mode,
                 "justification": selected.source_reuse_justification,
+                "source_use_index": source_use_index,
+                "maximum_source_uses": 2,
                 "requires_human_review": (
                     selected.source_reuse_mode
                     in {"alternate_presentation", "editorial_reprise"}
@@ -9006,7 +9213,8 @@ def _audit_render_source_reuse(
                 ),
             }
             row_violates = (
-                selected.source_reuse_mode == "none"
+                source_use_index > 2
+                or selected.source_reuse_mode == "none"
                 or not (
                     selected.source_reuse_justification
                     and selected.source_reuse_justification.strip()
@@ -9064,7 +9272,27 @@ def _runtime_candidate_reuse_violation(
     SAM, exact-event, or render work before failing.
     """
 
-    for prior in prior_chapters:
+    prior_source_uses = [
+        prior
+        for prior in prior_chapters
+        if prior.get("source_clip_id") == source_clip_id
+        and prior.get("source_in_ms") is not None
+        and prior.get("source_out_ms") is not None
+    ]
+    if len(prior_source_uses) >= 2:
+        return {
+            "prior_feature_ids": [
+                str(prior["feature_id"]) for prior in prior_source_uses
+            ],
+            "source_clip_id": source_clip_id,
+            "source_in_ms": source_in_ms,
+            "source_out_ms": source_out_ms,
+            "reuse_mode": selected.source_reuse_mode,
+            "justification": selected.source_reuse_justification,
+            "reason_code": "source_use_count_exceeds_bounded_v1_limit",
+            "maximum_source_uses": 2,
+        }
+    for prior in prior_source_uses:
         if (
             prior.get("source_clip_id") != source_clip_id
             or prior.get("source_in_ms") is None
@@ -9097,6 +9325,7 @@ def _runtime_candidate_reuse_violation(
                 "overlap_ms": overlap_ms,
                 "reuse_mode": selected.source_reuse_mode,
                 "justification": justification,
+                "reason_code": "source_reuse_authority_failed",
             }
     return None
 
@@ -9480,6 +9709,48 @@ def _validate_autonomous_plan_reuse_flags(
         raise ValueError(
             "autonomous direct-video plan is not bound to an "
             "AutonomousEditPolicy"
+        )
+    capability_artifact = next(
+        (
+            artifact
+            for artifact in source_artifacts
+            if isinstance(artifact, dict)
+            and artifact.get("role") == "editing_capability_catalog"
+        ),
+        None,
+    ) if isinstance(source_artifacts, list) else None
+    if not isinstance(capability_artifact, dict):
+        raise ValueError(
+            "autonomous direct-video plan is missing its editing capability "
+            "catalog binding"
+        )
+    capability_path = Path(
+        str(capability_artifact.get("path") or "")
+    ).expanduser().resolve()
+    if (
+        not capability_path.is_file()
+        or str(capability_artifact.get("sha256") or "")
+        != sha256_file(capability_path)
+    ):
+        raise ValueError(
+            "autonomous direct-video capability catalog hash/path changed"
+        )
+    capability_catalog = EditingCapabilityCatalog.model_validate(
+        read_json(capability_path)
+    )
+    capability_ids = {
+        capability.capability_id
+        for capability in capability_catalog.capabilities
+    }
+    missing_autonomous_capabilities = {
+        "two_panel_layout",
+        "solid_matte_fit",
+        "intentional_freeze",
+    } - capability_ids
+    if missing_autonomous_capabilities:
+        raise ValueError(
+            "autonomous plan predates the required presentation catalog: "
+            + ", ".join(sorted(missing_autonomous_capabilities))
         )
     bound_path = Path(str(policy_artifact.get("path") or "")).expanduser().resolve()
     bound_sha256 = str(policy_artifact.get("sha256") or "")
@@ -10297,6 +10568,47 @@ def _build_duration_capacity_shortfall_audit(
     }
 
 
+def _project_locked_cues_to_music_output(
+    music_lock: MusicMapLock,
+    *,
+    spans: Sequence[Any],
+) -> list[LockedMusicCue]:
+    """Map immutable source cue IDs onto the exact assembled output timeline."""
+
+    projected: list[LockedMusicCue] = []
+    for cue in music_lock.cues:
+        output_samples = [
+            int(span.output_start_sample)
+            + cue.sample_index
+            - int(span.source_start_sample)
+            for span in spans
+            if (
+                int(span.source_start_sample)
+                <= cue.sample_index
+                < int(span.source_end_sample)
+            )
+        ]
+        if not output_samples:
+            continue
+        output_sample = min(output_samples)
+        projected.append(
+            cue.model_copy(
+                update={
+                    "sample_index": output_sample,
+                    "time_ms": round(
+                        output_sample
+                        * 1000
+                        / music_lock.master_sample_rate
+                    ),
+                }
+            )
+        )
+    return sorted(
+        projected,
+        key=lambda cue: (cue.sample_index, cue.cue_id),
+    )
+
+
 def _resolve_editorial_chapter_durations(
     brief: FeatureEditBrief,
     plan: FeatureEditPlan,
@@ -10308,6 +10620,7 @@ def _resolve_editorial_chapter_durations(
     shortfall_audit_path: Path | None = None,
     project_duration_seconds: float | None = None,
     allow_music_lock_prefix: bool = False,
+    output_timeline_cues: Sequence[LockedMusicCue] | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Reconcile Gemini's relative dwell judgment to one legal project total.
 
@@ -10548,7 +10861,11 @@ def _resolve_editorial_chapter_durations(
             )
         cue_candidates = [
             cue
-            for cue in music_lock.cues
+            for cue in (
+                output_timeline_cues
+                if output_timeline_cues is not None
+                else music_lock.cues
+            )
             if cue.kind in {"section_boundary", "downbeat", "accent", "ending_hit"}
         ]
         proposed_boundaries: list[int] = []
@@ -10584,6 +10901,24 @@ def _resolve_editorial_chapter_durations(
                 if current_feature_id in rhythm_by_id
                 else "free"
             )
+            semantic_music_target = (
+                unsnapped[boundary_index][0].flow_intent.music_target
+                if unsnapped[boundary_index][0].flow_intent is not None
+                else None
+            )
+            semantic_preferred_cue_kinds = {
+                "phrase_start": {
+                    "section_boundary",
+                    "downbeat",
+                },
+                "phrase_end": {
+                    "section_boundary",
+                    "ending_hit",
+                },
+                "downbeat": {"downbeat"},
+                "accent": {"accent"},
+                "section_change": {"section_boundary"},
+            }.get(semantic_music_target, set())
             snap_window_ms = {
                 "low": 250,
                 "normal": 450,
@@ -10635,6 +10970,11 @@ def _resolve_editorial_chapter_durations(
                 chosen = min(
                     eligible,
                     key=lambda cue: (
+                        (
+                            0
+                            if cue.kind in semantic_preferred_cue_kinds
+                            else 1
+                        ),
                         0 if cue.kind == "section_boundary" else 1,
                         0 if cue.kind == "downbeat" else 1,
                         abs(cue.time_ms - proposed_ms),
@@ -10662,6 +11002,13 @@ def _resolve_editorial_chapter_durations(
                     "music_cue_kind": cue_kind,
                     "rhythm_boundary_priority": boundary_priority,
                     "flow_boundary_alignment": boundary_alignment,
+                    "semantic_music_target": semantic_music_target,
+                    "semantic_cue_kind_matched": (
+                        cue_kind in semantic_preferred_cue_kinds
+                        if cue_kind is not None
+                        and semantic_preferred_cue_kinds
+                        else None
+                    ),
                     "rhythm_snap_window_ms": snap_window_ms,
                 }
             )
@@ -10807,6 +11154,11 @@ def _resolve_editorial_chapter_durations(
         ),
         "music_lock_duration_ms": (
             music_lock.duration_ms if music_lock is not None else None
+        ),
+        "music_cue_timeline": (
+            "assembled_output_timeline"
+            if output_timeline_cues is not None
+            else "locked_source_timeline"
         ),
         "project_timeline_end_ms": target_duration_ms,
         "music_boundary_refinements": boundary_audit,
@@ -11352,42 +11704,70 @@ def _run_feature_cut_experiment_impl(
             ),
             3,
         )
-        if (
-            attention_maximum_seconds + 0.001
-            < project_duration_seconds
-            and allow_shorter_within_delivery_range
-            and not fixed_duration_seconds
-        ):
-            if attention_maximum_seconds < 60.0:
-                attention_profile, floor_reconciliation = (
-                    reconcile_attention_delivery_floor(
-                        attention_profile,
-                        delivery_floor_seconds=60.0,
-                        maximum_shortfall_tolerance_seconds=1.0,
+        attention_preferred_seconds = round(
+            sum(
+                chapter.preferred_dwell_seconds
+                for chapter in attention_profile.chapters
+            ),
+            3,
+        )
+        delivery_floor_seconds = (
+            autonomous_policy.duration.min_ms / 1000
+            if autonomous_policy is not None
+            else 60.0
+        )
+        delivery_ceiling_seconds = (
+            autonomous_policy.duration.max_ms / 1000
+            if autonomous_policy is not None
+            else 90.0
+        )
+        if allow_shorter_within_delivery_range and not fixed_duration_seconds:
+            if (
+                delivery_floor_seconds
+                <= attention_preferred_seconds
+                <= min(project_duration_seconds, delivery_ceiling_seconds)
+            ):
+                project_duration_seconds = attention_preferred_seconds
+                duration_resolution_authority = (
+                    "operator_authorized_preferred_dwell_within_delivery_range"
+                )
+            elif attention_maximum_seconds + 0.001 < project_duration_seconds:
+                if attention_maximum_seconds < delivery_floor_seconds:
+                    attention_profile, floor_reconciliation = (
+                        reconcile_attention_delivery_floor(
+                            attention_profile,
+                            delivery_floor_seconds=delivery_floor_seconds,
+                            maximum_shortfall_tolerance_seconds=1.0,
+                        )
                     )
+                    write_json(
+                        editorial_dir
+                        / "attention-delivery-floor-reconciliation.json",
+                        floor_reconciliation,
+                    )
+                    attention_maximum_seconds = round(
+                        sum(
+                            chapter.maximum_dwell_seconds
+                            for chapter in attention_profile.chapters
+                        ),
+                        3,
+                    )
+                project_duration_seconds = min(
+                    attention_maximum_seconds,
+                    delivery_ceiling_seconds,
                 )
-                write_json(
-                    editorial_dir
-                    / "attention-delivery-floor-reconciliation.json",
-                    floor_reconciliation,
+                duration_resolution_authority = (
+                    "operator_authorized_shorter_attention_maximum"
                 )
-                attention_maximum_seconds = round(
-                    sum(
-                        chapter.maximum_dwell_seconds
-                        for chapter in attention_profile.chapters
-                    ),
-                    3,
-                )
-            project_duration_seconds = attention_maximum_seconds
-            duration_resolution_authority = (
-                "operator_authorized_shorter_attention_maximum"
-            )
         write_json(attention_path, attention_profile)
         write_json(
             editorial_dir / "project-duration-resolution.json",
             {
                 "brief_preferred_duration_seconds": brief.target_duration_seconds,
                 "attention_maximum_seconds": attention_maximum_seconds,
+                "attention_preferred_seconds": attention_preferred_seconds,
+                "delivery_floor_seconds": delivery_floor_seconds,
+                "delivery_ceiling_seconds": delivery_ceiling_seconds,
                 "resolved_project_duration_seconds": project_duration_seconds,
                 "authority": duration_resolution_authority,
                 "allow_shorter_within_delivery_range": (
@@ -11405,6 +11785,52 @@ def _run_feature_cut_experiment_impl(
             style_profile=rhythm_style,
         )
         write_json(rhythm_path, rhythm_plan)
+        output_timeline_cues: list[LockedMusicCue] | None = None
+        music_timeline_plan: Any | None = None
+        if music_lock is not None and resolved_music_lock_path is not None:
+            picture_target_ms = round(project_duration_seconds * 1000)
+            try:
+                music_timeline_plan = plan_single_interval_music_assembly(
+                    music_lock,
+                    music_lock_path=resolved_music_lock_path,
+                    target_duration_ms=picture_target_ms,
+                    minimum_duration_ms=max(1, picture_target_ms - 100),
+                    maximum_duration_ms=picture_target_ms + 100,
+                )
+            except MusicAssemblyError:
+                music_timeline_plan = (
+                    plan_contiguous_reviewed_music_edit_v2(
+                        music_lock,
+                        music_lock_path=resolved_music_lock_path,
+                        target_duration_ms=picture_target_ms,
+                        minimum_duration_ms=max(1, picture_target_ms - 100),
+                        maximum_duration_ms=picture_target_ms + 100,
+                    )
+                )
+            output_timeline_cues = _project_locked_cues_to_music_output(
+                music_lock,
+                spans=music_timeline_plan.spans,
+            )
+            write_json(
+                editorial_dir / "music-output-timeline.json",
+                {
+                    "contract_version": "music-output-timeline-v1",
+                    "plan_contract_version": (
+                        music_timeline_plan.contract_version
+                    ),
+                    "plan_definition": music_timeline_plan.model_dump(
+                        mode="json"
+                    ),
+                    "source_music_definition_sha256": (
+                        music_lock.definition_sha256
+                    ),
+                    "output_cues": [
+                        cue.model_dump(mode="json")
+                        for cue in output_timeline_cues
+                    ],
+                    "generated_at": utc_now(),
+                },
+            )
         chapter_durations, duration_audit = _resolve_editorial_chapter_durations(
             brief,
             plan,
@@ -11414,6 +11840,7 @@ def _run_feature_cut_experiment_impl(
             rhythm_plan=rhythm_plan,
             project_duration_seconds=project_duration_seconds,
             allow_music_lock_prefix=allow_shorter_within_delivery_range,
+            output_timeline_cues=output_timeline_cues,
             shortfall_audit_path=(
                 output_dir / "editorial-duration-capacity-shortfall.json"
             ),
@@ -12161,6 +12588,7 @@ def _run_feature_cut_experiment_impl(
                     if (
                         option_data["strategy"] == "fit_with_background"
                         and not candidate_camera_phases
+                        and autonomous_policy is None
                     ):
                         fallback_filter, fallback_geometry = (
                             _vertical_delivery_fallback(
@@ -12361,6 +12789,25 @@ def _run_feature_cut_experiment_impl(
                                 ),
                                 max_identity_model_checks=(
                                     0 if autonomous_profile else 1
+                                ),
+                                autonomous_policy=autonomous_policy,
+                                presentation_preference=str(
+                                    option_data.get(
+                                        "presentation_preference",
+                                        "tracked_full_bleed",
+                                    )
+                                ),
+                                relation_mode=str(
+                                    option_data.get(
+                                        "coverage_mode",
+                                        "simultaneous",
+                                    )
+                                ),
+                                physical_scale_comparison=bool(
+                                    option_data.get(
+                                        "physical_scale_comparison",
+                                        False,
+                                    )
                                 ),
                             )
                         auto_audit = None
@@ -13344,7 +13791,11 @@ def _run_feature_cut_experiment_impl(
                 event_contract = relation_by_event_id[lock.event_id]
                 candidates = [
                     cue
-                    for cue in music_lock.cues
+                    for cue in (
+                        output_timeline_cues
+                        if output_timeline_cues is not None
+                        else music_lock.cues
+                    )
                     if cue.kind
                     in kinds_by_relation[event_contract.cue_relation]
                 ]
@@ -13381,6 +13832,18 @@ def _run_feature_cut_experiment_impl(
                 {
                     "contract_version": "selected-window-cue-plan-v2",
                     "music_map_sha256": sha256_file(music_map_path),
+                    "cue_timeline": (
+                        "assembled_output_timeline"
+                        if output_timeline_cues is not None
+                        else "locked_source_timeline"
+                    ),
+                    "music_output_timeline_sha256": (
+                        sha256_file(
+                            editorial_dir / "music-output-timeline.json"
+                        )
+                        if output_timeline_cues is not None
+                        else None
+                    ),
                     "alignments": cue_rows,
                 },
             )
@@ -13390,6 +13853,7 @@ def _run_feature_cut_experiment_impl(
                 if chapter.get("applied_strategy") in {
                     "required_scope_solid_fit",
                     "fit_with_solid_matte",
+                    "solid_matte_fit",
                 }:
                     autonomous_degradations.append(
                         DegradationRecord(
@@ -13402,6 +13866,17 @@ def _run_feature_cut_experiment_impl(
                             replacement_artifact_hashes=(
                                 "sha256:"
                                 + str(chapter["segment_render_fingerprint"]),
+                            ),
+                        )
+                    )
+                if chapter.get("applied_strategy") == "two_panel_layout":
+                    autonomous_degradations.append(
+                        DegradationRecord(
+                            beat_id=str(chapter["feature_id"]),
+                            action="two_panel_layout_used",
+                            reason_code="simultaneous_relation_geometry",
+                            replacement_artifact_hashes=(
+                                f"sha256:{chapter['segment_render_fingerprint']}",
                             ),
                         )
                     )

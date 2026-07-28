@@ -4272,6 +4272,28 @@ class FeatureVerticalCandidate(StrictModel):
         "primary_with_context",
         "independent_detail",
     ] = "simultaneous"
+    aspect_suitability: Literal[
+        "natural",
+        "reconstructable",
+        "unsuitable",
+    ] = "reconstructable"
+    suitability_risks: list[str] = Field(default_factory=list, max_length=8)
+    presentation_preference: Literal[
+        "static_full_bleed",
+        "tracked_full_bleed",
+        "phase_virtual_camera",
+        "two_panel_layout",
+        "solid_matte_fit",
+    ] = "tracked_full_bleed"
+    presentation_goal: Literal[
+        "hold",
+        "follow",
+        "reveal",
+        "compare",
+        "context_detail",
+        "emphasize",
+    ] = "hold"
+    physical_scale_comparison: bool = False
     allow_controlled_clip: bool = False
     target_description: str | None = None
     regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=8)

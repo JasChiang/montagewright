@@ -160,6 +160,40 @@ def _quality_map(tmp_path: Path) -> tuple[Path, ShotQualityMap]:
     return path, quality_map
 
 
+def test_short_unresolved_leading_camera_risk_becomes_clean_window(
+    tmp_path: Path,
+) -> None:
+    _, quality_map = _quality_map(tmp_path)
+    leading = QualityRiskWindow(
+        risk_window_id="QRW-0003",
+        source_asset_id=quality_map.source_asset_id,
+        shot_id=quality_map.shot_id,
+        start_pts=0,
+        end_pts=6,
+        start_ms=0,
+        end_ms=180,
+        reason_code="camera_shake",
+        severity="review",
+        intent="unknown",
+        confidence=0.8,
+        evidence_frame_ids=[quality_map.evidence_frames[0].frame_id],
+        metric_summary={"shift_magnitude_mean": 0.5},
+    )
+    quality_map = quality_map.model_copy(
+        update={"risk_windows": [*quality_map.risk_windows, leading]}
+    )
+
+    intervals = build_quality_safe_intervals(quality_map)
+
+    assert intervals[0].start_ms == 380
+    assert "QRW-0003" in intervals[0].excluded_risk_window_ids
+    assert "QRW-0003" not in intervals[0].review_risk_window_ids
+    assert any(
+        "QRW-0002" in interval.review_risk_window_ids
+        for interval in intervals
+    )
+
+
 def test_source_fps_scan_detects_black_and_freeze_without_editing(
     tmp_path: Path,
 ) -> None:

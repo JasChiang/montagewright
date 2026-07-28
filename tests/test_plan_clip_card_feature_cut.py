@@ -7,6 +7,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from jascue_video_lab.autonomous_policy import (
+    AutonomousEditPolicy,
+    BudgetPolicy,
+    DurationPolicy,
+)
 from jascue_video_lab.clip_card_retrieval import (
     FeatureChapterShortlist,
     FeatureShortlistCandidate,
@@ -92,12 +97,46 @@ from scripts.plan_clip_card_feature_cut import (
     main as feature_planner_main,
     planning_candidate_id,
     planning_candidate_slice,
+    planning_capability_catalog,
     project_direct_video_edit_plan,
     validate_candidate_video_budget,
 )
 
 
 ASSET_ID = "sha256:" + "a" * 64
+
+
+def test_autonomous_planner_catalog_exposes_policy_gated_presentations() -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=75_000,
+            min_ms=60_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+    review_ids = {
+        item.capability_id
+        for item in planning_capability_catalog(None).capabilities
+    }
+    autonomous_ids = {
+        item.capability_id
+        for item in planning_capability_catalog(policy).capabilities
+    }
+
+    assert "two_panel_layout" not in review_ids
+    assert {
+        "two_panel_layout",
+        "solid_matte_fit",
+        "intentional_freeze",
+    } <= autonomous_ids
 
 
 def test_direct_video_planning_only_selects_candidates_actually_attached() -> None:

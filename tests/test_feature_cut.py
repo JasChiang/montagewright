@@ -11,6 +11,14 @@ import pytest
 from pydantic import ValidationError
 import jascue_video_lab.feature_cut as feature_cut_module
 
+from jascue_video_lab.autonomous_policy import (
+    AutonomousEditPolicy,
+    BudgetPolicy,
+    DurationPolicy,
+)
+from jascue_video_lab.editing_capabilities import (
+    simple_production_capability_catalog,
+)
 from scripts.plan_clip_card_open_edit import (
     OpenEditCandidate,
     OpenEditPlan,
@@ -41,6 +49,7 @@ from jascue_video_lab.feature_cut import (
     _load_trim_decisions,
     _migrate_legacy_feature_plan_binding,
     _piecewise_expression,
+    _project_locked_cues_to_music_output,
     _production_review_preflight_failures,
     _prompt_binds_sha256,
     _concat_segments,
@@ -208,6 +217,65 @@ def test_review_profile_can_explicitly_reuse_editorial_plan() -> None:
         reuse_feature_plan=True,
         reuse_feature_plan_raw_output=False,
     )
+
+
+def test_autonomous_profile_rejects_plan_with_legacy_capability_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "run"
+    plan_dir = output_dir / "gemini-plan"
+    plan_dir.mkdir(parents=True)
+    policy_path = tmp_path / "policy.json"
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=75_000,
+            min_ms=60_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    write_json(policy_path, policy)
+    capability_path = plan_dir / "editing-capability-catalog.json"
+    write_json(
+        capability_path,
+        simple_production_capability_catalog(),
+    )
+    record = {
+        "projection_contract_id": "direct-video-edit-plan-v2",
+        "source_artifacts": [
+            {
+                "role": "autonomous_policy",
+                "path": str(policy_path.resolve()),
+                "sha256": sha256_file(policy_path),
+            },
+            {
+                "role": "editing_capability_catalog",
+                "path": str(capability_path.resolve()),
+                "sha256": sha256_file(capability_path),
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        feature_cut_module,
+        "load_external_feature_plan_projection",
+        lambda _plan_dir: (None, None, record),
+    )
+
+    with pytest.raises(ValueError, match="predates.*presentation catalog"):
+        _validate_autonomous_plan_reuse_flags(
+            FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+            reuse_feature_plan=True,
+            reuse_feature_plan_raw_output=False,
+            output_dir=output_dir,
+            autonomous_policy_path=policy_path,
+        )
 
 
 def test_feature_cut_failure_writes_terminal_run_status(
@@ -6651,6 +6719,74 @@ def test_runtime_candidate_reuse_allows_authorized_distinct_interval() -> None:
         )
         is not None
     )
+
+
+def test_runtime_candidate_reuse_blocks_third_use_even_with_authority() -> None:
+    selected = FeatureChapterSelect(
+        feature_id="third",
+        evidence_status="supported",
+        observed_visual_evidence="A third distinct interval.",
+        selection_reason="A later event.",
+        horizontal_frame_id="RF000003",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000003",
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+        source_reuse_mode="distinct_interval",
+        source_reuse_justification="A different event interval.",
+    )
+    prior = [
+        {
+            "feature_id": feature_id,
+            "source_clip_id": "clip-a",
+            "source_in_ms": start,
+            "source_out_ms": start + 1000,
+        }
+        for feature_id, start in (("first", 0), ("second", 2000))
+    ]
+
+    violation = _runtime_candidate_reuse_violation(
+        selected,
+        prior,
+        source_clip_id="clip-a",
+        source_in_ms=4000,
+        source_out_ms=5000,
+    )
+
+    assert violation is not None
+    assert violation["reason_code"] == (
+        "source_use_count_exceeds_bounded_v1_limit"
+    )
+
+
+def test_music_cues_are_projected_from_source_to_assembly_timeline() -> None:
+    cue = LockedMusicCue(
+        cue_id="locked-cue-00001",
+        kind="downbeat",
+        sample_index=72_000,
+        time_ms=1_500,
+        strength=0.9,
+        priority=CuePriority.PREFERRED,
+    )
+    lock = SimpleNamespace(master_sample_rate=48_000, cues=[cue])
+    span = SimpleNamespace(
+        source_start_sample=48_000,
+        source_end_sample=96_000,
+        output_start_sample=0,
+    )
+
+    projected = _project_locked_cues_to_music_output(
+        lock,
+        spans=[span],
+    )
+
+    assert projected[0].cue_id == cue.cue_id
+    assert projected[0].sample_index == 24_000
+    assert projected[0].time_ms == 500
 
 
 def test_simultaneous_relation_rejects_one_unbound_atomic_core() -> None:

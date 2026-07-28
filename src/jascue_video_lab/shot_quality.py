@@ -37,6 +37,12 @@ from .storage import read_json, utc_now, write_json
 
 
 SHOT_QUALITY_SCANNER_VERSION = "shot-quality-source-fps-v1"
+_AUTO_EDGE_CLEAN_REASON_CODES = frozenset(
+    {"focus_loss", "motion_blur", "camera_shake"}
+)
+_AUTO_EDGE_CLEAN_MAX_WINDOW_MS = 1_200
+_AUTO_EDGE_TOUCH_TOLERANCE_MS = 250
+_AUTO_EDGE_SETTLE_PADDING_MS = 200
 
 
 @dataclass(frozen=True)
@@ -878,6 +884,47 @@ def build_quality_safe_intervals(
         and window.start_ms < end_ms
         and start_ms < window.end_ms
     ]
+    promoted_edge_review_ids: set[str] = set()
+    for window in quality_map.risk_windows:
+        duration_ms = window.end_ms - window.start_ms
+        if (
+            window.severity != "review"
+            or window.intent == "intentional"
+            or window.reason_code not in _AUTO_EDGE_CLEAN_REASON_CODES
+            or duration_ms > _AUTO_EDGE_CLEAN_MAX_WINDOW_MS
+        ):
+            continue
+        touches_leading_edge = (
+            window.start_ms
+            <= start_ms + _AUTO_EDGE_TOUCH_TOLERANCE_MS
+        )
+        touches_trailing_edge = (
+            window.end_ms
+            >= end_ms - _AUTO_EDGE_TOUCH_TOLERANCE_MS
+        )
+        if not touches_leading_edge and not touches_trailing_edge:
+            continue
+        promoted_start = max(start_ms, window.start_ms)
+        promoted_end = min(end_ms, window.end_ms)
+        if touches_leading_edge:
+            promoted_end = min(
+                end_ms,
+                promoted_end + _AUTO_EDGE_SETTLE_PADDING_MS,
+            )
+        if touches_trailing_edge:
+            promoted_start = max(
+                start_ms,
+                promoted_start - _AUTO_EDGE_SETTLE_PADDING_MS,
+            )
+        exclusions.append(
+            window.model_copy(
+                update={
+                    "start_ms": promoted_start,
+                    "end_ms": promoted_end,
+                }
+            )
+        )
+        promoted_edge_review_ids.add(window.risk_window_id)
     merged: list[tuple[int, int, list[str]]] = []
     for window in sorted(exclusions, key=lambda item: (item.start_ms, item.end_ms)):
         window_start = max(start_ms, window.start_ms)
@@ -903,7 +950,10 @@ def build_quality_safe_intervals(
     review_windows = [
         window
         for window in quality_map.risk_windows
-        if window.severity == "review"
+        if (
+            window.severity == "review"
+            and window.risk_window_id not in promoted_edge_review_ids
+        )
     ]
     intervals: list[QualitySafeInterval] = []
     for index, (interval_start, interval_end, excluded_ids) in enumerate(

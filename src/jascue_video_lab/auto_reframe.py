@@ -98,6 +98,8 @@ class CandidatePreflight(StrictModel):
         "center_crop",
         "fit_with_background",
         "static_anchor",
+        "two_panel_layout",
+        "solid_matte_fit",
     ]
     source_lineage_valid: bool
     within_single_shot: bool

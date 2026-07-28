@@ -26,14 +26,29 @@ deterministic-delivery-evidence.json
 
 `feature-delivery` 的正常 autonomous 路徑不再要求人工準備這六份檔案。呼叫者提供 policy 與含 `feature_id` 的 beat templates 後，入選的最終 source window 會直接重用 dense-frame decoder、以一次 grouped exact-event call 選既有 frame IDs，將 templates 綁到實際 `EvidenceQueryLockV2`，再寫入 `autonomous-evidence-bundle.json`。`--autonomous-context-dir` 與 `--deterministic-delivery-evidence` 只保留作為既有 hash-bound bundle 的相容 override。
 
-Autonomous profile 必須使用全新的 output directory 重新產生 editorial
-plan；`--reuse-feature-plan` 與 `--reuse-feature-plan-raw-output` 只允許
-review profile。需要繼續同一次、輸入 hashes 完全相同的 autonomous run
-時，只能使用 `--reuse-picture-result`。Samsung strict fixture 也禁止 solid
-matte fit；無法滿版的候選必須換 Top-K，全部候選失敗則 block，不得輸出
-黑邊 fit 冒充正式直式成片。
+Autonomous profile 的新 benchmark 必須使用全新的 output directory 重新產生
+editorial plan；`--reuse-feature-plan-raw-output` 永遠不適用於 autonomous。
+`--reuse-feature-plan` 只可繼續同一 output namespace、同一 policy SHA，且原始
+direct-video plan 必須綁定目前包含 two-panel／solid-fit／intentional-freeze 的
+autonomous capability catalog；舊 simple-production plan 會在任何付費 geometry
+工作前被拒絕。需要繼續同一次、輸入 hashes 完全相同的 completed picture run 時，
+才使用 `--reuse-picture-result`。Samsung strict fixture 仍禁止 solid matte fit；
+無法滿版的候選必須先換 Top-K 或使用 policy 允許的 two-panel，全部失敗則 block，
+不得輸出黑邊 fit 冒充正式直式成片。
 
 首個 Samsung 9:16 selected-window run 事後確認重用了歷史 editorial plan 與 picture artifacts，且輸出只有 source audio，沒有走到 music mux；因此它只算 ExactEventLock integration evidence，不是新的 autonomous 試剪或 benchmark。相關 run 已歸檔，不再位於 active artifact namespace。下一次 Samsung benchmark 必須使用全新 output directory 與 fresh music-aware plan，並在交付給使用者觀看前明確產生 music-only audition mux。
+
+後續回歸另修正三個會直接影響觀看結果的執行缺口：
+
+- 短暫且貼住 shot 頭尾的 `camera_shake`／`focus_loss`／`motion_blur` review window
+  會連同 200 ms settle padding 編譯成 clean trim；shot 中段的運鏡與 rack focus
+  仍只保留 review evidence，不會被自動刪除。
+- Gemini 的 `music_target` 會影響合法 cue 類型的選擇；MusicMap source cue 必須
+  先投影到實際 MusicAssembly output timeline，picture alignment、exact-event
+  delta 與 delivery mux 再共同驗證同一組 spans，避免配樂從中段開始後仍拿原曲
+  timestamp 驗片。
+- 同一 source 的重用必須有 typed authority 與可觀察理由，且 autonomous V1
+  同一 source 最多使用兩次；第三次會在 Grounding／SAM／render 前改試 Top-K。
 
 ```bash
 UV_CACHE_DIR=.uv-cache uv run jascue-video-lab feature-delivery \

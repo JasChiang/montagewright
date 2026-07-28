@@ -277,9 +277,26 @@ def test_invalid_normalized_boxes_are_rejected(box) -> None:
 
 
 def test_api_schema_uses_only_supported_constraint_keywords() -> None:
-    schema_text = str(gemini_response_schema(GroundingProposal))
-    rushes_schema_text = str(gemini_response_schema(RushesEditPlan))
-    feature_schema_text = str(gemini_response_schema(FeatureEditPlan))
+    def schema_keys(value: object) -> set[str]:
+        if isinstance(value, dict):
+            return set(value) | {
+                key
+                for child in value.values()
+                for key in schema_keys(child)
+            }
+        if isinstance(value, list):
+            return {
+                key
+                for child in value
+                for key in schema_keys(child)
+            }
+        return set()
+
+    schemas = (
+        gemini_response_schema(GroundingProposal),
+        gemini_response_schema(RushesEditPlan),
+        gemini_response_schema(FeatureEditPlan),
+    )
     for unsupported in (
         "const",
         "exclusiveMinimum",
@@ -289,10 +306,11 @@ def test_api_schema_uses_only_supported_constraint_keywords() -> None:
         "minItems",
         "maxItems",
     ):
-        assert unsupported not in schema_text
-        assert unsupported not in rushes_schema_text
-        assert unsupported not in feature_schema_text
-    assert "prefixItems" in schema_text
+        assert all(
+            unsupported not in schema_keys(schema)
+            for schema in schemas
+        )
+    assert any("prefixItems" in schema_keys(schema) for schema in schemas)
 
 
 def test_native_grounding_schema_names_y_first_field_explicitly() -> None:

@@ -640,6 +640,7 @@ def run_feature_delivery_pipeline(
                     assembly_dir / "music.wav",
                     assembly_dir,
                 )
+                selected_music_plan = plan
             except MusicAssemblyError:
                 edit_plan = plan_contiguous_reviewed_music_edit_v2(
                     music_lock,
@@ -654,6 +655,29 @@ def run_feature_delivery_pipeline(
                     assembly_dir / "music.wav",
                     assembly_dir,
                 )
+                selected_music_plan = edit_plan
+            music_timeline_path = (
+                render_manifest_path.parent
+                / "editorial-planning"
+                / "music-output-timeline.json"
+            )
+            if music_timeline_path.is_file():
+                expected_timeline = read_json(music_timeline_path)
+                expected_plan = expected_timeline.get("plan_definition", {})
+                expected_spans = expected_plan.get("spans", [])
+                actual_spans = [
+                    span.model_dump(mode="json")
+                    for span in selected_music_plan.spans
+                ]
+                if (
+                    expected_timeline.get("plan_contract_version")
+                    != selected_music_plan.contract_version
+                    or expected_spans != actual_spans
+                ):
+                    raise DeliveryPipelineBlocked(
+                        "delivery music assembly differs from the output "
+                        "timeline used for picture cue alignment"
+                    )
             delivery = assemble_music_only_delivery(
                 picture_path=picture,
                 music_path=rendered_music.output_audio_path,

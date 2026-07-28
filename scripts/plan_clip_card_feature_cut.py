@@ -42,6 +42,7 @@ from jascue_video_lab.clip_card_supplement_runner import (
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.editing_capabilities import (
     EditingCapabilityCatalog,
+    autonomous_production_capability_catalog,
     simple_production_capability_catalog,
 )
 from jascue_video_lab.gemini import (
@@ -504,6 +505,28 @@ class ClipCardFeatureCandidateV3(StrictModel):
         "primary_with_context",
         "independent_detail",
     ] = "simultaneous"
+    aspect_suitability: Literal[
+        "natural",
+        "reconstructable",
+        "unsuitable",
+    ] = "reconstructable"
+    suitability_risks: list[str] = Field(default_factory=list, max_length=8)
+    presentation_preference: Literal[
+        "static_full_bleed",
+        "tracked_full_bleed",
+        "phase_virtual_camera",
+        "two_panel_layout",
+        "solid_matte_fit",
+    ] = "tracked_full_bleed"
+    presentation_goal: Literal[
+        "hold",
+        "follow",
+        "reveal",
+        "compare",
+        "context_detail",
+        "emphasize",
+    ] = "hold"
+    physical_scale_comparison: bool = False
     allow_controlled_clip: bool = False
     framing_intent: str = Field(min_length=1, max_length=300)
     required_entity_ids: list[str] = Field(default_factory=list, max_length=4)
@@ -589,9 +612,28 @@ class ClipCardFeatureSelectV3(StrictModel):
     duration_rationale: str | None = None
     attention_observation: AttentionObservation | None = None
     flow_intent: ShotFlowIntent | None = None
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
 
     @model_validator(mode="after")
     def validate_selection(self) -> "ClipCardFeatureSelectV3":
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "source reuse justification requires a typed reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError(
+                "intentional source reuse requires an observable justification"
+            )
         if self.recommended_duration_seconds is not None and not (
             self.duration_rationale and self.duration_rationale.strip()
         ):
@@ -713,6 +755,28 @@ class DirectVideoVerticalDecision(StrictModel):
         "primary_with_context",
         "independent_detail",
     ]
+    aspect_suitability: Literal[
+        "natural",
+        "reconstructable",
+        "unsuitable",
+    ] = "reconstructable"
+    suitability_risks: list[str] = Field(default_factory=list, max_length=8)
+    presentation_preference: Literal[
+        "static_full_bleed",
+        "tracked_full_bleed",
+        "phase_virtual_camera",
+        "two_panel_layout",
+        "solid_matte_fit",
+    ] = "tracked_full_bleed"
+    presentation_goal: Literal[
+        "hold",
+        "follow",
+        "reveal",
+        "compare",
+        "context_detail",
+        "emphasize",
+    ] = "hold"
+    physical_scale_comparison: bool = False
     traversal_policy: Literal[
         "semantic_order_locked",
         "spatially_optimizable",
@@ -744,6 +808,18 @@ class DirectVideoVerticalDecision(StrictModel):
             raise ValueError("fit-with-background cannot declare camera movement")
         if self.strategy == "fit_with_background" and self.allow_controlled_clip:
             raise ValueError("fit-with-background cannot request controlled clipping")
+        if (
+            self.presentation_preference == "two_panel_layout"
+            and self.coverage_mode
+            not in {"simultaneous", "relation_core", "primary_with_context"}
+        ):
+            raise ValueError(
+                "two-panel presentation requires a simultaneous or context-detail relation"
+            )
+        if self.physical_scale_comparison and self.presentation_goal != "compare":
+            raise ValueError(
+                "physical scale comparison requires presentation_goal=compare"
+            )
         if self.coverage_mode == "simultaneous" and len(self.attention_sequence) > 1:
             raise ValueError(
                 "simultaneous coverage cannot split evidence across phases"
@@ -846,10 +922,29 @@ class DirectVideoChapterDecision(StrictModel):
     duration_rationale: str | None = None
     attention_observation: AttentionObservation | None
     flow_intent: ShotFlowIntent | None
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_chapter(self) -> "DirectVideoChapterDecision":
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "source reuse justification requires a typed reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError(
+                "intentional source reuse requires an observable justification"
+            )
         if self.evidence_status == "not_found":
             if (
                 self.horizontal is not None
@@ -1499,6 +1594,18 @@ def planning_candidate_id(rank: int) -> str:
     return f"rank-{rank:02d}"
 
 
+def planning_capability_catalog(
+    policy: AutonomousEditPolicy | None,
+) -> EditingCapabilityCatalog:
+    """Expose only the presentation verbs authorized for this planning run."""
+
+    return (
+        autonomous_production_capability_catalog()
+        if policy is not None
+        else simple_production_capability_catalog()
+    )
+
+
 def validate_candidate_video_budget(
     *,
     total_duration_ms: int,
@@ -1523,6 +1630,7 @@ def project_direct_video_edit_plan(
     catalog: RushesCatalog,
     cards: dict[str, FullClipCard],
     provenance: ModelProvenance,
+    capability_catalog: EditingCapabilityCatalog | None = None,
 ) -> ClipCardFeaturePlanV3:
     """Resolve integer candidate ranks into the existing local renderer plan.
 
@@ -1531,7 +1639,9 @@ def project_direct_video_edit_plan(
     shortlist and catalog artifacts.
     """
 
-    capability_catalog = simple_production_capability_catalog()
+    capability_catalog = (
+        capability_catalog or simple_production_capability_catalog()
+    )
     if plan.capability_catalog_sha256 != capability_catalog.definition_sha256():
         raise ValueError(
             "direct-video plan capability catalog differs from the local "
@@ -1726,6 +1836,26 @@ def project_direct_video_edit_plan(
             vertical_strategy: Literal[
                 "tracked_crop", "fit_with_background"
             ] = "fit_with_background"
+            aspect_suitability: Literal[
+                "natural", "reconstructable", "unsuitable"
+            ] = "reconstructable"
+            suitability_risks: list[str] = []
+            presentation_preference: Literal[
+                "static_full_bleed",
+                "tracked_full_bleed",
+                "phase_virtual_camera",
+                "two_panel_layout",
+                "solid_matte_fit",
+            ] = "solid_matte_fit"
+            presentation_goal: Literal[
+                "hold",
+                "follow",
+                "reveal",
+                "compare",
+                "context_detail",
+                "emphasize",
+            ] = "hold"
+            physical_scale_comparison = False
             vertical_crop_mode: Literal["strict", "primary_center"] = (
                 "primary_center"
             )
@@ -1751,6 +1881,19 @@ def project_direct_video_edit_plan(
                 )
             if rank == direct_chapter.vertical.candidate_rank:
                 vertical_strategy = direct_chapter.vertical.strategy
+                aspect_suitability = (
+                    direct_chapter.vertical.aspect_suitability
+                )
+                suitability_risks = list(
+                    direct_chapter.vertical.suitability_risks
+                )
+                presentation_preference = (
+                    direct_chapter.vertical.presentation_preference
+                )
+                presentation_goal = direct_chapter.vertical.presentation_goal
+                physical_scale_comparison = (
+                    direct_chapter.vertical.physical_scale_comparison
+                )
                 vertical_crop_mode = direct_chapter.vertical.crop_mode
                 framing_intent = direct_chapter.vertical.framing_intent
                 required_entity_ids = resolve_entity_indices(
@@ -1796,6 +1939,11 @@ def project_direct_video_edit_plan(
                         if rank == direct_chapter.vertical.candidate_rank
                         else "simultaneous"
                     ),
+                    aspect_suitability=aspect_suitability,
+                    suitability_risks=suitability_risks,
+                    presentation_preference=presentation_preference,
+                    presentation_goal=presentation_goal,
+                    physical_scale_comparison=physical_scale_comparison,
                     allow_controlled_clip=(
                         direct_chapter.vertical.allow_controlled_clip
                         if rank == direct_chapter.vertical.candidate_rank
@@ -1831,6 +1979,10 @@ def project_direct_video_edit_plan(
                 ),
                 attention_observation=direct_chapter.attention_observation,
                 flow_intent=direct_chapter.flow_intent,
+                source_reuse_mode=direct_chapter.source_reuse_mode,
+                source_reuse_justification=(
+                    direct_chapter.source_reuse_justification
+                ),
             )
         )
     return ClipCardFeaturePlanV3(
@@ -2614,6 +2766,13 @@ def project_feature_contracts_v3(
                 strategy=candidate.vertical_strategy,
                 crop_mode=candidate.vertical_crop_mode,
                 coverage_mode=candidate.coverage_mode,
+                aspect_suitability=candidate.aspect_suitability,
+                suitability_risks=candidate.suitability_risks,
+                presentation_preference=candidate.presentation_preference,
+                presentation_goal=candidate.presentation_goal,
+                physical_scale_comparison=(
+                    candidate.physical_scale_comparison
+                ),
                 allow_controlled_clip=candidate.allow_controlled_clip,
                 target_description=vertical_target(candidate),
                 regions=regions,
@@ -2687,6 +2846,10 @@ def project_feature_contracts_v3(
                 duration_rationale=chapter.duration_rationale,
                 attention_observation=chapter.attention_observation,
                 flow_intent=chapter.flow_intent,
+                source_reuse_mode=chapter.source_reuse_mode,
+                source_reuse_justification=(
+                    chapter.source_reuse_justification
+                ),
                 horizontal_candidates=[
                     FeatureHorizontalCandidate(
                         candidate_id=candidate.candidate_id,
@@ -2978,7 +3141,15 @@ def reproject_direct_video_edit_plan(
     bound_capabilities = EditingCapabilityCatalog.model_validate(
         read_json(capability_path)
     )
-    current_capabilities = simple_production_capability_catalog()
+    bound_capability_ids = {
+        item.capability_id for item in bound_capabilities.capabilities
+    }
+    current_capabilities = (
+        autonomous_production_capability_catalog()
+        if bound_capability_ids
+        & {"two_panel_layout", "solid_matte_fit", "intentional_freeze"}
+        else simple_production_capability_catalog()
+    )
     if source_plan.capability_catalog_sha256 != (
         bound_capabilities.definition_sha256()
     ):
@@ -3304,6 +3475,7 @@ def main() -> int:
         if args.autonomous_policy is not None
         else None
     )
+    policy: AutonomousEditPolicy | None = None
     if autonomous_policy_path is not None:
         policy = AutonomousEditPolicy.model_validate(
             read_json(autonomous_policy_path)
@@ -3555,11 +3727,30 @@ def main() -> int:
             "每章只能從該 feature_id 下列出的 candidate_events 選擇；"
             "不得跨章引用未召回的 asset/event。"
         )
-    capability_catalog = simple_production_capability_catalog()
+    capability_catalog = planning_capability_catalog(policy)
     capability_catalog_path = args.output_dir / "editing-capability-catalog.json"
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_json(capability_catalog_path, capability_catalog)
     capability_catalog_sha256 = capability_catalog.definition_sha256()
+    autonomous_presentation_rules = (
+        """
+- 先評估每個候選對 9:16 是 natural、reconstructable 或 unsuitable，並列出
+  suitability_risks；不能只在選完素材後才發現必要人物、產品或 UI 裁不下。
+- presentation_preference 只表達語意可接受的呈現類型；本機仍會枚舉 geometry。
+  無須運鏡就用 static_full_bleed；需要保持活動主體才用 tracked_full_bleed；
+  有可觀察 attention handoff 才用 phase_virtual_camera。
+- 必須同時比較或保留 context+detail、共同滿版又不可行時，可以允許
+  two_panel_layout；只回傳語意許可與 compare/context_detail goal，不指定上下、
+  左右、panel 尺寸或 crop。物理尺寸比較需 physical_scale_comparison=true。
+- 必要關係無法滿版或 two-panel 會太小時，可以允許 solid_matte_fit。這是 policy
+  授權的正式候選，不是模糊背景，也不是任意補邊。
+"""
+        if policy is not None
+        else """
+- 本次是 review profile；two-panel、autonomous solid matte 與 intentional freeze
+  不在可執行目錄中。fit_with_background 只會形成非交付 review preview。
+"""
+    ).strip()
     prompt = f"""
 你是 evidence-bound 的資深短影音挑帶剪輯師。請使用完整 Clip Card library，為使用者 brief 的每個 chapter 保留有排序的候選 take，再分別選出橫式與直式代表。你只能引用輸入列出的 source_asset_id、event_id、entity_id 與 RF frame_id。
 
@@ -3622,6 +3813,11 @@ model_provenance 必須先原樣回傳：
    visual_sync_event 只在影片中真的有可觀察落點時提供，並同時給
    visual_sync_predicate 與 music_target；安靜訪談、空景或純 hold 可為 null。
    這些是相對剪輯意圖，不是精確剪點。
+7. 全片要有素材與視覺狀態的多樣性。若同一支 source 已被前章選用，應先選
+   不同 take；只有不同 interval 提供新的 hard evidence、alternate presentation
+   有新的閱讀目的，或明確 editorial reprise 時才能重用，並填入 typed reuse
+   authority 與具體理由。第一版同一 source 最多使用兩次；手機加立牌等相似構圖
+   即使來自不同時間，也不能反覆充當無差別 coverage。
 
 禁止回傳或推測：
 - project_id、catalog_id、feature_id、source_asset_id、event_id、frame_id、
@@ -3632,9 +3828,9 @@ model_provenance 必須先原樣回傳：
 - 影片、brief 與候選索引沒有直接支持的品牌、型號、數字或功能。
 
 構圖規則：
-- 9:16 優先採可安全滿版的 tracked_crop。只有必要關係或必要範圍無法在
-  9:16 同時成立，而且換候選也無法成立時，才使用 fit_with_background；
-  它只會產生非交付的人工 review preview。不要因為邊緣略有裁切就退回補邊。
+- 9:16 優先採可安全滿版的靜態或 tracked crop；不要因為 brief 有 primary target
+  就製造跟隨，也不要因為邊緣略有裁切就退回補邊。
+{autonomous_presentation_rules}
 - coverage_mode=sequential：兩個以上主體可以依序看懂，每個 phase 只鎖自己的
   anchor；本機可平移或在距離過遠時切換視角。
 - coverage_mode=relation_core：只需保留承載比較、接觸、方向或相對尺度的可見
@@ -4081,6 +4277,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                 catalog=catalog,
                 cards=cards,
                 provenance=provenance,
+                capability_catalog=capability_catalog,
             )
             write_json(
                 args.output_dir / "direct-video-edit-plan.json",
@@ -4224,6 +4421,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                             catalog=catalog,
                             cards=cards,
                             provenance=provenance,
+                            capability_catalog=capability_catalog,
                         )
                     else:
                         plan = ClipCardFeaturePlanV3.model_validate_json(
