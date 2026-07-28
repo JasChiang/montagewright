@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import uuid
 from pathlib import Path
@@ -145,6 +146,9 @@ _TRACKING_DEVICE = "cpu"
 _TRACKING_SEED_BOX_PADDING_RATIO = 0.04
 _PORTRAIT_PHASE_MAX_ZOOM = 1.12
 _PORTRAIT_DEADBAND_VIEWPORT_FRACTION = 0.08
+_PORTRAIT_FOLLOW_HYSTERESIS_VIEWPORT_FRACTION = 0.025
+_PORTRAIT_MIN_PERCEPTUAL_MOVE_VIEWPORT_FRACTION = 0.05
+_PORTRAIT_TRANSITION_SETTLE_FRACTION = 0.10
 _PORTRAIT_MAX_SPEED_PX_S = 720.0
 _PORTRAIT_MAX_ACCELERATION_PX_S2 = 1800.0
 _PORTRAIT_MAX_JERK_PX_S3 = 7200.0
@@ -4526,6 +4530,95 @@ def _minimum_smoothstep_transition_seconds(distance_pixels: float) -> float:
     )
 
 
+def _smootherstep(value: float) -> float:
+    """Quintic ease with zero velocity and acceleration at both ends."""
+
+    value = max(0.0, min(1.0, value))
+    return value**3 * (value * (value * 6 - 15) + 10)
+
+
+def _minimum_variation_interval_path(
+    intervals: Sequence[tuple[float, float]],
+    *,
+    preferences: Sequence[float],
+    default_value: float,
+) -> list[float]:
+    """Choose one feasible point per phase with the least needless travel.
+
+    Consecutive phases share a static composition while their feasible
+    crop-center ranges overlap.  Once movement is unavoidable, the path leaves
+    the current common range from its nearest boundary.  This is the
+    one-dimensional minimum-variation ("taut string") solution and avoids
+    greedily steering toward every raw anchor center.
+    """
+
+    if len(intervals) != len(preferences):
+        raise ValueError("interval path preferences must align with intervals")
+    if not intervals:
+        return []
+    for low, high in intervals:
+        if low > high + 1e-9:
+            raise ValueError("interval path contains an empty interval")
+
+    result: list[float | None] = [None] * len(intervals)
+    group_start = 0
+    common_low, common_high = intervals[0]
+    prior_value: float | None = None
+
+    def assign_group(end_exclusive: int, value: float) -> None:
+        nonlocal group_start, prior_value
+        for index in range(group_start, end_exclusive):
+            result[index] = value
+        prior_value = value
+
+    for index, (low, high) in enumerate(intervals[1:], start=1):
+        intersect_low = max(common_low, low)
+        intersect_high = min(common_high, high)
+        if intersect_low <= intersect_high + 1e-9:
+            common_low, common_high = intersect_low, intersect_high
+            continue
+        if low > common_high:
+            assign_group(index, common_high)
+        elif high < common_low:
+            assign_group(index, common_low)
+        else:  # Closed intervals should otherwise have intersected.
+            raise ValueError("interval path could not classify disjoint ranges")
+        group_start = index
+        common_low, common_high = low, high
+
+    if prior_value is not None:
+        final_value = max(common_low, min(common_high, prior_value))
+    else:
+        preferred = statistics.median(preferences)
+        final_value = max(
+            common_low,
+            min(
+                common_high,
+                preferred if math.isfinite(preferred) else default_value,
+            ),
+        )
+    assign_group(len(intervals), final_value)
+    return [float(value) for value in result if value is not None]
+
+
+def _signed_motion_reversal_count(
+    values: Sequence[float],
+    *,
+    perceptual_threshold: float,
+) -> int:
+    """Count meaningful direction reversals while ignoring tracking jitter."""
+
+    signs: list[int] = []
+    for before, after in zip(values[:-1], values[1:], strict=True):
+        delta = after - before
+        if abs(delta) < perceptual_threshold:
+            continue
+        sign = 1 if delta > 0 else -1
+        if not signs or signs[-1] != sign:
+            signs.append(sign)
+    return max(0, len(signs) - 1)
+
+
 def _vertical_virtual_camera_filter_from_tracks(
     *,
     tracks_by_region: Mapping[str, SegmentationTrack],
@@ -4681,37 +4774,234 @@ def _vertical_virtual_camera_filter_from_tracks(
     native_zoom_limit = max(1.0, 1.0 / max(1e-9, base_source_scale))
     maximum_zoom = min(_PORTRAIT_PHASE_MAX_ZOOM, native_zoom_limit)
 
-    phase_centers: dict[str, tuple[float, float]] = {}
-    for phase in phases:
-        samples: list[tuple[int, list[int]]] = []
-        for time_ms in all_times_ms:
-            progress = max(0.0, min(1.0, (time_ms - start_ms) / duration_ms))
-            _, active_phase = phase_for_progress(progress)
-            if active_phase.phase_id != phase.phase_id:
-                continue
-            box = union_box(phase.anchor_region_ids, time_ms)
-            if box is not None:
-                samples.append((time_ms, box))
-        if not samples:
-            raise ValueError(
-                f"phase {phase.phase_id} has no complete tracked anchor sample"
+    def phase_static_geometry(
+        current_phases: Sequence[VerticalVirtualCameraPhase],
+    ) -> tuple[
+        dict[str, tuple[float, float]],
+        dict[str, tuple[float, float, float, float] | None],
+    ]:
+        current_centers: dict[str, tuple[float, float]] = {}
+        current_regions: dict[
+            str,
+            tuple[float, float, float, float] | None,
+        ] = {}
+        for phase in current_phases:
+            samples: list[tuple[int, list[int]]] = []
+            for time_ms in all_times_ms:
+                progress = max(
+                    0.0,
+                    min(1.0, (time_ms - start_ms) / duration_ms),
+                )
+                _, active_phase = phase_for_progress(progress)
+                if active_phase.phase_id != phase.phase_id:
+                    continue
+                box = union_box(phase.anchor_region_ids, time_ms)
+                if box is not None:
+                    samples.append((time_ms, box))
+            if not samples:
+                raise ValueError(
+                    f"phase {phase.phase_id} has no complete tracked anchor sample"
+                )
+            current_centers[phase.phase_id] = (
+                statistics.median(
+                    (box[0] + box[2]) / 2 for _, box in samples
+                ),
+                statistics.median(
+                    (box[1] + box[3]) / 2 for _, box in samples
+                ),
             )
-        phase_centers[phase.phase_id] = (
-            sum((box[0] + box[2]) / 2 for _, box in samples) / len(samples),
-            sum((box[1] + box[3]) / 2 for _, box in samples) / len(samples),
+            center_x_low = crop_width_normalized / 2
+            center_x_high = 1000 - crop_width_normalized / 2
+            center_y_low = crop_height_normalized / 2
+            center_y_high = 1000 - crop_height_normalized / 2
+            for _, box in samples:
+                center_x_low = max(
+                    center_x_low,
+                    box[2] - crop_width_normalized / 2,
+                )
+                center_x_high = min(
+                    center_x_high,
+                    box[0] + crop_width_normalized / 2,
+                )
+                center_y_low = max(
+                    center_y_low,
+                    box[3] - crop_height_normalized / 2,
+                )
+                center_y_high = min(
+                    center_y_high,
+                    box[1] + crop_height_normalized / 2,
+                )
+            if (
+                center_x_low <= center_x_high + 1e-6
+                and center_y_low <= center_y_high + 1e-6
+            ):
+                current_regions[phase.phase_id] = (
+                    center_x_low,
+                    center_x_high,
+                    center_y_low,
+                    center_y_high,
+                )
+            else:
+                # The active anchor moves farther than one static viewport can
+                # contain. Follow/deadband remains responsible for this phase.
+                current_regions[phase.phase_id] = None
+        return current_centers, current_regions
+
+    phase_centers, phase_feasible_regions = phase_static_geometry(phases)
+
+    original_phase_order = [phase.phase_id for phase in phases]
+    traversal_policy = phases[0].traversal_policy
+    if any(phase.traversal_policy != traversal_policy for phase in phases):
+        raise ValueError("vertical camera phases must share one traversal policy")
+    traversal_audit: dict[str, Any] = {
+        "policy": traversal_policy,
+        "original_phase_order": original_phase_order,
+        "effective_phase_order": list(original_phase_order),
+        "reordered": False,
+        "reason": None,
+    }
+    if traversal_policy == "spatially_optimizable":
+        if not all(len(phase.anchor_region_ids) == 1 for phase in phases):
+            raise ValueError(
+                "spatially optimizable traversal requires independent "
+                "single-anchor phases"
+            )
+        traversal_audit.update(
+            {
+                "effective_phase_order": list(original_phase_order),
+                "reordered": False,
+                "reason": (
+                    "Spatial optimization changes feasible crop positions, not "
+                    "the source-time order of semantic phases. Reordering would "
+                    "require separately proven overlapping evidence windows."
+                ),
+            }
         )
 
+    original_phase_centers = dict(phase_centers)
+
+    def optimized_axis_targets(
+        *,
+        axis: Literal["x", "y"],
+    ) -> dict[str, float]:
+        axis_targets: dict[str, float] = {}
+        axis_offset = 0 if axis == "x" else 2
+        fallback_index = 0 if axis == "x" else 1
+        segment_start = 0
+        while segment_start < len(phases):
+            region = phase_feasible_regions[phases[segment_start].phase_id]
+            if region is None:
+                phase = phases[segment_start]
+                axis_targets[phase.phase_id] = phase_centers[phase.phase_id][
+                    fallback_index
+                ]
+                segment_start += 1
+                continue
+            segment_end = segment_start
+            while (
+                segment_end < len(phases)
+                and phase_feasible_regions[phases[segment_end].phase_id]
+                is not None
+            ):
+                segment_end += 1
+            segment = phases[segment_start:segment_end]
+            intervals = [
+                (
+                    phase_feasible_regions[phase.phase_id][axis_offset],
+                    phase_feasible_regions[phase.phase_id][axis_offset + 1],
+                )
+                for phase in segment
+                if phase_feasible_regions[phase.phase_id] is not None
+            ]
+            preferences = [
+                phase_centers[phase.phase_id][fallback_index]
+                for phase in segment
+            ]
+            values = _minimum_variation_interval_path(
+                intervals,
+                preferences=preferences,
+                default_value=500.0,
+            )
+            axis_targets.update(
+                {
+                    phase.phase_id: value
+                    for phase, value in zip(segment, values, strict=True)
+                }
+            )
+            segment_start = segment_end
+        return axis_targets
+
+    optimized_x_targets = optimized_axis_targets(axis="x")
+    optimized_y_targets = optimized_axis_targets(axis="y")
+    phase_centers = {
+        phase.phase_id: (
+            optimized_x_targets[phase.phase_id],
+            optimized_y_targets[phase.phase_id],
+        )
+        for phase in phases
+    }
+    traversal_audit["phase_target_audit"] = [
+        {
+            "phase_id": phase.phase_id,
+            "preferred_anchor_center_normalized": [
+                round(original_phase_centers[phase.phase_id][0], 6),
+                round(original_phase_centers[phase.phase_id][1], 6),
+            ],
+            "static_feasible_center_region_normalized": (
+                [
+                    round(value, 6)
+                    for value in phase_feasible_regions[phase.phase_id]
+                ]
+                if phase_feasible_regions[phase.phase_id] is not None
+                else None
+            ),
+            "optimized_camera_center_normalized": [
+                round(phase_centers[phase.phase_id][0], 6),
+                round(phase_centers[phase.phase_id][1], 6),
+            ],
+            "static_baseline_available": (
+                phase_feasible_regions[phase.phase_id] is not None
+            ),
+        }
+        for phase in phases
+    ]
+    traversal_audit["solver"] = "minimum_variation_feasible_region_path_v1"
+
+    minimum_perceptual_move_pixels = (
+        1080 * _PORTRAIT_MIN_PERCEPTUAL_MOVE_VIEWPORT_FRACTION
+    )
     effective_phases: list[VerticalVirtualCameraPhase] = []
     transition_audit: list[dict[str, Any]] = []
+    prior_meaningful_direction: int | None = None
     for phase_index, phase in enumerate(phases):
         effective = phase
-        if phase_index > 0 and phase.transition_in == "smoothstep":
+        if phase_index > 0:
             previous = phases[phase_index - 1]
             prior_center = phase_centers[previous.phase_id]
             current_center = phase_centers[phase.phase_id]
             distance_pixels = math.hypot(
                 (current_center[0] - prior_center[0]) / 1000 * scaled_width,
                 (current_center[1] - prior_center[1]) / 1000 * scaled_height,
+            )
+            horizontal_delta_pixels = (
+                (current_center[0] - prior_center[0])
+                / 1000
+                * scaled_width
+            )
+            current_direction = (
+                1
+                if horizontal_delta_pixels >= minimum_perceptual_move_pixels
+                else (
+                    -1
+                    if horizontal_delta_pixels
+                    <= -minimum_perceptual_move_pixels
+                    else None
+                )
+            )
+            reversal = (
+                current_direction is not None
+                and prior_meaningful_direction is not None
+                and current_direction != prior_meaningful_direction
             )
             phase_seconds = (
                 (phase.end_progress - phase.start_progress)
@@ -4725,8 +5015,45 @@ def _vertical_virtual_camera_filter_from_tracks(
                 distance_pixels
             )
             effective_seconds = max(requested_seconds, minimum_seconds)
-            maximum_seconds = phase_seconds
-            if effective_seconds > maximum_seconds + 1e-6:
+            settle_seconds = (
+                phase_seconds * _PORTRAIT_TRANSITION_SETTLE_FRACTION
+            )
+            maximum_seconds = max(0.0, phase_seconds - 2 * settle_seconds)
+            current_region = phase_feasible_regions[phase.phase_id]
+            shared_static_composition_feasible = bool(
+                current_region is not None
+                and current_region[0] - 1e-6
+                <= prior_center[0]
+                <= current_region[1] + 1e-6
+                and current_region[2] - 1e-6
+                <= prior_center[1]
+                <= current_region[3] + 1e-6
+            )
+            suppressed_small_move = (
+                distance_pixels < minimum_perceptual_move_pixels
+                and shared_static_composition_feasible
+            )
+            motion_is_motivated = (
+                phase.movement_motivation != "none"
+                and traversal_policy != "no_continuous_traversal"
+            )
+            compiler_cut_required = (
+                not suppressed_small_move
+                and phase.transition_in != "cut"
+                and (
+                    not motion_is_motivated
+                    or reversal
+                    or effective_seconds > maximum_seconds + 1e-6
+                )
+            )
+            if compiler_cut_required and not phase.cut_admissible:
+                raise ValueError(
+                    f"phase {phase.phase_id} requires a hard cut but the "
+                    "semantic proposal did not prove that cut admissible"
+                )
+            must_cut = phase.transition_in == "cut" or compiler_cut_required
+            if suppressed_small_move:
+                phase_centers[phase.phase_id] = prior_center
                 effective = phase.model_copy(
                     update={
                         "transition_in": "cut",
@@ -4734,7 +5061,28 @@ def _vertical_virtual_camera_filter_from_tracks(
                     }
                 )
                 effective_fraction = 0.0
-                disposition = "converted_to_cut"
+                disposition = "shared_hold_small_displacement"
+            elif must_cut:
+                effective = phase.model_copy(
+                    update={
+                        "transition_in": "cut",
+                        "transition_duration_fraction": 0.0,
+                    }
+                )
+                effective_fraction = 0.0
+                disposition = (
+                    "kept_cut"
+                    if phase.transition_in == "cut"
+                    else (
+                        "converted_to_cut_unmotivated"
+                        if not motion_is_motivated
+                        else (
+                            "converted_to_cut_direction_reversal"
+                            if reversal
+                            else "converted_to_cut_insufficient_settle"
+                        )
+                    )
+                )
             else:
                 effective_fraction = min(
                     1.0,
@@ -4746,6 +5094,13 @@ def _vertical_virtual_camera_filter_from_tracks(
                     }
                 )
                 disposition = "smoothstep"
+                if current_direction is not None:
+                    prior_meaningful_direction = current_direction
+            if must_cut:
+                # A cut terminates the continuous motion episode.  Its screen
+                # position jump must not create a false reversal constraint on
+                # the next independently executable move.
+                prior_meaningful_direction = None
             transition_audit.append(
                 {
                     "phase_id": phase.phase_id,
@@ -4754,8 +5109,19 @@ def _vertical_virtual_camera_filter_from_tracks(
                     "minimum_safe_duration_seconds": round(minimum_seconds, 6),
                     "effective_duration_seconds": round(effective_seconds, 6),
                     "effective_duration_fraction": round(effective_fraction, 6),
+                    "settle_seconds_each_side": round(settle_seconds, 6),
+                    "movement_motivation": phase.movement_motivation,
+                    "cut_admissible": phase.cut_admissible,
+                    "direction_reversal": reversal,
+                    "shared_static_composition_feasible": (
+                        shared_static_composition_feasible
+                    ),
+                    "minimum_perceptual_move_pixels": round(
+                        minimum_perceptual_move_pixels,
+                        6,
+                    ),
                     "disposition": disposition,
-                    "policy": "distance_aware_smoothstep_v1",
+                    "policy": "motivated_settled_transition_v2",
                 }
             )
         effective_phases.append(effective)
@@ -4806,6 +5172,20 @@ def _vertical_virtual_camera_filter_from_tracks(
             "punch_in_cut",
         }:
             current_center = phase_centers[phase.phase_id]
+        elif phase.camera_behavior == "follow":
+            current_center = _deadband_center(
+                deadband_centers.get(phase.phase_id),
+                current_center,
+                deadband_x=(
+                    crop_width_normalized
+                    * _PORTRAIT_FOLLOW_HYSTERESIS_VIEWPORT_FRACTION
+                ),
+                deadband_y=(
+                    crop_height_normalized
+                    * _PORTRAIT_FOLLOW_HYSTERESIS_VIEWPORT_FRACTION
+                ),
+            )
+            deadband_centers[phase.phase_id] = current_center
         elif phase.camera_behavior == "follow_deadband":
             current_center = _deadband_center(
                 deadband_centers.get(phase.phase_id),
@@ -4826,9 +5206,7 @@ def _vertical_virtual_camera_filter_from_tracks(
             / max(1e-6, phase.end_progress - phase.start_progress)
         )
         phase_progress = max(0.0, min(1.0, phase_progress))
-        phase_smoothstep = phase_progress * phase_progress * (
-            3 - 2 * phase_progress
-        )
+        phase_smoothstep = _smootherstep(phase_progress)
         start_scale, end_scale = phase_scale_ranges[phase.phase_id]
         if phase.camera_behavior == "punch_in_cut":
             scale = start_scale if phase_progress < 0.5 else end_scale
@@ -4841,7 +5219,10 @@ def _vertical_virtual_camera_filter_from_tracks(
         desired_center = current_center
         if phase_index > 0 and phase.transition_in == "smoothstep":
             phase_duration = phase.end_progress - phase.start_progress
-            transition_end = phase.start_progress + (
+            transition_start = phase.start_progress + (
+                phase_duration * _PORTRAIT_TRANSITION_SETTLE_FRACTION
+            )
+            transition_end = transition_start + (
                 phase_duration * phase.transition_duration_fraction
             )
             if progress < transition_end - 1e-9:
@@ -4861,11 +5242,10 @@ def _vertical_virtual_camera_filter_from_tracks(
                     else phase_centers[previous_phase.phase_id]
                 )
                 raw_alpha = (
-                    (progress - phase.start_progress)
-                    / max(1e-6, transition_end - phase.start_progress)
+                    (progress - transition_start)
+                    / max(1e-6, transition_end - transition_start)
                 )
-                alpha = max(0.0, min(1.0, raw_alpha))
-                alpha = alpha * alpha * (3 - 2 * alpha)
+                alpha = _smootherstep(raw_alpha)
                 desired_center = (
                     previous_center[0]
                     + (current_center[0] - previous_center[0]) * alpha,
@@ -5038,6 +5418,120 @@ def _vertical_virtual_camera_filter_from_tracks(
         }
         | punch_cut_sample_indexes
     )
+    continuous_travel_pixels = 0.0
+    unmotivated_travel_pixels = 0.0
+    continuous_runs_x: list[list[float]] = [[]]
+    continuous_run_distances: list[float] = [0.0]
+    for index, (before_x, before_y, after_x, after_y) in enumerate(
+        zip(
+            x_values[:-1],
+            y_values[:-1],
+            x_values[1:],
+            y_values[1:],
+            strict=True,
+        ),
+        start=1,
+    ):
+        if index in cut_before_indexes:
+            continuous_runs_x.append([])
+            continuous_run_distances.append(0.0)
+            continue
+        distance = math.hypot(after_x - before_x, after_y - before_y)
+        continuous_travel_pixels += distance
+        continuous_run_distances[-1] += distance
+        phase = phase_by_id[crop_keyframes[index]["phase_id"]]
+        if phase.movement_motivation == "none":
+            unmotivated_travel_pixels += distance
+        if not continuous_runs_x[-1]:
+            continuous_runs_x[-1].append(before_x)
+        continuous_runs_x[-1].append(after_x)
+    reversal_count = sum(
+        _signed_motion_reversal_count(
+            run,
+            perceptual_threshold=minimum_perceptual_move_pixels,
+        )
+        for run in continuous_runs_x
+        if len(run) >= 2
+    )
+    no_gratuitous_motion_passed = (
+        unmotivated_travel_pixels
+        <= minimum_perceptual_move_pixels + 1e-6
+    )
+    monotonic_path_passed = reversal_count == 0
+    crop_motion_episode_count = sum(
+        distance >= minimum_perceptual_move_pixels
+        for distance in continuous_run_distances
+    )
+    continuous_crop_motion_executed = crop_motion_episode_count > 0
+    perceived_reframe_class = (
+        "none"
+        if continuous_travel_pixels < minimum_perceptual_move_pixels
+        else (
+            "subtle"
+            if continuous_travel_pixels
+            < minimum_perceptual_move_pixels * 2
+            else "clear"
+        )
+    )
+    motion_quality_audit = {
+        "policy": "perceptual_virtual_camera_motion_v2",
+        "anchor_tracking_used": True,
+        "continuous_crop_motion_executed": (
+            continuous_crop_motion_executed
+        ),
+        "crop_motion_episode_count": crop_motion_episode_count,
+        "perceived_reframe_class": perceived_reframe_class,
+        "continuous_travel_pixels": round(continuous_travel_pixels, 6),
+        "unmotivated_travel_pixels": round(
+            unmotivated_travel_pixels,
+            6,
+        ),
+        "meaningful_direction_reversal_count": reversal_count,
+        "minimum_perceptual_move_pixels": round(
+            minimum_perceptual_move_pixels,
+            6,
+        ),
+        "no_gratuitous_motion_passed": no_gratuitous_motion_passed,
+        "monotonic_path_passed": monotonic_path_passed,
+        "source_camera_motion_measured": False,
+        "source_camera_motion_detected": None,
+        "source_camera_motion_note": (
+            "This audit measures synthetic crop motion only. A later global "
+            "motion estimator is required to compare it with source-camera motion."
+        ),
+    }
+    shared_hold_transitions_valid = all(
+        item["disposition"] != "shared_hold_small_displacement"
+        or item["shared_static_composition_feasible"]
+        for item in transition_audit
+    )
+    automatic_cut_transitions_valid = all(
+        not item["disposition"].startswith("converted_to_cut_")
+        or item["cut_admissible"]
+        for item in transition_audit
+    )
+    compiled_path_semantic_validation = {
+        "policy": "compiled_virtual_camera_semantic_invariants_v1",
+        "hard_anchor_samples_validated": True,
+        "steady_containment_passed": bool(steady_visible_fractions),
+        "temporal_phase_order_preserved": (
+            traversal_audit["effective_phase_order"]
+            == traversal_audit["original_phase_order"]
+        ),
+        "shared_hold_transitions_valid": shared_hold_transitions_valid,
+        "automatic_cut_transitions_valid": automatic_cut_transitions_valid,
+        "passed": (
+            bool(steady_visible_fractions)
+            and traversal_audit["effective_phase_order"]
+            == traversal_audit["original_phase_order"]
+            and shared_hold_transitions_valid
+            and automatic_cut_transitions_valid
+        ),
+    }
+    if not compiled_path_semantic_validation["passed"]:
+        raise ValueError(
+            "compiled virtual-camera path failed semantic invariant validation"
+        )
     max_velocity, max_acceleration, max_jerk = _motion_extrema(
         times,
         x_values,
@@ -5055,6 +5549,18 @@ def _vertical_virtual_camera_filter_from_tracks(
         and motion_gate_failed
         and any(phase.transition_in == "smoothstep" for phase in phases)
     ):
+        inadmissible_cut_phase_ids = [
+            phase.phase_id
+            for phase in phases
+            if phase.transition_in == "smoothstep"
+            and not phase.cut_admissible
+        ]
+        if inadmissible_cut_phase_ids:
+            raise ValueError(
+                "unsafe continuous camera motion cannot be replaced by an "
+                "unapproved hard cut for phases "
+                + ", ".join(inadmissible_cut_phase_ids)
+            )
         simplified_phases = [
             (
                 phase.model_copy(
@@ -5092,6 +5598,10 @@ def _vertical_virtual_camera_filter_from_tracks(
                 if phase.transition_in == "smoothstep"
             ],
         }
+        # The recursive compile receives the already-canonicalized phase order.
+        # Preserve the caller-visible audit so reviewers can still compare the
+        # original Gemini order with the geometry-selected effective order.
+        geometry["traversal_audit"] = traversal_audit
         geometry["requires_gemini_review"] = True
         return filter_graph, geometry
     keyframes = [
@@ -5125,9 +5635,16 @@ def _vertical_virtual_camera_filter_from_tracks(
             strict=True,
         )
     ]
+    effective_referenced_ids = list(
+        dict.fromkeys(
+            region_id
+            for phase in phases
+            for region_id in phase.anchor_region_ids
+        )
+    )
     plan = VerticalVirtualCameraPlan(
         phases=list(phases),
-        anchor_region_ids=referenced_ids,
+        anchor_region_ids=effective_referenced_ids,
         keyframes=keyframes,
         steady_containment_passed=True,
         transition_minimum_anchor_visible_fraction=round(
@@ -5199,6 +5716,16 @@ def _vertical_virtual_camera_filter_from_tracks(
                 if active_imputed_samples
                 else []
             ),
+            *(
+                ["unmotivated_virtual_camera_motion"]
+                if not no_gratuitous_motion_passed
+                else []
+            ),
+            *(
+                ["virtual_camera_direction_reversal"]
+                if not monotonic_path_passed
+                else []
+            ),
         ],
         "requires_gemini_review": True,
         "full_containment_feasible": all(
@@ -5217,8 +5744,19 @@ def _vertical_virtual_camera_filter_from_tracks(
         ),
         "transition_sample_count": transition_sample_count,
         "distance_aware_transition_audit": transition_audit,
+        "traversal_audit": traversal_audit,
+        "motion_quality_audit": motion_quality_audit,
+        "compiled_path_semantic_validation": (
+            compiled_path_semantic_validation
+        ),
         "deadband_viewport_fraction": (
             _PORTRAIT_DEADBAND_VIEWPORT_FRACTION
+        ),
+        "follow_hysteresis_viewport_fraction": (
+            _PORTRAIT_FOLLOW_HYSTERESIS_VIEWPORT_FRACTION
+        ),
+        "transition_settle_fraction": (
+            _PORTRAIT_TRANSITION_SETTLE_FRACTION
         ),
         "native_zoom_limit": round(native_zoom_limit, 6),
         "maximum_applied_zoom": round(max(scale_values), 6),
@@ -6561,6 +7099,12 @@ def _vertical_candidate_geometry(
                             end_progress=(index + 1) / phase_count,
                             anchor_region_ids=[region.region_id],
                             camera_behavior="follow_deadband",
+                            movement_motivation=(
+                                "none"
+                                if index == 0
+                                else "attention_handoff"
+                            ),
+                            traversal_policy="semantic_order_locked",
                             transition_in=("cut" if index == 0 else "smoothstep"),
                             transition_duration_fraction=(
                                 0.0 if index == 0 else 0.2
@@ -6600,37 +7144,43 @@ def _vertical_candidate_geometry(
                             )
                         )
                     except ValueError as sequential_error:
-                        cut_phases = [
-                            phase.model_copy(
-                                update={
-                                    "transition_in": "cut",
-                                    "transition_duration_fraction": 0.0,
-                                }
-                            )
-                            for phase in sequential_phases
-                        ]
-                        try:
-                            filter_graph, sequential_geometry = (
-                                _vertical_virtual_camera_filter_from_tracks(
-                                    tracks_by_region=tracks_by_region,
-                                    phases=cut_phases,
-                                    phase_origin="gemini_proposed",
-                                    display_sample_aspect_ratio=(
-                                        display_sample_aspect_ratio
-                                    ),
+                        sequential_geometry = None
+                        if all(
+                            phase.cut_admissible
+                            for phase in sequential_phases[1:]
+                        ):
+                            cut_phases = [
+                                phase.model_copy(
+                                    update={
+                                        "transition_in": "cut",
+                                        "transition_duration_fraction": 0.0,
+                                    }
                                 )
-                            )
-                            sequential_phases = cut_phases
-                            sequential_geometry.setdefault(
-                                "risk_codes", []
-                            ).append(
-                                "unsafe_sequential_pan_converted_to_reframe_cut"
-                            )
-                            sequential_geometry[
-                                "sequential_pan_failure_reason"
-                            ] = str(sequential_error)
-                        except ValueError:
-                            sequential_geometry = None
+                                for phase in sequential_phases
+                            ]
+                            try:
+                                filter_graph, sequential_geometry = (
+                                    _vertical_virtual_camera_filter_from_tracks(
+                                        tracks_by_region=tracks_by_region,
+                                        phases=cut_phases,
+                                        phase_origin="gemini_proposed",
+                                        display_sample_aspect_ratio=(
+                                            display_sample_aspect_ratio
+                                        ),
+                                    )
+                                )
+                                sequential_phases = cut_phases
+                                sequential_geometry.setdefault(
+                                    "risk_codes", []
+                                ).append(
+                                    "unsafe_sequential_pan_converted_to_"
+                                    "semantically_admissible_reframe_cut"
+                                )
+                                sequential_geometry[
+                                    "sequential_pan_failure_reason"
+                                ] = str(sequential_error)
+                            except ValueError:
+                                sequential_geometry = None
                     if sequential_geometry is not None:
                         geometry = sequential_geometry
                         geometry.setdefault("risk_codes", []).extend(
@@ -7234,8 +7784,8 @@ def _refine_selected_vertical_candidate(
         "selection_reason": option_data.get("selection_reason"),
         "current_strategy": option_data.get("strategy"),
         "current_target_description": option_data.get("target_description"),
-        "current_coverage_intent": option_data.get("coverage_intent"),
-        "current_coverage_target_descriptions": option_data.get(
+        "locked_minimum_coverage_intent": option_data.get("coverage_intent"),
+        "locked_required_target_descriptions": option_data.get(
             "coverage_target_descriptions", []
         ),
         "current_regions": option_data.get("regions", []),
@@ -7274,6 +7824,24 @@ def _refine_selected_vertical_candidate(
     raw_output_path = run_dir / "selected_vertical_framing.raw_output.json"
     raw_interaction_path = run_dir / "selected_vertical_framing.raw_interaction.json"
     reused = False
+    raw_paid_response_is_locally_recoverable = False
+    if raw_output_path.is_file() and raw_interaction_path.is_file():
+        try:
+            saved_raw_output = read_json(raw_output_path)
+            saved_canonical_text, _ = (
+                canonicalize_selected_vertical_framing_output(
+                    str(saved_raw_output["output_text"])
+                )
+            )
+            SelectedVerticalFramingProposal.model_validate_json(
+                saved_canonical_text
+            )
+            raw_paid_response_is_locally_recoverable = True
+        except Exception:
+            # The previous paid response is not a representation-only miss.
+            # Let the client perform its one bounded schema/contract repair;
+            # request/transport failures still never auto-retry there.
+            raw_paid_response_is_locally_recoverable = False
     if proposal_path.is_file() and binding_path.is_file():
         binding = read_json(binding_path)
         if binding.get("request_fingerprint") != request_fingerprint:
@@ -7337,7 +7905,7 @@ def _refine_selected_vertical_candidate(
                 read_json(proposal_path)
             )
         reused = True
-    elif raw_output_path.is_file() and raw_interaction_path.is_file():
+    elif raw_paid_response_is_locally_recoverable:
         # Representation-only recovery after a stricter local validator
         # rejected an otherwise complete paid response.  Never send another
         # request merely because the consumer contract was repaired.
@@ -7863,28 +8431,27 @@ def _should_refine_selected_vertical_candidate(
 ) -> bool:
     """Return whether a selected clip still lacks an executable camera plan.
 
-    Direct-video planning avoids a second paid pass only when it already
-    supplied enough geometry intent for the capabilities available at runtime.
-    Older or sparse plan artifacts must be enriched whenever they lack a
-    virtual-camera decision.  A list of targets is geometry input, not an
-    editorial camera plan: without the selected-clip pass, newly added hold,
-    follow, controlled-clip, relation-core, and phase-camera capabilities
-    remain invisible and the renderer can fall back to a mechanical center
-    crop.  The immutable candidate/event/frame identity and upstream coverage
+    Broad direct-video planning selects evidence and proposes an editorial
+    presentation, but it cannot reliably prove that a phase transition is
+    executable after local tracking, duration, and geometry constraints are
+    known.  Every automatically framed selected clip therefore receives the
+    bounded selected-clip pass, even when the broad plan already contains a
+    virtual-camera proposal.  This lets the model express transition
+    motivation and cut admissibility using the actual selected clip without
+    re-watching the whole rushes set.
+
+    The immutable candidate/event/frame identity and upstream coverage
     obligation are checked after enrichment, so this cannot silently replace
-    the selected evidence.
+    the selected evidence or weaken its semantic contract.
     """
 
     if not auto_vertical_framing or human_reframe_policy_requested:
         return False
-    missing_executable_camera_intent = (
-        option_data.get("virtual_camera_proposal") is None
-    )
     if external_projection_contract_id in {
         "direct-video-edit-plan-v1",
         "direct-video-edit-plan-v2",
     }:
-        return missing_executable_camera_intent
+        return True
     return (
         feature_plan_origin != "external_projection"
         or option_data.get("virtual_camera_proposal") is None
@@ -8135,6 +8702,9 @@ def _resolve_vertical_camera_phases(
             end_progress=phase.end_progress,
             anchor_region_ids=phase.anchor_region_ids,
             camera_behavior=phase.camera_behavior,
+            movement_motivation=phase.movement_motivation,
+            traversal_policy=proposal.traversal_policy,
+            cut_admissible=phase.cut_admissible,
             transition_in=phase.transition_in,
             transition_duration_fraction=phase.transition_duration_fraction,
             minimum_anchor_visible_fraction=minimum_visible_fraction(phase),

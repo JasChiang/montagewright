@@ -114,7 +114,7 @@ Clip Card 現在分成「不可變 Base Card」與按需產生的 `ClipObservati
 
 舊式 catalog／feature plan 若缺少可執行構圖意圖，`feature-cut` 仍可補做一次 **selected-clip framing refinement**。新的 `direct-video-edit-plan-v2` 路徑已在同一個 brief＋bounded 候選影片＋音樂 planning call 中完成選片、AttentionObservation、ShotFlowIntent、phase coverage 與相對停留，因此不會再付費重看同一片段；下游只做 exact-frame bbox、SAM、identity checkpoint、本機運鏡與 MusicMap boundary reconciliation。v2 的 phase anchors 不會再被全域 required union 覆寫。舊 refinement 僅保留作 legacy／研究相容路徑。
 
-本機的 phase transition 使用 smoothstep easing，並依實際移動距離同時估算速度、加速度與 jerk 所需的最低時間；Gemini 建議的 transition 若太短，不能直接把鏡頭加速。能安全完成時才移動，距離太遠或 phase 太短時改成有稽核紀錄的硬切，微小 tracker 位移則由 deadband 吸收。scale 也受來源解析度與最多 1.12× 的保守上限約束。若幾何失敗就改試下一個 take 或安全 fallback，不會硬做模型要求的移動。
+本機不再把每個 phase 的 anchor 中心直接當成相機 keyframe。它會先從該 phase 的 SAM samples 求出能保留 hard anchors 的裁切中心可行區域，再對整段 shot 求最小移動路徑；一個靜止構圖能跨 phase 成立時便維持不動。Gemini 只說明 attention phase、移動理由與語意順序是否可交換，不輸出左／右方向、座標或速度。小於可感門檻的位移會折疊成 hold，沒有理由的移動、無理由折返或缺乏 settle window 的連續 transition 會轉成有稽核紀錄的 hard cut。需要連續移動時使用 quintic smootherstep，並依實際距離檢查速度、加速度與 jerk；tracker 小幅抖動由 hysteresis／deadband 吸收。scale 仍受來源解析度與最多 1.12× 的保守上限約束。
 
 這也不是把「兩個都必須同時看見」改成任意裁切。規劃器以 `simultaneous`、`sequential`、`relation_core`、`primary_with_context` 與 `independent_detail` 表達語意：失去同框就無法證明的接觸、交接或同時狀態不能被拆鏡；可依序理解的角色、UI 步驟或多個焦點則不再全程 preserve-all；比較畫面只需保留真正承載大小、厚度、方向或接觸的 relation core，不能因追求完整物件而犧牲滿版，也不能分別放大造成尺度誤導。所有 full-bleed 方案與 Top-K 都失敗時，renderer 只可輸出 `full_bleed_center_crop_review` 供人工看問題；只有明確要求保全不可分割寬構圖時才另產生純色 fit review，兩者都不冒充 geometry success。
 
@@ -509,7 +509,7 @@ P1 不再把 Gemini 的 `recommended_duration_seconds` 當成孤立數字。每�
 
 本機先將 maximum clamp 到 QualitySafeInterval 的連續容量，再建立 `AttentionProfile` 與 `RhythmPlan`。RhythmPlan 只提供章節時長上下限和 boundary pressure；它沒有 source timestamp 欄位，不能自行產生 frame-accurate cut。舊 plan 沒有完整 attention vector 時，未知欄位保持 `null`，不以規則偽造模型分數。
 
-P2 將 reframe 從固定倍率升級為可稽核的 `VirtualCameraPlan`。16:9 與 9:16 都能使用 Gemini 基於素材證據提出的 `hold`、`follow_deadband`、`follow`、`punch_in_cut`、`push_in` 或 `pull_out`；多 anchor 直式鏡頭另可依 phase 順序交接注意力。實際 keyframe scale、center、containment、deadband、速度、加速度與 jerk 由本機 track 和 geometry solver 決定，不能由模型直接填數值。每個執行結果保存 sidecar 與 track fingerprint；phase 間若沒有足夠時間完成安全移動，就轉為 hard cut 而不是快速掃過。這套 16:9 剪輯運鏡與 9:16 版型 reframe 共用 tracking evidence，但分屬不同 editorial contract。
+P2 將 reframe 從固定倍率升級為可稽核的 `VirtualCameraPlan`。16:9 與 9:16 都能使用 Gemini 基於素材證據提出的 `hold`、`follow_deadband`、`follow`、`punch_in_cut`、`push_in` 或 `pull_out`；多 anchor 直式鏡頭另可依 phase 順序交接注意力。Gemini 另需標記 `movement_motivation`，並以 `semantic_order_locked`、`spatially_optimizable` 或 `no_continuous_traversal` 說明本機可否優化構圖位置；任何 policy 都不能交換影片中的事件時序，也不指定字面方向。實際 keyframe scale、可行 center region、全段最小移動路徑、containment、hysteresis、速度、加速度與 jerk 都由本機 track 和 geometry compiler 決定。微小位移只有在跨區間共同靜態構圖仍合法時才會折疊成 hold；自動改成 hard cut 則另需 `cut_admissible` 證明不會切斷關係、動作、UI 狀態或閱讀。每個執行結果保存 sidecar、track fingerprint、實際 crop movement episode 與 traversal audit。這套 16:9 剪輯運鏡與 9:16 版型 reframe 共用 tracking evidence，但分屬不同 editorial contract。
 
 若使用者授權的交付範圍是 60–90 秒，而 Gemini 的各章 AttentionProfile 在 QualitySafeInterval 內的最大連續容量總和略短於 brief 偏好秒數，可明示 `--allow-shorter-within-delivery-range`。程式只會把 project duration 降到仍在交付範圍內的 attention maximum，並保存 `project-duration-resolution.json`；它不會重播、停格、穿過髒畫面或偷偷延長任何章節。容量依 requested aspect、候選與 evidence anchor 分開計算：只計算包含該 anchor 的連續 safe interval，並以至少一個可執行候選能承擔的容量規劃；runtime 換候選時仍須重新確認該候選能承擔已配置時長。若已核准的同一首音樂長於縮短後的 project timeline，scheduler 可在使用者明示允許縮短交付時使用其合法 prefix cues 來調整畫面章節邊界；`feature-delivery` 接著強制由 assembly 產生單一連續區段與自然淡出，不切碎、交疊或 time-stretch 音樂，再對 final mux 執行成片 QA。任何長度或 lineage 不一致都會 fail closed。
 

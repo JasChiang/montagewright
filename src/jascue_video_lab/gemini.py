@@ -68,7 +68,7 @@ MODEL_ID = os.environ.get("JASCUE_GEMINI_MODEL", "gemini-3.6-flash")
 API_NAME = "gemini_interactions"
 SDK_NAME = "google-genai"
 SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION = (
-    "selected-vertical-framing-normalization-v2"
+    "selected-vertical-framing-normalization-v3"
 )
 
 
@@ -192,6 +192,152 @@ def canonicalize_selected_vertical_framing_output(
                     }
                 )
                 region["atomic"] = False
+        required_participants = [
+            region
+            for region in regions_value
+            if (
+                isinstance(region, dict)
+                and region.get("role") == "required"
+                and region.get("evidence_role") == "relation_participant"
+                and region.get("entity_id") is not None
+                and region.get("kind")
+                not in {"text_region", "ui_region", "graphic"}
+            )
+        ]
+        existing_atomic_carrier = any(
+            isinstance(region, dict)
+            and region.get("role") == "required"
+            and region.get("atomic") is True
+            and region.get("evidence_role") == "relation_carrier"
+            for region in regions_value
+        )
+        # A bounded representation repair is safe only when the model already
+        # made all semantic choices: the relation is simultaneous, controlled
+        # clipping is explicitly feasible, and exactly two participant
+        # identities are bound.  The canonicalizer then expresses the
+        # smallest shared relation core as the sole hard anchor while keeping
+        # both complete participants as soft identity/context extents.
+        if (
+            len(required_participants) == 2
+            and not existing_atomic_carrier
+            and all(
+                str(region.get("target_description") or "").strip()
+                for region in required_participants
+            )
+        ):
+            participant_region_ids = {
+                str(region["region_id"]) for region in required_participants
+            }
+            participant_entity_ids = [
+                str(region["entity_id"]) for region in required_participants
+            ]
+            participant_descriptions = [
+                str(region["target_description"])
+                for region in required_participants
+            ]
+            carrier_id = (
+                str(payload.get("candidate_id") or "candidate")
+                + ".required.atomic_relation_core"
+            )
+            carrier = {
+                "region_id": carrier_id,
+                "entity_id": None,
+                "target_description": (
+                    "同一個局部畫面中，"
+                    + participant_descriptions[0]
+                    + " 與 "
+                    + participant_descriptions[1]
+                    + " 直接形成之可見接觸、相鄰或比較核心；只框讓兩者關係"
+                    "成立的最小共同區域，不包含可犧牲的物件外圍"
+                ),
+                "kind": "other",
+                "evidence_role": "relation_carrier",
+                "observable_relations": [
+                    "simultaneous_relation_participants="
+                    + ",".join(participant_entity_ids)
+                ],
+                "exclusions": [],
+                "role": "required",
+                "atomic": True,
+                "minimum_visible_fraction": 1.0,
+            }
+            for index, region in enumerate(regions_value):
+                if region not in required_participants:
+                    continue
+                changes.append(
+                    {
+                        "field": f"regions[{index}].role",
+                        "from": "required",
+                        "to": "preferred",
+                        "reason": (
+                            "explicit_controlled_clipping_uses_one_atomic_"
+                            "relation_core_and_keeps_full_participants_as_"
+                            "soft_identity_context"
+                        ),
+                    }
+                )
+                region["role"] = "preferred"
+                region["atomic"] = False
+                region["minimum_visible_fraction"] = 0.5
+            regions_value.insert(0, carrier)
+            changes.append(
+                {
+                    "field": "regions[0]",
+                    "from": None,
+                    "to": carrier_id,
+                    "reason": (
+                        "explicit_controlled_clipping_compacts_two_bound_"
+                        "participants_into_one_minimal_atomic_relation_core"
+                    ),
+                }
+            )
+            if isinstance(proposal, dict):
+                phases_value = proposal.get("phases")
+                if isinstance(phases_value, list):
+                    for phase_index, phase in enumerate(phases_value):
+                        if not isinstance(phase, dict):
+                            continue
+                        anchors = list(phase.get("anchor_region_ids") or [])
+                        if not (
+                            participant_region_ids & set(anchors)
+                        ):
+                            continue
+                        canonical_anchors = [
+                            anchor
+                            for anchor in anchors
+                            if anchor not in participant_region_ids
+                        ]
+                        if carrier_id not in canonical_anchors:
+                            canonical_anchors.append(carrier_id)
+                        changes.append(
+                            {
+                                "field": (
+                                    "virtual_camera_proposal.phases"
+                                    f"[{phase_index}].anchor_region_ids"
+                                ),
+                                "from": anchors,
+                                "to": canonical_anchors,
+                                "reason": (
+                                    "phase_tracks_the_explicit_minimal_"
+                                    "simultaneous_relation_core"
+                                ),
+                            }
+                        )
+                        phase["anchor_region_ids"] = canonical_anchors
+                if proposal.get("composition_mode") == "joint_relation":
+                    changes.append(
+                        {
+                            "field": "virtual_camera_proposal.composition_mode",
+                            "from": "joint_relation",
+                            "to": "single_anchor_hold",
+                            "reason": (
+                                "one_atomic_relation_core_is_the_only_hard_"
+                                "phase_anchor"
+                            ),
+                        }
+                    )
+                    proposal["composition_mode"] = "single_anchor_hold"
+            hard_region_ids = {carrier_id}
     if (
         action == "tracked_crop"
         and payload.get("semantic_requirement") == "simultaneous_relation"
@@ -230,6 +376,16 @@ def canonicalize_selected_vertical_framing_output(
             }
         )
     elif isinstance(proposal, dict):
+        if "traversal_policy" not in proposal:
+            proposal["traversal_policy"] = "semantic_order_locked"
+            changes.append(
+                {
+                    "field": "virtual_camera_proposal.traversal_policy",
+                    "from": None,
+                    "to": "semantic_order_locked",
+                    "reason": "legacy_proposal_keeps_observable_semantic_order",
+                }
+            )
         phases = proposal.get("phases")
         if isinstance(phases, list) and phases:
             referenced_region_ids = {
@@ -284,6 +440,46 @@ def canonicalize_selected_vertical_framing_output(
                         )
                 payload["regions"] = canonical_regions
             for index, phase in enumerate(phases):
+                if "movement_motivation" not in phase:
+                    behavior = phase.get("camera_behavior")
+                    motivation = {
+                        "follow": "maintain_framing",
+                        "follow_deadband": "maintain_framing",
+                        "push_in": "reveal",
+                        "pull_out": "reveal",
+                        "punch_in_cut": "emphasis",
+                    }.get(behavior, "none")
+                    phase["movement_motivation"] = motivation
+                    changes.append(
+                        {
+                            "field": (
+                                "virtual_camera_proposal.phases"
+                                f"[{index}].movement_motivation"
+                            ),
+                            "from": None,
+                            "to": motivation,
+                            "reason": (
+                                "legacy_camera_behavior_migrated_to_a_"
+                                "conservative_visible_motion_reason"
+                            ),
+                        }
+                    )
+                if "cut_admissible" not in phase:
+                    phase["cut_admissible"] = False
+                    changes.append(
+                        {
+                            "field": (
+                                "virtual_camera_proposal.phases"
+                                f"[{index}].cut_admissible"
+                            ),
+                            "from": None,
+                            "to": False,
+                            "reason": (
+                                "legacy_proposal_has_no_semantic_proof_that_"
+                                "an_automatic_hard_cut_is_safe"
+                            ),
+                        }
+                    )
                 if (
                     phase.get("transition_in") == "cut"
                     and phase.get("transition_duration_fraction", 0) != 0
@@ -3579,6 +3775,7 @@ model_provenance (return it unchanged with interaction_id=null):
         prompt_template: str,
         run_id: str,
         run_dir: Path,
+        repair_attempts: int = 1,
     ) -> SelectedVerticalFramingProposal:
         """Inspect one selected full clip before Grounding/SAM/rendering.
 
@@ -3605,98 +3802,206 @@ model_provenance (return it unchanged with interaction_id=null):
             + "（interaction_id 先回傳 null）：\n"
             + provenance.model_dump_json()
         )
-        request_record = {
-            "model": self.model_id,
-            "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
-            "store": False,
-            "input": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "video",
-                    "uri": uploaded.uri,
-                    "mime_type": uploaded.mime_type,
-                },
-            ],
-            "generation_config": {"thinking_level": "low"},
-            "response_format": {
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": gemini_response_schema(SelectedVerticalFramingProposal),
-            },
+        previous_output: str | None = None
+        previous_error: Exception | None = None
+        attempt_results: list[dict[str, Any]] = []
+        total_attempts = 1 + max(0, repair_attempts)
+        expected = {
+            "candidate_id": candidate_id,
+            "source_asset_id": source_asset_id,
+            "event_id": event_id,
+            "frame_id": frame_id,
         }
-        write_json(run_dir / "selected_vertical_framing.request.json", request_record)
-        try:
-            interaction = self.client.interactions.create(**request_record)
+
+        for attempt_number in range(1, total_attempts + 1):
+            attempt_prompt = prompt
+            if attempt_number > 1:
+                attempt_prompt += (
+                    "\n\n## 本機 Contract 修正重試\n"
+                    "前一次模型已成功回應，但輸出未通過本機 schema 或不可變"
+                    "契約。請重新觀看同一支短片並輸出一份完整的新提案；不得"
+                    "改選 candidate、source、event 或 frame，也不得用刪除必要"
+                    "主體來規避錯誤。\n"
+                    f"前一次驗證錯誤：{previous_error}\n"
+                    "以下前次輸出只供找出結構矛盾，不是可信提案：\n"
+                    + (previous_output or "<沒有可修復的 output_text>")
+                )
+            request_record = {
+                "model": self.model_id,
+                "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+                "store": False,
+                "input": [
+                    {"type": "text", "text": attempt_prompt},
+                    {
+                        "type": "video",
+                        "uri": uploaded.uri,
+                        "mime_type": uploaded.mime_type,
+                    },
+                ],
+                "generation_config": {"thinking_level": "low"},
+                "response_format": {
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": gemini_response_schema(
+                        SelectedVerticalFramingProposal
+                    ),
+                },
+            }
+            write_json(
+                run_dir
+                / f"selected_vertical_framing.attempt-{attempt_number:02d}.request.json",
+                request_record,
+            )
+            if attempt_number == 1:
+                write_json(
+                    run_dir / "selected_vertical_framing.request.json",
+                    request_record,
+                )
+            try:
+                interaction = self.client.interactions.create(**request_record)
+            except Exception as error:
+                detail = {"type": type(error).__name__, "message": str(error)}
+                attempt_results.append(
+                    {
+                        "attempt": attempt_number,
+                        "ok": False,
+                        "failure_stage": "interaction_request",
+                        "paid_repair_allowed": False,
+                        "errors": [detail],
+                    }
+                )
+                append_error(
+                    run_dir,
+                    f"selected_vertical_framing_attempt_{attempt_number:02d}_request",
+                    error,
+                )
+                write_json(
+                    run_dir / "selected_vertical_framing.schema_validation.json",
+                    {
+                        "ok": False,
+                        "recovered_by_repair": False,
+                        "successful_attempt": None,
+                        "attempts": attempt_results,
+                        "errors": [detail],
+                    },
+                )
+                # A request failure has no model output to repair.  In
+                # particular, 429/503/timeout/quota errors must not trigger a
+                # second paid video request.
+                raise
+
+            previous_output = interaction.output_text
+            raw_output = {"output_text": previous_output}
+            raw_interaction = _raw_dump(interaction)
             _record_interaction_attempt(
                 run_dir=run_dir,
-                operation="selected_vertical_framing",
+                operation=(
+                    f"selected_vertical_framing_attempt_{attempt_number:02d}"
+                ),
                 canonical_filename="selected_vertical_framing.raw_interaction.json",
                 interaction=interaction,
             )
             write_json(
-                run_dir / "selected_vertical_framing.raw_output.json",
-                {"output_text": interaction.output_text},
+                run_dir
+                / f"selected_vertical_framing.attempt-{attempt_number:02d}.raw_output.json",
+                raw_output,
             )
-            canonical_text, normalization_changes = (
-                canonicalize_selected_vertical_framing_output(
-                    interaction.output_text
+            try:
+                canonical_text, normalization_changes = (
+                    canonicalize_selected_vertical_framing_output(previous_output)
                 )
-            )
-            write_json(
-                run_dir / "selected_vertical_framing.canonical_output.json",
-                {"output_text": canonical_text},
-            )
-            write_json(
-                run_dir / "selected_vertical_framing.normalization_audit.json",
-                {
-                    "changes": normalization_changes,
-                    "editorial_selection_changed": False,
-                },
-            )
-            parsed = SelectedVerticalFramingProposal.model_validate_json(
-                canonical_text
-            )
-            expected = {
-                "candidate_id": candidate_id,
-                "source_asset_id": source_asset_id,
-                "event_id": event_id,
-                "frame_id": frame_id,
-            }
-            mismatches = {
-                key: {"expected": value, "actual": getattr(parsed, key)}
-                for key, value in expected.items()
-                if getattr(parsed, key) != value
-            }
-            if mismatches:
-                raise GeminiContractError(
-                    "selected vertical framing changed immutable selection: "
-                    f"{mismatches}"
+                parsed = SelectedVerticalFramingProposal.model_validate_json(
+                    canonical_text
                 )
-            final = parsed.model_copy(
-                update={
-                    "model_provenance": parsed.model_provenance.model_copy(
-                        update={"interaction_id": interaction.id}
-                    )
+                mismatches = {
+                    key: {"expected": value, "actual": getattr(parsed, key)}
+                    for key, value in expected.items()
+                    if getattr(parsed, key) != value
                 }
+                if mismatches:
+                    raise GeminiContractError(
+                        "selected vertical framing changed immutable selection: "
+                        f"{mismatches}"
+                    )
+                final = parsed.model_copy(
+                    update={
+                        "model_provenance": parsed.model_provenance.model_copy(
+                            update={"interaction_id": interaction.id}
+                        )
+                    }
+                )
+                attempt_results.append(
+                    {"attempt": attempt_number, "ok": True, "errors": []}
+                )
+                write_json(
+                    run_dir / "selected_vertical_framing.request.json",
+                    request_record,
+                )
+                write_json(
+                    run_dir / "selected_vertical_framing.raw_interaction.json",
+                    raw_interaction,
+                )
+                write_json(
+                    run_dir / "selected_vertical_framing.raw_output.json",
+                    raw_output,
+                )
+                write_json(
+                    run_dir / "selected_vertical_framing.canonical_output.json",
+                    {"output_text": canonical_text},
+                )
+                write_json(
+                    run_dir
+                    / "selected_vertical_framing.normalization_audit.json",
+                    {
+                        "changes": normalization_changes,
+                        "editorial_selection_changed": False,
+                    },
+                )
+                write_json(run_dir / "selected_vertical_framing.json", final)
+                write_json(
+                    run_dir / "selected_vertical_framing.schema_validation.json",
+                    {
+                        "ok": True,
+                        "recovered_by_repair": attempt_number > 1,
+                        "successful_attempt": attempt_number,
+                        "attempts": attempt_results,
+                        "errors": [],
+                    },
+                )
+                return final
+            except Exception as error:
+                previous_error = error
+                detail = {"type": type(error).__name__, "message": str(error)}
+                attempt_results.append(
+                    {
+                        "attempt": attempt_number,
+                        "ok": False,
+                        "failure_stage": "local_contract_validation",
+                        "paid_repair_allowed": attempt_number < total_attempts,
+                        "errors": [detail],
+                    }
+                )
+                append_error(
+                    run_dir,
+                    f"selected_vertical_framing_attempt_{attempt_number:02d}",
+                    error,
+                )
+
+        write_json(
+            run_dir / "selected_vertical_framing.schema_validation.json",
+            {
+                "ok": False,
+                "recovered_by_repair": False,
+                "successful_attempt": None,
+                "attempts": attempt_results,
+                "errors": attempt_results[-1]["errors"] if attempt_results else [],
+            },
+        )
+        if previous_error is None:
+            raise GeminiContractError(
+                "selected vertical framing failed without a recorded exception"
             )
-            write_json(run_dir / "selected_vertical_framing.json", final)
-            write_json(
-                run_dir / "selected_vertical_framing.schema_validation.json",
-                {"ok": True, "errors": []},
-            )
-            return final
-        except Exception as error:
-            write_json(
-                run_dir / "selected_vertical_framing.schema_validation.json",
-                {
-                    "ok": False,
-                    "errors": [
-                        {"type": type(error).__name__, "message": str(error)}
-                    ],
-                },
-            )
-            append_error(run_dir, "selected_vertical_framing", error)
-            raise
+        raise previous_error
 
     def plan_music_semantic_pairing(
         self,

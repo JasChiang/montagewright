@@ -1924,6 +1924,19 @@ class VerticalVirtualCameraPhase(StrictModel):
         "pull_out",
         "punch_in_cut",
     ] = "follow_deadband"
+    movement_motivation: Literal[
+        "none",
+        "maintain_framing",
+        "attention_handoff",
+        "reveal",
+        "emphasis",
+    ] = "none"
+    traversal_policy: Literal[
+        "semantic_order_locked",
+        "spatially_optimizable",
+        "no_continuous_traversal",
+    ] = "semantic_order_locked"
+    cut_admissible: bool = False
     transition_in: Literal["cut", "smoothstep"] = "cut"
     transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     minimum_anchor_visible_fraction: float = Field(
@@ -1973,6 +1986,14 @@ class VerticalVirtualCameraProposalPhase(StrictModel):
         "pull_out",
         "punch_in_cut",
     ] = "follow_deadband"
+    movement_motivation: Literal[
+        "none",
+        "maintain_framing",
+        "attention_handoff",
+        "reveal",
+        "emphasis",
+    ] = "none"
+    cut_admissible: bool = False
     transition_in: Literal["cut", "smoothstep"] = "cut"
     transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
     observable_predicate: str = Field(
@@ -2021,6 +2042,11 @@ class VerticalVirtualCameraProposal(StrictModel):
         "joint_relation",
         "mixed_relation",
     ]
+    traversal_policy: Literal[
+        "semantic_order_locked",
+        "spatially_optimizable",
+        "no_continuous_traversal",
+    ] = "semantic_order_locked"
     phases: list[VerticalVirtualCameraProposalPhase] = Field(
         min_length=1,
         max_length=8,
@@ -2042,6 +2068,14 @@ class VerticalVirtualCameraProposal(StrictModel):
                 raise ValueError(
                     "vertical camera proposal phases must be contiguous"
                 )
+        if any(
+            phase.transition_in == "cut" and not phase.cut_admissible
+            for phase in self.phases[1:]
+        ):
+            raise ValueError(
+                "a proposed hard cut requires an explicit semantic "
+                "cut-admissibility decision"
+            )
         if self.phases[0].transition_in != "cut":
             raise ValueError(
                 "the first vertical camera proposal phase must use a cut"
@@ -2077,6 +2111,14 @@ class VerticalVirtualCameraProposal(StrictModel):
                 raise ValueError(
                     "mixed-relation composition requires both joint and "
                     "single-anchor phases"
+                )
+        if self.traversal_policy == "spatially_optimizable":
+            if self.composition_mode != "sequential_focus" or any(
+                len(phase.anchor_region_ids) != 1 for phase in self.phases
+            ):
+                raise ValueError(
+                    "spatially optimizable traversal is only valid for "
+                    "independent single-anchor sequential phases"
                 )
         return self
 

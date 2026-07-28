@@ -390,6 +390,14 @@ class ClipCardVirtualCameraPhaseV1(StrictModel):
         "pull_out",
         "punch_in_cut",
     ] = "follow_deadband"
+    movement_motivation: Literal[
+        "none",
+        "maintain_framing",
+        "attention_handoff",
+        "reveal",
+        "emphasis",
+    ] = "none"
+    cut_admissible: bool = False
     transition_in: Literal["cut", "smoothstep"] = "cut"
     transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
     observable_predicate: str = Field(min_length=1, max_length=800)
@@ -418,6 +426,11 @@ class ClipCardVirtualCameraProposalV1(StrictModel):
         "sequential_focus",
         "joint_relation",
     ]
+    traversal_policy: Literal[
+        "semantic_order_locked",
+        "spatially_optimizable",
+        "no_continuous_traversal",
+    ] = "semantic_order_locked"
     phases: list[ClipCardVirtualCameraPhaseV1] = Field(min_length=1, max_length=8)
     proposal_reason: str = Field(min_length=1, max_length=1200)
     uncertainties: list[str] = Field(default_factory=list, max_length=12)
@@ -431,6 +444,13 @@ class ClipCardVirtualCameraProposalV1(StrictModel):
         for prior, current in zip(self.phases[:-1], self.phases[1:], strict=True):
             if abs(prior.end_progress - current.start_progress) > 1e-6:
                 raise ValueError("virtual camera proposal phases must be contiguous")
+        if any(
+            phase.transition_in == "cut" and not phase.cut_admissible
+            for phase in self.phases[1:]
+        ):
+            raise ValueError(
+                "a hard-cut phase requires semantic cut admissibility"
+            )
         if self.phases[0].transition_in != "cut":
             raise ValueError("first virtual camera phase must use a cut")
         unique_entity_ids = {
@@ -449,6 +469,14 @@ class ClipCardVirtualCameraProposalV1(StrictModel):
             "single_anchor_follow",
         } and len(unique_entity_ids) != 1:
             raise ValueError("single-anchor mode must reference one entity")
+        if self.traversal_policy == "spatially_optimizable":
+            if self.composition_mode != "sequential_focus" or any(
+                len(phase.anchor_entity_ids) != 1 for phase in self.phases
+            ):
+                raise ValueError(
+                    "spatially optimizable traversal is only valid for "
+                    "independent single-anchor sequential phases"
+                )
         return self
 
 
@@ -627,6 +655,14 @@ class DirectVideoAttentionStep(StrictModel):
         "pull_out",
         "punch_in_cut",
     ]
+    movement_motivation: Literal[
+        "none",
+        "maintain_framing",
+        "attention_handoff",
+        "reveal",
+        "emphasis",
+    ] = "none"
+    cut_admissible: bool = False
     transition_preference: Literal["auto", "continuous", "cut"] = "auto"
 
     @model_validator(mode="after")
@@ -676,6 +712,11 @@ class DirectVideoVerticalDecision(StrictModel):
         "primary_with_context",
         "independent_detail",
     ]
+    traversal_policy: Literal[
+        "semantic_order_locked",
+        "spatially_optimizable",
+        "no_continuous_traversal",
+    ] = "semantic_order_locked"
     allow_controlled_clip: bool = False
     framing_intent: str = Field(min_length=1, max_length=300)
     required_entity_indices: list[int] = Field(max_length=4)
@@ -720,6 +761,30 @@ class DirectVideoVerticalDecision(StrictModel):
                 raise ValueError(
                     "sequential coverage requires at least two distinct anchors"
                 )
+        if self.traversal_policy == "spatially_optimizable":
+            if (
+                self.coverage_mode != "sequential"
+                or not self.attention_sequence
+                or any(
+                    len(step.anchor_entity_indices) != 1
+                    for step in self.attention_sequence
+                )
+            ):
+                raise ValueError(
+                    "spatially optimizable traversal requires independent "
+                    "single-anchor sequential attention"
+                )
+        if any(
+            (
+                step.transition_preference == "cut"
+                or step.camera_behavior == "punch_in_cut"
+            )
+            and not step.cut_admissible
+            for step in self.attention_sequence[1:]
+        ):
+            raise ValueError(
+                "hard-cut attention requires semantic cut admissibility"
+            )
         if self.coverage_mode in {
             "relation_core",
             "primary_with_context",
@@ -1447,6 +1512,8 @@ def project_direct_video_edit_plan(
                         indices=step.anchor_entity_indices,
                     ),
                     camera_behavior=step.camera_behavior,
+                    movement_motivation=step.movement_motivation,
+                    cut_admissible=step.cut_admissible,
                     transition_in=transition_in,
                     transition_duration_fraction=(
                         0.0 if transition_in == "cut" else 0.15
@@ -1464,6 +1531,7 @@ def project_direct_video_edit_plan(
             )
         return ClipCardVirtualCameraProposalV1(
             composition_mode=composition_mode,
+            traversal_policy=decision.traversal_policy,
             phases=phases,
             proposal_reason=decision.framing_intent,
             uncertainties=[],
@@ -2290,6 +2358,7 @@ def _project_candidate_virtual_camera_v3(
     }
     return VerticalVirtualCameraProposal(
         composition_mode=proposal.composition_mode,
+        traversal_policy=proposal.traversal_policy,
         phases=[
             VerticalVirtualCameraProposalPhase(
                 phase_id=phase.phase_id,
@@ -2300,6 +2369,8 @@ def _project_candidate_virtual_camera_v3(
                     for entity_id in phase.anchor_entity_ids
                 ],
                 camera_behavior=phase.camera_behavior,
+                movement_motivation=phase.movement_motivation,
+                cut_admissible=phase.cut_admissible,
                 transition_in=phase.transition_in,
                 transition_duration_fraction=phase.transition_duration_fraction,
                 observable_predicate=phase.observable_predicate,
@@ -3338,7 +3409,7 @@ def main() -> int:
 6. 9:16 應把 brief 的 vertical_primary_target_description 視為內容優先序，不是強制演算法。只有需要動態跟隨且存在可靠 target 時才用 tracked_crop；若穩定構圖已可保留內容，或窄裁切無法安全包含必要範圍，可以使用 fit_with_background。不得只因 brief 有 primary target 就強制 tracked_crop。
 7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。只分類與這次構圖決策直接相關的 entity；未列入者不會被程式偷偷視為 required 或 sacrificable。不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
 8. framing_intent 只需簡潔描述本候選的構圖取捨；不得輸出座標、bbox、mask、target description 或 verbose region contract。程式會把這些 entity priority ID 與 Clip Card entity/grounding target 資料轉成 domain-neutral hard-core、soft-extent 與 overlay keepout regions。
-8a. 若同一個 source event 有兩個以上「依序重要、但不必同時出現在單一 9:16 crop」的可追蹤 entity，可以提出 virtual_camera_proposal；否則必須為 null。{"本次另附帶 candidate_id 標籤的 bounded direct-video evidence；可只依該影片中實際可見的狀態順序提出 proposal。Clip Card 未評估 camera capability 不代表 direct video 中不存在順序。" if args.candidate_video_evidence else "順序只能引用 Clip Card 的 observable_beats 與 evidence_roles；observable_beats capability 若為 not_assessed、assessed_absent 或 not_applicable，不得自行發明注意力順序或 camera behavior。"}方向可以左→右、右→左、人物→結果、整體→細節或完全不動，不得使用固定方向模板。必須同時可見的 entity 應在同一 phase 共同保留；共同上下文或相對尺度是內容意義時，不得用會破壞參照的獨立特寫取代。phase 的 anchor_entity_ids 只能引用同 candidate 的 required_entity_ids 或 preferred_entity_ids；observable_predicate 與 transition_condition 必須描述可直接觀察的條件，不能引用常識、品牌知識或自創 timestamp。start_progress／end_progress 只表達連續覆蓋 0–1 的相對敘事順序。一般跟隨優先使用 follow_deadband，只有每一段移動都承載動作證據時才使用 follow；push_in 用於可見細節／結果逐漸成為重點，pull_out 用於回到整體關係，punch_in_cut 用於明確資訊落點的硬切放大，hold 用於固定構圖。不得輸出倍率、速度、easing 或曲線；本機會依來源解析度、距離、時長、速度、加速度與 jerk 決定安全運鏡，必要時將過短的遠距平移改為 cut。自動 proposal 不授權裁切 active anchor；後續 Grounding、SAM、containment 與 motion gate 失敗時會改試下一個候選或回退。
+8a. 若同一個 source event 有兩個以上「依序重要、但不必同時出現在單一 9:16 crop」的可追蹤 entity，可以提出 virtual_camera_proposal；否則必須為 null。{"本次另附帶 candidate_id 標籤的 bounded direct-video evidence；可只依該影片中實際可見的狀態順序提出 proposal。Clip Card 未評估 camera capability 不代表 direct video 中不存在順序。" if args.candidate_video_evidence else "順序只能引用 Clip Card 的 observable_beats 與 evidence_roles；observable_beats capability 若為 not_assessed、assessed_absent 或 not_applicable，不得自行發明注意力順序或 camera behavior。"}不要輸出左、右、上、下等字面運鏡方向；請輸出語意 attention phase，本機會從 grounded geometry 決定實際方向。若可見事件嚴格決定觀看順序，traversal_policy=semantic_order_locked；若各 phase 的主體可獨立構圖，可用 spatially_optimizable，讓本機在不改變來源時間順序的前提下選擇較短、較單調的位置；若不應連續移動則用 no_continuous_traversal。不要在一段可直接單調掃視的獨立主體前，先額外建立沒有必要的中央共同構圖。必須同時可見的 entity 應在同一 phase 共同保留；共同上下文或相對尺度是內容意義時，不得用會破壞參照的獨立特寫取代。phase 的 anchor_entity_ids 只能引用同 candidate 的 required_entity_ids 或 preferred_entity_ids；observable_predicate 與 transition_condition 必須描述可直接觀察的條件，不能引用常識、品牌知識或自創 timestamp。movement_motivation 必須逐 phase 說明移動是否為 none、maintain_framing、attention_handoff、reveal 或 emphasis；沒有可見必要性就必須是 none。只有 phase boundary 前後各自成立、沒有 simultaneous relation 跨界、沒有切斷接觸／交接／UI 狀態轉換／閱讀或未完成動作，而且仍保留 setup／result／reaction 時，cut_admissible 才可為 true。start_progress／end_progress 只表達連續覆蓋 0–1 的相對敘事順序。一般跟隨優先使用 follow_deadband，只有每一段移動都承載動作證據時才使用 follow；push_in 用於可見細節／結果逐漸成為重點，pull_out 用於回到整體關係，punch_in_cut 用於明確資訊落點的硬切放大，hold 用於固定構圖。不得輸出倍率、速度、easing 或曲線；本機會依來源解析度、距離、時長、共同靜態可行區域、settle、速度、加速度與 jerk 決定保持、連續移動或經核准的 cut。自動 proposal 不授權裁切 active anchor；後續 Grounding、SAM、containment 與 motion gate 失敗時會改試下一個候選或回退。
 9. 每個 supported／partial chapter 應依可見資訊、動作完整性、閱讀需求、情緒停留、重複壓力與音樂角色提出 recommended_duration_seconds、duration_rationale 與 attention_observation。minimum／recommended／maximum dwell 必須依序排列；attention 各分量 0–1，只是待審相對判斷，不是 source timestamp 或客觀真值。action_progress 表示到片段結尾時動作／結果已完成、適合轉場的程度。
 9a. {"本次另附實際音樂，music_sha256=" + music_sha256 + "。你必須實際聆聽音訊，依可聽見的段落、能量、留白與收尾安排候選及相對停留；不得只依文字猜音樂，也不得輸出自創 beat timestamp。" if music_sha256 is not None else "本次沒有附音樂；不得推測不存在的節拍、段落或能量變化。"}
 10. bbox、mask、crop 座標與精確 cut point 均由後續 Grounding／tracker／FFmpeg 處理；本階段不得輸出座標。
@@ -3374,6 +3445,11 @@ model_provenance 必須先原樣回傳：
    每個 phase 的 anchor 只代表該 phase 必須看見的主體；全段 required entity
    不得被本機強塞進每個 phase。若關係必須同時存在，coverage_mode 使用
    simultaneous 且不得拆成多 phase。
+   每個 phase 必須用 movement_motivation 說明移動的可見理由；沒有理由就是
+   none。traversal_policy=semantic_order_locked 表示事件順序不可交換；
+   spatially_optimizable 只表示本機可在各 phase 的可行構圖區域內選較短路徑，
+   不得交換影片中的 temporal phase order；no_continuous_traversal 表示應保持
+   或只在 cut_admissible=true 的 phase boundary 硬切。
 6. 每章提供 attention_observation 與 flow_intent，描述資訊量、動作完成度、
    閱讀需求、敘事角色、能量、前後鏡頭關係與 boundary_alignment。
    visual_sync_event 只在影片中真的有可觀察落點時提供，並同時給
@@ -3402,8 +3478,13 @@ model_provenance 必須先原樣回傳：
   必須 allow_controlled_clip=true。
 - attention_sequence 只描述「看誰」與「hold/follow/push/pull/punch」；
   後續本機會以 Gemini 單幀 bbox Grounding、SAM 與 geometry solver 執行。
-- transition_preference 可選 auto、continuous 或 cut。兩個 view 各自成立但距離
-  太遠時，cut 是正式剪輯語法；即使選 continuous，本機 motion gate 仍可改成 cut。
+- 不要輸出左→右、右→左等字面方向。本機從實際 grounded anchor 位置推導；
+  spatially_optimizable 只能調整每個 phase 的合法構圖位置，不能交換來源事件順序。
+- 不得為增加動感而建立中央→左→右之類的折返；共享中央構圖只有在同時關係
+  本身需要被看見時才是一個獨立 phase。
+- transition_preference 可選 auto、continuous 或 cut。只有 boundary 前後各自成立、
+  不切斷 relation／動作／UI 轉換／閱讀，且仍保留 setup／result／reaction 時，
+  cut_admissible 才可為 true；本機 motion gate 也只能在此條件下改成 cut。
 - 沒有可見注意力轉移時，sequence 可以是空陣列；不得為了看起來有運鏡而發明移動。
 - candidate_rank 必須直接複製該章候選索引中的整數，不得引用未附影片的 rank。
 - chapter_index 與 entity_index 也只能複製輸入中的整數；本機會解析成不可變 ID。

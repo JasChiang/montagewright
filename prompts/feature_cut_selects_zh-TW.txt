@@ -79,18 +79,29 @@
   本機會再映射為 hard core／soft extent／overlay keepout。
 - phase 的 `anchor_region_ids` 只能引用同一 candidate 內已存在的 region ID。
 - phase 順序必須由這支素材實際可見的資訊揭露、人物視線、操作流程或動作交接
-  決定。可以是左→右、右→左、人物→結果、全體→細節，或完全不移動；不得把
-  任一方向當成固定模板。
+  決定。不得輸出左、右、上、下等字面運鏡方向；本機會從 grounded geometry
+  推導實際方向。語意時序須維持時用 `semantic_order_locked`；
+  `spatially_optimizable` 只授權本機在各 phase 的可行構圖區域內選擇較短、
+  較單調的位置，不授權交換影片中的 temporal phase order；不應連續移動時
+  用 `no_continuous_traversal`。
+  不得在可直接單調掃視的主體前，額外建立沒有語意必要的中央共同構圖。
 - `observable_predicate` 說明為什麼此時該看該 anchor；
   `transition_condition` 說明畫面中出現什麼可見條件才適合交接。
+- `movement_motivation` 必須逐 phase 說明是 `none`、`maintain_framing`、
+  `attention_handoff`、`reveal` 或 `emphasis`；沒有可見必要性就是 `none`。
+- 只有 phase boundary 前後各自成立、沒有 simultaneous relation 跨界、沒有
+  切斷接觸／交接／UI 狀態轉換／閱讀或未完成動作，而且仍保留必要
+  setup／result／reaction 時，`cut_admissible` 才可為 true。
 - `camera_behavior` 只表達剪輯意圖：一般跟隨優先用
   `follow_deadband`，避免把 tracker 的細小抖動變成攝影機抖動；
   只有每一段移動都需要被看見時才用 `follow`。`push_in` 用於畫面直接支持的
   細節／結果強調，`pull_out` 用於回到整體關係，`punch_in_cut` 用於明確資訊
   落點的硬切放大，`hold` 用於固定構圖。不得為了補秒數或裝飾靜態畫面而發明
   運鏡，也不得輸出倍率、像素速度、 easing 或曲線；本機會依來源解析度、移動
-  距離、phase 時長、速度、加速度與 jerk 決定安全縮放／移動，距離過遠而時間
-  不足時可確定性改成 cut。
+  距離、phase 時長、共同靜態可行區域、settle、速度、加速度與 jerk 決定
+  保持、安全移動或經核准的 cut。微小位移只有在同一靜態構圖仍符合所有
+  hard anchors 時才會保持不動；反向折返也只能在 `cut_admissible=true`
+  時改成 cut。
 - `start_progress`／`end_progress` 只表示相對敘事順序，必須從 0 連續覆蓋到 1；
   不得輸出或暗示 source timestamp。快速或關鍵交接仍需後續 dense frame ID
   refine 才能改動精確剪點。

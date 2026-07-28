@@ -129,7 +129,7 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
     assert vertical.aspect == "9x16"
 
 
-def test_direct_video_projection_enriches_missing_camera_capability_fields() -> None:
+def test_direct_video_projection_always_refines_selected_clip_camera_plan() -> None:
     assert _should_refine_selected_vertical_candidate(
         auto_vertical_framing=True,
         human_reframe_policy_requested=False,
@@ -152,7 +152,7 @@ def test_direct_video_projection_enriches_missing_camera_capability_fields() -> 
             "regions": [{"role": "required"}],
         },
     )
-    assert not _should_refine_selected_vertical_candidate(
+    assert _should_refine_selected_vertical_candidate(
         auto_vertical_framing=True,
         human_reframe_policy_requested=False,
         feature_plan_origin="external_projection",
@@ -2525,14 +2525,15 @@ def test_selected_framing_allows_scale_locked_sequential_comparison() -> None:
                 transition_condition="Attention moves to the second subject.",
                 editorial_reason="Show the first subject.",
             ),
-            VerticalVirtualCameraProposalPhase(
-                phase_id="second",
+                VerticalVirtualCameraProposalPhase(
+                    phase_id="second",
                 start_progress=0.5,
                 end_progress=1.0,
                 anchor_region_ids=["subject-b"],
                 observable_predicate="The second subject is visible.",
-                transition_condition="Hold to the end.",
-                editorial_reason="Show the second subject.",
+                    transition_condition="Hold to the end.",
+                    cut_admissible=True,
+                    editorial_reason="Show the second subject.",
             ),
         ],
         proposal_reason="Show both comparison subjects at one consistent scale.",
@@ -2598,14 +2599,15 @@ def test_sequential_comparison_rejects_scale_changing_phase() -> None:
                 editorial_reason="Show the first subject.",
                 camera_behavior="push_in",
             ),
-            VerticalVirtualCameraProposalPhase(
-                phase_id="second",
+                VerticalVirtualCameraProposalPhase(
+                    phase_id="second",
                 start_progress=0.5,
                 end_progress=1.0,
                 anchor_region_ids=["subject-b"],
                 observable_predicate="The second subject is visible.",
-                transition_condition="Hold to the end.",
-                editorial_reason="Show the second subject.",
+                    transition_condition="Hold to the end.",
+                    cut_admissible=True,
+                    editorial_reason="Show the second subject.",
             ),
         ],
         proposal_reason="An invalid comparison that changes scale.",
@@ -2665,14 +2667,15 @@ def test_selected_framing_allows_overlapping_multi_subject_handoff() -> None:
                 transition_condition="Attention moves toward the right.",
                 editorial_reason="Establish the group with an overlapping anchor.",
             ),
-            VerticalVirtualCameraProposalPhase(
-                phase_id="center-right",
+                VerticalVirtualCameraProposalPhase(
+                    phase_id="center-right",
                 start_progress=0.5,
                 end_progress=1.0,
                 anchor_region_ids=["center", "right"],
                 observable_predicate="The center and right subjects are visible.",
-                transition_condition="Hold to the end.",
-                editorial_reason="Preserve the center subject across the handoff.",
+                    transition_condition="Hold to the end.",
+                    cut_admissible=True,
+                    editorial_reason="Preserve the center subject across the handoff.",
             ),
         ],
         proposal_reason="The shared center anchor preserves the group relation.",
@@ -2842,14 +2845,15 @@ def test_selected_framing_group_coverage_accepts_overlapping_sequence() -> None:
                 transition_condition="Attention passes toward the final member.",
                 editorial_reason="Cover the first part of the group.",
             ),
-            VerticalVirtualCameraProposalPhase(
-                phase_id="second-pair",
+                VerticalVirtualCameraProposalPhase(
+                    phase_id="second-pair",
                 start_progress=0.5,
                 end_progress=1.0,
                 anchor_region_ids=["middle", "last"],
                 observable_predicate="The middle and last members are visible.",
-                transition_condition="Hold through the end.",
-                editorial_reason="Complete coverage with an overlapping anchor.",
+                    transition_condition="Hold through the end.",
+                    cut_admissible=True,
+                    editorial_reason="Complete coverage with an overlapping anchor.",
             ),
         ],
         proposal_reason="Every meaning-bearing member is covered once.",
@@ -3193,14 +3197,15 @@ def test_strictly_simultaneous_relation_rejects_sequential_focus() -> None:
                         transition_condition="The receiver becomes relevant.",
                         editorial_reason="Show the giver.",
                     ),
-                    VerticalVirtualCameraProposalPhase(
-                        phase_id="receiver",
+                        VerticalVirtualCameraProposalPhase(
+                            phase_id="receiver",
                         start_progress=0.5,
                         end_progress=1.0,
                         anchor_region_ids=["receiver"],
                         observable_predicate="The receiver is visible.",
-                        transition_condition="Hold to the end.",
-                        editorial_reason="Show the receiver.",
+                            transition_condition="Hold to the end.",
+                            cut_admissible=True,
+                            editorial_reason="Show the receiver.",
                     ),
                 ],
                 proposal_reason="This would hide the required contact relation.",
@@ -3257,14 +3262,15 @@ def test_phase_mixed_relation_requires_joint_and_single_anchor_phases() -> None:
                     transition_condition="One participant begins a solo answer.",
                     editorial_reason="Preserve the simultaneous reaction.",
                 ),
-                VerticalVirtualCameraProposalPhase(
-                    phase_id="solo-answer",
+                    VerticalVirtualCameraProposalPhase(
+                        phase_id="solo-answer",
                     start_progress=0.4,
                     end_progress=1.0,
                     anchor_region_ids=["speaker"],
                     observable_predicate="The speaker continues the answer.",
-                    transition_condition="Hold through the end.",
-                    editorial_reason="Use a readable single-person portrait.",
+                        transition_condition="Hold through the end.",
+                        cut_admissible=True,
+                        editorial_reason="Use a readable single-person portrait.",
                 ),
             ],
             proposal_reason="The interaction mixes joint and solo evidence.",
@@ -4821,6 +4827,7 @@ def test_vertical_camera_phases_require_contiguous_known_region_anchors() -> Non
             end_progress=1.0,
             anchor_region_ids=["left"],
             camera_behavior="follow",
+            cut_admissible=True,
             transition_in="smoothstep",
             transition_duration_fraction=0.4,
             editorial_reason="Reveal the performer after the result.",
@@ -4923,6 +4930,7 @@ def test_phase_virtual_camera_moves_between_independent_tracked_anchors() -> Non
             end_progress=1.0,
             anchor_region_ids=["left"],
             camera_behavior="hold",
+            cut_admissible=True,
             transition_in="smoothstep",
             transition_duration_fraction=0.5,
             editorial_reason="Pan to the left-side evidence.",
@@ -4941,7 +4949,7 @@ def test_phase_virtual_camera_moves_between_independent_tracked_anchors() -> Non
     assert audit["minimum_visible_required_area_fraction"] == 1.0
     assert audit["transition_sample_count"] == 0
     assert audit["distance_aware_transition_audit"][0]["disposition"] == (
-        "converted_to_cut"
+        "converted_to_cut_unmotivated"
     )
     assert audit["requires_gemini_review"] is True
     keyframes = audit["crop_keyframes"]
@@ -4954,6 +4962,368 @@ def test_phase_virtual_camera_moves_between_independent_tracked_anchors() -> Non
     assert plan["max_velocity"] == 0.0
     assert plan["max_acceleration"] == 0.0
     assert plan["max_jerk"] == 0.0
+
+
+def test_spatially_optimizable_virtual_camera_preserves_temporal_order() -> None:
+    def track(target_id: str, box: list[int]) -> SimpleNamespace:
+        samples = [
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                source_pts=index * 15,
+                tracking_state=TrackingState.TRACKED,
+                derived_tracking_box=box,
+            )
+            for index in range(13)
+        ]
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=6000,
+            analysis_fps=2.0,
+            seed_source_width=1920,
+            seed_source_height=1080,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target_id,
+            target_id=target_id,
+            samples=samples,
+            model_dump=lambda *, mode: {
+                "target_id": target_id,
+                "box": box,
+                "mode": mode,
+            },
+        )
+
+    phases = [
+        VerticalVirtualCameraPhase(
+            phase_id="center",
+            start_progress=0.0,
+            end_progress=1 / 3,
+            anchor_region_ids=["center"],
+            camera_behavior="hold",
+            movement_motivation="none",
+            traversal_policy="spatially_optimizable",
+            editorial_reason="Independent center subject.",
+        ),
+        VerticalVirtualCameraPhase(
+            phase_id="left",
+            start_progress=1 / 3,
+            end_progress=2 / 3,
+            anchor_region_ids=["left"],
+            camera_behavior="hold",
+            movement_motivation="attention_handoff",
+            traversal_policy="spatially_optimizable",
+            cut_admissible=True,
+            transition_in="smoothstep",
+            transition_duration_fraction=0.25,
+            editorial_reason="Independent left subject.",
+        ),
+        VerticalVirtualCameraPhase(
+            phase_id="right",
+            start_progress=2 / 3,
+            end_progress=1.0,
+            anchor_region_ids=["right"],
+            camera_behavior="hold",
+            movement_motivation="attention_handoff",
+            traversal_policy="spatially_optimizable",
+            cut_admissible=True,
+            transition_in="smoothstep",
+            transition_duration_fraction=0.25,
+            editorial_reason="Independent right subject.",
+        ),
+    ]
+
+    _, audit = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={
+            "left": track("left", [80, 300, 260, 520]),
+            "center": track("center", [410, 300, 590, 520]),
+            "right": track("right", [740, 300, 920, 520]),
+        },
+        phases=phases,
+    )
+
+    traversal = audit["traversal_audit"]
+    assert traversal["original_phase_order"] == ["center", "left", "right"]
+    assert traversal["effective_phase_order"] == ["center", "left", "right"]
+    assert traversal["reordered"] is False
+    assert (
+        audit["motion_quality_audit"][
+            "meaningful_direction_reversal_count"
+        ]
+        == 0
+    )
+
+
+def test_virtual_camera_suppresses_subperceptual_attention_handoff() -> None:
+    def track(target_id: str, box: list[int]) -> SimpleNamespace:
+        samples = [
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                source_pts=index * 15,
+                tracking_state=TrackingState.TRACKED,
+                derived_tracking_box=box,
+            )
+            for index in range(9)
+        ]
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=4000,
+            analysis_fps=2.0,
+            seed_source_width=1920,
+            seed_source_height=1080,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target_id,
+            target_id=target_id,
+            samples=samples,
+            model_dump=lambda *, mode: {"target_id": target_id, "mode": mode},
+        )
+
+    _, audit = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={
+            "a": track("a", [430, 300, 530, 520]),
+            "b": track("b", [445, 300, 545, 520]),
+        },
+        phases=[
+            VerticalVirtualCameraPhase(
+                phase_id="a",
+                start_progress=0.0,
+                end_progress=0.5,
+                anchor_region_ids=["a"],
+                camera_behavior="hold",
+                editorial_reason="First nearby subject.",
+            ),
+            VerticalVirtualCameraPhase(
+                phase_id="b",
+                start_progress=0.5,
+                end_progress=1.0,
+                anchor_region_ids=["b"],
+                camera_behavior="hold",
+                movement_motivation="attention_handoff",
+                cut_admissible=True,
+                transition_in="smoothstep",
+                transition_duration_fraction=0.25,
+                editorial_reason="Second nearby subject.",
+            ),
+        ],
+    )
+
+    assert audit["transition_sample_count"] == 0
+    assert audit["distance_aware_transition_audit"][0]["disposition"] == (
+        "shared_hold_small_displacement"
+    )
+    assert audit["motion_quality_audit"]["no_gratuitous_motion_passed"] is True
+
+
+def test_virtual_camera_uses_feasible_regions_instead_of_greedy_centers() -> None:
+    def track(target_id: str, box: list[int]) -> SimpleNamespace:
+        samples = [
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                source_pts=index * 15,
+                tracking_state=TrackingState.TRACKED,
+                derived_tracking_box=box,
+            )
+            for index in range(13)
+        ]
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=6000,
+            analysis_fps=2.0,
+            seed_source_width=1920,
+            seed_source_height=1080,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target_id,
+            target_id=target_id,
+            samples=samples,
+            model_dump=lambda *, mode: {"target_id": target_id, "mode": mode},
+        )
+
+    _, audit = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={
+            "establish": track("establish", [450, 300, 550, 520]),
+            "left": track("left", [300, 300, 400, 520]),
+            "right": track("right", [700, 300, 800, 520]),
+        },
+        phases=[
+            VerticalVirtualCameraPhase(
+                phase_id="establish",
+                start_progress=0.0,
+                end_progress=1 / 3,
+                anchor_region_ids=["establish"],
+                camera_behavior="hold",
+                editorial_reason="Establish context without mandatory centering.",
+            ),
+            VerticalVirtualCameraPhase(
+                phase_id="left",
+                start_progress=1 / 3,
+                end_progress=2 / 3,
+                anchor_region_ids=["left"],
+                camera_behavior="hold",
+                movement_motivation="attention_handoff",
+                cut_admissible=True,
+                transition_in="smoothstep",
+                transition_duration_fraction=0.25,
+                editorial_reason="Attend to the left evidence.",
+            ),
+            VerticalVirtualCameraPhase(
+                phase_id="right",
+                start_progress=2 / 3,
+                end_progress=1.0,
+                anchor_region_ids=["right"],
+                camera_behavior="hold",
+                movement_motivation="attention_handoff",
+                cut_admissible=True,
+                transition_in="smoothstep",
+                transition_duration_fraction=0.25,
+                editorial_reason="Attend to the right evidence.",
+            ),
+        ],
+    )
+
+    targets = {
+        item["phase_id"]: item["optimized_camera_center_normalized"][0]
+        for item in audit["traversal_audit"]["phase_target_audit"]
+    }
+    assert targets["establish"] == targets["left"]
+    assert targets["establish"] < targets["right"]
+    assert audit["traversal_audit"]["solver"] == (
+        "minimum_variation_feasible_region_path_v1"
+    )
+    assert (
+        audit["distance_aware_transition_audit"][0]["disposition"]
+        == "shared_hold_small_displacement"
+    )
+    assert (
+        audit["motion_quality_audit"][
+            "meaningful_direction_reversal_count"
+        ]
+        == 0
+    )
+
+
+def test_small_required_camera_move_is_not_forced_into_hold() -> None:
+    def track(target_id: str, box: list[int]) -> SimpleNamespace:
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=4000,
+            analysis_fps=2.0,
+            seed_source_width=1920,
+            seed_source_height=1080,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target_id,
+            target_id=target_id,
+            samples=[
+                SimpleNamespace(
+                    analysis_sample_time_ms=index * 500,
+                    source_pts=index * 15,
+                    tracking_state=TrackingState.TRACKED,
+                    derived_tracking_box=box,
+                )
+                for index in range(9)
+            ],
+            model_dump=lambda *, mode: {"target_id": target_id, "mode": mode},
+        )
+
+    _, audit = _vertical_virtual_camera_filter_from_tracks(
+        tracks_by_region={
+            "a": track("a", [400, 300, 500, 520]),
+            "b": track("b", [626, 300, 726, 520]),
+        },
+        phases=[
+            VerticalVirtualCameraPhase(
+                phase_id="a",
+                start_progress=0.0,
+                end_progress=0.5,
+                anchor_region_ids=["a"],
+                camera_behavior="hold",
+                editorial_reason="First hard anchor.",
+            ),
+            VerticalVirtualCameraPhase(
+                phase_id="b",
+                start_progress=0.5,
+                end_progress=1.0,
+                anchor_region_ids=["b"],
+                camera_behavior="hold",
+                movement_motivation="attention_handoff",
+                cut_admissible=True,
+                transition_in="smoothstep",
+                transition_duration_fraction=0.5,
+                editorial_reason="Second hard anchor requires a small correction.",
+            ),
+        ],
+    )
+
+    transition = audit["distance_aware_transition_audit"][0]
+    assert transition["distance_pixels"] < transition[
+        "minimum_perceptual_move_pixels"
+    ]
+    assert transition["shared_static_composition_feasible"] is False
+    assert transition["disposition"] != "shared_hold_small_displacement"
+    assert audit["crop_keyframes"][0]["crop_x_pixels"] != (
+        audit["crop_keyframes"][-1]["crop_x_pixels"]
+    )
+
+
+def test_compiler_rejects_unapproved_automatic_hard_cut() -> None:
+    def track(target_id: str, box: list[int]) -> SimpleNamespace:
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=4000,
+            analysis_fps=2.0,
+            seed_source_width=1920,
+            seed_source_height=1080,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target_id,
+            target_id=target_id,
+            samples=[
+                SimpleNamespace(
+                    analysis_sample_time_ms=index * 500,
+                    source_pts=index * 15,
+                    tracking_state=TrackingState.TRACKED,
+                    derived_tracking_box=box,
+                )
+                for index in range(9)
+            ],
+            model_dump=lambda *, mode: {"target_id": target_id, "mode": mode},
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="did not prove that cut admissible",
+    ):
+        _vertical_virtual_camera_filter_from_tracks(
+            tracks_by_region={
+                "a": track("a", [100, 300, 220, 520]),
+                "b": track("b", [760, 300, 880, 520]),
+            },
+            phases=[
+                VerticalVirtualCameraPhase(
+                    phase_id="a",
+                    start_progress=0.0,
+                    end_progress=0.5,
+                    anchor_region_ids=["a"],
+                    camera_behavior="hold",
+                    editorial_reason="First hard anchor.",
+                ),
+                VerticalVirtualCameraPhase(
+                    phase_id="b",
+                    start_progress=0.5,
+                    end_progress=1.0,
+                    anchor_region_ids=["b"],
+                    camera_behavior="hold",
+                    movement_motivation="none",
+                    cut_admissible=False,
+                    transition_in="smoothstep",
+                    transition_duration_fraction=0.25,
+                    editorial_reason=(
+                        "No semantic evidence authorizes cutting this boundary."
+                    ),
+                ),
+            ],
+        )
 
 
 def test_motion_extrema_excludes_discontinuities_at_editorial_cuts() -> None:
@@ -5133,6 +5503,7 @@ def test_phase_virtual_camera_interpolates_one_short_track_gap() -> None:
                 start_progress=0.5,
                 end_progress=1.0,
                 anchor_region_ids=["second"],
+                cut_admissible=True,
                 transition_in="smoothstep",
                 transition_duration_fraction=0.25,
                 editorial_reason="Second subject.",
@@ -5217,6 +5588,7 @@ def test_phase_virtual_camera_filter_renders_playable_portrait(
                 start_progress=0.5,
                 end_progress=1.0,
                 anchor_region_ids=["left"],
+                cut_admissible=True,
                 transition_in="smoothstep",
                 transition_duration_fraction=0.5,
                 editorial_reason="Move left.",

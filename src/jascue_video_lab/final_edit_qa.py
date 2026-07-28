@@ -386,6 +386,44 @@ def build_final_qa_segment_contract(
                     )
                     in {"tracked_crop", "tracked_reframe"}
                 ),
+                "synthetic_camera_motion": {
+                    "declared": bool(
+                        chapter.get("phase_virtual_camera_plan")
+                        or (
+                            chapter.get("strategy")
+                            or chapter.get("applied_strategy")
+                        )
+                        in {"tracked_crop", "tracked_reframe", "phase_virtual_camera"}
+                    ),
+                    "phase_plan": chapter.get("phase_virtual_camera_plan"),
+                    "traversal_audit": chapter.get("traversal_audit"),
+                    "motion_quality_audit": chapter.get(
+                        "motion_quality_audit"
+                    ),
+                    "compiled_path_semantic_validation": chapter.get(
+                        "compiled_path_semantic_validation"
+                    ),
+                    "anchor_tracking_used": (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("anchor_tracking_used"),
+                    "continuous_crop_motion_executed": (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("continuous_crop_motion_executed"),
+                    "crop_motion_episode_count": (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("crop_motion_episode_count"),
+                    "source_camera_motion_detected": (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("source_camera_motion_detected"),
+                    "perceived_reframe_class": (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("perceived_reframe_class"),
+                    "interpretation": (
+                        "Application-owned synthetic crop intent and local "
+                        "path measurements. Judge perceived motion separately "
+                        "from motion already present in the source footage."
+                    ),
+                },
                 "duration_ms": (
                     int(duration_ms)
                     if isinstance(duration_ms, (int, float)) and duration_ms > 0

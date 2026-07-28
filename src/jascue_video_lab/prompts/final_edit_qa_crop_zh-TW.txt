@@ -5,7 +5,7 @@
 - crop_containment：必要主體、肢體、物件與構圖是否被合理保留，或因裁切而影響理解。
 - subject_visibility：指定或主要主體是否持續可辨認；多主體畫面不得只檢查其中一個。
 - text_integrity：契約明確列出的必要文字是否完整、可讀且未被裁掉；沒有必要文字時使用 not_applicable。
-- tracking_stability：動態裁切是否平順跟隨主體，是否出現追蹤太短、跳動、漂移、落後或主體離開裁切範圍；靜態裁切可使用 not_applicable。
+- tracking_stability：動態裁切是否平順跟隨主體，是否出現追蹤太短、跳動、漂移、落後或主體離開裁切範圍；也要觀察虛擬鏡頭是否在沒有可見理由時移動、短暫反向折返、來回修正、沒有 settle，或以生硬移動錯過可見注意力交接。來源影片本身的 pan、tilt、手持或主體移動不等於合成 crop path；請搭配 segment contract 的 synthetic_camera_motion 區分。真正靜態且未宣告合成運鏡的裁切可使用 not_applicable。
 
 評估 overall_crop_quality 與 segment_summary 時，還必須把「幾何安全」和
 「直式構圖品質」分開觀察：

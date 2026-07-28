@@ -110,10 +110,14 @@ def simple_production_capability_catalog() -> EditingCapabilityCatalog:
             EditingCapability(
                 capability_id="phase_virtual_camera",
                 planner_use=(
-                    "Show different anchors in contiguous relative phases when "
-                    "the meaning can be reconstructed sequentially."
+                    "Show evidence-bound anchors in temporal phases. Declare the "
+                    "motion reason and whether positions are optimizable; local "
+                    "geometry preserves source-time order, reuses a valid static "
+                    "crop, and otherwise compiles a low-travel path."
                 ),
-                local_executor="phase compiler + SAM tracks + motion solver",
+                local_executor=(
+                    "phase compiler + SAM tracks + motivated monotonic motion solver"
+                ),
                 delivery_scope="delivery_candidate",
             ),
             EditingCapability(
