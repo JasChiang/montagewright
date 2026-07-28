@@ -45,6 +45,7 @@ from jascue_video_lab.editing_capabilities import (
     autonomous_production_capability_catalog,
     simple_production_capability_catalog,
 )
+from jascue_video_lab.event_lock import load_editorial_beat_contracts
 from jascue_video_lab.gemini import (
     GeminiLabClient,
     MODEL_ID,
@@ -3486,6 +3487,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--editorial-beat-contracts",
+        type=Path,
+        help=(
+            "Optional selected-window EditorialBeatContracts. Hard and "
+            "preferred visual events constrain candidate event selection "
+            "before exact-frame resolution."
+        ),
+    )
+    parser.add_argument(
         "--file-cache-root",
         type=Path,
         help=(
@@ -3546,6 +3556,16 @@ def main() -> int:
         args.autonomous_policy.expanduser().resolve(strict=True)
         if args.autonomous_policy is not None
         else None
+    )
+    editorial_contracts_path = (
+        args.editorial_beat_contracts.expanduser().resolve(strict=True)
+        if args.editorial_beat_contracts is not None
+        else None
+    )
+    editorial_contracts = (
+        load_editorial_beat_contracts(editorial_contracts_path)
+        if editorial_contracts_path is not None
+        else ()
     )
     policy: AutonomousEditPolicy | None = None
     if autonomous_policy_path is not None:
@@ -3823,6 +3843,30 @@ def main() -> int:
   不在可執行目錄中。fit_with_background 只會形成非交付 review preview。
 """
     ).strip()
+    exact_event_selection_rules = (
+        """
+## Selected-window event contracts
+The following contracts constrain candidate selection. For each hard or
+preferred visual event, choose a Clip Card candidate event whose bounded
+source interval directly contains that observable action/state transition.
+Showing the same device in a nearby static setup is not equivalent. Preserve
+the immutable source_asset_id and event_id from candidate_events. If no
+candidate contains a hard event, return not_found; never invent an event ID or
+claim that a static state contains a transition. Exact frame IDs will be
+resolved downstream.
+
+"""
+        + json.dumps(
+            [
+                contract.model_dump(mode="json")
+                for contract in editorial_contracts
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+        if editorial_contracts
+        else ""
+    )
     prompt = f"""
 你是 evidence-bound 的資深短影音挑帶剪輯師。請使用完整 Clip Card library，為使用者 brief 的每個 chapter 保留有排序的候選 take，再分別選出橫式與直式代表。你只能引用輸入列出的 source_asset_id、event_id、entity_id 與 RF frame_id。
 
@@ -3853,6 +3897,8 @@ model_provenance 必須先原樣回傳：
 
 ## 使用者 brief
 {brief.model_dump_json(indent=2)}
+
+{exact_event_selection_rules}
 
 ## {evidence_heading}
 {json.dumps(evidence, ensure_ascii=False, indent=2)}
@@ -3934,6 +3980,8 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
 
 ## 使用者 brief
 {brief.model_dump_json(indent=2)}
+
+{exact_event_selection_rules}
 
 ## 每章可選的 bounded candidate 索引
 {json.dumps(evidence, ensure_ascii=False, indent=2)}
@@ -4204,6 +4252,10 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
     )
     if music_path is not None:
         extra_projection_artifacts["source_music"] = music_path
+    if editorial_contracts_path is not None:
+        extra_projection_artifacts["editorial_beat_contracts"] = (
+            editorial_contracts_path
+        )
     if autonomous_policy_path is not None:
         extra_projection_artifacts["autonomous_policy"] = (
             autonomous_policy_path
@@ -4687,6 +4739,10 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         extra_projection_artifacts["feature_shortlist"] = shortlist_path
     if music_path is not None:
         extra_projection_artifacts["source_music"] = music_path
+    if editorial_contracts_path is not None:
+        extra_projection_artifacts["editorial_beat_contracts"] = (
+            editorial_contracts_path
+        )
     if candidate_video_manifest_path is not None:
         extra_projection_artifacts[
             "candidate_video_evidence_manifest"

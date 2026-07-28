@@ -21,6 +21,7 @@ from jascue_video_lab.clip_card_retrieval import (
 )
 from jascue_video_lab.clip_card_observations import ClipObservationSupplement
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
+from jascue_video_lab.event_lock import load_editorial_beat_contracts
 from jascue_video_lab.models import (
     FeatureEditBrief,
     FullClipCard,
@@ -39,6 +40,14 @@ def main() -> int:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--thinking-level", choices=["low", "high"], default="low")
     parser.add_argument(
+        "--editorial-beat-contracts",
+        type=Path,
+        help=(
+            "Optional selected-window contracts that constrain event recall "
+            "before final semantic planning."
+        ),
+    )
+    parser.add_argument(
         "--supplement",
         type=Path,
         action="append",
@@ -52,6 +61,13 @@ def main() -> int:
         raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required")
     catalog = RushesCatalog.model_validate(read_json(args.catalog_json))
     brief = FeatureEditBrief.model_validate(read_json(args.brief_json))
+    editorial_contracts = (
+        load_editorial_beat_contracts(
+            args.editorial_beat_contracts.expanduser().resolve(strict=True)
+        )
+        if args.editorial_beat_contracts is not None
+        else ()
+    )
     cards: dict[str, FullClipCard] = {}
     for clip in catalog.clips:
         card_path = (
@@ -98,6 +114,9 @@ frame、bbox、crop、剪點或最終排名。
 6. 不輸出 frame ID、時間、座標、模型規格或未觀察到的功能。
 7. capability 為 not_assessed 時只代表尚未補件，不能據此否定候選；
    也不得自行補出 action、result、relation、readability 或 audio role。
+8. hard／preferred visual event 必須召回直接包含該動作或狀態轉換的 event。
+   顯示相同物件的靜態 setup 不能取代 UI state change、action apex、reaction
+   peak 或其他 contracted event；找不到 hard event 時必須 not_found。
 
 contract_version 必須原樣回傳：clip-card-feature-shortlist-v1
 project_id 必須原樣回傳：{brief.project_id}
@@ -107,6 +126,9 @@ model_provenance 必須原樣回傳：
 
 ## 使用者 brief
 {brief.model_dump_json(indent=2)}
+
+## Selected-window EditorialBeatContracts
+{json.dumps([contract.model_dump(mode="json") for contract in editorial_contracts], ensure_ascii=False, indent=2)}
 
 ## 完整精簡 Clip Card library
 {json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))}
