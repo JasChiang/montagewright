@@ -1147,7 +1147,11 @@ def test_feature_cut_single_aspect_skips_unrequested_segments_and_concat(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"segment")
 
-    def fake_concat(segments: list[Path], output_path: Path) -> None:
+    def fake_concat(
+        segments: list[Path],
+        output_path: Path,
+        **_kwargs,
+    ) -> None:
         assert len(segments) == 1
         concat_outputs.append(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1374,7 +1378,11 @@ def test_feature_cut_single_aspect_found_evidence_never_runs_other_geometry(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"segment")
 
-    def fake_concat(segments: list[Path], output_path: Path) -> None:
+    def fake_concat(
+        segments: list[Path],
+        output_path: Path,
+        **_kwargs,
+    ) -> None:
         assert len(segments) == 1
         concat_outputs.append(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6088,6 +6096,72 @@ def test_concat_decodes_each_mp4_instead_of_stream_copy(tmp_path: Path) -> None:
         text=True,
     )
     assert float(completed.stdout) == pytest.approx(2.0, abs=0.08)
+
+
+def test_concat_normalizes_mixed_frame_rates_to_editorial_durations(
+    tmp_path: Path,
+) -> None:
+    segments: list[Path] = []
+    for index, frame_rate in enumerate((25, 30)):
+        segment = tmp_path / f"mixed-rate-{index}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=black:s=320x180:r={frame_rate}:d=0.93",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-t",
+                "0.95",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-pix_fmt",
+                "yuv420p",
+                str(segment),
+            ],
+            check=True,
+        )
+        segments.append(segment)
+
+    output = tmp_path / "normalized.mp4"
+    _concat_segments(
+        segments,
+        output,
+        segment_durations_seconds=(1.0, 1.0),
+    )
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=codec_type,avg_frame_rate,nb_frames",
+            "-of",
+            "json",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    metadata = json.loads(probe.stdout)
+    video = next(
+        stream
+        for stream in metadata["streams"]
+        if stream["codec_type"] == "video"
+    )
+    assert float(metadata["format"]["duration"]) == pytest.approx(2.0, abs=0.04)
+    assert video["avg_frame_rate"] == "30/1"
+    assert int(video["nb_frames"]) == 60
 
 
 def test_video_only_source_gets_explicit_synthetic_silence(tmp_path: Path) -> None:

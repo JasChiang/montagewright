@@ -1986,15 +1986,55 @@ def _render_missing_segment(
     )
 
 
-def _concat_segments(segment_paths: Sequence[Path], output_path: Path) -> None:
+def _concat_segments(
+    segment_paths: Sequence[Path],
+    output_path: Path,
+    *,
+    segment_durations_seconds: Sequence[float] | None = None,
+) -> None:
     if not segment_paths:
         raise ValueError("cannot concatenate an empty segment list")
+    if (
+        segment_durations_seconds is not None
+        and len(segment_durations_seconds) != len(segment_paths)
+    ):
+        raise ValueError("segment duration count must match segment path count")
     inputs: list[str] = []
+    filters: list[str] = []
     filter_inputs: list[str] = []
     for index, path in enumerate(segment_paths):
         inputs.extend(["-i", str(path.resolve())])
-        filter_inputs.extend([f"[{index}:v:0]", f"[{index}:a:0]"])
-    filter_graph = "".join(filter_inputs) + f"concat=n={len(segment_paths)}:v=1:a=1[v][a]"
+        duration = (
+            segment_durations_seconds[index]
+            if segment_durations_seconds is not None
+            else _probe_duration_seconds(path)
+        )
+        if duration <= 0:
+            raise ValueError("segment durations must be positive")
+        # The concat filter requires every input to start at timestamp zero.
+        # Segment renderers may preserve a source time base or differ by one
+        # frame/AAC packet at their tails, so normalize both streams and pad
+        # only up to the immutable editorial duration before concatenating.
+        filters.extend(
+            [
+                (
+                    f"[{index}:v:0]fps=30,setpts=PTS-STARTPTS,"
+                    f"tpad=stop_mode=clone:stop_duration=1,"
+                    f"trim=duration={duration:.6f},setpts=PTS-STARTPTS[v{index}]"
+                ),
+                (
+                    f"[{index}:a:0]aresample=48000,"
+                    f"asetpts=PTS-STARTPTS,apad,"
+                    f"atrim=duration={duration:.6f},"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                ),
+            ]
+        )
+        filter_inputs.extend([f"[v{index}]", f"[a{index}]"])
+    filters.append(
+        "".join(filter_inputs) + f"concat=n={len(segment_paths)}:v=1:a=1[v][a]"
+    )
+    filter_graph = ";".join(filters)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f".{output_path.stem}.partial.mp4")
     _run_segment_encoder(
@@ -2032,7 +2072,11 @@ def _concat_segments(segment_paths: Sequence[Path], output_path: Path) -> None:
             str(temporary_path),
         ]
     )
-    expected_duration = sum(_probe_duration_seconds(path) for path in segment_paths)
+    expected_duration = sum(
+        segment_durations_seconds
+        if segment_durations_seconds is not None
+        else (_probe_duration_seconds(path) for path in segment_paths)
+    )
     actual_duration = _probe_duration_seconds(temporary_path)
     if abs(actual_duration - expected_duration) > 0.25:
         raise RuntimeError(
@@ -11349,7 +11393,6 @@ def _run_feature_cut_experiment_impl(
     }
     autonomous_policy: AutonomousEditPolicy | None = None
     editorial_templates: tuple[EditorialBeatContract, ...] = ()
-    editorial_feature_ids: set[str] = set()
     if autonomous_profile:
         if autonomous_policy_path is None:
             raise ValueError("autonomous feature-cut requires its policy")
@@ -11369,9 +11412,31 @@ def _run_feature_cut_experiment_impl(
             raise ValueError(
                 "selected-window orchestration requires feature_id on every beat"
             )
-        editorial_feature_ids = {
-            str(contract.feature_id) for contract in editorial_templates
-        }
+        # The global semantic planner must choose a candidate event that can
+        # actually satisfy the selected-window contracts. Supplying these only
+        # after planning lets a visually related but temporally wrong event
+        # win (for example, a static watch UI instead of its later state
+        # change), which no exact-frame resolver can repair inside the selected
+        # window.
+        plan_prompt = (
+            plan_prompt
+            + "\n\n## Autonomous selected-window editorial contracts\n"
+            + "These contracts are immutable selection constraints. For every "
+            "hard or preferred visual event, select a candidate reel event "
+            "whose bounded source window visibly contains that event. Do not "
+            "select a nearby static setup merely because it shows the same "
+            "object. A hard event with no supporting candidate must be returned "
+            "as not_found; never substitute or infer it. Exact frame IDs and "
+            "timestamps will be resolved locally after selection.\n"
+            + json.dumps(
+                [
+                    contract.model_dump(mode="json")
+                    for contract in editorial_templates
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     if (
         music_lock is not None
         and music_sha256 is not None
@@ -12682,16 +12747,12 @@ def _run_feature_cut_experiment_impl(
                         / "vertical"
                         / f"candidate-{candidate_rank:02d}-{candidate_id}"
                     )
-                    autonomous_static_audition = (
-                        autonomous_profile
-                        and selected.feature_id not in editorial_feature_ids
-                        and not candidate_camera_phases
-                        and sum(
-                            region.execution_role == "hard_core"
-                            for region in candidate_regions
-                        )
-                        == 1
-                    )
+                    # Autonomous delivery may not accept an ungrounded center
+                    # crop just because a beat has no exact-event contract.
+                    # Every selected shot still needs deterministic containment
+                    # evidence. Review profiles retain their existing preview
+                    # fallbacks elsewhere in this orchestration.
+                    autonomous_static_audition = False
                     try:
                         candidate_query_lock: EvidenceQueryLockV2 | None = None
                         if (
@@ -13742,9 +13803,17 @@ def _run_feature_cut_experiment_impl(
         )
         stage = monotonic()
         if horizontal_output is not None:
-            _concat_segments(horizontal_segments, horizontal_output)
+            _concat_segments(
+                horizontal_segments,
+                horizontal_output,
+                segment_durations_seconds=chapter_durations,
+            )
         if vertical_output is not None:
-            _concat_segments(vertical_segments, vertical_output)
+            _concat_segments(
+                vertical_segments,
+                vertical_output,
+                segment_durations_seconds=chapter_durations,
+            )
         timings["concat_seconds"] = round(monotonic() - stage, 3)
         timings["total_seconds"] = round(monotonic() - started, 3)
         if horizontal_output is not None:

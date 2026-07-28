@@ -38,7 +38,11 @@ from .music_assembly import (
     render_single_interval_music_assembly,
     write_music_assembly_artifacts,
 )
-from .models import FeatureCutExecutionProfile
+from .models import (
+    FeatureCutExecutionProfile,
+    MusicAssemblyPlan,
+    MusicEditPlanV2,
+)
 from .storage import read_json, utc_now, write_json
 
 
@@ -696,6 +700,16 @@ def run_feature_delivery_pipeline(
                 continue
             picture = Path(str(picture_value)).resolve(strict=True)
             picture_duration_ms = _picture_video_duration_ms(picture)
+            music_timeline_path = (
+                render_manifest_path.parent
+                / "editorial-planning"
+                / "music-output-timeline.json"
+            )
+            expected_timeline = (
+                read_json(music_timeline_path)
+                if music_timeline_path.is_file()
+                else None
+            )
             aspect_dir = resolved_output / (
                 "audition" if deterministic_failure_codes else "aspects"
             ) / aspect_key
@@ -704,64 +718,78 @@ def run_feature_delivery_pipeline(
                     "feature-delivery-music-assembly-v2:"
                     f"{sha256_file(picture)}:"
                     f"{picture_duration_ms}:"
-                    f"{sha256_file(resolved_lock_path)}"
+                    f"{sha256_file(resolved_lock_path)}:"
+                    f"{sha256_file(music_timeline_path) if expected_timeline else 'unplanned'}"
                 ).encode("utf-8")
             ).hexdigest()
             assembly_dir = (
                 aspect_dir / "music-assembly" / "runs" / assembly_key
             )
-            try:
-                plan = plan_single_interval_music_assembly(
-                    music_lock,
-                    music_lock_path=resolved_lock_path,
-                    target_duration_ms=picture_duration_ms,
-                    minimum_duration_ms=max(1, picture_duration_ms - 100),
-                    maximum_duration_ms=picture_duration_ms + 100,
-                )
-                write_music_assembly_artifacts(plan, output_dir=assembly_dir)
-                rendered_music = render_single_interval_music_assembly(
-                    resolved_music,
-                    plan,
-                    assembly_dir / "music.wav",
-                    assembly_dir,
-                )
-                selected_music_plan = plan
-            except MusicAssemblyError:
-                edit_plan = plan_contiguous_reviewed_music_edit_v2(
-                    music_lock,
-                    music_lock_path=resolved_lock_path,
-                    target_duration_ms=picture_duration_ms,
-                    minimum_duration_ms=max(1, picture_duration_ms - 100),
-                    maximum_duration_ms=picture_duration_ms + 100,
-                )
-                rendered_music = render_reviewed_music_edit_v2(
-                    resolved_music,
-                    edit_plan,
-                    assembly_dir / "music.wav",
-                    assembly_dir,
-                )
-                selected_music_plan = edit_plan
-            music_timeline_path = (
-                render_manifest_path.parent
-                / "editorial-planning"
-                / "music-output-timeline.json"
-            )
-            if music_timeline_path.is_file():
-                expected_timeline = read_json(music_timeline_path)
+            if expected_timeline is not None:
                 expected_plan = expected_timeline.get("plan_definition", {})
-                expected_spans = expected_plan.get("spans", [])
-                actual_spans = [
-                    span.model_dump(mode="json")
-                    for span in selected_music_plan.spans
-                ]
-                if (
-                    expected_timeline.get("plan_contract_version")
-                    != selected_music_plan.contract_version
-                    or expected_spans != actual_spans
-                ):
+                plan_contract_version = expected_timeline.get(
+                    "plan_contract_version"
+                )
+                if plan_contract_version == "music-assembly-plan-v1":
+                    selected_music_plan = MusicAssemblyPlan.model_validate(
+                        expected_plan
+                    )
+                    write_music_assembly_artifacts(
+                        selected_music_plan,
+                        output_dir=assembly_dir,
+                    )
+                    rendered_music = render_single_interval_music_assembly(
+                        resolved_music,
+                        selected_music_plan,
+                        assembly_dir / "music.wav",
+                        assembly_dir,
+                    )
+                elif plan_contract_version == "music-edit-plan-v2":
+                    selected_music_plan = MusicEditPlanV2.model_validate(
+                        expected_plan
+                    )
+                    rendered_music = render_reviewed_music_edit_v2(
+                        resolved_music,
+                        selected_music_plan,
+                        assembly_dir / "music.wav",
+                        assembly_dir,
+                    )
+                else:
                     raise DeliveryPipelineBlocked(
-                        "delivery music assembly differs from the output "
-                        "timeline used for picture cue alignment"
+                        "picture music timeline uses an unsupported plan contract"
+                    )
+            else:
+                try:
+                    selected_music_plan = plan_single_interval_music_assembly(
+                        music_lock,
+                        music_lock_path=resolved_lock_path,
+                        target_duration_ms=picture_duration_ms,
+                        minimum_duration_ms=max(1, picture_duration_ms - 100),
+                        maximum_duration_ms=picture_duration_ms + 100,
+                    )
+                    write_music_assembly_artifacts(
+                        selected_music_plan,
+                        output_dir=assembly_dir,
+                    )
+                    rendered_music = render_single_interval_music_assembly(
+                        resolved_music,
+                        selected_music_plan,
+                        assembly_dir / "music.wav",
+                        assembly_dir,
+                    )
+                except MusicAssemblyError:
+                    selected_music_plan = plan_contiguous_reviewed_music_edit_v2(
+                        music_lock,
+                        music_lock_path=resolved_lock_path,
+                        target_duration_ms=picture_duration_ms,
+                        minimum_duration_ms=max(1, picture_duration_ms - 100),
+                        maximum_duration_ms=picture_duration_ms + 100,
+                    )
+                    rendered_music = render_reviewed_music_edit_v2(
+                        resolved_music,
+                        selected_music_plan,
+                        assembly_dir / "music.wav",
+                        assembly_dir,
                     )
             delivery = assemble_music_only_delivery(
                 picture_path=picture,
