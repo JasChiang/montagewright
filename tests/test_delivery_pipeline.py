@@ -224,6 +224,64 @@ def _autonomous_policy(profile: str = "autonomous_strict") -> AutonomousEditPoli
     )
 
 
+def test_autonomous_music_lock_refreshes_stale_policy_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    music = tmp_path / "music.wav"
+    proposal = tmp_path / "music-map.proposal.json"
+    saved_lock_path = tmp_path / "music-map.lock.v2.json"
+    music.write_bytes(b"music")
+    proposal.write_text("{}")
+    saved_lock_path.write_text('{"lock": true}')
+    music_id = f"sha256:{sha256_file(music)}"
+    saved_lock = SimpleNamespace(
+        music_id=music_id,
+        proposal_path=str(proposal),
+        proposal_sha256=sha256_file(proposal),
+        authority=SimpleNamespace(policy_reference="sha256:" + "0" * 64),
+        bpm=117.0,
+        first_downbeat_sample=13_940,
+        meter=4,
+    )
+    monkeypatch.setattr(
+        pipeline.MusicMapLock,
+        "model_validate",
+        lambda _payload: saved_lock,
+    )
+    parsed_proposal = SimpleNamespace(music_id=music_id)
+    monkeypatch.setattr(
+        pipeline.MusicMapProposal,
+        "model_validate",
+        lambda _payload: parsed_proposal,
+    )
+    captured = {}
+
+    def fake_lock(proposal_value, **kwargs):
+        captured["proposal"] = proposal_value
+        captured.update(kwargs)
+        return {"contract_version": "music-map-lock-v2"}
+
+    monkeypatch.setattr(
+        pipeline,
+        "lock_music_map_with_auto_policy",
+        fake_lock,
+    )
+    policy = _autonomous_policy()
+    refreshed = pipeline._bind_music_lock_to_autonomous_policy(
+        music_path=music,
+        music_lock_path=saved_lock_path,
+        policy=policy,
+        output_dir=tmp_path / "delivery",
+    )
+
+    assert refreshed.is_file()
+    assert captured["proposal"] is parsed_proposal
+    assert captured["authority"].policy_reference == policy.policy_reference
+    assert captured["bpm"] == 117.0
+    assert saved_lock_path != refreshed
+
+
 def _passing_deterministic_report(policy: AutonomousEditPolicy):
     return run_deterministic_delivery_qa(
         DeterministicDeliveryEvidence(

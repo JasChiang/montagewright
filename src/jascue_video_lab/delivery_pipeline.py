@@ -25,7 +25,11 @@ from .final_edit_qa import (
 )
 from .gemini import GeminiLabClient, MODEL_ID
 from .media import probe_video, sha256_file
-from .music import MusicMapLock
+from .music import (
+    MusicMapLock,
+    MusicMapProposal,
+    lock_music_map_with_auto_policy,
+)
 from .music_assembly import (
     MusicAssemblyError,
     plan_contiguous_reviewed_music_edit_v2,
@@ -40,6 +44,73 @@ from .storage import read_json, utc_now, write_json
 
 class DeliveryPipelineBlocked(RuntimeError):
     """The pipeline preserved review artifacts but cannot continue safely."""
+
+
+def _bind_music_lock_to_autonomous_policy(
+    *,
+    music_path: Path,
+    music_lock_path: Path,
+    policy: AutonomousEditPolicy,
+    output_dir: Path,
+) -> Path:
+    """Reuse deterministic analysis while issuing fresh run-policy authority."""
+
+    resolved_music = music_path.expanduser().resolve(strict=True)
+    resolved_lock = music_lock_path.expanduser().resolve(strict=True)
+    saved_lock = MusicMapLock.model_validate(read_json(resolved_lock))
+    music_digest = sha256_file(resolved_music)
+    if saved_lock.music_id != f"sha256:{music_digest}":
+        raise DeliveryPipelineBlocked(
+            "MusicMap lock does not bind the supplied soundtrack"
+        )
+    if (
+        saved_lock.authority is not None
+        and saved_lock.authority.policy_reference == policy.policy_reference
+    ):
+        return resolved_lock
+    proposal_path = Path(saved_lock.proposal_path).expanduser().resolve(
+        strict=True
+    )
+    if sha256_file(proposal_path) != saved_lock.proposal_sha256:
+        raise DeliveryPipelineBlocked(
+            "cannot refresh MusicMap authority because its proposal changed"
+        )
+    proposal = MusicMapProposal.model_validate(read_json(proposal_path))
+    if proposal.music_id != saved_lock.music_id:
+        raise DeliveryPipelineBlocked(
+            "cannot refresh MusicMap authority because source identity changed"
+        )
+    authority = authorize_decision(
+        policy,
+        decision_scope="music_map",
+        input_artifact_hashes=(
+            f"sha256:{sha256_file(proposal_path)}",
+            f"sha256:{music_digest}",
+            f"sha256:{sha256_file(resolved_lock)}",
+        ),
+        deterministic_gate_results={
+            "proposal_integrity": "passed",
+            "music_source_hash": "passed",
+            "tempo_and_meter_resolved": "passed",
+        },
+        decision_codes=(
+            "music_source_bound",
+            "deterministic_music_analysis_reused",
+            "authority_refreshed_for_current_policy",
+        ),
+    )
+    refreshed = lock_music_map_with_auto_policy(
+        proposal,
+        proposal_path=proposal_path,
+        authority=authority,
+        policy=policy,
+        bpm=saved_lock.bpm,
+        first_downbeat_sample=saved_lock.first_downbeat_sample,
+        meter=saved_lock.meter,
+    )
+    refreshed_path = output_dir / "music" / "music-map.lock.v2.json"
+    write_json(refreshed_path, refreshed)
+    return refreshed_path.resolve(strict=True)
 
 
 def _write_status(
@@ -498,11 +569,23 @@ def run_feature_delivery_pipeline(
     outputs: dict[str, Any] = {}
     deterministic_failure_codes: tuple[str, ...] = ()
     try:
+        effective_music_lock_path = music_lock_path
+        if (
+            policy is not None
+            and music_path.expanduser().is_file()
+            and music_lock_path.expanduser().is_file()
+        ):
+            effective_music_lock_path = _bind_music_lock_to_autonomous_policy(
+                music_path=music_path,
+                music_lock_path=music_lock_path,
+                policy=policy,
+                output_dir=resolved_output,
+            )
         kwargs = dict(feature_cut_kwargs)
         kwargs["output_dir"] = resolved_output / "picture"
         kwargs["brief_path"] = brief_path
         kwargs["music_path"] = music_path
-        kwargs["music_lock_path"] = music_lock_path
+        kwargs["music_lock_path"] = effective_music_lock_path
         kwargs["execution_profile"] = profile.value
         if policy is not None:
             kwargs["autonomous_policy_path"] = autonomous_policy_path
@@ -587,7 +670,9 @@ def run_feature_delivery_pipeline(
         )
 
         resolved_music = music_path.expanduser().resolve(strict=True)
-        resolved_lock_path = music_lock_path.expanduser().resolve(strict=True)
+        resolved_lock_path = effective_music_lock_path.expanduser().resolve(
+            strict=True
+        )
         music_lock = MusicMapLock.model_validate(read_json(resolved_lock_path))
         if music_lock.music_id != f"sha256:{sha256_file(resolved_music)}":
             raise DeliveryPipelineBlocked(
