@@ -7,7 +7,7 @@
   ],
   "duration": {
     "target_ms": 85000,
-    "min_ms": 75000,
+    "min_ms": 60000,
     "max_ms": 90000
   },
   "budget": {
