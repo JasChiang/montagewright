@@ -224,13 +224,36 @@ def test_legacy_plan_can_still_request_missing_selected_clip_framing() -> None:
     )
 
 
-def test_autonomous_profile_rejects_raw_output_reuse() -> None:
-    with pytest.raises(ValueError, match="forbid.*raw-output"):
+def test_autonomous_profile_rejects_unbound_raw_output_reuse() -> None:
+    with pytest.raises(ValueError, match="requires the current output"):
         _validate_autonomous_plan_reuse_flags(
             FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
             reuse_feature_plan=False,
             reuse_feature_plan_raw_output=True,
         )
+
+
+def test_autonomous_profile_allows_bound_raw_output_normalization(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "run"
+    binding = (
+        output_dir
+        / "gemini-plan"
+        / "feature_edit_plan.raw_output_binding.json"
+    )
+    binding.parent.mkdir(parents=True)
+    binding.write_text("{}", encoding="utf-8")
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}", encoding="utf-8")
+
+    _validate_autonomous_plan_reuse_flags(
+        FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+        reuse_feature_plan=False,
+        reuse_feature_plan_raw_output=True,
+        output_dir=output_dir,
+        autonomous_policy_path=policy,
+    )
 
 
 def test_autonomous_profile_rejects_unbound_plan_reuse() -> None:

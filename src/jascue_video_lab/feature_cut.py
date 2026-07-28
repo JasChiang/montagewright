@@ -9751,11 +9751,25 @@ def _validate_autonomous_plan_reuse_flags(
     }:
         return
     if reuse_feature_plan_raw_output:
-        raise ValueError(
-            "autonomous profiles forbid --reuse-feature-plan-raw-output; "
-            "schema replay cannot establish a fresh policy-bound editorial "
-            "decision"
+        if output_dir is None or autonomous_policy_path is None:
+            raise ValueError(
+                "autonomous raw-output normalization requires the current "
+                "output directory and AutonomousEditPolicy"
+            )
+        binding_path = (
+            output_dir.expanduser().resolve()
+            / "gemini-plan"
+            / "feature_edit_plan.raw_output_binding.json"
         )
+        if not binding_path.is_file():
+            raise ValueError(
+                "autonomous raw-output normalization requires its immutable "
+                "paid-request causal binding"
+            )
+        # plan_feature_edit performs the full binding comparison after the
+        # current policy-filtered capability prompt and editorial contracts
+        # have been assembled. This preflight only rejects unbound replay.
+        return
     if not reuse_feature_plan:
         return
     if output_dir is None or autonomous_policy_path is None:
