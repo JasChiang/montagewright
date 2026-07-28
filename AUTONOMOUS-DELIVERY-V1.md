@@ -44,7 +44,7 @@ Legacy `review_preview` and `production_review` continue to normalize final QA t
 The final local suite completed with:
 
 ```text
-622 passed, 1 warning
+626 passed, 1 warning
 ```
 
 The warning is the existing Starlette/httpx deprecation warning and is unrelated to autonomous delivery.
@@ -68,15 +68,17 @@ Acceptance fixtures cover:
 - strict delivery authority without a human approval artifact;
 - best-effort degradation disclosure.
 
-## Paid Samsung 9:16 benchmark
+## Archived Samsung 9:16 evidence experiment
 
-The first selected-window V1 trial reused the historical
+The first selected-window V1 experiment explicitly reused the historical
 `direct-video-edit-plan-v2`, quality, geometry, and segment artifacts, then
-created the missing exact-event evidence in the live picture run.
+created the missing exact-event evidence in the live picture run. It was useful
+for validating grouped ExactEventLocks, but it is not a valid autonomous editing
+benchmark and must not be presented as a new edit.
 
 | Result | Value |
 | --- | --- |
-| Output | `artifacts/samsung-galaxy-z-autonomous-v1-benchmark-01/picture/renders/feature-cut-9x16-clean.mp4` |
+| Archived output | `artifacts/_archive/2026-07-28-stale-plan-reuse/samsung-galaxy-z-autonomous-v1-benchmark-01/picture/renders/feature-cut-9x16-clean.mp4` |
 | Media | 82.624 s, 1080×1920, 30 fps, H.264 + 48 kHz stereo AAC |
 | Paid interactions | 23 |
 | Input / cached input | 124,058 / 0 tokens |
@@ -86,20 +88,29 @@ created the missing exact-event evidence in the live picture run.
 | Technical QC | passed |
 | Exact locks | 6 locks across 5 grouped selected windows |
 | Presentation | 6 solid fits, 4 tracked crops, 2 review center crops, 0 panels |
+| Audio | source audio only; music mux was never reached |
 | Final semantic QA | not run; deterministic hard gate stopped first |
 | Delivery state | blocked |
 
-The trial remained below the 25-interaction warm-run target. It correctly
+The evidence experiment remained below the 25-interaction warm-run target. It correctly
 failed `autonomous_strict` cue sync: the AI result stable frame was 29 frames
 from its principal downbeat, while the closing reaction and freeze were 38 and
 41 frames from the phrase ending. Gesture, watch UI, and underwater apex were
 within 0, 0, and 4 frames of their contract-specific cues. No tolerance was
-relaxed and no second paid trial was made.
+relaxed and no second paid trial was made. Because the picture plan was reused
+and no music delivery was assembled, these figures cannot be used to claim a
+fresh-plan autonomous benchmark.
 
 The run also exposed and fixed a local gate bug: an authorized
 `solid_matte_fit_used` degradation was incorrectly classified as an editorial
 omission. Presentation fallbacks are now independent from optional/preferred
 beat omission authority, with regression tests.
+
+The contaminated benchmark and its historical source run were moved to
+`artifacts/_archive/2026-07-28-stale-plan-reuse/`. Autonomous profiles now
+reject both editorial plan reuse flags before paid work. The Samsung strict
+policy also forbids solid matte fit; an all-full-bleed request must switch
+Top-K candidates or block.
 
 Historical comparison baselines remain:
 
@@ -122,8 +133,7 @@ The historical feature-cut orchestration now emits the six autonomous inputs in 
 
 `autonomous-evidence-bundle.json` indexes all six artifacts. Hard beats without a selected query lock or exact event fail closed. Preferred/optional omissions require policy authority and are written to the degradation manifest.
 
-The next edit iteration is local cue-aware trim/duration reconciliation before
-framing and render. The saved exact locks and cue deltas are sufficient to
-design that repair without paying Gemini to inspect the same selected windows
-again. Until a repaired render passes deterministic cue sync, final semantic QA
-and `delivery_eligible` remain intentionally unavailable.
+The next valid benchmark must use a fresh output directory, generate a fresh
+music-aware editorial plan, forbid solid matte fit, assemble the music-only
+audition mux before it is shown to a user, and then apply cue-aware
+trim/duration reconciliation before framing and render.

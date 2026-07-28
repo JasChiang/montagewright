@@ -26,7 +26,14 @@ deterministic-delivery-evidence.json
 
 `feature-delivery` 的正常 autonomous 路徑不再要求人工準備這六份檔案。呼叫者提供 policy 與含 `feature_id` 的 beat templates 後，入選的最終 source window 會直接重用 dense-frame decoder、以一次 grouped exact-event call 選既有 frame IDs，將 templates 綁到實際 `EvidenceQueryLockV2`，再寫入 `autonomous-evidence-bundle.json`。`--autonomous-context-dir` 與 `--deterministic-delivery-evidence` 只保留作為既有 hash-bound bundle 的相容 override。
 
-首個 Samsung 9:16 selected-window trial 已產生 82.624 秒有聲 MP4 與六個 exact locks；23 次付費 interaction 的估算成本為 US$0.27729450。技術 QC 通過，但 strict delivery 在 final QA 前正確擋下 cue sync：AI result、closing reaction 與 freeze 分別偏離指定 cue 29、38、41 frames。這是可試看的正式 evidence run，不是 `delivery_eligible` 成片；下一步必須用保存的 locks 做本機 cue-aware trim／duration reconciliation，不能放寬 tolerance 或重付費猜時間。
+Autonomous profile 必須使用全新的 output directory 重新產生 editorial
+plan；`--reuse-feature-plan` 與 `--reuse-feature-plan-raw-output` 只允許
+review profile。需要繼續同一次、輸入 hashes 完全相同的 autonomous run
+時，只能使用 `--reuse-picture-result`。Samsung strict fixture 也禁止 solid
+matte fit；無法滿版的候選必須換 Top-K，全部候選失敗則 block，不得輸出
+黑邊 fit 冒充正式直式成片。
+
+首個 Samsung 9:16 selected-window run 事後確認重用了歷史 editorial plan 與 picture artifacts，且輸出只有 source audio，沒有走到 music mux；因此它只算 ExactEventLock integration evidence，不是新的 autonomous 試剪或 benchmark。相關 run 已歸檔，不再位於 active artifact namespace。下一次 Samsung benchmark 必須使用全新 output directory 與 fresh music-aware plan，並在交付給使用者觀看前明確產生 music-only audition mux。
 
 ```bash
 UV_CACHE_DIR=.uv-cache uv run jascue-video-lab feature-delivery \

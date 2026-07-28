@@ -2478,7 +2478,14 @@ def build_parser() -> argparse.ArgumentParser:
     feature_delivery_parser.add_argument(
         "--scdet-threshold", type=float, default=4.0
     )
-    feature_delivery_parser.add_argument("--reuse-feature-plan", action="store_true")
+    feature_delivery_parser.add_argument(
+        "--reuse-feature-plan",
+        action="store_true",
+        help=(
+            "Reuse a saved editorial plan for review profiles only. Autonomous "
+            "profiles reject this flag and require a fresh output directory."
+        ),
+    )
     feature_delivery_parser.add_argument(
         "--reuse-picture-result",
         action="store_true",

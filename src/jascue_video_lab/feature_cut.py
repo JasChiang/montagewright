@@ -9175,6 +9175,28 @@ def _requires_production_prerequisites(
     }
 
 
+def _validate_autonomous_plan_reuse_flags(
+    execution_profile: FeatureCutExecutionProfile,
+    *,
+    reuse_feature_plan: bool,
+    reuse_feature_plan_raw_output: bool,
+) -> None:
+    """Keep autonomous edits from inheriting an earlier editorial decision."""
+
+    if execution_profile not in {
+        FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+        FeatureCutExecutionProfile.AUTONOMOUS_BEST_EFFORT,
+    }:
+        return
+    if reuse_feature_plan or reuse_feature_plan_raw_output:
+        raise ValueError(
+            "autonomous profiles require a fresh editorial plan in a fresh "
+            "output directory; --reuse-feature-plan and "
+            "--reuse-feature-plan-raw-output are forbidden. Resume an "
+            "unchanged hash-bound picture with --reuse-picture-result instead."
+        )
+
+
 def _build_feature_cut_eligibility_report(
     manifest: Mapping[str, Any],
     *,
@@ -13136,6 +13158,11 @@ def run_feature_cut_experiment(
     """Run feature-cut while atomically preserving terminal editorial state."""
 
     profile = FeatureCutExecutionProfile(execution_profile)
+    _validate_autonomous_plan_reuse_flags(
+        profile,
+        reuse_feature_plan=reuse_feature_plan,
+        reuse_feature_plan_raw_output=reuse_feature_plan_raw_output,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     status_path = output_dir / "run-status.json"
     if status_path.is_file():

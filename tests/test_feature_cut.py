@@ -60,6 +60,7 @@ from jascue_video_lab.feature_cut import (
     _tracking_seed_request_ms,
     _tracked_crop_geometry,
     _usable_track_centers,
+    _validate_autonomous_plan_reuse_flags,
     _validate_selected_framing_coverage_invariant,
     _validate_feature_plan_binding,
     _validate_shared_sam_session_cache,
@@ -179,6 +180,30 @@ def test_legacy_plan_can_still_request_missing_selected_clip_framing() -> None:
         feature_plan_origin="generated",
         external_projection_contract_id=None,
         option_data={"virtual_camera_proposal": None},
+    )
+
+
+@pytest.mark.parametrize(
+    ("reuse_feature_plan", "reuse_feature_plan_raw_output"),
+    [(True, False), (False, True), (True, True)],
+)
+def test_autonomous_profile_rejects_editorial_plan_reuse(
+    reuse_feature_plan: bool,
+    reuse_feature_plan_raw_output: bool,
+) -> None:
+    with pytest.raises(ValueError, match="require a fresh editorial plan"):
+        _validate_autonomous_plan_reuse_flags(
+            FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+            reuse_feature_plan=reuse_feature_plan,
+            reuse_feature_plan_raw_output=reuse_feature_plan_raw_output,
+        )
+
+
+def test_review_profile_can_explicitly_reuse_editorial_plan() -> None:
+    _validate_autonomous_plan_reuse_flags(
+        FeatureCutExecutionProfile.PRODUCTION_REVIEW,
+        reuse_feature_plan=True,
+        reuse_feature_plan_raw_output=False,
     )
 
 
