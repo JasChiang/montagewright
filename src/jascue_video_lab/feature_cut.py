@@ -167,6 +167,7 @@ from .sam_tracking import (
 from .schema import gemini_response_schema
 from .shots import ShotManifest, detect_shots_ffmpeg
 from .shot_quality import (
+    SHOT_QUALITY_SCANNER_VERSION,
     build_quality_safe_intervals,
     build_render_quality_report,
     load_shot_quality_map,
@@ -9626,6 +9627,16 @@ def _ensure_requested_quality_maps(
             ):
                 raise ValueError(
                     "cached automatic ShotQualityMap has stale source lineage"
+                )
+            if (
+                quality_map.scanner_version
+                != SHOT_QUALITY_SCANNER_VERSION
+            ):
+                quality_map = scan_shot_quality(
+                    Path(clip.path),
+                    shot_manifest=shot_manifest,
+                    shot_id=shot.shot_id,
+                    output_path=output_path,
                 )
         else:
             quality_map = scan_shot_quality(
