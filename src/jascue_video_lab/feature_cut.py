@@ -104,6 +104,13 @@ from .models import (
     approve_evidence_query_proposal_v2,
 )
 from .overlay import draw_grounding_overlay
+from .presentation import (
+    _signed_motion_reversal_count,
+    _vertical_center_crop_filter,
+    _vertical_delivery_fallback,
+    _vertical_fit_filter,
+    _vertical_required_scope_fit_filter,
+)
 from .reframe_policy import (
     REFRAME_POLICY_BINDING_ORIGIN,
     validate_reframe_policy_bundle,
@@ -4601,24 +4608,6 @@ def _minimum_variation_interval_path(
     return [float(value) for value in result if value is not None]
 
 
-def _signed_motion_reversal_count(
-    values: Sequence[float],
-    *,
-    perceptual_threshold: float,
-) -> int:
-    """Count meaningful direction reversals while ignoring tracking jitter."""
-
-    signs: list[int] = []
-    for before, after in zip(values[:-1], values[1:], strict=True):
-        delta = after - before
-        if abs(delta) < perceptual_threshold:
-            continue
-        sign = 1 if delta > 0 else -1
-        if not signs or signs[-1] != sign:
-            signs.append(sign)
-    return max(0, len(signs) - 1)
-
-
 def _vertical_virtual_camera_filter_from_tracks(
     *,
     tracks_by_region: Mapping[str, SegmentationTrack],
@@ -5795,163 +5784,6 @@ def _vertical_virtual_camera_filter_from_tracks(
         "source_display_width": source_width,
         "source_display_height": source_height,
         **lineage,
-    }
-
-
-def _vertical_fit_filter() -> str:
-    return (
-        "[0:v]fps=30,"
-        "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x0b0e12,setsar=1[base]"
-    )
-
-
-def _vertical_required_scope_fit_filter(
-    geometry: Mapping[str, Any],
-    *,
-    margin_normalized: float = 45.0,
-) -> tuple[str, dict[str, Any]] | None:
-    """Build a static solid-matte fit around the tracked required envelope.
-
-    A full-source fit preserves semantics but can make a horizontal subject
-    occupy only a small strip inside 9:16.  When failed tracked-crop geometry
-    already contains an auditable required-union box for every sampled frame,
-    remove only source space that lies outside their all-frame envelope plus a
-    fixed safety margin.  This never clips the required envelope and never
-    invents a new target; it is a review fallback, not an approved crop.
-    """
-
-    keyframes = geometry.get("crop_keyframes")
-    source_width = geometry.get("source_display_width")
-    source_height = geometry.get("source_display_height")
-    if (
-        not isinstance(keyframes, list)
-        or not keyframes
-        or not isinstance(source_width, int)
-        or not isinstance(source_height, int)
-        or source_width <= 0
-        or source_height <= 0
-    ):
-        return None
-    boxes: list[list[float]] = []
-    for keyframe in keyframes:
-        box = (
-            keyframe.get("required_union_box")
-            if isinstance(keyframe, dict)
-            else None
-        )
-        if (
-            not isinstance(box, list)
-            or len(box) != 4
-            or not all(isinstance(value, (int, float)) for value in box)
-            or not (0 <= box[0] < box[2] <= 1000)
-            or not (0 <= box[1] < box[3] <= 1000)
-        ):
-            return None
-        boxes.append([float(value) for value in box])
-    envelope = [
-        max(0.0, min(box[0] for box in boxes) - margin_normalized),
-        max(0.0, min(box[1] for box in boxes) - margin_normalized),
-        min(1000.0, max(box[2] for box in boxes) + margin_normalized),
-        min(1000.0, max(box[3] for box in boxes) + margin_normalized),
-    ]
-    if envelope[2] <= envelope[0] or envelope[3] <= envelope[1]:
-        return None
-    crop_x = max(0, round(source_width * envelope[0] / 1000))
-    crop_y = max(0, round(source_height * envelope[1] / 1000))
-    crop_width = max(
-        2,
-        int(source_width * (envelope[2] - envelope[0]) / 1000) // 2 * 2,
-    )
-    crop_height = max(
-        2,
-        int(source_height * (envelope[3] - envelope[1]) / 1000) // 2 * 2,
-    )
-    crop_width = min(crop_width, source_width - crop_x)
-    crop_height = min(crop_height, source_height - crop_y)
-    crop_width -= crop_width % 2
-    crop_height -= crop_height % 2
-    if crop_width < 2 or crop_height < 2:
-        return None
-    filter_graph = (
-        "[0:v]fps=30,"
-        "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
-        f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x0b0e12,setsar=1[base]"
-    )
-    return filter_graph, {
-        "applied_strategy": "required_scope_solid_fit",
-        "fallback_reason": "required_region_union_too_large_for_safe_9x16_crop",
-        "scope_fit_source": "tracked_required_union_all_frame_envelope",
-        "scope_envelope_box_2d": [round(value, 3) for value in envelope],
-        "scope_margin_normalized": margin_normalized,
-        "scope_crop_pixels": {
-            "x": crop_x,
-            "y": crop_y,
-            "width": crop_width,
-            "height": crop_height,
-        },
-        "required_sample_count": len(boxes),
-        "required_envelope_contained": True,
-        "risk_codes": [
-            "scope_preserving_solid_fit",
-            "human_review_required",
-        ],
-        "requires_gemini_review": True,
-        "source_geometry_lineage_passed": bool(
-            geometry.get("source_geometry_lineage_passed")
-        ),
-        "tracking_confidence_gate_passed": bool(
-            geometry.get("tracking_confidence_gate_passed")
-        ),
-    }
-
-
-def _vertical_center_crop_filter() -> str:
-    return (
-        "[0:v]fps=30,"
-        "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920:x=(iw-ow)/2:y=(ih-oh)/2,setsar=1[base]"
-    )
-
-
-def _vertical_delivery_fallback(
-    strategy: Literal["fit_with_background", "center_crop"],
-    *,
-    reason: str,
-) -> tuple[str, dict[str, Any]]:
-    """Honor the explicit delivery preference while preserving review lineage."""
-
-    if strategy == "center_crop":
-        return _vertical_center_crop_filter(), {
-            "applied_strategy": "full_bleed_center_crop_review",
-            "fallback_reason": reason,
-            "risk_codes": [
-                "explicit_full_bleed_delivery_preference",
-                "unverified_center_crop",
-                "human_review_required",
-            ],
-            "requires_gemini_review": True,
-            "full_bleed": True,
-            "semantic_review_reasons": [
-                "fallback_crop_requires_sequence_review",
-            ],
-        }
-    return _vertical_fit_filter(), {
-        "applied_strategy": "fit_with_solid_matte",
-        "fallback_reason": reason,
-        "risk_codes": [
-            "scope_preserving_solid_fit",
-            "human_review_required",
-        ],
-        "requires_gemini_review": True,
-        "full_bleed": False,
-        "semantic_review_reasons": [
-            "scope_preserving_fit_is_review_only",
-        ],
     }
 
 

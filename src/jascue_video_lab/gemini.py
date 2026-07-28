@@ -15,6 +15,7 @@ from typing import Any, Literal, Sequence
 
 from google import genai
 from google.genai import types
+from PIL import Image
 
 from .event_lock import (
     EditorialBeatContract,
@@ -28,6 +29,10 @@ from .identity_checkpoints import IdentityCheckpointModelDecision
 from .media import sha256_file
 from .music import MusicMapLock
 from .music_cues import SemanticMusicPairingProposal, VisualSyncMap
+from .presentation import (
+    GroundingTargetRequest,
+    MultiTargetGroundingGroup,
+)
 from .models import (
     ContentMap,
     DirectVideoGroundingProposal,
@@ -1873,6 +1878,154 @@ class GeminiLabClient:
                 },
             )
             append_error(output_dir, "identity_checkpoint", error)
+            raise
+
+    def ground_multi_target_exact_frame(
+        self,
+        *,
+        event_lock: ExactEventLockV2,
+        frame_path: Path,
+        targets: Sequence[GroundingTargetRequest],
+        output_dir: Path,
+    ) -> MultiTargetGroundingGroup:
+        """Ground at most four targets in one exact original-aspect image call."""
+
+        if not 1 <= len(targets) <= 4:
+            raise ValueError("multi-target grounding supports one to four targets")
+        target_ids = [target.target_id for target in targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("multi-target grounding target IDs must be unique")
+        resolved_frame = frame_path.expanduser().resolve(strict=True)
+        if sha256_file(resolved_frame) != event_lock.source_frame_hash:
+            raise ValueError("grounding frame does not match ExactEventLockV2")
+        with Image.open(resolved_frame) as image:
+            width, height = image.size
+        mime_type = mimetypes.guess_type(resolved_frame.name)[0] or "image/jpeg"
+        prompt = (
+            "## MULTI_TARGET_EXACT_FRAME_GROUNDING\n"
+            "只處理這一張原比例 exact frame。依 target_id 順序回傳每個"
+            "目標的候選 box_2d_yxyx=[ymin,xmin,ymax,xmax]，座標 0..1000。"
+            "不得輸出 timestamp、PTS、crop、panel 或相機方向。找不到時"
+            " visible=false 且 candidates=[]；有歧義時保留候選與"
+            " ambiguity_reason，不得自行挑一個相似實例。\n"
+            f"source_asset_id={event_lock.source_asset_id}\n"
+            f"event_lock_id={event_lock.event_id}\n"
+            f"source_frame_id={event_lock.source_frame_id}\n"
+            f"source_frame_hash={event_lock.source_frame_hash}\n"
+            f"source_width={width}\nsource_height={height}\n"
+            "targets="
+            + json.dumps(
+                [target.model_dump(mode="json") for target in targets],
+                ensure_ascii=False,
+            )
+        )
+        image_item = {
+            "type": "image",
+            "data": base64.b64encode(resolved_frame.read_bytes()).decode(
+                "ascii"
+            ),
+            "mime_type": mime_type,
+            "media_resolution": "high",
+        }
+        request = {
+            "model": self.model_id,
+            "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+            "store": False,
+            "input": [
+                {"type": "text", "text": prompt},
+                image_item,
+            ],
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 2048,
+            },
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(
+                    MultiTargetGroundingGroup
+                ),
+            },
+        }
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_json(
+            output_dir / "multi_target_grounding.request.json",
+            {
+                **request,
+                "input": [
+                    request["input"][0],
+                    {
+                        "type": "image",
+                        "mime_type": mime_type,
+                        "sha256": event_lock.source_frame_hash,
+                        "media_resolution": "high",
+                    },
+                ],
+            },
+        )
+        try:
+            interaction = self.client.interactions.create(**request)
+            _record_interaction_attempt(
+                run_dir=output_dir,
+                operation="multi_target_grounding",
+                canonical_filename=(
+                    "multi_target_grounding.raw_interaction.json"
+                ),
+                interaction=interaction,
+            )
+            write_json(
+                output_dir / "multi_target_grounding.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            group = MultiTargetGroundingGroup.model_validate_json(
+                interaction.output_text
+            )
+            expected_metadata = {
+                "source_asset_id": event_lock.source_asset_id,
+                "event_lock_id": event_lock.event_id,
+                "source_frame_id": event_lock.source_frame_id,
+                "source_frame_hash": event_lock.source_frame_hash,
+                "source_width": width,
+                "source_height": height,
+            }
+            mismatches = {
+                field: {
+                    "expected": expected,
+                    "actual": getattr(group, field),
+                }
+                for field, expected in expected_metadata.items()
+                if getattr(group, field) != expected
+            }
+            if mismatches:
+                raise GeminiContractError(
+                    "multi-target grounding changed immutable metadata: "
+                    f"{mismatches}"
+                )
+            if [target.target_id for target in group.targets] != target_ids:
+                raise GeminiContractError(
+                    "multi-target grounding changed target order"
+                )
+            write_json(output_dir / "multi_target_grounding.json", group)
+            write_json(
+                output_dir / "multi_target_grounding.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return group
+        except Exception as error:
+            write_json(
+                output_dir / "multi_target_grounding.schema_validation.json",
+                {
+                    "ok": False,
+                    "repair_attempted": False,
+                    "errors": [
+                        {
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        }
+                    ],
+                },
+            )
+            append_error(output_dir, "multi_target_grounding", error)
             raise
 
     def ground_frame(

@@ -28,6 +28,9 @@ class EditingCapability(_StrictModel):
         "controlled_semantic_clip",
         "alternate_candidate",
         "solid_fit_review_fallback",
+        "two_panel_layout",
+        "solid_matte_fit",
+        "intentional_freeze",
         "music_phrase_alignment",
         "bounded_final_qa_replan",
     ]
@@ -187,4 +190,54 @@ def simple_production_capability_catalog() -> EditingCapabilityCatalog:
             "solid_fit",
             "blurred_background",
         ],
+    )
+
+
+def autonomous_production_capability_catalog() -> EditingCapabilityCatalog:
+    """Extend the same catalog with policy-gated autonomous presentations."""
+
+    legacy = simple_production_capability_catalog()
+    return legacy.model_copy(
+        update={
+            "capabilities": [
+                *legacy.capabilities,
+                EditingCapability(
+                    capability_id="two_panel_layout",
+                    planner_use=(
+                        "Declare that simultaneous comparison or context-detail "
+                        "presentation is semantically acceptable. Local code "
+                        "chooses top/bottom, side-by-side, rectangles and scale."
+                    ),
+                    local_executor="two-panel geometry compiler + FFmpeg",
+                    delivery_scope="delivery_candidate",
+                ),
+                EditingCapability(
+                    capability_id="solid_matte_fit",
+                    planner_use=(
+                        "Preserve an inseparable required scope when the signed "
+                        "AutonomousEditPolicy authorizes solid matte delivery."
+                    ),
+                    local_executor="scope-preserving solid-matte renderer",
+                    delivery_scope="delivery_candidate",
+                ),
+                EditingCapability(
+                    capability_id="intentional_freeze",
+                    planner_use=(
+                        "Hold an exact action/reaction frame only when brief and "
+                        "policy authorize it and a music cue binds the start."
+                    ),
+                    local_executor="exact-event PTS freeze renderer",
+                    delivery_scope="delivery_candidate",
+                ),
+            ],
+            "automatic_fallback_order": [
+                "static_or_tracked_full_bleed",
+                "phase_virtual_camera_or_hard_cut",
+                "alternate_candidate",
+                "two_panel_layout_when_relation_requires",
+                "solid_matte_fit_when_policy_authorized",
+                "optional_beat_omission_when_policy_authorized",
+            ],
+            "prohibited_automatic_delivery": ["blurred_background"],
+        }
     )
