@@ -421,7 +421,12 @@ class BudgetLedger:
         else:
             usable_fraction = 1.0 - self.reserved_recovery_fraction
             cost_limit = self.max_cost_usd * usable_fraction
-            interaction_limit = int(self.max_interactions * usable_fraction)
+            # The fraction is a monetary reserve. Interaction cardinality
+            # separately preserves the mandatory first final-QA call. A second
+            # QA/replan remains bounded by the absolute cap and is available
+            # only when earlier stages consume fewer calls.
+            recovery_slots = min(1, max(1, self.max_interactions - 1))
+            interaction_limit = self.max_interactions - recovery_slots
         failures: list[str] = []
         if projected_cost > cost_limit + 1e-9:
             failures.append(
@@ -443,6 +448,67 @@ class BudgetLedger:
             recovery_call=recovery_call,
             reserved_at=utc_now(),
         )
+        self._reservations[reservation.reservation_id] = reservation
+        return reservation
+
+    def adopt_reconciled_usage(
+        self,
+        *,
+        stage: str,
+        model_id: str,
+        usage: Mapping[str, Any],
+    ) -> BudgetReservation:
+        """Count an already persisted paid call when resuming the same run.
+
+        A new process must not regain the full interaction or USD allowance
+        merely because earlier successful calls are now cache artifacts.
+        """
+
+        input_tokens = int(usage.get("total_input_tokens") or 0)
+        cached_tokens = int(usage.get("total_cached_tokens") or 0)
+        output_tokens = int(usage.get("total_output_tokens") or 0)
+        thought_tokens = int(usage.get("total_thought_tokens") or 0)
+        cost = actual_usage_cost(
+            model_id=model_id,
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_tokens,
+            output_tokens=output_tokens,
+            thought_tokens=thought_tokens,
+        )
+        estimate = PaidCallEstimate(
+            stage=stage,
+            model_id=model_id,
+            media_resolution="low",
+            estimated_input_tokens=input_tokens,
+            max_output_tokens=max(1, output_tokens),
+            reserved_thought_tokens=thought_tokens,
+            retry_allowance=0,
+            worst_case_interactions=1,
+            worst_case_cost_usd=cost,
+        )
+        reservation = BudgetReservation(
+            reservation_id=uuid.uuid4().hex,
+            estimate=estimate,
+            recovery_call=False,
+            state="reconciled",
+            actual_input_tokens=input_tokens,
+            actual_cached_input_tokens=cached_tokens,
+            actual_output_tokens=output_tokens,
+            actual_thought_tokens=thought_tokens,
+            actual_cost_usd=cost,
+            reserved_at=utc_now(),
+            reconciled_at=utc_now(),
+        )
+        projected_interactions = self.committed_interactions + 1
+        projected_cost = self.actual_cost_usd + cost
+        if projected_interactions > self.max_interactions:
+            raise BudgetExceeded(
+                "persisted paid interactions already exceed the configured cap"
+            )
+        if projected_cost > self.max_cost_usd + 1e-9:
+            raise BudgetExceeded(
+                "persisted paid usage already exceeds the configured cost cap"
+            )
         self._reservations[reservation.reservation_id] = reservation
         return reservation
 

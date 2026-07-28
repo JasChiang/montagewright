@@ -385,6 +385,144 @@ def test_direct_video_canonicalization_only_removes_incomplete_optional_sync() -
     }
 
 
+def test_direct_video_canonicalization_fails_safe_for_missing_duration_and_attention() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "recommended_duration_seconds": None,
+                "attention_observation": {
+                    "minimum_dwell_seconds": 4.0,
+                    "maximum_dwell_seconds": 8.0,
+                },
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                },
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "tracked_crop",
+                    "crop_mode": "primary_center",
+                    "coverage_mode": "sequential",
+                    "allow_controlled_clip": True,
+                    "framing_intent": "Observe all required subjects.",
+                    "required_entity_indices": [1, 2, 3],
+                    "preferred_entity_indices": [4],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [
+                        {
+                            "start_progress": 0.0,
+                            "end_progress": 0.5,
+                            "anchor_entity_indices": [1],
+                            "camera_behavior": "hold",
+                        },
+                        {
+                            "start_progress": 0.5,
+                            "end_progress": 1.0,
+                            "anchor_entity_indices": [2],
+                            "camera_behavior": "follow",
+                        },
+                    ],
+                },
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+
+    assert chapter["recommended_duration_seconds"] == 6.0
+    assert chapter["vertical"]["coverage_mode"] == "simultaneous"
+    assert chapter["vertical"]["traversal_policy"] == "no_continuous_traversal"
+    assert chapter["vertical"]["attention_sequence"] == [
+        {
+            "start_progress": 0.0,
+            "end_progress": 1.0,
+            "anchor_entity_indices": [1, 2, 3],
+            "camera_behavior": "hold",
+            "movement_motivation": "none",
+            "cut_admissible": False,
+            "transition_preference": "auto",
+        }
+    ]
+    assert {
+        change["rule"] for change in changes
+    } >= {
+        "missing_recommended_duration_uses_model_attention_midpoint",
+        "incomplete_required_attention_fails_safe_to_joint_static_hold",
+        "joint_static_hold_disables_synthetic_traversal",
+    }
+
+
+def test_direct_video_canonicalization_completes_locked_required_suffix() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "recommended_duration_seconds": 5.0,
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                },
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "tracked_crop",
+                    "crop_mode": "primary_center",
+                    "coverage_mode": "sequential",
+                    "traversal_policy": "semantic_order_locked",
+                    "allow_controlled_clip": True,
+                    "framing_intent": "Observe subjects in declared order.",
+                    "required_entity_indices": [1, 2, 3],
+                    "preferred_entity_indices": [],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [
+                        {
+                            "start_progress": 0.0,
+                            "end_progress": 0.5,
+                            "anchor_entity_indices": [1],
+                            "camera_behavior": "hold",
+                        },
+                        {
+                            "start_progress": 0.5,
+                            "end_progress": 1.0,
+                            "anchor_entity_indices": [2],
+                            "camera_behavior": "follow",
+                        },
+                    ],
+                },
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    vertical = json.loads(canonical)["chapters"][0]["vertical"]
+
+    assert vertical["coverage_mode"] == "sequential"
+    assert vertical["traversal_policy"] == "semantic_order_locked"
+    assert [
+        phase["anchor_entity_indices"]
+        for phase in vertical["attention_sequence"]
+    ] == [[1], [2], [3]]
+    assert vertical["attention_sequence"][-1]["camera_behavior"] == "hold"
+    assert vertical["attention_sequence"][-1]["cut_admissible"] is True
+    assert vertical["attention_sequence"][-1]["transition_preference"] == "cut"
+    assert {
+        change["rule"] for change in changes
+    } >= {
+        "semantic_order_locked_missing_required_suffix_is_completed_without_reordering"
+    }
+
+
 def test_failed_plan_resume_selects_latest_complete_paid_attempt(
     tmp_path: Path,
 ) -> None:

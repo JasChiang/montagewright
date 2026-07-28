@@ -12,7 +12,7 @@ from .autonomous_policy import (
     DecisionAuthorityV2,
     authorize_decision,
 )
-from .billing import BudgetLedger
+from .billing import BudgetLedger, summarize_usage_and_list_price
 from .feature_cut import run_feature_cut_experiment
 from .final_delivery import assemble_music_only_delivery
 from .final_edit_qa import (
@@ -311,10 +311,10 @@ def run_feature_delivery_pipeline(
 ) -> dict[str, Any]:
     """Run picture → continuous music → final mux → final QA as one chain.
 
-    This function deliberately never grants final delivery eligibility. A
-    successful run means the immutable final muxes and their QA packages are
-    ready for a high-value human review. Human approval must be a later,
-    separately hash-bound artifact.
+    Review profiles stop at immutable QA packages for human approval.
+    Autonomous profiles may grant delivery eligibility only after deterministic
+    gates, semantic final QA, policy-authorized degradation checks, and a
+    separately hash-bound DecisionAuthorityV2 all pass.
     """
 
     resolved_output = output_dir.expanduser().resolve()
@@ -371,6 +371,27 @@ def run_feature_delivery_pipeline(
                 policy.budget.reserved_recovery_fraction
             ),
         )
+        prior_usage = summarize_usage_and_list_price(resolved_output)
+        policy_scoped_prior_requests = [
+            request
+            for request in prior_usage["requests"]
+            if str(request["path"]).startswith(
+                ("picture/", "aspects/", "audition/")
+            )
+        ]
+        for request in policy_scoped_prior_requests:
+            budget_ledger.adopt_reconciled_usage(
+                stage="resumed_artifact",
+                model_id=str(request["model"]),
+                usage={
+                    "total_input_tokens": request["input_tokens"],
+                    "total_cached_tokens": request[
+                        "cached_input_tokens"
+                    ],
+                    "total_output_tokens": request["output_tokens"],
+                    "total_thought_tokens": request["thought_tokens"],
+                },
+            )
         required_context_keys = {
             "editorial_beat_contracts",
             "music_map",
@@ -433,6 +454,20 @@ def run_feature_delivery_pipeline(
                 "policy_reference": policy.policy_reference,
                 "requested_aspects": list(policy.requested_aspects),
                 "budget": budget_ledger.report(),
+                "prior_usage_scope": {
+                    "included_policy_scoped_requests": len(
+                        policy_scoped_prior_requests
+                    ),
+                    "excluded_pre_policy_requests": (
+                        prior_usage["request_count"]
+                        - len(policy_scoped_prior_requests)
+                    ),
+                    "interpretation": (
+                        "retrieval and cold-ingest calls created before the "
+                        "policy-bound direct edit are reported separately and "
+                        "cannot consume or reset the selected-edit ledger"
+                    ),
+                },
                 "autonomous_context_paths": {
                     key: str(path)
                     for key, path in resolved_autonomous_context.items()
@@ -461,6 +496,7 @@ def run_feature_delivery_pipeline(
     )
     client: GeminiLabClient | None = None
     outputs: dict[str, Any] = {}
+    deterministic_failure_codes: tuple[str, ...] = ()
     try:
         kwargs = dict(feature_cut_kwargs)
         kwargs["output_dir"] = resolved_output / "picture"
@@ -470,6 +506,7 @@ def run_feature_delivery_pipeline(
         kwargs["execution_profile"] = profile.value
         if policy is not None:
             kwargs["autonomous_policy_path"] = autonomous_policy_path
+            kwargs["budget_ledger"] = budget_ledger
             kwargs["editorial_beat_contracts_path"] = (
                 editorial_beat_contracts_path
                 or resolved_autonomous_context.get(
@@ -523,10 +560,8 @@ def run_feature_delivery_pipeline(
                 policy=policy,
             )
             if not deterministic_report.passed:
-                raise DeliveryPipelineBlocked(
-                    "generated deterministic autonomous gates failed before "
-                    "final QA: "
-                    + ", ".join(deterministic_report.failure_codes)
+                deterministic_failure_codes = tuple(
+                    deterministic_report.failure_codes
                 )
         picture_media_rendered = bool(feature_result.get("media_rendered"))
         picture_outputs_present = any(
@@ -536,6 +571,16 @@ def run_feature_delivery_pipeline(
         if not picture_media_rendered or not picture_outputs_present:
             raise DeliveryPipelineBlocked(
                 "feature-cut did not produce reviewable picture media"
+            )
+        if deterministic_failure_codes and not any(
+            Path(str(feature_result[f"{aspect_key}_output"])).is_file()
+            for aspect_key in ("horizontal", "vertical")
+            if feature_result.get(f"{aspect_key}_output") is not None
+        ):
+            raise DeliveryPipelineBlocked(
+                "generated deterministic autonomous gates failed before "
+                "final QA: "
+                + ", ".join(deterministic_failure_codes)
             )
         picture_ready_for_review = bool(
             feature_result.get("ready_for_human_review")
@@ -555,7 +600,8 @@ def run_feature_delivery_pipeline(
         final_results: dict[str, Any] = {}
         qa_results_by_aspect: dict[str, Any] = {}
         qa_interaction_ids: list[str] = []
-        client = GeminiLabClient(model_id=model_id)
+        if not deterministic_failure_codes:
+            client = GeminiLabClient(model_id=model_id)
         for aspect_key, aspect_ratio, qa_mode in (
             ("horizontal", "16:9", "canonical_16x9"),
             ("vertical", "9:16", "crop_only_9x16"),
@@ -565,7 +611,9 @@ def run_feature_delivery_pipeline(
                 continue
             picture = Path(str(picture_value)).resolve(strict=True)
             picture_duration_ms = _picture_video_duration_ms(picture)
-            aspect_dir = resolved_output / "aspects" / aspect_key
+            aspect_dir = resolved_output / (
+                "audition" if deterministic_failure_codes else "aspects"
+            ) / aspect_key
             assembly_key = hashlib.sha256(
                 (
                     "feature-delivery-music-assembly-v2:"
@@ -609,8 +657,16 @@ def run_feature_delivery_pipeline(
             delivery = assemble_music_only_delivery(
                 picture_path=picture,
                 music_path=rendered_music.output_audio_path,
-                output_path=aspect_dir / f"final-{aspect_key}.mp4",
-                manifest_path=aspect_dir / "final-delivery.json",
+                output_path=aspect_dir / (
+                    f"audition-{aspect_key}.mp4"
+                    if deterministic_failure_codes
+                    else f"final-{aspect_key}.mp4"
+                ),
+                manifest_path=aspect_dir / (
+                    "audition-delivery.json"
+                    if deterministic_failure_codes
+                    else "final-delivery.json"
+                ),
                 music_assembly_artifact_dir=assembly_dir,
                 aspect_ratio=aspect_ratio,
                 artifact_bindings={
@@ -620,6 +676,24 @@ def run_feature_delivery_pipeline(
                     "music_map_lock_sha256": sha256_file(resolved_lock_path),
                 },
             )
+            if deterministic_failure_codes:
+                final_results[aspect_key] = {
+                    "audition_output": str(delivery.output_path),
+                    "audition_output_sha256": sha256_file(
+                        delivery.output_path
+                    ),
+                    "audition_manifest": str(delivery.manifest_path),
+                    "music_assembly_manifest": str(
+                        rendered_music.manifest_path
+                    ),
+                    "delivery_eligible": False,
+                    "interpretation": (
+                        "music-backed review artifact preserved after local "
+                        "autonomous gates blocked delivery"
+                    ),
+                }
+                continue
+            assert client is not None
             qa_dir = aspect_dir / "final-qa"
             if policy is not None and aspect_ratio == "9:16":
                 qa_mode = "autonomous_final_9x16"
@@ -676,6 +750,28 @@ def run_feature_delivery_pipeline(
                 "file_api_reused": file_reused,
             }
 
+        if deterministic_failure_codes:
+            outputs["audition_music_mix"] = final_results
+            if deterministic_report is not None:
+                write_json(
+                    resolved_output / "deterministic-delivery-qa.json",
+                    deterministic_report,
+                )
+            write_json(
+                resolved_output / "audition" / "audition-manifest.json",
+                {
+                    "contract_version": "blocked-audition-mix-v1",
+                    "delivery_eligible": False,
+                    "failure_codes": list(deterministic_failure_codes),
+                    "aspects": final_results,
+                    "generated_at": utc_now(),
+                },
+            )
+            raise DeliveryPipelineBlocked(
+                "generated deterministic autonomous gates failed before "
+                "final QA; a music-backed audition mix was preserved: "
+                + ", ".join(deterministic_failure_codes)
+            )
         if not final_results:
             raise DeliveryPipelineBlocked(
                 "feature-cut did not produce any requested picture output"

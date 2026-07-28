@@ -23,6 +23,7 @@ from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from jascue_video_lab.billing import summarize_usage_files
+from jascue_video_lab.autonomous_policy import AutonomousEditPolicy
 from jascue_video_lab.clip_card_retrieval import (
     FeatureShortlistPlan,
     validate_feature_shortlist,
@@ -1045,6 +1046,34 @@ def canonicalize_direct_video_edit_plan_output(
                         ),
                     }
                 )
+        attention = chapter.get("attention_observation")
+        if (
+            chapter.get("recommended_duration_seconds") is None
+            and isinstance(attention, dict)
+        ):
+            minimum = attention.get("minimum_dwell_seconds")
+            maximum = attention.get("maximum_dwell_seconds")
+            if (
+                isinstance(minimum, (int, float))
+                and isinstance(maximum, (int, float))
+                and 1.0 <= minimum <= maximum <= 15.0
+            ):
+                recommended = round((minimum + maximum) / 2.0, 3)
+                chapter["recommended_duration_seconds"] = recommended
+                changes.append(
+                    {
+                        "json_path": (
+                            f"chapters[{chapter_index}]"
+                            ".recommended_duration_seconds"
+                        ),
+                        "before": None,
+                        "after": recommended,
+                        "rule": (
+                            "missing_recommended_duration_uses_model_"
+                            "attention_midpoint"
+                        ),
+                    }
+                )
         vertical = chapter.get("vertical")
         if not isinstance(vertical, dict):
             continue
@@ -1137,6 +1166,120 @@ def canonicalize_direct_video_edit_plan_output(
                         "rule": "phase_anchor_deduplication_without_global_injection",
                     }
                 )
+        referenced = {
+            index
+            for step in sequence
+            if isinstance(step, dict)
+            for index in step.get("anchor_entity_indices", [])
+            if isinstance(index, int)
+        }
+        missing_required = [
+            index for index in required if index not in referenced
+        ]
+        if sequence and missing_required:
+            before_sequence = [dict(step) for step in sequence]
+            referenced_required_order = [
+                index
+                for step in sequence
+                if isinstance(step, dict)
+                for index in step.get("anchor_entity_indices", [])
+                if index in required
+            ]
+            safe_suffix_completion = (
+                vertical.get("coverage_mode") == "sequential"
+                and vertical.get("traversal_policy")
+                == "semantic_order_locked"
+                and referenced_required_order
+                == required[: len(referenced_required_order)]
+                and missing_required
+                == required[len(referenced_required_order) :]
+            )
+            if safe_suffix_completion:
+                sequence = [dict(step) for step in sequence]
+                sequence.extend(
+                    {
+                        "start_progress": 0.0,
+                        "end_progress": 1.0,
+                        "anchor_entity_indices": [index],
+                        "camera_behavior": "hold",
+                        "movement_motivation": "attention_handoff",
+                        "cut_admissible": True,
+                        "transition_preference": "cut",
+                    }
+                    for index in missing_required
+                )
+                phase_count = len(sequence)
+                for phase_index, step in enumerate(sequence):
+                    step["start_progress"] = round(
+                        phase_index / phase_count,
+                        6,
+                    )
+                    step["end_progress"] = round(
+                        (phase_index + 1) / phase_count,
+                        6,
+                    )
+                vertical["attention_sequence"] = sequence
+                changes.append(
+                    {
+                        "json_path": f"{base}.vertical.attention_sequence",
+                        "before": before_sequence,
+                        "after": sequence,
+                        "rule": (
+                            "semantic_order_locked_missing_required_suffix_"
+                            "is_completed_without_reordering"
+                        ),
+                    }
+                )
+            else:
+                sequence = [
+                    {
+                        "start_progress": 0.0,
+                        "end_progress": 1.0,
+                        "anchor_entity_indices": required,
+                        "camera_behavior": "hold",
+                        "movement_motivation": "none",
+                        "cut_admissible": False,
+                        "transition_preference": "auto",
+                    }
+                ]
+                vertical["attention_sequence"] = sequence
+                before_coverage = vertical.get("coverage_mode")
+                before_traversal = vertical.get("traversal_policy")
+                vertical["coverage_mode"] = "simultaneous"
+                vertical["traversal_policy"] = "no_continuous_traversal"
+                changes.append(
+                    {
+                        "json_path": f"{base}.vertical.attention_sequence",
+                        "before": before_sequence,
+                        "after": sequence,
+                        "rule": (
+                            "incomplete_required_attention_fails_safe_to_"
+                            "joint_static_hold"
+                        ),
+                    }
+                )
+                if before_coverage != "simultaneous":
+                    changes.append(
+                        {
+                            "json_path": f"{base}.vertical.coverage_mode",
+                            "before": before_coverage,
+                            "after": "simultaneous",
+                            "rule": (
+                                "joint_static_hold_requires_simultaneous_coverage"
+                            ),
+                        }
+                    )
+                if before_traversal != "no_continuous_traversal":
+                    changes.append(
+                        {
+                            "json_path": f"{base}.vertical.traversal_policy",
+                            "before": before_traversal,
+                            "after": "no_continuous_traversal",
+                            "rule": (
+                                "joint_static_hold_disables_synthetic_traversal"
+                            ),
+                        }
+                    )
         normalized_roles = {
             "required_entity_indices": required,
             "preferred_entity_indices": preferred,
@@ -3092,6 +3235,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--autonomous-policy",
+        type=Path,
+        help=(
+            "Bind this fresh direct-video editorial decision to the exact "
+            "AutonomousEditPolicy that will consume it."
+        ),
+    )
+    parser.add_argument(
         "--file-cache-root",
         type=Path,
         help=(
@@ -3148,6 +3299,20 @@ def main() -> int:
         if args.music is not None
         else None
     )
+    autonomous_policy_path = (
+        args.autonomous_policy.expanduser().resolve(strict=True)
+        if args.autonomous_policy is not None
+        else None
+    )
+    if autonomous_policy_path is not None:
+        policy = AutonomousEditPolicy.model_validate(
+            read_json(autonomous_policy_path)
+        )
+        if tuple(policy.requested_aspects) != ("9:16",):
+            raise ValueError(
+                "direct-video autonomous planner currently requires a "
+                "9:16-only policy"
+            )
     music_sha256 = sha256_file(music_path) if music_path is not None else None
     frames = {frame.frame_id: frame for frame in catalog.frames}
     clips = {clip.clip_id: clip for clip in catalog.clips}
@@ -3771,6 +3936,10 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
     )
     if music_path is not None:
         extra_projection_artifacts["source_music"] = music_path
+    if autonomous_policy_path is not None:
+        extra_projection_artifacts["autonomous_policy"] = (
+            autonomous_policy_path
+        )
     if args.reuse_raw_output:
         artifacts = _resolve_feature_reuse_artifacts(args.output_dir)
         source_request_path = artifacts["request"]
@@ -3933,12 +4102,14 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                 "--reuse-raw-output model provenance mismatch: "
                 f"expected {MODEL_ID!r}, got {plan.model_provenance.model_id!r}"
             )
-        extra_projection_artifacts = {
-            "original_request": artifacts["request"],
-            "current_reprojection_request": reprojection_request_path,
-            "raw_output_reuse_record": reuse_record_path,
-            "editing_capability_catalog": capability_catalog_path,
-        }
+        extra_projection_artifacts.update(
+            {
+                "original_request": artifacts["request"],
+                "current_reprojection_request": reprojection_request_path,
+                "raw_output_reuse_record": reuse_record_path,
+                "editing_capability_catalog": capability_catalog_path,
+            }
+        )
     else:
         if args.resume_failed_plan:
             failed_attempt = _resolve_latest_failed_feature_plan_attempt(

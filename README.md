@@ -127,7 +127,7 @@ render 前強制 requested-aspect Top-K 與所有可嘗試候選的 ShotQualityM
    若完整 Top-K Structured Output 太大，應先保存已驗證的 evidence-bound plan，再用一次精簡的 actual-audio reranker 只選既有 candidate ID。這個降載 call 不能新增素材、frame、entity、bbox 或 region；本機再從上游 artifact 投影回完整執行計畫，避免為了聽音樂重送或重寫全部視覺證據。
 3. 16:9 與 9:16 可有不同排名；橫式最好的 take 不必強迫成為直式首選。
 4. 實際 geometry 只按排名逐一驗證，第一個通過者即停止；API／tracker 不會為全部候選預先付費。
-5. manifest 會列出 Top-K 是否完整、實際嘗試與換帶次數、rank-1 source reuse，以及重複是否有 typed editorial authority。重用不是一律禁止：同來源不同區間、不同構圖重點，或有意的 montage／前後呼應都可以保留；但 planner 必須標明 `distinct_interval`、`alternate_presentation` 或 `editorial_reprise` 與理由。渲染後再以實際 source PTS 檢查區間重疊；無理由補秒數、把重疊區間冒充不同段，或完全相同 presentation 冒充新構圖時，仍保留可觀看的 review media 與完整 audit，但狀態固定降為 `review_preview`，不得成為 `delivery_eligible`。
+5. manifest 會列出 Top-K 是否完整、實際嘗試與換帶次數、rank-1 source reuse，以及重複是否有 typed editorial authority。重用不是一律禁止：同來源不同區間、不同構圖重點，或有意的 montage／前後呼應都可以保留；但 planner 必須標明 `distinct_interval`、`alternate_presentation` 或 `editorial_reprise` 與理由。runtime 會在付費 grounding 與 render 前先排除已可由 source interval 證明的未授權重用，再於渲染後以 presentation fingerprint 做完整稽核；無理由補秒數、把重疊區間冒充不同段，或完全相同 presentation 冒充新構圖時，不得成為 `delivery_eligible`。
 
 ### 9:16 不是「全部保留」與「隨便裁掉」二選一
 

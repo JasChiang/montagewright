@@ -516,3 +516,94 @@ def test_grouped_exact_event_call_uses_high_stills_and_no_time_schema(
     schema_text = json.dumps(requests[0]["response_format"]["schema"])
     assert "source_time_ms" not in schema_text
     assert "source_pts" not in schema_text
+
+
+def test_grouped_exact_event_empty_selection_is_persisted_fail_closed(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path, count=8)
+    beat = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "watch-state",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["watch_ui"],
+            "narrative_function": "feature_evidence",
+            "visual_events": [
+                {
+                    "event_type": "watch_ui_state_change",
+                    "cue_relation": "music_emphasis",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 24,
+                "preferred_frames": 54,
+                "maximum_frames": 90,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+    output = json.dumps(
+        {
+            "source_asset_id": catalog.source_asset_id,
+            "catalog_event_id": catalog.event_id,
+            "selections": [],
+        }
+    )
+    requests: list[dict[str, Any]] = []
+
+    class Interaction:
+        id = "exact-empty"
+        output_text = output
+
+        def model_dump(
+            self,
+            *,
+            mode: str,
+            exclude_none: bool,
+        ) -> dict[str, object]:
+            return {
+                "id": self.id,
+                "model": MODEL_ID,
+                "output_text": self.output_text,
+                "usage": {},
+            }
+
+    def create(**request: Any) -> Interaction:
+        requests.append(request)
+        return Interaction()
+
+    client = object.__new__(GeminiLabClient)
+    client.model_id = MODEL_ID
+    client.client = SimpleNamespace(
+        interactions=SimpleNamespace(create=create)
+    )
+
+    run_dir = tmp_path / "exact-empty"
+    locks = client.select_exact_event_locks(
+        catalog=catalog,
+        beat_contracts=[beat],
+        run_dir=run_dir,
+        input_artifact_hashes=("sha256:" + "c" * 64,),
+        max_bracket_frames=8,
+    )
+
+    assert locks == ()
+    assert len(requests) == 1
+    persisted = json.loads(
+        (run_dir / "exact_event_locks.json").read_text("utf-8")
+    )
+    assert persisted["locks"] == []
+    assert persisted["fail_closed"] is True
+    assert persisted["unresolved_events"] == [
+        {
+            "event_type": "watch_ui_state_change",
+            "reason_code": "insufficient_exact_frame_evidence",
+        }
+    ]
+    validation = json.loads(
+        (run_dir / "exact_event.schema_validation.json").read_text("utf-8")
+    )
+    assert validation["semantic_status"] == "unresolved_fail_closed"

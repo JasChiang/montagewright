@@ -28,6 +28,7 @@ from jascue_video_lab.feature_cut import (
     _audit_requested_candidate_recall,
     _build_feature_cut_eligibility_report,
     _audit_render_source_reuse,
+    _runtime_candidate_reuse_violation,
     _candidate_asset_reference_matches,
     _feature_vertical_candidate_from_runtime_option,
     _cover_transform,
@@ -183,19 +184,21 @@ def test_legacy_plan_can_still_request_missing_selected_clip_framing() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("reuse_feature_plan", "reuse_feature_plan_raw_output"),
-    [(True, False), (False, True), (True, True)],
-)
-def test_autonomous_profile_rejects_editorial_plan_reuse(
-    reuse_feature_plan: bool,
-    reuse_feature_plan_raw_output: bool,
-) -> None:
-    with pytest.raises(ValueError, match="require a fresh editorial plan"):
+def test_autonomous_profile_rejects_raw_output_reuse() -> None:
+    with pytest.raises(ValueError, match="forbid.*raw-output"):
         _validate_autonomous_plan_reuse_flags(
             FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
-            reuse_feature_plan=reuse_feature_plan,
-            reuse_feature_plan_raw_output=reuse_feature_plan_raw_output,
+            reuse_feature_plan=False,
+            reuse_feature_plan_raw_output=True,
+        )
+
+
+def test_autonomous_profile_rejects_unbound_plan_reuse() -> None:
+    with pytest.raises(ValueError, match="requires the current output"):
+        _validate_autonomous_plan_reuse_flags(
+            FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+            reuse_feature_plan=True,
+            reuse_feature_plan_raw_output=False,
         )
 
 
@@ -6560,6 +6563,94 @@ def test_render_source_reuse_distinct_interval_cannot_overlap() -> None:
 
     assert audit["status"] == "blocked"
     assert audit["violations"][0]["overlap_ms"] == 500
+
+
+def test_runtime_candidate_reuse_blocks_before_grounding() -> None:
+    selected = FeatureChapterSelect(
+        feature_id="second",
+        evidence_status="supported",
+        observed_visual_evidence="Second feature.",
+        selection_reason="Shows another feature.",
+        horizontal_frame_id="RF000002",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000002",
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+    )
+    prior = [
+        {
+            "feature_id": "first",
+            "source_clip_id": "clip-a",
+            "source_in_ms": 1000,
+            "source_out_ms": 8000,
+        }
+    ]
+
+    violation = _runtime_candidate_reuse_violation(
+        selected,
+        prior,
+        source_clip_id="clip-a",
+        source_in_ms=1000,
+        source_out_ms=8000,
+    )
+
+    assert violation is not None
+    assert violation["prior_feature_id"] == "first"
+    assert violation["overlap_ms"] == 7000
+    assert violation["reuse_mode"] == "none"
+
+
+def test_runtime_candidate_reuse_allows_authorized_distinct_interval() -> None:
+    selected = FeatureChapterSelect(
+        feature_id="second",
+        evidence_status="supported",
+        observed_visual_evidence="A later, distinct action.",
+        selection_reason="Shows a distinct event interval.",
+        horizontal_frame_id="RF000002",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000002",
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+        source_reuse_mode="distinct_interval",
+        source_reuse_justification="A visibly separate event in the same take.",
+    )
+    prior = [
+        {
+            "feature_id": "first",
+            "source_clip_id": "clip-a",
+            "source_in_ms": 1000,
+            "source_out_ms": 3000,
+        }
+    ]
+
+    assert (
+        _runtime_candidate_reuse_violation(
+            selected,
+            prior,
+            source_clip_id="clip-a",
+            source_in_ms=4000,
+            source_out_ms=6000,
+        )
+        is None
+    )
+    assert (
+        _runtime_candidate_reuse_violation(
+            selected,
+            prior,
+            source_clip_id="clip-a",
+            source_in_ms=2500,
+            source_out_ms=4500,
+        )
+        is not None
+    )
 
 
 def test_simultaneous_relation_rejects_one_unbound_atomic_core() -> None:

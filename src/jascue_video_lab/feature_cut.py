@@ -27,7 +27,12 @@ from .auto_reframe import (
     audit_auto_bounded_clip,
     choose_recovery,
 )
-from .billing import summarize_usage_and_list_price, summarize_usage_files
+from .billing import (
+    BudgetExceeded,
+    BudgetLedger,
+    summarize_usage_and_list_price,
+    summarize_usage_files,
+)
 from .autonomous_policy import (
     AutonomousDegradationManifest,
     AutonomousEditPolicy,
@@ -98,8 +103,13 @@ from .models import (
     FeatureVerticalCandidate,
     FramingRegionIntent,
     GeminiNativeGroundingProposal,
+    GroundingCandidate,
     GroundingProposal,
+    MatchStatus,
     MediaInfo,
+    ModelProvenance,
+    Occlusion,
+    PredicateStatus,
     RushClip,
     RushFrame,
     RushesCatalog,
@@ -122,11 +132,14 @@ from .models import (
 )
 from .overlay import draw_grounding_overlay
 from .presentation import (
+    GroundingTargetRequest,
+    MultiTargetGroundingGroup,
     _signed_motion_reversal_count,
     _vertical_center_crop_filter,
     _vertical_delivery_fallback,
     _vertical_fit_filter,
     _vertical_required_scope_fit_filter,
+    shared_sam_seeds_from_grounding,
 )
 from .reframe_policy import (
     REFRAME_POLICY_BINDING_ORIGIN,
@@ -5899,7 +5912,7 @@ def _is_exhausted_model_quota_error(error: Exception) -> bool:
         for value in status_values
         if value is not None
     ) or re.match(r"^\s*(?:http(?:\s+status)?\s*)?429(?:\b|:)", message)
-    return _is_non_retryable_spending_cap_error(error) or any(
+    return isinstance(error, BudgetExceeded) or _is_non_retryable_spending_cap_error(error) or any(
         marker in message
         for marker in (
             "resource_exhausted",
@@ -6492,47 +6505,256 @@ def _build_framing_region_tracks(
     proposals: list[GroundingProposal] = []
     seeds: list[SharedSam21BBoxSeed] = []
     debug_paths: list[Path] = []
-    for region in tracked_regions:
-        region_root = output_dir / "regions" / region.region_id
-        (
-            proposal,
-            selected_seed,
-            _,
-            _,
-            grounding_path,
-            frame_time_ms,
-            _,
-        ) = _ground_tracking_seed(
-            client=client,
-            clip=clip,
-            frame=frame,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            feature_id=feature_id,
-            event_description=event_description,
-            entity_id=region.entity_id or f"reframe_{region.region_id}",
-            target_description=region.target_description,
-            grounding_prompt=grounding_prompt,
-            output_dir=region_root,
-            run_id=f"feature-v-{region.region_id}-{uuid.uuid4().hex[:8]}",
-            model_request_block_reason=model_request_block_reason,
-            query_lock_v2=query_lock_v2,
-        )
-        proposals.append(proposal)
-        debug_paths.append(region_root / "grounding-debug.png")
-        seeds.append(
-            SharedSam21BBoxSeed(
-                target_id=region.region_id,
-                target_description=region.target_description,
-                seed_source=str(grounding_path.resolve()),
-                seed_time_ms=frame_time_ms,
-                seed_frame_pts=proposal.frame_pts,
-                seed_frame_sha256=proposal.frame_hash,
-                seed_source_width=proposal.source_width,
-                seed_source_height=proposal.source_height,
-                seed_box_2d=list(selected_seed.candidate.box_2d),
+    legacy_cached = all(
+        any(
+            (output_dir / "regions" / region.region_id).glob(
+                "grounding/bbox-*/grounding.json"
             )
         )
+        for region in tracked_regions
+    )
+    if legacy_cached:
+        # A resumed run may retain individually paid grounding evidence. Reuse
+        # it without another request, but all new multi-region frames take the
+        # grouped path below.
+        for region in tracked_regions:
+            region_root = output_dir / "regions" / region.region_id
+            (
+                proposal,
+                selected_seed,
+                _,
+                _,
+                grounding_path,
+                frame_time_ms,
+                _,
+            ) = _ground_tracking_seed(
+                client=client,
+                clip=clip,
+                frame=frame,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                feature_id=feature_id,
+                event_description=event_description,
+                entity_id=region.entity_id or f"reframe_{region.region_id}",
+                target_description=region.target_description,
+                grounding_prompt=grounding_prompt,
+                output_dir=region_root,
+                run_id=f"feature-v-{region.region_id}-{uuid.uuid4().hex[:8]}",
+                model_request_block_reason=model_request_block_reason,
+                query_lock_v2=query_lock_v2,
+            )
+            proposals.append(proposal)
+            debug_paths.append(region_root / "grounding-debug.png")
+            seeds.append(
+                SharedSam21BBoxSeed(
+                    target_id=region.region_id,
+                    target_description=region.target_description,
+                    seed_source=str(grounding_path.resolve()),
+                    seed_time_ms=frame_time_ms,
+                    seed_frame_pts=proposal.frame_pts,
+                    seed_frame_sha256=proposal.frame_hash,
+                    seed_source_width=proposal.source_width,
+                    seed_source_height=proposal.source_height,
+                    seed_box_2d=list(selected_seed.candidate.box_2d),
+                )
+            )
+    else:
+        seed_requested_time_ms, _ = _tracking_seed_request_ms(
+            frame,
+            start_ms,
+            end_ms,
+        )
+        batch_root = output_dir / "multi-target-grounding"
+        exact_frame = extract_frame(
+            Path(clip.path),
+            seed_requested_time_ms,
+            batch_root / "evidence-frame.png",
+        )
+        media = probe_video(Path(clip.path))
+        request_by_region: dict[str, GroundingTargetRequest] = {}
+        for region in tracked_regions:
+            target_id = region.region_id
+            description = region.target_description
+            exclusions: tuple[str, ...] = ()
+            if query_lock_v2 is not None and region.entity_id is not None:
+                identity = next(
+                    (
+                        item
+                        for item in query_lock_v2.identity.targets
+                        if item.target_id == region.entity_id
+                    ),
+                    None,
+                )
+                if identity is not None:
+                    detail = [identity.target_description]
+                    if identity.identity_cues:
+                        detail.append(
+                            "identity cues: "
+                            + "; ".join(identity.identity_cues)
+                        )
+                    if identity.context_cues:
+                        detail.append(
+                            "context cues are auxiliary only: "
+                            + "; ".join(identity.context_cues)
+                        )
+                    description = "\n".join(detail)
+                    exclusions = tuple(identity.stable_exclusions)
+            request_by_region[target_id] = GroundingTargetRequest(
+                target_id=target_id,
+                target_description=description,
+                exclusions=exclusions,
+            )
+
+        for chunk_index in range(0, len(tracked_regions), 4):
+            region_chunk = tracked_regions[chunk_index : chunk_index + 4]
+            requests = [
+                request_by_region[region.region_id]
+                for region in region_chunk
+            ]
+            group_key = {
+                "contract_version": "feature-cut-multi-target-grounding-v1",
+                "model_id": MODEL_ID,
+                "source_asset_id": media.asset_id,
+                "source_frame_id": frame.frame_id,
+                "source_frame_hash": exact_frame.frame_hash,
+                "feature_id": feature_id,
+                "targets": [
+                    request.model_dump(mode="json") for request in requests
+                ],
+            }
+            group_fingerprint = hashlib.sha256(
+                json.dumps(
+                    group_key,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            group_dir = (
+                batch_root / f"group-{group_fingerprint[:16]}"
+            )
+            group_path = group_dir / "multi_target_grounding.json"
+            if group_path.is_file():
+                group = MultiTargetGroundingGroup.model_validate(
+                    read_json(group_path)
+                )
+            else:
+                if model_request_block_reason:
+                    raise RuntimeError(
+                        "Gemini multi-target Grounding request skipped by "
+                        "run-level circuit breaker: "
+                        + model_request_block_reason
+                    )
+                write_json(group_dir / "request-key.json", group_key)
+                group = client.ground_multi_target_exact_frame(
+                    source_asset_id=media.asset_id,
+                    source_frame_id=frame.frame_id,
+                    grounding_anchor_id=f"grounding-anchor:{feature_id}",
+                    frame_path=Path(exact_frame.path),
+                    targets=requests,
+                    output_dir=group_dir,
+                )
+            interaction_path = (
+                group_dir / "multi_target_grounding.raw_interaction.json"
+            )
+            interaction_id = None
+            if interaction_path.is_file():
+                interaction_id = read_json(interaction_path).get("id")
+            provenance = ModelProvenance(
+                model_id=MODEL_ID,
+                api="gemini_interactions",
+                sdk="google-genai",
+                sdk_version=importlib.metadata.version("google-genai"),
+                interaction_id=(
+                    str(interaction_id) if interaction_id else None
+                ),
+                run_id=f"feature-v-group-{group_fingerprint[:8]}",
+                generated_at=utc_now(),
+            )
+            group_results = {
+                result.target_id: result for result in group.targets
+            }
+            for region in region_chunk:
+                result = group_results[region.region_id]
+                candidates = [
+                    GroundingCandidate(
+                        box_2d=(
+                            candidate.box_2d_yxyx[1],
+                            candidate.box_2d_yxyx[0],
+                            candidate.box_2d_yxyx[3],
+                            candidate.box_2d_yxyx[2],
+                        ),
+                        label=region.target_description,
+                        confidence=candidate.confidence,
+                        disambiguation_reason=(
+                            candidate.disambiguation_reason
+                        ),
+                    )
+                    for candidate in result.candidates
+                ]
+                match_status = (
+                    MatchStatus.MATCHED
+                    if result.visible
+                    and len(candidates) == 1
+                    and result.ambiguity_reason is None
+                    else (
+                        MatchStatus.AMBIGUOUS
+                        if result.visible and candidates
+                        else MatchStatus.NOT_VISIBLE
+                    )
+                )
+                proposal = GroundingProposal(
+                    asset_id=media.asset_id,
+                    event_id=feature_id,
+                    entity_id=(
+                        region.entity_id
+                        or f"reframe_{region.region_id}"
+                    ),
+                    frame_pts=exact_frame.frame_pts,
+                    frame_time_ms=exact_frame.frame_time_ms,
+                    frame_hash=exact_frame.frame_hash,
+                    source_width=exact_frame.width,
+                    source_height=exact_frame.height,
+                    visible=result.visible,
+                    match_status=match_status,
+                    predicate_status=PredicateStatus.NOT_APPLICABLE,
+                    occlusion=Occlusion.UNKNOWN,
+                    visibility_reason=(
+                        result.ambiguity_reason
+                        or "grouped exact-frame grounding"
+                    ),
+                    candidates=candidates,
+                    model_provenance=provenance,
+                )
+                region_root = output_dir / "regions" / region.region_id
+                grounding_dir = (
+                    region_root
+                    / "grounding"
+                    / f"group-{group_fingerprint[:16]}"
+                )
+                grounding_path = grounding_dir / "grounding.json"
+                write_json(grounding_path, proposal)
+                debug_path = grounding_dir / "debug.png"
+                draw_grounding_overlay(
+                    Path(exact_frame.path),
+                    proposal,
+                    debug_path,
+                )
+                shutil.copy2(
+                    debug_path,
+                    region_root / "grounding-debug.png",
+                )
+                proposals.append(proposal)
+                debug_paths.append(
+                    region_root / "grounding-debug.png"
+                )
+            seeds.extend(
+                shared_sam_seeds_from_grounding(
+                    group,
+                    target_requests=requests,
+                    seed_time_ms=exact_frame.frame_time_ms,
+                    seed_frame_pts=exact_frame.frame_pts,
+                )
+            )
 
     request_key = {
         "contract_version": "feature-cut-shared-framing-regions-v2",
@@ -6860,6 +7082,7 @@ def _vertical_candidate_geometry(
     model_request_block_reason: str | None = None,
     query_lock_v2: EvidenceQueryLockV2 | None = None,
     allow_review_sequential_fallback: bool = False,
+    max_identity_model_checks: int = 1,
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
     """Evaluate one immutable vertical candidate without rendering a segment."""
 
@@ -6879,7 +7102,7 @@ def _vertical_candidate_geometry(
     if crop_regions:
         if not hard_regions:
             raise ValueError("candidate region contract has no hard core")
-        _, hard_tracks, hard_debug_paths = _build_framing_region_tracks(
+        _, all_tracks, all_debug_paths = _build_framing_region_tracks(
             client=client,
             clip=clip,
             frame=frame,
@@ -6887,21 +7110,35 @@ def _vertical_candidate_geometry(
             end_ms=end_ms,
             feature_id=feature_id,
             event_description=event_description,
-            regions=hard_regions,
+            regions=crop_regions,
             checkpoint_path=checkpoint_path,
             grounding_prompt=grounding_prompt,
             output_dir=output_dir,
             analysis_fps=analysis_fps,
             scdet_threshold=scdet_threshold,
-            include_execution_roles=frozenset({"hard_core"}),
+            include_execution_roles=frozenset(
+                {"hard_core", "soft_extent"}
+            ),
             model_request_block_reason=model_request_block_reason,
             query_lock_v2=query_lock_v2,
         )
-        debug_paths.extend(hard_debug_paths)
+        debug_paths.extend(all_debug_paths)
         tracks_by_region = {
             region.region_id: track
-            for region, track in zip(hard_regions, hard_tracks, strict=True)
+            for region, track in zip(
+                crop_regions,
+                all_tracks,
+                strict=True,
+            )
         }
+        hard_tracks = [
+            tracks_by_region[region.region_id]
+            for region in hard_regions
+        ]
+        soft_tracks = [
+            tracks_by_region[region.region_id]
+            for region in soft_regions
+        ]
         identity_tracks.extend(
             (
                 region.entity_id or region.region_id,
@@ -6910,43 +7147,7 @@ def _vertical_candidate_geometry(
             )
             for region, track in zip(hard_regions, hard_tracks, strict=True)
         )
-        available_soft_regions: list[FramingRegionIntent] = []
-        soft_tracks: list[SegmentationTrack] = []
-        for soft_region in soft_regions:
-            try:
-                _, region_tracks, region_debug_paths = (
-                    _build_framing_region_tracks(
-                        client=client,
-                        clip=clip,
-                        frame=frame,
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        feature_id=feature_id,
-                        event_description=event_description,
-                        regions=[soft_region],
-                        checkpoint_path=checkpoint_path,
-                        grounding_prompt=grounding_prompt,
-                        output_dir=output_dir,
-                        analysis_fps=analysis_fps,
-                        scdet_threshold=scdet_threshold,
-                        include_execution_roles=frozenset({"soft_extent"}),
-                        model_request_block_reason=model_request_block_reason,
-                        query_lock_v2=query_lock_v2,
-                    )
-                )
-            except (RuntimeError, ValueError) as error:
-                optional_region_failures.append(
-                    {
-                        "region_id": soft_region.region_id,
-                        "error_type": type(error).__name__,
-                        "error": str(error),
-                    }
-                )
-                continue
-            available_soft_regions.append(soft_region)
-            soft_tracks.append(region_tracks[0])
-            tracks_by_region[soft_region.region_id] = region_tracks[0]
-            debug_paths.extend(region_debug_paths)
+        available_soft_regions = list(soft_regions)
         available_regions = [*hard_regions, *available_soft_regions]
         available_region_ids = set(tracks_by_region)
         effective_camera_phases: list[VerticalVirtualCameraPhase] = []
@@ -7206,7 +7407,7 @@ def _vertical_candidate_geometry(
         )
 
     identity_executions: list[IdentityCheckpointExecution] = []
-    if geometry.get("applied_strategy") in {
+    if max_identity_model_checks > 0 and geometry.get("applied_strategy") in {
         "tracked_crop",
         "phase_virtual_camera",
     }:
@@ -7234,6 +7435,7 @@ def _vertical_candidate_geometry(
                     / "identity-checkpoints"
                     / target_id,
                     identity_sha256=identity_sha256,
+                    max_model_checks=max_identity_model_checks,
                 )
             )
         semantic_checkpoint_status = _combined_semantic_checkpoint_status(
@@ -8846,6 +9048,59 @@ def _audit_render_source_reuse(
     return {**body, "audit_sha256": _stable_fingerprint(body)}
 
 
+def _runtime_candidate_reuse_violation(
+    selected: FeatureChapterSelect,
+    prior_chapters: Sequence[Mapping[str, Any]],
+    *,
+    source_clip_id: str,
+    source_in_ms: int,
+    source_out_ms: int,
+) -> dict[str, Any] | None:
+    """Reject unauthorized source reuse before grounding and rendering.
+
+    The final reuse audit still validates presentation fingerprints. This
+    earlier check handles the cases that are already decidable from immutable
+    source intervals, so an unauthorized duplicate cannot consume grounding,
+    SAM, exact-event, or render work before failing.
+    """
+
+    for prior in prior_chapters:
+        if (
+            prior.get("source_clip_id") != source_clip_id
+            or prior.get("source_in_ms") is None
+            or prior.get("source_out_ms") is None
+        ):
+            continue
+        prior_start = int(prior["source_in_ms"])
+        prior_end = int(prior["source_out_ms"])
+        overlap_ms = max(
+            0,
+            min(source_out_ms, prior_end) - max(source_in_ms, prior_start),
+        )
+        justification = selected.source_reuse_justification
+        violates = (
+            selected.source_reuse_mode == "none"
+            or not (justification and justification.strip())
+            or (
+                selected.source_reuse_mode == "distinct_interval"
+                and overlap_ms > 0
+            )
+        )
+        if violates:
+            return {
+                "prior_feature_id": prior["feature_id"],
+                "source_clip_id": source_clip_id,
+                "source_in_ms": source_in_ms,
+                "source_out_ms": source_out_ms,
+                "prior_source_in_ms": prior_start,
+                "prior_source_out_ms": prior_end,
+                "overlap_ms": overlap_ms,
+                "reuse_mode": selected.source_reuse_mode,
+                "justification": justification,
+            }
+    return None
+
+
 def _audit_requested_candidate_recall(
     plan: FeatureEditPlan,
     *,
@@ -9180,20 +9435,70 @@ def _validate_autonomous_plan_reuse_flags(
     *,
     reuse_feature_plan: bool,
     reuse_feature_plan_raw_output: bool,
+    output_dir: Path | None = None,
+    autonomous_policy_path: Path | None = None,
 ) -> None:
-    """Keep autonomous edits from inheriting an earlier editorial decision."""
+    """Allow only a policy-bound direct-video plan in autonomous profiles."""
 
     if execution_profile not in {
         FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
         FeatureCutExecutionProfile.AUTONOMOUS_BEST_EFFORT,
     }:
         return
-    if reuse_feature_plan or reuse_feature_plan_raw_output:
+    if reuse_feature_plan_raw_output:
         raise ValueError(
-            "autonomous profiles require a fresh editorial plan in a fresh "
-            "output directory; --reuse-feature-plan and "
-            "--reuse-feature-plan-raw-output are forbidden. Resume an "
-            "unchanged hash-bound picture with --reuse-picture-result instead."
+            "autonomous profiles forbid --reuse-feature-plan-raw-output; "
+            "schema replay cannot establish a fresh policy-bound editorial "
+            "decision"
+        )
+    if not reuse_feature_plan:
+        return
+    if output_dir is None or autonomous_policy_path is None:
+        raise ValueError(
+            "autonomous plan reuse requires the current output directory and "
+            "AutonomousEditPolicy"
+        )
+    policy_path = autonomous_policy_path.expanduser().resolve(strict=True)
+    policy = AutonomousEditPolicy.model_validate(read_json(policy_path))
+    plan_dir = output_dir.expanduser().resolve() / "gemini-plan"
+    _, _, record = load_external_feature_plan_projection(plan_dir)
+    if record.get("projection_contract_id") != "direct-video-edit-plan-v2":
+        raise ValueError(
+            "autonomous plan reuse only accepts direct-video-edit-plan-v2"
+        )
+    source_artifacts = record.get("source_artifacts")
+    policy_artifact = next(
+        (
+            artifact
+            for artifact in source_artifacts
+            if isinstance(artifact, dict)
+            and artifact.get("role") == "autonomous_policy"
+        ),
+        None,
+    ) if isinstance(source_artifacts, list) else None
+    if not isinstance(policy_artifact, dict):
+        raise ValueError(
+            "autonomous direct-video plan is not bound to an "
+            "AutonomousEditPolicy"
+        )
+    bound_path = Path(str(policy_artifact.get("path") or "")).expanduser().resolve()
+    bound_sha256 = str(policy_artifact.get("sha256") or "")
+    if (
+        bound_path != policy_path
+        or bound_sha256 != sha256_file(policy_path)
+        or not bound_path.is_file()
+    ):
+        raise ValueError(
+            "autonomous direct-video plan policy artifact differs from the "
+            "current policy"
+        )
+    bound_policy = AutonomousEditPolicy.model_validate(read_json(bound_path))
+    if (
+        bound_policy.policy_reference != policy.policy_reference
+        or bound_policy.execution_profile.value != execution_profile.value
+    ):
+        raise ValueError(
+            "autonomous direct-video plan policy reference/profile mismatch"
         )
 
 
@@ -10539,6 +10844,7 @@ def _run_feature_cut_experiment_impl(
     ),
     autonomous_policy_path: Path | None = None,
     editorial_beat_contracts_path: Path | None = None,
+    budget_ledger: BudgetLedger | None = None,
 ) -> dict[str, Any]:
     resolved_vertical_framing_prompt = vertical_framing_prompt or (
         "Inspect the complete selected clip and propose a generic evidence-only "
@@ -10643,6 +10949,7 @@ def _run_feature_cut_experiment_impl(
     }
     autonomous_policy: AutonomousEditPolicy | None = None
     editorial_templates: tuple[EditorialBeatContract, ...] = ()
+    editorial_feature_ids: set[str] = set()
     if autonomous_profile:
         if autonomous_policy_path is None:
             raise ValueError("autonomous feature-cut requires its policy")
@@ -10662,13 +10969,20 @@ def _run_feature_cut_experiment_impl(
             raise ValueError(
                 "selected-window orchestration requires feature_id on every beat"
             )
+        editorial_feature_ids = {
+            str(contract.feature_id) for contract in editorial_templates
+        }
     if (
         music_lock is not None
         and music_sha256 is not None
         and music_lock.music_id != f"sha256:{music_sha256}"
     ):
         raise ValueError("music file does not match the supplied MusicMap lock")
-    client = GeminiLabClient()
+    client = (
+        GeminiLabClient(budget_ledger=budget_ledger)
+        if budget_ledger is not None
+        else GeminiLabClient()
+    )
     feature_plan_origin = "generated"
     external_projection_contract_id: str | None = None
     plan_reuse_record_path: Path | None = None
@@ -11634,6 +11948,40 @@ def _run_feature_cut_experiment_impl(
                             expected_event_id=option_data.get("event_id"),
                             quality_maps=shot_quality_maps,
                         )
+                        reuse_violation = _runtime_candidate_reuse_violation(
+                            selected,
+                            manifest["vertical"]["chapters"],
+                            source_clip_id=candidate_clip.clip_id,
+                            source_in_ms=candidate_start,
+                            source_out_ms=candidate_end,
+                        )
+                        if reuse_violation is not None:
+                            candidate_attempts.append(
+                                {
+                                    "candidate_id": candidate_id,
+                                    "rank": candidate_rank,
+                                    "frame_id": frame_id,
+                                    "source_asset_id": (
+                                        f"sha256:{candidate_clip.sha256}"
+                                    ),
+                                    "event_id": option_data.get("event_id"),
+                                    "strategy": option_data.get("strategy"),
+                                    "decision": "try_next",
+                                    "reason_code": (
+                                        "unauthorized_source_reuse_preflight"
+                                    ),
+                                    "failure_codes": [
+                                        FailureCode.NO_FEASIBLE_PRESENTATION.value
+                                    ],
+                                    "recovery_action": (
+                                        "try_next_candidate"
+                                        if option_index + 1 < len(vertical_options)
+                                        else "fallback_requires_review"
+                                    ),
+                                    "reuse_violation": reuse_violation,
+                                }
+                            )
+                            continue
                     except Exception as error:
                         abort_for_geometry_quota(error)
                         candidate_attempts.append(
@@ -11858,6 +12206,16 @@ def _run_feature_cut_experiment_impl(
                         / "vertical"
                         / f"candidate-{candidate_rank:02d}-{candidate_id}"
                     )
+                    autonomous_static_audition = (
+                        autonomous_profile
+                        and selected.feature_id not in editorial_feature_ids
+                        and not candidate_camera_phases
+                        and sum(
+                            region.execution_role == "hard_core"
+                            for region in candidate_regions
+                        )
+                        == 1
+                    )
                     try:
                         candidate_query_lock: EvidenceQueryLockV2 | None = None
                         if (
@@ -11888,77 +12246,123 @@ def _run_feature_cut_experiment_impl(
                                     candidate_query_lock.approval.policy_reference
                                 ),
                             }
-                        (
-                            candidate_filter,
-                            candidate_geometry,
-                            candidate_debugs,
-                            candidate_track_fingerprint,
-                        ) = _vertical_candidate_geometry(
-                            client=client,
-                            clip=candidate_clip,
-                            frame=candidate_frame,
-                            start_ms=candidate_start,
-                            end_ms=candidate_end,
-                            feature_id=selected.feature_id,
-                            event_description=(
-                                brief_chapter.title
-                                + "；"
-                                + str(option_data["observed_visual_evidence"])
-                            ),
-                            target_description=(
-                                str(candidate_target) if candidate_target else None
-                            ),
-                            regions=candidate_regions,
-                            camera_phases=candidate_camera_phases,
-                            camera_phase_origin=candidate_camera_phase_origin,
-                            crop_mode=candidate_crop_mode,
-                            overflow_policy=(
-                                brief_chapter.vertical_overflow_policy
-                                if human_reframe_policy_requested
-                                else (
-                                    "controlled_clip"
-                                    if controlled_preview_requested
-                                    else "preserve_all"
-                                )
-                            ),
-                            edge_priority=(
-                                brief_chapter.vertical_edge_priority
-                                if human_reframe_policy_requested
-                                else "balanced"
-                            ),
-                            fallback_strategy=(
-                                brief.vertical_fallback_strategy
-                                if human_reframe_policy_requested
-                                else "center_crop"
-                            ),
-                            checkpoint_path=checkpoint_path,
-                            grounding_prompt=grounding_prompt,
-                            output_dir=candidate_root,
-                            analysis_fps=sam_analysis_fps,
-                            scdet_threshold=scdet_threshold,
-                            display_sample_aspect_ratio=candidate_display_sar,
-                            track_cache=track_cache,
-                            model_request_block_reason=gemini_geometry_block_reason,
-                            query_lock_v2=candidate_query_lock,
-                            allow_review_sequential_fallback=any(
-                                assessment.get("mode")
-                                == "sequential_virtual_camera"
-                                and assessment.get("verdict") == "feasible"
-                                for assessment in (
-                                    option_data.get(
-                                        "framing_refinement", {}
-                                    ).get("presentation_options", [])
-                                    if isinstance(
+                        if autonomous_static_audition:
+                            candidate_filter = (
+                                _vertical_center_crop_filter()
+                            )
+                            candidate_geometry = {
+                                "applied_strategy": (
+                                    "static_full_bleed_crop_unverified"
+                                ),
+                                "fallback_reason": None,
+                                "risk_codes": [
+                                    "unverified_static_full_bleed_audition"
+                                ],
+                                "requires_gemini_review": True,
+                                "full_bleed": True,
+                                "source_geometry_lineage_passed": True,
+                                "tracking_confidence_gate_passed": True,
+                                "coverage_passed": True,
+                                "minimum_visible_required_area_fraction": 0.0,
+                                "semantic_checkpoint_status": (
+                                    SemanticCheckpointStatus
+                                    .NOT_REQUIRED_BY_POLICY.value
+                                ),
+                            }
+                            candidate_debugs = []
+                            candidate_track_fingerprint = None
+                        else:
+                            (
+                                candidate_filter,
+                                candidate_geometry,
+                                candidate_debugs,
+                                candidate_track_fingerprint,
+                            ) = _vertical_candidate_geometry(
+                                client=client,
+                                clip=candidate_clip,
+                                frame=candidate_frame,
+                                start_ms=candidate_start,
+                                end_ms=candidate_end,
+                                feature_id=selected.feature_id,
+                                event_description=(
+                                    brief_chapter.title
+                                    + "；"
+                                    + str(
+                                        option_data[
+                                            "observed_visual_evidence"
+                                        ]
+                                    )
+                                ),
+                                target_description=(
+                                    str(candidate_target)
+                                    if candidate_target
+                                    else None
+                                ),
+                                regions=candidate_regions,
+                                camera_phases=candidate_camera_phases,
+                                camera_phase_origin=(
+                                    candidate_camera_phase_origin
+                                ),
+                                crop_mode=candidate_crop_mode,
+                                overflow_policy=(
+                                    brief_chapter.vertical_overflow_policy
+                                    if human_reframe_policy_requested
+                                    else (
+                                        "controlled_clip"
+                                        if controlled_preview_requested
+                                        else "preserve_all"
+                                    )
+                                ),
+                                edge_priority=(
+                                    brief_chapter.vertical_edge_priority
+                                    if human_reframe_policy_requested
+                                    else "balanced"
+                                ),
+                                fallback_strategy=(
+                                    brief.vertical_fallback_strategy
+                                    if human_reframe_policy_requested
+                                    else "center_crop"
+                                ),
+                                checkpoint_path=checkpoint_path,
+                                grounding_prompt=grounding_prompt,
+                                output_dir=candidate_root,
+                                analysis_fps=sam_analysis_fps,
+                                scdet_threshold=scdet_threshold,
+                                display_sample_aspect_ratio=(
+                                    candidate_display_sar
+                                ),
+                                track_cache=track_cache,
+                                model_request_block_reason=(
+                                    gemini_geometry_block_reason
+                                ),
+                                query_lock_v2=candidate_query_lock,
+                                allow_review_sequential_fallback=any(
+                                    assessment.get("mode")
+                                    == "sequential_virtual_camera"
+                                    and assessment.get("verdict")
+                                    == "feasible"
+                                    for assessment in (
                                         option_data.get(
                                             "framing_refinement", {}
-                                        ),
-                                        Mapping,
+                                        ).get(
+                                            "presentation_options",
+                                            [],
+                                        )
+                                        if isinstance(
+                                            option_data.get(
+                                                "framing_refinement",
+                                                {},
+                                            ),
+                                            Mapping,
+                                        )
+                                        else []
                                     )
-                                    else []
-                                )
-                                if isinstance(assessment, Mapping)
-                            ),
-                        )
+                                    if isinstance(assessment, Mapping)
+                                ),
+                                max_identity_model_checks=(
+                                    0 if autonomous_profile else 1
+                                ),
+                            )
                         auto_audit = None
                         failure_codes: list[FailureCode] = []
                         candidate_execution_verified = False
@@ -12046,6 +12450,16 @@ def _run_feature_cut_experiment_impl(
                                 candidate_geometry.setdefault("risk_codes", []).append(
                                     "explicit_unverified_geometry_preview"
                                 )
+                            if autonomous_static_audition:
+                                hard_gate_passed = True
+                                candidate_geometry[
+                                    "autonomous_audition_only_override"
+                                ] = True
+                                candidate_geometry.setdefault(
+                                    "risk_codes", []
+                                ).append(
+                                    "deterministic_containment_not_proven"
+                                )
                             candidate_geometry["auto_bounded_clip_audit"] = (
                                 auto_audit.model_dump(mode="json")
                             )
@@ -12064,6 +12478,26 @@ def _run_feature_cut_experiment_impl(
                                 candidate_geometry["automatic_policy_label"] = (
                                     "auto_bounded_clip_v1"
                                 )
+                        write_json(
+                            candidate_root / "geometry-preflight.json",
+                            {
+                                "contract_version": (
+                                    "vertical-geometry-preflight-debug-v1"
+                                ),
+                                "candidate_id": candidate_id,
+                                "candidate_rank": candidate_rank,
+                                "filter_graph": candidate_filter,
+                                "geometry": candidate_geometry,
+                                "track_fingerprint": (
+                                    candidate_track_fingerprint
+                                ),
+                                "failure_codes": [
+                                    failure.value
+                                    for failure in failure_codes
+                                ],
+                                "hard_gate_passed": hard_gate_passed,
+                            },
+                        )
                         if human_reframe_policy_requested:
                             candidate_geometry[
                                 "human_policy_execution_verified"
@@ -12368,6 +12802,41 @@ def _run_feature_cut_experiment_impl(
                 selected_candidate_rank = int(
                     selected_vertical["option"]["rank"]
                 )
+                candidate_attempt_dir = (
+                    output_dir / "candidate-attempts" / selected.feature_id
+                )
+                candidate_attempt_dir.mkdir(parents=True, exist_ok=True)
+                resolved_attempt_path = candidate_attempt_dir / "9x16.resolved.json"
+                write_json(
+                    resolved_attempt_path,
+                    {
+                        "contract_version": (
+                            "automatic-candidate-resolution-v1"
+                        ),
+                        "feature_id": selected.feature_id,
+                        "selected_candidate_id": selected_candidate_id,
+                        "selected_candidate_rank": selected_candidate_rank,
+                        "attempts": candidate_attempts,
+                        "resolved": True,
+                    },
+                )
+                stale_exhaustion_path = (
+                    candidate_attempt_dir / "9x16.exhausted.json"
+                )
+                if stale_exhaustion_path.is_file():
+                    stale_exhaustion = read_json(stale_exhaustion_path)
+                    stale_exhaustion.update(
+                        {
+                            "superseded": True,
+                            "superseded_by": str(
+                                resolved_attempt_path.resolve()
+                            ),
+                            "superseded_by_sha256": sha256_file(
+                                resolved_attempt_path
+                            ),
+                        }
+                    )
+                    write_json(stale_exhaustion_path, stale_exhaustion)
                 selected_beat_templates = [
                     contract
                     for contract in editorial_templates
@@ -12527,10 +12996,11 @@ def _run_feature_cut_experiment_impl(
                                 run_dir=dense_root / "resolve",
                                 input_artifact_hashes=exact_input_hashes,
                             )
-                        locks = bind_grouped_event_lock_ids(
-                            locks,
-                            bound_contracts,
-                        )
+                        if locks:
+                            locks = bind_grouped_event_lock_ids(
+                                locks,
+                                bound_contracts,
+                            )
                         project_start_ms = sum(
                             int(row["duration_ms"])
                             for row in manifest["vertical"]["chapters"]
@@ -12959,13 +13429,56 @@ def _run_feature_cut_experiment_impl(
                 manifest["post_render_quality_qc"]["technical_qc_passed"]
             )
             reuse_passed = bool(manifest["source_reuse_contract_passed"])
+            vertical_chapters = manifest["vertical"]["chapters"]
+            containment_failure_codes = {
+                "hard_core_not_fully_retained",
+                "tracking_or_grounding_failed",
+                "unverified_center_crop",
+                "unverified_static_full_bleed_audition",
+                "explicit_unverified_geometry_preview",
+            }
+            identity_failure_codes = {
+                "identity_verification_pending",
+                "identity_drift",
+                "tracking_or_grounding_failed",
+            }
+            relation_failure_codes = {
+                "relation_lost",
+                "relative_scale_misleading",
+                "tracking_or_grounding_failed",
+            }
+            containment_passed = not any(
+                chapter.get("unverified_geometry_preview_override") is True
+                or bool(
+                    containment_failure_codes
+                    & set(chapter.get("risk_codes") or [])
+                )
+                or (
+                    isinstance(
+                        chapter.get("auto_bounded_clip_audit"),
+                        Mapping,
+                    )
+                    and not bool(
+                        chapter["auto_bounded_clip_audit"].get("approved")
+                    )
+                )
+                for chapter in vertical_chapters
+            )
+            identity_passed = not any(
+                identity_failure_codes & set(chapter.get("risk_codes") or [])
+                for chapter in vertical_chapters
+            )
+            relation_passed = not any(
+                relation_failure_codes & set(chapter.get("risk_codes") or [])
+                for chapter in vertical_chapters
+            )
             deterministic = DeterministicDeliveryEvidence(
                 media_playable=technical_passed,
                 pts_valid=technical_passed,
                 unexpected_freeze_count=0,
-                containment_passed=True,
-                identity_passed=True,
-                relation_passed=True,
+                containment_passed=containment_passed,
+                identity_passed=identity_passed,
+                relation_passed=relation_passed,
                 panel_same_pts_passed=True,
                 relative_scale_lock_passed=True,
                 cue_delta_frames=cue_deltas,
@@ -13154,6 +13667,7 @@ def run_feature_cut_experiment(
     ),
     autonomous_policy_path: Path | None = None,
     editorial_beat_contracts_path: Path | None = None,
+    budget_ledger: BudgetLedger | None = None,
 ) -> dict[str, Any]:
     """Run feature-cut while atomically preserving terminal editorial state."""
 
@@ -13162,6 +13676,8 @@ def run_feature_cut_experiment(
         profile,
         reuse_feature_plan=reuse_feature_plan,
         reuse_feature_plan_raw_output=reuse_feature_plan_raw_output,
+        output_dir=output_dir,
+        autonomous_policy_path=autonomous_policy_path,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     status_path = output_dir / "run-status.json"
@@ -13241,6 +13757,7 @@ def run_feature_cut_experiment(
             execution_profile=profile,
             autonomous_policy_path=autonomous_policy_path,
             editorial_beat_contracts_path=editorial_beat_contracts_path,
+            budget_ledger=budget_ledger,
         )
     except Exception as error:
         saved_eligibility_path = output_dir / "delivery-eligibility.json"

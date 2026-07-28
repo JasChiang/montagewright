@@ -1,0 +1,54 @@
+{
+  "contract_version": "autonomous-edit-policy-v1",
+  "execution_profile": "autonomous_strict",
+  "content_mode": "music_led_feature",
+  "requested_aspects": [
+    "9:16"
+  ],
+  "duration": {
+    "target_ms": 84000,
+    "min_ms": 60000,
+    "max_ms": 90000
+  },
+  "budget": {
+    "max_gemini_cost_usd": 1.25,
+    "max_paid_interactions": 25,
+    "max_semantic_replans": 1,
+    "max_final_qa_passes": 2,
+    "reserved_recovery_fraction": 0.2
+  },
+  "presentation": {
+    "allow_two_panel_layout": true,
+    "allowed_panel_modes": [
+      "top_bottom",
+      "side_by_side",
+      "context_detail"
+    ],
+    "max_panels": 2,
+    "max_panel_runtime_fraction": 0.25,
+    "allow_solid_matte_fit": false,
+    "allow_blurred_background": false,
+    "allow_intentional_freeze": true,
+    "max_intentional_freeze_ms": 1500,
+    "allow_synthetic_motion_without_motivation": false
+  },
+  "editorial": {
+    "allow_optional_beat_omission": true,
+    "allow_preferred_beat_substitution": true,
+    "allow_hard_evidence_omission": false,
+    "allow_source_reuse": [
+      "distinct_interval",
+      "alternate_presentation",
+      "editorial_reprise"
+    ]
+  },
+  "sync": {
+    "hard_tolerance_frames": 2,
+    "preferred_tolerance_frames": 4
+  },
+  "recovery": {
+    "max_candidate_attempts_per_beat": 3,
+    "max_request_failure_retries": 0,
+    "allow_deterministic_delivery_when_semantic_qa_unavailable": false
+  }
+}

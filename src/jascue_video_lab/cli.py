@@ -2482,8 +2482,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--reuse-feature-plan",
         action="store_true",
         help=(
-            "Reuse a saved editorial plan for review profiles only. Autonomous "
-            "profiles reject this flag and require a fresh output directory."
+            "Reuse a hash-bound editorial plan. Autonomous profiles accept "
+            "only direct-video-edit-plan-v2 with the exact current policy "
+            "included in its immutable projection artifacts."
         ),
     )
     feature_delivery_parser.add_argument(

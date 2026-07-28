@@ -141,7 +141,6 @@ class ExactEventSelectionGroup(FrozenStrictModel):
     source_asset_id: str
     catalog_event_id: str
     selections: tuple[ExactEventSelection, ...] = Field(
-        min_length=1,
         max_length=8,
     )
 
