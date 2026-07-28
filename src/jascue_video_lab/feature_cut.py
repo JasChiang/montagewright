@@ -9742,11 +9742,27 @@ def _validate_autonomous_plan_reuse_flags(
         capability.capability_id
         for capability in capability_catalog.capabilities
     }
-    missing_autonomous_capabilities = {
-        "two_panel_layout",
-        "solid_matte_fit",
-        "intentional_freeze",
-    } - capability_ids
+    required_autonomous_capabilities = {
+        capability_id
+        for capability_id, allowed in (
+            (
+                "two_panel_layout",
+                policy.presentation.allow_two_panel_layout,
+            ),
+            (
+                "solid_matte_fit",
+                policy.presentation.allow_solid_matte_fit,
+            ),
+            (
+                "intentional_freeze",
+                policy.presentation.allow_intentional_freeze,
+            ),
+        )
+        if allowed
+    }
+    missing_autonomous_capabilities = (
+        required_autonomous_capabilities - capability_ids
+    )
     if missing_autonomous_capabilities:
         raise ValueError(
             "autonomous plan predates the required presentation catalog: "
