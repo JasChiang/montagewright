@@ -12,6 +12,7 @@ from time import monotonic
 from PIL import Image
 
 from .ab_review import render_grounding_ab_review
+from .autonomous_policy import AutonomousEditPolicy
 from .billing import summarize_usage_and_list_price
 from .compare import compare_runs
 from .delivery_pipeline import run_feature_delivery_pipeline
@@ -818,6 +819,27 @@ def command_feature_cut(args: argparse.Namespace) -> int:
 
 
 def command_feature_delivery(args: argparse.Namespace) -> int:
+    autonomous_policy_path = args.autonomous_policy
+    if args.execution_profile.startswith("autonomous_"):
+        if autonomous_policy_path is None:
+            raise ValueError(
+                "autonomous execution requires --autonomous-policy"
+            )
+        policy = AutonomousEditPolicy.model_validate(
+            read_json(autonomous_policy_path)
+        )
+        if policy.execution_profile.value != args.execution_profile:
+            raise ValueError(
+                "autonomous policy profile does not match --execution-profile"
+            )
+        if (
+            args.max_gemini_cost_usd is not None
+            and args.max_gemini_cost_usd
+            > policy.budget.max_gemini_cost_usd
+        ):
+            raise ValueError(
+                "--max-gemini-cost-usd cannot loosen the signed policy cap"
+            )
     result = run_feature_delivery_pipeline(
         feature_cut_kwargs={
             "catalog_path": args.catalog_json,
@@ -849,6 +871,8 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
         model_id=args.model,
         execution_profile=args.execution_profile,
         reuse_picture_result=args.reuse_picture_result,
+        autonomous_policy_path=autonomous_policy_path,
+        max_gemini_cost_usd=args.max_gemini_cost_usd,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2447,11 +2471,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feature_delivery_parser.add_argument(
         "--execution-profile",
-        choices=["production_review", "review_preview"],
+        choices=[
+            "production_review",
+            "review_preview",
+            "autonomous_strict",
+            "autonomous_best_effort",
+        ],
         default="production_review",
         help=(
             "Keep production_review as the strict default; use review_preview "
             "only to render an explicitly non-deliverable audit preview."
+        ),
+    )
+    feature_delivery_parser.add_argument(
+        "--autonomous-policy",
+        type=Path,
+        help=(
+            "Hash-bound AutonomousEditPolicy JSON. Required for autonomous "
+            "profiles and ignored by legacy review profiles."
+        ),
+    )
+    feature_delivery_parser.add_argument(
+        "--max-gemini-cost-usd",
+        type=float,
+        help=(
+            "Optional tighter per-run cost cap; it cannot loosen the policy."
         ),
     )
     feature_delivery_parser.add_argument("--model", default=MODEL_ID)

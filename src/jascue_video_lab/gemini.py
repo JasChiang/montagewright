@@ -1490,7 +1490,12 @@ class GeminiLabClient:
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
-                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
+                },
                 {"type": "text", "text": prompt},
             ],
             "generation_config": {"thinking_level": "low"},
@@ -1556,30 +1561,48 @@ class GeminiLabClient:
         previous_output: str | None = None
         previous_error: Exception | None = None
         attempt_results: list[dict[str, Any]] = []
-        total_attempts = 1 + max(0, repair_attempts)
+        # At most one representation-only repair is permitted.  It receives
+        # the paid raw text and schema, never the full video again.
+        total_attempts = 1 + min(1, max(0, repair_attempts))
 
         for attempt_number in range(1, total_attempts + 1):
             prompt = base_prompt
             if attempt_number > 1:
-                prompt += (
-                    "\n\n## Contract 修正重試\n"
-                    "前一次輸出未通過本機 Pydantic contract。請重新檢視同一支影片並重新產生完整 Content Map；"
-                    "不要直接截斷超界時間、不要交換錯誤區間端點、不要補造影片結束後的事件。"
-                    "若前一版聲稱的事件不在影片內，應刪除或依影片證據重新分段。\n"
+                prompt = (
+                    "## Text-only contract repair\n"
+                    "本次沒有影片輸入。只能正規化前次已產生 JSON 的表示，"
+                    "不得新增、替換或推測任何視聽 claim。若無法在不新增媒體"
+                    "事實的條件下修正，請保留原 claim 並讓 schema validation "
+                    "失敗；下游會對受影響 claim 使用 deterministic fallback。\n"
                     f"不可超過的 duration_ms：{media.duration_ms}\n"
                     f"前一次驗證錯誤：{previous_error}\n"
-                    "以下前次輸出僅供找錯，不是可信資料：\n"
+                    "以下是唯一可用的前次 raw output：\n"
                     + (previous_output or "<前次呼叫沒有可用 output_text>")
                 )
+            request_input = (
+                [
+                    {
+                        "type": "video",
+                        "uri": uploaded.uri,
+                        "mime_type": uploaded.mime_type,
+                        "media_resolution": "low",
+                    },
+                    {"type": "text", "text": prompt},
+                ]
+                if attempt_number == 1
+                else [{"type": "text", "text": prompt}]
+            )
             request_record = {
                 "model": self.model_id,
                 "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
                 "store": False,
-                "input": [
-                    {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
-                    {"type": "text", "text": prompt},
-                ],
-                "generation_config": {"thinking_level": "low"},
+                "input": request_input,
+                "generation_config": {
+                    "thinking_level": (
+                        "low" if attempt_number == 1 else "minimal"
+                    ),
+                    "max_output_tokens": 4096,
+                },
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",
@@ -1671,6 +1694,7 @@ class GeminiLabClient:
                         "ok": False,
                         "failure_stage": "local_contract_validation",
                         "paid_repair_allowed": attempt_number < total_attempts,
+                        "repair_media_attached": False,
                         "errors": [detail],
                     }
                 )
@@ -1744,6 +1768,7 @@ class GeminiLabClient:
                     {"type": "text", "text": label},
                     {
                         "type": "image",
+                        "media_resolution": "high",
                         "data": base64.b64encode(reference.path.read_bytes()).decode(
                             "ascii"
                         ),
@@ -1756,6 +1781,7 @@ class GeminiLabClient:
                     {"type": "text", "text": label},
                     {
                         "type": "image",
+                        "media_resolution": "high",
                         "mime_type": reference_mime_type,
                         "sha256": reference.sha256,
                         "reference_id": reference.reference_id,
@@ -1775,6 +1801,7 @@ class GeminiLabClient:
                 {"type": "text", "text": frame_label},
                 {
                     "type": "image",
+                    "media_resolution": "high",
                     "data": base64.b64encode(frame_path.read_bytes()).decode("ascii"),
                     "mime_type": frame_mime_type,
                 },
@@ -1785,6 +1812,7 @@ class GeminiLabClient:
                 {"type": "text", "text": frame_label},
                 {
                     "type": "image",
+                    "media_resolution": "high",
                     "mime_type": frame_mime_type,
                     "sha256": frame.frame_hash,
                     "image_role": "frame_to_verify",
@@ -1921,6 +1949,7 @@ class GeminiLabClient:
                     {"type": "text", "text": label},
                     {
                         "type": "image",
+                        "media_resolution": "high",
                         "data": base64.b64encode(reference.path.read_bytes()).decode(
                             "ascii"
                         ),
@@ -1933,6 +1962,7 @@ class GeminiLabClient:
                     {"type": "text", "text": label},
                     {
                         "type": "image",
+                        "media_resolution": "high",
                         "mime_type": reference_mime_type,
                         "sha256": reference.sha256,
                         "reference_id": reference.reference_id,
@@ -1947,7 +1977,12 @@ class GeminiLabClient:
         api_input.extend(
             [
                 {"type": "text", "text": frame_label},
-                {"type": "image", "data": image_data, "mime_type": mime_type},
+                {
+                    "type": "image",
+                    "data": image_data,
+                    "mime_type": mime_type,
+                    "media_resolution": "high",
+                },
             ]
         )
         recorded_input.extend(
@@ -1958,6 +1993,7 @@ class GeminiLabClient:
                     "mime_type": mime_type,
                     "sha256": frame.frame_hash,
                     "image_role": "frame_to_ground",
+                    "media_resolution": "high",
                 },
             ]
         )
@@ -2123,7 +2159,12 @@ model_provenance (return it unchanged with interaction_id=null):
             "store": False,
             "input": [
                 {"type": "text", "text": prompt},
-                {"type": "image", "data": image_data, "mime_type": mime_type},
+                {
+                    "type": "image",
+                    "data": image_data,
+                    "mime_type": mime_type,
+                    "media_resolution": "high",
+                },
             ],
             "generation_config": {
                 "thinking_level": "low",
@@ -2140,7 +2181,12 @@ model_provenance (return it unchanged with interaction_id=null):
                 **api_request,
                 "input": [
                     api_request["input"][0],
-                    {"type": "image", "mime_type": mime_type, "sha256": frame.frame_hash},
+                    {
+                        "type": "image",
+                        "mime_type": mime_type,
+                        "sha256": frame.frame_hash,
+                        "media_resolution": "high",
+                    },
                 ],
                 "bbox_coordinate_order": "ymin,xmin,ymax,xmax",
                 "polygon_coordinate_order": "x,y",
@@ -2231,7 +2277,12 @@ model_provenance (return it unchanged with interaction_id=null):
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
-                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
+                },
                 {"type": "text", "text": prompt},
             ],
             "generation_config": {"thinking_level": "low"},
@@ -2334,7 +2385,12 @@ model_provenance (return it unchanged with interaction_id=null):
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
-                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
+                },
                 {"type": "text", "text": prompt},
             ],
             "generation_config": {"thinking_level": "low"},
@@ -2411,7 +2467,12 @@ model_provenance (return it unchanged with interaction_id=null):
             api_input.extend(
                 [
                     {"type": "text", "text": label},
-                    {"type": "image", "data": data, "mime_type": mime_type},
+                    {
+                        "type": "image",
+                        "data": data,
+                        "mime_type": mime_type,
+                        "media_resolution": "high",
+                    },
                 ]
             )
             recorded_input.extend(
@@ -2421,6 +2482,7 @@ model_provenance (return it unchanged with interaction_id=null):
                         "type": "image",
                         "mime_type": mime_type,
                         "sha256": frame["image_hash"],
+                        "media_resolution": "high",
                     },
                 ]
             )
@@ -2530,7 +2592,12 @@ model_provenance (return it unchanged with interaction_id=null):
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
-                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
+                },
                 {"type": "text", "text": prompt},
             ],
             "generation_config": {"thinking_level": "low"},
@@ -2630,7 +2697,12 @@ model_provenance (return it unchanged with interaction_id=null):
             "store": False,
             "input": [
                 {"type": "text", "text": prompt},
-                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
+                },
             ],
             "generation_config": {"thinking_level": "low"},
             "response_format": {
@@ -2725,7 +2797,12 @@ model_provenance (return it unchanged with interaction_id=null):
             api_input.extend(
                 [
                     {"type": "text", "text": label},
-                    {"type": "image", "data": data, "mime_type": mime_type},
+                    {
+                        "type": "image",
+                        "data": data,
+                        "mime_type": mime_type,
+                        "media_resolution": "high",
+                    },
                 ]
             )
             recorded_input.extend(
@@ -2735,6 +2812,7 @@ model_provenance (return it unchanged with interaction_id=null):
                         "type": "image",
                         "mime_type": mime_type,
                         "sha256": page_hash,
+                        "media_resolution": "high",
                     },
                 ]
             )
@@ -2909,6 +2987,7 @@ model_provenance (return it unchanged with interaction_id=null):
                     {"type": "text", "text": label},
                     {
                         "type": "image",
+                        "media_resolution": "high",
                         "data": base64.b64encode(page_path.read_bytes()).decode("ascii"),
                         "mime_type": mime_type,
                     },
@@ -2923,6 +3002,7 @@ model_provenance (return it unchanged with interaction_id=null):
                         "sha256": page_hash,
                         "image_role": "dense_contact_sheet",
                         "page_number": page_number,
+                        "media_resolution": "high",
                     },
                 ]
             )
@@ -3108,13 +3188,23 @@ model_provenance (return it unchanged with interaction_id=null):
             api_input.extend(
                 [
                     {"type": "text", "text": label},
-                    {"type": "image", "data": data, "mime_type": mime_type},
+                    {
+                        "type": "image",
+                        "data": data,
+                        "mime_type": mime_type,
+                        "media_resolution": "high",
+                    },
                 ]
             )
             recorded_input.extend(
                 [
                     {"type": "text", "text": label},
-                    {"type": "image", "mime_type": mime_type, "sha256": page_hash},
+                    {
+                        "type": "image",
+                        "mime_type": mime_type,
+                        "sha256": page_hash,
+                        "media_resolution": "high",
+                    },
                 ]
             )
         api_request = {
@@ -3242,7 +3332,12 @@ model_provenance (return it unchanged with interaction_id=null):
             "store": False,
             "input": [
                 {"type": "text", "text": prompt},
-                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
+                },
             ],
             "generation_config": {
                 "thinking_level": "low",
@@ -3318,7 +3413,12 @@ model_provenance (return it unchanged with interaction_id=null):
             "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
-                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
+                },
                 {"type": "text", "text": prompt},
             ],
             "generation_config": {"thinking_level": "low"},
@@ -3507,6 +3607,7 @@ model_provenance (return it unchanged with interaction_id=null):
                     "type": "video",
                     "uri": uploaded.uri,
                     "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
                 },
             ]
             if uploaded_audio is not None:
@@ -3524,7 +3625,10 @@ model_provenance (return it unchanged with interaction_id=null):
                 "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
                 "store": False,
                 "input": request_input,
-                "generation_config": {"thinking_level": "low"},
+                "generation_config": {
+                    "thinking_level": "low",
+                    "max_output_tokens": 12288,
+                },
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",
@@ -3594,29 +3698,32 @@ model_provenance (return it unchanged with interaction_id=null):
                 parsed = FeatureEditPlan.model_validate_json(canonical_text)
             except Exception as validation_error:
                 # A response was successfully generated and paid for, but it
-                # does not satisfy the local cross-field contract. This is the
-                # only failure class where one paid repair is useful: request
-                # failures such as 429/503/timeout never reach this block.
-                #
-                # Keep the original video/music inputs attached so the repair
-                # cannot fill omissions from the prior JSON alone, and require
-                # a complete replacement rather than a patch document.
-                repair_record = dict(request_record)
+                # does not satisfy the local cross-field contract. A single
+                # text-only representation repair may normalize the preserved
+                # raw JSON. It must not re-upload or resend video/audio.
+                repair_record = {
+                    **request_record,
+                    "generation_config": {
+                        "thinking_level": "minimal",
+                        "max_output_tokens": 4096,
+                    },
+                }
                 repair_record["input"] = [
-                    *list(request_record["input"]),
                     {
                         "type": "text",
                         "text": (
-                            "## Contract 修正重試（僅一次）\n"
+                            "## Text-only contract 修正（僅一次）\n"
+                            "本次沒有影片或音樂輸入。"
                             "前一次完整輸出已成功產生，但未通過本機 Pydantic "
-                            "與跨欄位 contract。請重新檢視同一份影片、音樂、"
-                            "brief 與 catalog 標籤，輸出一份完整 FeatureEditPlan。\n"
+                            "與跨欄位 contract。只能修正 JSON 表示、enum、缺省"
+                            "欄位及可由既有輸出直接推導的內部引用，輸出一份完整"
+                            " FeatureEditPlan。\n"
                             "只修正驗證錯誤與其直接造成的內部矛盾；能保留的 "
                             "frame selection、可觀察證據與敘事順序都應保留。"
-                            "不得新增未在影片中看見的證據，不得輸出 JSON patch。\n"
+                            "不得新增、替換或推測任何媒體證據，不得輸出 JSON "
+                            "patch；無法安全修正時應保持錯誤，由本機 fail closed。\n"
                             f"本機驗證錯誤：{validation_error}\n"
-                            "以下前次輸出只供定位 contract 錯誤，不是新的"
-                            "證據來源：\n"
+                            "以下前次 raw output 是唯一可用資料：\n"
                             + output_text
                         ),
                     },
@@ -3661,6 +3768,7 @@ model_provenance (return it unchanged with interaction_id=null):
                     "recovered_by_paid_schema_repair": (
                         recovered_by_paid_schema_repair
                     ),
+                    "schema_repair_media_attached": False,
                 },
             )
             expected_ids = [chapter.feature_id for chapter in brief.chapters]
@@ -3836,6 +3944,7 @@ model_provenance (return it unchanged with interaction_id=null):
                         "type": "video",
                         "uri": uploaded.uri,
                         "mime_type": uploaded.mime_type,
+                        "media_resolution": "low",
                     },
                 ],
                 "generation_config": {"thinking_level": "low"},

@@ -9273,6 +9273,15 @@ def _production_review_preflight_failures(
     return failures
 
 
+def _requires_production_prerequisites(
+    execution_profile: FeatureCutExecutionProfile,
+) -> bool:
+    return execution_profile in {
+        FeatureCutExecutionProfile.PRODUCTION_REVIEW,
+        FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+    }
+
+
 def _build_feature_cut_eligibility_report(
     manifest: Mapping[str, Any],
     *,
@@ -9329,8 +9338,7 @@ def _build_feature_cut_eligibility_report(
         if quality_complete
         else (
             EligibilityGateStatus.FAILED
-            if execution_profile
-            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            if _requires_production_prerequisites(execution_profile)
             else EligibilityGateStatus.NOT_RUN
         )
     )
@@ -9366,8 +9374,7 @@ def _build_feature_cut_eligibility_report(
         else (
             EligibilityGateStatus.FAILED
             if technical_requested
-            or execution_profile
-            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            or _requires_production_prerequisites(execution_profile)
             else EligibilityGateStatus.NOT_RUN
         )
     )
@@ -9424,22 +9431,19 @@ def _build_feature_cut_eligibility_report(
     if not candidate_recall_complete:
         (
             blocking_reasons
-            if execution_profile
-            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            if _requires_production_prerequisites(execution_profile)
             else review_reasons
         ).append("candidate_recall_incomplete")
     if quality_status != EligibilityGateStatus.PASSED:
         (
             blocking_reasons
-            if execution_profile
-            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            if _requires_production_prerequisites(execution_profile)
             else review_reasons
         ).append("quality_map_coverage_incomplete")
     if technical_status != EligibilityGateStatus.PASSED:
         (
             blocking_reasons
-            if execution_profile
-            == FeatureCutExecutionProfile.PRODUCTION_REVIEW
+            if _requires_production_prerequisites(execution_profile)
             else review_reasons
         ).append("technical_quality_not_verified")
 
@@ -11006,7 +11010,7 @@ def _run_feature_cut_experiment_impl(
             output_dir / "requested-candidate-recall-audit.json",
             requested_candidate_recall_audit,
         )
-        if execution_profile == FeatureCutExecutionProfile.PRODUCTION_REVIEW:
+        if _requires_production_prerequisites(execution_profile):
             quality_stage = monotonic()
             shot_quality_maps = _ensure_requested_quality_maps(
                 plan,
@@ -11041,7 +11045,7 @@ def _run_feature_cut_experiment_impl(
             output_dir / "quality-map-coverage-audit.json",
             quality_map_coverage_audit,
         )
-        if execution_profile == FeatureCutExecutionProfile.PRODUCTION_REVIEW:
+        if _requires_production_prerequisites(execution_profile):
             preflight_failures = _production_review_preflight_failures(
                 requested_candidate_recall_audit,
                 quality_map_coverage_audit,

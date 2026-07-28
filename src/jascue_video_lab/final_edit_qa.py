@@ -643,6 +643,7 @@ def prepare_final_edit_qa(
         ).hexdigest(),
         "response_schema_sha256": _canonical_sha256(schema),
         "proxy_contract": proxy_contract,
+        "media_resolution": "low",
         "media_metadata": metadata,
         "proxy_media_metadata": proxy_metadata,
         "segment_contract_sha256": _canonical_sha256(segment_contract),
@@ -876,7 +877,12 @@ def execute_final_edit_qa(
         "store": False,
         "input": [
             {"type": "text", "text": prepared.prompt},
-            {"type": "video", "uri": str(uri), "mime_type": str(mime_type)},
+            {
+                "type": "video",
+                "uri": str(uri),
+                "mime_type": str(mime_type),
+                "media_resolution": "low",
+            },
         ],
         "generation_config": FINAL_EDIT_QA_GENERATION_CONFIG,
         "response_format": {

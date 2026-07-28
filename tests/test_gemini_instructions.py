@@ -23,6 +23,7 @@ from jascue_video_lab.gemini import (
     canonicalize_selected_vertical_framing_output,
 )
 from jascue_video_lab.models import (
+    ContentMap,
     FeatureChapterBrief,
     FeatureChapterSelect,
     FeatureEditBrief,
@@ -39,6 +40,30 @@ from jascue_video_lab.models import (
 
 class _StopRequest(RuntimeError):
     pass
+
+
+class _FakeInteraction:
+    def __init__(self, *, interaction_id: str, output_text: str) -> None:
+        self.id = interaction_id
+        self.output_text = output_text
+
+    def model_dump(
+        self,
+        *,
+        mode: str,
+        exclude_none: bool,
+    ) -> dict[str, object]:
+        assert mode == "json"
+        assert exclude_none is False
+        return {
+            "id": self.id,
+            "model": MODEL_ID,
+            "output_text": self.output_text,
+            "usage": {
+                "total_input_tokens": 1,
+                "total_output_tokens": 1,
+            },
+        }
 
 
 def test_portrait_prompts_require_relation_timing_and_presentation_alternatives() -> None:
@@ -1625,3 +1650,86 @@ def test_content_map_transport_failure_never_triggers_paid_schema_repair(
     )
     assert validation["attempts"][0]["failure_stage"] == "interaction_request"
     assert validation["attempts"][0]["paid_repair_allowed"] is False
+
+
+def test_content_map_schema_repair_is_text_only_and_video_is_low_resolution(
+    tmp_path: Path,
+    content_map: ContentMap,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    valid = content_map.model_copy(
+        update={
+            "model_provenance": content_map.model_provenance.model_copy(
+                update={
+                    "model_id": MODEL_ID,
+                    "interaction_id": None,
+                    "run_id": "text-repair",
+                }
+            )
+        }
+    )
+    responses = iter(
+        (
+            _FakeInteraction(
+                interaction_id="invalid",
+                output_text="{}",
+            ),
+            _FakeInteraction(
+                interaction_id="repaired",
+                output_text=valid.model_dump_json(),
+            ),
+        )
+    )
+
+    def create(**request: Any) -> _FakeInteraction:
+        requests.append(request)
+        return next(responses)
+
+    client = object.__new__(GeminiLabClient)
+    client.model_id = MODEL_ID
+    client.client = SimpleNamespace(
+        interactions=SimpleNamespace(create=create)
+    )
+    media = MediaInfo(
+        path=str(tmp_path / "source.mp4"),
+        sha256="a" * 64,
+        asset_id="sha256:" + "a" * 64,
+        format_name="mp4",
+        duration_ms=10_000,
+        size_bytes=1,
+        format_metadata={},
+        video=VideoStreamInfo(
+            index=0,
+            codec_name="h264",
+            coded_width=1920,
+            coded_height=1080,
+            display_width=1920,
+            display_height=1080,
+            rotation_degrees=0,
+            average_frame_rate=Rational(numerator=30, denominator=1),
+            real_frame_rate=Rational(numerator=30, denominator=1),
+            time_base=Rational(numerator=1, denominator=30),
+            start_pts=0,
+            duration_ts=300,
+            metadata={},
+        ),
+    )
+
+    result = client.analyze_video(
+        media=media,
+        uploaded=SimpleNamespace(
+            uri="files/source",
+            mime_type="video/mp4",
+        ),
+        prompt_template="Analyze visible evidence.",
+        run_id="text-repair",
+        run_dir=tmp_path / "run",
+        repair_attempts=3,
+    )
+
+    assert result.model_provenance.interaction_id == "repaired"
+    assert len(requests) == 2
+    assert requests[0]["input"][0]["type"] == "video"
+    assert requests[0]["input"][0]["media_resolution"] == "low"
+    assert [item["type"] for item in requests[1]["input"]] == ["text"]
+    assert requests[1]["generation_config"]["thinking_level"] == "minimal"

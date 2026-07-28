@@ -11,7 +11,8 @@ from jascue_video_lab.storage import read_json
 
 
 def test_legacy_execution_profiles_remain_the_baseline() -> None:
-    assert [profile.value for profile in FeatureCutExecutionProfile] == [
+    values = [profile.value for profile in FeatureCutExecutionProfile]
+    assert values[:2] == [
         "review_preview",
         "production_review",
     ]

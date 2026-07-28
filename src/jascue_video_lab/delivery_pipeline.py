@@ -5,6 +5,11 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Mapping
 
+from .autonomous_policy import (
+    AutonomousEditPolicy,
+    AutonomousExecutionProfile,
+)
+from .billing import BudgetLedger
 from .feature_cut import run_feature_cut_experiment
 from .final_delivery import assemble_music_only_delivery
 from .final_edit_qa import execute_final_edit_qa, prepare_final_edit_qa
@@ -19,6 +24,7 @@ from .music_assembly import (
     render_single_interval_music_assembly,
     write_music_assembly_artifacts,
 )
+from .models import FeatureCutExecutionProfile
 from .storage import read_json, utc_now, write_json
 
 
@@ -145,6 +151,8 @@ def run_feature_delivery_pipeline(
     model_id: str = MODEL_ID,
     execution_profile: str = "production_review",
     reuse_picture_result: bool = False,
+    autonomous_policy_path: Path | None = None,
+    max_gemini_cost_usd: float | None = None,
 ) -> dict[str, Any]:
     """Run picture → continuous music → final mux → final QA as one chain.
 
@@ -156,6 +164,68 @@ def run_feature_delivery_pipeline(
 
     resolved_output = output_dir.expanduser().resolve()
     resolved_output.mkdir(parents=True, exist_ok=True)
+    profile = FeatureCutExecutionProfile(execution_profile)
+    policy: AutonomousEditPolicy | None = None
+    budget_ledger: BudgetLedger | None = None
+    if profile in {
+        FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+        FeatureCutExecutionProfile.AUTONOMOUS_BEST_EFFORT,
+    }:
+        if autonomous_policy_path is None:
+            raise DeliveryPipelineBlocked(
+                "autonomous delivery requires an AutonomousEditPolicy"
+            )
+        resolved_policy = autonomous_policy_path.expanduser().resolve(
+            strict=True
+        )
+        policy = AutonomousEditPolicy.model_validate(read_json(resolved_policy))
+        expected_profile = AutonomousExecutionProfile(profile.value)
+        if policy.execution_profile != expected_profile:
+            raise DeliveryPipelineBlocked(
+                "execution profile does not match the autonomous policy"
+            )
+        requested = set(policy.requested_aspects)
+        aspect_argument = str(feature_cut_kwargs.get("aspect", "both"))
+        expected_aspects = (
+            {"16:9", "9:16"}
+            if aspect_argument == "both"
+            else {aspect_argument.replace("x", ":")}
+        )
+        if requested != expected_aspects:
+            raise DeliveryPipelineBlocked(
+                "requested aspect does not match the autonomous policy"
+            )
+        effective_cap = policy.budget.max_gemini_cost_usd
+        if max_gemini_cost_usd is not None:
+            if max_gemini_cost_usd <= 0:
+                raise DeliveryPipelineBlocked(
+                    "Gemini cost cap must be positive"
+                )
+            if max_gemini_cost_usd > effective_cap:
+                raise DeliveryPipelineBlocked(
+                    "runtime Gemini cost cap cannot loosen policy authority"
+                )
+            effective_cap = max_gemini_cost_usd
+        budget_ledger = BudgetLedger(
+            max_cost_usd=effective_cap,
+            max_interactions=policy.budget.max_paid_interactions,
+            reserved_recovery_fraction=(
+                policy.budget.reserved_recovery_fraction
+            ),
+        )
+        write_json(
+            resolved_output / "autonomous-preflight.json",
+            {
+                "contract_version": "autonomous-delivery-preflight-v1",
+                "execution_profile": profile.value,
+                "policy_path": str(resolved_policy),
+                "policy_reference": policy.policy_reference,
+                "requested_aspects": list(policy.requested_aspects),
+                "budget": budget_ledger.report(),
+                "paid_call_started": False,
+                "generated_at": utc_now(),
+            },
+        )
     status_path = resolved_output / "run-status.json"
     started_at = utc_now()
     _write_status(
@@ -172,7 +242,7 @@ def run_feature_delivery_pipeline(
         kwargs["brief_path"] = brief_path
         kwargs["music_path"] = music_path
         kwargs["music_lock_path"] = music_lock_path
-        kwargs["execution_profile"] = execution_profile
+        kwargs["execution_profile"] = profile.value
         if reuse_picture_result:
             feature_result = _load_reusable_picture_result(
                 resolved_output / "picture",
@@ -328,6 +398,14 @@ def run_feature_delivery_pipeline(
             "final_sequence_qa_completed": True,
             "human_approval_status": "not_run",
             "delivery_eligible": False,
+            "autonomous_policy_reference": (
+                policy.policy_reference if policy is not None else None
+            ),
+            "budget": (
+                budget_ledger.report()
+                if budget_ledger is not None
+                else None
+            ),
             "picture_ready_for_human_review": picture_ready_for_review,
             "picture_run_state": feature_result.get("run_state"),
             "feature_cut": feature_result,

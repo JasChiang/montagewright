@@ -2758,6 +2758,8 @@ class FeatureCutExecutionProfile(StrEnum):
 
     REVIEW_PREVIEW = "review_preview"
     PRODUCTION_REVIEW = "production_review"
+    AUTONOMOUS_STRICT = "autonomous_strict"
+    AUTONOMOUS_BEST_EFFORT = "autonomous_best_effort"
 
 
 class FeatureCutRunState(StrEnum):
@@ -2768,6 +2770,7 @@ class FeatureCutRunState(StrEnum):
     REVIEW_PREVIEW = "review_preview"
     READY_FOR_HUMAN_REVIEW = "ready_for_human_review"
     DELIVERY_ELIGIBLE = "delivery_eligible"
+    BEST_EFFORT_COMPLETE = "best_effort_complete"
 
 
 class EligibilityGateStatus(StrEnum):
@@ -2819,6 +2822,7 @@ class FeatureCutEligibilityReport(StrictModel):
         if self.ready_for_human_review and self.run_state not in {
             FeatureCutRunState.READY_FOR_HUMAN_REVIEW,
             FeatureCutRunState.DELIVERY_ELIGIBLE,
+            FeatureCutRunState.BEST_EFFORT_COMPLETE,
         }:
             raise ValueError(
                 "review-ready flag conflicts with the feature-cut run state"
