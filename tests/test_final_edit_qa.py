@@ -464,6 +464,57 @@ def test_validator_only_bump_reuses_paid_raw_output_without_request(
     assert validation["additional_api_request_count"] == 0
 
 
+def test_autonomous_paid_request_ignores_regenerated_provenance_timestamps(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(tmp_path)
+    output_dir = tmp_path / "qa"
+    original = prepare_final_edit_qa(
+        mode="autonomous_final_9x16",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=output_dir,
+        model_id="gemini-3.6-flash",
+    )
+    manifest_payload = read_json(manifest)
+    manifest_payload["generated_at"] = "2026-07-28T01:02:03+00:00"
+    write_json(manifest, manifest_payload)
+    degradation_path = contexts["reuse_degradation"]
+    degradation_payload = read_json(degradation_path)
+    degradation_payload["generated_at"] = "2026-07-28T04:05:06+00:00"
+    write_json(degradation_path, degradation_payload)
+
+    regenerated = prepare_final_edit_qa(
+        mode="autonomous_final_9x16",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=output_dir,
+        model_id="gemini-3.6-flash",
+    )
+
+    assert regenerated.cache_key == original.cache_key
+    assert (
+        regenerated.input_hashes["manifest_sha256"]
+        == original.input_hashes["manifest_sha256"]
+    )
+    assert (
+        regenerated.input_hashes["manifest_file_sha256"]
+        != original.input_hashes["manifest_file_sha256"]
+    )
+    assert (
+        regenerated.input_hashes["autonomous_context_hashes"]
+        == original.input_hashes["autonomous_context_hashes"]
+    )
+    assert (
+        regenerated.input_hashes["autonomous_context_file_hashes"]
+        != original.input_hashes["autonomous_context_file_hashes"]
+    )
+
+
 def test_dwell_quality_contract_rejects_fixed_second_rules() -> None:
     payload = {
         "order": 1,
@@ -799,6 +850,72 @@ def test_recovery_uses_local_mapping_and_enforces_both_caps(
     )
     assert exhausted.outcome == "blocked"
     assert exhausted.decision_codes == ("final_qa_pass_limit_reached",)
+
+
+def test_autonomous_validator_allows_aspect_ratio_but_rejects_timestamp(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(tmp_path)
+    prepared = prepare_final_edit_qa(
+        mode="autonomous_final_9x16",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=tmp_path / "qa",
+        model_id="gemini-3.6-flash",
+    )
+    issue = {
+        "issue_id": "issue-1",
+        "issue_type": "result_not_readable",
+        "severity": "high",
+        "segment_id": "payoff",
+        "beat_id": "generation-result",
+        "observation": "The result is too small in the 9:16 vertical presentation.",
+        "evidence_modality": "visual",
+        "repair_class": "solid_matte_fit",
+    }
+    accepted_payload = {
+        **_autonomous_output(
+            prepared,
+            issues=[issue],
+            status="issues_observed",
+        ),
+        "context_hashes": {},
+        "requires_human_review": False,
+    }
+    normalized, normalization_audit = (
+        final_edit_qa_module._normalize_application_owned_fields(
+            json.dumps(accepted_payload),
+            mode="autonomous_final_9x16",
+            autonomous_context_hashes=prepared.autonomous_context_hashes,
+        )
+    )
+    accepted = AutonomousFinalEditQa.model_validate(normalized)
+
+    final_edit_qa_module._validate_result(prepared, accepted)
+    assert accepted.issues[0].observation == issue["observation"]
+    assert accepted.context_hashes == prepared.autonomous_context_hashes
+    assert (
+        normalization_audit["application_owned_fields"]["context_hashes"][
+            "model_value"
+        ]
+        == {}
+    )
+
+    timestamp_issue = {**issue, "observation": "The result becomes visible at 01:23."}
+    rejected = AutonomousFinalEditQa.model_validate(
+        {
+            **_autonomous_output(
+                prepared,
+                issues=[timestamp_issue],
+                status="issues_observed",
+            ),
+            "requires_human_review": False,
+        }
+    )
+    with pytest.raises(ValueError, match="executable timestamp"):
+        final_edit_qa_module._validate_result(prepared, rejected)
 
 
 def test_semantic_replan_is_scoped_and_limited_to_one(

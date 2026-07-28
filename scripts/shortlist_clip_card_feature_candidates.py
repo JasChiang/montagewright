@@ -122,9 +122,12 @@ frame、bbox、crop、剪點或最終排名。
 6. 不輸出 frame ID、時間、座標、模型規格或未觀察到的功能。
 7. capability 為 not_assessed 時只代表尚未補件，不能據此否定候選；
    也不得自行補出 action、result、relation、readability 或 audio role。
-8. hard／preferred visual event 必須召回直接包含該動作或狀態轉換的 event。
-   顯示相同物件的靜態 setup 不能取代 UI state change、action apex、reaction
-   peak 或其他 contracted event；找不到 hard event 時必須 not_found。
+8. 這是粗召回，不要求 Base Clip Card 已有 exact event type 或 exact frame。
+   當 event 的 observable_evidence 直接描述 contracted 動作、狀態轉換或結果，
+   即使整段仍需下游 ExactEventLock 定位，也必須保留為候選。反之，只顯示
+   相同物件的靜態 setup 不能取代 UI state change、action apex、reaction peak
+   或 result stable start；完整 library 都沒有可觀察描述時，hard event 才是
+   not_found。
 
 contract_version 必須原樣回傳：clip-card-feature-shortlist-v1
 project_id 必須原樣回傳：{brief.project_id}

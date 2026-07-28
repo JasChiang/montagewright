@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from PIL import Image
 
 from jascue_video_lab.autonomous_policy import (
@@ -185,12 +186,34 @@ def test_impossible_two_device_crop_uses_scale_locked_two_panel() -> None:
     filter_graph = two_panel_ffmpeg_filter(compilation.panel_layout)
     assert "[0:v]split=2" in filter_graph
     assert filter_graph.count("[0:v]") == 1
+    assert "force_original_aspect_ratio=decrease" not in filter_graph
+    assert ",pad=" not in filter_graph
+
+
+def test_runtime_crop_failure_can_force_two_panel_enumeration() -> None:
+    compilation = compile_presentation(
+        targets=[
+            _target("person", (380, 120, 620, 980)),
+            _target("phone", (470, 420, 540, 610)),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="context_detail",
+        policy=_policy(),
+        allow_static_full_bleed=False,
+    )
+
+    assert compilation.mode == "two_panel_layout"
+    assert compilation.panel_layout is not None
+    assert compilation.paid_model_calls_added == 0
 
 
 def test_different_sources_cannot_claim_physical_simultaneity() -> None:
     result = choose_two_panel_layout(
         _target("a", (100, 200, 300, 800), asset="sha256:" + "a" * 64),
         _target("b", (700, 200, 900, 800), asset="sha256:" + "b" * 64),
+        source_width=1920,
+        source_height=1080,
         relation_mode="simultaneous_relation",
         physical_scale_comparison=True,
         allow_conceptual_different_source=True,
@@ -198,6 +221,37 @@ def test_different_sources_cannot_claim_physical_simultaneity() -> None:
     )
 
     assert result is None
+
+
+def test_landscape_two_panel_uses_fill_crops_without_internal_letterbox() -> None:
+    result = choose_two_panel_layout(
+        _target("a", (100, 300, 400, 700)),
+        _target("b", (600, 300, 900, 700)),
+        source_width=1920,
+        source_height=1080,
+        relation_mode="simultaneous_relation",
+        physical_scale_comparison=True,
+        allow_conceptual_different_source=False,
+        allowed_modes=("top_bottom", "side_by_side"),
+    )
+
+    assert result is not None
+    assert result.layout_mode == "top_bottom"
+    for panel in result.panels:
+        crop_width = panel.crop_box_2d[2] - panel.crop_box_2d[0]
+        crop_height = panel.crop_box_2d[3] - panel.crop_box_2d[1]
+        crop_pixel_aspect = (crop_width * 1920) / (crop_height * 1080)
+        panel_pixel_aspect = (
+            (panel.output_rect.width * 1080)
+            / (panel.output_rect.height * 1920)
+        )
+        assert crop_pixel_aspect == pytest.approx(
+            panel_pixel_aspect,
+            abs=0.01,
+        )
+    filter_graph = two_panel_ffmpeg_filter(result)
+    assert "force_original_aspect_ratio" not in filter_graph
+    assert "pad=" not in filter_graph
 
 
 def test_three_person_group_never_creates_three_panels() -> None:

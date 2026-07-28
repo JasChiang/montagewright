@@ -308,8 +308,8 @@ def create_dense_window_catalog(
         raise ValueError("dense event catalog exceeds the 3600-image request limit")
     frames: list[DenseFrame] = []
     output_dir.mkdir(parents=True, exist_ok=True)
-    for index, requested_ms in enumerate(ordered_times, start=1):
-        frame_id = f"DF{index:06d}"
+    for requested_ms in ordered_times:
+        frame_id = f"DF{len(frames) + 1:06d}"
         source_path = output_dir / "analysis-frames" / f"{frame_id}.jpg"
         transport_path = output_dir / "transport-frames" / f"{frame_id}.jpg"
         extracted = extract_frame(
@@ -318,6 +318,12 @@ def create_dense_window_catalog(
             source_path,
             max_width=max_width,
         )
+        # A requested millisecond can still decode to the following source
+        # frame. Keep the immutable selected window half-open instead of
+        # admitting an out-of-window PTS merely because the request was valid.
+        if not start_ms <= extracted.frame_time_ms < end_ms:
+            source_path.unlink(missing_ok=True)
+            continue
         _render_dense_transport(source_path, transport_path, frame_id, max_width)
         frames.append(
             DenseFrame(
@@ -333,6 +339,11 @@ def create_dense_window_catalog(
                 transport_image_path=str(transport_path.resolve()),
                 transport_image_hash=sha256_file(transport_path),
             )
+        )
+    if not frames:
+        raise ValueError(
+            "dense selected window contains no decoded frame inside its "
+            "half-open source bounds"
         )
     contact_sheet_paths, contact_sheet_hashes = _render_dense_contact_sheets(
         frames, output_dir / "contact-sheets"

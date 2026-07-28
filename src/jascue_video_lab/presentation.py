@@ -250,6 +250,7 @@ def compile_presentation(
     policy: AutonomousEditPolicy,
     physical_scale_comparison: bool = False,
     allow_conceptual_different_source: bool = False,
+    allow_static_full_bleed: bool = True,
 ) -> PresentationCompilation:
     """Enumerate static/layout/fit candidates and select locally."""
 
@@ -258,10 +259,14 @@ def compile_presentation(
             mode="blocked",
             decision_codes=("no_required_targets",),
         )
-    shared_crop = _largest_shared_vertical_crop(
-        targets,
-        source_width=source_width,
-        source_height=source_height,
+    shared_crop = (
+        _largest_shared_vertical_crop(
+            targets,
+            source_width=source_width,
+            source_height=source_height,
+        )
+        if allow_static_full_bleed
+        else None
     )
     if shared_crop is not None:
         return PresentationCompilation(
@@ -277,6 +282,8 @@ def compile_presentation(
         panel = choose_two_panel_layout(
             targets[0],
             targets[1],
+            source_width=source_width,
+            source_height=source_height,
             relation_mode=relation_mode,
             physical_scale_comparison=physical_scale_comparison,
             allow_conceptual_different_source=(
@@ -418,6 +425,8 @@ def choose_two_panel_layout(
     first: PresentationTarget,
     second: PresentationTarget,
     *,
+    source_width: int,
+    source_height: int,
     relation_mode: Literal["simultaneous_relation", "context_detail"],
     physical_scale_comparison: bool,
     allow_conceptual_different_source: bool,
@@ -436,11 +445,50 @@ def choose_two_panel_layout(
         if mode == "context_detail" and relation_mode != "context_detail":
             continue
         rects = _panel_rects(mode)
+        crop_boxes = [
+            _panel_crop_around(
+                target.box_2d,
+                rect=rect,
+                source_width=source_width,
+                source_height=source_height,
+            )
+            for target, rect in zip((first, second), rects, strict=True)
+        ]
+        if any(crop is None for crop in crop_boxes):
+            continue
+        first_crop, second_crop = crop_boxes
+        assert first_crop is not None and second_crop is not None
+        if physical_scale_comparison:
+            if rects[0].width != rects[1].width or (
+                rects[0].height != rects[1].height
+            ):
+                continue
+            shared_height = max(
+                first_crop[3] - first_crop[1],
+                second_crop[3] - second_crop[1],
+            )
+            first_crop = _panel_crop_around(
+                first.box_2d,
+                rect=rects[0],
+                source_width=source_width,
+                source_height=source_height,
+                fixed_crop_height=shared_height,
+            )
+            second_crop = _panel_crop_around(
+                second.box_2d,
+                rect=rects[1],
+                source_width=source_width,
+                source_height=source_height,
+                fixed_crop_height=shared_height,
+            )
+            if first_crop is None or second_crop is None:
+                continue
         score = sum(
-            _panel_readability(target.box_2d, rect)
-            for target, rect in zip(
+            _panel_readability(target.box_2d, rect, crop)
+            for target, rect, crop in zip(
                 (first, second),
                 rects,
+                (first_crop, second_crop),
                 strict=True,
             )
         )
@@ -476,14 +524,7 @@ def choose_two_panel_layout(
                         source_asset_id=first.source_asset_id,
                         source_pts=first.source_pts,
                         target_ids=(first.target_id,),
-                        crop_box_2d=_square_crop_around(
-                            first.box_2d,
-                            size=(
-                                _shared_physical_crop_size(first, second)
-                                if physical_scale_comparison
-                                else None
-                            ),
-                        ),
+                        crop_box_2d=first_crop,
                         output_rect=rects[0],
                     ),
                     PanelSpec(
@@ -491,14 +532,7 @@ def choose_two_panel_layout(
                         source_asset_id=second.source_asset_id,
                         source_pts=second.source_pts,
                         target_ids=(second.target_id,),
-                        crop_box_2d=_square_crop_around(
-                            second.box_2d,
-                            size=(
-                                _shared_physical_crop_size(first, second)
-                                if physical_scale_comparison
-                                else None
-                            ),
-                        ),
+                        crop_box_2d=second_crop,
                         output_rect=rects[1],
                     ),
                 ),
@@ -609,9 +643,7 @@ def two_panel_ffmpeg_filter(
         labels.append(label)
         filter_parts.append(
             f"[p{index}]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:"
-            f"color={background_color}[{label}]"
+            f"scale={width}:{height}:flags=lanczos[{label}]"
         )
     x0 = round(canvas_width * first.output_rect.x / 1000)
     y0 = round(canvas_height * first.output_rect.y / 1000)
@@ -652,6 +684,24 @@ def _signed_motion_reversal_count(
 def _vertical_fit_filter() -> str:
     return (
         "[0:v]fps=30,"
+        "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
+        "scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x0b0e12,setsar=1[base]"
+    )
+
+
+def _vertical_intentional_freeze_fit_filter(
+    *,
+    freeze_start_seconds: float,
+    total_duration_seconds: float,
+) -> str:
+    if not 0 < freeze_start_seconds < total_duration_seconds:
+        raise ValueError("intentional freeze must start inside the segment")
+    freeze_duration = total_duration_seconds - freeze_start_seconds
+    return (
+        "[0:v]fps=30,"
+        f"trim=end={freeze_start_seconds:.6f},setpts=PTS-STARTPTS,"
+        f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f},"
         "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
         "scale=1080:1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x0b0e12,setsar=1[base]"
@@ -864,46 +914,82 @@ def _panel_rects(
     )
 
 
-def _panel_readability(box: NormalizedBox, rect: PanelRect) -> float:
+def _panel_readability(
+    box: NormalizedBox,
+    rect: PanelRect,
+    crop: NormalizedBox,
+) -> float:
     box_width = box[2] - box[0]
     box_height = box[3] - box[1]
-    box_aspect = box_width / box_height
-    panel_aspect = rect.width / rect.height
-    aspect_efficiency = min(
-        box_aspect / panel_aspect,
-        panel_aspect / box_aspect,
+    crop_width = crop[2] - crop[0]
+    crop_height = crop[3] - crop[1]
+    target_occupancy = min(
+        1.0,
+        (box_width * box_height) / (crop_width * crop_height),
     )
     area = rect.width * rect.height / 1_000_000
-    return area * max(0.0, aspect_efficiency)
+    return area * target_occupancy**0.5
 
 
-def _square_crop_around(
+def _panel_crop_around(
     box: NormalizedBox,
     *,
-    size: int | None = None,
-) -> NormalizedBox:
+    rect: PanelRect,
+    source_width: int,
+    source_height: int,
+    canvas_width: int = 1080,
+    canvas_height: int = 1920,
+    fixed_crop_height: int | None = None,
+) -> NormalizedBox | None:
+    """Return a contained crop whose pixel aspect exactly fills one panel."""
+
     x0, y0, x1, y1 = box
-    size = min(1000, size or max(x1 - x0, y1 - y0))
+    box_width = x1 - x0
+    box_height = y1 - y0
+    panel_pixel_aspect = (
+        canvas_width * rect.width / 1000
+    ) / (canvas_height * rect.height / 1000)
+    normalized_width_per_height = (
+        panel_pixel_aspect * source_height / source_width
+    )
+    minimum_height = max(
+        float(box_height),
+        float(box_width) / normalized_width_per_height,
+    )
+    crop_height = float(fixed_crop_height or minimum_height)
+    if fixed_crop_height is None:
+        maximum_scale = min(
+            1000 / crop_height,
+            1000 / (crop_height * normalized_width_per_height),
+        )
+        crop_height *= min(1.12, maximum_scale)
+    crop_width = crop_height * normalized_width_per_height
+    if (
+        crop_height > 1000.5
+        or crop_width > 1000.5
+        or crop_height + 0.5 < box_height
+        or crop_width + 0.5 < box_width
+    ):
+        return None
+    crop_height_i = min(1000, max(1, round(crop_height)))
+    crop_width_i = min(1000, max(1, round(crop_width)))
+    if crop_height_i < box_height or crop_width_i < box_width:
+        return None
     center_x = (x0 + x1) / 2
     center_y = (y0 + y1) / 2
-    left = max(0, min(1000 - size, round(center_x - size / 2)))
-    top = max(0, min(1000 - size, round(center_y - size / 2)))
-    return (left, top, left + size, top + size)
-
-
-def _shared_physical_crop_size(
-    first: PresentationTarget,
-    second: PresentationTarget,
-) -> int:
-    return min(
-        1000,
-        max(
-            first.box_2d[2] - first.box_2d[0],
-            first.box_2d[3] - first.box_2d[1],
-            second.box_2d[2] - second.box_2d[0],
-            second.box_2d[3] - second.box_2d[1],
-        ),
+    left = max(
+        0,
+        min(1000 - crop_width_i, round(center_x - crop_width_i / 2)),
     )
+    top = max(
+        0,
+        min(1000 - crop_height_i, round(center_y - crop_height_i / 2)),
+    )
+    if left > x0 or top > y0:
+        return None
+    if left + crop_width_i < x1 or top + crop_height_i < y1:
+        return None
+    return (left, top, left + crop_width_i, top + crop_height_i)
 
 
 def presentation_cache_fragment(compilation: PresentationCompilation) -> str:

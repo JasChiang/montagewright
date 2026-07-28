@@ -146,7 +146,9 @@ from .presentation import (
     _vertical_center_crop_filter,
     _vertical_delivery_fallback,
     _vertical_fit_filter,
+    _vertical_intentional_freeze_fit_filter,
     _vertical_required_scope_fit_filter,
+    compile_intentional_freeze,
     compile_presentation,
     shared_sam_seeds_from_grounding,
     two_panel_ffmpeg_filter,
@@ -1995,6 +1997,10 @@ def _concat_segments(
 ) -> None:
     if not segment_paths:
         raise ValueError("cannot concatenate an empty segment list")
+    if isinstance(segment_durations_seconds, Mapping):
+        raise TypeError(
+            "segment durations must be ordered to match segment paths"
+        )
     if (
         segment_durations_seconds is not None
         and len(segment_durations_seconds) != len(segment_paths)
@@ -2713,6 +2719,30 @@ def _segment_variant_fingerprint(
             "track_fingerprint": track_fingerprint,
         }
     )
+
+
+def _reuse_content_addressed_segment(
+    *,
+    output_dir: Path,
+    aspect: Literal["16x9", "9x16"],
+    fingerprint: str,
+    expected_duration: float,
+    dimensions: tuple[int, int],
+) -> Path | None:
+    """Find a valid segment by content, independent of the run variant."""
+
+    for candidate in sorted(
+        (output_dir / "segments").glob(
+            f"*/{aspect}/*-{fingerprint[:12]}.mp4"
+        )
+    ):
+        if _segment_is_valid(
+            candidate,
+            expected_duration=expected_duration,
+            dimensions=dimensions,
+        ):
+            return candidate
+    return None
 
 
 def _usable_track_centers(
@@ -7160,9 +7190,263 @@ def _autonomous_panel_fallback_eligible(
     }:
         return True
     return (
-        relation_mode in {"simultaneous", "relation_core"}
+        relation_mode in {
+            "simultaneous",
+            "relation_core",
+            "primary_with_context",
+        }
         and policy.presentation.allow_two_panel_layout
     )
+
+
+def _resolved_autonomous_relation_mode(
+    relation_mode: str,
+) -> Literal[
+    "single_subject",
+    "sequential_focus",
+    "simultaneous_relation",
+    "context_detail",
+]:
+    if relation_mode in {"simultaneous", "relation_core"}:
+        return "simultaneous_relation"
+    if relation_mode == "primary_with_context":
+        return "context_detail"
+    if relation_mode == "sequential":
+        return "sequential_focus"
+    return "single_subject"
+
+
+def _compatible_output_cues(
+    cues: Sequence[LockedMusicCue],
+    *,
+    cue_relation: str,
+    project_event_time_ms: int,
+    project_duration_ms: int,
+) -> list[LockedMusicCue]:
+    kinds_by_relation = {
+        "accent": {"accent"},
+        "principal_downbeat": {"downbeat"},
+        "music_emphasis": {"accent", "downbeat"},
+        "phrase_ending": {"ending_hit", "section_boundary"},
+    }
+    candidates = [
+        cue
+        for cue in cues
+        if cue.kind in kinds_by_relation[cue_relation]
+    ]
+    if cue_relation == "phrase_ending":
+        # The final assembled span may end on a locked accent rather than a
+        # separately labeled section boundary. Treat only final-phrase accents
+        # as ending candidates; earlier accents remain ineligible.
+        final_phrase_start_ms = max(0, project_duration_ms - 2_000)
+        candidates.extend(
+            cue
+            for cue in cues
+            if cue.kind in {"accent", "downbeat"}
+            and cue.time_ms >= final_phrase_start_ms
+        )
+    return sorted(
+        {
+            (cue.cue_id, cue.sample_index): cue
+            for cue in candidates
+        }.values(),
+        key=lambda cue: (
+            abs(cue.time_ms - project_event_time_ms),
+            cue.time_ms,
+            cue.cue_id,
+        ),
+    )
+
+
+def _bind_freeze_start_to_reaction_peak(
+    locks: Sequence[ExactEventLockV2],
+) -> tuple[ExactEventLockV2, ...]:
+    reaction = next(
+        (
+            lock
+            for lock in locks
+            if lock.event_type == "group_laugh_reaction_peak"
+        ),
+        None,
+    )
+    if reaction is None:
+        return tuple(locks)
+    bound: list[ExactEventLockV2] = []
+    for lock in locks:
+        if lock.event_type != "freeze_start":
+            bound.append(lock)
+            continue
+        bound.append(
+            lock.model_copy(
+                update={
+                    "source_frame_id": reaction.source_frame_id,
+                    "source_pts": reaction.source_pts,
+                    "source_time_ms": reaction.source_time_ms,
+                    "source_frame_hash": reaction.source_frame_hash,
+                    "support_window_start_frame_id": (
+                        reaction.support_window_start_frame_id
+                    ),
+                    "support_window_end_frame_id": (
+                        reaction.support_window_end_frame_id
+                    ),
+                    "support_window_start_ms": (
+                        reaction.support_window_start_ms
+                    ),
+                    "support_window_end_ms": reaction.support_window_end_ms,
+                    "confidence": min(lock.confidence, reaction.confidence),
+                }
+            )
+        )
+    return tuple(bound)
+
+
+def _runtime_scope_preserving_presentation_fallback(
+    *,
+    failed_geometry: Mapping[str, Any],
+    hard_regions: Sequence[FramingRegionIntent],
+    hard_tracks: Sequence[SegmentationTrack],
+    policy: AutonomousEditPolicy | None,
+    presentation_preference: str,
+    relation_mode: str,
+    physical_scale_comparison: bool,
+) -> tuple[str, dict[str, Any]] | None:
+    """Recover locally after whole-window evidence invalidates a crop.
+
+    Two-panel crops still require complete verified tracks. Solid fit retains
+    the complete source frame, so it remains safe when tracking coverage is the
+    reason the full-bleed crop failed.
+    """
+
+    unsafe_delivery_risks = {
+        "explicit_unverified_geometry_preview",
+        "review_only_controlled_primary_center_clip",
+        "review_only_atomic_relation_bbox_clip",
+        "phase_intentional_anchor_clipping",
+    }
+    observed_unsafe_risks = unsafe_delivery_risks & set(
+        failed_geometry.get("risk_codes") or []
+    )
+    if policy is None or not hard_regions or not (
+        failed_geometry.get("fallback_reason") or observed_unsafe_risks
+    ):
+        return None
+    source_width, source_height, source_lineage = (
+        _orientation_corrected_track_dimensions(hard_tracks)
+    )
+    tracking_gate_passed = all(
+        _track_confidence_diagnostics(track)[
+            "tracking_confidence_gate_passed"
+        ]
+        for track in hard_tracks
+    )
+    original_coverage_passed = bool(
+        failed_geometry.get("coverage_passed", False)
+    )
+    failed_reason = str(
+        failed_geometry.get("fallback_reason")
+        or "runtime_geometry_not_delivery_safe:"
+        + ",".join(sorted(observed_unsafe_risks))
+    )
+
+    if (
+        original_coverage_passed
+        and tracking_gate_passed
+        and _autonomous_panel_fallback_eligible(
+            hard_region_count=len(hard_regions),
+            presentation_preference=presentation_preference,
+            relation_mode=relation_mode,
+            policy=policy,
+        )
+    ):
+        targets = [
+            _presentation_target_from_track(
+                target_id=region.entity_id or region.region_id,
+                track=track,
+            )
+            for region, track in zip(
+                hard_regions,
+                hard_tracks,
+                strict=True,
+            )
+        ]
+        compilation = compile_presentation(
+            targets=targets,
+            source_width=source_width,
+            source_height=source_height,
+            relation_mode=_resolved_autonomous_relation_mode(relation_mode),
+            policy=policy,
+            physical_scale_comparison=physical_scale_comparison,
+            allow_static_full_bleed=False,
+        )
+        if compilation.mode == "two_panel_layout":
+            assert compilation.panel_layout is not None
+            return (
+                two_panel_ffmpeg_filter(compilation.panel_layout),
+                {
+                    "applied_strategy": "two_panel_layout",
+                    "fallback_reason": None,
+                    "runtime_full_bleed_failure_reason": failed_reason,
+                    "risk_codes": [
+                        "runtime_full_bleed_geometry_failed",
+                        "scope_preserving_two_panel_recovery",
+                    ],
+                    "full_bleed": True,
+                    "source_geometry_lineage_passed": True,
+                    "tracking_confidence_gate_passed": True,
+                    "coverage_passed": True,
+                    "minimum_visible_required_area_fraction": 1.0,
+                    "soft_extent_visibility_passed": True,
+                    "paid_model_calls_added": 0,
+                    "presentation_decision_codes": [
+                        "whole_window_tracks_verified",
+                        *compilation.decision_codes,
+                    ],
+                    "panel_layout": compilation.panel_layout.model_dump(
+                        mode="json"
+                    ),
+                    "panel_same_pts": True,
+                    "relative_scale_locked": (
+                        compilation.panel_layout.relative_scale_policy
+                        == "locked"
+                    ),
+                    **source_lineage,
+                },
+            )
+
+    if policy.presentation.allow_solid_matte_fit:
+        return (
+            _vertical_fit_filter(),
+            {
+                "applied_strategy": "solid_matte_fit",
+                "fallback_reason": None,
+                "runtime_full_bleed_failure_reason": failed_reason,
+                "risk_codes": [
+                    "runtime_full_bleed_geometry_failed",
+                    "whole_source_scope_preserving_fit",
+                ],
+                "full_bleed": False,
+                "source_geometry_lineage_passed": True,
+                "tracking_confidence_gate_passed": True,
+                "coverage_passed": True,
+                "original_tracking_confidence_gate_passed": (
+                    tracking_gate_passed
+                ),
+                "original_tracking_coverage_passed": (
+                    original_coverage_passed
+                ),
+                "minimum_visible_required_area_fraction": 1.0,
+                "soft_extent_visibility_passed": True,
+                "paid_model_calls_added": 0,
+                "presentation_decision_codes": [
+                    "tracked_full_bleed_failed_runtime_evidence",
+                    "whole_source_scope_preserved",
+                    "solid_matte_fit_policy_authorized",
+                ],
+                "requires_gemini_review": True,
+                **source_lineage,
+            },
+        )
+    return None
 
 
 def _vertical_candidate_geometry(
@@ -7273,20 +7557,9 @@ def _vertical_candidate_geometry(
             policy=autonomous_policy,
         ):
             assert autonomous_policy is not None
-            resolved_relation_mode: Literal[
-                "single_subject",
-                "sequential_focus",
-                "simultaneous_relation",
-                "context_detail",
-            ]
-            if relation_mode in {"simultaneous", "relation_core"}:
-                resolved_relation_mode = "simultaneous_relation"
-            elif relation_mode == "primary_with_context":
-                resolved_relation_mode = "context_detail"
-            elif relation_mode == "sequential":
-                resolved_relation_mode = "sequential_focus"
-            else:
-                resolved_relation_mode = "single_subject"
+            resolved_relation_mode = _resolved_autonomous_relation_mode(
+                relation_mode
+            )
             if presentation_preference == "solid_matte_fit":
                 resolved_relation_mode = "single_subject"
             source_width, source_height, source_lineage = (
@@ -7558,6 +7831,17 @@ def _vertical_candidate_geometry(
                 preferred_tracks=soft_tracks,
                 preferred_regions=available_soft_regions,
             )
+        runtime_fallback = _runtime_scope_preserving_presentation_fallback(
+            failed_geometry=geometry,
+            hard_regions=hard_regions,
+            hard_tracks=hard_tracks,
+            policy=autonomous_policy,
+            presentation_preference=presentation_preference,
+            relation_mode=relation_mode,
+            physical_scale_comparison=physical_scale_comparison,
+        )
+        if runtime_fallback is not None:
+            filter_graph, geometry = runtime_fallback
     else:
         target = (target_description or "").strip()
         if not target:
@@ -11939,8 +12223,14 @@ def _run_feature_cut_experiment_impl(
                 )
                 duration_resolution_authority = (
                     "operator_authorized_shorter_attention_maximum"
-                )
+        )
         write_json(attention_path, attention_profile)
+        attention_definition_sha256 = _stable_fingerprint(
+            attention_profile.model_dump(
+                mode="json",
+                exclude={"generated_at"},
+            )
+        )
         write_json(
             editorial_dir / "project-duration-resolution.json",
             {
@@ -11962,12 +12252,19 @@ def _run_feature_cut_experiment_impl(
         rhythm_plan = build_rhythm_plan(
             attention_profile,
             target_duration_seconds=project_duration_seconds,
-            attention_profile_sha256=sha256_file(attention_path),
+            attention_profile_sha256=attention_definition_sha256,
             style_profile=rhythm_style,
         )
         write_json(rhythm_path, rhythm_plan)
+        rhythm_definition_sha256 = _stable_fingerprint(
+            rhythm_plan.model_dump(
+                mode="json",
+                exclude={"generated_at"},
+            )
+        )
         output_timeline_cues: list[LockedMusicCue] | None = None
         music_timeline_plan: Any | None = None
+        music_output_timeline_definition_sha256: str | None = None
         if music_lock is not None and resolved_music_lock_path is not None:
             picture_target_ms = round(project_duration_seconds * 1000)
             try:
@@ -11992,23 +12289,40 @@ def _run_feature_cut_experiment_impl(
                 music_lock,
                 spans=music_timeline_plan.spans,
             )
+            music_output_timeline_plan_definition = (
+                music_timeline_plan.model_dump(mode="json")
+            )
+            music_output_timeline_definition = {
+                "contract_version": "music-output-timeline-v1",
+                "plan_contract_version": music_timeline_plan.contract_version,
+                "plan_definition": music_output_timeline_plan_definition,
+                "source_music_definition_sha256": (
+                    music_lock.definition_sha256
+                ),
+                "output_cues": [
+                    cue.model_dump(mode="json")
+                    for cue in output_timeline_cues
+                ],
+            }
+            music_output_timeline_definition_sha256 = _stable_fingerprint(
+                {
+                    **music_output_timeline_definition,
+                    "plan_definition": {
+                        key: value
+                        for key, value in (
+                            music_output_timeline_plan_definition.items()
+                        )
+                        if key != "generated_at"
+                    },
+                }
+            )
             write_json(
                 editorial_dir / "music-output-timeline.json",
                 {
-                    "contract_version": "music-output-timeline-v1",
-                    "plan_contract_version": (
-                        music_timeline_plan.contract_version
+                    **music_output_timeline_definition,
+                    "definition_sha256": (
+                        music_output_timeline_definition_sha256
                     ),
-                    "plan_definition": music_timeline_plan.model_dump(
-                        mode="json"
-                    ),
-                    "source_music_definition_sha256": (
-                        music_lock.definition_sha256
-                    ),
-                    "output_cues": [
-                        cue.model_dump(mode="json")
-                        for cue in output_timeline_cues
-                    ],
                     "generated_at": utc_now(),
                 },
             )
@@ -12061,10 +12375,10 @@ def _run_feature_cut_experiment_impl(
                 allow_shorter_within_delivery_range
             ),
             "resolved_project_duration_seconds": project_duration_seconds,
-            "attention_profile_path": str(attention_path.resolve()),
-            "attention_profile_sha256": sha256_file(attention_path),
-            "rhythm_plan_path": str(rhythm_path.resolve()),
-            "rhythm_plan_sha256": sha256_file(rhythm_path),
+            "attention_profile_definition_sha256": (
+                attention_definition_sha256
+            ),
+            "rhythm_plan_definition_sha256": rhythm_definition_sha256,
             "allow_proposed_trim_preview": allow_proposed_trim_preview,
             "allow_unverified_geometry_preview": allow_unverified_geometry_preview,
         }
@@ -12428,6 +12742,16 @@ def _run_feature_cut_experiment_impl(
                         / render_variant
                         / "16x9"
                         / f"{index:02d}-{horizontal_segment_fingerprint[:12]}.mp4"
+                    )
+                    horizontal_segment = (
+                        _reuse_content_addressed_segment(
+                            output_dir=output_dir,
+                            aspect="16x9",
+                            fingerprint=horizontal_segment_fingerprint,
+                            expected_duration=(h_end - h_start) / 1000,
+                            dimensions=(1920, 1080),
+                        )
+                        or horizontal_segment
                     )
                     if not _segment_is_valid(
                         horizontal_segment,
@@ -13318,6 +13642,15 @@ def _run_feature_cut_experiment_impl(
                     except Exception as error:
                         abort_for_geometry_quota(error)
                         failure_codes = _failure_codes_from_geometry_error(error)
+                        whole_source_fit_authorized = (
+                            autonomous_policy is not None
+                            and autonomous_policy.presentation.allow_solid_matte_fit
+                            and any(
+                                contract.feature_id == selected.feature_id
+                                and contract.priority == "hard"
+                                for contract in editorial_templates
+                            )
+                        )
                         recovery = choose_recovery(
                             failure_codes,
                             candidates_remaining=(
@@ -13326,18 +13659,72 @@ def _run_feature_cut_experiment_impl(
                         )
                         attempt.update(
                             {
-                                "decision": "try_next",
-                                "reason_code": ",".join(
-                                    failure.value for failure in failure_codes
+                                "decision": (
+                                    "accepted_scope_preserving_fit"
+                                    if whole_source_fit_authorized
+                                    else "try_next"
+                                ),
+                                "reason_code": (
+                                    "hard_event_geometry_failed_whole_source_fit"
+                                    if whole_source_fit_authorized
+                                    else ",".join(
+                                        failure.value
+                                        for failure in failure_codes
+                                    )
                                 ),
                                 "failure_codes": [
                                     failure.value for failure in failure_codes
                                 ],
-                                "recovery_action": recovery.value,
+                                "recovery_action": (
+                                    "whole_source_solid_fit"
+                                    if whole_source_fit_authorized
+                                    else recovery.value
+                                ),
                                 "error": str(error),
                             }
                         )
                         candidate_attempts.append(attempt)
+                        if whole_source_fit_authorized:
+                            selected_vertical = {
+                                "option": option_data,
+                                "frame": candidate_frame,
+                                "clip": candidate_clip,
+                                "media": candidate_media,
+                                "start_ms": candidate_start,
+                                "end_ms": candidate_end,
+                                "shot_id": candidate_shot,
+                                "trim": candidate_trim,
+                                "regions": candidate_regions,
+                                "target": candidate_target,
+                                "filter": _vertical_fit_filter(),
+                                "geometry": {
+                                    "applied_strategy": "solid_matte_fit",
+                                    "fallback_reason": None,
+                                    "risk_codes": [
+                                        "grounding_geometry_unavailable",
+                                        "whole_source_scope_preserving_fit",
+                                    ],
+                                    "full_bleed": False,
+                                    "source_geometry_lineage_passed": True,
+                                    "tracking_confidence_gate_passed": True,
+                                    "coverage_passed": True,
+                                    "minimum_visible_required_area_fraction": 1.0,
+                                    "soft_extent_visibility_passed": True,
+                                    "paid_model_calls_added": 0,
+                                    "presentation_decision_codes": [
+                                        "hard_event_candidate_preserved",
+                                        "whole_source_scope_preserved",
+                                        "solid_matte_fit_policy_authorized",
+                                    ],
+                                    "requires_gemini_review": True,
+                                },
+                                "debugs": [],
+                                "track_fingerprint": None,
+                                "evidence_query_v2": attempt.get(
+                                    "evidence_query_v2"
+                                ),
+                            }
+                            break
                         if human_reframe_policy_requested:
                             selected_vertical = {
                                 "option": option_data,
@@ -13625,10 +14012,222 @@ def _run_feature_cut_experiment_impl(
                                 locks,
                                 bound_contracts,
                             )
+                            locks = _bind_freeze_start_to_reaction_peak(
+                                locks
+                            )
                         project_start_ms = sum(
                             int(row["duration_ms"])
                             for row in manifest["vertical"]["chapters"]
                         )
+                        project_duration_ms = round(
+                            sum(chapter_durations.values()) * 1000
+                        )
+                        event_contract_by_id = {
+                            f"{contract.beat_id}:{event.event_type}": event
+                            for contract in bound_contracts
+                            for event in contract.visual_events
+                        }
+                        cue_source = (
+                            output_timeline_cues
+                            if output_timeline_cues is not None
+                            else music_lock.cues
+                            if music_lock is not None
+                            else ()
+                        )
+                        requested_shifts_ms: list[int] = []
+                        selected_cue_by_event_id: dict[
+                            str, LockedMusicCue
+                        ] = {}
+                        for lock in locks:
+                            event_contract = event_contract_by_id[
+                                lock.event_id
+                            ]
+                            current_project_time_ms = (
+                                project_start_ms
+                                + lock.source_time_ms
+                                - v_start
+                            )
+                            candidates = _compatible_output_cues(
+                                cue_source,
+                                cue_relation=event_contract.cue_relation,
+                                project_event_time_ms=(
+                                    current_project_time_ms
+                                ),
+                                project_duration_ms=project_duration_ms,
+                            )
+                            if not candidates:
+                                raise ValueError(
+                                    "MusicMap has no executable cue for "
+                                    f"{event_contract.cue_relation}"
+                                )
+                            cue = candidates[0]
+                            selected_cue_by_event_id[lock.event_id] = cue
+                            alignment = build_cue_alignment_evidence(
+                                lock,
+                                cue_id=cue.cue_id,
+                                cue_sample_index=cue.sample_index,
+                                music_sample_rate=(
+                                    music_lock.master_sample_rate
+                                    if music_lock is not None
+                                    else 48_000
+                                ),
+                                project_event_time_ms=(
+                                    current_project_time_ms
+                                ),
+                                fps_numerator=30,
+                                tolerance_frames=(
+                                    event_contract.tolerance_frames
+                                ),
+                            )
+                            if not alignment.passed:
+                                requested_shifts_ms.append(
+                                    round(
+                                        alignment.delta_frames
+                                        * 1000
+                                        / 30
+                                    )
+                                )
+
+                        reaction_lock = next(
+                            (
+                                lock
+                                for lock in locks
+                                if lock.event_type
+                                == "group_laugh_reaction_peak"
+                            ),
+                            None,
+                        )
+                        freeze_lock = next(
+                            (
+                                lock
+                                for lock in locks
+                                if lock.event_type == "freeze_start"
+                            ),
+                            None,
+                        )
+                        freeze_applied = False
+                        if (
+                            reaction_lock is not None
+                            and freeze_lock is not None
+                            and autonomous_policy is not None
+                            and autonomous_policy.presentation
+                            .allow_intentional_freeze
+                        ):
+                            freeze_duration_ms = (
+                                v_end - reaction_lock.source_time_ms
+                            )
+                            if 0 < freeze_duration_ms <= (
+                                autonomous_policy.presentation
+                                .max_intentional_freeze_ms
+                            ):
+                                freeze_cue = selected_cue_by_event_id[
+                                    freeze_lock.event_id
+                                ]
+                                freeze_spec = compile_intentional_freeze(
+                                    freeze_lock,
+                                    cue_id=freeze_cue.cue_id,
+                                    duration_ms=freeze_duration_ms,
+                                    policy=autonomous_policy,
+                                )
+                                vertical_filter = (
+                                    _vertical_intentional_freeze_fit_filter(
+                                        freeze_start_seconds=(
+                                            reaction_lock.source_time_ms
+                                            - v_start
+                                        )
+                                        / 1000,
+                                        total_duration_seconds=(
+                                            v_end - v_start
+                                        )
+                                        / 1000,
+                                    )
+                                )
+                                vertical_geometry = {
+                                    "applied_strategy": (
+                                        "intentional_freeze"
+                                    ),
+                                    "fallback_reason": None,
+                                    "risk_codes": [
+                                        "brief_authorized_phrase_ending_freeze",
+                                        "whole_source_scope_preserving_fit",
+                                    ],
+                                    "full_bleed": False,
+                                    "source_geometry_lineage_passed": True,
+                                    "tracking_confidence_gate_passed": True,
+                                    "coverage_passed": True,
+                                    "minimum_visible_required_area_fraction": 1.0,
+                                    "soft_extent_visibility_passed": True,
+                                    "intentional_freeze_spec": (
+                                        freeze_spec.model_dump(mode="json")
+                                    ),
+                                    "unexpected_freeze_count": 0,
+                                    "paid_model_calls_added": 0,
+                                    "requires_gemini_review": True,
+                                }
+                                vertical_track_fingerprint = None
+                                requested_shifts_ms = []
+                                freeze_applied = True
+
+                        if requested_shifts_ms and not freeze_applied:
+                            shift_spread_ms = (
+                                max(requested_shifts_ms)
+                                - min(requested_shifts_ms)
+                            )
+                            shift_ms = round(
+                                sum(requested_shifts_ms)
+                                / len(requested_shifts_ms)
+                            )
+                            shifted_start = v_start + shift_ms
+                            shifted_end = v_end + shift_ms
+                            locks_remain_inside = all(
+                                shifted_start
+                                <= lock.source_time_ms
+                                < shifted_end
+                                for lock in locks
+                            )
+                            if (
+                                shift_spread_ms <= 67
+                                and abs(shift_ms) <= 1_000
+                                and shifted_start >= 0
+                                and shifted_end <= vertical_clip.duration_ms
+                                and locks_remain_inside
+                            ):
+                                original_start = v_start
+                                original_end = v_end
+                                v_start = shifted_start
+                                v_end = shifted_end
+                                vertical_filter = _vertical_fit_filter()
+                                vertical_geometry = {
+                                    "applied_strategy": "solid_matte_fit",
+                                    "fallback_reason": None,
+                                    "risk_codes": [
+                                        "cue_aligned_trim_shift",
+                                        "whole_source_scope_preserving_fit",
+                                    ],
+                                    "full_bleed": False,
+                                    "source_geometry_lineage_passed": True,
+                                    "tracking_confidence_gate_passed": True,
+                                    "coverage_passed": True,
+                                    "minimum_visible_required_area_fraction": 1.0,
+                                    "soft_extent_visibility_passed": True,
+                                    "cue_alignment_repair": {
+                                        "method": (
+                                            "bounded_source_window_shift"
+                                        ),
+                                        "shift_ms": shift_ms,
+                                        "original_source_in_ms": (
+                                            original_start
+                                        ),
+                                        "original_source_out_ms": (
+                                            original_end
+                                        ),
+                                        "repaired_source_in_ms": v_start,
+                                        "repaired_source_out_ms": v_end,
+                                    },
+                                    "paid_model_calls_added": 0,
+                                    "requires_gemini_review": True,
+                                }
+                                vertical_track_fingerprint = None
                         for lock in locks:
                             exact_event_project_times_ms[lock.event_id] = (
                                 project_start_ms + lock.source_time_ms - v_start
@@ -13642,6 +14241,12 @@ def _run_feature_cut_experiment_impl(
                                 "source_asset_id": vertical_source_media.asset_id,
                                 "source_in_ms": v_start,
                                 "source_out_ms": v_end,
+                                "analysis_source_in_ms": (
+                                    dense_catalog.source_start_ms
+                                ),
+                                "analysis_source_out_ms": (
+                                    dense_catalog.source_end_ms
+                                ),
                                 "dense_catalog_path": str(
                                     dense_catalog_path.resolve()
                                 ),
@@ -13706,6 +14311,16 @@ def _run_feature_cut_experiment_impl(
                     / render_variant
                     / "9x16"
                     / f"{index:02d}-{vertical_segment_fingerprint[:12]}.mp4"
+                )
+                vertical_segment = (
+                    _reuse_content_addressed_segment(
+                        output_dir=output_dir,
+                        aspect="9x16",
+                        fingerprint=vertical_segment_fingerprint,
+                        expected_duration=(v_end - v_start) / 1000,
+                        dimensions=(1080, 1920),
+                    )
+                    or vertical_segment
                 )
                 if not _segment_is_valid(
                     vertical_segment,
@@ -13874,13 +14489,19 @@ def _run_feature_cut_experiment_impl(
             _concat_segments(
                 horizontal_segments,
                 horizontal_output,
-                segment_durations_seconds=chapter_durations,
+                segment_durations_seconds=tuple(
+                    chapter_durations[chapter.feature_id]
+                    for chapter in plan.chapters
+                ),
             )
         if vertical_output is not None:
             _concat_segments(
                 vertical_segments,
                 vertical_output,
-                segment_durations_seconds=chapter_durations,
+                segment_durations_seconds=tuple(
+                    chapter_durations[chapter.feature_id]
+                    for chapter in plan.chapters
+                ),
             )
         timings["concat_seconds"] = round(monotonic() - stage, 3)
         timings["total_seconds"] = round(monotonic() - started, 3)
@@ -13963,36 +14584,30 @@ def _run_feature_cut_experiment_impl(
                 for contract in resolved_editorial_contracts
                 for event in contract.visual_events
             }
-            kinds_by_relation = {
-                "accent": {"accent"},
-                "principal_downbeat": {"downbeat"},
-                "music_emphasis": {"accent", "downbeat"},
-                "phrase_ending": {"ending_hit", "section_boundary"},
-            }
             cue_rows: list[dict[str, Any]] = []
             cue_deltas: dict[str, int] = {}
             cue_tolerances: dict[str, int] = {}
+            project_duration_ms = round(
+                sum(chapter_durations.values()) * 1000
+            )
             for lock in resolved_exact_event_locks:
                 event_contract = relation_by_event_id[lock.event_id]
-                candidates = [
-                    cue
-                    for cue in (
+                project_time_ms = exact_event_project_times_ms[lock.event_id]
+                candidates = _compatible_output_cues(
+                    (
                         output_timeline_cues
                         if output_timeline_cues is not None
                         else music_lock.cues
-                    )
-                    if cue.kind
-                    in kinds_by_relation[event_contract.cue_relation]
-                ]
+                    ),
+                    cue_relation=event_contract.cue_relation,
+                    project_event_time_ms=project_time_ms,
+                    project_duration_ms=project_duration_ms,
+                )
                 if not candidates:
                     raise ValueError(
                         f"MusicMap has no cue for {event_contract.cue_relation}"
                     )
-                project_time_ms = exact_event_project_times_ms[lock.event_id]
-                cue = min(
-                    candidates,
-                    key=lambda item: abs(item.time_ms - project_time_ms),
-                )
+                cue = candidates[0]
                 alignment = build_cue_alignment_evidence(
                     lock,
                     cue_id=cue.cue_id,
@@ -14023,9 +14638,7 @@ def _run_feature_cut_experiment_impl(
                         else "locked_source_timeline"
                     ),
                     "music_output_timeline_sha256": (
-                        sha256_file(
-                            editorial_dir / "music-output-timeline.json"
-                        )
+                        music_output_timeline_definition_sha256
                         if output_timeline_cues is not None
                         else None
                     ),

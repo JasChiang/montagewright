@@ -25,8 +25,8 @@ from .storage import read_json, utc_now, write_json
 
 
 FINAL_EDIT_QA_CONTRACT_VERSION = "final-edit-qa-v1"
-FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v1"
-FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v2"
+FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v2"
+FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v3"
 FINAL_EDIT_QA_GENERATION_CONFIG = {
     "thinking_level": "low",
     "max_output_tokens": 8192,
@@ -331,13 +331,39 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _without_volatile_provenance(value: Any) -> Any:
+    """Return the semantic QA contract without run-clock metadata."""
+
+    volatile_keys = {
+        "completed_at",
+        "created_at",
+        "generated_at",
+        "started_at",
+        "updated_at",
+    }
+    if isinstance(value, dict):
+        return {
+            key: _without_volatile_provenance(item)
+            for key, item in value.items()
+            if key not in volatile_keys
+        }
+    if isinstance(value, list):
+        return [_without_volatile_provenance(item) for item in value]
+    return value
+
+
 def _paid_request_input_hashes(input_hashes: dict[str, Any]) -> dict[str, Any]:
     """Exclude local validator code from the definition of a paid request."""
 
     return {
         key: value
         for key, value in input_hashes.items()
-        if key != "validator_version"
+        if key
+        not in {
+            "autonomous_context_file_hashes",
+            "manifest_file_sha256",
+            "validator_version",
+        }
     }
 
 
@@ -746,6 +772,7 @@ def prepare_final_edit_qa(
 
     resolved_context_paths: dict[str, Path] = {}
     context_hashes: dict[str, str] = {}
+    context_file_hashes: dict[str, str] = {}
     autonomous_context: dict[str, Any] | None = None
     if mode == "autonomous_final_9x16":
         supplied = dict(autonomous_context_paths or {})
@@ -764,11 +791,13 @@ def prepare_final_edit_qa(
                 raise ValueError(
                     f"autonomous QA context {key} must be JSON object/list"
                 )
+            semantic_payload = _without_volatile_provenance(payload)
             resolved_context_paths[key] = resolved
-            context_hashes[key] = sha256_file(resolved)
+            context_file_hashes[key] = sha256_file(resolved)
+            context_hashes[key] = _canonical_sha256(semantic_payload)
             autonomous_context[key] = {
                 "sha256": context_hashes[key],
-                "payload": payload,
+                "payload": semantic_payload,
             }
     elif autonomous_context_paths:
         raise ValueError(
@@ -778,9 +807,20 @@ def prepare_final_edit_qa(
     metadata = _probe_media(resolved_render)
     _validate_media_mode(metadata, mode)
     render_hash = sha256_file(resolved_render)
-    manifest_hash = sha256_file(resolved_manifest)
     brief_hash = sha256_file(resolved_brief) if resolved_brief else None
     segment_contract = build_final_qa_segment_contract(manifest, mode=mode)
+    manifest_file_hash = sha256_file(resolved_manifest)
+    # The model receives the derived segment contract, not the complete
+    # renderer manifest. Bind QA to that stable projection so regenerating
+    # timestamps in an otherwise identical manifest cannot trigger another
+    # paid review.
+    manifest_hash = _canonical_sha256(
+        {
+            "contract_version": "final-qa-manifest-binding-v1",
+            "mode": mode,
+            "segment_contract": segment_contract,
+        }
+    )
     proxy_contract = _proxy_contract(mode, crop_include_audio)
     proxy_contract_hash = _canonical_sha256(proxy_contract)
     proxy_path = (
@@ -828,8 +868,10 @@ def prepare_final_edit_qa(
         "render_sha256": render_hash,
         "proxy_sha256": proxy_hash,
         "manifest_sha256": manifest_hash,
+        "manifest_file_sha256": manifest_file_hash,
         "brief_sha256": brief_hash,
         "autonomous_context_hashes": context_hashes,
+        "autonomous_context_file_hashes": context_file_hashes,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "system_instruction_sha256": hashlib.sha256(
             FINAL_EDIT_QA_SYSTEM_INSTRUCTION.encode("utf-8")
@@ -931,10 +973,20 @@ def _validate_result(
                 raise ValueError(
                     "Gemini referenced an unknown autonomous QA segment"
                 )
+            # Portrait/landscape aspect-ratio notation is descriptive QA
+            # context, not an executable edit reference.  Remove only the two
+            # supported aspect tokens before scanning for model-invented
+            # timestamps; keep the original observation unchanged in the
+            # persisted result.
+            executable_reference_text = re.sub(
+                r"(?i)\b(?:9:16|16:9)\b",
+                "",
+                issue.observation,
+            )
             prohibited = re.search(
                 r"(?i)\b(?:pts|frame|bbox|crop)\s*[:=#]?\s*"
                 r"(?:\d|[\[(])|\b\d{1,2}:\d{2}(?::\d{2})?\b",
-                issue.observation,
+                executable_reference_text,
             )
             if prohibited:
                 raise ValueError(
@@ -947,6 +999,7 @@ def _normalize_application_owned_fields(
     output_text: str,
     *,
     mode: FinalQaMode,
+    autonomous_context_hashes: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Keep model observations intact while enforcing application policy fields.
 
@@ -963,18 +1016,38 @@ def _normalize_application_owned_fields(
     original = payload.get("requires_human_review")
     normalized = mode != "autonomous_final_9x16"
     payload["requires_human_review"] = normalized
+    application_owned_fields: dict[str, Any] = {
+        "requires_human_review": {
+            "model_value": original,
+            "normalized_value": normalized,
+            "reason": (
+                "review authority is application-owned; autonomous QA "
+                "observations are evaluated later by the policy compiler"
+            ),
+        }
+    }
+    if (
+        mode == "autonomous_final_9x16"
+        and autonomous_context_hashes
+        and not payload.get("context_hashes")
+    ):
+        # These hashes bind the request to immutable application artifacts.
+        # They are not a semantic model observation.  A structured response
+        # that omits the echo may be completed locally, while a non-empty but
+        # incorrect echo remains untouched and fails validation below.
+        model_context_hashes = payload.get("context_hashes")
+        payload["context_hashes"] = dict(autonomous_context_hashes)
+        application_owned_fields["context_hashes"] = {
+            "model_value": model_context_hashes,
+            "normalized_value": dict(autonomous_context_hashes),
+            "reason": (
+                "immutable request context binding is application-owned; "
+                "only a missing or empty echo may be restored locally"
+            ),
+        }
     audit = {
         "contract_version": "final-edit-qa-normalization-v1",
-        "application_owned_fields": {
-            "requires_human_review": {
-                "model_value": original,
-                "normalized_value": normalized,
-                "reason": (
-                    "review authority is application-owned; autonomous QA "
-                    "observations are evaluated later by the policy compiler"
-                ),
-            }
-        },
+        "application_owned_fields": application_owned_fields,
         "model_observations_changed": False,
     }
     return payload, audit
@@ -1365,6 +1438,7 @@ def execute_final_edit_qa(
             _normalize_application_owned_fields(
                 output_text,
                 mode=prepared.mode,
+                autonomous_context_hashes=prepared.autonomous_context_hashes,
             )
         )
         write_json(
@@ -1502,6 +1576,9 @@ def _recover_latest_saved_output(
                     _normalize_application_owned_fields(
                         output_text,
                         mode=prepared.mode,
+                        autonomous_context_hashes=(
+                            prepared.autonomous_context_hashes
+                        ),
                     )
                 )
                 result = prepared.result_model.model_validate(

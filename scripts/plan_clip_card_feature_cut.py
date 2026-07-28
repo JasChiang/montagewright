@@ -1144,6 +1144,24 @@ def canonicalize_direct_video_edit_plan_output(
                 )
         attention = chapter.get("attention_observation")
         if (
+            isinstance(attention, dict)
+            and attention.get("requires_human_review") is False
+        ):
+            attention["requires_human_review"] = True
+            changes.append(
+                {
+                    "json_path": (
+                        f"chapters[{chapter_index}]"
+                        ".attention_observation.requires_human_review"
+                    ),
+                    "before": False,
+                    "after": True,
+                    "rule": (
+                        "legacy_attention_review_flag_is_not_delivery_authority"
+                    ),
+                }
+            )
+        if (
             chapter.get("recommended_duration_seconds") is None
             and isinstance(attention, dict)
         ):
@@ -1262,6 +1280,34 @@ def canonicalize_direct_video_edit_plan_output(
         if not isinstance(sequence, list):
             sequence = []
             vertical["attention_sequence"] = sequence
+        if vertical.get("traversal_policy") == "spatially_optimizable":
+            spatially_executable = (
+                vertical.get("coverage_mode") == "sequential"
+                and bool(sequence)
+                and all(
+                    isinstance(step, dict)
+                    and len(step.get("anchor_entity_indices") or []) == 1
+                    for step in sequence
+                )
+            )
+            if not spatially_executable:
+                before_traversal = vertical.get("traversal_policy")
+                vertical["traversal_policy"] = (
+                    "semantic_order_locked"
+                    if vertical.get("coverage_mode") == "sequential"
+                    else "no_continuous_traversal"
+                )
+                changes.append(
+                    {
+                        "json_path": f"{base}.vertical.traversal_policy",
+                        "before": before_traversal,
+                        "after": vertical["traversal_policy"],
+                        "rule": (
+                            "spatial_optimization_requires_executable_"
+                            "single_anchor_sequential_attention"
+                        ),
+                    }
+                )
         if vertical.get("strategy") == "fit_with_background" and sequence:
             changes.append(
                 {

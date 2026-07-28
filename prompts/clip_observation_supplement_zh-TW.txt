@@ -22,4 +22,11 @@ Capability 規則：
 - `readability`：只評估文字、UI、圖表或細節是必須讀懂、輔助理解或僅裝飾，以及其狀態是否短暫。
 - `audio_role`：只描述語音、同步聲及環境聲對理解／節奏是否有價值，不輸出 transcript。
 
+Structured Output 的 capability 狀態與 payload 必須一致：
+
+- `evidence_roles=assessed_present` 時，至少一個 role ID 陣列或 relation boolean 必須有可觀察內容，並填寫 `observable_reason`。
+- `observable_beats=assessed_present` 時，`observable_beats` 必須至少列出一個依畫面順序觀察到的 beat；不能只回傳狀態。
+- `audio_role=assessed_present` 時，必須完整回傳 `audio_role` object。
+- 若無法提供對應 payload，該 capability 必須使用 `not_assessed`，不得宣稱 `assessed_present`。
+
 只回傳符合 Structured Output schema 的資料。

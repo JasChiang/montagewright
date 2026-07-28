@@ -32,7 +32,7 @@
     ],
     "max_panels": 2,
     "max_panel_runtime_fraction": 0.25,
-    "allow_solid_matte_fit": false,
+    "allow_solid_matte_fit": true,
     "allow_blurred_background": false,
     "allow_intentional_freeze": true,
     "max_intentional_freeze_ms": 1500,

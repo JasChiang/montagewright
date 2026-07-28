@@ -113,6 +113,12 @@ def test_simultaneous_relation_enables_local_two_panel_fallback() -> None:
         relation_mode="simultaneous",
         policy=policy,
     )
+    assert _autonomous_panel_fallback_eligible(
+        hard_region_count=2,
+        presentation_preference="tracked_full_bleed",
+        relation_mode="primary_with_context",
+        policy=policy,
+    )
     assert not _autonomous_panel_fallback_eligible(
         hard_region_count=3,
         presentation_preference="tracked_full_bleed",
@@ -6185,6 +6191,18 @@ def test_concat_normalizes_mixed_frame_rates_to_editorial_durations(
     assert float(metadata["format"]["duration"]) == pytest.approx(2.0, abs=0.04)
     assert video["avg_frame_rate"] == "30/1"
     assert int(video["nb_frames"]) == 60
+
+
+def test_concat_rejects_unordered_duration_mapping(tmp_path: Path) -> None:
+    with pytest.raises(
+        TypeError,
+        match="segment durations must be ordered",
+    ):
+        _concat_segments(
+            [tmp_path / "segment.mp4"],
+            tmp_path / "output.mp4",
+            segment_durations_seconds={"opening": 1.0},
+        )
 
 
 def test_video_only_source_gets_explicit_synthetic_silence(tmp_path: Path) -> None:

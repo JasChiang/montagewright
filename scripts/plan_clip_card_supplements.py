@@ -7,6 +7,7 @@ import argparse
 from pathlib import Path
 
 from jascue_video_lab.clip_card_observations import (
+    EditingClaim,
     clip_card_sha256,
     plan_supplement_needs,
 )
@@ -29,9 +30,32 @@ def main() -> int:
             "only hard action/boundary risks are planned."
         ),
     )
+    parser.add_argument(
+        "--observable-beats-event",
+        action="append",
+        default=[],
+        metavar="SOURCE_ASSET_ID:EVENT_ID",
+        help=(
+            "Explicitly request bounded observable-beat evidence for one Base "
+            "Clip Card event. May be repeated."
+        ),
+    )
     args = parser.parse_args()
 
     catalog = RushesCatalog.model_validate(read_json(args.catalog_json))
+    explicit_observable_beats: dict[str, set[str]] = {}
+    for reference in args.observable_beats_event:
+        try:
+            source_asset_id, event_id = reference.rsplit(":", 1)
+        except ValueError as error:
+            raise ValueError(
+                "--observable-beats-event must be SOURCE_ASSET_ID:EVENT_ID"
+            ) from error
+        if not source_asset_id.startswith("sha256:") or not event_id:
+            raise ValueError(
+                "--observable-beats-event must bind a sha256 asset and event ID"
+            )
+        explicit_observable_beats.setdefault(source_asset_id, set()).add(event_id)
     frontier_by_asset: dict[str, set[str]] = {}
     if args.frontier is not None:
         frontier = FeatureShortlistPlan.model_validate(read_json(args.frontier))
@@ -63,6 +87,13 @@ def main() -> int:
                 if args.frontier is not None
                 else None
             ),
+            requested_claims={
+                event_id: {EditingClaim.SEQUENTIAL_VIRTUAL_CAMERA}
+                for event_id in explicit_observable_beats.get(
+                    card.source_asset_id,
+                    set(),
+                )
+            },
         )
         if needs:
             clips.append(
