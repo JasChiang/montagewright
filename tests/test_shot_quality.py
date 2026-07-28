@@ -259,6 +259,11 @@ def test_locked_camera_with_sensor_noise_is_not_exact_freeze(
     assert any(
         window.reason_code == "freeze" for window in exact_result.risk_windows
     )
+    assert all(
+        window.severity == "trim_candidate"
+        for window in exact_result.risk_windows
+        if window.reason_code == "freeze"
+    )
     assert not any(
         window.reason_code == "freeze" for window in noisy_result.risk_windows
     )

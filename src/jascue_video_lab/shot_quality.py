@@ -36,7 +36,7 @@ from .shots import ShotManifest, ShotSegment
 from .storage import read_json, utc_now, write_json
 
 
-SHOT_QUALITY_SCANNER_VERSION = "shot-quality-source-fps-v1"
+SHOT_QUALITY_SCANNER_VERSION = "shot-quality-source-fps-v2"
 _AUTO_EDGE_CLEAN_REASON_CODES = frozenset(
     {"focus_loss", "motion_blur", "camera_shake"}
 )
@@ -461,6 +461,7 @@ def _candidate_groups(
     )
 
     freeze_indexes: list[int] = []
+    near_static_indexes: list[int] = []
     for index in range(1, len(measurements)):
         previous = measurements[index - 1]
         current = measurements[index]
@@ -469,13 +470,24 @@ def _candidate_groups(
             (current.average_hash ^ previous.average_hash).bit_count() <= 1
             and current.mean_delta <= 0.00035
         )
-        if exact or near:
+        if exact:
             freeze_indexes.extend([index - 1, index])
+        elif near:
+            near_static_indexes.extend([index - 1, index])
     add_groups(
         freeze_indexes,
         reason="freeze",
         severity="trim_candidate",
         confidence=0.94,
+        minimum_duration_ms=400,
+        metric_name="mean_delta",
+        metric_getter=lambda item: item.mean_delta,
+    )
+    add_groups(
+        near_static_indexes,
+        reason="freeze",
+        severity="review",
+        confidence=0.70,
         minimum_duration_ms=400,
         metric_name="mean_delta",
         metric_getter=lambda item: item.mean_delta,
