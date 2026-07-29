@@ -41,6 +41,7 @@ QA_GENERATION_CONFIG = {
     "thinking_level": "low",
     "max_output_tokens": 4096,
 }
+QA_MEDIA_RESOLUTION = "low"
 PROXY_CONTRACT = {
     "version": "feature-cut-qa-proxy-v1",
     "width": 720,
@@ -695,6 +696,7 @@ def _validate_cached_run(
         or not video_input["uri"]
         or not isinstance(video_input.get("mime_type"), str)
         or not video_input["mime_type"]
+        or video_input.get("media_resolution") != QA_MEDIA_RESOLUTION
     ):
         raise ValueError("cached request video input is incomplete")
 
@@ -930,6 +932,7 @@ def main() -> None:
                     "type": "video",
                     "uri": uploaded.uri,
                     "mime_type": uploaded.mime_type,
+                    "media_resolution": QA_MEDIA_RESOLUTION,
                 },
             ],
             "generation_config": QA_GENERATION_CONFIG,

@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import shutil
+import subprocess
+import sys
+import uuid
+from time import monotonic
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from .autonomous_policy import (
     AutonomousDegradationManifest,
@@ -11,24 +17,59 @@ from .autonomous_policy import (
     AutonomousExecutionProfile,
     DecisionAuthorityV2,
     authorize_decision,
+    omissions_are_policy_authorized,
 )
-from .billing import BudgetLedger, summarize_usage_and_list_price
-from .feature_cut import run_feature_cut_experiment
-from .final_delivery import assemble_music_only_delivery
+from .billing import (
+    BudgetLedger,
+    adopt_paid_dispatch_journals,
+    estimate_paid_call,
+    summarize_usage_and_list_price,
+)
+from .clip_card_observations import (
+    ClipObservationSupplement,
+    EventObservationSupplement,
+    validate_supplement,
+)
+from .clip_card_supplement_runner import (
+    current_supplement_request_binding,
+)
+from .clip_card_retrieval import compact_retrieval_card
+from .clip_card_retrieval import FeatureShortlistPlan
+from .feature_cut import (
+    compile_repair_request,
+    render_changed_segments_and_concat,
+    run_feature_cut_experiment,
+    validate_authorized_selected_window_cue_plan,
+    validate_policy_decision_artifact,
+)
+from .final_delivery import (
+    assemble_music_only_delivery,
+    assemble_picture_only_delivery,
+)
 from .final_edit_qa import (
     AutonomousFinalEditQa,
+    AutonomousRecoveryExecution,
+    AutonomousRecoveryPlan,
+    DeterministicEvidenceCausalBinding,
     DeterministicDeliveryEvidence,
     DeterministicDeliveryQaReport,
     execute_final_edit_qa,
+    plan_autonomous_recovery,
     prepare_final_edit_qa,
     run_deterministic_delivery_qa,
+    validate_deterministic_evidence_causal_binding,
 )
-from .gemini import GeminiLabClient, MODEL_ID
+from .gemini import (
+    GeminiLabClient,
+    MODEL_ID,
+    VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+)
 from .media import probe_video, sha256_file
 from .music import (
     MusicMapLock,
     MusicMapProposal,
     lock_music_map_with_auto_policy,
+    validate_music_map_lock_integrity,
 )
 from .music_assembly import (
     MusicAssemblyError,
@@ -40,14 +81,913 @@ from .music_assembly import (
 )
 from .models import (
     FeatureCutExecutionProfile,
+    FullClipCard,
     MusicAssemblyPlan,
     MusicEditPlanV2,
+    RushesCatalog,
 )
+from .schema import gemini_response_schema
 from .storage import read_json, utc_now, write_json
 
 
 class DeliveryPipelineBlocked(RuntimeError):
     """The pipeline preserved review artifacts but cannot continue safely."""
+
+
+def _prepared_clip_card_library_root(
+    *,
+    catalog_path: Path,
+    prepared_library_path: Path | None,
+    create_explicit: bool = False,
+) -> Path:
+    resolved_catalog = catalog_path.expanduser().resolve(strict=True)
+    if prepared_library_path is not None:
+        explicit = prepared_library_path.expanduser().resolve()
+        if create_explicit:
+            (explicit / "clips").mkdir(parents=True, exist_ok=True)
+        if (explicit / "clips").is_dir():
+            return explicit
+        raise DeliveryPipelineBlocked(
+            "prepared Clip Card library has no clips directory"
+        )
+    candidates = (
+        resolved_catalog.parent.parent / "clip-cards",
+        resolved_catalog.parent / "clip-cards",
+    )
+    library = next(
+        (candidate for candidate in candidates if (candidate / "clips").is_dir()),
+        None,
+    )
+    if library is None:
+        raise DeliveryPipelineBlocked(
+            "fresh autonomous planning requires a prepared Base Clip Card "
+            "library; pass --prepared-clip-cards or place clip-cards beside "
+            "the catalog artifacts"
+        )
+    return library.resolve()
+
+
+def _expected_clip_card_cache_key(
+    *,
+    source_asset_id: str,
+    proxy_asset_id: str,
+) -> dict[str, Any]:
+    card_prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "full_clip_card_mmss_zh-TW.txt"
+    ).read_text(encoding="utf-8")
+    schema_payload = json.dumps(
+        gemini_response_schema(FullClipCard),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "model": MODEL_ID,
+        "prompt_sha256": hashlib.sha256(
+            card_prompt.encode("utf-8")
+        ).hexdigest(),
+        "schema_sha256": hashlib.sha256(
+            schema_payload.encode("utf-8")
+        ).hexdigest(),
+        "system_instruction_sha256": hashlib.sha256(
+            VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
+        ).hexdigest(),
+        "media_resolution": "low",
+        "thinking_level": "low",
+        "max_output_tokens": 4_096,
+        "source_asset_id": source_asset_id,
+        "proxy_asset_id": proxy_asset_id,
+    }
+
+
+def _clip_card_entry_stale_reason(
+    *,
+    clip: Any,
+    clip_root: Path,
+) -> str | None:
+    card_dir = clip_root / "gemini" / "clip-card"
+    card_path = card_dir / "clip_card.json"
+    proxy_path = clip_root / "analysis-proxy.mp4"
+    cache_key_path = card_dir / "cache-key.json"
+    if not card_path.is_file():
+        return "missing_clip_card"
+    if not proxy_path.is_file():
+        return "missing_analysis_proxy"
+    if not cache_key_path.is_file():
+        return "missing_cache_binding"
+    try:
+        card = FullClipCard.model_validate(read_json(card_path))
+        proxy = probe_video(proxy_path)
+    except Exception:
+        return "invalid_clip_card_or_proxy"
+    if card.source_asset_id != f"sha256:{clip.sha256}":
+        return "source_identity_changed"
+    if (
+        card.proxy_asset_id != proxy.asset_id
+        or card.duration_ms != clip.duration_ms
+        or abs(proxy.duration_ms - card.duration_ms) > 100
+        or card.model_provenance.model_id != MODEL_ID
+    ):
+        return "proxy_duration_or_model_lineage_changed"
+    expected = _expected_clip_card_cache_key(
+        source_asset_id=card.source_asset_id,
+        proxy_asset_id=card.proxy_asset_id,
+    )
+    if read_json(cache_key_path) != expected:
+        return "prompt_schema_or_request_binding_changed"
+    return None
+
+
+def _resolve_prepared_clip_card_library(
+    *,
+    catalog_path: Path,
+    prepared_library_path: Path | None,
+) -> tuple[Path, RushesCatalog, tuple[Path, ...], int]:
+    """Resolve and validate the reusable Base Clip Card library before paid work."""
+
+    resolved_catalog = catalog_path.expanduser().resolve(strict=True)
+    catalog = RushesCatalog.model_validate(read_json(resolved_catalog))
+    library = _prepared_clip_card_library_root(
+        catalog_path=resolved_catalog,
+        prepared_library_path=prepared_library_path,
+    )
+    compact_evidence: list[dict[str, object]] = []
+    cards_by_asset: dict[str, FullClipCard] = {}
+    for clip in catalog.clips:
+        clip_root = library / "clips" / clip.sha256[:16]
+        card_dir = (
+            clip_root
+            / "gemini"
+            / "clip-card"
+        )
+        card_path = (
+            card_dir
+            / "clip_card.json"
+        )
+        if not card_path.is_file():
+            raise DeliveryPipelineBlocked(
+                "prepared Clip Card library is incomplete for source "
+                f"sha256:{clip.sha256}"
+            )
+        card = FullClipCard.model_validate(read_json(card_path))
+        if card.source_asset_id != f"sha256:{clip.sha256}":
+            raise DeliveryPipelineBlocked(
+                "prepared Clip Card source identity differs from the catalog"
+            )
+        proxy_path = clip_root / "analysis-proxy.mp4"
+        if not proxy_path.is_file():
+            raise DeliveryPipelineBlocked(
+                "prepared Clip Card is missing its immutable analysis proxy"
+            )
+        proxy = probe_video(proxy_path)
+        if (
+            card.proxy_asset_id != proxy.asset_id
+            or card.duration_ms != clip.duration_ms
+            or abs(proxy.duration_ms - card.duration_ms) > 100
+            or card.model_provenance.model_id != MODEL_ID
+        ):
+            raise DeliveryPipelineBlocked(
+                "prepared Clip Card proxy, duration, or model lineage is stale"
+            )
+        cache_key_path = card_dir / "cache-key.json"
+        expected_cache_key = _expected_clip_card_cache_key(
+            source_asset_id=card.source_asset_id,
+            proxy_asset_id=card.proxy_asset_id,
+        )
+        if (
+            not cache_key_path.is_file()
+            or read_json(cache_key_path) != expected_cache_key
+        ):
+            raise DeliveryPipelineBlocked(
+                "prepared Clip Card cache binding is stale; regenerate it "
+                "before autonomous planning"
+            )
+        cards_by_asset[card.source_asset_id] = card
+    supplement_paths = tuple(
+        sorted(
+            library.glob(
+                "clips/*/supplements/*/clip-observation-supplement.json"
+            )
+        )
+    )
+    supplements_by_asset: dict[str, list[ClipObservationSupplement]] = {}
+    supplement_prompt_path = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "clip_observation_supplement_zh-TW.txt"
+    )
+    supplement_schema_payload = json.dumps(
+        gemini_response_schema(EventObservationSupplement),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected_supplement_binding = current_supplement_request_binding(
+        model_id=MODEL_ID,
+        prompt_sha256=sha256_file(supplement_prompt_path),
+        response_schema_sha256=hashlib.sha256(
+            supplement_schema_payload.encode("utf-8")
+        ).hexdigest(),
+    )
+    for path in supplement_paths:
+        supplement = ClipObservationSupplement.model_validate(read_json(path))
+        card = cards_by_asset.get(supplement.source_asset_id)
+        if card is None:
+            raise DeliveryPipelineBlocked(
+                "prepared supplement references an asset outside the catalog"
+            )
+        validate_supplement(
+            card,
+            supplement,
+            expected_request_binding=expected_supplement_binding,
+            require_current_lineage=True,
+        )
+        supplements_by_asset.setdefault(
+            supplement.source_asset_id, []
+        ).append(supplement)
+    for card in cards_by_asset.values():
+        compact_evidence.append(
+            compact_retrieval_card(
+                card,
+                supplements_by_asset.get(card.source_asset_id, ()),
+            )
+        )
+    # Character count deliberately overestimates the token count for the
+    # compact multilingual JSON. This is a reserve, not post-hoc billing.
+    evidence_characters = len(
+        json.dumps(
+            compact_evidence,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    return library.resolve(), catalog, supplement_paths, evidence_characters
+
+
+def _reconcile_planning_subprocess_usage(
+    *,
+    budget_ledger: BudgetLedger,
+    reservation_id: str,
+    stage_dir: Path,
+    estimate_input_tokens: int,
+    estimate_output_tokens: int,
+    estimate_thought_tokens: int,
+) -> dict[str, Any]:
+    usage = summarize_usage_and_list_price(stage_dir)
+    request_count = int(usage["request_count"])
+    if request_count == 0:
+        dispatched_request_paths = tuple(stage_dir.rglob("*.request.json"))
+        if not dispatched_request_paths:
+            budget_ledger.cancel_before_dispatch(reservation_id)
+            return usage
+        # The request artifact is written immediately before dispatch. If the
+        # API failed before returning immutable usage, keep the run fail-closed
+        # and charge the reservation's conservative ceiling. A resume must
+        # never regain budget merely because a 429/503 lacked token metadata.
+        budget_ledger.reconcile(
+            reservation_id,
+            usage={
+                "total_input_tokens": estimate_input_tokens,
+                "total_cached_tokens": 0,
+                "total_output_tokens": estimate_output_tokens,
+                "total_thought_tokens": estimate_thought_tokens,
+            },
+            model_id=MODEL_ID,
+        )
+        return {
+            **usage,
+            "usage_status": "dispatch_recorded_usage_unavailable",
+            "conservative_reconciliation": True,
+            "total_input_tokens": estimate_input_tokens,
+            "total_cached_input_tokens": 0,
+            "total_output_tokens": estimate_output_tokens,
+            "total_thought_tokens": estimate_thought_tokens,
+            "request_artifacts": [
+                str(path.resolve()) for path in dispatched_request_paths
+            ],
+        }
+    if request_count != 1:
+        raise DeliveryPipelineBlocked(
+            "bounded autonomous planning stage produced an unexpected number "
+            f"of paid interactions: {request_count}"
+        )
+    budget_ledger.reconcile(
+        reservation_id,
+        usage={
+            "total_input_tokens": usage["total_input_tokens"],
+            "total_cached_tokens": usage["total_cached_input_tokens"],
+            "total_output_tokens": usage["total_output_tokens"],
+            "total_thought_tokens": usage["total_thought_tokens"],
+        },
+        model_id=MODEL_ID,
+    )
+    return usage
+
+
+def _run_budgeted_planning_stage(
+    *,
+    command: list[str],
+    stage: str,
+    stage_dir: Path,
+    budget_ledger: BudgetLedger,
+    estimated_text_tokens: int,
+    media_duration_ms: int = 0,
+    media_resolution: str = "low",
+    max_output_tokens: int = 12_000,
+    thinking_level: str = "low",
+) -> dict[str, Any]:
+    estimate = estimate_paid_call(
+        stage=stage,
+        model_id=MODEL_ID,
+        media_duration_ms=media_duration_ms,
+        media_resolution=media_resolution,
+        text_input_tokens=estimated_text_tokens,
+        max_output_tokens=max_output_tokens,
+        thinking_level=thinking_level,
+        retry_allowance=0,
+    )
+    reservation = budget_ledger.reserve(estimate)
+    started = monotonic()
+    completed: subprocess.CompletedProcess[str] | None = None
+    error: BaseException | None = None
+    usage: dict[str, Any] = {}
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except BaseException as caught:
+        error = caught
+    finally:
+        usage = _reconcile_planning_subprocess_usage(
+            budget_ledger=budget_ledger,
+            reservation_id=reservation.reservation_id,
+            stage_dir=stage_dir,
+            estimate_input_tokens=estimate.estimated_input_tokens,
+            estimate_output_tokens=estimate.max_output_tokens,
+            estimate_thought_tokens=estimate.reserved_thought_tokens,
+        )
+        write_json(
+            stage_dir / "orchestration.json",
+            {
+                "contract_version": "autonomous-planning-orchestration-v1",
+                "stage": stage,
+                "command": command,
+                "returncode": (
+                    completed.returncode if completed is not None else None
+                ),
+                "stdout": (
+                    completed.stdout if completed is not None else None
+                ),
+                "stderr": (
+                    completed.stderr if completed is not None else None
+                ),
+                "elapsed_seconds": round(monotonic() - started, 3),
+                "usage": usage,
+                "error": (
+                    None
+                    if error is None
+                    else {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                    }
+                ),
+                "generated_at": utc_now(),
+            },
+        )
+    if error is not None:
+        raise DeliveryPipelineBlocked(
+            f"{stage} failed; immutable subprocess artifacts were preserved"
+        ) from error
+    return usage
+
+
+def _refresh_stale_clip_cards(
+    *,
+    catalog_path: Path,
+    prepared_library_path: Path | None,
+    output_dir: Path,
+    budget_ledger: BudgetLedger,
+) -> tuple[dict[str, Any], ...]:
+    """Refresh only stale/missing Base Clip Cards and archive prior lineage."""
+
+    resolved_catalog = catalog_path.expanduser().resolve(strict=True)
+    catalog = RushesCatalog.model_validate(read_json(resolved_catalog))
+    library = _prepared_clip_card_library_root(
+        catalog_path=resolved_catalog,
+        prepared_library_path=prepared_library_path,
+        create_explicit=prepared_library_path is not None,
+    )
+    refresh_records: list[dict[str, Any]] = []
+    entrypoint = Path(sys.executable).with_name("jascue-video-lab")
+    if not entrypoint.is_file():
+        raise DeliveryPipelineBlocked(
+            "cannot refresh Clip Cards because the installed CLI entrypoint "
+            "is unavailable"
+        )
+    for clip in catalog.clips:
+        clip_root = library / "clips" / clip.sha256[:16]
+        stale_reason = _clip_card_entry_stale_reason(
+            clip=clip,
+            clip_root=clip_root,
+        )
+        if stale_reason is None:
+            continue
+        refresh_root = (
+            library
+            / ".refresh"
+            / f"{clip.sha256[:16]}-{uuid.uuid4().hex}"
+        )
+        source_path = Path(clip.path).expanduser().resolve(strict=True)
+        command = [
+            str(entrypoint),
+            "full-clip",
+            str(source_path),
+            "--output-dir",
+            str(refresh_root),
+            "--dense-mode",
+            "none",
+        ]
+        run_record_dir = (
+            output_dir / "cold-ingest" / clip.sha256[:16]
+        )
+        run_record_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            usage = _run_budgeted_planning_stage(
+                command=command,
+                stage="autonomous_base_clip_card_refresh",
+                stage_dir=refresh_root,
+                budget_ledger=budget_ledger,
+                estimated_text_tokens=12_000,
+                media_duration_ms=int(clip.duration_ms),
+                media_resolution="low",
+                max_output_tokens=4_096,
+                thinking_level="low",
+            )
+        except BaseException:
+            for raw_path in refresh_root.rglob("*raw_interaction.json"):
+                relative = raw_path.relative_to(refresh_root)
+                destination = run_record_dir / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(raw_path, destination)
+            failed_orchestration = refresh_root / "orchestration.json"
+            if failed_orchestration.is_file():
+                shutil.copy2(
+                    failed_orchestration,
+                    run_record_dir / "orchestration.json",
+                )
+            raise
+        refreshed_reason = _clip_card_entry_stale_reason(
+            clip=clip,
+            clip_root=refresh_root,
+        )
+        if refreshed_reason is not None:
+            raise DeliveryPipelineBlocked(
+                "refreshed Clip Card failed current lineage validation: "
+                f"{refreshed_reason}"
+            )
+        for raw_path in refresh_root.rglob("*raw_interaction.json"):
+            relative = raw_path.relative_to(refresh_root)
+            destination = run_record_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(raw_path, destination)
+        orchestration_path = refresh_root / "orchestration.json"
+        if orchestration_path.is_file():
+            shutil.copy2(
+                orchestration_path,
+                run_record_dir / "orchestration.json",
+            )
+        archived_path: Path | None = None
+        if clip_root.exists():
+            archive_root = library / "archive"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            archived_path = (
+                archive_root
+                / f"{clip.sha256[:16]}-{uuid.uuid4().hex}"
+            )
+            clip_root.rename(archived_path)
+        clip_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(refresh_root), str(clip_root))
+        record = {
+            "contract_version": "base-clip-card-refresh-v1",
+            "source_asset_id": f"sha256:{clip.sha256}",
+            "reason_code": stale_reason,
+            "archived_path": (
+                str(archived_path.resolve())
+                if archived_path is not None
+                else None
+            ),
+            "refreshed_path": str(clip_root.resolve()),
+            "usage": usage,
+            "generated_at": utc_now(),
+        }
+        write_json(run_record_dir / "refresh-record.json", record)
+        refresh_records.append(record)
+    return tuple(refresh_records)
+
+
+def _archive_stale_clip_card_supplements(
+    *,
+    catalog_path: Path,
+    prepared_library_path: Path | None,
+    output_dir: Path,
+) -> tuple[dict[str, Any], ...]:
+    """Remove stale optional supplements from active lookup without deleting them."""
+
+    catalog = RushesCatalog.model_validate(
+        read_json(catalog_path.expanduser().resolve(strict=True))
+    )
+    library = _prepared_clip_card_library_root(
+        catalog_path=catalog_path,
+        prepared_library_path=prepared_library_path,
+    )
+    cards = {
+        f"sha256:{clip.sha256}": FullClipCard.model_validate(
+            read_json(
+                library
+                / "clips"
+                / clip.sha256[:16]
+                / "gemini"
+                / "clip-card"
+                / "clip_card.json"
+            )
+        )
+        for clip in catalog.clips
+    }
+    prompt_path = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "clip_observation_supplement_zh-TW.txt"
+    )
+    schema_payload = json.dumps(
+        gemini_response_schema(EventObservationSupplement),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected_binding = current_supplement_request_binding(
+        model_id=MODEL_ID,
+        prompt_sha256=sha256_file(prompt_path),
+        response_schema_sha256=hashlib.sha256(
+            schema_payload.encode("utf-8")
+        ).hexdigest(),
+    )
+    records: list[dict[str, Any]] = []
+    for path in tuple(
+        sorted(
+            library.glob(
+                "clips/*/supplements/*/clip-observation-supplement.json"
+            )
+        )
+    ):
+        reason: str | None = None
+        try:
+            supplement = ClipObservationSupplement.model_validate(
+                read_json(path)
+            )
+            card = cards.get(supplement.source_asset_id)
+            if card is None:
+                raise ValueError("supplement source is outside current catalog")
+            validate_supplement(
+                card,
+                supplement,
+                expected_request_binding=expected_binding,
+                require_current_lineage=True,
+            )
+        except Exception as error:
+            reason = f"{type(error).__name__}:{error}"
+        if reason is None:
+            continue
+        source_dir = path.parent
+        archive_dir = (
+            library
+            / "archive"
+            / "supplements"
+            / f"{source_dir.name}-{uuid.uuid4().hex}"
+        )
+        archive_dir.parent.mkdir(parents=True, exist_ok=True)
+        source_dir.rename(archive_dir)
+        records.append(
+            {
+                "contract_version": "stale-supplement-archive-v1",
+                "source_path": str(source_dir),
+                "archived_path": str(archive_dir.resolve()),
+                "reason": reason,
+                "generated_at": utc_now(),
+            }
+        )
+    if records:
+        write_json(
+            output_dir
+            / "cold-ingest"
+            / "stale-supplement-archive.json",
+            {
+                "contract_version": "stale-supplement-archive-set-v1",
+                "records": records,
+                "generated_at": utc_now(),
+            },
+        )
+    return tuple(records)
+
+
+def _archive_stale_planning_stage(
+    stage_dir: Path,
+    *,
+    output_dir: Path,
+    reason_code: str,
+) -> Path | None:
+    """Move a stale fixed-path planning stage out of the active namespace."""
+
+    if not stage_dir.exists():
+        return None
+    archive_dir = (
+        output_dir
+        / "archive"
+        / "planning-lineage"
+        / f"{stage_dir.name}-{uuid.uuid4().hex}"
+    )
+    archive_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage_dir.rename(archive_dir)
+    write_json(
+        archive_dir / "archive-record.json",
+        {
+            "contract_version": "stale-planning-stage-archive-v1",
+            "source_path": str(stage_dir),
+            "archived_path": str(archive_dir.resolve()),
+            "reason_code": reason_code,
+            "generated_at": utc_now(),
+        },
+    )
+    return archive_dir.resolve()
+
+
+def _direct_plan_binds_current_shortlist(
+    *,
+    plan_dir: Path,
+    shortlist_path: Path,
+) -> bool:
+    """Verify that a fixed-path direct plan names this exact shortlist."""
+
+    pointer_path = plan_dir / "feature-plan.external-projection.json"
+    if not pointer_path.is_file() or not shortlist_path.is_file():
+        return False
+    try:
+        pointer = read_json(pointer_path)
+        if not isinstance(pointer, Mapping):
+            return False
+        record_path = (plan_dir / str(pointer["record_path"])).resolve(
+            strict=True
+        )
+        if plan_dir.resolve() not in record_path.parents:
+            return False
+        if sha256_file(record_path) != str(pointer["record_sha256"]):
+            return False
+        record = read_json(record_path)
+        if not isinstance(record, Mapping):
+            return False
+        shortlist_rows = [
+            row
+            for row in record.get("source_artifacts", [])
+            if isinstance(row, Mapping)
+            and row.get("role") == "feature_shortlist"
+        ]
+        if len(shortlist_rows) != 1:
+            return False
+        row = shortlist_rows[0]
+        return (
+            Path(str(row["path"])).expanduser().resolve(strict=True)
+            == shortlist_path.resolve(strict=True)
+            and str(row["sha256"]) == sha256_file(shortlist_path)
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _prepare_fresh_autonomous_direct_plan(
+    *,
+    catalog_path: Path,
+    brief_path: Path,
+    music_path: Path | None,
+    music_duration_ms: int,
+    policy_path: Path,
+    editorial_contracts_path: Path,
+    prepared_library_path: Path | None,
+    output_dir: Path,
+    budget_ledger: BudgetLedger,
+) -> dict[str, Any]:
+    """Build the only fresh autonomous plan accepted by feature-cut."""
+
+    policy = AutonomousEditPolicy.model_validate(
+        read_json(policy_path.expanduser().resolve(strict=True))
+    )
+    if (
+        policy.media_resolution.base_clip_card != "low"
+        or policy.gemini_limits.base_clip_card.thinking_level != "low"
+        or policy.gemini_limits.base_clip_card.max_output_tokens != 4_096
+    ):
+        raise DeliveryPipelineBlocked(
+            "Base Clip Card refresh currently supports the signed low / "
+            "low-thinking / 4096-token contract only"
+        )
+    clip_card_refreshes = _refresh_stale_clip_cards(
+        catalog_path=catalog_path,
+        prepared_library_path=prepared_library_path,
+        output_dir=output_dir,
+        budget_ledger=budget_ledger,
+    )
+    archived_supplements = _archive_stale_clip_card_supplements(
+        catalog_path=catalog_path,
+        prepared_library_path=prepared_library_path,
+        output_dir=output_dir,
+    )
+    shortlist_dir = output_dir / "retrieval"
+    plan_dir = output_dir / "picture" / "gemini-plan"
+    if clip_card_refreshes or archived_supplements:
+        evidence_change_reason = (
+            "base_clip_card_or_supplement_lineage_changed"
+        )
+        _archive_stale_planning_stage(
+            shortlist_dir,
+            output_dir=output_dir,
+            reason_code=evidence_change_reason,
+        )
+        _archive_stale_planning_stage(
+            plan_dir,
+            output_dir=output_dir,
+            reason_code=evidence_change_reason,
+        )
+    library, _catalog, supplements, evidence_characters = (
+        _resolve_prepared_clip_card_library(
+            catalog_path=catalog_path,
+            prepared_library_path=prepared_library_path,
+        )
+    )
+    project_root = Path(__file__).resolve().parents[2]
+    shortlist_path = shortlist_dir / "feature-shortlist.json"
+    supplement_args = [
+        argument
+        for path in supplements
+        for argument in ("--supplement", str(path))
+    ]
+    shortlist_command = [
+        sys.executable,
+        str(project_root / "scripts/shortlist_clip_card_feature_candidates.py"),
+        str(catalog_path.expanduser().resolve(strict=True)),
+        str(brief_path.expanduser().resolve(strict=True)),
+        str(library),
+        str(shortlist_dir),
+        "--thinking-level",
+        "low",
+        "--editorial-beat-contracts",
+        str(editorial_contracts_path.expanduser().resolve(strict=True)),
+        *supplement_args,
+    ]
+    if shortlist_path.is_file():
+        FeatureShortlistPlan.model_validate(read_json(shortlist_path))
+        validation = subprocess.run(
+            [*shortlist_command, "--reuse-raw-output"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+        )
+        if validation.returncode == 0:
+            shortlist_usage = {
+                "request_count": 0,
+                "reuse_status": "validated_existing_shortlist",
+            }
+        else:
+            _archive_stale_planning_stage(
+                shortlist_dir,
+                output_dir=output_dir,
+                reason_code="shortlist_input_binding_changed",
+            )
+            _archive_stale_planning_stage(
+                plan_dir,
+                output_dir=output_dir,
+                reason_code="shortlist_input_binding_changed",
+            )
+            shortlist_usage = _run_budgeted_planning_stage(
+                command=shortlist_command,
+                stage="autonomous_clip_card_shortlist",
+                stage_dir=shortlist_dir,
+                budget_ledger=budget_ledger,
+                estimated_text_tokens=max(
+                    30_000,
+                    evidence_characters + 20_000,
+                ),
+            )
+    else:
+        if any(shortlist_dir.rglob("*.request.json")):
+            raise DeliveryPipelineBlocked(
+                "a prior shortlist dispatch has no validated result; "
+                "refusing an implicit paid retry"
+            )
+        shortlist_usage = _run_budgeted_planning_stage(
+            command=shortlist_command,
+            stage="autonomous_clip_card_shortlist",
+            stage_dir=shortlist_dir,
+            budget_ledger=budget_ledger,
+            estimated_text_tokens=max(
+                30_000,
+                evidence_characters + 20_000,
+            ),
+        )
+    if not shortlist_path.is_file():
+        raise DeliveryPipelineBlocked(
+            "autonomous shortlist completed without its typed artifact"
+        )
+    plan_command = [
+        sys.executable,
+        str(project_root / "scripts/plan_clip_card_feature_cut.py"),
+        str(catalog_path.expanduser().resolve(strict=True)),
+        str(brief_path.expanduser().resolve(strict=True)),
+        str(library),
+        str(plan_dir),
+        "--thinking-level",
+        "low",
+        "--repair-attempts",
+        "0",
+        "--shortlist",
+        str(shortlist_path),
+        "--autonomous-policy",
+        str(policy_path.expanduser().resolve(strict=True)),
+        "--editorial-beat-contracts",
+        str(editorial_contracts_path.expanduser().resolve(strict=True)),
+        "--candidate-video-evidence",
+        "--candidate-video-depth",
+        "3",
+        "--maximum-candidate-video-seconds",
+        "360",
+        *supplement_args,
+    ]
+    if music_path is not None:
+        plan_command.extend(
+            [
+                "--music",
+                str(music_path.expanduser().resolve(strict=True)),
+            ]
+        )
+    required = (
+        plan_dir / "feature_edit_plan.json",
+        plan_dir / "selected-clip-card-evidence.json",
+        plan_dir / "feature-plan.external-projection.json",
+    )
+    if all(path.is_file() for path in required) and (
+        _direct_plan_binds_current_shortlist(
+            plan_dir=plan_dir,
+            shortlist_path=shortlist_path,
+        )
+    ):
+        planning_usage = {
+            "request_count": 0,
+            "reuse_status": "validated_existing_direct_plan_artifacts",
+        }
+    else:
+        if plan_dir.exists():
+            _archive_stale_planning_stage(
+                plan_dir,
+                output_dir=output_dir,
+                reason_code="direct_plan_shortlist_binding_changed",
+            )
+        if any(plan_dir.rglob("*.request.json")):
+            raise DeliveryPipelineBlocked(
+                "a prior direct-plan dispatch has no complete typed "
+                "projection; refusing an implicit paid retry"
+            )
+        planning_usage = _run_budgeted_planning_stage(
+            command=plan_command,
+            stage="autonomous_direct_video_edit_plan",
+            stage_dir=plan_dir,
+            budget_ledger=budget_ledger,
+            estimated_text_tokens=max(
+                60_000,
+                len(shortlist_path.read_text(encoding="utf-8")) * 3
+                + 30_000,
+            ),
+            media_duration_ms=360_000 + music_duration_ms,
+        )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise DeliveryPipelineBlocked(
+            "direct-video planning completed without required projection "
+            "artifacts: " + ", ".join(missing)
+        )
+    return {
+        "contract_version": "fresh-autonomous-direct-plan-orchestration-v1",
+        "prepared_library": str(library),
+        "clip_card_refreshes": list(clip_card_refreshes),
+        "archived_stale_supplements": list(archived_supplements),
+        "supplements": [str(path) for path in supplements],
+        "shortlist_path": str(shortlist_path.resolve()),
+        "plan_dir": str(plan_dir.resolve()),
+        "shortlist_usage": shortlist_usage,
+        "planning_usage": planning_usage,
+    }
 
 
 def _bind_music_lock_to_autonomous_policy(
@@ -63,27 +1003,37 @@ def _bind_music_lock_to_autonomous_policy(
     resolved_lock = music_lock_path.expanduser().resolve(strict=True)
     saved_lock = MusicMapLock.model_validate(read_json(resolved_lock))
     music_digest = sha256_file(resolved_music)
-    if saved_lock.music_id != f"sha256:{music_digest}":
-        raise DeliveryPipelineBlocked(
-            "MusicMap lock does not bind the supplied soundtrack"
+    try:
+        proposal = validate_music_map_lock_integrity(
+            saved_lock,
+            music_path=resolved_music,
+            lock_path=resolved_lock,
+            policy=(
+                policy
+                if (
+                    saved_lock.authority is not None
+                    and saved_lock.authority.policy_reference
+                    == policy.policy_reference
+                )
+                else None
+            ),
+            # Older current-policy locks can be upgraded below.  The newly
+            # issued authority always binds both proposal and soundtrack.
+            require_authority_source_binding=False,
+            validate_authority_policy=(
+                saved_lock.authority is not None
+                and saved_lock.authority.policy_reference
+                == policy.policy_reference
+            ),
         )
-    if (
-        saved_lock.authority is not None
-        and saved_lock.authority.policy_reference == policy.policy_reference
-    ):
-        return resolved_lock
+    except (OSError, ValueError) as exc:
+        raise DeliveryPipelineBlocked(
+            "cannot refresh MusicMap authority because saved lineage failed "
+            f"integrity validation: {exc}"
+        ) from exc
     proposal_path = Path(saved_lock.proposal_path).expanduser().resolve(
         strict=True
     )
-    if sha256_file(proposal_path) != saved_lock.proposal_sha256:
-        raise DeliveryPipelineBlocked(
-            "cannot refresh MusicMap authority because its proposal changed"
-        )
-    proposal = MusicMapProposal.model_validate(read_json(proposal_path))
-    if proposal.music_id != saved_lock.music_id:
-        raise DeliveryPipelineBlocked(
-            "cannot refresh MusicMap authority because source identity changed"
-        )
     authority = authorize_decision(
         policy,
         decision_scope="music_map",
@@ -114,6 +1064,12 @@ def _bind_music_lock_to_autonomous_policy(
     )
     refreshed_path = output_dir / "music" / "music-map.lock.v2.json"
     write_json(refreshed_path, refreshed)
+    validate_music_map_lock_integrity(
+        refreshed,
+        music_path=resolved_music,
+        lock_path=refreshed_path,
+        policy=policy,
+    )
     return refreshed_path.resolve(strict=True)
 
 
@@ -155,13 +1111,67 @@ def _qa_disposition(execution: Any) -> str:
 
 
 def _autonomous_semantic_qa_passed(result: Any) -> bool:
-    if isinstance(result, AutonomousFinalEditQa):
-        return (
-            result.qa_observation_status == "no_blocking_observation"
-            and not result.issues
-        )
-    review = getattr(result, "global_review", None)
-    return getattr(review, "disposition", None) == "ready_for_human_review"
+    return isinstance(result, AutonomousFinalEditQa) and (
+        result.qa_observation_status == "no_blocking_observation"
+        and not result.issues
+    )
+
+
+def _validate_autonomous_context_aspect_binding(
+    paths: Mapping[str, Path],
+    *,
+    expected_aspect: str,
+    policy: AutonomousEditPolicy | None = None,
+) -> None:
+    """Reject explicit or selected-window context reuse across aspects."""
+
+    for key, path in paths.items():
+        payload = read_json(path)
+        if not isinstance(payload, Mapping):
+            continue
+        declared_aspect = payload.get("aspect")
+        if (
+            declared_aspect is not None
+            and declared_aspect != expected_aspect
+        ):
+            raise DeliveryPipelineBlocked(
+                f"{expected_aspect} autonomous QA cannot consume "
+                f"{declared_aspect} context artifact {key}"
+            )
+        if key != "exact_event_locks":
+            continue
+        selected_windows = payload.get("selected_windows", [])
+        if not isinstance(selected_windows, list):
+            continue
+        wrong_window_aspects = {
+            str(window["aspect"])
+            for window in selected_windows
+            if isinstance(window, Mapping)
+            and window.get("aspect") is not None
+            and window.get("aspect") != expected_aspect
+        }
+        if wrong_window_aspects:
+            raise DeliveryPipelineBlocked(
+                f"{expected_aspect} autonomous QA cannot consume exact-event "
+                f"windows for {sorted(wrong_window_aspects)}"
+            )
+    if policy is not None:
+        cue_plan_path = paths.get("cue_plan")
+        if cue_plan_path is None:
+            raise DeliveryPipelineBlocked(
+                f"{expected_aspect} autonomous context omitted CuePlan"
+            )
+        try:
+            validate_authorized_selected_window_cue_plan(
+                cue_plan_path,
+                policy=policy,
+                expected_aspect=expected_aspect,
+            )
+        except (OSError, ValueError) as exc:
+            raise DeliveryPipelineBlocked(
+                f"{expected_aspect} selected-window CuePlan authority failed: "
+                f"{exc}"
+            ) from exc
 
 
 def authorize_autonomous_delivery(
@@ -169,9 +1179,14 @@ def authorize_autonomous_delivery(
     policy: AutonomousEditPolicy,
     deterministic_qa: DeterministicDeliveryQaReport,
     qa_results: Mapping[str, Any],
+    qa_context_hashes_by_aspect: Mapping[str, Mapping[str, str]],
     degradation: AutonomousDegradationManifest,
     input_artifact_hashes: tuple[str, ...],
+    final_render_sha256_by_aspect: Mapping[str, str],
+    final_manifest_sha256: str,
+    brief_sha256: str,
     gemini_interaction_ids: tuple[str, ...] = (),
+    music_supplied: bool = True,
 ) -> tuple[str, DecisionAuthorityV2]:
     """Grant delivery only from local gates bound to immutable artifacts."""
 
@@ -183,6 +1198,46 @@ def authorize_autonomous_delivery(
         raise DeliveryPipelineBlocked(
             "semantic QA results do not cover every requested aspect"
         )
+    if set(final_render_sha256_by_aspect) != set(policy.requested_aspects):
+        raise DeliveryPipelineBlocked(
+            "final render hashes do not cover every requested aspect"
+        )
+    if set(qa_context_hashes_by_aspect) != set(policy.requested_aspects):
+        raise DeliveryPipelineBlocked(
+            "final QA context hashes do not cover every requested aspect"
+        )
+    for aspect, result in qa_results.items():
+        expected_mode = (
+            "autonomous_final_16x9"
+            if aspect == "16:9"
+            else "autonomous_final_9x16"
+        )
+        if (
+            not isinstance(result, AutonomousFinalEditQa)
+            or result.mode != expected_mode
+        ):
+            raise DeliveryPipelineBlocked(
+                f"{aspect} final authority received the wrong semantic QA mode"
+            )
+        if result.render_sha256 != final_render_sha256_by_aspect[aspect]:
+            raise DeliveryPipelineBlocked(
+                f"{aspect} semantic QA does not bind the current final render"
+            )
+        if result.manifest_sha256 != final_manifest_sha256:
+            raise DeliveryPipelineBlocked(
+                f"{aspect} semantic QA does not bind the current render manifest"
+            )
+        if result.brief_sha256 != brief_sha256:
+            raise DeliveryPipelineBlocked(
+                f"{aspect} semantic QA does not bind the current brief"
+            )
+        if result.context_hashes != dict(
+            qa_context_hashes_by_aspect[aspect]
+        ):
+            raise DeliveryPipelineBlocked(
+                f"{aspect} semantic QA does not bind the current autonomous "
+                "context"
+            )
     if not all(
         _autonomous_semantic_qa_passed(result)
         for result in qa_results.values()
@@ -193,6 +1248,11 @@ def authorize_autonomous_delivery(
     if degradation.policy_reference != policy.policy_reference:
         raise DeliveryPipelineBlocked(
             "degradation manifest is not bound to the autonomous policy"
+        )
+    if not omissions_are_policy_authorized(policy, degradation.records):
+        raise DeliveryPipelineBlocked(
+            "degradation manifest contains an omission or substitution that "
+            "the autonomous policy did not authorize"
         )
     gate_results = {
         **{
@@ -206,7 +1266,11 @@ def authorize_autonomous_delivery(
     }
     decision_codes = [
         "hard_evidence_passed",
-        "music_sync_passed",
+        (
+            "music_sync_passed"
+            if music_supplied
+            else "semantic_visual_cadence_passed"
+        ),
         "geometry_passed",
         "final_qa_passed",
     ]
@@ -232,6 +1296,448 @@ def authorize_autonomous_delivery(
     return state, authority
 
 
+AutonomousRepairExecutor = Callable[..., Mapping[str, Any]]
+
+
+def _remaining_run_global_followup_qa_slots(
+    *,
+    maximum_full_final_qa_calls: int,
+    completed_full_final_qa_calls: int,
+    requested_initial_aspects: Sequence[str],
+    started_initial_aspects: Collection[str],
+) -> int:
+    """Reserve one initial final-QA observation for every requested aspect."""
+
+    if maximum_full_final_qa_calls < 1:
+        raise ValueError("full final QA cap must be positive")
+    requested = tuple(dict.fromkeys(requested_initial_aspects))
+    started = set(started_initial_aspects)
+    if not started <= set(requested):
+        raise ValueError("started QA aspects are outside the requested set")
+    pending_initial = len(set(requested) - started)
+    return (
+        maximum_full_final_qa_calls
+        - completed_full_final_qa_calls
+        - pending_initial
+    )
+
+
+def _write_recovery_execution(
+    output_path: Path,
+    execution: AutonomousRecoveryExecution,
+) -> Path:
+    write_json(output_path, execution)
+    return output_path.resolve(strict=True)
+
+
+def _render_manifest_segment_content_hashes(
+    *,
+    render_manifest_path: Path,
+    aspect: str,
+) -> dict[str, str]:
+    """Resolve the exact segment bytes represented by one aspect manifest."""
+
+    payload = read_json(render_manifest_path.expanduser().resolve(strict=True))
+    if not isinstance(payload, Mapping):
+        raise ValueError("render manifest must be an object")
+    section_name = "vertical" if aspect == "9:16" else "horizontal"
+    section = payload.get(section_name)
+    if not isinstance(section, Mapping):
+        raise ValueError(f"render manifest has no {section_name} section")
+    chapters = section.get("chapters")
+    if not isinstance(chapters, list) or not chapters:
+        raise ValueError("render manifest has no segment-bearing chapters")
+    hashes: dict[str, str] = {}
+    for index, row in enumerate(chapters, start=1):
+        if not isinstance(row, Mapping):
+            raise ValueError("render manifest chapter must be an object")
+        segment_id = str(row.get("segment_id") or f"segment-{index:03d}")
+        segment_value = row.get("segment_path")
+        if not isinstance(segment_value, str):
+            raise ValueError(f"{segment_id} has no immutable segment path")
+        segment_path = Path(segment_value).expanduser().resolve(strict=True)
+        if segment_id in hashes:
+            raise ValueError("render manifest segment IDs must be unique")
+        hashes[segment_id] = sha256_file(segment_path)
+    return hashes
+
+
+def _bind_deterministic_evidence_to_delivery(
+    *,
+    evidence: DeterministicDeliveryEvidence,
+    aspect: str,
+    policy: AutonomousEditPolicy,
+    render_path: Path,
+    render_manifest_path: Path,
+    delivery_manifest_path: Path,
+    music_assembly_manifest_path: Path,
+    autonomous_context_paths: Mapping[str, Path],
+    output_path: Path,
+    changed_segment_ids: tuple[str, ...] = (),
+    reused_segment_ids: tuple[str, ...] = (),
+) -> tuple[DeterministicDeliveryEvidence, Path]:
+    """Persist a delivery-scoped evidence envelope without trusting model IO."""
+
+    context_hashes = {
+        key: sha256_file(path.expanduser().resolve(strict=True))
+        for key, path in autonomous_context_paths.items()
+    }
+    segment_hashes = _render_manifest_segment_content_hashes(
+        render_manifest_path=render_manifest_path,
+        aspect=aspect,
+    )
+    binding = DeterministicEvidenceCausalBinding(
+        render_sha256=sha256_file(render_path),
+        render_manifest_sha256=sha256_file(render_manifest_path),
+        policy_reference=policy.policy_reference,
+        context_hashes=context_hashes,
+        delivery_manifest_sha256=sha256_file(delivery_manifest_path),
+        music_assembly_manifest_sha256=sha256_file(
+            music_assembly_manifest_path
+        ),
+        segment_content_hashes=segment_hashes,
+        changed_segment_ids=changed_segment_ids,
+        reused_segment_ids=reused_segment_ids,
+    )
+    bound = evidence.model_copy(update={"causal_binding": binding})
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(output_path, bound)
+    validate_deterministic_evidence_causal_binding(
+        bound,
+        render_sha256=sha256_file(render_path),
+        render_manifest_sha256=sha256_file(render_manifest_path),
+        policy_reference=policy.policy_reference,
+        context_hashes=context_hashes,
+        delivery_manifest_sha256=sha256_file(delivery_manifest_path),
+        music_assembly_manifest_sha256=sha256_file(
+            music_assembly_manifest_path
+        ),
+        segment_content_hashes=segment_hashes,
+        changed_segment_ids=changed_segment_ids,
+        reused_segment_ids=reused_segment_ids,
+    )
+    return bound, output_path.resolve(strict=True)
+
+
+def _feature_manifest_attests_deterministic_evidence(
+    *,
+    render_manifest_path: Path,
+    aspect: str,
+    evidence_path: Path,
+) -> None:
+    """Reject detached evidence before minting final-delivery bindings."""
+
+    manifest = read_json(render_manifest_path.expanduser().resolve(strict=True))
+    if not isinstance(manifest, Mapping):
+        raise ValueError("render manifest must be an object")
+    per_aspect = manifest.get(
+        "deterministic_delivery_evidence_by_aspect"
+    )
+    if isinstance(per_aspect, Mapping):
+        reference = per_aspect.get(aspect)
+    else:
+        reference = manifest.get("deterministic_delivery_evidence")
+    if not isinstance(reference, Mapping):
+        raise ValueError(
+            "render manifest does not attest deterministic evidence"
+        )
+    resolved_evidence = evidence_path.expanduser().resolve(strict=True)
+    if (
+        str(reference.get("path")) != str(resolved_evidence)
+        or str(reference.get("sha256")) != sha256_file(resolved_evidence)
+    ):
+        raise ValueError(
+            "deterministic evidence is detached from the current render manifest"
+        )
+
+
+def _execute_autonomous_recovery_plan(
+    *,
+    plan: AutonomousRecoveryPlan,
+    policy: AutonomousEditPolicy,
+    input_qa_path: Path,
+    input_render_path: Path,
+    input_render_manifest_path: Path,
+    input_delivery_manifest_path: Path,
+    input_music_assembly_manifest_path: Path,
+    autonomous_context_paths: Mapping[str, Path],
+    deterministic_delivery_evidence_path: Path,
+    segment_contract: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    budget_ledger: BudgetLedger,
+    executor: AutonomousRepairExecutor | None,
+) -> tuple[AutonomousRecoveryExecution, dict[str, Any] | None]:
+    """Execute one bounded recovery or persist why it cannot run safely.
+
+    The delivery layer does not reinterpret a QA suggestion as executable edit
+    instructions.  A repair executor must return rebuilt, hash-verifiable final
+    media, complete changed/reused segment coverage, updated deterministic
+    evidence, and all six autonomous context artifacts.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = output_dir / "recovery-plan.json"
+    write_json(plan_path, plan)
+    plan_sha256 = sha256_file(plan_path)
+    input_qa = input_qa_path.expanduser().resolve(strict=True)
+    input_qa_sha256 = sha256_file(input_qa)
+    input_render = input_render_path.expanduser().resolve(strict=True)
+    input_render_sha256 = sha256_file(input_render)
+    execution_path = output_dir / "recovery-execution.json"
+
+    def nonexecuted(
+        status: str,
+        reason_code: str,
+    ) -> tuple[AutonomousRecoveryExecution, None]:
+        execution = AutonomousRecoveryExecution(
+            status=status,
+            plan_sha256=plan_sha256,
+            input_qa_sha256=input_qa_sha256,
+            reason_code=reason_code,
+            input_render_sha256=input_render_sha256,
+            qa_passes_completed=plan.qa_passes_completed,
+            semantic_replans_used=plan.semantic_replans_used,
+            generated_at=utc_now(),
+        )
+        _write_recovery_execution(execution_path, execution)
+        return execution, None
+
+    if plan.outcome == "complete":
+        return nonexecuted("not_required", "semantic_qa_passed")
+    if plan.outcome == "blocked":
+        return nonexecuted("blocked", "recovery_plan_blocked")
+    if executor is None:
+        return nonexecuted(
+            "unavailable",
+            "no_verified_autonomous_repair_executor",
+        )
+
+    expected_segment_ids = {
+        str(row["segment_id"])
+        for row in segment_contract
+        if isinstance(row, Mapping)
+        and isinstance(row.get("segment_id"), str)
+    }
+    action_segment_ids = {
+        str(action.segment_id)
+        for action in plan.actions
+        if action.segment_id is not None
+    }
+    if (
+        not expected_segment_ids
+        or len(action_segment_ids) != len(plan.actions)
+        or not action_segment_ids <= expected_segment_ids
+    ):
+        return nonexecuted(
+            "unavailable",
+            "repair_actions_lack_exact_segment_binding",
+        )
+
+    semantic_replan_required = any(
+        action.requires_semantic_replan for action in plan.actions
+    )
+    paid_before = int(budget_ledger.report()["committed_interactions"])
+    try:
+        raw_result = executor(
+            plan=plan,
+            policy=policy,
+            input_render_path=input_render,
+            input_render_manifest_path=input_render_manifest_path,
+            input_delivery_manifest_path=input_delivery_manifest_path,
+            input_music_assembly_manifest_path=(
+                input_music_assembly_manifest_path
+            ),
+            autonomous_context_paths=dict(autonomous_context_paths),
+            deterministic_delivery_evidence_path=(
+                deterministic_delivery_evidence_path
+            ),
+            segment_contract=tuple(dict(row) for row in segment_contract),
+            output_dir=output_dir / "executor",
+            budget_ledger=budget_ledger,
+        )
+    except Exception as error:
+        write_json(
+            output_dir / "executor-error.json",
+            {
+                "contract_version": "autonomous-recovery-executor-error-v1",
+                "type": type(error).__name__,
+                "message": str(error),
+                "generated_at": utc_now(),
+            },
+        )
+        return nonexecuted(
+            "unavailable",
+            "autonomous_repair_executor_failed",
+        )
+    paid_after = int(budget_ledger.report()["committed_interactions"])
+    paid_delta = paid_after - paid_before
+    if paid_delta < 0 or paid_delta > (1 if semantic_replan_required else 0):
+        return nonexecuted(
+            "unavailable",
+            "repair_executor_violated_paid_call_bound",
+        )
+    if not isinstance(raw_result, Mapping):
+        return nonexecuted(
+            "unavailable",
+            "repair_executor_returned_invalid_contract",
+        )
+
+    try:
+        output_render = Path(str(raw_result["render_path"])).expanduser().resolve(
+            strict=True
+        )
+        output_render_manifest = Path(
+            str(raw_result["render_manifest_path"])
+        ).expanduser().resolve(strict=True)
+        output_delivery_manifest = Path(
+            str(raw_result["delivery_manifest_path"])
+        ).expanduser().resolve(strict=True)
+        output_music_manifest = Path(
+            str(raw_result["music_assembly_manifest_path"])
+        ).expanduser().resolve(strict=True)
+        output_deterministic_path = Path(
+            str(raw_result["deterministic_delivery_evidence_path"])
+        ).expanduser().resolve(strict=True)
+        output_context_raw = raw_result["autonomous_context_paths"]
+        if not isinstance(output_context_raw, Mapping):
+            raise ValueError("recovery context paths must be a mapping")
+        output_context = {
+            str(key): Path(str(path)).expanduser().resolve(strict=True)
+            for key, path in output_context_raw.items()
+        }
+        if set(output_context) != set(autonomous_context_paths):
+            raise ValueError("recovery changed autonomous context key set")
+        changed_segment_ids = tuple(
+            str(value) for value in raw_result["changed_segment_ids"]
+        )
+        reused_segment_ids = tuple(
+            str(value) for value in raw_result["reused_segment_ids"]
+        )
+        semantic_interaction_ids = tuple(
+            str(value)
+            for value in raw_result.get(
+                "semantic_replan_interaction_ids",
+                (),
+            )
+        )
+    except (KeyError, TypeError, ValueError, OSError):
+        return nonexecuted(
+            "unavailable",
+            "repair_executor_returned_invalid_contract",
+        )
+
+    changed = set(changed_segment_ids)
+    reused = set(reused_segment_ids)
+    if (
+        not changed
+        or changed & reused
+        or changed | reused != expected_segment_ids
+        or not action_segment_ids <= changed
+        or not changed <= action_segment_ids
+    ):
+        return nonexecuted(
+            "unavailable",
+            "repair_executor_did_not_prove_changed_segment_only_render",
+        )
+    if semantic_replan_required:
+        if (
+            plan.semantic_replans_used != 1
+            or len(semantic_interaction_ids) != 1
+            or paid_delta not in {0, 1}
+        ):
+            return nonexecuted(
+                "unavailable",
+                "semantic_replan_provenance_or_bound_missing",
+            )
+    elif semantic_interaction_ids or paid_delta:
+        return nonexecuted(
+            "unavailable",
+            "deterministic_repair_used_semantic_paid_work",
+        )
+
+    if sha256_file(output_render) == input_render_sha256:
+        return nonexecuted(
+            "unavailable",
+            "repair_executor_did_not_change_final_media",
+        )
+    try:
+        output_deterministic = DeterministicDeliveryEvidence.model_validate(
+            read_json(output_deterministic_path)
+        )
+        output_context_hashes = {
+            key: sha256_file(path)
+            for key, path in output_context.items()
+        }
+        output_segment_hashes = _render_manifest_segment_content_hashes(
+            render_manifest_path=output_render_manifest,
+            aspect=str(output_deterministic.aspect or policy.requested_aspects[0]),
+        )
+        validate_deterministic_evidence_causal_binding(
+            output_deterministic,
+            render_sha256=sha256_file(output_render),
+            render_manifest_sha256=sha256_file(output_render_manifest),
+            policy_reference=policy.policy_reference,
+            context_hashes=output_context_hashes,
+            delivery_manifest_sha256=sha256_file(output_delivery_manifest),
+            music_assembly_manifest_sha256=sha256_file(
+                output_music_manifest
+            ),
+            segment_content_hashes=output_segment_hashes,
+            changed_segment_ids=changed_segment_ids,
+            reused_segment_ids=reused_segment_ids,
+        )
+        output_deterministic_report = run_deterministic_delivery_qa(
+            output_deterministic,
+            policy=policy,
+        )
+    except Exception:
+        return nonexecuted(
+            "unavailable",
+            "post_repair_deterministic_evidence_invalid",
+        )
+    if not output_deterministic_report.passed:
+        write_json(
+            output_dir / "post-repair-deterministic-qa.json",
+            output_deterministic_report,
+        )
+        return nonexecuted(
+            "unavailable",
+            "post_repair_deterministic_qa_failed",
+        )
+
+    execution = AutonomousRecoveryExecution(
+        status="executed",
+        plan_sha256=plan_sha256,
+        input_qa_sha256=input_qa_sha256,
+        reason_code="bounded_repair_executed_and_locally_verified",
+        input_render_sha256=input_render_sha256,
+        output_render_sha256=sha256_file(output_render),
+        changed_segment_ids=changed_segment_ids,
+        reused_segment_ids=reused_segment_ids,
+        deterministic_delivery_evidence_sha256=sha256_file(
+            output_deterministic_path
+        ),
+        semantic_replan_interaction_ids=semantic_interaction_ids,
+        qa_passes_completed=plan.qa_passes_completed,
+        semantic_replans_used=plan.semantic_replans_used,
+        generated_at=utc_now(),
+    )
+    _write_recovery_execution(execution_path, execution)
+    return execution, {
+        "render_path": output_render,
+        "render_manifest_path": output_render_manifest,
+        "delivery_manifest_path": output_delivery_manifest,
+        "music_assembly_manifest_path": output_music_manifest,
+        "autonomous_context_paths": output_context,
+        "deterministic_delivery_evidence_path": output_deterministic_path,
+        "deterministic_delivery_evidence": output_deterministic,
+        "deterministic_delivery_qa": output_deterministic_report,
+        "semantic_replan_interaction_ids": semantic_interaction_ids,
+        "recovery_plan_path": plan_path.resolve(strict=True),
+        "recovery_execution_path": execution_path.resolve(strict=True),
+    }
+
+
 def _picture_video_duration_ms(path: Path) -> int:
     """Return authoritative picture duration from the video stream timeline."""
 
@@ -252,7 +1758,7 @@ def _load_reusable_picture_result(
     *,
     catalog_path: Path,
     brief_path: Path,
-    music_path: Path,
+    music_path: Path | None,
 ) -> dict[str, Any]:
     """Resume downstream delivery only from a completed, hash-bound picture run."""
 
@@ -278,7 +1784,11 @@ def _load_reusable_picture_result(
     expected_hashes = {
         "catalog_sha256": sha256_file(catalog_path.expanduser().resolve(strict=True)),
         "brief_sha256": sha256_file(brief_path.expanduser().resolve(strict=True)),
-        "music_sha256": sha256_file(music_path.expanduser().resolve(strict=True)),
+        "music_sha256": (
+            sha256_file(music_path.expanduser().resolve(strict=True))
+            if music_path is not None
+            else None
+        ),
     }
     for field, expected in expected_hashes.items():
         if binding.get(field) != expected:
@@ -302,6 +1812,92 @@ def _load_reusable_picture_result(
             raise DeliveryPipelineBlocked(
                 f"picture resume rejected because {aspect_key} output changed"
             )
+    saved_context_by_aspect = manifest.get(
+        "autonomous_context_by_aspect"
+    )
+    result_context_by_aspect = result.get(
+        "autonomous_context_paths_by_aspect"
+    )
+    if (
+        saved_context_by_aspect is not None
+        or result_context_by_aspect is not None
+    ):
+        if not isinstance(saved_context_by_aspect, Mapping) or not isinstance(
+            result_context_by_aspect,
+            Mapping,
+        ):
+            raise DeliveryPipelineBlocked(
+                "picture resume per-aspect autonomous context is malformed"
+            )
+        if set(saved_context_by_aspect) != set(result_context_by_aspect):
+            raise DeliveryPipelineBlocked(
+                "picture resume autonomous aspect context keys changed"
+            )
+        for aspect, raw_paths in result_context_by_aspect.items():
+            saved_paths = saved_context_by_aspect.get(aspect)
+            if not isinstance(raw_paths, Mapping) or not isinstance(
+                saved_paths,
+                Mapping,
+            ):
+                raise DeliveryPipelineBlocked(
+                    f"picture resume {aspect} context is malformed"
+                )
+            if set(raw_paths) != set(saved_paths):
+                raise DeliveryPipelineBlocked(
+                    f"picture resume {aspect} context keys changed"
+                )
+            for key, value in raw_paths.items():
+                context_path = Path(str(value)).resolve(strict=True)
+                manifest_row = saved_paths.get(key)
+                if (
+                    not isinstance(manifest_row, Mapping)
+                    or manifest_row.get("path") != str(context_path)
+                    or manifest_row.get("sha256")
+                    != sha256_file(context_path)
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"picture resume rejected because {aspect}/{key} "
+                        "context changed"
+                    )
+    for manifest_key, result_key, label in (
+        (
+            "deterministic_delivery_evidence_by_aspect",
+            "deterministic_delivery_evidence_paths_by_aspect",
+            "deterministic evidence",
+        ),
+        (
+            "autonomous_evidence_bundle_by_aspect",
+            "autonomous_evidence_bundle_paths_by_aspect",
+            "evidence bundle",
+        ),
+    ):
+        saved_by_aspect = manifest.get(manifest_key)
+        result_by_aspect = result.get(result_key)
+        if saved_by_aspect is None and result_by_aspect is None:
+            continue
+        if not isinstance(saved_by_aspect, Mapping) or not isinstance(
+            result_by_aspect,
+            Mapping,
+        ):
+            raise DeliveryPipelineBlocked(
+                f"picture resume per-aspect {label} is malformed"
+            )
+        if set(saved_by_aspect) != set(result_by_aspect):
+            raise DeliveryPipelineBlocked(
+                f"picture resume per-aspect {label} keys changed"
+            )
+        for aspect, raw_path in result_by_aspect.items():
+            artifact_path = Path(str(raw_path)).resolve(strict=True)
+            manifest_row = saved_by_aspect.get(aspect)
+            if (
+                not isinstance(manifest_row, Mapping)
+                or manifest_row.get("path") != str(artifact_path)
+                or manifest_row.get("sha256")
+                != sha256_file(artifact_path)
+            ):
+                raise DeliveryPipelineBlocked(
+                    f"picture resume rejected because {aspect} {label} changed"
+                )
     saved_context = manifest.get("autonomous_context")
     result_context = result.get("autonomous_context_paths")
     if saved_context is not None or result_context is not None:
@@ -372,8 +1968,8 @@ def run_feature_delivery_pipeline(
     *,
     feature_cut_kwargs: Mapping[str, Any],
     brief_path: Path,
-    music_path: Path,
-    music_lock_path: Path,
+    music_path: Path | None,
+    music_lock_path: Path | None,
     output_dir: Path,
     model_id: str = MODEL_ID,
     execution_profile: str = "production_review",
@@ -382,7 +1978,15 @@ def run_feature_delivery_pipeline(
     max_gemini_cost_usd: float | None = None,
     autonomous_context_paths: Mapping[str, Path] | None = None,
     deterministic_delivery_evidence_path: Path | None = None,
+    autonomous_context_paths_by_aspect: (
+        Mapping[str, Mapping[str, Path]] | None
+    ) = None,
+    deterministic_delivery_evidence_paths_by_aspect: (
+        Mapping[str, Path] | None
+    ) = None,
     editorial_beat_contracts_path: Path | None = None,
+    prepared_clip_card_library_path: Path | None = None,
+    autonomous_repair_executor: AutonomousRepairExecutor | None = None,
 ) -> dict[str, Any]:
     """Run picture → continuous music → final mux → final QA as one chain.
 
@@ -395,11 +1999,39 @@ def run_feature_delivery_pipeline(
     resolved_output = output_dir.expanduser().resolve()
     resolved_output.mkdir(parents=True, exist_ok=True)
     profile = FeatureCutExecutionProfile(execution_profile)
+    if (music_path is None) != (music_lock_path is None):
+        raise DeliveryPipelineBlocked(
+            "music and MusicMap lock must either both be supplied or both be "
+            "omitted"
+        )
+    music_supplied = music_path is not None
+    if (
+        profile
+        not in {
+            FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+            FeatureCutExecutionProfile.AUTONOMOUS_BEST_EFFORT,
+        }
+        and not music_supplied
+    ):
+        raise DeliveryPipelineBlocked(
+            "review feature-delivery requires music and a MusicMap lock; "
+            "silent delivery is an autonomous-only extension"
+        )
     policy: AutonomousEditPolicy | None = None
     budget_ledger: BudgetLedger | None = None
     deterministic_evidence: DeterministicDeliveryEvidence | None = None
     deterministic_report: DeterministicDeliveryQaReport | None = None
     resolved_autonomous_context: dict[str, Path] = {}
+    resolved_autonomous_context_by_aspect: dict[
+        str, dict[str, Path]
+    ] = {}
+    resolved_deterministic_evidence_by_aspect: dict[str, Path] = {}
+    deterministic_evidence_by_aspect: dict[
+        str, DeterministicDeliveryEvidence
+    ] = {}
+    deterministic_report_by_aspect: dict[
+        str, DeterministicDeliveryQaReport
+    ] = {}
     if profile in {
         FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
         FeatureCutExecutionProfile.AUTONOMOUS_BEST_EFFORT,
@@ -412,6 +2044,10 @@ def run_feature_delivery_pipeline(
             strict=True
         )
         policy = AutonomousEditPolicy.model_validate(read_json(resolved_policy))
+        if model_id != policy.model_id or MODEL_ID != policy.model_id:
+            raise DeliveryPipelineBlocked(
+                "autonomous delivery model does not match the signed policy"
+            )
         expected_profile = AutonomousExecutionProfile(profile.value)
         if policy.execution_profile != expected_profile:
             raise DeliveryPipelineBlocked(
@@ -451,7 +2087,13 @@ def run_feature_delivery_pipeline(
             request
             for request in prior_usage["requests"]
             if str(request["path"]).startswith(
-                ("picture/", "aspects/", "audition/")
+                (
+                    "cold-ingest/",
+                    "retrieval/",
+                    "picture/",
+                    "aspects/",
+                    "audition/",
+                )
             )
         ]
         for request in policy_scoped_prior_requests:
@@ -467,6 +2109,72 @@ def run_feature_delivery_pipeline(
                     "total_thought_tokens": request["thought_tokens"],
                 },
             )
+        conservative_dispatches: list[dict[str, Any]] = []
+        for orchestration_path in resolved_output.rglob(
+            "orchestration.json"
+        ):
+            relative = orchestration_path.relative_to(resolved_output)
+            if not relative.parts or relative.parts[0] not in {
+                "cold-ingest",
+                "retrieval",
+                "picture",
+                "aspects",
+                "audition",
+            }:
+                continue
+            orchestration = read_json(orchestration_path)
+            usage = (
+                orchestration.get("usage")
+                if isinstance(orchestration, Mapping)
+                else None
+            )
+            if (
+                not isinstance(usage, Mapping)
+                or usage.get("conservative_reconciliation") is not True
+            ):
+                continue
+            conservative_dispatches.append(
+                {
+                    "path": str(relative),
+                    "stage": str(
+                        orchestration.get("stage")
+                        or "resumed_conservative_dispatch"
+                    ),
+                    "usage": dict(usage),
+                }
+            )
+            budget_ledger.adopt_reconciled_usage(
+                stage=str(
+                    orchestration.get("stage")
+                    or "resumed_conservative_dispatch"
+                ),
+                model_id=MODEL_ID,
+                usage={
+                    "total_input_tokens": int(
+                        usage["total_input_tokens"]
+                    ),
+                    "total_cached_tokens": int(
+                        usage.get("total_cached_input_tokens") or 0
+                    ),
+                    "total_output_tokens": int(
+                        usage["total_output_tokens"]
+                    ),
+                    "total_thought_tokens": int(
+                        usage["total_thought_tokens"]
+                    ),
+                },
+            )
+        adopted_dispatch_journals = adopt_paid_dispatch_journals(
+            budget_ledger=budget_ledger,
+            root=resolved_output,
+            allowed_top_level={
+                "cold-ingest",
+                "retrieval",
+                "picture",
+                "aspects",
+                "audition",
+            },
+        )
         required_context_keys = {
             "editorial_beat_contracts",
             "music_map",
@@ -475,15 +2183,88 @@ def run_feature_delivery_pipeline(
             "sequence_optimization",
             "reuse_degradation",
         }
-        if autonomous_context_paths is not None:
+        if (
+            autonomous_context_paths is not None
+            and autonomous_context_paths_by_aspect is not None
+        ):
+            raise DeliveryPipelineBlocked(
+                "autonomous context must use either the flat single-aspect "
+                "shape or the per-aspect shape, never both"
+            )
+        if (
+            deterministic_delivery_evidence_path is not None
+            and deterministic_delivery_evidence_paths_by_aspect is not None
+        ):
+            raise DeliveryPipelineBlocked(
+                "deterministic evidence must use either the flat single-aspect "
+                "shape or the per-aspect shape, never both"
+            )
+        if len(requested) > 1 and (
+            autonomous_context_paths is not None
+            or deterministic_delivery_evidence_path is not None
+        ):
+            raise DeliveryPipelineBlocked(
+                "multi-aspect autonomous delivery rejects ambiguous flat "
+                "context/evidence; supply independently bound per-aspect maps"
+            )
+        if autonomous_context_paths_by_aspect is not None:
+            if set(autonomous_context_paths_by_aspect) != requested:
+                raise DeliveryPipelineBlocked(
+                    "per-aspect autonomous context keys do not match the "
+                    "requested aspects"
+                )
+            for aspect_key, supplied_paths in (
+                autonomous_context_paths_by_aspect.items()
+            ):
+                if set(supplied_paths) != required_context_keys:
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} autonomous final-QA context keys are "
+                        "incomplete or unknown"
+                    )
+                resolved_paths = {
+                    key: path.expanduser().resolve(strict=True)
+                    for key, path in supplied_paths.items()
+                }
+                _validate_autonomous_context_aspect_binding(
+                    resolved_paths,
+                    expected_aspect=aspect_key,
+                    policy=policy,
+                )
+                preflight_degradation = (
+                    AutonomousDegradationManifest.model_validate(
+                        read_json(resolved_paths["reuse_degradation"])
+                    )
+                )
+                if (
+                    preflight_degradation.policy_reference
+                    != policy.policy_reference
+                    or (
+                        preflight_degradation.aspect is not None
+                        and preflight_degradation.aspect != aspect_key
+                    )
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} degradation manifest does not bind the "
+                        "policy and aspect"
+                    )
+                resolved_autonomous_context_by_aspect[aspect_key] = (
+                    resolved_paths
+                )
+        elif autonomous_context_paths is not None:
             if set(autonomous_context_paths) != required_context_keys:
                 raise DeliveryPipelineBlocked(
                     "autonomous final-QA context keys are incomplete or unknown"
                 )
+            only_aspect = next(iter(requested))
             resolved_autonomous_context = {
                 key: path.expanduser().resolve(strict=True)
                 for key, path in autonomous_context_paths.items()
             }
+            _validate_autonomous_context_aspect_binding(
+                resolved_autonomous_context,
+                expected_aspect=only_aspect,
+                policy=policy,
+            )
             preflight_degradation = (
                 AutonomousDegradationManifest.model_validate(
                     read_json(
@@ -491,17 +2272,67 @@ def run_feature_delivery_pipeline(
                     )
                 )
             )
-            if preflight_degradation.policy_reference != policy.policy_reference:
-                raise DeliveryPipelineBlocked(
-                    "degradation manifest does not bind the autonomous policy"
+            if (
+                preflight_degradation.policy_reference
+                != policy.policy_reference
+                or (
+                    preflight_degradation.aspect is not None
+                    and preflight_degradation.aspect != only_aspect
                 )
+            ):
+                raise DeliveryPipelineBlocked(
+                    "degradation manifest does not bind the policy and aspect"
+                )
+            resolved_autonomous_context_by_aspect[only_aspect] = dict(
+                resolved_autonomous_context
+            )
         elif editorial_beat_contracts_path is None:
             raise DeliveryPipelineBlocked(
                 "autonomous delivery requires editorial beat contracts so "
                 "feature-cut can generate selected-window context"
             )
         resolved_deterministic_evidence: Path | None = None
-        if deterministic_delivery_evidence_path is not None:
+        if deterministic_delivery_evidence_paths_by_aspect is not None:
+            if set(
+                deterministic_delivery_evidence_paths_by_aspect
+            ) != requested:
+                raise DeliveryPipelineBlocked(
+                    "per-aspect deterministic evidence keys do not match the "
+                    "requested aspects"
+                )
+            for aspect_key, evidence_path in (
+                deterministic_delivery_evidence_paths_by_aspect.items()
+            ):
+                resolved_path = evidence_path.expanduser().resolve(
+                    strict=True
+                )
+                evidence = DeterministicDeliveryEvidence.model_validate(
+                    read_json(resolved_path)
+                )
+                if (
+                    evidence.aspect is not None
+                    and evidence.aspect != aspect_key
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} autonomous QA cannot consume "
+                        f"{evidence.aspect} deterministic evidence"
+                    )
+                report = run_deterministic_delivery_qa(
+                    evidence,
+                    policy=policy,
+                )
+                if not report.passed:
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} deterministic autonomous gates failed "
+                        "before paid work: "
+                        + ", ".join(report.failure_codes)
+                    )
+                resolved_deterministic_evidence_by_aspect[aspect_key] = (
+                    resolved_path
+                )
+                deterministic_evidence_by_aspect[aspect_key] = evidence
+                deterministic_report_by_aspect[aspect_key] = report
+        elif deterministic_delivery_evidence_path is not None:
             resolved_deterministic_evidence = (
                 deterministic_delivery_evidence_path.expanduser().resolve(
                     strict=True
@@ -512,6 +2343,15 @@ def run_feature_delivery_pipeline(
                     read_json(resolved_deterministic_evidence)
                 )
             )
+            only_aspect = next(iter(requested))
+            if (
+                deterministic_evidence.aspect is not None
+                and deterministic_evidence.aspect != only_aspect
+            ):
+                raise DeliveryPipelineBlocked(
+                    f"{only_aspect} autonomous QA cannot consume "
+                    f"{deterministic_evidence.aspect} deterministic evidence"
+                )
             deterministic_report = run_deterministic_delivery_qa(
                 deterministic_evidence,
                 policy=policy,
@@ -521,6 +2361,15 @@ def run_feature_delivery_pipeline(
                     "deterministic autonomous gates failed before paid work: "
                     + ", ".join(deterministic_report.failure_codes)
                 )
+            resolved_deterministic_evidence_by_aspect[only_aspect] = (
+                resolved_deterministic_evidence
+            )
+            deterministic_evidence_by_aspect[only_aspect] = (
+                deterministic_evidence
+            )
+            deterministic_report_by_aspect[only_aspect] = (
+                deterministic_report
+            )
         write_json(
             resolved_output / "autonomous-preflight.json",
             {
@@ -534,19 +2383,33 @@ def run_feature_delivery_pipeline(
                     "included_policy_scoped_requests": len(
                         policy_scoped_prior_requests
                     ),
+                    "included_conservative_dispatches": len(
+                        conservative_dispatches
+                    ),
+                    "included_non_subprocess_dispatch_journals": len(
+                        adopted_dispatch_journals
+                    ),
                     "excluded_pre_policy_requests": (
                         prior_usage["request_count"]
                         - len(policy_scoped_prior_requests)
                     ),
                     "interpretation": (
-                        "retrieval and cold-ingest calls created before the "
-                        "policy-bound direct edit are reported separately and "
-                        "cannot consume or reset the selected-edit ledger"
+                        "only cold-ingest calls created before the policy-bound "
+                        "direct edit are reported separately; policy-bound "
+                        "retrieval is included and cannot be reset on resume"
                     ),
                 },
                 "autonomous_context_paths": {
                     key: str(path)
                     for key, path in resolved_autonomous_context.items()
+                },
+                "autonomous_context_paths_by_aspect": {
+                    aspect_key: {
+                        key: str(path) for key, path in paths.items()
+                    }
+                    for aspect_key, paths in (
+                        resolved_autonomous_context_by_aspect.items()
+                    )
                 },
                 "context_source": (
                     "supplied"
@@ -558,6 +2421,12 @@ def run_feature_delivery_pipeline(
                     if resolved_deterministic_evidence is not None
                     else None
                 ),
+                "deterministic_delivery_evidence_paths_by_aspect": {
+                    aspect_key: str(path)
+                    for aspect_key, path in (
+                        resolved_deterministic_evidence_by_aspect.items()
+                    )
+                },
                 "paid_call_started": False,
                 "generated_at": utc_now(),
             },
@@ -575,11 +2444,8 @@ def run_feature_delivery_pipeline(
     deterministic_failure_codes: tuple[str, ...] = ()
     try:
         effective_music_lock_path = music_lock_path
-        if (
-            policy is not None
-            and music_path.expanduser().is_file()
-            and music_lock_path.expanduser().is_file()
-        ):
+        if policy is not None and music_path is not None:
+            assert music_lock_path is not None
             effective_music_lock_path = _bind_music_lock_to_autonomous_policy(
                 music_path=music_path,
                 music_lock_path=music_lock_path,
@@ -596,11 +2462,57 @@ def run_feature_delivery_pipeline(
             kwargs["autonomous_policy_path"] = autonomous_policy_path
             kwargs["budget_ledger"] = budget_ledger
             kwargs["editorial_beat_contracts_path"] = (
-                editorial_beat_contracts_path
-                or resolved_autonomous_context.get(
-                    "editorial_beat_contracts"
+                    editorial_beat_contracts_path
+                    or resolved_autonomous_context.get(
+                        "editorial_beat_contracts"
+                    )
+                    or (
+                        next(
+                            iter(
+                                resolved_autonomous_context_by_aspect.values()
+                            )
+                        )["editorial_beat_contracts"]
+                        if resolved_autonomous_context_by_aspect
+                        else None
+                    )
                 )
-            )
+            if (
+                not reuse_picture_result
+                and not bool(kwargs.get("reuse_feature_plan"))
+                and not bool(kwargs.get("reuse_feature_plan_raw_output"))
+            ):
+                assert budget_ledger is not None
+                contracts_path = kwargs["editorial_beat_contracts_path"]
+                if contracts_path is None:
+                    raise DeliveryPipelineBlocked(
+                        "fresh autonomous planning requires editorial beat "
+                        "contracts"
+                    )
+                planning_orchestration = (
+                    _prepare_fresh_autonomous_direct_plan(
+                        catalog_path=Path(kwargs["catalog_path"]),
+                        brief_path=brief_path,
+                        music_path=music_path,
+                        music_duration_ms=(
+                            MusicMapLock.model_validate(
+                                read_json(effective_music_lock_path)
+                            ).duration_ms
+                            if effective_music_lock_path is not None
+                            else 0
+                        ),
+                        policy_path=Path(autonomous_policy_path),
+                        editorial_contracts_path=Path(contracts_path),
+                        prepared_library_path=(
+                            prepared_clip_card_library_path
+                        ),
+                        output_dir=resolved_output,
+                        budget_ledger=budget_ledger,
+                    )
+                )
+                kwargs["reuse_feature_plan"] = True
+                outputs["fresh_autonomous_planning"] = (
+                    planning_orchestration
+                )
         if reuse_picture_result:
             feature_result = _load_reusable_picture_result(
                 resolved_output / "picture",
@@ -612,44 +2524,257 @@ def run_feature_delivery_pipeline(
             feature_result = run_feature_cut_experiment(**kwargs)
         outputs["feature_cut"] = feature_result
         if policy is not None:
-            generated_context = feature_result.get(
-                "autonomous_context_paths"
+            presentation_authorities = feature_result.get(
+                "presentation_authority_paths_by_aspect"
             )
-            if not isinstance(generated_context, Mapping):
-                raise DeliveryPipelineBlocked(
-                    "feature-cut did not persist selected-window context"
-                )
-            if set(generated_context) != required_context_keys:
-                raise DeliveryPipelineBlocked(
-                    "generated autonomous context is incomplete"
-                )
-            resolved_autonomous_context = {
-                str(key): Path(str(path)).expanduser().resolve(strict=True)
-                for key, path in generated_context.items()
-            }
-        if policy is not None:
-            generated_evidence = feature_result.get(
-                "deterministic_delivery_evidence_path"
+            feature_cut_authority_value = feature_result.get(
+                "feature_cut_authority_path"
             )
-            if not isinstance(generated_evidence, str):
+            if (
+                not isinstance(presentation_authorities, Mapping)
+                or set(presentation_authorities) != requested
+                or not isinstance(feature_cut_authority_value, str)
+            ):
                 raise DeliveryPipelineBlocked(
-                    "feature-cut did not persist deterministic delivery evidence"
+                    "autonomous feature-cut omitted policy-bound presentation "
+                    "or feature-cut authority"
                 )
-            resolved_deterministic_evidence = Path(
-                generated_evidence
+            feature_manifest_path = Path(
+                str(feature_result["manifest_path"])
             ).expanduser().resolve(strict=True)
-            deterministic_evidence = (
-                DeterministicDeliveryEvidence.model_validate(
-                    read_json(resolved_deterministic_evidence)
+            feature_manifest = read_json(feature_manifest_path)
+            saved_presentation_authorities = (
+                feature_manifest.get("presentation_authority_by_aspect")
+                if isinstance(feature_manifest, Mapping)
+                else None
+            )
+            if (
+                not isinstance(saved_presentation_authorities, Mapping)
+                or set(saved_presentation_authorities) != requested
+            ):
+                raise DeliveryPipelineBlocked(
+                    "render manifest presentation authority is incomplete"
                 )
+            for aspect_key, raw_path in presentation_authorities.items():
+                presentation_path = Path(str(raw_path)).expanduser().resolve(
+                    strict=True
+                )
+                saved_row = saved_presentation_authorities.get(aspect_key)
+                if (
+                    not isinstance(saved_row, Mapping)
+                    or saved_row.get("path") != str(presentation_path)
+                    or saved_row.get("sha256")
+                    != sha256_file(presentation_path)
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} presentation authority differs from "
+                        "render manifest"
+                    )
+                try:
+                    presentation_artifact = validate_policy_decision_artifact(
+                        presentation_path,
+                        policy=policy,
+                        expected_scope="reframe",
+                        expected_aspect=str(aspect_key),
+                    )
+                except (OSError, ValueError) as exc:
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} presentation authority failed: {exc}"
+                    ) from exc
+                presentation_proposal = read_json(
+                    Path(
+                        str(presentation_artifact["proposal_path"])
+                    ).expanduser().resolve(strict=True)
+                )
+                result_output_key = (
+                    "horizontal_output"
+                    if aspect_key == "16:9"
+                    else "vertical_output"
+                )
+                result_output = Path(
+                    str(feature_result.get(result_output_key) or "")
+                ).expanduser().resolve()
+                if (
+                    not isinstance(presentation_proposal, Mapping)
+                    or presentation_proposal.get("final_output_path")
+                    != str(result_output)
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} presentation authority does not bind "
+                        "the feature-cut output"
+                    )
+            feature_cut_authority_path = Path(
+                feature_cut_authority_value
+            ).expanduser().resolve(strict=True)
+            saved_feature_authority = (
+                feature_manifest.get("feature_cut_authority")
+                if isinstance(feature_manifest, Mapping)
+                else None
             )
-            deterministic_report = run_deterministic_delivery_qa(
-                deterministic_evidence,
-                policy=policy,
+            if (
+                not isinstance(saved_feature_authority, Mapping)
+                or saved_feature_authority.get("path")
+                != str(feature_cut_authority_path)
+                or saved_feature_authority.get("sha256")
+                != sha256_file(feature_cut_authority_path)
+            ):
+                raise DeliveryPipelineBlocked(
+                    "feature-cut authority differs from render manifest"
+                )
+            try:
+                validate_policy_decision_artifact(
+                    feature_cut_authority_path,
+                    policy=policy,
+                    expected_scope="feature_cut",
+                    expected_aspect=None,
+                )
+            except (OSError, ValueError) as exc:
+                raise DeliveryPipelineBlocked(
+                    f"feature-cut authority failed: {exc}"
+                ) from exc
+            generated_context_by_aspect = feature_result.get(
+                "autonomous_context_paths_by_aspect"
             )
-            if not deterministic_report.passed:
-                deterministic_failure_codes = tuple(
-                    deterministic_report.failure_codes
+            generated_evidence_by_aspect = feature_result.get(
+                "deterministic_delivery_evidence_paths_by_aspect"
+            )
+            if isinstance(generated_context_by_aspect, Mapping):
+                if set(generated_context_by_aspect) != requested:
+                    raise DeliveryPipelineBlocked(
+                        "feature-cut per-aspect context does not match the "
+                        "requested aspects"
+                    )
+                resolved_autonomous_context_by_aspect = {}
+                for aspect_key, raw_paths in (
+                    generated_context_by_aspect.items()
+                ):
+                    if (
+                        not isinstance(raw_paths, Mapping)
+                        or set(raw_paths) != required_context_keys
+                    ):
+                        raise DeliveryPipelineBlocked(
+                            f"generated {aspect_key} autonomous context is "
+                            "incomplete"
+                        )
+                    resolved_autonomous_context_by_aspect[str(aspect_key)] = {
+                        str(key): Path(str(path))
+                        .expanduser()
+                        .resolve(strict=True)
+                        for key, path in raw_paths.items()
+                    }
+                    _validate_autonomous_context_aspect_binding(
+                        resolved_autonomous_context_by_aspect[
+                            str(aspect_key)
+                        ],
+                        expected_aspect=str(aspect_key),
+                        policy=policy,
+                    )
+            else:
+                generated_context = feature_result.get(
+                    "autonomous_context_paths"
+                )
+                if len(requested) != 1 or not isinstance(
+                    generated_context,
+                    Mapping,
+                ):
+                    raise DeliveryPipelineBlocked(
+                        "multi-aspect feature-cut must persist independently "
+                        "bound per-aspect context"
+                    )
+                if set(generated_context) != required_context_keys:
+                    raise DeliveryPipelineBlocked(
+                        "generated autonomous context is incomplete"
+                    )
+                only_aspect = next(iter(requested))
+                resolved_autonomous_context = {
+                    str(key): Path(str(path))
+                    .expanduser()
+                    .resolve(strict=True)
+                    for key, path in generated_context.items()
+                }
+                _validate_autonomous_context_aspect_binding(
+                    resolved_autonomous_context,
+                    expected_aspect=only_aspect,
+                    policy=policy,
+                )
+                resolved_autonomous_context_by_aspect[only_aspect] = dict(
+                    resolved_autonomous_context
+                )
+            if isinstance(generated_evidence_by_aspect, Mapping):
+                if set(generated_evidence_by_aspect) != requested:
+                    raise DeliveryPipelineBlocked(
+                        "feature-cut per-aspect deterministic evidence does "
+                        "not match the requested aspects"
+                    )
+                resolved_deterministic_evidence_by_aspect = {
+                    str(aspect_key): Path(str(path))
+                    .expanduser()
+                    .resolve(strict=True)
+                    for aspect_key, path in (
+                        generated_evidence_by_aspect.items()
+                    )
+                }
+            else:
+                generated_evidence = feature_result.get(
+                    "deterministic_delivery_evidence_path"
+                )
+                if len(requested) != 1 or not isinstance(
+                    generated_evidence,
+                    str,
+                ):
+                    raise DeliveryPipelineBlocked(
+                        "multi-aspect feature-cut must persist independently "
+                        "bound per-aspect deterministic evidence"
+                    )
+                only_aspect = next(iter(requested))
+                resolved_deterministic_evidence = Path(
+                    generated_evidence
+                ).expanduser().resolve(strict=True)
+                resolved_deterministic_evidence_by_aspect[only_aspect] = (
+                    resolved_deterministic_evidence
+                )
+            deterministic_evidence_by_aspect = {}
+            deterministic_report_by_aspect = {}
+            aspect_failure_codes: list[str] = []
+            for aspect_key in sorted(requested):
+                evidence_path = (
+                    resolved_deterministic_evidence_by_aspect[aspect_key]
+                )
+                evidence = DeterministicDeliveryEvidence.model_validate(
+                    read_json(evidence_path)
+                )
+                if (
+                    evidence.aspect is not None
+                    and evidence.aspect != aspect_key
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} autonomous QA cannot consume "
+                        f"{evidence.aspect} deterministic evidence"
+                    )
+                report = run_deterministic_delivery_qa(
+                    evidence,
+                    policy=policy,
+                )
+                deterministic_evidence_by_aspect[aspect_key] = evidence
+                deterministic_report_by_aspect[aspect_key] = report
+                aspect_failure_codes.extend(
+                    f"{aspect_key}:{code}"
+                    for code in report.failure_codes
+                )
+            deterministic_failure_codes = tuple(aspect_failure_codes)
+            if len(requested) == 1:
+                only_aspect = next(iter(requested))
+                resolved_autonomous_context = dict(
+                    resolved_autonomous_context_by_aspect[only_aspect]
+                )
+                resolved_deterministic_evidence = (
+                    resolved_deterministic_evidence_by_aspect[only_aspect]
+                )
+                deterministic_evidence = (
+                    deterministic_evidence_by_aspect[only_aspect]
+                )
+                deterministic_report = (
+                    deterministic_report_by_aspect[only_aspect]
                 )
         picture_media_rendered = bool(feature_result.get("media_rendered"))
         picture_outputs_present = any(
@@ -674,22 +2799,45 @@ def run_feature_delivery_pipeline(
             feature_result.get("ready_for_human_review")
         )
 
-        resolved_music = music_path.expanduser().resolve(strict=True)
-        resolved_lock_path = effective_music_lock_path.expanduser().resolve(
-            strict=True
+        resolved_music = (
+            music_path.expanduser().resolve(strict=True)
+            if music_path is not None
+            else None
         )
-        music_lock = MusicMapLock.model_validate(read_json(resolved_lock_path))
-        if music_lock.music_id != f"sha256:{sha256_file(resolved_music)}":
-            raise DeliveryPipelineBlocked(
-                "reviewed MusicMap lock does not bind the supplied soundtrack"
+        resolved_lock_path = (
+            effective_music_lock_path.expanduser().resolve(strict=True)
+            if effective_music_lock_path is not None
+            else None
+        )
+        music_lock: MusicMapLock | None = None
+        if resolved_music is not None:
+            assert resolved_lock_path is not None
+            music_lock = MusicMapLock.model_validate(
+                read_json(resolved_lock_path)
             )
+            if music_lock.music_id != f"sha256:{sha256_file(resolved_music)}":
+                raise DeliveryPipelineBlocked(
+                    "reviewed MusicMap lock does not bind the supplied soundtrack"
+                )
 
         render_manifest_path = Path(feature_result["manifest_path"]).resolve(
             strict=True
         )
         final_results: dict[str, Any] = {}
         qa_results_by_aspect: dict[str, Any] = {}
+        qa_context_hashes_by_aspect: dict[str, dict[str, str]] = {}
         qa_interaction_ids: list[str] = []
+        autonomous_final_qa_calls_completed = 0
+        autonomous_semantic_replans_used = 0
+        autonomous_initial_aspect_order = tuple(
+            aspect_ratio
+            for aspect_key, aspect_ratio in (
+                ("horizontal", "16:9"),
+                ("vertical", "9:16"),
+            )
+            if feature_result.get(f"{aspect_key}_output") is not None
+        )
+        autonomous_initial_aspects_started: set[str] = set()
         if not deterministic_failure_codes:
             client = GeminiLabClient(model_id=model_id)
         for aspect_key, aspect_ratio, qa_mode in (
@@ -716,17 +2864,52 @@ def run_feature_delivery_pipeline(
             ) / aspect_key
             assembly_key = hashlib.sha256(
                 (
-                    "feature-delivery-music-assembly-v2:"
-                    f"{sha256_file(picture)}:"
-                    f"{picture_duration_ms}:"
-                    f"{sha256_file(resolved_lock_path)}:"
-                    f"{sha256_file(music_timeline_path) if expected_timeline else 'unplanned'}"
+                    (
+                        "feature-delivery-music-assembly-v2:"
+                        if music_supplied
+                        else "feature-delivery-picture-only-v1:"
+                    )
+                    + f"{sha256_file(picture)}:"
+                    + f"{picture_duration_ms}:"
+                    + (
+                        f"{sha256_file(resolved_lock_path)}:"
+                        if resolved_lock_path is not None
+                        else "no-music:"
+                    )
+                    + (
+                        sha256_file(music_timeline_path)
+                        if expected_timeline
+                        else "unplanned"
+                    )
                 ).encode("utf-8")
             ).hexdigest()
             assembly_dir = (
                 aspect_dir / "music-assembly" / "runs" / assembly_key
             )
-            if expected_timeline is not None:
+            rendered_music = None
+            if not music_supplied:
+                delivery = assemble_picture_only_delivery(
+                    picture_path=picture,
+                    output_path=aspect_dir / (
+                        f"audition-{aspect_key}.mp4"
+                        if deterministic_failure_codes
+                        else f"final-{aspect_key}.mp4"
+                    ),
+                    manifest_path=aspect_dir / (
+                        "audition-delivery.json"
+                        if deterministic_failure_codes
+                        else "final-delivery.json"
+                    ),
+                    aspect_ratio=aspect_ratio,
+                    artifact_bindings={
+                        "feature_render_manifest_sha256": sha256_file(
+                            render_manifest_path
+                        ),
+                        "audio_policy": "explicitly_absent",
+                    },
+                )
+            elif expected_timeline is not None:
+                assert resolved_music is not None
                 expected_plan = expected_timeline.get("plan_definition", {})
                 plan_contract_version = expected_timeline.get(
                     "plan_contract_version"
@@ -759,7 +2942,9 @@ def run_feature_delivery_pipeline(
                     raise DeliveryPipelineBlocked(
                         "picture music timeline uses an unsupported plan contract"
                     )
-            else:
+            elif music_lock is not None:
+                assert resolved_music is not None
+                assert resolved_lock_path is not None
                 try:
                     selected_music_plan = plan_single_interval_music_assembly(
                         music_lock,
@@ -792,28 +2977,103 @@ def run_feature_delivery_pipeline(
                         assembly_dir / "music.wav",
                         assembly_dir,
                     )
-            delivery = assemble_music_only_delivery(
-                picture_path=picture,
-                music_path=rendered_music.output_audio_path,
-                output_path=aspect_dir / (
-                    f"audition-{aspect_key}.mp4"
-                    if deterministic_failure_codes
-                    else f"final-{aspect_key}.mp4"
-                ),
-                manifest_path=aspect_dir / (
-                    "audition-delivery.json"
-                    if deterministic_failure_codes
-                    else "final-delivery.json"
-                ),
-                music_assembly_artifact_dir=assembly_dir,
-                aspect_ratio=aspect_ratio,
-                artifact_bindings={
-                    "feature_render_manifest_sha256": sha256_file(
-                        render_manifest_path
+            else:
+                raise DeliveryPipelineBlocked(
+                    "music delivery state is internally inconsistent"
+                )
+            if rendered_music is not None:
+                assert resolved_lock_path is not None
+                delivery = assemble_music_only_delivery(
+                    picture_path=picture,
+                    music_path=rendered_music.output_audio_path,
+                    output_path=aspect_dir / (
+                        f"audition-{aspect_key}.mp4"
+                        if deterministic_failure_codes
+                        else f"final-{aspect_key}.mp4"
                     ),
-                    "music_map_lock_sha256": sha256_file(resolved_lock_path),
-                },
-            )
+                    manifest_path=aspect_dir / (
+                        "audition-delivery.json"
+                        if deterministic_failure_codes
+                        else "final-delivery.json"
+                    ),
+                    music_assembly_artifact_dir=assembly_dir,
+                    aspect_ratio=aspect_ratio,
+                    artifact_bindings={
+                        "feature_render_manifest_sha256": sha256_file(
+                            render_manifest_path
+                        ),
+                        "music_map_lock_sha256": sha256_file(
+                            resolved_lock_path
+                        ),
+                    },
+                )
+            if policy is not None:
+                source_evidence_path = (
+                    resolved_deterministic_evidence_by_aspect.get(
+                        aspect_ratio
+                    )
+                )
+                source_evidence = deterministic_evidence_by_aspect.get(
+                    aspect_ratio
+                )
+                source_context = (
+                    resolved_autonomous_context_by_aspect.get(aspect_ratio)
+                )
+                if (
+                    source_evidence_path is None
+                    or source_evidence is None
+                    or source_context is None
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_ratio} has no deterministic evidence "
+                        "available for final delivery binding"
+                    )
+                final_media_authority_path = (
+                    rendered_music.manifest_path
+                    if rendered_music is not None
+                    else delivery.manifest_path
+                )
+                try:
+                    _feature_manifest_attests_deterministic_evidence(
+                        render_manifest_path=render_manifest_path,
+                        aspect=aspect_ratio,
+                        evidence_path=source_evidence_path,
+                    )
+                    bound_evidence, bound_evidence_path = (
+                        _bind_deterministic_evidence_to_delivery(
+                            evidence=source_evidence,
+                            aspect=aspect_ratio,
+                            policy=policy,
+                            render_path=delivery.output_path,
+                            render_manifest_path=render_manifest_path,
+                            delivery_manifest_path=delivery.manifest_path,
+                            music_assembly_manifest_path=(
+                                final_media_authority_path
+                            ),
+                            autonomous_context_paths=source_context,
+                            output_path=(
+                                aspect_dir
+                                / "deterministic-delivery-evidence.bound.json"
+                            ),
+                        )
+                    )
+                except (OSError, TypeError, ValueError) as error:
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_ratio} deterministic evidence is not "
+                        f"causally bound to the current delivery: {error}"
+                    ) from error
+                resolved_deterministic_evidence_by_aspect[aspect_ratio] = (
+                    bound_evidence_path
+                )
+                deterministic_evidence_by_aspect[aspect_ratio] = (
+                    bound_evidence
+                )
+                deterministic_report_by_aspect[aspect_ratio] = (
+                    run_deterministic_delivery_qa(
+                        bound_evidence,
+                        policy=policy,
+                    )
+                )
             if deterministic_failure_codes:
                 final_results[aspect_key] = {
                     "audition_output": str(delivery.output_path),
@@ -821,20 +3081,55 @@ def run_feature_delivery_pipeline(
                         delivery.output_path
                     ),
                     "audition_manifest": str(delivery.manifest_path),
-                    "music_assembly_manifest": str(
+                    "media_assembly_manifest": str(
                         rendered_music.manifest_path
+                        if rendered_music is not None
+                        else delivery.manifest_path
                     ),
                     "delivery_eligible": False,
                     "interpretation": (
-                        "music-backed review artifact preserved after local "
+                        "playable review artifact preserved after local "
                         "autonomous gates blocked delivery"
                     ),
                 }
                 continue
             assert client is not None
             qa_dir = aspect_dir / "final-qa"
-            if policy is not None and aspect_ratio == "9:16":
-                qa_mode = "autonomous_final_9x16"
+            if policy is not None:
+                qa_mode = (
+                    "autonomous_final_16x9"
+                    if aspect_ratio == "16:9"
+                    else "autonomous_final_9x16"
+                )
+                aspect_autonomous_context = (
+                    resolved_autonomous_context_by_aspect.get(aspect_ratio)
+                )
+                aspect_deterministic_path = (
+                    resolved_deterministic_evidence_by_aspect.get(
+                        aspect_ratio
+                    )
+                )
+                aspect_deterministic_evidence = (
+                    deterministic_evidence_by_aspect.get(aspect_ratio)
+                )
+                aspect_deterministic_report = (
+                    deterministic_report_by_aspect.get(aspect_ratio)
+                )
+                if (
+                    aspect_autonomous_context is None
+                    or aspect_deterministic_path is None
+                    or aspect_deterministic_evidence is None
+                    or aspect_deterministic_report is None
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_ratio} final QA has no matching autonomous "
+                        "context/evidence authority"
+                    )
+            else:
+                aspect_autonomous_context = None
+                aspect_deterministic_path = None
+                aspect_deterministic_evidence = None
+                aspect_deterministic_report = None
             prepared = prepare_final_edit_qa(
                 mode=qa_mode,
                 render_path=delivery.output_path,
@@ -844,48 +3139,634 @@ def run_feature_delivery_pipeline(
                 brief_path=(
                     brief_path
                     if qa_mode
-                    in {"canonical_16x9", "autonomous_final_9x16"}
+                    in {
+                        "canonical_16x9",
+                        "autonomous_final_16x9",
+                        "autonomous_final_9x16",
+                    }
                     else None
                 ),
-                crop_include_audio=qa_mode != "crop_only_9x16",
+                crop_include_audio=(
+                    music_supplied and qa_mode != "crop_only_9x16"
+                ),
+                music_supplied=(
+                    music_supplied if policy is not None else None
+                ),
+                autonomous_policy=policy,
                 autonomous_context_paths=(
-                    resolved_autonomous_context
-                    if qa_mode == "autonomous_final_9x16"
+                    aspect_autonomous_context
+                    if qa_mode
+                    in {
+                        "autonomous_final_16x9",
+                        "autonomous_final_9x16",
+                    }
                     else None
                 ),
             )
+            if policy is not None:
+                qa_context_hashes_by_aspect[aspect_ratio] = dict(
+                    prepared.autonomous_context_hashes
+                )
             uploaded, file_reused = client.ensure_video_upload(
                 prepared.proxy_path,
                 qa_dir / "file-api" / prepared.input_hashes["proxy_sha256"],
             )
+            if (
+                policy is not None
+                and autonomous_final_qa_calls_completed
+                >= policy.budget.max_final_qa_passes
+            ):
+                raise DeliveryPipelineBlocked(
+                    "run-global full final QA pass limit reached before "
+                    f"{aspect_ratio} initial QA"
+                )
             qa = execute_final_edit_qa(
                 prepared=prepared,
                 client=client.client,
                 uploaded_video=uploaded,
                 output_dir=qa_dir,
                 budget_ledger=budget_ledger,
-                recovery_call=policy is not None,
+                recovery_call=False,
             )
-            qa_results_by_aspect[aspect_ratio] = qa.result
+            if policy is not None:
+                autonomous_final_qa_calls_completed += 1
+                autonomous_initial_aspects_started.add(aspect_ratio)
+            qa_passes = [qa]
             raw_path = qa.run_dir / "raw_interaction.json"
             if raw_path.is_file():
                 interaction_id = read_json(raw_path).get("id")
                 if isinstance(interaction_id, str) and interaction_id:
                     qa_interaction_ids.append(interaction_id)
+            final_output_path = delivery.output_path
+            final_delivery_manifest_path = delivery.manifest_path
+            final_media_manifest_path = (
+                rendered_music.manifest_path
+                if rendered_music is not None
+                else delivery.manifest_path
+            )
+            final_qa = qa
+            recovery_summary: dict[str, Any] | None = None
+            if policy is not None and isinstance(
+                qa.result,
+                AutonomousFinalEditQa,
+            ):
+                assert budget_ledger is not None
+                assert aspect_deterministic_path is not None
+                assert aspect_deterministic_evidence is not None
+                assert aspect_deterministic_report is not None
+                first_plan = plan_autonomous_recovery(
+                    qa.result,
+                    policy=policy,
+                    qa_passes_completed=1,
+                    semantic_replans_used=(
+                        autonomous_semantic_replans_used
+                    ),
+                )
+                recovery_dir = qa_dir / "recovery" / "pass-01"
+                remaining_followup_slots = (
+                    _remaining_run_global_followup_qa_slots(
+                        maximum_full_final_qa_calls=(
+                            policy.budget.max_final_qa_passes
+                        ),
+                        completed_full_final_qa_calls=(
+                            autonomous_final_qa_calls_completed
+                        ),
+                        requested_initial_aspects=(
+                            autonomous_initial_aspect_order
+                        ),
+                        started_initial_aspects=(
+                            autonomous_initial_aspects_started
+                        ),
+                    )
+                )
+                if (
+                    first_plan.outcome == "repair"
+                    and remaining_followup_slots < 1
+                ):
+                    recovery_dir.mkdir(parents=True, exist_ok=True)
+                    write_json(
+                        recovery_dir / "recovery-plan.json",
+                        first_plan,
+                    )
+                    write_json(
+                        recovery_dir
+                        / "run-global-qa-cap-block.json",
+                        {
+                            "contract_version": (
+                                "autonomous-run-global-qa-cap-v1"
+                            ),
+                            "policy_reference": policy.policy_reference,
+                            "completed_full_final_qa_calls": (
+                                autonomous_final_qa_calls_completed
+                            ),
+                            "reserved_unstarted_initial_aspects": sorted(
+                                set(autonomous_initial_aspect_order)
+                                - autonomous_initial_aspects_started
+                            ),
+                            "maximum_full_final_qa_calls": (
+                                policy.budget.max_final_qa_passes
+                            ),
+                            "semantic_replans_used": (
+                                autonomous_semantic_replans_used
+                            ),
+                            "maximum_semantic_replans": (
+                                policy.budget.max_semantic_replans
+                            ),
+                            "decision_code": (
+                                "repair_requires_unavailable_global_second_qa"
+                            ),
+                            "generated_at": utc_now(),
+                        },
+                    )
+                    raise DeliveryPipelineBlocked(
+                        "autonomous repair requires a follow-up QA, but the "
+                        "run-global final QA cap is reserved for requested "
+                        "aspect initial reviews"
+                    )
+                effective_repair_executor = autonomous_repair_executor
+                if (
+                    effective_repair_executor is None
+                    and first_plan.outcome == "repair"
+                ):
+                    # The production default may replay only options that the
+                    # feature-cut persisted from its original hard-gate-passed
+                    # presentation frontier. It cannot translate arbitrary QA
+                    # prose into a new crop, timestamp, or candidate.
+                    def execute_feature_cut_repair(
+                        *,
+                        plan: AutonomousRecoveryPlan,
+                        input_render_path: Path,
+                        input_render_manifest_path: Path,
+                        autonomous_context_paths: Mapping[str, Path],
+                        deterministic_delivery_evidence_path: Path,
+                        output_dir: Path,
+                        **_: Any,
+                    ) -> Mapping[str, Any]:
+                        request = compile_repair_request(
+                            render_manifest_path=(
+                                input_render_manifest_path
+                            ),
+                            input_picture_path=picture,
+                            aspect=aspect_ratio,
+                            actions=tuple(
+                                action.model_dump(mode="json")
+                                for action in plan.actions
+                            ),
+                            output_dir=output_dir / "compile",
+                        )
+                        if request["status"] != "compiled":
+                            raise ValueError(
+                                "feature-cut repair remains fail-closed: "
+                                + ",".join(
+                                    str(row.get("reason_code"))
+                                    for row in request["blockers"]
+                                )
+                            )
+                        repaired_picture = (
+                            render_changed_segments_and_concat(
+                                compiled_request_path=Path(
+                                    request["path"]
+                                ),
+                                deterministic_delivery_evidence_path=(
+                                    deterministic_delivery_evidence_path
+                                ),
+                                autonomous_context_paths=(
+                                    autonomous_context_paths
+                                ),
+                                output_dir=output_dir / "picture",
+                            )
+                        )
+                        repaired_picture_path = Path(
+                            repaired_picture["picture_path"]
+                        )
+                        repaired_manifest_path = Path(
+                            repaired_picture["render_manifest_path"]
+                        )
+                        if rendered_music is None:
+                            repaired_delivery = (
+                                assemble_picture_only_delivery(
+                                    picture_path=repaired_picture_path,
+                                    output_path=(
+                                        output_dir / "final-repaired.mp4"
+                                    ),
+                                    manifest_path=(
+                                        output_dir
+                                        / "final-repaired-delivery.json"
+                                    ),
+                                    aspect_ratio=aspect_ratio,
+                                    artifact_bindings={
+                                        "feature_render_manifest_sha256": (
+                                            sha256_file(
+                                                repaired_manifest_path
+                                            )
+                                        ),
+                                        "repair_request_sha256": request[
+                                            "sha256"
+                                        ],
+                                        "audio_policy": (
+                                            "explicitly_absent"
+                                        ),
+                                    },
+                                )
+                            )
+                            repaired_music_manifest_path = (
+                                repaired_delivery.manifest_path
+                            )
+                        else:
+                            assert resolved_lock_path is not None
+                            repaired_delivery = (
+                                assemble_music_only_delivery(
+                                    picture_path=repaired_picture_path,
+                                    music_path=(
+                                        rendered_music.output_audio_path
+                                    ),
+                                    output_path=(
+                                        output_dir / "final-repaired.mp4"
+                                    ),
+                                    manifest_path=(
+                                        output_dir
+                                        / "final-repaired-delivery.json"
+                                    ),
+                                    music_assembly_artifact_dir=(
+                                        assembly_dir
+                                    ),
+                                    aspect_ratio=aspect_ratio,
+                                    artifact_bindings={
+                                        "feature_render_manifest_sha256": (
+                                            sha256_file(
+                                                repaired_manifest_path
+                                            )
+                                        ),
+                                        "music_map_lock_sha256": (
+                                            sha256_file(
+                                                resolved_lock_path
+                                            )
+                                        ),
+                                        "repair_request_sha256": request[
+                                            "sha256"
+                                        ],
+                                    },
+                                )
+                            )
+                            repaired_music_manifest_path = (
+                                rendered_music.manifest_path
+                            )
+                        repaired_evidence_path = Path(
+                            repaired_picture[
+                                "deterministic_delivery_evidence_path"
+                            ]
+                        )
+                        repaired_evidence = (
+                            DeterministicDeliveryEvidence.model_validate(
+                                read_json(repaired_evidence_path)
+                            )
+                        )
+                        _, repaired_evidence_path = (
+                            _bind_deterministic_evidence_to_delivery(
+                                evidence=repaired_evidence,
+                                aspect=aspect_ratio,
+                                policy=policy,
+                                render_path=repaired_delivery.output_path,
+                                render_manifest_path=(
+                                    repaired_manifest_path
+                                ),
+                                delivery_manifest_path=(
+                                    repaired_delivery.manifest_path
+                                ),
+                                music_assembly_manifest_path=(
+                                    repaired_music_manifest_path
+                                ),
+                                autonomous_context_paths=(
+                                    repaired_picture[
+                                        "autonomous_context_paths"
+                                    ]
+                                ),
+                                output_path=repaired_evidence_path,
+                                changed_segment_ids=tuple(
+                                    repaired_picture[
+                                        "changed_segment_ids"
+                                    ]
+                                ),
+                                reused_segment_ids=tuple(
+                                    repaired_picture[
+                                        "reused_segment_ids"
+                                    ]
+                                ),
+                            )
+                        )
+                        return {
+                            "render_path": (
+                                repaired_delivery.output_path
+                            ),
+                            "render_manifest_path": (
+                                repaired_manifest_path
+                            ),
+                            "delivery_manifest_path": (
+                                repaired_delivery.manifest_path
+                            ),
+                            "music_assembly_manifest_path": (
+                                repaired_music_manifest_path
+                            ),
+                            "autonomous_context_paths": repaired_picture[
+                                "autonomous_context_paths"
+                            ],
+                            "deterministic_delivery_evidence_path": (
+                                repaired_evidence_path
+                            ),
+                            "changed_segment_ids": repaired_picture[
+                                "changed_segment_ids"
+                            ],
+                            "reused_segment_ids": repaired_picture[
+                                "reused_segment_ids"
+                            ],
+                            "semantic_replan_interaction_ids": (),
+                        }
+
+                    effective_repair_executor = execute_feature_cut_repair
+                first_execution, repaired = (
+                    _execute_autonomous_recovery_plan(
+                        plan=first_plan,
+                        policy=policy,
+                        input_qa_path=qa.run_dir / "validated.json",
+                        input_render_path=final_output_path,
+                        input_render_manifest_path=render_manifest_path,
+                        input_delivery_manifest_path=(
+                            final_delivery_manifest_path
+                        ),
+                        input_music_assembly_manifest_path=(
+                            final_media_manifest_path
+                        ),
+                        autonomous_context_paths=(
+                            aspect_autonomous_context
+                        ),
+                        deterministic_delivery_evidence_path=(
+                            aspect_deterministic_path
+                        ),
+                        segment_contract=prepared.segment_contract,
+                        output_dir=recovery_dir,
+                        budget_ledger=budget_ledger,
+                        executor=effective_repair_executor,
+                    )
+                )
+                recovery_summary = {
+                    "first_plan": str(
+                        (recovery_dir / "recovery-plan.json").resolve(
+                            strict=True
+                        )
+                    ),
+                    "first_execution": str(
+                        (
+                            recovery_dir / "recovery-execution.json"
+                        ).resolve(strict=True)
+                    ),
+                    "first_status": first_execution.status,
+                }
+                if first_plan.outcome == "repair" and repaired is None:
+                    final_results[aspect_key] = {
+                        "final_output": str(final_output_path),
+                        "final_output_sha256": sha256_file(final_output_path),
+                        "delivery_manifest": str(
+                            final_delivery_manifest_path
+                        ),
+                        "media_assembly_manifest": str(
+                            final_media_manifest_path
+                        ),
+                        "qa_run_dir": str(qa.run_dir),
+                        "qa_disposition": (
+                            qa.result.qa_observation_status
+                        ),
+                        "qa_cache_hit": qa.cache_hit,
+                        "file_api_reused": file_reused,
+                        "qa_pass_count": 1,
+                        "autonomous_recovery": recovery_summary,
+                        "delivery_eligible": False,
+                    }
+                    outputs["aspects"] = final_results
+                    outputs["autonomous_recovery"] = recovery_summary
+                    raise DeliveryPipelineBlocked(
+                        "final semantic QA requested a repair, but no verified "
+                        "changed-segment-only recovery executor completed it"
+                    )
+                if first_plan.outcome == "blocked":
+                    outputs["autonomous_recovery"] = recovery_summary
+                    raise DeliveryPipelineBlocked(
+                        "final semantic QA produced a non-repairable bounded "
+                        "recovery plan"
+                    )
+                if repaired is not None:
+                    autonomous_semantic_replans_used = max(
+                        autonomous_semantic_replans_used,
+                        first_plan.semantic_replans_used,
+                    )
+                    final_output_path = repaired["render_path"]
+                    render_manifest_path = repaired["render_manifest_path"]
+                    final_delivery_manifest_path = repaired[
+                        "delivery_manifest_path"
+                    ]
+                    final_media_manifest_path = repaired[
+                        "music_assembly_manifest_path"
+                    ]
+                    aspect_autonomous_context = repaired[
+                        "autonomous_context_paths"
+                    ]
+                    aspect_deterministic_path = repaired[
+                        "deterministic_delivery_evidence_path"
+                    ]
+                    aspect_deterministic_evidence = repaired[
+                        "deterministic_delivery_evidence"
+                    ]
+                    aspect_deterministic_report = repaired[
+                        "deterministic_delivery_qa"
+                    ]
+                    resolved_autonomous_context_by_aspect[aspect_ratio] = (
+                        aspect_autonomous_context
+                    )
+                    resolved_deterministic_evidence_by_aspect[aspect_ratio] = (
+                        aspect_deterministic_path
+                    )
+                    deterministic_evidence_by_aspect[aspect_ratio] = (
+                        aspect_deterministic_evidence
+                    )
+                    deterministic_report_by_aspect[aspect_ratio] = (
+                        aspect_deterministic_report
+                    )
+                    qa_interaction_ids.extend(
+                        repaired["semantic_replan_interaction_ids"]
+                    )
+                    second_qa_dir = qa_dir / "pass-02"
+                    second_prepared = prepare_final_edit_qa(
+                        mode=qa_mode,
+                        render_path=final_output_path,
+                        manifest_path=render_manifest_path,
+                        output_dir=second_qa_dir,
+                        model_id=model_id,
+                        brief_path=brief_path,
+                        crop_include_audio=music_supplied,
+                        music_supplied=music_supplied,
+                        autonomous_policy=policy,
+                        autonomous_context_paths=(
+                            aspect_autonomous_context
+                        ),
+                    )
+                    qa_context_hashes_by_aspect[aspect_ratio] = dict(
+                        second_prepared.autonomous_context_hashes
+                    )
+                    second_uploaded, second_file_reused = (
+                        client.ensure_video_upload(
+                            second_prepared.proxy_path,
+                            second_qa_dir
+                            / "file-api"
+                            / second_prepared.input_hashes["proxy_sha256"],
+                        )
+                    )
+                    if (
+                        autonomous_final_qa_calls_completed
+                        >= policy.budget.max_final_qa_passes
+                    ):
+                        raise DeliveryPipelineBlocked(
+                            "run-global full final QA pass limit reached "
+                            "before repaired render QA"
+                        )
+                    second_qa = execute_final_edit_qa(
+                        prepared=second_prepared,
+                        client=client.client,
+                        uploaded_video=second_uploaded,
+                        output_dir=second_qa_dir,
+                        budget_ledger=budget_ledger,
+                        recovery_call=True,
+                    )
+                    autonomous_final_qa_calls_completed += 1
+                    qa_passes.append(second_qa)
+                    second_raw_path = (
+                        second_qa.run_dir / "raw_interaction.json"
+                    )
+                    if second_raw_path.is_file():
+                        interaction_id = read_json(second_raw_path).get("id")
+                        if isinstance(interaction_id, str) and interaction_id:
+                            qa_interaction_ids.append(interaction_id)
+                    second_plan = plan_autonomous_recovery(
+                        second_qa.result,
+                        policy=policy,
+                        qa_passes_completed=2,
+                        semantic_replans_used=(
+                            autonomous_semantic_replans_used
+                        ),
+                    )
+                    second_recovery_dir = (
+                        qa_dir / "recovery" / "pass-02"
+                    )
+                    second_execution, _ = (
+                        _execute_autonomous_recovery_plan(
+                            plan=second_plan,
+                            policy=policy,
+                            input_qa_path=(
+                                second_qa.run_dir / "validated.json"
+                            ),
+                            input_render_path=final_output_path,
+                            input_render_manifest_path=render_manifest_path,
+                            input_delivery_manifest_path=(
+                                final_delivery_manifest_path
+                            ),
+                            input_music_assembly_manifest_path=(
+                                final_media_manifest_path
+                            ),
+                            autonomous_context_paths=(
+                                aspect_autonomous_context
+                            ),
+                            deterministic_delivery_evidence_path=(
+                                aspect_deterministic_path
+                            ),
+                            segment_contract=(
+                                second_prepared.segment_contract
+                            ),
+                            output_dir=second_recovery_dir,
+                            budget_ledger=budget_ledger,
+                            executor=None,
+                        )
+                    )
+                    recovery_summary.update(
+                        {
+                            "second_plan": str(
+                                (
+                                    second_recovery_dir
+                                    / "recovery-plan.json"
+                                ).resolve(strict=True)
+                            ),
+                            "second_execution": str(
+                                (
+                                    second_recovery_dir
+                                    / "recovery-execution.json"
+                                ).resolve(strict=True)
+                            ),
+                            "second_status": second_execution.status,
+                        }
+                    )
+                    if second_plan.outcome != "complete":
+                        final_results[aspect_key] = {
+                            "final_output": str(final_output_path),
+                            "final_output_sha256": sha256_file(
+                                final_output_path
+                            ),
+                            "delivery_manifest": str(
+                                final_delivery_manifest_path
+                            ),
+                            "media_assembly_manifest": str(
+                                final_media_manifest_path
+                            ),
+                            "qa_run_dir": str(second_qa.run_dir),
+                            "qa_disposition": (
+                                second_qa.result.qa_observation_status
+                            ),
+                            "qa_cache_hit": second_qa.cache_hit,
+                            "file_api_reused": second_file_reused,
+                            "qa_pass_count": 2,
+                            "autonomous_recovery": recovery_summary,
+                            "delivery_eligible": False,
+                        }
+                        outputs["aspects"] = final_results
+                        outputs["autonomous_recovery"] = recovery_summary
+                        raise DeliveryPipelineBlocked(
+                            "second and final semantic QA still reported "
+                            "blocking observations"
+                        )
+                    final_qa = second_qa
+                    file_reused = second_file_reused
+
+            qa_results_by_aspect[aspect_ratio] = final_qa.result
             qa_disposition = (
-                qa.result.qa_observation_status
-                if isinstance(qa.result, AutonomousFinalEditQa)
-                else _qa_disposition(qa)
+                final_qa.result.qa_observation_status
+                if isinstance(final_qa.result, AutonomousFinalEditQa)
+                else _qa_disposition(final_qa)
             )
             final_results[aspect_key] = {
-                "final_output": str(delivery.output_path),
-                "final_output_sha256": sha256_file(delivery.output_path),
-                "delivery_manifest": str(delivery.manifest_path),
-                "music_assembly_manifest": str(rendered_music.manifest_path),
-                "qa_run_dir": str(qa.run_dir),
+                "final_output": str(final_output_path),
+                "final_output_sha256": sha256_file(final_output_path),
+                "delivery_manifest": str(final_delivery_manifest_path),
+                "media_assembly_manifest": str(final_media_manifest_path),
+                "qa_run_dir": str(final_qa.run_dir),
                 "qa_disposition": qa_disposition,
-                "qa_cache_hit": qa.cache_hit,
+                "qa_cache_hit": final_qa.cache_hit,
                 "file_api_reused": file_reused,
+                "qa_pass_count": len(qa_passes),
+                "autonomous_recovery": recovery_summary,
+                **(
+                    {
+                        "autonomous_context_aspect": aspect_ratio,
+                        "autonomous_context_sha256": {
+                            key: sha256_file(path)
+                            for key, path in (
+                                aspect_autonomous_context or {}
+                            ).items()
+                        },
+                        "deterministic_delivery_evidence_sha256": (
+                            sha256_file(aspect_deterministic_path)
+                            if aspect_deterministic_path is not None
+                            else None
+                        ),
+                    }
+                    if policy is not None
+                    else {}
+                ),
             }
 
         if deterministic_failure_codes:
@@ -907,7 +3788,7 @@ def run_feature_delivery_pipeline(
             )
             raise DeliveryPipelineBlocked(
                 "generated deterministic autonomous gates failed before "
-                "final QA; a music-backed audition mix was preserved: "
+                "final QA; a playable audition was preserved: "
                 + ", ".join(deterministic_failure_codes)
             )
         if not final_results:
@@ -916,34 +3797,102 @@ def run_feature_delivery_pipeline(
             )
         delivery_authority: DecisionAuthorityV2 | None = None
         if policy is not None:
-            assert deterministic_evidence is not None
-            assert deterministic_report is not None
-            if resolved_deterministic_evidence is None:
+            if (
+                set(deterministic_report_by_aspect) != requested
+                or set(resolved_deterministic_evidence_by_aspect)
+                != requested
+                or set(resolved_autonomous_context_by_aspect) != requested
+            ):
                 raise DeliveryPipelineBlocked(
-                    "deterministic delivery evidence has no immutable artifact"
+                    "per-aspect autonomous authority artifacts are incomplete"
                 )
-            degradation_path = resolved_autonomous_context.get(
-                "reuse_degradation"
+            combined_gate_results = {
+                f"{aspect_key}:{gate}": status
+                for aspect_key, report in (
+                    deterministic_report_by_aspect.items()
+                )
+                for gate, status in report.gate_results.items()
+            }
+            deterministic_report = DeterministicDeliveryQaReport(
+                gate_results=combined_gate_results,
+                failure_codes=tuple(
+                    f"{aspect_key}:{code}"
+                    for aspect_key, report in (
+                        deterministic_report_by_aspect.items()
+                    )
+                    for code in report.failure_codes
+                ),
+                passed=all(
+                    report.passed
+                    for report in deterministic_report_by_aspect.values()
+                ),
             )
-            if degradation_path is None:
-                raise DeliveryPipelineBlocked(
-                    "autonomous context omitted reuse_degradation"
+            degradation_manifests: list[
+                AutonomousDegradationManifest
+            ] = []
+            for aspect_key, context_paths in (
+                resolved_autonomous_context_by_aspect.items()
+            ):
+                degradation_path = context_paths.get("reuse_degradation")
+                if degradation_path is None:
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} autonomous context omitted "
+                        "reuse_degradation"
+                    )
+                aspect_degradation = (
+                    AutonomousDegradationManifest.model_validate(
+                        read_json(degradation_path)
+                    )
                 )
-            degradation = AutonomousDegradationManifest.model_validate(
-                read_json(degradation_path)
+                if (
+                    aspect_degradation.aspect is not None
+                    and aspect_degradation.aspect != aspect_key
+                ):
+                    raise DeliveryPipelineBlocked(
+                        f"{aspect_key} final authority received "
+                        f"{aspect_degradation.aspect} degradation evidence"
+                    )
+                degradation_manifests.append(aspect_degradation)
+            degradation = AutonomousDegradationManifest(
+                policy_reference=policy.policy_reference,
+                records=tuple(
+                    record
+                    for manifest_value in degradation_manifests
+                    for record in manifest_value.records
+                ),
+                generated_at=utc_now(),
             )
             deterministic_report_path = (
                 resolved_output / "deterministic-delivery-qa.json"
             )
-            write_json(deterministic_report_path, deterministic_report)
+            write_json(
+                deterministic_report_path,
+                {
+                    **deterministic_report.model_dump(mode="json"),
+                    "aspect_reports": {
+                        aspect_key: report.model_dump(mode="json")
+                        for aspect_key, report in (
+                            deterministic_report_by_aspect.items()
+                        )
+                    },
+                },
+            )
             authority_hashes = {
                 f"sha256:{policy.definition_sha256()}",
-                f"sha256:{sha256_file(resolved_deterministic_evidence)}",
+                *(
+                    f"sha256:{sha256_file(path)}"
+                    for path in (
+                        resolved_deterministic_evidence_by_aspect.values()
+                    )
+                ),
                 f"sha256:{sha256_file(deterministic_report_path)}",
                 f"sha256:{sha256_file(render_manifest_path)}",
                 *(
                     f"sha256:{sha256_file(path)}"
-                    for path in resolved_autonomous_context.values()
+                    for paths in (
+                        resolved_autonomous_context_by_aspect.values()
+                    )
+                    for path in paths.values()
                 ),
                 *(
                     f"sha256:{row['final_output_sha256']}"
@@ -954,7 +3903,7 @@ def run_feature_delivery_pipeline(
                     for row in final_results.values()
                     for path_key in (
                         "delivery_manifest",
-                        "music_assembly_manifest",
+                        "media_assembly_manifest",
                     )
                 ),
                 *(
@@ -966,16 +3915,43 @@ def run_feature_delivery_pipeline(
                         "validated.json",
                     )
                 ),
+                *(
+                    f"sha256:{sha256_file(Path(str(path_value)))}"
+                    for row in final_results.values()
+                    for recovery in (row.get("autonomous_recovery"),)
+                    if isinstance(recovery, Mapping)
+                    for path_key, path_value in recovery.items()
+                    if path_key.endswith(("_plan", "_execution"))
+                    and isinstance(path_value, str)
+                ),
             }
             state, delivery_authority = authorize_autonomous_delivery(
                 policy=policy,
                 deterministic_qa=deterministic_report,
                 qa_results=qa_results_by_aspect,
+                qa_context_hashes_by_aspect=(
+                    qa_context_hashes_by_aspect
+                ),
                 degradation=degradation,
                 input_artifact_hashes=tuple(sorted(authority_hashes)),
+                final_render_sha256_by_aspect={
+                    aspect_ratio: final_results[aspect_key][
+                        "final_output_sha256"
+                    ]
+                    for aspect_key, aspect_ratio in (
+                        ("horizontal", "16:9"),
+                        ("vertical", "9:16"),
+                    )
+                    if aspect_key in final_results
+                },
+                final_manifest_sha256=sha256_file(render_manifest_path),
+                brief_sha256=sha256_file(
+                    brief_path.expanduser().resolve(strict=True)
+                ),
                 gemini_interaction_ids=tuple(
                     dict.fromkeys(qa_interaction_ids)
                 ),
+                music_supplied=music_supplied,
             )
             write_json(
                 resolved_output / "decision-authority.json",
@@ -1014,6 +3990,24 @@ def run_feature_delivery_pipeline(
                 if budget_ledger is not None
                 else None
             ),
+            "autonomous_run_limits": (
+                {
+                    "full_final_qa_calls_completed": (
+                        autonomous_final_qa_calls_completed
+                    ),
+                    "max_full_final_qa_calls": (
+                        policy.budget.max_final_qa_passes
+                    ),
+                    "semantic_replans_used": (
+                        autonomous_semantic_replans_used
+                    ),
+                    "max_semantic_replans": (
+                        policy.budget.max_semantic_replans
+                    ),
+                }
+                if policy is not None
+                else None
+            ),
             "decision_authority": (
                 delivery_authority.model_dump(mode="json")
                 if delivery_authority is not None
@@ -1022,6 +4016,38 @@ def run_feature_delivery_pipeline(
             "deterministic_delivery_qa": (
                 deterministic_report.model_dump(mode="json")
                 if deterministic_report is not None
+                else None
+            ),
+            "deterministic_delivery_qa_by_aspect": (
+                {
+                    aspect_key: report.model_dump(mode="json")
+                    for aspect_key, report in (
+                        deterministic_report_by_aspect.items()
+                    )
+                }
+                if deterministic_report_by_aspect
+                else None
+            ),
+            "autonomous_context_paths_by_aspect": (
+                {
+                    aspect_key: {
+                        key: str(path) for key, path in paths.items()
+                    }
+                    for aspect_key, paths in (
+                        resolved_autonomous_context_by_aspect.items()
+                    )
+                }
+                if resolved_autonomous_context_by_aspect
+                else None
+            ),
+            "deterministic_delivery_evidence_paths_by_aspect": (
+                {
+                    aspect_key: str(path)
+                    for aspect_key, path in (
+                        resolved_deterministic_evidence_by_aspect.items()
+                    )
+                }
+                if resolved_deterministic_evidence_by_aspect
                 else None
             ),
             "picture_ready_for_human_review": picture_ready_for_review,

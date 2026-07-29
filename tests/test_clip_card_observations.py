@@ -11,17 +11,21 @@ from jascue_video_lab.clip_card_observations import (
     ObservationBasis,
     ObservableBeat,
     assess_editing_claim,
+    build_supplement_request_binding,
     clip_card_sha256,
     effective_event_observation_sha256,
     effective_event_observations,
     effective_event_observations_sha256,
     event_fingerprint,
     plan_supplement_needs,
+    validate_supplement,
 )
 from jascue_video_lab.clip_card_retrieval import compact_retrieval_card
 from jascue_video_lab.clip_card_supplement_runner import (
     CAPABILITY_NAMES,
     bounded_event_window_ms,
+    current_supplement_request_binding,
+    supplement_cache_key,
     validate_requested_observation,
 )
 from jascue_video_lab.models import (
@@ -256,6 +260,141 @@ def test_legacy_v1_supplement_remains_readable() -> None:
     assert restored.contract_version == "clip-observation-supplement-v1"
     assert restored.event_observations[0].evidence_origin is None
     assert _supplement(card).contract_version == "clip-observation-supplement-v2"
+
+
+def _request_binding(
+    *,
+    model_id: str = "gemini-3.6-flash",
+    media_resolution: str = "low",
+):
+    return build_supplement_request_binding(
+        model_id=model_id,
+        system_instruction_sha256="e" * 64,
+        prompt_sha256="c" * 64,
+        response_schema_sha256="d" * 64,
+        media_resolution=media_resolution,
+        thinking_level="low",
+        max_output_tokens=2_048,
+    )
+
+
+def test_v3_supplement_requires_hash_bound_request_lineage() -> None:
+    card = _card()
+    payload = _supplement(card).model_dump(mode="json")
+    payload["contract_version"] = "clip-observation-supplement-v3"
+
+    try:
+        ClipObservationSupplement.model_validate(payload)
+    except ValueError as error:
+        assert "request_binding" in str(error)
+    else:
+        raise AssertionError("v3 supplement without request lineage was accepted")
+
+
+def test_autonomous_lineage_rejects_legacy_review_supplement() -> None:
+    card = _card()
+
+    try:
+        validate_supplement(
+            card,
+            _supplement(card),
+            expected_request_binding=_request_binding(),
+            require_current_lineage=True,
+        )
+    except ValueError as error:
+        assert "review-only" in str(error)
+    else:
+        raise AssertionError("legacy supplement authorized autonomous reuse")
+
+
+def test_autonomous_lineage_rejects_changed_media_or_model_config() -> None:
+    card = _card()
+    current = _request_binding()
+    supplement = _supplement(card).model_copy(
+        update={
+            "contract_version": "clip-observation-supplement-v3",
+            "request_binding": current,
+        }
+    )
+    validate_supplement(
+        card,
+        supplement,
+        expected_request_binding=current,
+        require_current_lineage=True,
+    )
+
+    for stale in (
+        _request_binding(media_resolution="high"),
+        _request_binding(model_id="gemini-other"),
+    ):
+        try:
+            validate_supplement(
+                card,
+                supplement,
+                expected_request_binding=stale,
+                require_current_lineage=True,
+            )
+        except ValueError as error:
+            assert "stale for the current model" in str(error)
+        else:
+            raise AssertionError("stale supplement request lineage was accepted")
+
+
+def test_request_binding_rejects_tampered_hash() -> None:
+    payload = _request_binding().model_dump(mode="json")
+    payload["binding_sha256"] = "f" * 64
+
+    try:
+        type(_request_binding()).model_validate(payload)
+    except ValueError as error:
+        assert "binding hash is invalid" in str(error)
+    else:
+        raise AssertionError("tampered request binding hash was accepted")
+
+
+def test_supplement_cache_key_includes_complete_request_binding(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    card = _card()
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"fixture")
+    monkeypatch.setattr(
+        "jascue_video_lab.clip_card_supplement_runner.sha256_file",
+        lambda path: "1" * 64,
+    )
+    low = current_supplement_request_binding(
+        model_id="gemini-3.6-flash",
+        prompt_sha256="c" * 64,
+        response_schema_sha256="d" * 64,
+    )
+    high = _request_binding(media_resolution="high")
+
+    low_key = supplement_cache_key(
+        source_video=source,
+        card=card,
+        event=card.events[0],
+        requested_capabilities=["readability"],
+        context_ms=2_000,
+        model_id="gemini-3.6-flash",
+        prompt_sha256="c" * 64,
+        response_schema_sha256="d" * 64,
+        request_binding=low,
+    )
+    high_key = supplement_cache_key(
+        source_video=source,
+        card=card,
+        event=card.events[0],
+        requested_capabilities=["readability"],
+        context_ms=2_000,
+        model_id="gemini-3.6-flash",
+        prompt_sha256="c" * 64,
+        response_schema_sha256="d" * 64,
+        request_binding=high,
+    )
+
+    assert low_key["contract_version"] == "clip-observation-supplement-cache-v3"
+    assert low_key["request_binding_sha256"] != high_key["request_binding_sha256"]
 
 
 def test_generic_origin_override_replaces_stale_legacy_directness() -> None:

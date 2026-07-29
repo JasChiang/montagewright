@@ -272,6 +272,10 @@ class BudgetExceeded(RuntimeError):
     """Raised before a paid request when its reserve would exceed policy."""
 
 
+class PaidDispatchAlreadyRecorded(RuntimeError):
+    """The exact paid request may already have reached the provider."""
+
+
 @dataclass(frozen=True)
 class PaidCallEstimate:
     stage: str
@@ -298,6 +302,16 @@ class BudgetReservation:
     actual_cost_usd: float | None = None
     reserved_at: str = ""
     reconciled_at: str | None = None
+    reconciliation_basis: Literal["actual_usage", "conservative_worst_case"] | None = None
+    dispatch_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PaidDispatchHandle:
+    dispatch_id: str
+    request_sha256: str
+    journal_path: Path
+    reservation_id: str | None
 
 
 def estimate_paid_call(
@@ -371,6 +385,250 @@ def actual_usage_cost(
         * rates["output_including_thought"],
         8,
     )
+
+
+def _canonical_request_sha256(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _estimate_from_dispatch_journal(payload: Mapping[str, Any]) -> PaidCallEstimate:
+    raw = payload.get("estimate")
+    if not isinstance(raw, Mapping):
+        raise ValueError("paid dispatch journal has no estimate")
+    estimate = PaidCallEstimate(
+        stage=str(raw["stage"]),
+        model_id=str(raw["model_id"]),
+        media_resolution=str(raw["media_resolution"]),  # type: ignore[arg-type]
+        estimated_input_tokens=int(raw["estimated_input_tokens"]),
+        max_output_tokens=int(raw["max_output_tokens"]),
+        reserved_thought_tokens=int(raw["reserved_thought_tokens"]),
+        retry_allowance=int(raw["retry_allowance"]),
+        worst_case_interactions=int(raw["worst_case_interactions"]),
+        worst_case_cost_usd=float(raw["worst_case_cost_usd"]),
+    )
+    if estimate.retry_allowance != 0 or estimate.worst_case_interactions != 1:
+        raise ValueError(
+            "paid dispatch journal may bind only one non-retrying provider call"
+        )
+    return estimate
+
+
+def _dispatch_needs_conservative_adoption(payload: Mapping[str, Any]) -> bool:
+    return str(payload.get("status") or "") in {
+        "dispatch_started",
+        "dispatch_failed_usage_unavailable",
+        "raw_persisted_usage_unavailable",
+    }
+
+
+def dispatch_paid_interaction(
+    *,
+    client: Any,
+    request: Mapping[str, Any],
+    request_record: Mapping[str, Any],
+    journal_dir: Path,
+    estimate: PaidCallEstimate,
+    budget_ledger: "BudgetLedger | None",
+    recovery_call: bool = False,
+) -> tuple[Any, PaidDispatchHandle]:
+    """Dispatch one exact request with a crash-safe, hash-bound journal.
+
+    The journal is durable immediately before ``interactions.create``. If the
+    provider call raises without usage, the active reserve is reconciled at its
+    worst case. A later process encountering the same hash adopts that journal
+    and refuses to dispatch the exact request again.
+    """
+
+    if estimate.retry_allowance != 0 or estimate.worst_case_interactions != 1:
+        raise ValueError(
+            "journaled non-subprocess calls must disable provider retries"
+        )
+    resolved_dir = journal_dir.expanduser().resolve()
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+    request_sha256 = _canonical_request_sha256(request_record)
+    safe_stage = re.sub(r"[^A-Za-z0-9._-]+", "-", estimate.stage).strip("-")
+    journal_path = (
+        resolved_dir / f"{safe_stage}.{request_sha256}.paid_dispatch.json"
+    )
+    if journal_path.exists():
+        payload = read_json(journal_path)
+        if str(payload.get("request_sha256") or "") != request_sha256:
+            raise ValueError("paid dispatch journal path/hash mismatch")
+        dispatch_id = str(payload.get("dispatch_id") or "")
+        if not dispatch_id:
+            raise ValueError("paid dispatch journal has no dispatch ID")
+        if budget_ledger is not None and _dispatch_needs_conservative_adoption(
+            payload
+        ):
+            budget_ledger.adopt_conservative_dispatch(
+                dispatch_id=dispatch_id,
+                estimate=_estimate_from_dispatch_journal(payload),
+            )
+        raise PaidDispatchAlreadyRecorded(
+            "the exact paid request already has a durable dispatch journal; "
+            "refusing interactions.create"
+        )
+
+    reservation = None
+    if budget_ledger is not None:
+        reservation = budget_ledger.reserve(
+            estimate,
+            recovery_call=recovery_call,
+        )
+    dispatch_id = uuid.uuid4().hex
+    if reservation is not None:
+        reservation.dispatch_id = dispatch_id
+    handle = PaidDispatchHandle(
+        dispatch_id=dispatch_id,
+        request_sha256=request_sha256,
+        journal_path=journal_path,
+        reservation_id=(
+            reservation.reservation_id if reservation is not None else None
+        ),
+    )
+    journal = {
+        "contract_version": "paid-dispatch-journal-v1",
+        "dispatch_id": dispatch_id,
+        "request_sha256": request_sha256,
+        "stage": estimate.stage,
+        "model_id": estimate.model_id,
+        "estimate": asdict(estimate),
+        "status": "dispatch_started",
+        "request_artifact_persisted": True,
+        "raw_usage_persisted": False,
+        "started_at": utc_now(),
+    }
+    write_json(journal_path, journal)
+    try:
+        interaction = client.interactions.create(**dict(request))
+    except BaseException as error:
+        journal.update(
+            {
+                "status": "dispatch_failed_usage_unavailable",
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+                "failed_at": utc_now(),
+            }
+        )
+        write_json(journal_path, journal)
+        if budget_ledger is not None and reservation is not None:
+            budget_ledger.reconcile_conservative_dispatch(
+                reservation.reservation_id,
+                dispatch_id=dispatch_id,
+            )
+        raise
+    return interaction, handle
+
+
+def complete_paid_dispatch(
+    *,
+    handle: PaidDispatchHandle,
+    raw_interaction: Mapping[str, Any],
+    raw_artifact_path: Path,
+    budget_ledger: "BudgetLedger | None",
+    model_id: str,
+) -> None:
+    """Bind persisted raw usage to a started dispatch and settle its reserve."""
+
+    if not raw_artifact_path.is_file():
+        raise ValueError(
+            "raw interaction must be durably persisted before dispatch completion"
+        )
+    journal = read_json(handle.journal_path)
+    if str(journal.get("dispatch_id") or "") != handle.dispatch_id:
+        raise ValueError("paid dispatch handle/journal mismatch")
+    usage = raw_interaction.get("usage")
+    has_usage = isinstance(usage, Mapping) and bool(usage)
+    if budget_ledger is not None and handle.reservation_id is not None:
+        if has_usage:
+            budget_ledger.reconcile(
+                handle.reservation_id,
+                usage=usage,
+                model_id=model_id,
+            )
+        else:
+            budget_ledger.reconcile_conservative_dispatch(
+                handle.reservation_id,
+                dispatch_id=handle.dispatch_id,
+            )
+    journal.update(
+        {
+            "status": (
+                "raw_usage_persisted"
+                if has_usage
+                else "raw_persisted_usage_unavailable"
+            ),
+            "raw_usage_persisted": has_usage,
+            "raw_artifact_path": str(raw_artifact_path.resolve()),
+            "interaction_id": str(raw_interaction.get("id") or ""),
+            "completed_at": utc_now(),
+        }
+    )
+    write_json(handle.journal_path, journal)
+
+
+def adopt_paid_dispatch_journals(
+    *,
+    budget_ledger: "BudgetLedger",
+    root: Path,
+    allowed_top_level: set[str] | frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Adopt every ambiguous non-subprocess dispatch once on process resume."""
+
+    adopted: list[dict[str, Any]] = []
+    seen_dispatch_ids: set[str] = set()
+    resolved_root = root.expanduser().resolve()
+    if not resolved_root.exists():
+        return adopted
+    for journal_path in sorted(
+        resolved_root.rglob("*.paid_dispatch.json")
+    ):
+        relative = journal_path.relative_to(resolved_root)
+        if (
+            allowed_top_level is not None
+            and (
+                not relative.parts
+                or relative.parts[0] not in allowed_top_level
+            )
+        ):
+            continue
+        payload = read_json(journal_path)
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"invalid paid dispatch journal: {journal_path}")
+        if not _dispatch_needs_conservative_adoption(payload):
+            continue
+        dispatch_id = str(payload.get("dispatch_id") or "")
+        if not dispatch_id:
+            raise ValueError(f"paid dispatch journal has no ID: {journal_path}")
+        if dispatch_id in seen_dispatch_ids:
+            continue
+        estimate = _estimate_from_dispatch_journal(payload)
+        budget_ledger.adopt_conservative_dispatch(
+            dispatch_id=dispatch_id,
+            estimate=estimate,
+        )
+        seen_dispatch_ids.add(dispatch_id)
+        adopted.append(
+            {
+                "dispatch_id": dispatch_id,
+                "path": str(relative),
+                "stage": estimate.stage,
+                "model_id": estimate.model_id,
+                "status": str(payload.get("status") or ""),
+                "worst_case_cost_usd": estimate.worst_case_cost_usd,
+            }
+        )
+    return adopted
 
 
 class BudgetLedger:
@@ -522,6 +780,7 @@ class BudgetLedger:
             actual_cost_usd=cost,
             reserved_at=utc_now(),
             reconciled_at=utc_now(),
+            reconciliation_basis="actual_usage",
         )
         projected_interactions = self.committed_interactions + 1
         projected_cost = self.actual_cost_usd + cost
@@ -532,6 +791,56 @@ class BudgetLedger:
         if projected_cost > self.max_cost_usd + 1e-9:
             raise BudgetExceeded(
                 "persisted paid usage already exceeds the configured cost cap"
+            )
+        self._reservations[reservation.reservation_id] = reservation
+        return reservation
+
+    def adopt_conservative_dispatch(
+        self,
+        *,
+        dispatch_id: str,
+        estimate: PaidCallEstimate,
+    ) -> BudgetReservation:
+        """Adopt one ambiguous persisted dispatch at its worst-case reserve.
+
+        ``dispatch_id`` is stable across copied artifact aliases and process
+        restarts. Re-adopting the same journal into one ledger is therefore a
+        no-op instead of double-counting the paid interaction.
+        """
+
+        for reservation in self._reservations.values():
+            if reservation.dispatch_id == dispatch_id:
+                return reservation
+        if estimate.retry_allowance != 0 or estimate.worst_case_interactions != 1:
+            raise ValueError(
+                "a dispatch journal must describe exactly one provider attempt"
+            )
+        reservation = BudgetReservation(
+            reservation_id=uuid.uuid4().hex,
+            estimate=estimate,
+            recovery_call=False,
+            state="reconciled",
+            actual_input_tokens=estimate.estimated_input_tokens,
+            actual_cached_input_tokens=0,
+            actual_output_tokens=estimate.max_output_tokens,
+            actual_thought_tokens=estimate.reserved_thought_tokens,
+            actual_cost_usd=estimate.worst_case_cost_usd,
+            reserved_at=utc_now(),
+            reconciled_at=utc_now(),
+            reconciliation_basis="conservative_worst_case",
+            dispatch_id=dispatch_id,
+        )
+        projected_interactions = self.committed_interactions + 1
+        projected_cost = self.actual_cost_usd + estimate.worst_case_cost_usd
+        if projected_interactions > self.max_interactions:
+            raise BudgetExceeded(
+                "persisted ambiguous dispatches already exceed the configured "
+                "interaction cap"
+            )
+        if projected_cost > self.max_cost_usd + 1e-9:
+            raise BudgetExceeded(
+                "persisted ambiguous dispatches already exceed the configured "
+                "cost cap"
             )
         self._reservations[reservation.reservation_id] = reservation
         return reservation
@@ -564,8 +873,38 @@ class BudgetLedger:
         )
         reservation.state = "reconciled"
         reservation.reconciled_at = utc_now()
+        reservation.reconciliation_basis = "actual_usage"
         if self.actual_cost_usd > self.max_cost_usd + 1e-9:
             raise BudgetExceeded("actual usage exceeded the configured cost cap")
+        return reservation
+
+    def reconcile_conservative_dispatch(
+        self,
+        reservation_id: str,
+        *,
+        dispatch_id: str,
+    ) -> BudgetReservation:
+        """Charge one started request at its reserve when usage is unavailable."""
+
+        reservation = self._reservations[reservation_id]
+        if reservation.state != "reserved":
+            raise ValueError("only an active budget reservation can reconcile")
+        estimate = reservation.estimate
+        if estimate.retry_allowance != 0 or estimate.worst_case_interactions != 1:
+            raise ValueError(
+                "a dispatch journal must describe exactly one provider attempt"
+            )
+        reservation.actual_input_tokens = estimate.estimated_input_tokens
+        reservation.actual_cached_input_tokens = 0
+        reservation.actual_output_tokens = estimate.max_output_tokens
+        reservation.actual_thought_tokens = estimate.reserved_thought_tokens
+        reservation.actual_cost_usd = estimate.worst_case_cost_usd
+        reservation.state = "reconciled"
+        reservation.reconciled_at = utc_now()
+        reservation.reconciliation_basis = "conservative_worst_case"
+        reservation.dispatch_id = dispatch_id
+        if self.actual_cost_usd > self.max_cost_usd + 1e-9:
+            raise BudgetExceeded("conservative usage exceeded the configured cost cap")
         return reservation
 
     def cancel_before_dispatch(self, reservation_id: str) -> None:

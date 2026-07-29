@@ -20,11 +20,16 @@ from jascue_video_lab.clip_card_retrieval import (
     compact_retrieval_card,
     validate_feature_shortlist,
 )
-from jascue_video_lab.clip_card_observations import ClipObservationSupplement
+from jascue_video_lab.clip_card_observations import (
+    ClipObservationSupplement,
+    effective_event_observations,
+)
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
 from jascue_video_lab.event_lock import (
     EditorialBeatContract,
+    EvidenceFulfillmentObservation,
     load_editorial_beat_contracts,
+    select_strongest_evidence_fulfillment,
 )
 from jascue_video_lab.models import (
     FeatureEditBrief,
@@ -73,6 +78,68 @@ def _shortlist_input_binding(
         "thinking_level": thinking_level,
         "max_output_tokens": 12_000,
     }
+
+
+def validate_shortlist_fulfillment_minimums(
+    plan: FeatureShortlistPlan,
+    *,
+    cards: dict[str, FullClipCard],
+    contracts: tuple[EditorialBeatContract, ...],
+    supplements: dict[str, list[ClipObservationSupplement]] | None = None,
+) -> None:
+    """Fail locally when a hard shortlist falls below its authorized minimum."""
+
+    supplements = supplements or {}
+    chapter_by_feature = {
+        chapter.feature_id: chapter for chapter in plan.chapters
+    }
+    failures: list[str] = []
+    for contract in contracts:
+        if contract.priority != "hard" or contract.feature_id is None:
+            continue
+        chapter = chapter_by_feature.get(contract.feature_id)
+        observations: list[EvidenceFulfillmentObservation] = []
+        for rank, candidate in enumerate(
+            chapter.candidates if chapter is not None else (),
+            start=1,
+        ):
+            card = cards[candidate.source_asset_id]
+            observation = effective_event_observations(
+                card,
+                supplements.get(candidate.source_asset_id, ()),
+            )[candidate.event_id]
+            observations.append(
+                EvidenceFulfillmentObservation(
+                    candidate_id=f"rank-{rank:02d}",
+                    evidence_provenance=observation.evidence_provenance,
+                    observable_predicates=tuple(
+                        dict.fromkeys(
+                            [
+                                *(
+                                    beat.observable_predicate
+                                    for beat in observation.observable_beats
+                                ),
+                                *(
+                                    f"observable_beat:{beat.kind}"
+                                    for beat in observation.observable_beats
+                                ),
+                            ]
+                        )
+                    ),
+                )
+            )
+        try:
+            select_strongest_evidence_fulfillment(contract, observations)
+        except ValueError:
+            failures.append(
+                f"{contract.beat_id}/"
+                f"{contract.minimum_fulfillment_level or 'direct_demonstration'}"
+            )
+    if failures:
+        raise ValueError(
+            "shortlist is below hard fulfillment minimums: "
+            + ", ".join(failures)
+        )
 
 
 def main() -> int:
@@ -169,15 +236,16 @@ frame、bbox、crop、剪點或最終排名。
 7. capability 為 not_assessed 時只代表尚未補件，不能據此否定候選；
    也不得自行補出 action、result、relation、readability 或 audio role。
 8. 這是粗召回，不要求 Base Clip Card 已有 exact event type 或 exact frame。
-   當 event 的 observable_evidence 直接描述 contracted 動作、狀態轉換或結果，
-   即使整段仍需下游 ExactEventLock 定位，也必須保留為候選。反之，只顯示
-   相同物件的靜態 setup 不能取代 UI state change、action apex、reaction peak
-   或 result stable start；完整 library 都沒有可觀察描述時，hard event 才是
-   not_found。
-9. mediated depiction、圖文 claim 或 context-only 畫面可以保留為 contextual
-   候選，但不得用它們冒充 hard predicate 的 direct source event。若 brief
-   允許替代表達，retrieval_reason 必須明確說明它只支持哪一部分、缺少哪個
-   observable predicate。
+   依每份 EditorialBeatContract 的 fulfillment_alternatives 召回可達成的最強
+   evidence tier；priority=hard 約束的是 minimum_fulfillment_level，不代表一律
+   強制 direct demonstration。當 observable_evidence 直接描述 contracted 動作、
+   狀態轉換或結果，即使仍需下游 ExactEventLock 定位，也必須保留。只顯示相同
+   物件的靜態 setup 不得冒充 UI state change、action apex、reaction peak 或
+   result stable start。
+9. mediated depiction、圖文 claim 或 context-only 畫面只在 contract 明確列為
+   合法 alternative 時才能滿足該 tier。retrieval_reason 必須標明它是 illustrative
+   evidence、缺少哪些 predicate，以及禁止哪些具體 claim。只有所有候選都低於
+   minimum_fulfillment_level 時，hard beat 才是 not_found。
 
 contract_version 必須原樣回傳：clip-card-feature-shortlist-v1
 project_id 必須原樣回傳：{brief.project_id}
@@ -311,6 +379,12 @@ model_provenance 必須原樣回傳：
         brief=brief,
         catalog=catalog,
         cards=cards,
+    )
+    validate_shortlist_fulfillment_minimums(
+        plan,
+        cards=cards,
+        contracts=tuple(editorial_contracts),
+        supplements=supplements,
     )
     final = plan.model_copy(
         update={

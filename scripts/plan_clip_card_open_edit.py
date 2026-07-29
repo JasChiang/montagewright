@@ -849,6 +849,7 @@ model_provenance 必須先原樣回傳：
         "input": [{"type": "text", "text": prompt}],
         "generation_config": {
             "thinking_level": args.thinking_level,
+            "max_output_tokens": 32_000,
         },
         "response_format": {
             "type": "text",

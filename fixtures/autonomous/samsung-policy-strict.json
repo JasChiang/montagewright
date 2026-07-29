@@ -40,7 +40,7 @@
   },
   "editorial": {
     "allow_optional_beat_omission": true,
-    "allow_preferred_beat_substitution": true,
+    "allow_preferred_beat_substitution": false,
     "allow_hard_evidence_omission": false,
     "allow_source_reuse": [
       "distinct_interval",

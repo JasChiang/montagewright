@@ -7,7 +7,7 @@
 `codex/autonomous-delivery-v1` 在原本的 semantic planner → deterministic compiler → local executors 上新增兩個 fail-closed profile：
 
 - `autonomous_strict`：所有 hard evidence、exact cue、geometry、technical QA 與有聲 final QA 都通過，才由 `AUTO_POLICY` 產生 `DecisionAuthorityV2` 與 `delivery_eligible`。
-- `autonomous_best_effort`：只允許 policy 預先授權的 optional omission、preferred substitution、Top-K 換帶、two-panel 或 solid matte fit；hard evidence 仍不得省略。所有替代寫入 policy-bound degradation manifest。
+- `autonomous_best_effort`：只允許 policy 預先授權的 optional omission、Top-K 換帶、two-panel 或 solid matte fit；hard evidence 仍不得省略。所有替代寫入 policy-bound degradation manifest。Preferred-beat substitution 尚無可驗證的 alternate execution hook，因此 V1 policy 會明確拒絕開啟，不會默默忽略。
 
 ## Generalized edit compiler
 
@@ -49,7 +49,7 @@ branch. The planned source of word-level local timing is Apple
 SpeechTranscriber, followed by a bounded Gemini correction pass that may
 correct recognized text but may not rewrite the local timing lineage.
 
-Gemini 只負責語意計畫、既有 frame ID 的事件選擇、exact-frame multi-target grounding 與成片觀察；它不能授予 approval、輸出任意 final timestamp/bbox，或自行形成 repair loop。本機最多允許一次 scoped semantic replan、兩次 full final QA，並在每次付費 final QA 前由 `BudgetLedger` 先 reserve 成本與 interaction。
+Gemini 只負責語意計畫、既有 frame ID 的事件選擇、exact-frame multi-target grounding 與成片觀察；它不能授予 approval、輸出任意 final timestamp/bbox，或自行形成 repair loop。完整 final QA 最多兩次，並在每次付費呼叫前由 `BudgetLedger` reserve 成本與 interaction。V1 會保存最多三個候選及前後文的 scoped-replan handoff，但在 alternate candidate 尚未重新走完 exact-event → trim authority → grounding/SAM → presentation compiler 前會明確 block；它不會假裝已執行，也不會重送完整素材。
 
 Autonomous 9:16 final QA 必須取得有聲成片、brief，以及下列自動產生、不可變的 JSON：
 
@@ -114,7 +114,7 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab feature-delivery \
 4. **提出選片與相對停留建議**：有剪輯 brief 時，AI 會同時依主題、可觀察資訊量、動作是否完整及音樂 flow 挑選素材；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。每段另保存 AttentionProfile，分開記錄閱讀負擔、動作進度、重複壓力、刻意停留價值等理由，再由 RhythmPlan 產生最短／偏好／最長停留範圍。系統不會因為畫面被分類成人物、產品、UI 或靜態鏡頭，就套用固定秒數。
 5. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
 6. **確認真正可用的秒數**：只對入選 shot 逐幀量測黑白格、freeze、解碼／PTS 異常及需複核的失焦、模糊與晃動，先算出連續的安全區間，再分配章節片長；不拿包含髒畫面的整個 shot 長度冒充可用容量。
-7. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨目標、做有目的的 push-in／pull-out／punch-in，或避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。多主體不再被要求「每一刻全部同框」：Gemini 可標記 `simultaneous`、`sequential`、`relation_core`、`primary_with_context` 或 `independent_detail`。本機只對當下 phase 的 hard anchors 求滿版構圖；連續移動太快時可在 phase boundary 硬切，且 motion gate 不跨硬切計算。滿版依序嘗試靜態裁切、追蹤、phase virtual camera、可控語意裁切與下一個 Top-K 候選；純色 fit 只可作非交付 review preview，模糊背景不屬於正式能力。
+7. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨目標、做有目的的 push-in／pull-out／punch-in，或避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。多主體不再被要求「每一刻全部同框」：Gemini 可標記 `simultaneous`、`sequential`、`relation_core`、`primary_with_context` 或 `independent_detail`。本機只對當下 phase 的 hard anchors 求滿版構圖；連續移動太快時可在 phase boundary 硬切，且 motion gate 不跨硬切計算。滿版依序嘗試靜態裁切、追蹤、phase virtual camera、可控語意裁切與下一個 Top-K 候選；two-panel 與純色 fit 只有在 relation、可讀性與 policy 都允許且 deterministic QA 通過時才可交付，模糊背景不屬於正式能力。
 8. **保留連續音樂，不拿毛片原音疊上去**：review delivery 只使用已核准的一段連續音樂，優先保留自然收尾；不把同一首歌切成數段交疊、不 time-stretch，也不混入每顆毛片原音造成突兀重疊。若畫面長度與連續音樂無法在容差內對齊，會停止而不是硬裁或 freeze 畫面。
 9. **完成版一定走同一條交付鏈**：`feature-delivery` 依序執行 production picture gate、連續音樂 assembly、最終 mux 與 Gemini 成片 QA。任何一層失敗只會留下可稽核的 blocked／review artifact，不會因 MP4 能播放就宣稱完成；QA 通過後仍須真人核准。
 10. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。Gemini 可用一次有聲 16:9 call 檢查 brief、資訊停留、重複、轉場及音樂 flow；9:16 另以靜音 proxy 只檢查裁切、文字與追蹤。QA 只提出觀察，不會自行改片；真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。

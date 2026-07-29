@@ -21,7 +21,8 @@ from .models import (
 )
 
 
-SUPPLEMENT_CONTRACT_VERSION = "clip-observation-supplement-v2"
+SUPPLEMENT_CONTRACT_VERSION = "clip-observation-supplement-v3"
+SUPPLEMENT_REQUEST_BINDING_VERSION = "clip-observation-request-binding-v1"
 
 
 class AssessmentStatus(StrEnum):
@@ -244,13 +245,43 @@ class EventObservationSupplement(FrozenStrictModel):
         return self
 
 
+class SupplementRequestBinding(FrozenStrictModel):
+    """Immutable paid-request lineage for one supplement generation contract."""
+
+    contract_version: Literal["clip-observation-request-binding-v1"] = (
+        SUPPLEMENT_REQUEST_BINDING_VERSION
+    )
+    model_id: str = Field(min_length=1)
+    system_instruction_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    response_schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    media_resolution: Literal["low", "medium", "high"]
+    thinking_level: Literal["minimal", "low", "medium", "high"]
+    max_output_tokens: int = Field(gt=0)
+    binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_binding_hash(self) -> "SupplementRequestBinding":
+        expected = supplement_request_binding_sha256(
+            model_id=self.model_id,
+            system_instruction_sha256=self.system_instruction_sha256,
+            prompt_sha256=self.prompt_sha256,
+            response_schema_sha256=self.response_schema_sha256,
+            media_resolution=self.media_resolution,
+            thinking_level=self.thinking_level,
+            max_output_tokens=self.max_output_tokens,
+        )
+        if self.binding_sha256 != expected:
+            raise ValueError("supplement request binding hash is invalid")
+        return self
+
+
 class ClipObservationSupplement(FrozenStrictModel):
     contract_version: Literal[
         "clip-observation-supplement-v1",
         "clip-observation-supplement-v2",
-    ] = (
-        SUPPLEMENT_CONTRACT_VERSION
-    )
+        "clip-observation-supplement-v3",
+    ] = "clip-observation-supplement-v2"
     supplement_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
     supersedes: list[str] = Field(default_factory=list)
     source_asset_id: str
@@ -260,6 +291,7 @@ class ClipObservationSupplement(FrozenStrictModel):
     response_schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     event_observations: list[EventObservationSupplement] = Field(min_length=1)
     model_provenance: ModelProvenance
+    request_binding: SupplementRequestBinding | None = None
 
     @model_validator(mode="after")
     def validate_event_ids(self) -> "ClipObservationSupplement":
@@ -270,6 +302,24 @@ class ClipObservationSupplement(FrozenStrictModel):
             raise ValueError("a supplement cannot supersede itself")
         if len(self.supersedes) != len(set(self.supersedes)):
             raise ValueError("supersedes IDs must be unique")
+        if self.contract_version == "clip-observation-supplement-v3":
+            if self.request_binding is None:
+                raise ValueError("v3 supplement requires request_binding")
+            if self.request_binding.model_id != self.model_provenance.model_id:
+                raise ValueError(
+                    "supplement request binding model differs from provenance"
+                )
+            if self.request_binding.prompt_sha256 != self.supplement_prompt_sha256:
+                raise ValueError(
+                    "supplement request binding prompt differs from supplement"
+                )
+            if (
+                self.request_binding.response_schema_sha256
+                != self.response_schema_sha256
+            ):
+                raise ValueError(
+                    "supplement request binding schema differs from supplement"
+                )
         return self
 
 
@@ -304,6 +354,55 @@ def _canonical_sha256(value: object) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def supplement_request_binding_sha256(
+    *,
+    model_id: str,
+    system_instruction_sha256: str,
+    prompt_sha256: str,
+    response_schema_sha256: str,
+    media_resolution: Literal["low", "medium", "high"],
+    thinking_level: Literal["minimal", "low", "medium", "high"],
+    max_output_tokens: int,
+) -> str:
+    return _canonical_sha256(
+        {
+            "contract_version": SUPPLEMENT_REQUEST_BINDING_VERSION,
+            "model_id": model_id,
+            "system_instruction_sha256": system_instruction_sha256,
+            "prompt_sha256": prompt_sha256,
+            "response_schema_sha256": response_schema_sha256,
+            "media_resolution": media_resolution,
+            "thinking_level": thinking_level,
+            "max_output_tokens": max_output_tokens,
+        }
+    )
+
+
+def build_supplement_request_binding(
+    *,
+    model_id: str,
+    system_instruction_sha256: str,
+    prompt_sha256: str,
+    response_schema_sha256: str,
+    media_resolution: Literal["low", "medium", "high"],
+    thinking_level: Literal["minimal", "low", "medium", "high"],
+    max_output_tokens: int,
+) -> SupplementRequestBinding:
+    values = {
+        "model_id": model_id,
+        "system_instruction_sha256": system_instruction_sha256,
+        "prompt_sha256": prompt_sha256,
+        "response_schema_sha256": response_schema_sha256,
+        "media_resolution": media_resolution,
+        "thinking_level": thinking_level,
+        "max_output_tokens": max_output_tokens,
+    }
+    return SupplementRequestBinding(
+        **values,
+        binding_sha256=supplement_request_binding_sha256(**values),
+    )
 
 
 def clip_card_sha256(card: FullClipCard) -> str:
@@ -409,6 +508,8 @@ def validate_supplement(
     supplement: ClipObservationSupplement,
     *,
     expected_base_card_sha256: str | None = None,
+    expected_request_binding: SupplementRequestBinding | None = None,
+    require_current_lineage: bool = False,
 ) -> None:
     expected_hash = expected_base_card_sha256 or clip_card_sha256(card)
     if supplement.source_asset_id != card.source_asset_id:
@@ -417,6 +518,24 @@ def validate_supplement(
         raise ValueError("supplement proxy asset differs from base Clip Card")
     if supplement.base_card_sha256 != expected_hash:
         raise ValueError("supplement is stale for the current base Clip Card")
+    if require_current_lineage and supplement.request_binding is None:
+        raise ValueError(
+            "autonomous supplement requires current request lineage; "
+            "legacy v1/v2 artifacts are review-only"
+        )
+    if expected_request_binding is not None:
+        if supplement.request_binding is None:
+            raise ValueError(
+                "supplement lacks request lineage required by the current operation"
+            )
+        if (
+            supplement.request_binding.binding_sha256
+            != expected_request_binding.binding_sha256
+        ):
+            raise ValueError(
+                "supplement is stale for the current model, prompt, schema, "
+                "system instruction, media resolution, or generation limits"
+            )
     events = {event.event_id: event for event in card.events}
     known_entities = {entity.entity_id for entity in card.entities}
     for observation in supplement.event_observations:

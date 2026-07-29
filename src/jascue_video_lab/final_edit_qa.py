@@ -16,6 +16,8 @@ from .autonomous_policy import AutonomousEditPolicy
 from .billing import (
     STANDARD_PRICING_USD_PER_MILLION,
     BudgetLedger,
+    complete_paid_dispatch,
+    dispatch_paid_interaction,
     estimate_paid_call,
     summarize_usage_files,
 )
@@ -25,8 +27,8 @@ from .storage import read_json, utc_now, write_json
 
 
 FINAL_EDIT_QA_CONTRACT_VERSION = "final-edit-qa-v1"
-FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v4"
-FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v5"
+FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v5"
+FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v6"
 FINAL_EDIT_QA_GENERATION_CONFIG = {
     "thinking_level": "low",
     "max_output_tokens": 8192,
@@ -43,8 +45,15 @@ AUTONOMOUS_PROMPT_RESOURCE = "final_edit_qa_autonomous_zh-TW.txt"
 FinalQaMode = Literal[
     "canonical_16x9",
     "crop_only_9x16",
+    "autonomous_final_16x9",
     "autonomous_final_9x16",
 ]
+AUTONOMOUS_FINAL_QA_MODES = frozenset(
+    {"autonomous_final_16x9", "autonomous_final_9x16"}
+)
+HORIZONTAL_FINAL_QA_MODES = frozenset(
+    {"canonical_16x9", "autonomous_final_16x9"}
+)
 QaAssessment = Literal[
     "effective",
     "acceptable",
@@ -258,7 +267,10 @@ class AutonomousCueAlignmentClaim(StrictModel):
 
 class AutonomousFinalEditQa(StrictModel):
     contract_version: Literal["final-edit-qa-v1"] = FINAL_EDIT_QA_CONTRACT_VERSION
-    mode: Literal["autonomous_final_9x16"]
+    mode: Literal[
+        "autonomous_final_16x9",
+        "autonomous_final_9x16",
+    ]
     render_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     proxy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -305,6 +317,61 @@ class AutonomousFinalEditQa(StrictModel):
         return self
 
 
+class DeterministicEvidenceCausalBinding(StrictModel):
+    """Immutable artifacts whose bytes the deterministic claims describe.
+
+    The measured booleans alone are not delivery authority.  This binding
+    prevents a passing evidence JSON produced for one render from being
+    replayed against a different render, manifest, policy, or context set.
+    Recovery additionally binds every changed and reused segment byte-for-byte.
+    """
+
+    contract_version: Literal["deterministic-evidence-binding-v1"] = (
+        "deterministic-evidence-binding-v1"
+    )
+    render_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    render_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_reference: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    context_hashes: dict[str, str]
+    delivery_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_assembly_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    segment_content_hashes: dict[str, str]
+    changed_segment_ids: tuple[str, ...] = ()
+    reused_segment_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> "DeterministicEvidenceCausalBinding":
+        hash_pattern = re.compile(r"^[0-9a-f]{64}$")
+        if not self.context_hashes or any(
+            not key or hash_pattern.fullmatch(value) is None
+            for key, value in self.context_hashes.items()
+        ):
+            raise ValueError(
+                "deterministic evidence requires a non-empty context hash set"
+            )
+        if not self.segment_content_hashes or any(
+            not key or hash_pattern.fullmatch(value) is None
+            for key, value in self.segment_content_hashes.items()
+        ):
+            raise ValueError(
+                "deterministic evidence requires segment content hashes"
+            )
+        if len(set(self.changed_segment_ids)) != len(self.changed_segment_ids):
+            raise ValueError("changed segment IDs must be unique")
+        if len(set(self.reused_segment_ids)) != len(self.reused_segment_ids):
+            raise ValueError("reused segment IDs must be unique")
+        if set(self.changed_segment_ids) & set(self.reused_segment_ids):
+            raise ValueError("segments cannot be both changed and reused")
+        classified = set(self.changed_segment_ids) | set(
+            self.reused_segment_ids
+        )
+        if classified and classified != set(self.segment_content_hashes):
+            raise ValueError(
+                "recovery segment classification must cover all content hashes"
+            )
+        return self
+
+
 class DeterministicDeliveryEvidence(StrictModel):
     """Application-measured delivery facts.
 
@@ -315,6 +382,7 @@ class DeterministicDeliveryEvidence(StrictModel):
     """
 
     media_playable: bool
+    aspect: Literal["16:9", "9:16"] | None = None
     pts_valid: bool
     unexpected_freeze_count: int = Field(ge=0)
     containment_passed: bool
@@ -346,6 +414,7 @@ class DeterministicDeliveryEvidence(StrictModel):
     reuse_authorized: bool
     omissions_authorized: bool
     hard_evidence_passed: bool
+    causal_binding: DeterministicEvidenceCausalBinding | None = None
 
     @model_validator(mode="after")
     def validate_audit_identities(self) -> "DeterministicDeliveryEvidence":
@@ -354,6 +423,39 @@ class DeterministicDeliveryEvidence(StrictModel):
         ):
             raise ValueError("required cue event IDs must be unique")
         return self
+
+
+def validate_deterministic_evidence_causal_binding(
+    evidence: DeterministicDeliveryEvidence,
+    *,
+    render_sha256: str,
+    render_manifest_sha256: str,
+    policy_reference: str,
+    context_hashes: Mapping[str, str],
+    delivery_manifest_sha256: str,
+    music_assembly_manifest_sha256: str,
+    segment_content_hashes: Mapping[str, str],
+    changed_segment_ids: tuple[str, ...] = (),
+    reused_segment_ids: tuple[str, ...] = (),
+) -> None:
+    """Fail closed unless evidence is bound to these exact immutable bytes."""
+
+    expected = DeterministicEvidenceCausalBinding(
+        render_sha256=render_sha256,
+        render_manifest_sha256=render_manifest_sha256,
+        policy_reference=policy_reference,
+        context_hashes=dict(context_hashes),
+        delivery_manifest_sha256=delivery_manifest_sha256,
+        music_assembly_manifest_sha256=music_assembly_manifest_sha256,
+        segment_content_hashes=dict(segment_content_hashes),
+        changed_segment_ids=changed_segment_ids,
+        reused_segment_ids=reused_segment_ids,
+    )
+    if evidence.causal_binding != expected:
+        raise ValueError(
+            "deterministic delivery evidence causal binding does not match "
+            "the current render authority"
+        )
 
 
 class DeterministicDeliveryQaReport(StrictModel):
@@ -385,6 +487,76 @@ class AutonomousRecoveryPlan(StrictModel):
     decision_codes: tuple[str, ...]
 
 
+class AutonomousRecoveryExecution(StrictModel):
+    """Auditable outcome of applying one bounded recovery plan.
+
+    Planning a repair is deliberately separate from proving that an executor
+    changed the requested segments and rebuilt the final media.  ``unavailable``
+    therefore remains a terminal, fail-closed state rather than being treated
+    as a successful repair.
+    """
+
+    contract_version: Literal["autonomous-recovery-execution-v1"] = (
+        "autonomous-recovery-execution-v1"
+    )
+    status: Literal["not_required", "blocked", "unavailable", "executed"]
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    input_qa_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason_code: str | None = None
+    input_render_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_render_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    changed_segment_ids: tuple[str, ...] = ()
+    reused_segment_ids: tuple[str, ...] = ()
+    deterministic_delivery_evidence_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    semantic_replan_interaction_ids: tuple[str, ...] = ()
+    qa_passes_completed: int = Field(ge=1, le=2)
+    semantic_replans_used: int = Field(ge=0, le=1)
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_execution(self) -> "AutonomousRecoveryExecution":
+        if len(set(self.changed_segment_ids)) != len(self.changed_segment_ids):
+            raise ValueError("changed recovery segment IDs must be unique")
+        if len(set(self.reused_segment_ids)) != len(self.reused_segment_ids):
+            raise ValueError("reused recovery segment IDs must be unique")
+        if set(self.changed_segment_ids) & set(self.reused_segment_ids):
+            raise ValueError("recovery segments cannot be both changed and reused")
+        if len(set(self.semantic_replan_interaction_ids)) != len(
+            self.semantic_replan_interaction_ids
+        ):
+            raise ValueError("semantic replan interaction IDs must be unique")
+        if self.status == "executed":
+            if (
+                self.output_render_sha256 is None
+                or self.deterministic_delivery_evidence_sha256 is None
+                or not self.changed_segment_ids
+            ):
+                raise ValueError(
+                    "executed recovery requires changed media and deterministic evidence"
+                )
+            if self.output_render_sha256 == self.input_render_sha256:
+                raise ValueError(
+                    "executed recovery must change the final render content"
+                )
+        elif (
+            self.output_render_sha256 is not None
+            or self.changed_segment_ids
+            or self.reused_segment_ids
+            or self.deterministic_delivery_evidence_sha256 is not None
+            or self.semantic_replan_interaction_ids
+        ):
+            raise ValueError(
+                "non-executed recovery cannot claim changed or validated outputs"
+            )
+        return self
+
+
 FinalEditQaResult = (
     CanonicalFinalEditQa
     | CropOnlyFinalEditQa
@@ -403,6 +575,8 @@ class PreparedFinalEditQa:
     segment_contract: list[dict[str, Any]]
     prompt: str
     schema: dict[str, Any]
+    media_resolution: Literal["low", "medium", "high"]
+    generation_config: dict[str, Any]
     result_model: (
         type[CanonicalFinalEditQa]
         | type[CropOnlyFinalEditQa]
@@ -487,6 +661,7 @@ def _read_prompt(mode: FinalQaMode, override: Path | None = None) -> str:
     resource_name = {
         "canonical_16x9": CANONICAL_PROMPT_RESOURCE,
         "crop_only_9x16": CROP_PROMPT_RESOURCE,
+        "autonomous_final_16x9": AUTONOMOUS_PROMPT_RESOURCE,
         "autonomous_final_9x16": AUTONOMOUS_PROMPT_RESOURCE,
     }[mode]
     return (
@@ -561,7 +736,11 @@ def _timeline_chapters(
     manifest: dict[str, Any],
     mode: FinalQaMode,
 ) -> list[dict[str, Any]]:
-    section_key = "horizontal" if mode == "canonical_16x9" else "vertical"
+    section_key = (
+        "horizontal"
+        if mode in HORIZONTAL_FINAL_QA_MODES
+        else "vertical"
+    )
     section = manifest.get(section_key)
     if isinstance(section, dict) and isinstance(section.get("chapters"), list):
         chapters = section["chapters"]
@@ -814,37 +993,64 @@ def build_final_qa_segment_contract(
     return contract
 
 
-def _validate_media_mode(metadata: dict[str, Any], mode: FinalQaMode) -> None:
+def _validate_media_mode(
+    metadata: dict[str, Any],
+    mode: FinalQaMode,
+    *,
+    music_supplied: bool | None = None,
+) -> None:
     width = int(metadata["width"])
     height = int(metadata["height"])
     if width <= 0 or height <= 0 or metadata["duration_seconds"] <= 0:
         raise ValueError("final render has invalid media geometry or duration")
-    if mode == "canonical_16x9":
+    if mode in HORIZONTAL_FINAL_QA_MODES:
         if width * 9 != height * 16:
-            raise ValueError(f"canonical QA requires exact 16:9, got {width}x{height}")
-        if not metadata["has_audio"]:
             raise ValueError(
-                "canonical 16:9 QA requires the final render with its music/audio"
+                f"horizontal QA requires exact 16:9, got {width}x{height}"
+            )
+        if (
+            mode == "canonical_16x9"
+            or (
+                mode in AUTONOMOUS_FINAL_QA_MODES
+                and music_supplied is not False
+            )
+        ) and not metadata["has_audio"]:
+            raise ValueError(
+                f"{mode} QA requires the final render with its music/audio"
             )
     elif width * 16 != height * 9:
         raise ValueError(f"vertical QA requires exact 9:16, got {width}x{height}")
-    elif mode == "autonomous_final_9x16" and not metadata["has_audio"]:
+    elif (
+        mode in AUTONOMOUS_FINAL_QA_MODES
+        and music_supplied is not False
+        and not metadata["has_audio"]
+    ):
         raise ValueError(
             "autonomous 9:16 QA requires the final render with music/audio"
         )
 
 
-def _proxy_contract(mode: FinalQaMode, crop_include_audio: bool) -> dict[str, Any]:
+def _proxy_contract(
+    mode: FinalQaMode,
+    crop_include_audio: bool,
+    *,
+    music_supplied: bool | None = None,
+) -> dict[str, Any]:
+    autonomous_audio = (
+        mode in AUTONOMOUS_FINAL_QA_MODES
+        and music_supplied is not False
+    )
     return {
         "contract_version": "final-edit-qa-proxy-v1",
-        "width": 1280 if mode == "canonical_16x9" else 720,
-        "height": 720 if mode == "canonical_16x9" else 1280,
+        "width": 1280 if mode in HORIZONTAL_FINAL_QA_MODES else 720,
+        "height": 720 if mode in HORIZONTAL_FINAL_QA_MODES else 1280,
         "video_codec": "libx264",
         "preset": "veryfast",
         "crf": 30,
         "audio": (
             "aac-64k"
-            if mode in {"canonical_16x9", "autonomous_final_9x16"}
+            if mode == "canonical_16x9"
+            or autonomous_audio
             or crop_include_audio
             else "omitted"
         ),
@@ -857,14 +1063,15 @@ def _create_proxy(
     *,
     mode: FinalQaMode,
     crop_include_audio: bool,
+    music_supplied: bool | None = None,
 ) -> None:
     if destination.exists() and destination.stat().st_size > 0:
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp.mp4")
     temporary.unlink(missing_ok=True)
-    width = 1280 if mode == "canonical_16x9" else 720
-    height = 720 if mode == "canonical_16x9" else 1280
+    width = 1280 if mode in HORIZONTAL_FINAL_QA_MODES else 720
+    height = 720 if mode in HORIZONTAL_FINAL_QA_MODES else 1280
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -885,7 +1092,10 @@ def _create_proxy(
         "-crf",
         "30",
     ]
-    if mode in {"canonical_16x9", "autonomous_final_9x16"}:
+    if mode == "canonical_16x9" or (
+        mode in AUTONOMOUS_FINAL_QA_MODES
+        and music_supplied is not False
+    ):
         command.extend(["-map", "0:a:0", "-c:a", "aac", "-b:a", "64k"])
     elif crop_include_audio:
         command.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "64k"])
@@ -910,6 +1120,7 @@ def _build_prompt(
     brief: dict[str, Any] | None,
     segment_contract: list[dict[str, Any]],
     autonomous_context: Mapping[str, Any] | None = None,
+    music_supplied: bool | None = None,
 ) -> str:
     immutable = {
         "mode": mode,
@@ -917,6 +1128,7 @@ def _build_prompt(
         "proxy_sha256": proxy_sha256,
         "manifest_sha256": manifest_sha256,
         "brief_sha256": brief_sha256,
+        "music_supplied": music_supplied,
     }
     blocks = [
         prompt_template.rstrip(),
@@ -937,6 +1149,13 @@ def _build_prompt(
                 indent=2,
             )
         )
+        if music_supplied is False:
+            blocks.append(
+                "## 本次無配樂契約\n"
+                "本次成片明確沒有音訊或配樂。只評估可見的剪輯節奏、"
+                "停留、動作完整性與段落流動；不得回報 music_sync_miss，"
+                "不得聲稱聽見音樂、節拍、重拍或 cue。"
+            )
     blocks.append(
         "## 依成片順序排列的剪輯單元契約\n"
         + json.dumps(segment_contract, ensure_ascii=False, indent=2)
@@ -955,10 +1174,13 @@ def prepare_final_edit_qa(
     prompt_override: Path | None = None,
     crop_include_audio: bool = False,
     autonomous_context_paths: Mapping[str, Path] | None = None,
+    music_supplied: bool | None = None,
+    autonomous_policy: AutonomousEditPolicy | None = None,
 ) -> PreparedFinalEditQa:
     if mode not in {
         "canonical_16x9",
         "crop_only_9x16",
+        "autonomous_final_16x9",
         "autonomous_final_9x16",
     }:
         raise ValueError(f"unsupported final QA mode: {mode}")
@@ -975,7 +1197,7 @@ def prepare_final_edit_qa(
         raise ValueError("final edit manifest must be a JSON object")
     resolved_brief: Path | None = None
     brief: dict[str, Any] | None = None
-    if mode in {"canonical_16x9", "autonomous_final_9x16"}:
+    if mode == "canonical_16x9" or mode in AUTONOMOUS_FINAL_QA_MODES:
         if brief_path is None:
             raise ValueError(f"{mode} QA requires a brief JSON")
         resolved_brief = brief_path.expanduser().resolve(strict=True)
@@ -989,7 +1211,10 @@ def prepare_final_edit_qa(
     context_hashes: dict[str, str] = {}
     context_file_hashes: dict[str, str] = {}
     autonomous_context: dict[str, Any] | None = None
-    if mode == "autonomous_final_9x16":
+    if mode in AUTONOMOUS_FINAL_QA_MODES:
+        expected_context_aspect = (
+            "16:9" if mode == "autonomous_final_16x9" else "9:16"
+        )
         supplied = dict(autonomous_context_paths or {})
         missing = sorted(set(AUTONOMOUS_CONTEXT_KEYS) - set(supplied))
         extras = sorted(set(supplied) - set(AUTONOMOUS_CONTEXT_KEYS))
@@ -1006,6 +1231,30 @@ def prepare_final_edit_qa(
                 raise ValueError(
                     f"autonomous QA context {key} must be JSON object/list"
                 )
+            if isinstance(payload, dict):
+                declared_aspect = payload.get("aspect")
+                if (
+                    declared_aspect is not None
+                    and declared_aspect != expected_context_aspect
+                ):
+                    raise ValueError(
+                        f"{mode} cannot consume {declared_aspect} "
+                        f"autonomous context artifact {key}"
+                    )
+                if key == "exact_event_locks":
+                    selected_windows = payload.get("selected_windows", [])
+                    if isinstance(selected_windows, list):
+                        window_aspects = {
+                            str(window["aspect"])
+                            for window in selected_windows
+                            if isinstance(window, Mapping)
+                            and window.get("aspect") is not None
+                        }
+                        if window_aspects - {expected_context_aspect}:
+                            raise ValueError(
+                                f"{mode} exact-event windows bind a different "
+                                f"aspect: {sorted(window_aspects)}"
+                            )
             semantic_payload = _without_volatile_provenance(payload)
             resolved_context_paths[key] = resolved
             context_file_hashes[key] = sha256_file(resolved)
@@ -1016,11 +1265,40 @@ def prepare_final_edit_qa(
             }
     elif autonomous_context_paths:
         raise ValueError(
-            "autonomous context is only valid for autonomous_final_9x16"
+            "autonomous context is only valid for autonomous final QA"
         )
+    if mode not in AUTONOMOUS_FINAL_QA_MODES and music_supplied is not None:
+        raise ValueError(
+            "music_supplied is only valid for autonomous final QA"
+        )
+    if autonomous_policy is not None and mode not in AUTONOMOUS_FINAL_QA_MODES:
+        raise ValueError(
+            "AutonomousEditPolicy limits are only valid for autonomous QA"
+        )
+    media_resolution = (
+        autonomous_policy.media_resolution.final_video_qa
+        if autonomous_policy is not None
+        else "low"
+    )
+    generation_config = (
+        {
+            "thinking_level": (
+                autonomous_policy.gemini_limits.final_qa.thinking_level
+            ),
+            "max_output_tokens": (
+                autonomous_policy.gemini_limits.final_qa.max_output_tokens
+            ),
+        }
+        if autonomous_policy is not None
+        else dict(FINAL_EDIT_QA_GENERATION_CONFIG)
+    )
 
     metadata = _probe_media(resolved_render)
-    _validate_media_mode(metadata, mode)
+    _validate_media_mode(
+        metadata,
+        mode,
+        music_supplied=music_supplied,
+    )
     render_hash = sha256_file(resolved_render)
     brief_hash = sha256_file(resolved_brief) if resolved_brief else None
     segment_contract = build_final_qa_segment_contract(manifest, mode=mode)
@@ -1036,7 +1314,11 @@ def prepare_final_edit_qa(
             "segment_contract": segment_contract,
         }
     )
-    proxy_contract = _proxy_contract(mode, crop_include_audio)
+    proxy_contract = _proxy_contract(
+        mode,
+        crop_include_audio,
+        music_supplied=music_supplied,
+    )
     proxy_contract_hash = _canonical_sha256(proxy_contract)
     proxy_path = (
         resolved_output
@@ -1048,9 +1330,14 @@ def prepare_final_edit_qa(
         proxy_path,
         mode=mode,
         crop_include_audio=crop_include_audio,
+        music_supplied=music_supplied,
     )
     proxy_metadata = _probe_media(proxy_path)
-    _validate_media_mode(proxy_metadata, mode)
+    _validate_media_mode(
+        proxy_metadata,
+        mode,
+        music_supplied=music_supplied,
+    )
     proxy_hash = sha256_file(proxy_path)
     prompt_template = _read_prompt(mode, prompt_override)
     result_model: (
@@ -1060,6 +1347,7 @@ def prepare_final_edit_qa(
     ) = {
         "canonical_16x9": CanonicalFinalEditQa,
         "crop_only_9x16": CropOnlyFinalEditQa,
+        "autonomous_final_16x9": AutonomousFinalEditQa,
         "autonomous_final_9x16": AutonomousFinalEditQa,
     }[mode]
     schema = gemini_response_schema(result_model)
@@ -1073,6 +1361,7 @@ def prepare_final_edit_qa(
         brief=brief,
         segment_contract=segment_contract,
         autonomous_context=autonomous_context,
+        music_supplied=music_supplied,
     )
     input_hashes = {
         "contract_version": FINAL_EDIT_QA_CONTRACT_VERSION,
@@ -1087,13 +1376,15 @@ def prepare_final_edit_qa(
         "brief_sha256": brief_hash,
         "autonomous_context_hashes": context_hashes,
         "autonomous_context_file_hashes": context_file_hashes,
+        "music_supplied": music_supplied,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "system_instruction_sha256": hashlib.sha256(
             FINAL_EDIT_QA_SYSTEM_INSTRUCTION.encode("utf-8")
         ).hexdigest(),
         "response_schema_sha256": _canonical_sha256(schema),
         "proxy_contract": proxy_contract,
-        "media_resolution": "low",
+        "media_resolution": media_resolution,
+        "generation_config": generation_config,
         "media_metadata": metadata,
         "proxy_media_metadata": proxy_metadata,
         "segment_contract_sha256": _canonical_sha256(segment_contract),
@@ -1108,6 +1399,8 @@ def prepare_final_edit_qa(
         segment_contract=segment_contract,
         prompt=prompt,
         schema=schema,
+        media_resolution=media_resolution,
+        generation_config=generation_config,
         result_model=result_model,
         autonomous_context_paths=resolved_context_paths,
         autonomous_context_hashes=context_hashes,
@@ -1177,6 +1470,18 @@ def _validate_result(
             raise ValueError("Gemini changed the autonomous QA brief hash")
         if result.context_hashes != prepared.autonomous_context_hashes:
             raise ValueError("Gemini changed autonomous QA context hashes")
+        if hashes.get("music_supplied") is False:
+            if result.cue_alignment_claims:
+                raise ValueError(
+                    "music-free autonomous QA cannot claim cue alignment"
+                )
+            if any(
+                issue.issue_type == "music_sync_miss"
+                for issue in result.issues
+            ):
+                raise ValueError(
+                    "music-free autonomous QA cannot report music_sync_miss"
+                )
         expected_segment_ids = {
             item["segment_id"] for item in prepared.segment_contract
         }
@@ -1323,7 +1628,7 @@ def _normalize_application_owned_fields(
     if not isinstance(payload, dict):
         raise ValueError("Gemini final-edit QA output must be a JSON object")
     original = payload.get("requires_human_review")
-    normalized = mode != "autonomous_final_9x16"
+    normalized = mode not in AUTONOMOUS_FINAL_QA_MODES
     payload["requires_human_review"] = normalized
     application_owned_fields: dict[str, Any] = {
         "requires_human_review": {
@@ -1335,7 +1640,7 @@ def _normalize_application_owned_fields(
             ),
         }
     }
-    if mode == "autonomous_final_9x16" and autonomous_context_hashes:
+    if mode in AUTONOMOUS_FINAL_QA_MODES and autonomous_context_hashes:
         # These hashes bind the request to immutable application artifacts.
         # They are not a semantic model observation or a field whose key names
         # may be delegated to Gemini. Preserve the raw response separately,
@@ -1698,10 +2003,10 @@ def execute_final_edit_qa(
                 "type": "video",
                 "uri": str(uri),
                 "mime_type": str(mime_type),
-                "media_resolution": "low",
+                "media_resolution": prepared.media_resolution,
             },
         ],
-        "generation_config": FINAL_EDIT_QA_GENERATION_CONFIG,
+        "generation_config": prepared.generation_config,
         "response_format": {
             "type": "text",
             "mime_type": "application/json",
@@ -1717,7 +2022,7 @@ def execute_final_edit_qa(
             "segment_contract": prepared.segment_contract,
         },
     )
-    reservation = None
+    estimate = None
     if budget_ledger is not None:
         media_seconds = float(
             prepared.input_hashes["proxy_media_metadata"][
@@ -1728,23 +2033,50 @@ def execute_final_edit_qa(
             stage=f"final_qa:{prepared.mode}",
             model_id=prepared.model_id,
             media_duration_ms=round(media_seconds * 1_000),
-            media_resolution="low",
+            media_resolution=prepared.media_resolution,
             text_input_tokens=max(1, len(prepared.prompt) // 4),
             max_output_tokens=int(
-                FINAL_EDIT_QA_GENERATION_CONFIG["max_output_tokens"]
+                prepared.generation_config["max_output_tokens"]
             ),
             thinking_level=str(
-                FINAL_EDIT_QA_GENERATION_CONFIG["thinking_level"]
+                prepared.generation_config["thinking_level"]
             ),
             retry_allowance=0,
         )
-        reservation = budget_ledger.reserve(
-            estimate,
-            recovery_call=recovery_call,
+    if estimate is None:
+        media_seconds = float(
+            prepared.input_hashes["proxy_media_metadata"]["duration_seconds"]
+        )
+        estimate = estimate_paid_call(
+            stage=f"final_qa:{prepared.mode}",
+            model_id=prepared.model_id,
+            media_duration_ms=round(media_seconds * 1_000),
+            media_resolution=prepared.media_resolution,
+            text_input_tokens=max(1, len(prepared.prompt) // 4),
+            max_output_tokens=int(
+                prepared.generation_config["max_output_tokens"]
+            ),
+            thinking_level=str(
+                prepared.generation_config["thinking_level"]
+            ),
+            retry_allowance=0,
         )
     started = time.monotonic()
     try:
-        interaction = client.interactions.create(**request)
+        interaction, dispatch = dispatch_paid_interaction(
+            client=client,
+            request=request,
+            request_record={
+                **request,
+                "cache_key": prepared.cache_key,
+                "input_hashes": prepared.input_hashes,
+                "segment_contract": prepared.segment_contract,
+            },
+            journal_dir=run_dir,
+            estimate=estimate,
+            budget_ledger=budget_ledger,
+            recovery_call=recovery_call,
+        )
     except BaseException as error:
         elapsed = round(time.monotonic() - started, 3)
         write_json(
@@ -1782,6 +2114,13 @@ def execute_final_edit_qa(
     if not isinstance(raw_interaction, dict):
         raise ValueError("Gemini interaction did not serialize to an object")
     write_json(attempt_dir / "raw_interaction.json", raw_interaction)
+    complete_paid_dispatch(
+        handle=dispatch,
+        raw_interaction=raw_interaction,
+        raw_artifact_path=attempt_dir / "raw_interaction.json",
+        budget_ledger=budget_ledger,
+        model_id=str(raw_interaction.get("model") or prepared.model_id),
+    )
     output_text = str(getattr(interaction, "output_text", ""))
     write_json(attempt_dir / "raw_output.json", {"output_text": output_text})
     write_json(
@@ -1791,13 +2130,6 @@ def execute_final_edit_qa(
             "usage": raw_interaction.get("usage"),
         },
     )
-    if budget_ledger is not None and reservation is not None:
-        usage = raw_interaction.get("usage") or {}
-        budget_ledger.reconcile(
-            reservation.reservation_id,
-            usage=usage,
-            model_id=str(raw_interaction.get("model") or prepared.model_id),
-        )
     write_json(
         attempt_dir / "timing.json",
         {

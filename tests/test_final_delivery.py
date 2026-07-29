@@ -9,6 +9,7 @@ import pytest
 from jascue_video_lab.final_delivery import (
     FinalDeliveryError,
     assemble_music_only_delivery,
+    assemble_picture_only_delivery,
 )
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.music import (
@@ -77,6 +78,43 @@ def _music(path: Path, duration: float) -> None:
         ],
         check=True,
     )
+
+
+def test_picture_only_delivery_is_explicitly_silent_and_hash_bound(
+    tmp_path: Path,
+) -> None:
+    picture = tmp_path / "picture.mp4"
+    _picture(picture, 1.0)
+    result = assemble_picture_only_delivery(
+        picture_path=picture,
+        output_path=tmp_path / "silent.mp4",
+        manifest_path=tmp_path / "silent.json",
+        aspect_ratio="16:9",
+        artifact_bindings={"render": "a" * 64},
+    )
+
+    payload = read_json(result.manifest_path)
+    assert payload["audio_policy"] == "explicitly_absent"
+    assert payload["output_sha256"] == sha256_file(result.output_path)
+    probe = json.loads(
+        subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_streams",
+                "-of",
+                "json",
+                str(result.output_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    assert {
+        stream["codec_type"] for stream in probe["streams"]
+    } == {"video"}
 
 
 def _assembled_music(

@@ -317,14 +317,15 @@ def _autonomous_files(
     tmp_path: Path,
     *,
     audio: bool = True,
+    vertical: bool = True,
 ) -> tuple[Path, Path, Path, dict[str, Path]]:
     render = tmp_path / "autonomous.mp4"
-    _write_video(render, vertical=True, audio=audio)
+    _write_video(render, vertical=vertical, audio=audio)
     manifest = tmp_path / "autonomous-manifest.json"
     write_json(
         manifest,
         {
-            "vertical": {
+            ("vertical" if vertical else "horizontal"): {
                 "chapters": [
                     {
                         "segment_id": "payoff",
@@ -372,7 +373,7 @@ def _autonomous_output(
     hashes = prepared.input_hashes
     return {
         "contract_version": "final-edit-qa-v1",
-        "mode": "autonomous_final_9x16",
+        "mode": prepared.mode,
         "render_sha256": hashes["render_sha256"],
         "proxy_sha256": hashes["proxy_sha256"],
         "manifest_sha256": hashes["manifest_sha256"],
@@ -386,6 +387,32 @@ def _autonomous_output(
         "limitations": ["Model QA is observational, not authority."],
         "requires_human_review": True,
     }
+
+
+def test_autonomous_16x9_qa_rejects_explicit_9x16_context(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(
+        tmp_path,
+        vertical=False,
+    )
+    music_map = read_json(contexts["music_map"])
+    music_map["aspect"] = "9:16"
+    write_json(contexts["music_map"], music_map)
+
+    with pytest.raises(
+        ValueError,
+        match="autonomous_final_16x9 cannot consume 9:16",
+    ):
+        prepare_final_edit_qa(
+            mode="autonomous_final_16x9",
+            render_path=render,
+            manifest_path=manifest,
+            brief_path=brief,
+            autonomous_context_paths=contexts,
+            output_dir=tmp_path / "qa",
+            model_id="gemini-3.6-flash",
+        )
 
 
 def test_canonical_final_qa_is_one_read_only_structured_request(
@@ -808,6 +835,45 @@ def test_autonomous_vertical_qa_consumes_audio_brief_and_all_contracts(
     assert "使用者 brief" in prepared.prompt
 
 
+def test_autonomous_horizontal_qa_uses_typed_authority_and_horizontal_timeline(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(
+        tmp_path,
+        vertical=False,
+    )
+    prepared = prepare_final_edit_qa(
+        mode="autonomous_final_16x9",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=tmp_path / "autonomous-horizontal-qa",
+        model_id="gemini-3.6-flash",
+        music_supplied=True,
+    )
+    interaction = _FakeInteraction(
+        _autonomous_output(prepared),
+        model="gemini-3.6-flash",
+    )
+
+    execution = execute_final_edit_qa(
+        prepared=prepared,
+        client=_FakeClient(interaction),
+        uploaded_video={"uri": "files/final", "mime_type": "video/mp4"},
+        output_dir=tmp_path / "autonomous-horizontal-qa",
+    )
+
+    assert isinstance(execution.result, AutonomousFinalEditQa)
+    assert execution.result.mode == "autonomous_final_16x9"
+    assert execution.result.requires_human_review is False
+    assert prepared.segment_contract[0]["brief_item_id"] == (
+        "generation-result"
+    )
+    assert prepared.input_hashes["proxy_contract"]["width"] == 1280
+    assert prepared.input_hashes["proxy_contract"]["height"] == 720
+
+
 def test_autonomous_vertical_qa_rejects_silent_final_media(
     tmp_path: Path,
 ) -> None:
@@ -826,6 +892,54 @@ def test_autonomous_vertical_qa_rejects_silent_final_media(
             output_dir=tmp_path / "qa",
             model_id="gemini-3.6-flash",
         )
+
+
+def test_music_free_autonomous_qa_uses_silent_proxy_and_visual_rhythm_contract(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(
+        tmp_path,
+        audio=False,
+        vertical=False,
+    )
+    prepared = prepare_final_edit_qa(
+        mode="autonomous_final_16x9",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=tmp_path / "silent-autonomous-qa",
+        model_id="gemini-3.6-flash",
+        music_supplied=False,
+    )
+
+    assert prepared.input_hashes["music_supplied"] is False
+    assert prepared.input_hashes["proxy_contract"]["audio"] == "omitted"
+    assert prepared.input_hashes["proxy_media_metadata"]["has_audio"] is False
+    assert "不得回報 music_sync_miss" in prepared.prompt
+
+    result_payload = _autonomous_output(
+        prepared,
+        status="issues_observed",
+        issues=[
+            {
+                "issue_id": "invented-music",
+                "issue_type": "music_sync_miss",
+                "severity": "high",
+                "segment_id": "payoff",
+                "beat_id": "generation-result",
+                "observation": "The silent edit misses a musical accent.",
+                "evidence_modality": "audio",
+                "repair_class": "shift_trim_within_handles",
+            }
+        ],
+    )
+    result_payload["requires_human_review"] = False
+    result = AutonomousFinalEditQa.model_validate(
+        result_payload
+    )
+    with pytest.raises(ValueError, match="cannot report music_sync_miss"):
+        final_edit_qa_module._validate_result(prepared, result)
 
 
 def test_deterministic_qa_measures_cue_delta_and_fails_independently() -> None:
@@ -1442,3 +1556,61 @@ def test_final_qa_budget_cap_blocks_before_paid_interaction(
         )
 
     assert client.interactions.requests == []
+
+
+def test_final_qa_transport_journal_blocks_same_request_after_process_resume(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(tmp_path)
+    output_dir = tmp_path / "resumed-qa"
+    prepared = prepare_final_edit_qa(
+        mode="autonomous_final_9x16",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=output_dir,
+        model_id="gemini-3.6-flash",
+    )
+
+    class FailingInteractions:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def create(self, **request: Any) -> Any:
+            self.requests.append(request)
+            raise RuntimeError("429 transport interrupted")
+
+    first_client = type("Client", (), {})()
+    first_client.interactions = FailingInteractions()
+    first_ledger = BudgetLedger(max_cost_usd=1.25, max_interactions=25)
+    with pytest.raises(RuntimeError, match="429"):
+        execute_final_edit_qa(
+            prepared=prepared,
+            client=first_client,
+            uploaded_video={"uri": "files/final", "mime_type": "video/mp4"},
+            output_dir=output_dir,
+            budget_ledger=first_ledger,
+        )
+    assert len(first_client.interactions.requests) == 1
+    assert first_ledger.committed_interactions == 1
+    assert first_ledger.actual_cost_usd > 0
+
+    resumed_client = _FakeClient(
+        _FakeInteraction(
+            _autonomous_output(prepared),
+            model="gemini-3.6-flash",
+        )
+    )
+    resumed_ledger = BudgetLedger(max_cost_usd=1.25, max_interactions=25)
+    with pytest.raises(RuntimeError, match="durable dispatch journal"):
+        execute_final_edit_qa(
+            prepared=prepared,
+            client=resumed_client,
+            uploaded_video={"uri": "files/final", "mime_type": "video/mp4"},
+            output_dir=output_dir,
+            budget_ledger=resumed_ledger,
+        )
+    assert resumed_client.interactions.requests == []
+    assert resumed_ledger.committed_interactions == 1
+    assert resumed_ledger.actual_cost_usd == first_ledger.actual_cost_usd

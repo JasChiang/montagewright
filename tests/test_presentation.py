@@ -294,6 +294,12 @@ def test_static_subject_compiles_without_synthetic_motion() -> None:
 
     assert compilation.mode == "static_full_bleed_crop"
     assert compilation.static_crop_box_2d is not None
+    assert compilation.option_set is not None
+    assert compilation.selection is not None
+    assert compilation.selection.selected_option_id in {
+        option.option.option_id
+        for option in compilation.option_set.options
+    }
 
     assert not any(
         "motion" in code for code in compilation.decision_codes

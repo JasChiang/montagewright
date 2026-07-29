@@ -43,6 +43,43 @@
           "tolerance_frames": 2
         }
       ],
+      "minimum_fulfillment_level": "contextual_identity",
+      "fulfillment_alternatives": [
+        {
+          "fulfillment_level": "direct_demonstration",
+          "accepted_evidence_provenance": [
+            "direct_ui_interaction",
+            "direct_result"
+          ],
+          "claim_support_level": "direct",
+          "exact_event_requirement": "required_when_selected",
+          "visual_events": [
+            {
+              "event_type": "generation_result_stable_start",
+              "cue_relation": "principal_downbeat",
+              "tolerance_frames": 2
+            }
+          ]
+        },
+        {
+          "fulfillment_level": "contextual_identity",
+          "accepted_evidence_provenance": [
+            "direct_physical_action",
+            "prerecorded_screen_playback",
+            "promotional_graphic",
+            "context_only"
+          ],
+          "claim_support_level": "illustrative_only",
+          "exact_event_requirement": "none",
+          "degradation_codes": [
+            "direct_demonstration_unavailable",
+            "contextual_visual_substitution"
+          ],
+          "copy_suppression_codes": [
+            "specific_claim_copy_suppressed"
+          ]
+        }
+      ],
       "duration": {
         "minimum_readable_frames": 24,
         "preferred_frames": 54,
@@ -64,6 +101,41 @@
           "event_type": "watch_ui_state_change",
           "cue_relation": "music_emphasis",
           "tolerance_frames": 2
+        }
+      ],
+      "minimum_fulfillment_level": "contextual_identity",
+      "fulfillment_alternatives": [
+        {
+          "fulfillment_level": "direct_demonstration",
+          "accepted_evidence_provenance": [
+            "direct_ui_interaction"
+          ],
+          "claim_support_level": "direct",
+          "exact_event_requirement": "required_when_selected",
+          "visual_events": [
+            {
+              "event_type": "watch_ui_state_change",
+              "cue_relation": "music_emphasis",
+              "tolerance_frames": 2
+            }
+          ]
+        },
+        {
+          "fulfillment_level": "contextual_identity",
+          "accepted_evidence_provenance": [
+            "direct_physical_action",
+            "direct_ui_interaction",
+            "context_only"
+          ],
+          "claim_support_level": "illustrative_only",
+          "exact_event_requirement": "none",
+          "degradation_codes": [
+            "direct_demonstration_unavailable",
+            "contextual_visual_substitution"
+          ],
+          "copy_suppression_codes": [
+            "specific_claim_copy_suppressed"
+          ]
         }
       ],
       "duration": {

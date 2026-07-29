@@ -20,7 +20,12 @@ from PIL import Image
 from pydantic import Field, model_validator
 
 from .autonomous_policy import AutonomousEditPolicy
-from .billing import BudgetLedger, estimate_paid_call
+from .billing import (
+    BudgetLedger,
+    complete_paid_dispatch,
+    dispatch_paid_interaction,
+    estimate_paid_call,
+)
 from .event_lock import (
     EditorialBeatContract,
     ExactEventLockV2,
@@ -1467,6 +1472,7 @@ class GeminiLabClient:
         api_key: str | None = None,
         model_id: str = MODEL_ID,
         budget_ledger: BudgetLedger | None = None,
+        autonomous_policy: AutonomousEditPolicy | None = None,
     ) -> None:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not resolved_key:
@@ -1481,6 +1487,7 @@ class GeminiLabClient:
         )
         self.model_id = model_id
         self.budget_ledger = budget_ledger
+        self.autonomous_policy = autonomous_policy
 
     def close(self) -> None:
         self.client.close()
@@ -1772,29 +1779,27 @@ class GeminiLabClient:
                 )
                 // 4,
             )
-            reservation = self.budget_ledger.reserve(
-                estimate_paid_call(
-                    stage="semantic_negotiation",
-                    model_id=self.model_id,
-                    text_input_tokens=text_tokens,
-                    max_output_tokens=(
-                        policy.gemini_limits.semantic_negotiation.max_output_tokens
-                    ),
-                    thinking_level=(
-                        policy.gemini_limits.semantic_negotiation.thinking_level
-                    ),
+            estimate = estimate_paid_call(
+                stage="semantic_negotiation",
+                model_id=self.model_id,
+                text_input_tokens=text_tokens,
+                max_output_tokens=(
+                    policy.gemini_limits.semantic_negotiation.max_output_tokens
                 ),
+                thinking_level=(
+                    policy.gemini_limits.semantic_negotiation.thinking_level
+                ),
+            )
+            interaction, dispatch = dispatch_paid_interaction(
+                client=self.client,
+                request=request_record,
+                request_record=request_record,
+                journal_dir=run_dir,
+                estimate=estimate,
+                budget_ledger=self.budget_ledger,
                 recovery_call=recovery_call,
             )
-            try:
-                interaction = self.client.interactions.create(**request_record)
-            except Exception:
-                # Dispatch status is unknown once the SDK call begins. Keep
-                # the worst-case reservation active so a 429/503/transport
-                # failure cannot silently restore budget and trigger another
-                # paid attempt later in the run.
-                raise
-            raw_interaction, _ = _record_interaction_attempt(
+            raw_interaction, raw_attempt_path = _record_interaction_attempt(
                 run_dir=run_dir,
                 operation=f"semantic_negotiation_round_{round_number}",
                 canonical_filename=(
@@ -1803,12 +1808,13 @@ class GeminiLabClient:
                 ),
                 interaction=interaction,
             )
-            if reservation is not None:
-                self.budget_ledger.reconcile(
-                    reservation.reservation_id,
-                    usage=raw_interaction.get("usage") or {},
-                    model_id=self.model_id,
-                )
+            complete_paid_dispatch(
+                handle=dispatch,
+                raw_interaction=raw_interaction,
+                raw_artifact_path=raw_attempt_path,
+                budget_ledger=self.budget_ledger,
+                model_id=self.model_id,
+            )
             interaction_id = str(getattr(interaction, "id", "") or "")
             if not interaction_id:
                 raise ValueError("semantic negotiation response has no ID")
@@ -2276,34 +2282,38 @@ class GeminiLabClient:
         request_record = {**api_request, "input": recorded_input}
         output_dir.mkdir(parents=True, exist_ok=True)
         write_json(output_dir / "identity_checkpoint.request.json", request_record)
-        reservation = None
         budget_ledger = getattr(self, "budget_ledger", None)
-        if budget_ledger is not None:
-            reservation = budget_ledger.reserve(
-                estimate_paid_call(
-                    stage="identity_checkpoint",
-                    model_id=self.model_id,
-                    media_resolution="high",
-                    image_count=1 + len(identity_references),
-                    text_input_tokens=max(1, len(prompt) // 3),
-                    max_output_tokens=1024,
-                    thinking_level="medium",
-                    retry_allowance=0,
-                )
-            )
+        estimate = estimate_paid_call(
+            stage="identity_checkpoint",
+            model_id=self.model_id,
+            media_resolution="high",
+            image_count=1 + len(identity_references),
+            text_input_tokens=max(1, len(prompt) // 3),
+            max_output_tokens=1024,
+            thinking_level="medium",
+            retry_allowance=0,
+        )
         try:
-            interaction = self.client.interactions.create(**api_request)
-            if reservation is not None:
-                budget_ledger.reconcile(
-                    reservation.reservation_id,
-                    usage=(_raw_dump(interaction).get("usage") or {}),
-                    model_id=self.model_id,
-                )
-            _record_interaction_attempt(
+            interaction, dispatch = dispatch_paid_interaction(
+                client=self.client,
+                request=api_request,
+                request_record=request_record,
+                journal_dir=output_dir,
+                estimate=estimate,
+                budget_ledger=budget_ledger,
+            )
+            raw_interaction, raw_attempt_path = _record_interaction_attempt(
                 run_dir=output_dir,
                 operation="identity_checkpoint",
                 canonical_filename="identity_checkpoint.raw_interaction.json",
                 interaction=interaction,
+            )
+            complete_paid_dispatch(
+                handle=dispatch,
+                raw_interaction=raw_interaction,
+                raw_artifact_path=raw_attempt_path,
+                budget_ledger=budget_ledger,
+                model_id=self.model_id,
             )
             write_json(
                 output_dir / "identity_checkpoint.raw_output.json",
@@ -2389,13 +2399,34 @@ class GeminiLabClient:
                 ensure_ascii=False,
             )
         )
+        autonomous_policy = getattr(self, "autonomous_policy", None)
+        operation_limit = (
+            autonomous_policy.gemini_limits.multi_target_grounding
+            if autonomous_policy is not None
+            else None
+        )
+        media_resolution = (
+            autonomous_policy.media_resolution.exact_frame_grounding_image
+            if autonomous_policy is not None
+            else "high"
+        )
+        thinking_level = (
+            operation_limit.thinking_level
+            if operation_limit is not None
+            else "low"
+        )
+        max_output_tokens = (
+            operation_limit.max_output_tokens
+            if operation_limit is not None
+            else 2_048
+        )
         image_item = {
             "type": "image",
             "data": base64.b64encode(resolved_frame.read_bytes()).decode(
                 "ascii"
             ),
             "mime_type": mime_type,
-            "media_resolution": "high",
+            "media_resolution": media_resolution,
         }
         request = {
             "model": self.model_id,
@@ -2406,8 +2437,8 @@ class GeminiLabClient:
                 image_item,
             ],
             "generation_config": {
-                "thinking_level": "low",
-                "max_output_tokens": 2048,
+                "thinking_level": thinking_level,
+                "max_output_tokens": max_output_tokens,
             },
             "response_format": {
                 "type": "text",
@@ -2428,41 +2459,56 @@ class GeminiLabClient:
                         "type": "image",
                         "mime_type": mime_type,
                         "sha256": expected_frame_hash,
-                        "media_resolution": "high",
+                        "media_resolution": media_resolution,
                     },
                 ],
             },
         )
-        reservation = None
         budget_ledger = getattr(self, "budget_ledger", None)
-        if budget_ledger is not None:
-            reservation = budget_ledger.reserve(
-                estimate_paid_call(
-                    stage="multi_target_grounding",
-                    model_id=self.model_id,
-                    media_resolution="high",
-                    image_count=1,
-                    text_input_tokens=max(1, len(prompt) // 3),
-                    max_output_tokens=2048,
-                    thinking_level="low",
-                    retry_allowance=0,
-                )
-            )
+        estimate = estimate_paid_call(
+            stage="multi_target_grounding",
+            model_id=self.model_id,
+            media_resolution=media_resolution,
+            image_count=1,
+            text_input_tokens=max(1, len(prompt) // 3),
+            max_output_tokens=max_output_tokens,
+            thinking_level=thinking_level,
+            retry_allowance=0,
+        )
         try:
-            interaction = self.client.interactions.create(**request)
-            if reservation is not None:
-                budget_ledger.reconcile(
-                    reservation.reservation_id,
-                    usage=(_raw_dump(interaction).get("usage") or {}),
-                    model_id=self.model_id,
-                )
-            _record_interaction_attempt(
+            interaction, dispatch = dispatch_paid_interaction(
+                client=self.client,
+                request=request,
+                request_record={
+                    **request,
+                    "input": [
+                        request["input"][0],
+                        {
+                            "type": "image",
+                            "mime_type": mime_type,
+                            "sha256": expected_frame_hash,
+                            "media_resolution": media_resolution,
+                        },
+                    ],
+                },
+                journal_dir=output_dir,
+                estimate=estimate,
+                budget_ledger=budget_ledger,
+            )
+            raw_interaction, raw_attempt_path = _record_interaction_attempt(
                 run_dir=output_dir,
                 operation="multi_target_grounding",
                 canonical_filename=(
                     "multi_target_grounding.raw_interaction.json"
                 ),
                 interaction=interaction,
+            )
+            complete_paid_dispatch(
+                handle=dispatch,
+                raw_interaction=raw_interaction,
+                raw_artifact_path=raw_attempt_path,
+                budget_ledger=budget_ledger,
+                model_id=self.model_id,
             )
             write_json(
                 output_dir / "multi_target_grounding.raw_output.json",
@@ -2670,34 +2716,38 @@ class GeminiLabClient:
             "canonical_coordinate_order": "xmin,ymin,xmax,ymax",
         }
         write_json(output_dir / "grounding.request.json", request_record)
-        reservation = None
         budget_ledger = getattr(self, "budget_ledger", None)
-        if budget_ledger is not None:
-            reservation = budget_ledger.reserve(
-                estimate_paid_call(
-                    stage="single_target_grounding",
-                    model_id=self.model_id,
-                    media_resolution="high",
-                    image_count=1 + len(identity_references),
-                    text_input_tokens=max(1, len(prompt) // 3),
-                    max_output_tokens=2048,
-                    thinking_level="low",
-                    retry_allowance=0,
-                )
-            )
+        estimate = estimate_paid_call(
+            stage="single_target_grounding",
+            model_id=self.model_id,
+            media_resolution="high",
+            image_count=1 + len(identity_references),
+            text_input_tokens=max(1, len(prompt) // 3),
+            max_output_tokens=2048,
+            thinking_level="low",
+            retry_allowance=0,
+        )
         try:
-            interaction = self.client.interactions.create(**api_request)
-            if reservation is not None:
-                budget_ledger.reconcile(
-                    reservation.reservation_id,
-                    usage=(_raw_dump(interaction).get("usage") or {}),
-                    model_id=self.model_id,
-                )
-            _record_interaction_attempt(
+            interaction, dispatch = dispatch_paid_interaction(
+                client=self.client,
+                request=api_request,
+                request_record=request_record,
+                journal_dir=output_dir,
+                estimate=estimate,
+                budget_ledger=budget_ledger,
+            )
+            raw_interaction, raw_attempt_path = _record_interaction_attempt(
                 run_dir=output_dir,
                 operation="grounding",
                 canonical_filename="grounding.raw_interaction.json",
                 interaction=interaction,
+            )
+            complete_paid_dispatch(
+                handle=dispatch,
+                raw_interaction=raw_interaction,
+                raw_artifact_path=raw_attempt_path,
+                budget_ledger=budget_ledger,
+                model_id=self.model_id,
             )
             write_json(output_dir / "grounding.raw_output.json", {"output_text": interaction.output_text})
             parsed = GeminiNativeGroundingProposal.model_validate_json(interaction.output_text)
@@ -2843,6 +2893,7 @@ model_provenance (return it unchanged with interaction_id=null):
             ],
             "generation_config": {
                 "thinking_level": "low",
+                "max_output_tokens": 2_048,
             },
             "response_format": {
                 "type": "text",
@@ -2960,7 +3011,10 @@ model_provenance (return it unchanged with interaction_id=null):
                 },
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"thinking_level": "low"},
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 2_048,
+            },
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -3068,7 +3122,10 @@ model_provenance (return it unchanged with interaction_id=null):
                 },
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"thinking_level": "low"},
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 4_096,
+            },
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -3166,7 +3223,10 @@ model_provenance (return it unchanged with interaction_id=null):
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": api_input,
-            "generation_config": {"thinking_level": "low"},
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 4_096,
+            },
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -3275,7 +3335,10 @@ model_provenance (return it unchanged with interaction_id=null):
                 },
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"thinking_level": "low"},
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 4_096,
+            },
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -3379,7 +3442,10 @@ model_provenance (return it unchanged with interaction_id=null):
                     "media_resolution": "low",
                 },
             ],
-            "generation_config": {"thinking_level": "low"},
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 4_096,
+            },
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -3468,6 +3534,9 @@ model_provenance (return it unchanged with interaction_id=null):
             "只能從本次提供的原比例影格選擇既有 frame ID。不得輸出、"
             "推算或改寫 timestamp、PTS、秒數、bbox 或 crop。"
             "每個 event 必須回傳 selected/support start/support end IDs；"
+            "event_id 必須逐字回傳 editorial_events 中的 "
+            "required_event_id（格式為 beat_id:event_type），不得只用 "
+            "event_type 或自創 ID；"
             "若任一 requested event 在提供的影格中沒有足夠證據，"
             "必須回傳 selections=[]，不得猜測，也不得用近似動作代替。\n"
             f"source_asset_id={catalog.source_asset_id}\n"
@@ -3481,7 +3550,12 @@ model_provenance (return it unchanged with interaction_id=null):
                     {
                         "beat_id": beat.beat_id,
                         "events": [
-                            event.model_dump(mode="json")
+                            {
+                                "required_event_id": (
+                                    f"{beat.beat_id}:{event.event_type}"
+                                ),
+                                **event.model_dump(mode="json"),
+                            }
                             for event in beat.visual_events
                         ],
                     }
@@ -3494,6 +3568,27 @@ model_provenance (return it unchanged with interaction_id=null):
         recorded_input: list[dict[str, Any]] = [
             {"type": "text", "text": prompt}
         ]
+        autonomous_policy = getattr(self, "autonomous_policy", None)
+        operation_limit = (
+            autonomous_policy.gemini_limits.exact_event_group
+            if autonomous_policy is not None
+            else None
+        )
+        media_resolution = (
+            autonomous_policy.media_resolution.exact_event_image
+            if autonomous_policy is not None
+            else "high"
+        )
+        thinking_level = (
+            operation_limit.thinking_level
+            if operation_limit is not None
+            else "low"
+        )
+        max_output_tokens = (
+            operation_limit.max_output_tokens
+            if operation_limit is not None
+            else 2_048
+        )
         for frame in bracket:
             path = Path(frame.image_path).expanduser().resolve(strict=True)
             mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
@@ -3510,7 +3605,7 @@ model_provenance (return it unchanged with interaction_id=null):
                             "ascii"
                         ),
                         "mime_type": mime_type,
-                        "media_resolution": "high",
+                        "media_resolution": media_resolution,
                     },
                 ]
             )
@@ -3522,7 +3617,7 @@ model_provenance (return it unchanged with interaction_id=null):
                         "mime_type": mime_type,
                         "sha256": frame.frame_hash,
                         "frame_id": frame.frame_id,
-                        "media_resolution": "high",
+                        "media_resolution": media_resolution,
                     },
                 ]
             )
@@ -3532,8 +3627,8 @@ model_provenance (return it unchanged with interaction_id=null):
             "store": False,
             "input": api_input,
             "generation_config": {
-                "thinking_level": "low",
-                "max_output_tokens": 2048,
+                "thinking_level": thinking_level,
+                "max_output_tokens": max_output_tokens,
             },
             "response_format": {
                 "type": "text",
@@ -3541,38 +3636,40 @@ model_provenance (return it unchanged with interaction_id=null):
                 "schema": gemini_response_schema(ExactEventSelectionGroup),
             },
         }
-        write_json(
-            run_dir / "exact_event.request.json",
-            {**request, "input": recorded_input},
-        )
-        reservation = None
+        request_record = {**request, "input": recorded_input}
+        write_json(run_dir / "exact_event.request.json", request_record)
         budget_ledger = getattr(self, "budget_ledger", None)
-        if budget_ledger is not None:
-            reservation = budget_ledger.reserve(
-                estimate_paid_call(
-                    stage="exact_event_group",
-                    model_id=self.model_id,
-                    media_resolution="high",
-                    image_count=len(bracket),
-                    text_input_tokens=max(1, len(prompt) // 3),
-                    max_output_tokens=2048,
-                    thinking_level="low",
-                    retry_allowance=0,
-                )
-            )
+        estimate = estimate_paid_call(
+            stage="exact_event_group",
+            model_id=self.model_id,
+            media_resolution=media_resolution,
+            image_count=len(bracket),
+            text_input_tokens=max(1, len(prompt) // 3),
+            max_output_tokens=max_output_tokens,
+            thinking_level=thinking_level,
+            retry_allowance=0,
+        )
         try:
-            interaction = self.client.interactions.create(**request)
-            if reservation is not None:
-                budget_ledger.reconcile(
-                    reservation.reservation_id,
-                    usage=(_raw_dump(interaction).get("usage") or {}),
-                    model_id=self.model_id,
-                )
-            _record_interaction_attempt(
+            interaction, dispatch = dispatch_paid_interaction(
+                client=self.client,
+                request=request,
+                request_record=request_record,
+                journal_dir=run_dir,
+                estimate=estimate,
+                budget_ledger=budget_ledger,
+            )
+            raw_interaction, raw_attempt_path = _record_interaction_attempt(
                 run_dir=run_dir,
                 operation="exact_event_group",
                 canonical_filename="exact_event.raw_interaction.json",
                 interaction=interaction,
+            )
+            complete_paid_dispatch(
+                handle=dispatch,
+                raw_interaction=raw_interaction,
+                raw_artifact_path=raw_attempt_path,
+                budget_ledger=budget_ledger,
+                model_id=self.model_id,
             )
             write_json(
                 run_dir / "exact_event.raw_output.json",
@@ -3726,7 +3823,10 @@ model_provenance (return it unchanged with interaction_id=null):
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": api_input,
-            "generation_config": {"thinking_level": "low"},
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 2_048,
+            },
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -4326,7 +4426,10 @@ model_provenance (return it unchanged with interaction_id=null):
                 },
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"thinking_level": "low"},
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 24_576,
+            },
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -4867,7 +4970,10 @@ model_provenance (return it unchanged with interaction_id=null):
                         "media_resolution": "low",
                     },
                 ],
-                "generation_config": {"thinking_level": "low"},
+                "generation_config": {
+                    "thinking_level": "low",
+                    "max_output_tokens": 4_096,
+                },
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",

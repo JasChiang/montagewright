@@ -190,7 +190,10 @@ model_provenance 必須原樣回傳：
         ),
         "store": False,
         "input": [{"type": "text", "text": prompt}],
-        "generation_config": {"thinking_level": "high"},
+        "generation_config": {
+            "thinking_level": "high",
+            "max_output_tokens": 12_000,
+        },
         "response_format": {
             "type": "text",
             "mime_type": "application/json",

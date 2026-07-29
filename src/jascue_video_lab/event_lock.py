@@ -47,7 +47,26 @@ CueRelation = Literal[
     "music_emphasis",
     "phrase_ending",
 ]
-EXACT_EVENT_RESOLVER_VERSION = "exact-event-frame-selection-v2"
+EvidenceFulfillmentLevel = Literal[
+    "contextual_identity",
+    "visible_state",
+    "visible_result",
+    "direct_demonstration",
+]
+ClaimSupportLevel = Literal[
+    "illustrative_only",
+    "observable_state",
+    "observable_result",
+    "direct",
+]
+ExactEventRequirement = Literal["none", "required_when_selected"]
+EXACT_EVENT_RESOLVER_VERSION = "exact-event-frame-selection-v3"
+_FULFILLMENT_STRENGTH: dict[EvidenceFulfillmentLevel, int] = {
+    "contextual_identity": 0,
+    "visible_state": 1,
+    "visible_result": 2,
+    "direct_demonstration": 3,
+}
 
 
 class ReadabilityDuration(FrozenStrictModel):
@@ -81,6 +100,155 @@ class SyntheticMotionPermission(FrozenStrictModel):
     ] = "optional"
 
 
+class EvidenceFulfillmentAlternative(FrozenStrictModel):
+    """One authorized way to fulfill a beat without changing evidence truth.
+
+    The alternative binds claim strength separately from exact-event
+    availability.  In particular, contextual footage may keep a chapter in the
+    edit, but it may not manufacture a direct demonstration or an exact event.
+    """
+
+    fulfillment_level: EvidenceFulfillmentLevel
+    accepted_evidence_provenance: tuple[
+        FeatureEvidenceProvenance, ...
+    ] = Field(min_length=1)
+    required_observable_predicates: tuple[str, ...] = ()
+    claim_support_level: ClaimSupportLevel
+    exact_event_requirement: ExactEventRequirement
+    visual_events: tuple[EditorialVisualEvent, ...] = Field(
+        default=(),
+        max_length=8,
+    )
+    degradation_codes: tuple[str, ...] = ()
+    copy_suppression_codes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_alternative(self) -> "EvidenceFulfillmentAlternative":
+        if len(set(self.accepted_evidence_provenance)) != len(
+            self.accepted_evidence_provenance
+        ):
+            raise ValueError(
+                "fulfillment evidence provenance values must be unique"
+            )
+        if len(set(self.required_observable_predicates)) != len(
+            self.required_observable_predicates
+        ):
+            raise ValueError(
+                "fulfillment observable predicates must be unique"
+            )
+        event_types = [event.event_type for event in self.visual_events]
+        if len(set(event_types)) != len(event_types):
+            raise ValueError(
+                "fulfillment visual event types must be unique"
+            )
+        if len(set(self.degradation_codes)) != len(self.degradation_codes):
+            raise ValueError("fulfillment degradation codes must be unique")
+        if len(set(self.copy_suppression_codes)) != len(
+            self.copy_suppression_codes
+        ):
+            raise ValueError(
+                "fulfillment copy-suppression codes must be unique"
+            )
+        if (
+            self.exact_event_requirement == "required_when_selected"
+            and not self.visual_events
+        ):
+            raise ValueError(
+                "exact-event fulfillment requires at least one visual event"
+            )
+        if (
+            self.exact_event_requirement == "none"
+            and self.visual_events
+        ):
+            raise ValueError(
+                "non-exact fulfillment cannot declare exact visual events"
+            )
+        if self.fulfillment_level == "contextual_identity":
+            if self.claim_support_level != "illustrative_only":
+                raise ValueError(
+                    "contextual identity footage is illustrative only"
+                )
+            if self.exact_event_requirement != "none":
+                raise ValueError(
+                    "contextual identity footage cannot require an exact event"
+                )
+            if (
+                "contextual_visual_substitution"
+                not in self.degradation_codes
+            ):
+                raise ValueError(
+                    "contextual fallback must record its substitution"
+                )
+            if (
+                "specific_claim_copy_suppressed"
+                not in self.copy_suppression_codes
+            ):
+                raise ValueError(
+                    "contextual fallback must suppress specific claim copy"
+                )
+        return self
+
+
+class EvidenceFulfillmentObservation(FrozenStrictModel):
+    """Immutable evidence facts available for one bounded candidate."""
+
+    candidate_id: str = Field(min_length=1)
+    evidence_provenance: FeatureEvidenceProvenance
+    observable_predicates: tuple[str, ...] = ()
+    available_visual_event_types: tuple[VisualEventType, ...] | None = None
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> "EvidenceFulfillmentObservation":
+        if len(set(self.observable_predicates)) != len(
+            self.observable_predicates
+        ):
+            raise ValueError("observable predicates must be unique")
+        if (
+            self.available_visual_event_types is not None
+            and len(set(self.available_visual_event_types))
+            != len(self.available_visual_event_types)
+        ):
+            raise ValueError("available visual event types must be unique")
+        return self
+
+
+class EditorialBeatFulfillmentSelection(FrozenStrictModel):
+    """The strongest eligible, locally verified fulfillment for one beat."""
+
+    beat_id: str
+    candidate_id: str
+    fulfillment_level: EvidenceFulfillmentLevel
+    evidence_provenance: FeatureEvidenceProvenance
+    claim_support_level: ClaimSupportLevel
+    visual_events: tuple[EditorialVisualEvent, ...] = ()
+    exact_event_required: bool
+    degradation_codes: tuple[str, ...] = ()
+    copy_suppression_codes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "EditorialBeatFulfillmentSelection":
+        if self.exact_event_required != bool(self.visual_events):
+            raise ValueError(
+                "selected exact-event requirement must match visual events"
+            )
+        if self.fulfillment_level == "contextual_identity":
+            if self.exact_event_required:
+                raise ValueError(
+                    "contextual fulfillment cannot fabricate exact events"
+                )
+            if (
+                "contextual_visual_substitution"
+                not in self.degradation_codes
+                or "specific_claim_copy_suppressed"
+                not in self.copy_suppression_codes
+            ):
+                raise ValueError(
+                    "contextual selection requires degradation and copy "
+                    "suppression"
+                )
+        return self
+
+
 class EditorialBeatContract(FrozenStrictModel):
     contract_version: Literal["editorial-beat-contract-v1"] = (
         "editorial-beat-contract-v1"
@@ -107,9 +275,13 @@ class EditorialBeatContract(FrozenStrictModel):
         "closing",
     ]
     visual_events: tuple[EditorialVisualEvent, ...] = Field(
-        min_length=1,
+        default=(),
         max_length=8,
     )
+    minimum_fulfillment_level: EvidenceFulfillmentLevel | None = None
+    fulfillment_alternatives: tuple[
+        EvidenceFulfillmentAlternative, ...
+    ] = Field(default=(), max_length=4)
     duration: ReadabilityDuration
     relation_mode: Literal[
         "single_subject",
@@ -149,7 +321,151 @@ class EditorialBeatContract(FrozenStrictModel):
             self.allowed_evidence_provenance
         ):
             raise ValueError("allowed evidence provenance values must be unique")
+        if not self.fulfillment_alternatives:
+            if self.minimum_fulfillment_level is not None:
+                raise ValueError(
+                    "minimum fulfillment level requires alternatives"
+                )
+            if not self.visual_events:
+                raise ValueError(
+                    "legacy editorial beats require at least one visual event"
+                )
+            return self
+        if self.minimum_fulfillment_level is None:
+            raise ValueError(
+                "fulfillment alternatives require a minimum level"
+            )
+        levels = [
+            alternative.fulfillment_level
+            for alternative in self.fulfillment_alternatives
+        ]
+        if len(set(levels)) != len(levels):
+            raise ValueError("fulfillment alternative levels must be unique")
+        minimum_strength = _FULFILLMENT_STRENGTH[
+            self.minimum_fulfillment_level
+        ]
+        if any(
+            _FULFILLMENT_STRENGTH[level] < minimum_strength
+            for level in levels
+        ):
+            raise ValueError(
+                "fulfillment alternatives cannot fall below the minimum level"
+            )
         return self
+
+    @property
+    def effective_fulfillment_alternatives(
+        self,
+    ) -> tuple[EvidenceFulfillmentAlternative, ...]:
+        """Expose legacy contracts as one direct, exact-event alternative."""
+
+        if self.fulfillment_alternatives:
+            return self.fulfillment_alternatives
+        return (
+            EvidenceFulfillmentAlternative(
+                fulfillment_level="direct_demonstration",
+                accepted_evidence_provenance=(
+                    self.allowed_evidence_provenance
+                ),
+                claim_support_level="direct",
+                exact_event_requirement="required_when_selected",
+                visual_events=self.visual_events,
+            ),
+        )
+
+
+def select_strongest_evidence_fulfillment(
+    contract: EditorialBeatContract,
+    observations: Sequence[EvidenceFulfillmentObservation],
+) -> EditorialBeatFulfillmentSelection:
+    """Select the strongest contract-authorized evidence without relabeling it.
+
+    A known-empty ``available_visual_event_types`` tuple means exact-event
+    inspection found no declared event and makes an exact alternative
+    ineligible. ``None`` means the event has not been resolved yet, so the
+    selected alternative remains fail-closed and still requires resolution.
+    """
+
+    alternatives = sorted(
+        contract.effective_fulfillment_alternatives,
+        key=lambda alternative: _FULFILLMENT_STRENGTH[
+            alternative.fulfillment_level
+        ],
+        reverse=True,
+    )
+    minimum_level = (
+        contract.minimum_fulfillment_level or "direct_demonstration"
+    )
+    minimum_strength = _FULFILLMENT_STRENGTH[minimum_level]
+    for alternative in alternatives:
+        if (
+            _FULFILLMENT_STRENGTH[alternative.fulfillment_level]
+            < minimum_strength
+        ):
+            continue
+        required_predicates = set(
+            alternative.required_observable_predicates
+        )
+        required_event_types = {
+            event.event_type for event in alternative.visual_events
+        }
+        for observation in observations:
+            if (
+                observation.evidence_provenance
+                not in alternative.accepted_evidence_provenance
+            ):
+                continue
+            if not required_predicates.issubset(
+                observation.observable_predicates
+            ):
+                continue
+            if (
+                alternative.exact_event_requirement
+                == "required_when_selected"
+                and observation.available_visual_event_types is not None
+                and not required_event_types.issubset(
+                    observation.available_visual_event_types
+                )
+            ):
+                continue
+            return EditorialBeatFulfillmentSelection(
+                beat_id=contract.beat_id,
+                candidate_id=observation.candidate_id,
+                fulfillment_level=alternative.fulfillment_level,
+                evidence_provenance=observation.evidence_provenance,
+                claim_support_level=alternative.claim_support_level,
+                visual_events=alternative.visual_events,
+                exact_event_required=(
+                    alternative.exact_event_requirement
+                    == "required_when_selected"
+                ),
+                degradation_codes=alternative.degradation_codes,
+                copy_suppression_codes=(
+                    alternative.copy_suppression_codes
+                ),
+            )
+    raise ValueError(
+        "no evidence candidate satisfies the editorial beat minimum "
+        f"fulfillment level: {contract.beat_id}/{minimum_level}"
+    )
+
+
+def bind_selected_fulfillment(
+    contract: EditorialBeatContract,
+    selection: EditorialBeatFulfillmentSelection,
+) -> EditorialBeatContract:
+    """Materialize only the selected alternative for exact-event execution."""
+
+    if selection.beat_id != contract.beat_id:
+        raise ValueError("fulfillment selection belongs to another beat")
+    return contract.model_copy(
+        update={
+            "allowed_evidence_provenance": (
+                selection.evidence_provenance,
+            ),
+            "visual_events": selection.visual_events,
+        }
+    )
 
 
 class ExactEventSelection(FrozenStrictModel):
@@ -247,7 +563,7 @@ class AuthorizedTrimIntentDecisionV2(FrozenStrictModel):
     authority: DecisionAuthorityV2
     approval_status: Literal["approved"] = "approved"
     requires_human_review: Literal[False] = False
-    exact_event_lock_sha256s: tuple[str, ...] = Field(min_length=1)
+    exact_event_lock_sha256s: tuple[str, ...] = ()
     generated_at: str
 
     @model_validator(mode="after")
@@ -565,7 +881,13 @@ def bind_grouped_event_lock_ids(
     locks: Sequence[ExactEventLockV2],
     contracts: Sequence[EditorialBeatContract],
 ) -> tuple[ExactEventLockV2, ...]:
-    """Bind model-selected events by declared type, independent of return order."""
+    """Bind locks by beat-qualified ID; allow unambiguous legacy type binding.
+
+    A repeated event type in two beats is not interchangeable evidence. New
+    resolvers must therefore return ``<beat_id>:<event_type>``. Historical
+    arbitrary IDs remain compatible only when one requested beat owns that
+    event type.
+    """
 
     expected_by_type: dict[str, list[str]] = {}
     for contract in contracts:
@@ -573,22 +895,73 @@ def bind_grouped_event_lock_ids(
             expected_by_type.setdefault(event.event_type, []).append(
                 f"{contract.beat_id}:{event.event_type}"
             )
-    if len(locks) != sum(len(ids) for ids in expected_by_type.values()):
+    expected_ids = {
+        event_id
+        for event_ids in expected_by_type.values()
+        for event_id in event_ids
+    }
+    if len(locks) != len(expected_ids):
         raise ValueError("grouped ExactEventLocks omitted a requested event")
     bound: list[ExactEventLockV2] = []
+    consumed: set[str] = set()
     for lock in locks:
-        expected_ids = expected_by_type.get(lock.event_type)
-        if not expected_ids:
+        event_ids_for_type = expected_by_type.get(lock.event_type)
+        if not event_ids_for_type:
             raise ValueError(
                 "grouped ExactEventLocks returned an undeclared event type: "
                 f"{lock.event_type}"
             )
-        bound.append(
-            lock.model_copy(update={"event_id": expected_ids.pop(0)})
+        if lock.event_id in expected_ids:
+            bound_event_id = lock.event_id
+            if bound_event_id not in event_ids_for_type:
+                raise ValueError(
+                    "grouped ExactEventLock beat-qualified ID disagrees with "
+                    f"its event type: {bound_event_id}/{lock.event_type}"
+                )
+        elif len(event_ids_for_type) == 1:
+            bound_event_id = event_ids_for_type[0]
+        else:
+            raise ValueError(
+                "ambiguous legacy ExactEventLock ID cannot bind repeated "
+                f"event type across beats: {lock.event_type}"
+            )
+        if bound_event_id in consumed:
+            raise ValueError(
+                "grouped ExactEventLocks duplicated a beat-qualified event: "
+                f"{bound_event_id}"
+            )
+        consumed.add(bound_event_id)
+        bound.append(lock.model_copy(update={"event_id": bound_event_id}))
+    if consumed != expected_ids:
+        missing = sorted(expected_ids - consumed)
+        raise ValueError(
+            "grouped ExactEventLocks omitted requested beat events: "
+            + ", ".join(missing)
         )
-    if any(expected_by_type.values()):
-        raise ValueError("grouped ExactEventLocks omitted a requested event type")
     return tuple(bound)
+
+
+def hard_exact_event_requirements_satisfied(
+    contracts: Sequence[EditorialBeatContract],
+    locks: Sequence[ExactEventLockV2],
+) -> bool:
+    """Check hard exact evidence by beat-qualified ID, never global type."""
+
+    required = {
+        f"{contract.beat_id}:{event.event_type}": event.event_type
+        for contract in contracts
+        if contract.priority == "hard"
+        for event in contract.visual_events
+    }
+    observed: dict[str, str] = {}
+    for lock in locks:
+        if lock.event_id in observed:
+            return False
+        observed[lock.event_id] = lock.event_type
+    return all(
+        observed.get(event_id) == event_type
+        for event_id, event_type in required.items()
+    )
 
 
 def write_exact_event_bundle(
@@ -597,6 +970,7 @@ def write_exact_event_bundle(
     contracts: Sequence[EditorialBeatContract],
     locks: Sequence[ExactEventLockV2],
     selected_windows: Sequence[Mapping[str, Any]],
+    aspect: str | None = None,
 ) -> dict[str, Path]:
     """Persist the two grouped selected-window artifacts atomically by content."""
 
@@ -605,10 +979,12 @@ def write_exact_event_bundle(
     locks_path = output_dir / "exact-event-locks.json"
     contracts_payload = {
         "contract_version": "editorial-beat-contract-bundle-v1",
+        **({"aspect": aspect} if aspect is not None else {}),
         "beats": [contract.model_dump(mode="json") for contract in contracts],
     }
     locks_payload = {
         "contract_version": "exact-event-lock-bundle-v2",
+        **({"aspect": aspect} if aspect is not None else {}),
         "locks": [lock.model_dump(mode="json") for lock in locks],
         "selected_windows": [dict(window) for window in selected_windows],
     }

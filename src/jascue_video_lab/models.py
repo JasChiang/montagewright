@@ -4582,7 +4582,7 @@ class FeatureChapterBrief(StrictModel):
 class FeatureEditBrief(StrictModel):
     project_id: str
     title: str
-    target_duration_seconds: float = Field(ge=60.0, le=90.0)
+    target_duration_seconds: float = Field(ge=30.0, le=120.0)
     render_title_overlays: bool = True
     vertical_fallback_strategy: Literal["fit_with_background", "center_crop"] = (
         "center_crop"

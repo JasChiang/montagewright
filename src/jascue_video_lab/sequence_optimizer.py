@@ -27,6 +27,411 @@ PresentationMode = Literal[
 ]
 
 
+class CandidateRouteOption(FrozenStrictModel):
+    """One bounded pre-render sequence choice.
+
+    Exact evidence, tracking, and pixel geometry are deliberately not claimed
+    here.  The option binds every editorial fact that is already known before
+    rendering (candidate, resolved trim duration, music exit, presentation
+    family, and symbolic entry/exit composition).  Runtime execution must
+    still pass the unresolved hard gates and may advance to the next
+    globally-ranked fallback.
+    """
+
+    beat_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    event_id: str = Field(min_length=1)
+    planner_rank: int = Field(ge=1)
+    semantic_confidence: float = Field(ge=0.0, le=1.0)
+    presentation_intrusion_rank: int = Field(default=0, ge=0, le=10)
+    trim_duration_ms: int = Field(default=1, gt=0)
+    minimum_readable_ms: int = Field(default=1, gt=0)
+    preferred_readable_ms: int = Field(default=1, gt=0)
+    maximum_readable_ms: int = Field(default=1, gt=0)
+    cue_id: str = Field(default="no-music", min_length=1)
+    cue_aligned: bool = True
+    presentation_mode: PresentationMode = "source_hold"
+    entry_composition: str = Field(default="unresolved", min_length=1)
+    exit_composition: str = Field(default="unresolved", min_length=1)
+    technical_quality: float = Field(default=0.5, ge=0.0, le=1.0)
+    preflight_hard_failures: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_editorial_bounds(self) -> "CandidateRouteOption":
+        if not (
+            self.minimum_readable_ms
+            <= self.preferred_readable_ms
+            <= self.maximum_readable_ms
+        ):
+            raise ValueError("pre-render readability bounds must be ordered")
+        if not (
+            self.minimum_readable_ms
+            <= self.trim_duration_ms
+            <= self.maximum_readable_ms
+        ):
+            raise ValueError(
+                "pre-render trim duration must remain inside readability bounds"
+            )
+        return self
+
+
+class CandidateRouteBeat(FrozenStrictModel):
+    beat_id: str = Field(min_length=1)
+    options: tuple[CandidateRouteOption, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_options(self) -> "CandidateRouteBeat":
+        if any(option.beat_id != self.beat_id for option in self.options):
+            raise ValueError("candidate route options must match their beat")
+        ids = [option.candidate_id for option in self.options]
+        if len(ids) != len(set(ids)):
+            raise ValueError("candidate route option IDs must be unique")
+        return self
+
+
+class CandidateRouteSelection(FrozenStrictModel):
+    beat_id: str
+    candidate_id: str
+    source_asset_id: str
+    event_id: str
+    trim_duration_ms: int = Field(gt=0)
+    cue_id: str
+    cue_aligned: bool
+    presentation_mode: PresentationMode
+    entry_composition: str
+    exit_composition: str
+    decision_codes: tuple[str, ...]
+
+
+class CandidateRouteResult(FrozenStrictModel):
+    contract_version: Literal["pre-render-sequence-frontier-v2"] = (
+        "pre-render-sequence-frontier-v2"
+    )
+    selections: tuple[CandidateRouteSelection, ...]
+    fallback_candidate_ids_by_beat: Mapping[str, tuple[str, ...]]
+    option_bindings_by_beat: Mapping[
+        str,
+        Mapping[str, CandidateRouteOption],
+    ]
+    objective_score: float
+    beam_width: int = Field(gt=0)
+    total_duration_ms: int = Field(gt=0)
+    unresolved_runtime_hard_gates: tuple[str, ...] = (
+        "exact_event_evidence",
+        "identity",
+        "action_completeness",
+        "required_relation_and_scale",
+        "quality_safe_interval",
+        "reuse_authority",
+        "pixel_geometry",
+    )
+
+
+class _CandidateRouteState(FrozenStrictModel):
+    selections: tuple[CandidateRouteSelection, ...] = ()
+    source_asset_ids: tuple[str, ...] = ()
+    source_events: tuple[tuple[str, str], ...] = ()
+    exit_composition: str | None = None
+    duration_ms: int = Field(default=0, ge=0)
+    panel_duration_ms: int = Field(default=0, ge=0)
+    score: float = 0.0
+
+
+def optimize_pre_render_candidate_route(
+    beats: Sequence[CandidateRouteBeat],
+    *,
+    beam_width: int = 64,
+    minimum_duration_ms: int | None = None,
+    maximum_duration_ms: int | None = None,
+    max_panel_runtime_fraction: float | None = None,
+) -> CandidateRouteResult:
+    """Choose the executable pre-render frontier without inventing geometry.
+
+    Options with a known hard failure are removed before any preference score
+    is evaluated.  This is intentionally a first-stage optimizer: runtime
+    exact evidence and geometry remain fail-closed gates, and the result also
+    carries a globally contextual fallback order for those later failures.
+    """
+
+    if beam_width < 1:
+        raise ValueError("candidate route beam width must be positive")
+    if (minimum_duration_ms is None) != (maximum_duration_ms is None):
+        raise ValueError(
+            "pre-render duration bounds must be supplied together"
+        )
+    if (
+        minimum_duration_ms is not None
+        and maximum_duration_ms is not None
+        and (
+            minimum_duration_ms < 1
+            or maximum_duration_ms < minimum_duration_ms
+        )
+    ):
+        raise ValueError("pre-render duration bounds are invalid")
+    if max_panel_runtime_fraction is not None and not (
+        0 <= max_panel_runtime_fraction <= 1
+    ):
+        raise ValueError(
+            "pre-render panel runtime fraction must be between 0 and 1"
+        )
+    states = [_CandidateRouteState()]
+    for beat in beats:
+        feasible_options = [
+            option
+            for option in beat.options
+            if not option.preflight_hard_failures
+        ]
+        if not feasible_options:
+            failures = sorted(
+                {
+                    failure
+                    for option in beat.options
+                    for failure in option.preflight_hard_failures
+                }
+                or {"no_pre_render_candidate_options"}
+            )
+            raise ValueError(
+                "pre-render sequence frontier has no hard-safe option for "
+                f"{beat.beat_id}: {','.join(failures)}"
+            )
+        expanded: list[_CandidateRouteState] = []
+        for state in states:
+            for option in feasible_options:
+                exact_repeat = (
+                    option.source_asset_id,
+                    option.event_id,
+                ) in state.source_events
+                source_repeat_count = state.source_asset_ids.count(
+                    option.source_asset_id
+                )
+                immediate_repeat = bool(
+                    state.source_asset_ids
+                    and state.source_asset_ids[-1] == option.source_asset_id
+                )
+                composition_continuity = (
+                    state.exit_composition is not None
+                    and state.exit_composition != "unresolved"
+                    and option.entry_composition != "unresolved"
+                    and state.exit_composition == option.entry_composition
+                )
+                readability = min(
+                    1.0,
+                    option.trim_duration_ms
+                    / max(option.preferred_readable_ms, 1),
+                )
+                score = (
+                    state.score
+                    + option.semantic_confidence * 1.2
+                    + option.technical_quality * 0.20
+                    + readability * 0.15
+                    + (0.08 if option.cue_aligned else 0.0)
+                    + (0.05 if composition_continuity else 0.0)
+                    - (option.planner_rank - 1) * 0.10
+                    - option.presentation_intrusion_rank * 0.025
+                    - source_repeat_count * 0.12
+                    - (0.22 if immediate_repeat else 0.0)
+                    - (0.75 if exact_repeat else 0.0)
+                )
+                codes = ["gemini_semantic_rank_respected"]
+                if not exact_repeat:
+                    codes.append("exact_source_event_repetition_avoided")
+                if not immediate_repeat:
+                    codes.append("adjacent_source_variety_preferred")
+                codes.extend(
+                    (
+                        "resolved_trim_bound_before_render",
+                        "music_exit_bound_before_render",
+                        "presentation_family_bound_before_render",
+                        "entry_exit_composition_bound_before_render",
+                        "runtime_hard_gates_remain_fail_closed",
+                    )
+                )
+                if composition_continuity:
+                    codes.append("symbolic_composition_continuity_preferred")
+                expanded.append(
+                    _CandidateRouteState(
+                        selections=state.selections
+                        + (
+                            CandidateRouteSelection(
+                                beat_id=beat.beat_id,
+                                candidate_id=option.candidate_id,
+                                source_asset_id=option.source_asset_id,
+                                event_id=option.event_id,
+                                trim_duration_ms=option.trim_duration_ms,
+                                cue_id=option.cue_id,
+                                cue_aligned=option.cue_aligned,
+                                presentation_mode=option.presentation_mode,
+                                entry_composition=option.entry_composition,
+                                exit_composition=option.exit_composition,
+                                decision_codes=tuple(codes),
+                            ),
+                        ),
+                        source_asset_ids=state.source_asset_ids
+                        + (option.source_asset_id,),
+                        source_events=state.source_events
+                        + ((option.source_asset_id, option.event_id),),
+                        exit_composition=option.exit_composition,
+                        duration_ms=state.duration_ms + option.trim_duration_ms,
+                        panel_duration_ms=(
+                            state.panel_duration_ms
+                            + (
+                                option.trim_duration_ms
+                                if option.presentation_mode
+                                == "two_panel_layout"
+                                else 0
+                            )
+                        ),
+                        score=score,
+                    )
+                )
+        if not expanded:
+            raise ValueError(
+                f"candidate route has no options for beat {beat.beat_id}"
+            )
+        states = sorted(
+            expanded,
+            key=lambda state: (
+                state.score,
+                tuple(
+                    selection.candidate_id
+                    for selection in state.selections
+                ),
+            ),
+            reverse=True,
+        )[:beam_width]
+    eligible_states = [
+        state
+        for state in states
+        if (
+            (
+                minimum_duration_ms is None
+                or maximum_duration_ms is None
+                or minimum_duration_ms
+                <= state.duration_ms
+                <= maximum_duration_ms
+            )
+            and (
+                max_panel_runtime_fraction is None
+                or state.duration_ms == 0
+                or state.panel_duration_ms / state.duration_ms
+                <= max_panel_runtime_fraction + 1e-9
+            )
+        )
+    ]
+    if not eligible_states:
+        raise ValueError(
+            "pre-render sequence frontier has no route inside duration and "
+            "panel-runtime policy bounds"
+        )
+    best = max(
+        eligible_states,
+        key=lambda state: (
+            state.score,
+            tuple(
+                selection.candidate_id for selection in state.selections
+            ),
+        ),
+    )
+    selected_by_beat = {
+        selection.beat_id: selection.candidate_id
+        for selection in best.selections
+    }
+    fallback_candidate_ids_by_beat: dict[str, tuple[str, ...]] = {}
+    option_bindings_by_beat: dict[
+        str,
+        dict[str, CandidateRouteOption],
+    ] = {}
+    for beat in beats:
+        selected_candidate_id = selected_by_beat[beat.beat_id]
+        legal = [
+            option
+            for option in beat.options
+            if not option.preflight_hard_failures
+        ]
+        primary = next(
+            option
+            for option in legal
+            if option.candidate_id == selected_candidate_id
+        )
+        contextual_legal: list[CandidateRouteOption] = []
+        for option in legal:
+            substituted_duration_ms = (
+                best.duration_ms
+                - primary.trim_duration_ms
+                + option.trim_duration_ms
+            )
+            substituted_panel_duration_ms = (
+                best.panel_duration_ms
+                - (
+                    primary.trim_duration_ms
+                    if primary.presentation_mode == "two_panel_layout"
+                    else 0
+                )
+                + (
+                    option.trim_duration_ms
+                    if option.presentation_mode == "two_panel_layout"
+                    else 0
+                )
+            )
+            duration_safe = (
+                minimum_duration_ms is None
+                or maximum_duration_ms is None
+                or minimum_duration_ms
+                <= substituted_duration_ms
+                <= maximum_duration_ms
+            )
+            panel_safe = (
+                max_panel_runtime_fraction is None
+                or substituted_duration_ms == 0
+                or substituted_panel_duration_ms
+                / substituted_duration_ms
+                <= max_panel_runtime_fraction + 1e-9
+            )
+            if duration_safe and panel_safe:
+                contextual_legal.append(option)
+        # The primary comes from the global beam.  Remaining options use the
+        # same hard-first local terms and are deterministic.  Runtime never
+        # falls back to an option that the pre-render frontier rejected.
+        alternatives = sorted(
+            (
+                option
+                for option in contextual_legal
+                if option.candidate_id != selected_candidate_id
+            ),
+            key=lambda option: (
+                option.semantic_confidence * 1.2
+                + option.technical_quality * 0.20
+                + min(
+                    1.0,
+                    option.trim_duration_ms
+                    / max(option.preferred_readable_ms, 1),
+                )
+                * 0.15
+                + (0.08 if option.cue_aligned else 0.0)
+                - (option.planner_rank - 1) * 0.10
+                - option.presentation_intrusion_rank * 0.025,
+                option.candidate_id,
+            ),
+            reverse=True,
+        )
+        fallback_candidate_ids_by_beat[beat.beat_id] = (
+            selected_candidate_id,
+            *(option.candidate_id for option in alternatives),
+        )
+        option_bindings_by_beat[beat.beat_id] = {
+            option.candidate_id: option for option in contextual_legal
+        }
+    return CandidateRouteResult(
+        selections=best.selections,
+        fallback_candidate_ids_by_beat=fallback_candidate_ids_by_beat,
+        option_bindings_by_beat=option_bindings_by_beat,
+        objective_score=round(best.score, 6),
+        beam_width=beam_width,
+        total_duration_ms=best.duration_ms,
+    )
+
+
 class ConstraintResult(FrozenStrictModel):
     """Typed, evidence-carrying result shared by every editing capability."""
 

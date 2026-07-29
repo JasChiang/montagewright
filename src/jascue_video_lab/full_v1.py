@@ -408,7 +408,7 @@ def dense_window_for_event(
     return start, end, shot.shot_id
 
 
-def _cache_fingerprint(prompt: str) -> dict[str, str]:
+def _cache_fingerprint(prompt: str) -> dict[str, Any]:
     schema_json = json.dumps(
         gemini_response_schema(FullClipCard), sort_keys=True, separators=(",", ":")
     )
@@ -420,6 +420,8 @@ def _cache_fingerprint(prompt: str) -> dict[str, str]:
             VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
         ).hexdigest(),
         "media_resolution": "low",
+        "thinking_level": "low",
+        "max_output_tokens": 4_096,
     }
 
 
@@ -433,6 +435,11 @@ def _saved_request_matches_prompt(run_dir: Path, prompt: str) -> bool:
         return bool(
             request.get("model") == MODEL_ID
             and request.get("system_instruction") == VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
+            and request.get("generation_config")
+            == {
+                "thinking_level": "low",
+                "max_output_tokens": 4_096,
+            }
             and request_inputs
             and request_inputs[0].get("text", "").startswith(prompt)
         )

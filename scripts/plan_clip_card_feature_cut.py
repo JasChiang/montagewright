@@ -24,7 +24,10 @@ from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from jascue_video_lab.billing import summarize_usage_files
-from jascue_video_lab.autonomous_policy import AutonomousEditPolicy
+from jascue_video_lab.autonomous_policy import (
+    AutonomousEditPolicy,
+    sync_tolerance_for_priority,
+)
 from jascue_video_lab.clip_card_retrieval import (
     FeatureShortlistPlan,
     validate_feature_shortlist,
@@ -37,9 +40,11 @@ from jascue_video_lab.clip_card_observations import (
     assess_editing_claim,
     effective_event_observation_sha256,
     effective_event_observations,
+    validate_supplement,
 )
 from jascue_video_lab.clip_card_supplement_runner import (
     bounded_event_window_ms,
+    current_supplement_request_binding,
     render_bounded_event_proxy,
 )
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
@@ -50,7 +55,10 @@ from jascue_video_lab.editing_capabilities import (
 )
 from jascue_video_lab.event_lock import (
     EditorialBeatContract,
+    EditorialBeatFulfillmentSelection,
+    EvidenceFulfillmentObservation,
     load_editorial_beat_contracts,
+    select_strongest_evidence_fulfillment,
 )
 from jascue_video_lab.gemini import (
     GeminiLabClient,
@@ -1070,6 +1078,36 @@ class SelectedClipCardEvidence(StrictModel):
 FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v2"
 
 
+def fulfillment_observation_from_clip_card(
+    *,
+    candidate_id: str,
+    observation: EventObservationSupplement,
+    available_visual_event_types: tuple[str, ...] | None = None,
+) -> EvidenceFulfillmentObservation:
+    """Project immutable Clip Card observations into the generic contract."""
+
+    predicates = tuple(
+        dict.fromkeys(
+            [
+                *(
+                    beat.observable_predicate
+                    for beat in observation.observable_beats
+                ),
+                *(
+                    f"observable_beat:{beat.kind}"
+                    for beat in observation.observable_beats
+                ),
+            ]
+        )
+    )
+    return EvidenceFulfillmentObservation(
+        candidate_id=candidate_id,
+        evidence_provenance=observation.evidence_provenance,
+        observable_predicates=predicates,
+        available_visual_event_types=available_visual_event_types,
+    )
+
+
 def validate_hard_shortlist_provenance(
     shortlist: FeatureShortlistPlan,
     *,
@@ -1105,9 +1143,8 @@ def validate_hard_shortlist_provenance(
             if chapter is not None
             else []
         )
-        observed: list[str] = []
-        eligible = False
-        for candidate in candidates:
+        observations: list[EvidenceFulfillmentObservation] = []
+        for rank, candidate in enumerate(candidates, start=1):
             card = cards[candidate.source_asset_id]
             event = next(
                 event
@@ -1118,23 +1155,108 @@ def validate_hard_shortlist_provenance(
                 card,
                 supplements.get(candidate.source_asset_id, ()),
             )[event.event_id]
-            observed.append(str(observation.evidence_provenance))
-            eligible = eligible or (
-                observation.evidence_provenance
-                in contract.allowed_evidence_provenance
+            observations.append(
+                fulfillment_observation_from_clip_card(
+                    candidate_id=planning_candidate_id(rank),
+                    observation=observation,
+                )
             )
-        if not eligible:
+        try:
+            select_strongest_evidence_fulfillment(contract, observations)
+        except ValueError:
             failures.append(
                 f"{contract.beat_id}/{contract.feature_id}:"
-                f"observed={sorted(set(observed)) or ['not_found']},"
-                f"allowed={list(contract.allowed_evidence_provenance)}"
+                "no_candidate_satisfies_minimum="
+                f"{contract.minimum_fulfillment_level or 'direct_demonstration'},"
+                "observed="
+                f"{sorted({row.evidence_provenance for row in observations}) or ['not_found']}"
             )
     if failures:
         raise ValueError(
-            "hard evidence is absent from the provenance-eligible Top-K; "
+            "hard evidence is absent from the fulfillment-eligible Top-K; "
             "blocked before candidate-video upload or paid multimodal planning: "
             + "; ".join(failures)
         )
+
+
+def validate_direct_video_plan_fulfillment(
+    plan: DirectVideoEditPlan,
+    *,
+    shortlist: FeatureShortlistPlan,
+    cards: dict[str, FullClipCard],
+    contracts: tuple[EditorialBeatContract, ...],
+    candidate_depth: int,
+    supplements: dict[str, list[ClipObservationSupplement]] | None = None,
+    requested_aspects: tuple[str, ...] = ("9:16",),
+) -> dict[str, EditorialBeatFulfillmentSelection]:
+    """Verify every requested aspect's selection against immutable minima."""
+
+    supplements = supplements or {}
+    chapter_by_feature = {
+        chapter.feature_id: (offset, chapter)
+        for offset, chapter in enumerate(shortlist.chapters)
+    }
+    selections: dict[str, EditorialBeatFulfillmentSelection] = {}
+    for contract in contracts:
+        if contract.priority != "hard" or contract.feature_id is None:
+            continue
+        chapter_entry = chapter_by_feature.get(contract.feature_id)
+        if chapter_entry is None:
+            raise ValueError(
+                f"direct plan omitted contracted feature: {contract.feature_id}"
+            )
+        offset, shortlist_chapter = chapter_entry
+        direct_chapter = plan.chapters[offset]
+        if direct_chapter.evidence_status == "not_found":
+            raise ValueError(
+                "hard beat cannot use a not-found direct-video chapter: "
+                f"{contract.beat_id}"
+            )
+        candidates = planning_candidate_slice(
+            shortlist_chapter.candidates,
+            direct_video_evidence=True,
+            depth=candidate_depth,
+        )
+        aspect_decisions = {
+            "16:9": direct_chapter.horizontal,
+            "9:16": direct_chapter.vertical,
+        }
+        for aspect in requested_aspects:
+            decision = aspect_decisions.get(aspect)
+            if decision is None:
+                raise ValueError(
+                    f"direct plan omitted requested aspect {aspect}: "
+                    f"{contract.beat_id}"
+                )
+            rank = decision.candidate_rank
+            if rank > len(candidates):
+                raise ValueError(
+                    f"direct plan selected unseen rank for {contract.beat_id}"
+                )
+            candidate = candidates[rank - 1]
+            card = cards[candidate.source_asset_id]
+            observation = effective_event_observations(
+                card,
+                supplements.get(candidate.source_asset_id, ()),
+            )[candidate.event_id]
+            try:
+                selections[f"{contract.beat_id}:{aspect}"] = (
+                    select_strongest_evidence_fulfillment(
+                        contract,
+                        (
+                            fulfillment_observation_from_clip_card(
+                                candidate_id=planning_candidate_id(rank),
+                                observation=observation,
+                            ),
+                        ),
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "direct-video selected candidate cannot satisfy hard beat "
+                    f"minimum: {contract.beat_id}/{aspect}/rank-{rank:02d}"
+                ) from exc
+    return selections
 
 
 def canonicalize_feature_plan_output(
@@ -2071,6 +2193,29 @@ def planning_capability_catalog(
         if policy is not None
         else simple_production_capability_catalog()
     )
+
+
+def autonomous_content_mode_instructions(
+    policy: AutonomousEditPolicy | None,
+) -> str:
+    """Translate the signed content grammar into planner-visible semantics."""
+
+    if policy is None:
+        return ""
+    if policy.content_mode == "music_led_feature":
+        return (
+            "本次 content_mode=music_led_feature：以可見功能、產品、活動或反應"
+            "的 setup／action／result 完整性組織短片；有附音樂時依實際聽到的"
+            "段落角色與視覺事件規劃節奏，沒有音樂時依動作、閱讀與敘事能量"
+            "規劃，不得捏造節拍。來源語音不是敘事主體。"
+        )
+    if policy.content_mode == "visual_demo":
+        return (
+            "本次 content_mode=visual_demo：優先保存可直接觀察的操作、狀態轉換"
+            "與結果可讀性；不得用 contextual 畫面冒充功能結果。節奏需服從"
+            " setup／action／result 與 UI 閱讀時間，來源語音不是敘事主體。"
+        )
+    raise AssertionError(f"unsupported autonomous content mode: {policy.content_mode}")
 
 
 def validate_candidate_video_budget(
@@ -3897,6 +4042,24 @@ def reproject_direct_video_edit_plan(
     return brief, projected
 
 
+def validate_autonomous_planner_requested_aspects(
+    policy: AutonomousEditPolicy,
+) -> frozenset[str]:
+    """Keep direct planning reachable for every supported delivery shape."""
+
+    requested_aspects = frozenset(policy.requested_aspects)
+    if requested_aspects not in {
+        frozenset({"16:9"}),
+        frozenset({"9:16"}),
+        frozenset({"16:9", "9:16"}),
+    }:
+        raise ValueError(
+            "direct-video autonomous planner requires one or both "
+            "supported delivery aspects"
+        )
+    return requested_aspects
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("catalog_json", type=Path)
@@ -4123,11 +4286,38 @@ def main() -> int:
         policy = AutonomousEditPolicy.model_validate(
             read_json(autonomous_policy_path)
         )
-        if tuple(policy.requested_aspects) != ("9:16",):
+        if MODEL_ID != policy.model_id:
             raise ValueError(
-                "direct-video autonomous planner currently requires a "
-                "9:16-only policy"
+                "autonomous planner model does not match the signed policy"
             )
+        validate_autonomous_planner_requested_aspects(policy)
+        for contract in editorial_contracts:
+            policy_tolerance = sync_tolerance_for_priority(
+                policy,
+                contract.priority,
+            )
+            for visual_event in contract.visual_events:
+                if visual_event.tolerance_frames > policy_tolerance:
+                    raise ValueError(
+                        "editorial visual-event tolerance exceeds autonomous "
+                        f"policy for {contract.beat_id}: "
+                        f"{visual_event.tolerance_frames} > {policy_tolerance}"
+                    )
+    planning_media_resolution = (
+        policy.media_resolution.candidate_reel_plan
+        if policy is not None
+        else "low"
+    )
+    planning_thinking_level = (
+        policy.gemini_limits.candidate_reel_plan.thinking_level
+        if policy is not None
+        else args.thinking_level
+    )
+    planning_max_output_tokens = (
+        policy.gemini_limits.candidate_reel_plan.max_output_tokens
+        if policy is not None
+        else (12_000 if args.candidate_video_evidence else 32_000)
+    )
     music_sha256 = sha256_file(music_path) if music_path is not None else None
     frames = {frame.frame_id: frame for frame in catalog.frames}
     clips = {clip.clip_id: clip for clip in catalog.clips}
@@ -4169,8 +4359,40 @@ def main() -> int:
             )
         cards[expected_asset] = card
     supplements: dict[str, list[ClipObservationSupplement]] = {}
+    current_supplement_binding = None
+    if policy is not None and args.supplement:
+        supplement_prompt_path = (
+            Path(__file__).resolve().parents[1]
+            / "prompts"
+            / "clip_observation_supplement_zh-TW.txt"
+        )
+        supplement_schema = gemini_response_schema(EventObservationSupplement)
+        supplement_schema_sha256 = hashlib.sha256(
+            json.dumps(
+                supplement_schema,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        current_supplement_binding = current_supplement_request_binding(
+            model_id=MODEL_ID,
+            prompt_sha256=sha256_file(supplement_prompt_path),
+            response_schema_sha256=supplement_schema_sha256,
+        )
     for path in args.supplement:
         supplement = ClipObservationSupplement.model_validate(read_json(path))
+        card = cards.get(supplement.source_asset_id)
+        if card is None:
+            raise ValueError(
+                "supplement source asset is not present in the current catalog"
+            )
+        validate_supplement(
+            card,
+            supplement,
+            expected_request_binding=current_supplement_binding,
+            require_current_lineage=policy is not None,
+        )
         supplements.setdefault(supplement.source_asset_id, []).append(supplement)
 
     shortlist: FeatureShortlistPlan | None = None
@@ -4484,7 +4706,7 @@ def main() -> int:
   授權的正式候選，不是模糊背景，也不是任意補邊。
 """
         if policy is not None
-        else """
+        else f"""
 - 本次是 review profile；two-panel、autonomous solid matte 與 intentional freeze
   不在可執行目錄中。fit_with_background 只會形成非交付 review preview。
 """
@@ -4492,14 +4714,18 @@ def main() -> int:
     exact_event_selection_rules = (
         """
 ## Selected-window event contracts
-The following contracts constrain candidate selection. For each hard or
-preferred visual event, choose a Clip Card candidate event whose bounded
-source interval directly contains that observable action/state transition.
-Showing the same device in a nearby static setup is not equivalent. Preserve
-the immutable source_asset_id and event_id from candidate_events. If no
-candidate contains a hard event, return not_found; never invent an event ID or
-claim that a static state contains a transition. Exact frame IDs will be
-resolved downstream.
+The following contracts constrain candidate selection. Select the strongest
+eligible `fulfillment_alternative` supported by the candidate's immutable
+evidence_origin/provenance and observable predicates. `priority=hard` applies
+to `minimum_fulfillment_level`, not automatically to the strongest direct
+tier. A direct tier that requires an exact event must use a bounded source
+interval that visibly contains that action/state transition; nearby static
+setup is not equivalent. An authorized contextual tier may keep the chapter,
+but observed_visual_evidence and quality_risks must state that it is
+illustrative, must preserve the listed degradation/copy-suppression limits,
+and must not claim an exact transition or direct function result. Preserve
+immutable candidate IDs. Return not_found only when no candidate reaches the
+minimum tier. Exact frame IDs are resolved downstream.
 
 """
         + json.dumps(
@@ -4532,7 +4758,7 @@ constraint after evidence safety, not randomness.
 ## Fresh edition contract
 This planning call creates a new editorial decision. It is not permitted to
 reuse a saved feature plan implicitly. Rank candidates from the evidence and
-music in this request.
+{"the actual music in this request" if music_path is not None else "the visible cadence, action completeness, and narrative flow; no music was supplied"}.
 """.strip()
     )
     prompt = f"""
@@ -4576,12 +4802,16 @@ model_provenance 必須先原樣回傳：
 {json.dumps(evidence, ensure_ascii=False, indent=2)}
 """.strip()
     if args.candidate_video_evidence:
+        content_mode_instructions = autonomous_content_mode_instructions(policy)
         prompt = f"""
 你是 evidence-bound 的資深短影音剪輯師。請同時閱讀 brief、精簡候選索引，
 觀看後續每個有 feature_id 與 candidate_rank 標籤的 bounded candidate video，
-並實際聆聽最後附上的完整音樂。你的任務是提出一份精簡的剪輯意圖；
+{"並實際聆聽最後附上的完整音樂" if music_path is not None else "本次沒有附音樂；請依可見動作、資訊閱讀與敘事能量規劃視覺節奏，不得捏造節拍"}。你的任務是提出一份精簡的剪輯意圖；
 不是產生剪點、座標或追蹤結果。你只能使用下方能力目錄列出的剪輯動詞；
 能力目錄說明本機確實能執行什麼，不是要求你每一種都使用。
+
+## 已簽署的內容 grammar
+{content_mode_instructions}
 
 只能回傳：
 1. 每個 chapter_index 的橫式與直式各選哪一個 candidate_rank。
@@ -4789,6 +5019,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                         "mime_type": canonical_interactions_mime_type(
                             str(uploaded.mime_type)
                         ),
+                        "media_resolution": planning_media_resolution,
                     }
                 )
                 direct_rows.append(
@@ -4926,6 +5157,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                 "mime_type": canonical_interactions_mime_type(
                     str(uploaded_music.mime_type)
                 ),
+                "media_resolution": planning_media_resolution,
             }
         )
     response_model: type[BaseModel] = (
@@ -4937,7 +5169,13 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         "model": MODEL_ID,
         "system_instruction": (
             "Provided Clip Cards, candidate indexes, explicitly labeled direct "
-            "candidate videos, and supplied music are the only evidence. "
+            "candidate videos"
+            + (
+                ", and supplied music"
+                if music_path is not None
+                else ""
+            )
+            + " are the only evidence. "
             "Never replace visible evidence with model memory or likely product knowledge. "
             "Return editorial selection, relative dwell, and attention intent only. "
             "Never return exact time, candidate IDs, asset/event/frame IDs, bounding "
@@ -4947,10 +5185,8 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         "store": False,
         "input": request_input,
         "generation_config": {
-            "thinking_level": args.thinking_level,
-            "max_output_tokens": (
-                12_000 if args.candidate_video_evidence else 32_000
-            ),
+            "thinking_level": planning_thinking_level,
+            "max_output_tokens": planning_max_output_tokens,
         },
         "response_format": {
             "type": "text",
@@ -5171,6 +5407,19 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
             direct_video_plan = DirectVideoEditPlan.model_validate_json(
                 output_text
             )
+            validate_direct_video_plan_fulfillment(
+                direct_video_plan,
+                shortlist=shortlist,
+                cards=cards,
+                contracts=tuple(editorial_contracts),
+                candidate_depth=args.candidate_video_depth,
+                supplements=supplements,
+                requested_aspects=(
+                    tuple(policy.requested_aspects)
+                    if policy is not None
+                    else ("16:9", "9:16")
+                ),
+            )
             plan = project_direct_video_edit_plan(
                 direct_video_plan,
                 shortlist=shortlist,
@@ -5352,6 +5601,19 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                         assert shortlist is not None
                         direct_video_plan = DirectVideoEditPlan.model_validate_json(
                             canonical_text
+                        )
+                        validate_direct_video_plan_fulfillment(
+                            direct_video_plan,
+                            shortlist=shortlist,
+                            cards=cards,
+                            contracts=tuple(editorial_contracts),
+                            candidate_depth=args.candidate_video_depth,
+                            supplements=supplements,
+                            requested_aspects=(
+                                tuple(policy.requested_aspects)
+                                if policy is not None
+                                else ("16:9", "9:16")
+                            ),
                         )
                         plan = project_direct_video_edit_plan(
                             direct_video_plan,

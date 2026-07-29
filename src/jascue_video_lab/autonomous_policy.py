@@ -58,13 +58,17 @@ class BudgetPolicy(FrozenStrictModel):
 
 
 class MediaResolutionPolicy(FrozenStrictModel):
-    base_clip_card: MediaResolution = "low"
+    # These stages do not yet have variable-resolution execution paths. Keep
+    # their signed values fixed instead of accepting ignored configuration.
+    base_clip_card: Literal["low"] = "low"
     candidate_reel_plan: MediaResolution = "low"
-    bounded_event_video: MediaResolution = "low"
+    bounded_event_video: Literal["low"] = "low"
     exact_event_image: Literal["high"] = "high"
     exact_frame_grounding_image: Literal["high"] = "high"
     final_video_qa: MediaResolution = "low"
-    text_heavy_video: MediaResolution = "high"
+    # V1 resolves text/UI uncertainty with high-resolution exact stills. A
+    # whole-video text-heavy escalation route is deliberately not executable.
+    text_heavy_video: Literal["high"] = "high"
 
 
 class GeminiOperationLimit(FrozenStrictModel):
@@ -131,7 +135,9 @@ class PresentationPolicy(FrozenStrictModel):
 
 class EditorialPolicy(FrozenStrictModel):
     allow_optional_beat_omission: bool = True
-    allow_preferred_beat_substitution: bool = True
+    # V1 has no executable preferred-beat substitution compiler. Do not grant
+    # authority that the production path cannot use and audit.
+    allow_preferred_beat_substitution: Literal[False] = False
     allow_hard_evidence_omission: Literal[False] = False
     allow_source_reuse: tuple[
         Literal[
@@ -156,8 +162,14 @@ class SyncPolicy(FrozenStrictModel):
 
 class RecoveryPolicy(FrozenStrictModel):
     max_candidate_attempts_per_beat: int = Field(default=3, ge=1, le=5)
-    max_request_failure_retries: int = Field(default=0, ge=0, le=1)
-    allow_deterministic_delivery_when_semantic_qa_unavailable: bool = False
+    # Dispatch journals make a failed/ambiguous paid request resumable, but V1
+    # deliberately has no automatic request retry. Retrying must be a new,
+    # explicit run after inspecting preserved artifacts.
+    max_request_failure_retries: Literal[0] = 0
+    # Semantic final QA remains a hard V1 delivery requirement.
+    allow_deterministic_delivery_when_semantic_qa_unavailable: Literal[
+        False
+    ] = False
 
 
 class SemanticNegotiationPolicy(FrozenStrictModel):
@@ -201,6 +213,12 @@ class SemanticNegotiationPolicy(FrozenStrictModel):
 
 
 class WorkerPolicy(FrozenStrictModel):
+    """Maximum concurrency ceilings, not requested pool sizes.
+
+    Selected-window production is currently sequential, so its observed
+    concurrency of one is within every accepted ceiling.
+    """
+
     ffmpeg_workers: int = Field(default=2, ge=1, le=8)
     proxy_workers: int = Field(default=2, ge=1, le=8)
     sam_workers: int = Field(default=1, ge=1, le=2)
@@ -212,6 +230,7 @@ class AutonomousEditPolicy(FrozenStrictModel):
     contract_version: Literal["autonomous-edit-policy-v1"] = (
         AUTONOMOUS_POLICY_VERSION
     )
+    model_id: Literal["gemini-3.6-flash"] = "gemini-3.6-flash"
     execution_profile: AutonomousExecutionProfile
     content_mode: Literal["music_led_feature", "visual_demo"]
     requested_aspects: tuple[Aspect, ...] = Field(min_length=1, max_length=2)
@@ -232,6 +251,13 @@ class AutonomousEditPolicy(FrozenStrictModel):
     def validate_policy(self) -> "AutonomousEditPolicy":
         if len(set(self.requested_aspects)) != len(self.requested_aspects):
             raise ValueError("requested aspects must be unique")
+        if self.gemini_limits.scoped_replan != (
+            GeminiOperationLimits().scoped_replan
+        ):
+            raise ValueError(
+                "scoped semantic replan call limits are reserved in V1 and "
+                "cannot be customized"
+            )
         return self
 
     def definition_sha256(self) -> str:
@@ -294,10 +320,28 @@ class DegradationRecord(FrozenStrictModel):
         "two_panel_layout_used",
         "solid_matte_fit_used",
         "target_duration_shortened",
+        "contextual_visual_substitution",
     ]
     reason_code: str
+    copy_suppression_codes: tuple[str, ...] = ()
     original_artifact_hashes: tuple[str, ...] = ()
     replacement_artifact_hashes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_copy_suppression(self) -> "DegradationRecord":
+        if len(set(self.copy_suppression_codes)) != len(
+            self.copy_suppression_codes
+        ):
+            raise ValueError("copy-suppression codes must be unique")
+        if (
+            self.action == "contextual_visual_substitution"
+            and "specific_claim_copy_suppressed"
+            not in self.copy_suppression_codes
+        ):
+            raise ValueError(
+                "contextual substitution must suppress specific claim copy"
+            )
+        return self
 
 
 class AutonomousDegradationManifest(FrozenStrictModel):
@@ -307,6 +351,7 @@ class AutonomousDegradationManifest(FrozenStrictModel):
     policy_reference: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     records: tuple[DegradationRecord, ...] = ()
     hard_evidence_omitted: Literal[False] = False
+    aspect: Literal["16:9", "9:16"] | None = None
     generated_at: str
 
 
@@ -328,6 +373,17 @@ def omissions_are_policy_authorized(
         ):
             return False
     return True
+
+
+def sync_tolerance_for_priority(
+    policy: AutonomousEditPolicy,
+    priority: Literal["hard", "preferred", "optional"],
+) -> int:
+    """Return the policy ceiling for an editorial visual-event contract."""
+
+    if priority == "hard":
+        return policy.sync.hard_tolerance_frames
+    return policy.sync.preferred_tolerance_frames
 
 
 def authorize_decision(

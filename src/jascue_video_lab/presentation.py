@@ -452,6 +452,11 @@ class PresentationCompilation(FrozenStrictModel):
     filter_graph: str | None = None
     camera_motion: CameraMotionDecision | None = None
     scene_facts: SceneFacts | None = None
+    # Persist the complete bounded frontier that produced ``selection``.
+    # Recovery may replay only an option in this immutable set whose hard
+    # constraints passed; it must never reconstruct a new crop from a QA
+    # observation after render time.
+    option_set: PresentationOptionSet | None = None
     selection: ExecutableOptionSelectionV2 | None = None
     decision_codes: tuple[str, ...]
     paid_model_calls_added: Literal[0] = 0
@@ -818,6 +823,7 @@ def compile_presentation(
         return PresentationCompilation(
             mode="blocked",
             scene_facts=option_set.scene_facts,
+            option_set=option_set,
             selection=selection,
             decision_codes=selection.decision_codes,
         )
@@ -828,6 +834,7 @@ def compile_presentation(
         filter_graph=selected.filter_graph,
         camera_motion=selected.camera_motion,
         scene_facts=option_set.scene_facts,
+        option_set=option_set,
         selection=selection,
         decision_codes=(
             *selected.option.decision_codes,

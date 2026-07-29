@@ -972,6 +972,10 @@ def test_saved_raw_clip_card_can_be_revalidated_without_another_api_call(
                 "model": MODEL_ID,
                 "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
                 "input": [{"type": "text", "text": prompt + "\nmetadata"}],
+                "generation_config": {
+                    "thinking_level": "low",
+                    "max_output_tokens": 4_096,
+                },
             }
         ),
         encoding="utf-8",
@@ -986,6 +990,43 @@ def test_saved_raw_clip_card_can_be_revalidated_without_another_api_call(
     assert recovered is not None
     assert recovered.model_provenance.interaction_id == "interaction-1"
     assert json.loads((run_dir / "clip_card.schema_validation.json").read_text())["ok"]
+
+
+def test_saved_raw_clip_card_is_not_reused_after_generation_limit_change(
+    tmp_path: Path,
+) -> None:
+    card = _card(model_provenance=_provenance(MODEL_ID))
+    prompt = "clip card prompt"
+    run_dir = tmp_path / "gemini"
+    run_dir.mkdir()
+    (run_dir / "clip_card.raw_output.json").write_text(
+        json.dumps({"output_text": card.model_dump_json()}),
+        encoding="utf-8",
+    )
+    (run_dir / "clip_card.request.json").write_text(
+        json.dumps(
+            {
+                "model": MODEL_ID,
+                "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+                "input": [{"type": "text", "text": prompt + "\nmetadata"}],
+                "generation_config": {
+                    "thinking_level": "low",
+                    "max_output_tokens": 8_192,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        _revalidate_saved_clip_card(
+            run_dir,
+            card.source_asset_id,
+            card.proxy_asset_id,
+            card.duration_ms,
+            prompt,
+        )
+        is None
+    )
 
 
 def test_saved_raw_clip_card_is_not_reused_after_prompt_change(tmp_path: Path) -> None:

@@ -86,6 +86,7 @@ from scripts.plan_clip_card_feature_cut import (
     _verified_feature_raw_output_text,
     _write_feature_normalization_artifacts,
     audit_editorial_freshness,
+    autonomous_content_mode_instructions,
     build_selected_clip_card_evidence,
     canonicalize_direct_video_edit_plan_output,
     canonicalize_feature_plan_output,
@@ -105,10 +106,13 @@ from scripts.plan_clip_card_feature_cut import (
     prior_vertical_selections,
     project_direct_video_edit_plan,
     validate_candidate_video_budget,
+    validate_autonomous_planner_requested_aspects,
+    validate_direct_video_plan_fulfillment,
     validate_hard_shortlist_provenance,
 )
 from scripts.shortlist_clip_card_feature_candidates import (
     _shortlist_input_binding,
+    validate_shortlist_fulfillment_minimums,
 )
 
 
@@ -186,6 +190,66 @@ def test_autonomous_planner_catalog_exposes_policy_gated_presentations() -> None
     assert "solid_matte_fit" not in restricted_ids
     assert "intentional_freeze" not in restricted_ids
     assert "solid_fit" in restricted_catalog.prohibited_automatic_delivery
+
+
+def test_autonomous_content_mode_is_visible_to_the_semantic_planner() -> None:
+    music_led = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=75_000,
+            min_ms=60_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    visual_demo = music_led.model_copy(
+        update={"content_mode": "visual_demo"}
+    )
+
+    music_text = autonomous_content_mode_instructions(music_led)
+    demo_text = autonomous_content_mode_instructions(visual_demo)
+
+    assert "content_mode=music_led_feature" in music_text
+    assert "沒有音樂時" in music_text
+    assert "content_mode=visual_demo" in demo_text
+    assert "操作、狀態轉換" in demo_text
+    assert music_text != demo_text
+
+
+@pytest.mark.parametrize(
+    "requested_aspects",
+    [
+        ("16:9",),
+        ("9:16",),
+        ("16:9", "9:16"),
+    ],
+)
+def test_autonomous_direct_planner_accepts_every_supported_aspect_shape(
+    requested_aspects: tuple[str, ...],
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=requested_aspects,
+        duration=DurationPolicy(
+            target_ms=75_000,
+            min_ms=60_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+    assert validate_autonomous_planner_requested_aspects(policy) == frozenset(
+        requested_aspects
+    )
 
 
 def test_direct_video_planning_only_selects_candidates_actually_attached() -> None:
@@ -744,6 +808,185 @@ def test_hard_shortlist_provenance_blocks_prerecorded_playback() -> None:
             contracts=(contract,),
             candidate_depth=3,
             direct_video_evidence=True,
+        )
+
+
+def test_hard_shortlist_accepts_authorized_contextual_minimum() -> None:
+    card = _card().model_copy(
+        update={
+            "events": [
+                _card().events[0].model_copy(
+                    update={
+                        "evidence_provenance": (
+                            "prerecorded_screen_playback"
+                        )
+                    }
+                )
+            ]
+        }
+    )
+    shortlist = FeatureShortlistPlan(
+        project_id="project-1",
+        catalog_id="catalog-1",
+        chapters=[
+            FeatureChapterShortlist(
+                feature_id="feature-1",
+                evidence_status="partial",
+                candidates=[
+                    FeatureShortlistCandidate(
+                        source_asset_id=ASSET_ID,
+                        event_id="demo",
+                        retrieval_reason="Illustrative playback is visible.",
+                    )
+                ],
+            )
+        ],
+        uncertainties=[],
+        model_provenance=_provenance(),
+    )
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "hard-chapter",
+            "feature_id": "feature-1",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["product"],
+            "narrative_function": "feature_evidence",
+            "visual_events": [
+                {
+                    "event_type": "result_stable_start",
+                    "cue_relation": "principal_downbeat",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "minimum_fulfillment_level": "contextual_identity",
+            "fulfillment_alternatives": [
+                {
+                    "fulfillment_level": "direct_demonstration",
+                    "accepted_evidence_provenance": ["direct_result"],
+                    "claim_support_level": "direct",
+                    "exact_event_requirement": "required_when_selected",
+                    "visual_events": [
+                        {
+                            "event_type": "result_stable_start",
+                            "cue_relation": "principal_downbeat",
+                            "tolerance_frames": 2,
+                        }
+                    ],
+                },
+                {
+                    "fulfillment_level": "contextual_identity",
+                    "accepted_evidence_provenance": [
+                        "prerecorded_screen_playback"
+                    ],
+                    "claim_support_level": "illustrative_only",
+                    "exact_event_requirement": "none",
+                    "degradation_codes": [
+                        "contextual_visual_substitution"
+                    ],
+                    "copy_suppression_codes": [
+                        "specific_claim_copy_suppressed"
+                    ],
+                },
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    validate_hard_shortlist_provenance(
+        shortlist,
+        cards={ASSET_ID: card},
+        contracts=(contract,),
+        candidate_depth=3,
+        direct_video_evidence=True,
+    )
+    validate_shortlist_fulfillment_minimums(
+        shortlist,
+        cards={ASSET_ID: card},
+        contracts=(contract,),
+    )
+
+
+def test_direct_video_plan_cannot_drop_hard_fulfillment_chapter() -> None:
+    shortlist = FeatureShortlistPlan(
+        project_id="project-1",
+        catalog_id="catalog-1",
+        chapters=[
+            FeatureChapterShortlist(
+                feature_id="feature-1",
+                evidence_status="partial",
+                candidates=[
+                    FeatureShortlistCandidate(
+                        source_asset_id=ASSET_ID,
+                        event_id="demo",
+                        retrieval_reason="A candidate is available.",
+                    )
+                ],
+            )
+        ],
+        uncertainties=[],
+        model_provenance=_provenance(),
+    )
+    direct = DirectVideoEditPlan(
+        contract_version="direct-video-edit-plan-v2",
+        capability_catalog_sha256="1" * 64,
+        title="Plan",
+        strategy_summary="No supported chapter.",
+        chapters=[
+            DirectVideoChapterDecision(
+                chapter_index=1,
+                evidence_status="not_found",
+                observed_visual_evidence="",
+                selection_reason="No selection.",
+                attention_observation=None,
+                flow_intent=None,
+                confidence=0.0,
+            )
+        ],
+        uncertainties=[],
+    )
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "hard-result",
+            "feature_id": "feature-1",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["result"],
+            "allowed_evidence_provenance": ["direct_result"],
+            "narrative_function": "feature_evidence",
+            "visual_events": [
+                {
+                    "event_type": "result_stable_start",
+                    "cue_relation": "principal_downbeat",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="hard beat cannot use a not-found",
+    ):
+        validate_direct_video_plan_fulfillment(
+            direct,
+            shortlist=shortlist,
+            cards={ASSET_ID: _card()},
+            contracts=(contract,),
+            candidate_depth=3,
         )
 
 

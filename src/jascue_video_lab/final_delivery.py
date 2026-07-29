@@ -35,6 +35,89 @@ class FinalDeliveryResult:
     manifest: dict[str, Any]
 
 
+def assemble_picture_only_delivery(
+    *,
+    picture_path: Path,
+    output_path: Path,
+    manifest_path: Path,
+    aspect_ratio: Literal["16:9", "9:16"],
+    artifact_bindings: Mapping[str, str],
+) -> FinalDeliveryResult:
+    """Create an explicitly silent delivery without inventing an audio bed."""
+
+    picture = picture_path.expanduser().resolve(strict=True)
+    output = output_path.expanduser().resolve()
+    manifest = manifest_path.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(picture),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-an",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise FinalDeliveryError(
+            "FFmpeg could not create picture-only delivery: "
+            + completed.stderr
+        )
+    picture_probe = _probe(picture)
+    output_probe = _probe(output)
+    picture_video = _single_stream(
+        picture_probe, "video", source_label="picture"
+    )
+    output_video = _single_stream(
+        output_probe, "video", source_label="picture-only delivery"
+    )
+    output_audio = [
+        stream
+        for stream in output_probe.get("streams") or []
+        if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+    ]
+    if output_audio:
+        raise FinalDeliveryError("picture-only delivery unexpectedly has audio")
+    if abs(
+        _stream_duration_ms(picture_video)
+        - _stream_duration_ms(output_video)
+    ) > 40:
+        raise FinalDeliveryError(
+            "picture-only delivery changed the video timeline"
+        )
+    payload = {
+        "contract_version": "picture-only-delivery-v1",
+        "output_path": str(output),
+        "output_sha256": sha256_file(output),
+        "picture_path": str(picture),
+        "picture_sha256": sha256_file(picture),
+        "aspect_ratio": aspect_ratio,
+        "audio_policy": "explicitly_absent",
+        "artifact_bindings": dict(sorted(artifact_bindings.items())),
+        "generated_at": utc_now(),
+    }
+    write_json(manifest, payload)
+    return FinalDeliveryResult(
+        output_path=output,
+        manifest_path=manifest,
+        manifest=payload,
+    )
+
+
 def _probe(path: Path) -> dict[str, Any]:
     completed = subprocess.run(
         [

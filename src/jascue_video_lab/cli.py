@@ -820,6 +820,18 @@ def command_feature_cut(args: argparse.Namespace) -> int:
 
 def command_feature_delivery(args: argparse.Namespace) -> int:
     autonomous_policy_path = args.autonomous_policy
+    if (args.music is None) != (args.music_map_lock is None):
+        raise ValueError(
+            "--music and --music-map-lock must be supplied together"
+        )
+    if (
+        not args.execution_profile.startswith("autonomous_")
+        and args.music is None
+    ):
+        raise ValueError(
+            "review feature-delivery still requires --music and "
+            "--music-map-lock; use feature-cut for a silent review render"
+        )
     if args.execution_profile.startswith("autonomous_"):
         if autonomous_policy_path is None:
             raise ValueError(
@@ -848,22 +860,59 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
                 "autonomous execution requires --editorial-beat-contracts "
                 "unless a complete --autonomous-context-dir is supplied"
             )
-    autonomous_context_paths = None
-    if args.autonomous_context_dir is not None:
-        autonomous_context_paths = {
+    def context_paths(context_dir: Path) -> dict[str, Path]:
+        return {
             "editorial_beat_contracts": (
-                args.autonomous_context_dir
-                / "editorial-beat-contracts.json"
+                context_dir / "editorial-beat-contracts.json"
             ),
-            "music_map": args.autonomous_context_dir / "music-map.json",
-            "cue_plan": args.autonomous_context_dir / "cue-plan.json",
+            "music_map": context_dir / "music-map.json",
+            "cue_plan": context_dir / "cue-plan.json",
             "exact_event_locks": (
-                args.autonomous_context_dir / "exact-event-locks.json"
+                context_dir / "exact-event-locks.json"
+            ),
+            "sequence_optimization": (
+                context_dir / "sequence-optimization.json"
             ),
             "reuse_degradation": (
-                args.autonomous_context_dir / "reuse-degradation.json"
+                context_dir / "reuse-degradation.json"
             ),
         }
+
+    autonomous_context_paths = None
+    autonomous_context_paths_by_aspect = None
+    deterministic_paths_by_aspect = None
+    if args.autonomous_context_dir is not None:
+        if args.aspect == "both":
+            if args.deterministic_delivery_evidence is not None:
+                raise ValueError(
+                    "--deterministic-delivery-evidence is ambiguous for "
+                    "--aspect both; place independently bound evidence in "
+                    "<context-dir>/16x9 and <context-dir>/9x16"
+                )
+            autonomous_context_paths_by_aspect = {
+                "16:9": context_paths(
+                    args.autonomous_context_dir / "16x9"
+                ),
+                "9:16": context_paths(
+                    args.autonomous_context_dir / "9x16"
+                ),
+            }
+            deterministic_paths_by_aspect = {
+                "16:9": (
+                    args.autonomous_context_dir
+                    / "16x9"
+                    / "deterministic-delivery-evidence.json"
+                ),
+                "9:16": (
+                    args.autonomous_context_dir
+                    / "9x16"
+                    / "deterministic-delivery-evidence.json"
+                ),
+            }
+        else:
+            autonomous_context_paths = context_paths(
+                args.autonomous_context_dir
+            )
     result = run_feature_delivery_pipeline(
         feature_cut_kwargs={
             "catalog_path": args.catalog_json,
@@ -901,7 +950,14 @@ def command_feature_delivery(args: argparse.Namespace) -> int:
         deterministic_delivery_evidence_path=(
             args.deterministic_delivery_evidence
         ),
+        autonomous_context_paths_by_aspect=(
+            autonomous_context_paths_by_aspect
+        ),
+        deterministic_delivery_evidence_paths_by_aspect=(
+            deterministic_paths_by_aspect
+        ),
         editorial_beat_contracts_path=args.editorial_beat_contracts,
+        prepared_clip_card_library_path=args.prepared_clip_cards,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2465,9 +2521,20 @@ def build_parser() -> argparse.ArgumentParser:
     feature_delivery_parser.add_argument("catalog_json", type=Path)
     feature_delivery_parser.add_argument("brief_json", type=Path)
     feature_delivery_parser.add_argument("--sam-checkpoint", type=Path, required=True)
-    feature_delivery_parser.add_argument("--music", type=Path, required=True)
     feature_delivery_parser.add_argument(
-        "--music-map-lock", type=Path, required=True
+        "--music",
+        type=Path,
+        help=(
+            "Optional for autonomous visual-cadence delivery; when supplied "
+            "it must be paired with --music-map-lock."
+        ),
+    )
+    feature_delivery_parser.add_argument(
+        "--music-map-lock",
+        type=Path,
+        help=(
+            "Required with --music and omitted for autonomous no-music runs."
+        ),
     )
     feature_delivery_parser.add_argument(
         "--aspect", choices=["both", "9x16", "16x9"], default="both"
@@ -2545,13 +2612,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     feature_delivery_parser.add_argument(
+        "--prepared-clip-cards",
+        type=Path,
+        help=(
+            "Prepared Base Clip Card library used by fresh autonomous "
+            "shortlisting and bounded direct-video planning. If omitted, the "
+            "pipeline searches beside the catalog and fails before paid work "
+            "when the complete hash-matched library cannot be found."
+        ),
+    )
+    feature_delivery_parser.add_argument(
         "--autonomous-context-dir",
         type=Path,
         help=(
             "Directory containing editorial-beat-contracts.json, "
-            "music-map.json, cue-plan.json, exact-event-locks.json, and "
-            "reuse-degradation.json. Optional compatibility override; normal "
-            "autonomous runs generate these from selected windows."
+            "music-map.json, cue-plan.json, exact-event-locks.json, "
+            "sequence-optimization.json, and reuse-degradation.json. Optional "
+            "compatibility override; normal autonomous runs generate these "
+            "from selected windows."
         ),
     )
     feature_delivery_parser.add_argument(

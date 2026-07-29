@@ -193,10 +193,13 @@ frame_time_ms={record['frame_time_ms']}
                         "type": "image",
                         "data": image_data,
                         "mime_type": "image/png",
-                        "resolution": args.resolution,
+                        "media_resolution": "high",
                     },
                 ],
-                "generation_config": {"thinking_level": "low"},
+                "generation_config": {
+                    "thinking_level": "low",
+                    "max_output_tokens": 2_048,
+                },
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",
@@ -271,12 +274,15 @@ frame_time_ms={record['frame_time_ms']}
                             "type": "image",
                             "data": base64.b64encode(path.read_bytes()).decode("ascii"),
                             "mime_type": "image/png",
-                            "resolution": args.resolution,
+                            "media_resolution": "high",
                         }
                         for path in crop_paths
                     ],
                 ],
-                "generation_config": {"thinking_level": "low"},
+                "generation_config": {
+                    "thinking_level": "low",
+                    "max_output_tokens": 4_096,
+                },
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",

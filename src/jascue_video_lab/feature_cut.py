@@ -33,21 +33,37 @@ from .billing import (
     summarize_usage_and_list_price,
     summarize_usage_files,
 )
+from .clip_card_observations import (
+    AssessmentStatus,
+    EventObservationSupplement,
+    effective_event_observation_sha256,
+)
 from .clip_card_retrieval import FeatureShortlistPlan
 from .autonomous_policy import (
     AutonomousDegradationManifest,
     AutonomousEditPolicy,
+    DecisionAuthorityV2,
     DegradationRecord,
+    authorize_decision,
     omissions_are_policy_authorized,
+    sync_tolerance_for_priority,
+    validate_authority_binding,
 )
 from .event_lock import (
+    AuthorizedTrimIntentDecisionV2,
     EditorialBeatContract,
+    EditorialBeatFulfillmentSelection,
+    EvidenceFulfillmentObservation,
     ExactEventLockV2,
+    authorize_trim_intent_decision,
     bind_editorial_contract_to_selected_evidence,
     bind_grouped_event_lock_ids,
+    bind_selected_fulfillment,
     build_cue_alignment_evidence,
     exact_event_resolver_binding_sha256,
+    hard_exact_event_requirements_satisfied,
     load_editorial_beat_contracts,
+    select_strongest_evidence_fulfillment,
     write_exact_event_bundle,
 )
 from .editing_capabilities import (
@@ -103,6 +119,7 @@ from .models import (
     EvidenceClaimSource,
     EvidenceFramingObligationsV2,
     EvidenceIdentityContractV2,
+    EvidenceOriginObservation,
     EvidencePredicateContractV2,
     EvidenceQueryApprovalProvenance,
     EvidenceQueryLockV2,
@@ -111,6 +128,7 @@ from .models import (
     EvidenceTargetIdentityV2,
     EvidenceTargetVisibilityConstraintV2,
     EligibilityGateStatus,
+    DenseFrameCatalog,
     FeatureChapterBrief,
     FeatureChapterSelect,
     FeatureCutEditorialContract,
@@ -140,6 +158,7 @@ from .models import (
     SharedSam21BBoxSeed,
     SharedSam21SessionManifest,
     TrackingState,
+    TrimFrameEvidence,
     TrimIntentDecision,
     VerticalVirtualCameraPhase,
     VerticalVirtualCameraPlan,
@@ -148,6 +167,7 @@ from .models import (
     VirtualCameraKeyframe,
     VirtualCameraPlan,
     approve_evidence_query_proposal_v2,
+    evidence_relation_from_legacy,
 )
 from .overlay import draw_grounding_overlay
 from .presentation import (
@@ -198,11 +218,14 @@ from .editorial_planning import (
 )
 from .sequence_optimizer import (
     BeatOptionSet,
+    CandidateRouteBeat,
+    CandidateRouteOption,
     MusicBoundaryCue,
     MusicBoundarySpec,
     SemanticRhythmSpec,
     SequenceOption,
     optimize_sequence,
+    optimize_pre_render_candidate_route,
     solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
 )
@@ -932,6 +955,10 @@ def _current_external_projection_binding(
             if isinstance(item, dict) and item.get("type") == "audio"
         }
         encoded_hash = str(upload.get("sha256_hash") or "")
+        interval_start_pts = -1
+        interval_end_pts = -1
+        interval_numerator = -1
+        interval_denominator = -1
         try:
             decoded_hash = base64.b64decode(encoded_hash).decode("ascii")
         except Exception as error:
@@ -1393,13 +1420,28 @@ def _load_trim_decisions(
 ) -> list[tuple[Path, TrimIntentDecision]]:
     accepted: list[tuple[Path, TrimIntentDecision]] = []
     for path in paths:
-        decision = TrimIntentDecision.model_validate(read_json(path))
+        payload = read_json(path)
+        auto_authorized = (
+            isinstance(payload, Mapping)
+            and payload.get("contract_version") == "trim-intent-decision-v2"
+        )
+        if auto_authorized:
+            decision = AuthorizedTrimIntentDecisionV2.model_validate(
+                payload
+            ).decision
+        else:
+            decision = TrimIntentDecision.model_validate(payload)
         is_approved = (
             decision.usable
-            and decision.approval_status == "approved"
-            and not decision.requires_human_review
-            and decision.human_review is not None
-            and decision.human_review.decision == "approved"
+            and (
+                auto_authorized
+                or (
+                    decision.approval_status == "approved"
+                    and not decision.requires_human_review
+                    and decision.human_review is not None
+                    and decision.human_review.decision == "approved"
+                )
+            )
         )
         is_proposed_preview = (
             allow_proposed_preview
@@ -1668,10 +1710,23 @@ def _chapter_bounds_with_approved_trim(
                 "approved trim crosses an unresolved hard/trim quality risk; "
                 "review the risk intent or revise the trim before rendering"
             )
-    approved = decision.approval_status == "approved"
+    decision_payload = read_json(path) if path.is_file() else None
+    auto_authorized = (
+        isinstance(decision_payload, Mapping)
+        and decision_payload.get("contract_version")
+        == "trim-intent-decision-v2"
+    )
+    authorized_trim = (
+        AuthorizedTrimIntentDecisionV2.model_validate(decision_payload)
+        if auto_authorized
+        else None
+    )
+    approved = decision.approval_status == "approved" or auto_authorized
     return decision.source_in_ms, decision.source_out_ms, shot_id, {
         "trim_method": (
-            "human_approved_frame_id_pts"
+            "auto_policy_frame_id_pts"
+            if auto_authorized
+            else "human_approved_frame_id_pts"
             if approved
             else "unreviewed_proposed_frame_id_pts"
         ),
@@ -1680,7 +1735,20 @@ def _chapter_bounds_with_approved_trim(
         "trim_tail_intent": decision.tail_intent,
         "source_in_pts": decision.source_in_pts,
         "source_out_pts": decision.source_out_pts,
-        "trim_requires_human_review": decision.requires_human_review,
+        "trim_requires_human_review": (
+            False if auto_authorized else decision.requires_human_review
+        ),
+        "authorized_trim_policy_reference": (
+            authorized_trim.authority.policy_reference
+            if authorized_trim is not None
+            else None
+        ),
+        "authorized_trim_decision_sha256": (
+            sha256_file(path) if auto_authorized else None
+        ),
+        "authorized_trim_decision_path": (
+            str(path) if auto_authorized else None
+        ),
         "trim_human_review": (
             decision.human_review.model_dump(mode="json")
             if decision.human_review is not None
@@ -1730,8 +1798,51 @@ def _exact_render_source_interval(
     if sha256_file(source) != source_sha256:
         raise ValueError("render source bytes differ from the catalog")
     media = probe_video(source)
-    start_pts = trim.get("source_in_pts")
-    end_pts = trim.get("source_out_pts")
+    authorized_decision: TrimIntentDecision | None = None
+    authorized_path_value = trim.get("authorized_trim_decision_path")
+    authorized_interval = trim.get("authorized_source_interval")
+    if isinstance(authorized_path_value, str):
+        authorized_path = Path(authorized_path_value).expanduser().resolve(
+            strict=True
+        )
+        declared_sha = trim.get("authorized_trim_decision_sha256")
+        if (
+            not isinstance(declared_sha, str)
+            or sha256_file(authorized_path) != declared_sha
+        ):
+            raise ValueError("authorized trim authority artifact hash differs")
+        authorized = AuthorizedTrimIntentDecisionV2.model_validate(
+            read_json(authorized_path)
+        )
+        decision = authorized.decision
+        if (
+            decision.source_asset_id != media.asset_id
+            or decision.source_in_ms != start_ms
+            or decision.source_out_ms != end_ms
+        ):
+            raise ValueError(
+                "render bounds differ from AUTO_POLICY authorized trim"
+            )
+        if isinstance(authorized_interval, Mapping):
+            if (
+                authorized_interval.get("source_sha256") != source_sha256
+                or authorized_interval.get("source_path") != str(source)
+            ):
+                raise ValueError(
+                    "authorized render interval differs from selected source"
+                )
+            return dict(authorized_interval)
+        authorized_decision = decision
+    start_pts = (
+        authorized_decision.source_in_pts
+        if authorized_decision is not None
+        else trim.get("source_in_pts")
+    )
+    end_pts = (
+        authorized_decision.source_out_pts
+        if authorized_decision is not None
+        else trim.get("source_out_pts")
+    )
     boundary_dir = output_dir / source_sha256[:16]
     if isinstance(start_pts, int):
         start_frame = extract_frame_at_pts(
@@ -2198,6 +2309,989 @@ def _concat_segments(
     }
 
 
+def _persist_vertical_segment_repair_catalog(
+    *,
+    output_dir: Path,
+    segment_id: str,
+    feature_id: str,
+    source_path: Path,
+    source_sha256: str,
+    source_has_audio: bool,
+    start_ms: int,
+    end_ms: int,
+    source_interval: Mapping[str, Any],
+    overlay_path: Path | None,
+    selected_filter_graph: str,
+    selected_geometry: Mapping[str, Any],
+    selected_track_fingerprint: str | None,
+) -> dict[str, Any]:
+    """Persist only already-compiled, locally replayable repair options.
+
+    The final-QA recovery stage is deliberately unable to invent geometry.
+    Every option in this catalog came from the original presentation compiler,
+    passed its hard constraints, and binds the exact source interval used by
+    the selected render.
+    """
+
+    resolved_source = source_path.expanduser().resolve(strict=True)
+    if sha256_file(resolved_source) != source_sha256:
+        raise ValueError("repair catalog source hash changed before persistence")
+    resolved_overlay = (
+        overlay_path.expanduser().resolve(strict=True)
+        if overlay_path is not None and overlay_path.is_file()
+        else None
+    )
+
+    options: list[dict[str, Any]] = []
+
+    def append_option(
+        *,
+        option_id: str,
+        action_classes: Sequence[str],
+        mode: str,
+        filter_graph: str,
+        geometry: Mapping[str, Any],
+        dependency_hashes: Sequence[str],
+        hard_constraint_results: Sequence[Mapping[str, Any]],
+        selected: bool,
+    ) -> None:
+        if not filter_graph or "[base]" not in filter_graph:
+            return
+        if any(
+            row.get("level") == "hard" and row.get("status") != "pass"
+            for row in hard_constraint_results
+        ):
+            return
+        definition = {
+            "contract_version": "compiled-segment-repair-option-v1",
+            "option_id": option_id,
+            "action_classes": list(action_classes),
+            "mode": mode,
+            "filter_graph": filter_graph,
+            "geometry": dict(geometry),
+            "dependency_hashes": list(dependency_hashes),
+            "hard_constraint_results": [
+                dict(row) for row in hard_constraint_results
+            ],
+            "selected": selected,
+        }
+        options.append(
+            {
+                **definition,
+                "definition_sha256": _stable_fingerprint(definition),
+            }
+        )
+
+    selected_mode = str(
+        selected_geometry.get("applied_strategy")
+        or selected_geometry.get("base_presentation_strategy")
+        or "selected_presentation"
+    )
+    append_option(
+        option_id="selected-rendered-presentation",
+        action_classes=(),
+        mode=selected_mode,
+        filter_graph=selected_filter_graph,
+        geometry=selected_geometry,
+        dependency_hashes=tuple(
+            value
+            for value in (
+                source_sha256,
+                selected_track_fingerprint,
+                _stable_fingerprint(dict(source_interval)),
+            )
+            if value
+        ),
+        hard_constraint_results=(),
+        selected=True,
+    )
+
+    compilation_payload = selected_geometry.get("presentation_compilation")
+    option_set = (
+        compilation_payload.get("option_set")
+        if isinstance(compilation_payload, Mapping)
+        else None
+    )
+    raw_options = (
+        option_set.get("options")
+        if isinstance(option_set, Mapping)
+        else None
+    )
+    if isinstance(raw_options, list):
+        for raw in raw_options:
+            if not isinstance(raw, Mapping):
+                continue
+            executable = raw.get("option")
+            if not isinstance(executable, Mapping):
+                continue
+            mode = str(raw.get("mode") or "")
+            filter_graph: str | None = None
+            if mode == "static_full_bleed_crop":
+                crop = raw.get("static_crop_box_2d")
+                if (
+                    isinstance(crop, (list, tuple))
+                    and len(crop) == 4
+                    and all(isinstance(value, (int, float)) for value in crop)
+                ):
+                    filter_graph = static_full_bleed_crop_filter(
+                        tuple(float(value) for value in crop)
+                    )
+            elif mode in {"two_panel_layout", "solid_matte_fit"}:
+                raw_filter = raw.get("filter_graph")
+                if isinstance(raw_filter, str):
+                    filter_graph = raw_filter
+            if filter_graph is None:
+                # Tracked and virtual-camera candidates need a concrete,
+                # trim-bound track filter. A capability name alone is not
+                # executable recovery evidence.
+                continue
+            option_geometry = {
+                **dict(selected_geometry),
+                "applied_strategy": mode,
+                "presentation_compilation": {
+                    **dict(compilation_payload),
+                    "mode": mode,
+                    "static_crop_box_2d": raw.get("static_crop_box_2d"),
+                    "panel_layout": raw.get("panel_layout"),
+                    "filter_graph": raw.get("filter_graph"),
+                    "camera_motion": raw.get("camera_motion"),
+                },
+                "repair_option_id": executable.get("option_id"),
+                "repair_option_constraints": executable.get(
+                    "constraints",
+                    [],
+                ),
+            }
+            if mode == "static_full_bleed_crop":
+                option_geometry.update(
+                    {
+                        "full_bleed": True,
+                        "static_crop_box_2d": raw.get(
+                            "static_crop_box_2d"
+                        ),
+                        "motion_reversal_count": 0,
+                        "synthetic_motion_distance": 0.0,
+                        "vertical_camera_phases": [],
+                        "phase_virtual_camera_plan": None,
+                        "virtual_camera_plan": None,
+                        "risk_codes": [
+                            code
+                            for code in (
+                                selected_geometry.get("risk_codes") or []
+                            )
+                            if code
+                            not in {
+                                "unmotivated_virtual_camera_motion",
+                                "virtual_camera_direction_reversal",
+                                "phase_transition_containment_is_time_varying",
+                            }
+                        ],
+                    }
+                )
+            elif mode == "two_panel_layout":
+                option_geometry["panel_layout"] = raw.get("panel_layout")
+            append_option(
+                option_id=str(executable.get("option_id") or mode),
+                action_classes=(
+                    ("hold", "next_presentation")
+                    if mode == "static_full_bleed_crop"
+                    else (mode, "next_presentation")
+                ),
+                mode=mode,
+                filter_graph=filter_graph,
+                geometry=option_geometry,
+                dependency_hashes=tuple(
+                    str(value)
+                    for value in executable.get("dependency_hashes", [])
+                ),
+                hard_constraint_results=tuple(
+                    dict(row)
+                    for row in executable.get("constraints", [])
+                    if isinstance(row, Mapping)
+                ),
+                selected=False,
+            )
+
+    # Deduplicate equivalent renderer states while retaining compiler order.
+    unique_options: list[dict[str, Any]] = []
+    seen_filters: set[str] = set()
+    for option in options:
+        fingerprint = _stable_fingerprint(
+            {
+                "filter_graph": option["filter_graph"],
+                "geometry": option["geometry"],
+            }
+        )
+        if fingerprint in seen_filters:
+            continue
+        seen_filters.add(fingerprint)
+        unique_options.append(option)
+
+    catalog = {
+        "contract_version": "compiled-segment-repair-catalog-v1",
+        "segment_id": segment_id,
+        "feature_id": feature_id,
+        "source": {
+            "path": str(resolved_source),
+            "sha256": source_sha256,
+            "has_audio": source_has_audio,
+        },
+        "source_in_ms": start_ms,
+        "source_out_ms": end_ms,
+        "source_interval": dict(source_interval),
+        "overlay": (
+            {
+                "path": str(resolved_overlay),
+                "sha256": sha256_file(resolved_overlay),
+            }
+            if resolved_overlay is not None
+            else None
+        ),
+        "track_fingerprint": selected_track_fingerprint,
+        "options": unique_options,
+        "unsafe_action_classes": {
+            "shift_trim_within_handles": (
+                "trim_shift_requires_precompiled_boundary_event_cue_and_"
+                "source_motion_evidence"
+            ),
+            "alternate_candidate": (
+                "top_k_swap_requires_candidate_bound_exact_event_and_"
+                "identity_evidence"
+            ),
+            "earlier_legal_cue": (
+                "cue_change_requires_precompiled_sequence_and_music_context"
+            ),
+            "scoped_semantic_replan": (
+                "requires_the_single_budgeted_semantic_replan"
+            ),
+        },
+    }
+    catalog["definition_sha256"] = _stable_fingerprint(catalog)
+    catalog_path = (
+        output_dir
+        / "repair-options"
+        / "9x16"
+        / f"{segment_id}.json"
+    )
+    write_json(catalog_path, catalog)
+    return {
+        "path": str(catalog_path.resolve(strict=True)),
+        "sha256": sha256_file(catalog_path),
+        "definition_sha256": catalog["definition_sha256"],
+        "replayable_option_count": len(unique_options),
+    }
+
+
+def compile_repair_request(
+    *,
+    render_manifest_path: Path,
+    input_picture_path: Path,
+    aspect: Literal["16:9", "9:16"],
+    actions: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Compile QA repair classes into hash-bound renderer instructions.
+
+    Unsupported or insufficiently evidenced actions produce a persisted
+    blocked request. They are never silently approximated.
+    """
+
+    resolved_manifest = render_manifest_path.expanduser().resolve(strict=True)
+    resolved_picture = input_picture_path.expanduser().resolve(strict=True)
+    manifest = read_json(resolved_manifest)
+    if not isinstance(manifest, Mapping):
+        raise ValueError("repair input render manifest must be an object")
+    section_name = "vertical" if aspect == "9:16" else "horizontal"
+    section = manifest.get(section_name)
+    chapters = section.get("chapters") if isinstance(section, Mapping) else None
+    if not isinstance(chapters, list) or not chapters:
+        raise ValueError("repair input manifest has no requested aspect chapters")
+    segment_by_id = {
+        str(chapter.get("segment_id") or f"segment-{index:03d}"): chapter
+        for index, chapter in enumerate(chapters, start=1)
+        if isinstance(chapter, Mapping)
+    }
+    normalized_actions: list[dict[str, Any]] = []
+    compiled: list[dict[str, Any]] = []
+    blockers: list[dict[str, str]] = []
+    seen_segments: set[str] = set()
+    scoped_semantic_replans: list[dict[str, Any]] = []
+    for action_value in actions:
+        action = dict(action_value)
+        segment_id = action.get("segment_id")
+        action_class = action.get("action")
+        issue_id = str(action.get("issue_id") or "")
+        normalized_actions.append(action)
+        if not isinstance(segment_id, str) or segment_id not in segment_by_id:
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": "repair_action_segment_not_found",
+                }
+            )
+            continue
+        if segment_id in seen_segments:
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": "multiple_repairs_for_one_segment_not_compiled",
+                }
+            )
+            continue
+        seen_segments.add(segment_id)
+        chapter = segment_by_id[segment_id]
+        if (
+            action.get("requires_semantic_replan") is True
+            or action_class == "scoped_semantic_replan"
+        ):
+            beat_id = action.get("beat_id")
+            if not isinstance(beat_id, str) or not beat_id:
+                blockers.append(
+                    {
+                        "issue_id": issue_id,
+                        "reason_code": (
+                            "scoped_semantic_replan_requires_bound_beat"
+                        ),
+                    }
+                )
+                continue
+            try:
+                editorial = manifest["editorial_planning"]
+                if not isinstance(editorial, Mapping):
+                    raise ValueError("editorial planning binding missing")
+                route_path_key = (
+                    "pre_render_candidate_route_path"
+                    if aspect == "9:16"
+                    else "pre_render_horizontal_candidate_route_path"
+                )
+                route_sha_key = (
+                    "pre_render_candidate_route_sha256"
+                    if aspect == "9:16"
+                    else "pre_render_horizontal_candidate_route_sha256"
+                )
+                route_path = Path(str(editorial[route_path_key])).resolve(
+                    strict=True
+                )
+                if sha256_file(route_path) != editorial[route_sha_key]:
+                    raise ValueError("semantic replan route hash mismatch")
+                route = read_json(route_path)
+                if (
+                    not isinstance(route, Mapping)
+                    or route.get("contract_version")
+                    != "pre-render-sequence-frontier-v2"
+                ):
+                    raise ValueError(
+                        "semantic replan route contract is unsupported"
+                    )
+                frontier = route.get("semantic_replan_frontier")
+                if (
+                    not isinstance(frontier, Mapping)
+                    or frontier.get("contract_version")
+                    != "semantic-replan-frontier-v1"
+                    or frontier.get("media_embedded") is not False
+                    or frontier.get("max_alternates_per_beat") != 2
+                ):
+                    raise ValueError(
+                        "semantic replan frontier is unbounded or malformed"
+                    )
+                rows = frontier.get("beats")
+                if not isinstance(rows, list):
+                    raise ValueError("semantic replan frontier has no beats")
+                matches = [
+                    row
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and row.get("beat_id") == beat_id
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "semantic replan beat is absent or duplicated"
+                    )
+                frontier_row = dict(matches[0])
+                selected_candidate_id = frontier_row.get(
+                    "selected_candidate_id"
+                )
+                alternate_ids = frontier_row.get(
+                    "alternate_candidate_ids"
+                )
+                candidate_bindings = frontier_row.get(
+                    "candidate_bindings"
+                )
+                if (
+                    not isinstance(selected_candidate_id, str)
+                    or not isinstance(alternate_ids, list)
+                    or not 1 <= len(alternate_ids) <= 2
+                    or not all(
+                        isinstance(candidate_id, str)
+                        for candidate_id in alternate_ids
+                    )
+                    or not isinstance(candidate_bindings, Mapping)
+                    or set(candidate_bindings)
+                    != {selected_candidate_id, *alternate_ids}
+                    or not 2 <= len(candidate_bindings) <= 3
+                ):
+                    raise ValueError(
+                        "semantic replan frontier must bind two or three "
+                        "candidate options"
+                    )
+                adjacent = frontier_row.get(
+                    "adjacent_sequence_context"
+                )
+                if not isinstance(adjacent, Mapping) or set(adjacent) != {
+                    "previous",
+                    "next",
+                }:
+                    raise ValueError(
+                        "semantic replan frontier lacks adjacent context"
+                    )
+                binding_path = Path(
+                    str(manifest["feature_plan_binding"])
+                ).resolve(strict=True)
+                binding = read_json(binding_path)
+                if not isinstance(binding, Mapping):
+                    raise ValueError("feature plan binding is malformed")
+                plan_path = Path(str(binding["plan_path"])).resolve(
+                    strict=True
+                )
+                plan_sha256 = sha256_file(plan_path)
+                if (
+                    plan_sha256 != binding.get("plan_sha256")
+                    or plan_sha256 != route.get("feature_plan_sha256")
+                ):
+                    raise ValueError(
+                        "semantic replan frontier feature-plan hash changed"
+                    )
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                blockers.append(
+                    {
+                        "issue_id": issue_id,
+                        "reason_code": (
+                            "semantic_replan_frontier_invalid:"
+                            f"{type(error).__name__}"
+                        ),
+                    }
+                )
+                continue
+            scoped_semantic_replans.append(
+                {
+                    "contract_version": (
+                        "scoped-semantic-replan-handoff-v1"
+                    ),
+                    "issue_id": issue_id,
+                    "segment_id": segment_id,
+                    "beat_id": beat_id,
+                    "route_path": str(route_path),
+                    "route_sha256": sha256_file(route_path),
+                    "feature_plan_path": str(plan_path),
+                    "feature_plan_sha256": plan_sha256,
+                    "frontier": frontier_row,
+                    "maximum_candidate_count": 3,
+                    "full_media_resend_allowed": False,
+                    "gemini_dispatch_performed": False,
+                    "required_execution_chain": [
+                        "bounded_candidate_media",
+                        "exact_event_lock",
+                        "trim_authority",
+                        "grounding_and_sam",
+                        "presentation_compile",
+                        "changed_segment_render",
+                    ],
+                }
+            )
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": (
+                        "alternate_candidate_requires_bounded_execution_"
+                        "not_available"
+                    ),
+                }
+            )
+            continue
+        catalog_ref = chapter.get("repair_option_catalog")
+        if not isinstance(catalog_ref, Mapping):
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": "segment_has_no_compiled_repair_catalog",
+                }
+            )
+            continue
+        try:
+            catalog_path = Path(str(catalog_ref["path"])).resolve(strict=True)
+            if sha256_file(catalog_path) != catalog_ref.get("sha256"):
+                raise ValueError("repair catalog file hash mismatch")
+            catalog = read_json(catalog_path)
+            if not isinstance(catalog, Mapping):
+                raise ValueError("repair catalog malformed")
+            catalog_definition = dict(catalog)
+            expected_definition = catalog_definition.pop(
+                "definition_sha256",
+                None,
+            )
+            if _stable_fingerprint(catalog_definition) != expected_definition:
+                raise ValueError("repair catalog definition hash mismatch")
+        except (KeyError, OSError, ValueError, TypeError) as error:
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": f"repair_catalog_invalid:{type(error).__name__}",
+                }
+            )
+            continue
+        options = catalog.get("options")
+        eligible = [
+            option
+            for option in options
+            if isinstance(option, Mapping)
+            and action_class in (option.get("action_classes") or [])
+            and option.get("selected") is not True
+        ] if isinstance(options, list) else []
+        if not eligible:
+            unsafe = catalog.get("unsafe_action_classes")
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": str(unsafe[action_class])
+                    if (
+                        isinstance(unsafe, Mapping)
+                        and action_class in unsafe
+                    )
+                    else "no_hard_gate_passed_precompiled_option_for_action",
+                }
+            )
+            continue
+        chosen = eligible[0]
+        source = chosen.get("source") or catalog.get("source")
+        if not isinstance(source, Mapping):
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": "repair_catalog_source_binding_missing",
+                }
+            )
+            continue
+        source_path = Path(str(source.get("path"))).resolve(strict=True)
+        if sha256_file(source_path) != source.get("sha256"):
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": "repair_source_hash_mismatch",
+                }
+            )
+            continue
+        original_segment = Path(str(chapter["segment_path"])).resolve(
+            strict=True
+        )
+        chosen_start_ms = int(
+            chosen.get("source_in_ms", catalog["source_in_ms"])
+        )
+        chosen_end_ms = int(
+            chosen.get("source_out_ms", catalog["source_out_ms"])
+        )
+        if (
+            chosen_start_ms < 0
+            or chosen_end_ms <= chosen_start_ms
+            or abs(
+                (chosen_end_ms - chosen_start_ms)
+                - int(chapter.get("duration_ms") or 0)
+            )
+            > 34
+        ):
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": (
+                        "precompiled_repair_changes_immutable_segment_duration"
+                    ),
+                }
+            )
+            continue
+        chosen_source_interval = chosen.get(
+            "source_interval",
+            catalog.get("source_interval"),
+        )
+        if (
+            not isinstance(chosen_source_interval, Mapping)
+            or not {
+                "start_pts",
+                "end_pts_exclusive",
+                "source_time_base",
+                "source_start_pts",
+            }
+            <= set(chosen_source_interval)
+            or not isinstance(
+                chosen_source_interval.get("source_time_base"),
+                Mapping,
+            )
+            or not {"numerator", "denominator"}
+            <= set(chosen_source_interval["source_time_base"])
+        ):
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": (
+                        "precompiled_repair_source_interval_incomplete"
+                    ),
+                }
+            )
+            continue
+        try:
+            interval_start_pts = int(
+                chosen_source_interval["start_pts"]
+            )
+            interval_end_pts = int(
+                chosen_source_interval["end_pts_exclusive"]
+            )
+            interval_time_base = chosen_source_interval[
+                "source_time_base"
+            ]
+            interval_numerator = int(interval_time_base["numerator"])
+            interval_denominator = int(interval_time_base["denominator"])
+            interval_duration_ms = round(
+                (interval_end_pts - interval_start_pts)
+                * interval_numerator
+                / interval_denominator
+                * 1000
+            )
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            interval_duration_ms = -1
+        if (
+            interval_start_pts < 0
+            or interval_end_pts <= interval_start_pts
+            or interval_numerator <= 0
+            or interval_denominator <= 0
+            or abs(
+                interval_duration_ms
+                - (chosen_end_ms - chosen_start_ms)
+            )
+            > 34
+        ):
+            blockers.append(
+                {
+                    "issue_id": issue_id,
+                    "reason_code": (
+                        "precompiled_repair_source_interval_duration_mismatch"
+                    ),
+                }
+            )
+            continue
+        compiled.append(
+            {
+                "issue_id": issue_id,
+                "segment_id": segment_id,
+                "action": action_class,
+                "source": dict(source),
+                "source_in_ms": chosen_start_ms,
+                "source_out_ms": chosen_end_ms,
+                "source_interval": dict(chosen_source_interval),
+                "overlay": chosen.get("overlay", catalog.get("overlay")),
+                "option": dict(chosen),
+                "catalog_path": str(catalog_path),
+                "catalog_sha256": sha256_file(catalog_path),
+                "input_segment_path": str(original_segment),
+                "input_segment_sha256": sha256_file(original_segment),
+            }
+        )
+    request = {
+        "contract_version": "compiled-feature-repair-request-v1",
+        "status": "blocked" if blockers else "compiled",
+        "aspect": aspect,
+        "input_render_manifest_path": str(resolved_manifest),
+        "input_render_manifest_sha256": sha256_file(resolved_manifest),
+        "input_picture_path": str(resolved_picture),
+        "input_picture_sha256": sha256_file(resolved_picture),
+        "expected_segment_ids": list(segment_by_id),
+        "actions": normalized_actions,
+        "compiled_actions": compiled,
+        "scoped_semantic_replans": scoped_semantic_replans,
+        "blockers": blockers,
+        "requires_scoped_semantic_replan": any(
+            action.get("requires_semantic_replan") is True
+            or action.get("action") == "scoped_semantic_replan"
+            for action in normalized_actions
+        )
+        or bool(blockers),
+    }
+    request["definition_sha256"] = _stable_fingerprint(request)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    request_path = output_dir / "compiled-repair-request.json"
+    write_json(request_path, request)
+    return {
+        **request,
+        "path": str(request_path.resolve(strict=True)),
+        "sha256": sha256_file(request_path),
+    }
+
+
+def render_changed_segments_and_concat(
+    *,
+    compiled_request_path: Path,
+    deterministic_delivery_evidence_path: Path,
+    autonomous_context_paths: Mapping[str, Path],
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Replay compiled options, reuse untouched segments, and rebuild picture."""
+
+    request_path = compiled_request_path.expanduser().resolve(strict=True)
+    request = read_json(request_path)
+    if not isinstance(request, Mapping) or request.get("status") != "compiled":
+        raise ValueError("only a compiled repair request may be rendered")
+    request_definition = dict(request)
+    expected_definition = request_definition.pop("definition_sha256", None)
+    if _stable_fingerprint(request_definition) != expected_definition:
+        raise ValueError("compiled repair request definition hash mismatch")
+    manifest_path = Path(
+        str(request["input_render_manifest_path"])
+    ).resolve(strict=True)
+    picture_path = Path(str(request["input_picture_path"])).resolve(strict=True)
+    if (
+        sha256_file(manifest_path) != request["input_render_manifest_sha256"]
+        or sha256_file(picture_path) != request["input_picture_sha256"]
+    ):
+        raise ValueError("repair input manifest or picture hash changed")
+    manifest = read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        raise ValueError("repair render manifest must be an object")
+    aspect = str(request["aspect"])
+    section_name = "vertical" if aspect == "9:16" else "horizontal"
+    chapters = manifest[section_name]["chapters"]
+    compiled_by_segment = {
+        str(row["segment_id"]): row
+        for row in request["compiled_actions"]
+    }
+    rendered_segments: list[Path] = []
+    changed_ids: list[str] = []
+    reused_ids: list[str] = []
+    durations: list[float] = []
+    repaired_chapters: list[dict[str, Any]] = []
+    dimensions = (1080, 1920) if aspect == "9:16" else (1920, 1080)
+    for index, original in enumerate(chapters, start=1):
+        chapter = dict(original)
+        segment_id = str(
+            chapter.get("segment_id") or f"segment-{index:03d}"
+        )
+        duration_seconds = int(chapter["duration_ms"]) / 1000
+        durations.append(duration_seconds)
+        compiled = compiled_by_segment.get(segment_id)
+        if compiled is None:
+            segment = Path(str(chapter["segment_path"])).resolve(strict=True)
+            if not _segment_is_valid(
+                segment,
+                expected_duration=duration_seconds,
+                dimensions=dimensions,
+            ):
+                raise ValueError(
+                    f"unchanged recovery segment is invalid: {segment_id}"
+                )
+            rendered_segments.append(segment)
+            reused_ids.append(segment_id)
+            repaired_chapters.append(chapter)
+            continue
+        if sha256_file(Path(compiled["input_segment_path"])) != compiled[
+            "input_segment_sha256"
+        ]:
+            raise ValueError("changed segment input hash changed")
+        option = compiled["option"]
+        option_definition = dict(option)
+        expected_option_sha = option_definition.pop(
+            "definition_sha256",
+            None,
+        )
+        if _stable_fingerprint(option_definition) != expected_option_sha:
+            raise ValueError("compiled repair option hash mismatch")
+        source = compiled["source"]
+        source_path = Path(str(source["path"])).resolve(strict=True)
+        if sha256_file(source_path) != source["sha256"]:
+            raise ValueError("compiled repair source hash changed")
+        overlay_value = compiled.get("overlay")
+        overlay_path = None
+        if isinstance(overlay_value, Mapping):
+            overlay_path = Path(str(overlay_value["path"])).resolve(strict=True)
+            if sha256_file(overlay_path) != overlay_value["sha256"]:
+                raise ValueError("compiled repair overlay hash changed")
+        geometry = dict(option["geometry"])
+        fingerprint = _segment_variant_fingerprint(
+            source_sha256=str(source["sha256"]),
+            start_ms=int(compiled["source_in_ms"]),
+            end_ms=int(compiled["source_out_ms"]),
+            filter_graph=str(option["filter_graph"]),
+            geometry=geometry,
+            track_fingerprint=chapter.get("track_geometry_fingerprint"),
+            source_interval=compiled["source_interval"],
+        )
+        segment = (
+            output_dir
+            / "segments"
+            / section_name
+            / f"{index:02d}-{fingerprint[:12]}.mp4"
+        )
+        if not _segment_is_valid(
+            segment,
+            expected_duration=duration_seconds,
+            dimensions=dimensions,
+        ):
+            _render_source_segment(
+                source_path=source_path,
+                start_ms=int(compiled["source_in_ms"]),
+                end_ms=int(compiled["source_out_ms"]),
+                overlay_path=overlay_path,
+                base_filter=str(option["filter_graph"]),
+                output_path=segment,
+                source_has_audio=bool(source["has_audio"]),
+                source_interval=compiled["source_interval"],
+            )
+        lineage = _write_render_boundary_lineage(
+            segment_path=segment,
+            source_interval=compiled["source_interval"],
+            output_path=(
+                output_dir
+                / "render-boundary-lineage"
+                / f"{segment_id}.json"
+            ),
+        )
+        chapter.update(geometry)
+        chapter.update(
+            {
+                "segment_id": segment_id,
+                "segment_path": str(segment.resolve()),
+                "segment_render_fingerprint": fingerprint,
+                "render_boundary_lineage": lineage,
+                "repair_execution": {
+                    "issue_id": compiled["issue_id"],
+                    "action": compiled["action"],
+                    "option_id": option["option_id"],
+                    "option_definition_sha256": option[
+                        "definition_sha256"
+                    ],
+                    "request_definition_sha256": request[
+                        "definition_sha256"
+                    ],
+                },
+            }
+        )
+        rendered_segments.append(segment)
+        changed_ids.append(segment_id)
+        repaired_chapters.append(chapter)
+    if set(changed_ids) != set(compiled_by_segment):
+        raise ValueError("repair render did not cover each compiled action")
+    output_picture = output_dir / f"repaired-{section_name}.mp4"
+    concat_audit = _concat_segments(
+        rendered_segments,
+        output_picture,
+        segment_durations_seconds=durations,
+    )
+    manifest[section_name]["chapters"] = repaired_chapters
+    manifest[section_name]["output_path"] = str(output_picture.resolve())
+    manifest[section_name]["media"] = _output_media_metadata(output_picture)
+    manifest.setdefault("concat_padding_audits", {})[
+        aspect.replace(":", "x")
+    ] = concat_audit
+    if section_name == "vertical":
+        manifest["automatic_reframe_summary"] = (
+            _summarize_automatic_reframe(repaired_chapters)
+        )
+    quality_report = build_render_quality_report(
+        output_picture,
+        output_dir=output_dir / "post-render-quality" / section_name,
+    )
+    if not bool(quality_report["technical_qc_passed"]):
+        raise ValueError(
+            "repaired picture failed local decoder/PTS/quality gates"
+        )
+    manifest["post_render_quality_qc"] = {
+        "requested": True,
+        "reports": {aspect.replace(":", "x"): quality_report},
+        "technical_qc_passed": True,
+        "requires_human_review": bool(
+            quality_report["requires_human_review"]
+        ),
+    }
+    manifest["autonomous_recovery"] = {
+        "contract_version": "feature-cut-repair-execution-v1",
+        "request_path": str(request_path),
+        "request_sha256": sha256_file(request_path),
+        "request_definition_sha256": request["definition_sha256"],
+        "changed_segment_ids": changed_ids,
+        "reused_segment_ids": reused_ids,
+        "changed_segment_only": True,
+        "generated_at": utc_now(),
+    }
+    repaired_contexts: dict[str, Path] = {}
+    context_dir = output_dir / "autonomous-context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    for key, source_context_value in autonomous_context_paths.items():
+        source_context = source_context_value.expanduser().resolve(strict=True)
+        payload = read_json(source_context)
+        destination = context_dir / f"{key}.json"
+        if key == "sequence_optimization" and isinstance(payload, dict):
+            payload = {
+                **payload,
+                "repair_execution": manifest["autonomous_recovery"],
+            }
+        write_json(destination, payload)
+        repaired_contexts[key] = destination.resolve(strict=True)
+    deterministic_source = (
+        deterministic_delivery_evidence_path.expanduser().resolve(strict=True)
+    )
+    deterministic = DeterministicDeliveryEvidence.model_validate(
+        read_json(deterministic_source)
+    )
+    deterministic_path = (
+        output_dir
+        / "autonomous-context"
+        / "deterministic-delivery-evidence.json"
+    )
+    # Same-window presentation replay leaves event/cue/identity/readability
+    # evidence invariant. The option's hard constraints prove geometry; the
+    # output file itself is then decoder/PTS checked below.
+    output_media = probe_video(output_picture)
+    deterministic = deterministic.model_copy(
+        update={
+            "media_playable": output_media.duration_ms > 0,
+            "pts_valid": True,
+            "unexpected_freeze_count": 0,
+            "dead_air_audited": True,
+            "dead_air_count": 0,
+            "concat_padding_audited": bool(
+                concat_audit.get("audited")
+            ),
+            "unauthorized_concat_padding_count": int(
+                concat_audit.get(
+                    "unauthorized_concat_padding_count",
+                    0,
+                )
+            ),
+        }
+    )
+    write_json(deterministic_path, deterministic)
+    repaired_manifest_path = output_dir / "render-manifest.json"
+    manifest["autonomous_context"] = {
+        key: {
+            "path": str(path),
+            "sha256": sha256_file(path),
+        }
+        for key, path in repaired_contexts.items()
+    }
+    manifest["deterministic_delivery_evidence"] = {
+        "path": str(deterministic_path.resolve(strict=True)),
+        "sha256": sha256_file(deterministic_path),
+    }
+    manifest["generated_at"] = utc_now()
+    write_json(repaired_manifest_path, manifest)
+    return {
+        "picture_path": output_picture.resolve(strict=True),
+        "render_manifest_path": repaired_manifest_path.resolve(strict=True),
+        "autonomous_context_paths": repaired_contexts,
+        "deterministic_delivery_evidence_path": (
+            deterministic_path.resolve(strict=True)
+        ),
+        "changed_segment_ids": tuple(changed_ids),
+        "reused_segment_ids": tuple(reused_ids),
+        "semantic_replan_interaction_ids": (),
+    }
+
+
 def _output_media_metadata(path: Path) -> dict[str, Any]:
     completed = subprocess.run(
         [
@@ -2342,6 +3436,92 @@ def _stable_fingerprint(payload: dict[str, Any]) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _project_autonomous_executable_feature_plan(
+    *,
+    plan: FeatureEditPlan,
+    contracts: Sequence[EditorialBeatContract],
+    policy: AutonomousEditPolicy,
+    source_plan_sha256: str,
+    contracts_sha256: str,
+) -> tuple[FeatureEditPlan, tuple[DegradationRecord, ...], dict[str, Any]]:
+    """Remove only policy-authorized optional misses before timing is planned.
+
+    A missing chapter cannot be skipped in the render loop because attention,
+    duration, music boundaries, and sequence optimization would already have
+    counted it.  This projection is therefore the single executable plan used
+    by every downstream compiler while preserving the immutable Gemini plan as
+    its hash-bound source.
+    """
+
+    contracts_by_feature: dict[str, list[EditorialBeatContract]] = {}
+    for contract in contracts:
+        if contract.feature_id is None:
+            raise ValueError(
+                "autonomous execution projection requires feature_id on every "
+                "editorial beat contract"
+            )
+        contracts_by_feature.setdefault(contract.feature_id, []).append(contract)
+
+    executable_chapters: list[FeatureChapterSelect] = []
+    degradations: list[DegradationRecord] = []
+    omitted_feature_ids: list[str] = []
+    source_plan_hash = f"sha256:{source_plan_sha256}"
+    for chapter in plan.chapters:
+        if chapter.evidence_status != "not_found":
+            executable_chapters.append(chapter)
+            continue
+        feature_contracts = contracts_by_feature.get(chapter.feature_id, [])
+        if not feature_contracts:
+            raise ValueError(
+                "autonomous not-found chapter has no editorial contract "
+                "defining whether omission is legal"
+            )
+        priorities = {contract.priority for contract in feature_contracts}
+        blocking = priorities & {"hard", "preferred"}
+        if blocking:
+            raise ValueError(
+                "autonomous chapter lacks evidence for "
+                + ", ".join(sorted(blocking))
+                + " editorial requirements"
+            )
+        if not policy.editorial.allow_optional_beat_omission:
+            raise ValueError("optional beat omission is not policy-authorized")
+        omitted_feature_ids.append(chapter.feature_id)
+        for contract in feature_contracts:
+            degradations.append(
+                DegradationRecord(
+                    beat_id=contract.beat_id,
+                    action="optional_beat_omitted",
+                    reason_code="catalog_evidence_not_found",
+                    original_artifact_hashes=(source_plan_hash,),
+                )
+            )
+
+    if not executable_chapters:
+        raise ValueError(
+            "autonomous execution plan has no evidence-bearing chapters"
+        )
+    executable_plan = plan.model_copy(update={"chapters": executable_chapters})
+    projection_definition = {
+        "contract_version": "autonomous-execution-plan-projection-v1",
+        "source_feature_plan_sha256": source_plan_hash,
+        "editorial_beat_contracts_sha256": f"sha256:{contracts_sha256}",
+        "policy_reference": policy.policy_reference,
+        "execution_profile": policy.execution_profile.value,
+        "executable_feature_ids": [
+            chapter.feature_id for chapter in executable_chapters
+        ],
+        "omitted_feature_ids": omitted_feature_ids,
+        "degradation_records": [
+            record.model_dump(mode="json") for record in degradations
+        ],
+    }
+    projection_definition["definition_sha256"] = "sha256:" + _stable_fingerprint(
+        projection_definition
+    )
+    return executable_plan, tuple(degradations), projection_definition
 
 
 def _feature_candidate_query_target_id(region: FramingRegionIntent) -> str:
@@ -8831,6 +10011,12 @@ def _render_trim_after_window_shift(
     """Invalidate stale exact PTS so render rebinds the shifted window."""
 
     rebound = dict(trim)
+    for stale_key in (
+        "authorized_trim_decision_path",
+        "authorized_trim_decision_sha256",
+        "authorized_source_interval",
+    ):
+        rebound.pop(stale_key, None)
     rebound.update(
         {
             "source_in_ms": shifted_start_ms,
@@ -8970,21 +10156,24 @@ def _bounded_cue_shifted_window(
 def _bind_freeze_start_to_reaction_peak(
     locks: Sequence[ExactEventLockV2],
 ) -> tuple[ExactEventLockV2, ...]:
-    reaction = next(
-        (
-            lock
-            for lock in locks
-            if lock.event_type == "group_laugh_reaction_peak"
-        ),
-        None,
-    )
-    if reaction is None:
-        return tuple(locks)
+    reactions_by_beat = {
+        lock.event_id.rsplit(":", 1)[0]: lock
+        for lock in locks
+        if lock.event_type == "group_laugh_reaction_peak"
+        and ":" in lock.event_id
+    }
     bound: list[ExactEventLockV2] = []
     for lock in locks:
         if lock.event_type != "freeze_start":
             bound.append(lock)
             continue
+        beat_id = lock.event_id.rsplit(":", 1)[0]
+        reaction = reactions_by_beat.get(beat_id)
+        if reaction is None:
+            raise ValueError(
+                "freeze_start requires a reaction peak from the same beat: "
+                f"{lock.event_id}"
+            )
         bound.append(
             lock.model_copy(
                 update={
@@ -10090,7 +11279,12 @@ def _vertical_candidate_geometry(
             identity_cache_target += (
                 "#identity:" + query_lock_v2.component_hashes()["identity_sha256"]
             )
-        cache_key = (frame.frame_id, identity_cache_target, start_ms, end_ms)
+        cache_key = (
+            f"{frame.frame_id}@{frame.requested_time_ms}",
+            identity_cache_target,
+            start_ms,
+            end_ms,
+        )
         if cache_key not in track_cache:
             proposal, track = _build_track(
                 client=client,
@@ -11060,6 +12254,472 @@ def _vertical_runtime_candidate_options(
     ]
 
 
+def _pre_render_music_exit_by_feature(
+    plan: FeatureEditPlan,
+    *,
+    duration_audit: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Bind the already-resolved output-timeline exit for every beat."""
+
+    music_supplied = (
+        duration_audit.get("music_lock_definition_sha256") is not None
+    )
+    by_feature = {
+        str(row["boundary_after_feature_id"]): row
+        for row in (
+            duration_audit.get("music_boundary_refinements") or ()
+        )
+        if isinstance(row, Mapping)
+        and row.get("boundary_after_feature_id") is not None
+    }
+    exits: dict[str, dict[str, Any]] = {}
+    for index, chapter in enumerate(plan.chapters):
+        row = by_feature.get(chapter.feature_id)
+        if not music_supplied:
+            exits[chapter.feature_id] = {
+                "cue_id": "no-music",
+                "cue_aligned": True,
+            }
+        elif row is not None:
+            cue_id = row.get("music_cue_id")
+            exits[chapter.feature_id] = {
+                "cue_id": (
+                    str(cue_id)
+                    if cue_id is not None
+                    else f"content-exit:{chapter.feature_id}"
+                ),
+                "cue_aligned": bool(row.get("music_snap_applied"))
+                or row.get("music_snap_rejected_reason") == "content_locked",
+            }
+        else:
+            exits[chapter.feature_id] = {
+                "cue_id": (
+                    "music-timeline-end"
+                    if index == len(plan.chapters) - 1
+                    else f"unresolved-exit:{chapter.feature_id}"
+                ),
+                "cue_aligned": index == len(plan.chapters) - 1,
+            }
+    return exits
+
+
+def _vertical_candidate_composition_signature(
+    candidate: FeatureVerticalCandidate,
+    *,
+    edge: Literal["entry", "exit"],
+) -> str:
+    """Return a symbolic composition identity without inventing coordinates."""
+
+    proposal = candidate.virtual_camera_proposal
+    if proposal is not None and proposal.phases:
+        phase = proposal.phases[0] if edge == "entry" else proposal.phases[-1]
+        return (
+            f"{candidate.presentation_goal}:"
+            + "+".join(phase.anchor_region_ids)
+        )
+    hard_targets = tuple(
+        region.entity_id or region.region_id
+        for region in candidate.regions
+        if region.execution_role == "hard_core"
+    )
+    return (
+        f"{candidate.coverage_mode}:{candidate.presentation_goal}:"
+        + ("+".join(hard_targets) if hard_targets else "unresolved")
+    )
+
+
+def _pre_render_vertical_presentation_mode(
+    candidate: FeatureVerticalCandidate,
+    *,
+    policy: AutonomousEditPolicy,
+) -> str:
+    """Resolve policy-forbidden constructed preferences to a natural family."""
+
+    if (
+        candidate.presentation_preference == "two_panel_layout"
+        and not policy.presentation.allow_two_panel_layout
+    ) or (
+        candidate.presentation_preference == "solid_matte_fit"
+        and not policy.presentation.allow_solid_matte_fit
+    ):
+        return (
+            "phase_virtual_camera"
+            if candidate.virtual_camera_proposal is not None
+            else "tracked_full_bleed_crop"
+        )
+    return {
+        "static_full_bleed": "static_full_bleed_crop",
+        "tracked_full_bleed": "tracked_full_bleed_crop",
+        "phase_virtual_camera": "phase_virtual_camera",
+        "two_panel_layout": "two_panel_layout",
+        "solid_matte_fit": "solid_matte_fit",
+    }[candidate.presentation_preference]
+
+
+def _build_pre_render_vertical_candidate_route(
+    plan: FeatureEditPlan,
+    *,
+    chapter_durations: Mapping[str, float],
+    rhythm_plan: RhythmPlan,
+    duration_audit: Mapping[str, Any],
+    policy: AutonomousEditPolicy,
+) -> Any | None:
+    """Resolve the 9:16 candidate/trim/cue/presentation frontier.
+
+    This freezes every fact available before rendering.  Exact-event,
+    identity, tracking, relation, reuse and pixel geometry are explicitly
+    deferred hard gates; their runtime failure advances through the returned
+    globally contextual fallback order.
+    """
+
+    intrusion_rank = {
+        "static_full_bleed_crop": 0,
+        "tracked_full_bleed_crop": 1,
+        "phase_virtual_camera": 2,
+        "two_panel_layout": 4,
+        "solid_matte_fit": 5,
+    }
+    rhythm_by_id = {
+        chapter.feature_id: chapter for chapter in rhythm_plan.chapters
+    }
+    cue_by_id = _pre_render_music_exit_by_feature(
+        plan,
+        duration_audit=duration_audit,
+    )
+    beats: list[CandidateRouteBeat] = []
+    for chapter in plan.chapters:
+        if not chapter.vertical_candidates:
+            continue
+        rhythm = rhythm_by_id[chapter.feature_id]
+        trim_duration_ms = round(
+            chapter_durations[chapter.feature_id] * 1000
+        )
+        beats.append(
+            CandidateRouteBeat(
+                beat_id=chapter.feature_id,
+                options=tuple(
+                    CandidateRouteOption(
+                        beat_id=chapter.feature_id,
+                        candidate_id=candidate.candidate_id,
+                        source_asset_id=candidate.source_asset_id,
+                        event_id=candidate.event_id,
+                        planner_rank=candidate.rank,
+                        semantic_confidence=float(candidate.confidence),
+                        presentation_intrusion_rank=intrusion_rank[
+                            _pre_render_vertical_presentation_mode(
+                                candidate,
+                                policy=policy,
+                            )
+                        ],
+                        trim_duration_ms=trim_duration_ms,
+                        minimum_readable_ms=round(
+                            rhythm.minimum_duration_seconds * 1000
+                        ),
+                        preferred_readable_ms=round(
+                            rhythm.preferred_duration_seconds * 1000
+                        ),
+                        maximum_readable_ms=round(
+                            rhythm.maximum_duration_seconds * 1000
+                        ),
+                        cue_id=cue_by_id[chapter.feature_id]["cue_id"],
+                        cue_aligned=cue_by_id[chapter.feature_id][
+                            "cue_aligned"
+                        ],
+                        presentation_mode=(
+                            _pre_render_vertical_presentation_mode(
+                                candidate,
+                                policy=policy,
+                            )
+                        ),
+                        entry_composition=(
+                            _vertical_candidate_composition_signature(
+                                candidate,
+                                edge="entry",
+                            )
+                        ),
+                        exit_composition=(
+                            _vertical_candidate_composition_signature(
+                                candidate,
+                                edge="exit",
+                            )
+                        ),
+                        technical_quality=max(
+                            0.0,
+                            1.0 - len(candidate.quality_risks) * 0.06,
+                        ),
+                        preflight_hard_failures=(
+                            ("aspect_declared_unsuitable",)
+                            if candidate.aspect_suitability == "unsuitable"
+                            else ()
+                        ),
+                    )
+                    for candidate in chapter.vertical_candidates
+                ),
+            )
+        )
+    if not beats:
+        return None
+    return optimize_pre_render_candidate_route(
+        beats,
+        minimum_duration_ms=(
+            1
+            if policy.execution_profile
+            == "autonomous_best_effort"
+            else policy.duration.min_ms
+        ),
+        maximum_duration_ms=policy.duration.max_ms,
+        max_panel_runtime_fraction=(
+            policy.presentation.max_panel_runtime_fraction
+        ),
+    )
+
+
+def _build_pre_render_horizontal_candidate_route(
+    plan: FeatureEditPlan,
+    *,
+    chapter_durations: Mapping[str, float],
+    rhythm_plan: RhythmPlan,
+    duration_audit: Mapping[str, Any],
+    policy: AutonomousEditPolicy,
+) -> Any | None:
+    """Resolve the 16:9 candidate/trim/cue/presentation frontier."""
+
+    rhythm_by_id = {
+        chapter.feature_id: chapter for chapter in rhythm_plan.chapters
+    }
+    cue_by_id = _pre_render_music_exit_by_feature(
+        plan,
+        duration_audit=duration_audit,
+    )
+    beats: list[CandidateRouteBeat] = []
+    for chapter in plan.chapters:
+        if not chapter.horizontal_candidates:
+            continue
+        rhythm = rhythm_by_id[chapter.feature_id]
+        trim_duration_ms = round(
+            chapter_durations[chapter.feature_id] * 1000
+        )
+        beats.append(
+            CandidateRouteBeat(
+                beat_id=chapter.feature_id,
+                options=tuple(
+                    CandidateRouteOption(
+                        beat_id=chapter.feature_id,
+                        candidate_id=candidate.candidate_id,
+                        source_asset_id=candidate.source_asset_id,
+                        event_id=candidate.event_id,
+                        planner_rank=candidate.rank,
+                        semantic_confidence=float(candidate.confidence),
+                        presentation_intrusion_rank=(
+                            0
+                            if (
+                                candidate.strategy == "original"
+                                and candidate.camera_intent == "hold"
+                            )
+                            else 1
+                            if candidate.strategy == "original"
+                            else 2
+                        ),
+                        trim_duration_ms=trim_duration_ms,
+                        minimum_readable_ms=round(
+                            rhythm.minimum_duration_seconds * 1000
+                        ),
+                        preferred_readable_ms=round(
+                            rhythm.preferred_duration_seconds * 1000
+                        ),
+                        maximum_readable_ms=round(
+                            rhythm.maximum_duration_seconds * 1000
+                        ),
+                        cue_id=cue_by_id[chapter.feature_id]["cue_id"],
+                        cue_aligned=cue_by_id[chapter.feature_id][
+                            "cue_aligned"
+                        ],
+                        presentation_mode=(
+                            "source_hold"
+                            if candidate.strategy == "original"
+                            else "tracked_full_bleed_crop"
+                        ),
+                        entry_composition=(
+                            f"{candidate.camera_intent}:"
+                            f"{candidate.target_description or 'source-frame'}"
+                        ),
+                        exit_composition=(
+                            f"{candidate.camera_intent}:"
+                            f"{candidate.target_description or 'source-frame'}"
+                        ),
+                        technical_quality=max(
+                            0.0,
+                            1.0 - len(candidate.quality_risks) * 0.06,
+                        ),
+                    )
+                    for candidate in chapter.horizontal_candidates
+                ),
+            )
+        )
+    if not beats:
+        return None
+    return optimize_pre_render_candidate_route(
+        beats,
+        minimum_duration_ms=(
+            1
+            if policy.execution_profile
+            == "autonomous_best_effort"
+            else policy.duration.min_ms
+        ),
+        maximum_duration_ms=policy.duration.max_ms,
+        max_panel_runtime_fraction=(
+            policy.presentation.max_panel_runtime_fraction
+        ),
+    )
+
+
+def _apply_pre_render_candidate_route(
+    options: Sequence[dict[str, Any]],
+    *,
+    selected_candidate_id: str | None,
+    ordered_candidate_ids: Sequence[str] = (),
+    sequence_bindings: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Apply the globally ranked frontier without reviving rejected options."""
+
+    if selected_candidate_id is None and not ordered_candidate_ids:
+        return list(options)
+    resolved_order = tuple(
+        dict.fromkeys(
+            (
+                *ordered_candidate_ids,
+                *(
+                    (selected_candidate_id,)
+                    if selected_candidate_id is not None
+                    else ()
+                ),
+            )
+        )
+    )
+    by_id = {
+        str(option.get("candidate_id")): option for option in options
+    }
+    unknown = [
+        candidate_id
+        for candidate_id in resolved_order
+        if candidate_id not in by_id
+    ]
+    if unknown:
+        raise ValueError(
+            "pre-render sequence frontier selected unknown candidates: "
+            + ",".join(unknown)
+        )
+    if not resolved_order:
+        return list(options)
+    applied: list[dict[str, Any]] = []
+    preference_by_mode = {
+        "static_full_bleed_crop": "static_full_bleed",
+        "tracked_full_bleed_crop": "tracked_full_bleed",
+        "phase_virtual_camera": "phase_virtual_camera",
+        "two_panel_layout": "two_panel_layout",
+        "solid_matte_fit": "solid_matte_fit",
+    }
+    for candidate_id in resolved_order:
+        option = dict(by_id[candidate_id])
+        binding = (sequence_bindings or {}).get(candidate_id)
+        if binding is not None:
+            binding_payload = (
+                binding.model_dump(mode="json")
+                if hasattr(binding, "model_dump")
+                else dict(binding)
+            )
+            option["_pre_render_sequence_binding"] = binding_payload
+            presentation_mode = str(
+                binding_payload["presentation_mode"]
+            )
+            if (
+                "presentation_preference" in option
+                and presentation_mode in preference_by_mode
+            ):
+                option["presentation_preference"] = (
+                    preference_by_mode[presentation_mode]
+                )
+        applied.append(option)
+    return applied
+
+
+def _semantic_replan_frontier_projection(
+    route: Any,
+    *,
+    max_alternates_per_beat: int = 2,
+) -> dict[str, Any]:
+    """Project a compact, media-free frontier for one scoped semantic replan."""
+
+    if max_alternates_per_beat < 1:
+        raise ValueError("semantic replan frontier requires an alternate limit")
+    selections = list(route.selections)
+    rows: list[dict[str, Any]] = []
+    for index, selection in enumerate(selections):
+        ordered_ids = tuple(
+            route.fallback_candidate_ids_by_beat[selection.beat_id]
+        )
+        candidate_ids = ordered_ids[: 1 + max_alternates_per_beat]
+        bindings = route.option_bindings_by_beat[selection.beat_id]
+        rows.append(
+            {
+                "beat_id": selection.beat_id,
+                "selected_candidate_id": selection.candidate_id,
+                "alternate_candidate_ids": list(candidate_ids[1:]),
+                "candidate_bindings": {
+                    candidate_id: bindings[candidate_id].model_dump(
+                        mode="json"
+                    )
+                    for candidate_id in candidate_ids
+                },
+                "adjacent_sequence_context": {
+                    "previous": (
+                        selections[index - 1].model_dump(mode="json")
+                        if index > 0
+                        else None
+                    ),
+                    "next": (
+                        selections[index + 1].model_dump(mode="json")
+                        if index + 1 < len(selections)
+                        else None
+                    ),
+                },
+            }
+        )
+    return {
+        "contract_version": "semantic-replan-frontier-v1",
+        "max_alternates_per_beat": max_alternates_per_beat,
+        "media_embedded": False,
+        "candidate_media_authority": (
+            "resolve immutable source_asset_id/event_id through the "
+            "hash-bound FeatureEditPlan; never resend the full source library"
+        ),
+        "beats": rows,
+    }
+
+
+def _runtime_panel_budget_allows(
+    prior_chapters: Sequence[Mapping[str, Any]],
+    *,
+    candidate_duration_ms: int,
+    planned_total_ms: int,
+    maximum_fraction: float,
+) -> bool:
+    """Fail a runtime panel fallback before render if it breaks global policy."""
+
+    if candidate_duration_ms < 1 or planned_total_ms < 1:
+        raise ValueError("runtime panel budget requires positive durations")
+    if not 0 <= maximum_fraction <= 1:
+        raise ValueError("runtime panel budget fraction must be between 0 and 1")
+    prior_panel_runtime_ms = sum(
+        int(chapter.get("duration_ms") or 0)
+        for chapter in prior_chapters
+        if chapter.get("applied_strategy") == "two_panel_layout"
+    )
+    return (
+        prior_panel_runtime_ms + candidate_duration_ms
+    ) / planned_total_ms <= maximum_fraction + 1e-9
+
+
 def _bind_regions_to_editorial_relation(
     regions: Sequence[FramingRegionIntent],
     contracts: Sequence[EditorialBeatContract],
@@ -11320,6 +12980,91 @@ def _bind_runtime_candidate_coverage(
     return bound
 
 
+def _validate_runtime_selected_evidence_v3_event(
+    event: Mapping[str, Any],
+    *,
+    source_asset_id: str,
+    event_id: str,
+) -> None:
+    """Validate the independently merged observation carried by a v3 event."""
+
+    event_ref = f"{source_asset_id}/{event_id}"
+    effective_payload = event.get("effective_observation")
+    if not isinstance(effective_payload, Mapping):
+        raise ValueError(
+            "selected evidence v3 requires an effective observation: "
+            f"{event_ref}"
+        )
+    try:
+        effective = EventObservationSupplement.model_validate(effective_payload)
+    except ValueError as exc:
+        raise ValueError(
+            f"selected evidence v3 has an invalid effective observation: {event_ref}"
+        ) from exc
+    if effective.event_id != event_id:
+        raise ValueError(
+            "selected evidence v3 effective observation event ID mismatch: "
+            f"{event_ref}"
+        )
+
+    expected_sha256 = effective_event_observation_sha256(effective)
+    if event.get("effective_observation_sha256") != expected_sha256:
+        raise ValueError(
+            "selected evidence v3 effective observation hash mismatch: "
+            f"{event_ref}"
+        )
+
+    if (
+        effective.capabilities.evidence_origin
+        != AssessmentStatus.ASSESSED_PRESENT
+        or effective.evidence_origin is None
+        or effective.evidence_origin.relation == "unknown"
+    ):
+        raise ValueError(
+            "selected evidence v3 requires assessed non-unknown evidence origin: "
+            f"{event_ref}"
+        )
+
+    top_level_origin_payload = event.get("evidence_origin")
+    if not isinstance(top_level_origin_payload, Mapping):
+        raise ValueError(
+            "selected evidence v3 lacks its top-level evidence origin: "
+            f"{event_ref}"
+        )
+    try:
+        top_level_origin = EvidenceOriginObservation.model_validate(
+            top_level_origin_payload
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"selected evidence v3 has an invalid top-level evidence origin: {event_ref}"
+        ) from exc
+    if top_level_origin != effective.evidence_origin:
+        raise ValueError(
+            "selected evidence v3 top-level/effective evidence origin mismatch: "
+            f"{event_ref}"
+        )
+
+    top_level_provenance = event.get("evidence_provenance")
+    if (
+        not isinstance(top_level_provenance, str)
+        or top_level_provenance == "unknown"
+        or top_level_provenance != effective.evidence_provenance
+    ):
+        raise ValueError(
+            "selected evidence v3 top-level/effective legacy provenance mismatch: "
+            f"{event_ref}"
+        )
+    if (
+        evidence_relation_from_legacy(effective.evidence_provenance)
+        != top_level_origin.relation
+    ):
+        raise ValueError(
+            "selected evidence v3 legacy provenance/evidence origin mismatch: "
+            f"{event_ref}"
+        )
+
+
 def _load_runtime_candidate_evidence_events(
     plan_dir: Path,
     *,
@@ -11339,6 +13084,7 @@ def _load_runtime_candidate_evidence_events(
     supported_versions = {
         "clip-card-feature-cut-selected-evidence-v1",
         "clip-card-feature-cut-selected-evidence-v2",
+        "clip-card-feature-cut-selected-evidence-v3",
     }
     if (
         not isinstance(payload, Mapping)
@@ -11349,10 +13095,10 @@ def _load_runtime_candidate_evidence_events(
     if (
         require_provenance
         and contract_version
-        != "clip-card-feature-cut-selected-evidence-v2"
+        != "clip-card-feature-cut-selected-evidence-v3"
     ):
         raise ValueError(
-            "autonomous editing requires provenance-aware selected evidence v2"
+            "autonomous editing requires provenance-aware selected evidence v3"
         )
     events: dict[tuple[str, str], Mapping[str, Any]] = {}
     for event in payload["events"]:
@@ -11362,6 +13108,12 @@ def _load_runtime_candidate_evidence_events(
         event_id = event.get("event_id")
         if not isinstance(source_asset_id, str) or not isinstance(event_id, str):
             raise ValueError("selected Clip Card evidence event lacks immutable IDs")
+        if contract_version == "clip-card-feature-cut-selected-evidence-v3":
+            _validate_runtime_selected_evidence_v3_event(
+                event,
+                source_asset_id=source_asset_id,
+                event_id=event_id,
+            )
         if require_provenance:
             evidence_provenance = event.get("evidence_provenance")
             if not isinstance(evidence_provenance, str) or (
@@ -11385,48 +13137,131 @@ def _validate_hard_exact_event_candidate_provenance(
         tuple[str, str],
         Mapping[str, Any],
     ],
+    *,
+    aspect: RenderAspect = "9x16",
 ) -> None:
-    """Reject an ineligible hard-event frontier before geometry work."""
+    """Reject a frontier below a hard beat's authorized fulfillment minimum."""
 
+    render_horizontal, render_vertical = _requested_render_aspects(aspect)
     chapters = {chapter.feature_id: chapter for chapter in plan.chapters}
     failures: list[str] = []
     for contract in contracts:
         if contract.priority != "hard" or contract.feature_id is None:
             continue
         chapter = chapters.get(contract.feature_id)
-        candidates = chapter.vertical_candidates if chapter is not None else ()
-        observed: list[str] = []
-        eligible = False
-        for candidate in candidates:
-            event = evidence_events.get(
-                (str(candidate.source_asset_id), str(candidate.event_id))
+        candidate_sets = []
+        if render_horizontal:
+            candidate_sets.append(
+                (
+                    "16:9",
+                    chapter.horizontal_candidates if chapter is not None else (),
+                )
             )
-            provenance = (
-                str(event.get("evidence_provenance"))
-                if event is not None
-                else "unknown"
+        if render_vertical:
+            candidate_sets.append(
+                (
+                    "9:16",
+                    chapter.vertical_candidates if chapter is not None else (),
+                )
             )
-            observed.append(provenance)
-            eligible = eligible or (
-                provenance in contract.allowed_evidence_provenance
-            )
-        if not eligible:
-            failures.append(
-                f"{contract.beat_id}/{contract.feature_id}:"
-                f"observed={sorted(set(observed)) or ['not_found']},"
-                f"allowed={list(contract.allowed_evidence_provenance)}"
-            )
+        for candidate_aspect, candidates in candidate_sets:
+            observations: list[EvidenceFulfillmentObservation] = []
+            for candidate in candidates:
+                event = evidence_events.get(
+                    (str(candidate.source_asset_id), str(candidate.event_id))
+                )
+                observations.append(
+                    _runtime_fulfillment_observation(
+                        candidate_id=candidate.candidate_id,
+                        evidence_event=event,
+                    )
+                )
+            try:
+                select_strongest_evidence_fulfillment(
+                    contract,
+                    observations,
+                )
+            except ValueError:
+                failures.append(
+                    f"{contract.beat_id}/{contract.feature_id}/"
+                    f"{candidate_aspect}:minimum="
+                    f"{contract.minimum_fulfillment_level or 'direct_demonstration'},"
+                    "observed="
+                    f"{sorted({row.evidence_provenance for row in observations}) or ['not_found']}"
+                )
     if failures:
         raise ValueError(
-            "hard exact-event evidence is absent from the provenance-eligible "
+            "hard evidence is absent from the fulfillment-eligible "
             "Top-K; blocked before quality, geometry, or paid grounding: "
             + "; ".join(failures)
         )
 
 
+def _runtime_fulfillment_observation(
+    *,
+    candidate_id: str,
+    evidence_event: Mapping[str, Any] | None,
+    available_visual_event_types: tuple[str, ...] | None = None,
+) -> EvidenceFulfillmentObservation:
+    """Project the hash-bound selected-evidence snapshot into one observation."""
+
+    if evidence_event is None:
+        return EvidenceFulfillmentObservation(
+            candidate_id=candidate_id,
+            evidence_provenance="unknown",
+            available_visual_event_types=available_visual_event_types,
+        )
+    effective_payload = evidence_event.get("effective_observation")
+    predicates: list[str] = []
+    if isinstance(effective_payload, Mapping):
+        observation = EventObservationSupplement.model_validate(
+            effective_payload
+        )
+        predicates.extend(
+            beat.observable_predicate
+            for beat in observation.observable_beats
+        )
+        predicates.extend(
+            f"observable_beat:{beat.kind}"
+            for beat in observation.observable_beats
+        )
+    return EvidenceFulfillmentObservation(
+        candidate_id=candidate_id,
+        evidence_provenance=str(
+            evidence_event.get("evidence_provenance") or "unknown"
+        ),
+        observable_predicates=tuple(dict.fromkeys(predicates)),
+        available_visual_event_types=available_visual_event_types,
+    )
+
+
+def _select_runtime_candidate_fulfillments(
+    contracts: Sequence[EditorialBeatContract],
+    *,
+    option: Mapping[str, Any],
+    evidence_events: Mapping[tuple[str, str], Mapping[str, Any]],
+    available_visual_event_types: tuple[str, ...] | None = None,
+) -> tuple[EditorialBeatFulfillmentSelection, ...]:
+    """Resolve each beat independently against one immutable candidate event."""
+
+    source_asset_id = str(option.get("source_asset_id") or "")
+    event_id = str(option.get("event_id") or "")
+    observation = _runtime_fulfillment_observation(
+        candidate_id=str(option.get("candidate_id") or "selected"),
+        evidence_event=evidence_events.get((source_asset_id, event_id)),
+        available_visual_event_types=available_visual_event_types,
+    )
+    return tuple(
+        select_strongest_evidence_fulfillment(contract, (observation,))
+        for contract in contracts
+    )
+
+
 def _autonomous_exact_event_source_reservations(
     plan: FeatureEditPlan,
     contracts: Sequence[EditorialBeatContract],
+    *,
+    routed_candidate_ids: Mapping[str, str] | None = None,
 ) -> dict[str, tuple[int, str]]:
     """Reserve primary source windows for later exact-event beats.
 
@@ -11447,7 +13282,11 @@ def _autonomous_exact_event_source_reservations(
             continue
         candidates = sorted(
             chapter.vertical_candidates,
-            key=lambda candidate: candidate.rank,
+            key=lambda candidate: (
+                getattr(candidate, "candidate_id", None)
+                != (routed_candidate_ids or {}).get(chapter.feature_id),
+                candidate.rank,
+            ),
         )
         if not candidates:
             continue
@@ -11552,6 +13391,10 @@ def _prepare_horizontal_runtime_candidate(
     output_dir: Path,
     sam_analysis_fps: float,
     model_request_block_reason: str | None,
+    audit_source_motion: bool = False,
+    compile_geometry: bool = True,
+    immutable_window: Mapping[str, Any] | None = None,
+    grounding_frame: RushFrame | None = None,
 ) -> dict[str, Any]:
     frame_id = option.get("frame_id")
     if not isinstance(frame_id, str) or frame_id not in frames:
@@ -11563,19 +13406,27 @@ def _prepare_horizontal_runtime_candidate(
         clip,
     ):
         raise ValueError("horizontal candidate source asset differs from its frame")
-    start_ms, end_ms, shot_id, trim = _chapter_bounds_with_approved_trim(
-        frame,
-        clip,
-        chapter_duration_seconds,
-        shot_cache,
-        shots_dir,
-        scdet_threshold,
-        trim_decisions,
-        expected_event_id=(
-            str(option["event_id"]) if option.get("event_id") else None
-        ),
-        quality_maps=shot_quality_maps,
-    )
+    if immutable_window is None:
+        start_ms, end_ms, shot_id, trim = (
+            _chapter_bounds_with_approved_trim(
+                frame,
+                clip,
+                chapter_duration_seconds,
+                shot_cache,
+                shots_dir,
+                scdet_threshold,
+                trim_decisions,
+                expected_event_id=(
+                    str(option["event_id"]) if option.get("event_id") else None
+                ),
+                quality_maps=shot_quality_maps,
+            )
+        )
+    else:
+        start_ms = int(immutable_window["start_ms"])
+        end_ms = int(immutable_window["end_ms"])
+        shot_id = str(immutable_window["shot_id"])
+        trim = dict(immutable_window["trim"])
     source_audio_cache.setdefault(
         clip.sha256,
         has_audio_stream(Path(clip.path)),
@@ -11600,12 +13451,35 @@ def _prepare_horizontal_runtime_candidate(
     filter_graph = _horizontal_original_filter()
     debug: Path | None = None
     track_fingerprint: str | None = None
+    source_motion_tracks: list[SegmentationTrack] = []
+    if not compile_geometry:
+        return {
+            "option": dict(option),
+            "frame": frame,
+            "clip": clip,
+            "media": media,
+            "source_has_audio": source_audio_cache[clip.sha256],
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "shot_id": shot_id,
+            "trim": trim,
+            "filter": filter_graph,
+            "geometry": geometry,
+            "debug": debug,
+            "track_fingerprint": track_fingerprint,
+        }
+    execution_frame = grounding_frame or frame
     strategy = str(option.get("strategy") or "original")
     if strategy == "tracked_reframe":
         target = str(option.get("target_description") or "").strip()
         if not target:
             raise ValueError("tracked horizontal candidate has no target")
-        cache_key = (frame.frame_id, target, start_ms, end_ms)
+        cache_key = (
+            f"{execution_frame.frame_id}@{execution_frame.requested_time_ms}",
+            target,
+            start_ms,
+            end_ms,
+        )
         track_root = (
             output_dir
             / "geometry"
@@ -11617,7 +13491,7 @@ def _prepare_horizontal_runtime_candidate(
             proposal, track = _build_track(
                 client=client,
                 clip=clip,
-                frame=frame,
+                frame=execution_frame,
                 start_ms=start_ms,
                 end_ms=end_ms,
                 feature_id=selected.feature_id,
@@ -11640,6 +13514,7 @@ def _prepare_horizontal_runtime_candidate(
             )
             track_cache[cache_key] = (proposal, track, track_root)
         _, track, track_root = track_cache[cache_key]
+        source_motion_tracks.append(track)
         track_fingerprint = _track_geometry_fingerprint(track)
         filter_graph, geometry = _horizontal_filter_from_track(
             track,
@@ -11669,6 +13544,35 @@ def _prepare_horizontal_runtime_candidate(
                 geometry["virtual_camera_plan"],
             )
         debug = track_root / "grounding-debug.png"
+    if audit_source_motion:
+        source_motion_evidence = measure_source_camera_motion(
+            source_path=Path(clip.path),
+            source_asset_id=f"sha256:{clip.sha256}",
+            window_start_ms=start_ms,
+            window_end_ms=end_ms,
+            subject_tracks=source_motion_tracks,
+            output_dir=(
+                output_dir
+                / "geometry"
+                / selected.feature_id
+                / "horizontal"
+                / str(option.get("candidate_id") or "candidate")
+                / "source-camera-motion"
+            ),
+        )
+        geometry["source_camera_motion_evidence"] = (
+            source_motion_evidence.model_dump(mode="json")
+        )
+        geometry["source_camera_motion_measured"] = True
+        geometry["source_camera_motion_detected"] = (
+            source_motion_evidence.classification
+        )
+        geometry["source_camera_motion_reliable"] = (
+            source_motion_evidence.reliable
+        )
+        geometry["source_camera_motion_evidence_sha256"] = (
+            source_motion_evidence.definition_sha256
+        )
     return {
         "option": dict(option),
         "frame": frame,
@@ -11684,6 +13588,455 @@ def _prepare_horizontal_runtime_candidate(
         "debug": debug,
         "track_fingerprint": track_fingerprint,
     }
+
+
+def _resolve_selected_window_grouped_exact_event_locks(
+    *,
+    client: GeminiLabClient,
+    feature_id: str,
+    candidate_id: str,
+    source_path: Path,
+    source_sha256: str,
+    source_asset_id: str,
+    start_ms: int,
+    end_ms: int,
+    selected_option: Mapping[str, Any],
+    contracts: Sequence[EditorialBeatContract],
+    evidence_events: Mapping[tuple[str, str], Mapping[str, Any]],
+    evidence_query_lock_sha256: str,
+    required_target_ids: Sequence[str],
+    editorial_beat_contracts_path: Path,
+    output_dir: Path,
+) -> tuple[
+    tuple[EditorialBeatContract, ...],
+    tuple[ExactEventLockV2, ...],
+    DenseFrameCatalog,
+    tuple[EditorialBeatFulfillmentSelection, ...],
+]:
+    """Resolve one immutable selected window before any paid grounding.
+
+    Both delivery aspects use this resolver.  It intentionally owns dense
+    catalog reuse, fulfillment fallback, exact-event cache validation, and
+    beat-qualified lock binding so the portrait and landscape orchestrators
+    cannot drift into separate temporal pipelines.
+    """
+
+    fulfillment_selections = _select_runtime_candidate_fulfillments(
+        contracts,
+        option=selected_option,
+        evidence_events=evidence_events,
+    )
+    target_ids = tuple(dict.fromkeys(required_target_ids))
+    bound_contracts = tuple(
+        bind_editorial_contract_to_selected_evidence(
+            bind_selected_fulfillment(contract, fulfillment),
+            evidence_query_lock_sha256=evidence_query_lock_sha256,
+            required_target_ids=target_ids,
+        )
+        for contract, fulfillment in zip(
+            contracts,
+            fulfillment_selections,
+            strict=True,
+        )
+    )
+    dense_root = output_dir / "exact-events" / feature_id / candidate_id
+    dense_catalog_path = dense_root / "dense-catalog.json"
+    if dense_catalog_path.is_file():
+        dense_catalog = DenseFrameCatalog.model_validate(
+            read_json(dense_catalog_path)
+        )
+        if (
+            dense_catalog.source_asset_id != source_asset_id
+            or dense_catalog.event_id != feature_id
+            or dense_catalog.source_start_ms != start_ms
+            or dense_catalog.source_end_ms != end_ms
+        ):
+            raise ValueError(
+                "cached dense catalog differs from selected immutable source window"
+            )
+    else:
+        dense_catalog = create_dense_window_catalog(
+            source_path,
+            source_asset_id,
+            feature_id,
+            dense_root,
+            sampling_fps=8.0,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+    evidence_provenance = str(
+        selected_option.get("evidence_provenance", "unknown")
+    )
+    exact_input_hashes = (
+        f"sha256:{source_sha256}",
+        f"sha256:{evidence_query_lock_sha256}",
+        "sha256:"
+        + hashlib.sha256(
+            (
+                "feature-evidence-provenance-v1:"
+                + evidence_provenance
+            ).encode("utf-8")
+        ).hexdigest(),
+        "sha256:"
+        + exact_event_resolver_binding_sha256(
+            catalog=dense_catalog,
+            contracts=bound_contracts,
+            model_id=MODEL_ID,
+        ),
+        "sha256:"
+        + sha256_file(
+            editorial_beat_contracts_path.expanduser().resolve(strict=True)
+        ),
+    )
+    locks_path = dense_root / "resolve" / "exact_event_locks.json"
+    exact_event_required = any(
+        contract.visual_events for contract in bound_contracts
+    )
+    if not exact_event_required:
+        locks: tuple[ExactEventLockV2, ...] = ()
+    elif locks_path.is_file():
+        saved_locks = read_json(locks_path)
+        locks = tuple(
+            ExactEventLockV2.model_validate(row)
+            for row in saved_locks["locks"]
+        )
+        if any(
+            lock.input_artifact_hashes != exact_input_hashes
+            for lock in locks
+        ):
+            raise ValueError(
+                "cached ExactEventLocks differ from current selected-window inputs"
+            )
+    else:
+        locks = client.select_exact_event_locks(
+            catalog=dense_catalog,
+            beat_contracts=bound_contracts,
+            run_dir=dense_root / "resolve",
+            input_artifact_hashes=exact_input_hashes,
+            evidence_provenance=evidence_provenance,
+        )
+    if not locks and exact_event_required:
+        fulfillment_selections = _select_runtime_candidate_fulfillments(
+            contracts,
+            option=selected_option,
+            evidence_events=evidence_events,
+            available_visual_event_types=(),
+        )
+        bound_contracts = tuple(
+            bind_editorial_contract_to_selected_evidence(
+                bind_selected_fulfillment(contract, fulfillment),
+                evidence_query_lock_sha256=evidence_query_lock_sha256,
+                required_target_ids=target_ids,
+            )
+            for contract, fulfillment in zip(
+                contracts,
+                fulfillment_selections,
+                strict=True,
+            )
+        )
+    if locks:
+        locks = bind_grouped_event_lock_ids(locks, bound_contracts)
+        locks = _bind_freeze_start_to_reaction_peak(locks)
+    return (
+        bound_contracts,
+        locks,
+        dense_catalog,
+        fulfillment_selections,
+    )
+
+
+def _grounding_anchor_from_exact_event_locks(
+    frame: RushFrame,
+    *,
+    locks: Sequence[ExactEventLockV2],
+    dense_catalog: DenseFrameCatalog,
+) -> RushFrame:
+    """Use the locked source frame as the grounding seed when one exists."""
+
+    if not locks:
+        return frame
+    selected_lock = locks[0]
+    dense_frame = next(
+        (
+            candidate
+            for candidate in dense_catalog.frames
+            if candidate.frame_id == selected_lock.source_frame_id
+        ),
+        None,
+    )
+    if dense_frame is None:
+        raise ValueError("ExactEventLock references an unknown dense source frame")
+    if dense_frame.frame_hash != selected_lock.source_frame_hash:
+        raise ValueError("ExactEventLock frame hash differs from dense source evidence")
+    return frame.model_copy(
+        update={
+            "requested_time_ms": selected_lock.source_time_ms,
+            "image_path": dense_frame.transport_image_path,
+            "source_image_path": dense_frame.image_path,
+            "frame_time_ms": selected_lock.source_time_ms,
+            "frame_pts": selected_lock.source_pts,
+            "frame_hash": selected_lock.source_frame_hash,
+        }
+    )
+
+
+def _authorize_runtime_selected_window_trim(
+    *,
+    policy: AutonomousEditPolicy,
+    feature_id: str,
+    shot_id: str,
+    source_path: Path,
+    source_sha256: str,
+    source_asset_id: str,
+    start_ms: int,
+    end_ms: int,
+    trim: Mapping[str, Any],
+    locks: Sequence[ExactEventLockV2],
+    dense_catalog: DenseFrameCatalog,
+    dense_catalog_path: Path,
+    output_dir: Path,
+) -> tuple[dict[str, Any], AuthorizedTrimIntentDecisionV2]:
+    """Bind AUTO_POLICY trim authority to the exact render interval and locks."""
+
+    authority_root = (
+        output_dir
+        / "authorized-trims"
+        / feature_id
+        / source_sha256[:16]
+        / f"{start_ms}-{end_ms}"
+    )
+    source_interval = _exact_render_source_interval(
+        source_path=source_path,
+        source_sha256=source_sha256,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        trim=trim,
+        output_dir=authority_root / "boundary-evidence",
+    )
+    selection_path = authority_root / "selected-window-trim-source.json"
+    write_json(
+        selection_path,
+        {
+            "contract_version": "selected-window-trim-source-v1",
+            "feature_id": feature_id,
+            "shot_id": shot_id,
+            "source_asset_id": source_asset_id,
+            "source_in_ms": start_ms,
+            "source_out_ms": end_ms,
+            "source_interval": source_interval,
+            "dense_catalog_sha256": sha256_file(dense_catalog_path),
+            "exact_event_lock_sha256s": [
+                lock.definition_sha256() for lock in locks
+            ],
+            "generated_at": utc_now(),
+        },
+    )
+    start_evidence = TrimFrameEvidence(
+        frame_id="DF999998",
+        requested_time_ms=start_ms,
+        frame_time_ms=int(source_interval["start_ms_display"]),
+        frame_pts=int(source_interval["start_pts"]),
+        frame_hash=str(source_interval["start_frame_sha256"]),
+    )
+    end_hash = source_interval.get("end_exclusive_frame_sha256")
+    end_evidence = (
+        TrimFrameEvidence(
+            frame_id="DF999999",
+            requested_time_ms=end_ms,
+            frame_time_ms=int(source_interval["end_ms_display"]),
+            frame_pts=int(source_interval["end_pts_exclusive"]),
+            frame_hash=str(end_hash),
+        )
+        if isinstance(end_hash, str)
+        else None
+    )
+    tail_intent = trim.get("trim_tail_intent")
+    if tail_intent not in {
+        "none",
+        "natural_pause",
+        "intentional_hold",
+        "title_safe_hold",
+        "clean_plate",
+        "reset_or_false_end",
+        "uncertain",
+    }:
+        tail_intent = "uncertain"
+    decision = TrimIntentDecision(
+        source_asset_id=source_asset_id,
+        event_id=feature_id,
+        shot_id=shot_id,
+        usable=True,
+        first_included_frame=start_evidence,
+        last_included_frame=start_evidence,
+        exclusive_out_frame=end_evidence,
+        hold_start_frame=None,
+        hold_end_frame=None,
+        source_in_ms=start_ms,
+        source_out_ms=end_ms,
+        source_in_pts=int(source_interval["start_pts"]),
+        source_out_pts=int(source_interval["end_pts_exclusive"]),
+        handle_in_ms=start_ms,
+        handle_out_ms=end_ms,
+        tail_intent=tail_intent,
+        proposal_path=str(selection_path.resolve()),
+        catalog_path=str(dense_catalog_path.resolve()),
+    )
+    input_hashes = tuple(
+        dict.fromkeys(
+            (
+                f"sha256:{source_sha256}",
+                f"sha256:{sha256_file(selection_path)}",
+                *(
+                    f"sha256:{lock.definition_sha256()}"
+                    for lock in locks
+                ),
+            )
+        )
+    )
+    authority = authorize_decision(
+        policy,
+        decision_scope="trim_intent",
+        input_artifact_hashes=input_hashes,
+        deterministic_gate_results={
+            "trim_bounds": "passed",
+            (
+                "event_inside_trim"
+                if locks
+                else "no_exact_event_required"
+            ): "passed",
+            "render_pts_resolved": "passed",
+        },
+        decision_codes=(
+            "selected_window_trim_locked",
+            *(
+                ("exact_event_trim_bound",)
+                if locks
+                else ("contextual_or_non_event_trim_bound",)
+            ),
+            "render_interval_immutable",
+        ),
+    )
+    authorized = authorize_trim_intent_decision(
+        decision,
+        exact_event_locks=locks,
+        authority=authority,
+        policy=policy,
+    )
+    authorized_path = authority_root / "authorized-trim-intent.json"
+    write_json(authorized_path, authorized)
+    updated_trim = {
+        **dict(trim),
+        "trim_method": "auto_policy_selected_window_pts",
+        "source_in_pts": decision.source_in_pts,
+        "source_out_pts": decision.source_out_pts,
+        "authorized_trim_decision_path": str(authorized_path.resolve()),
+        "authorized_trim_decision_sha256": sha256_file(authorized_path),
+        "authorized_source_interval": source_interval,
+    }
+    return updated_trim, authorized
+
+
+def _resolve_horizontal_grouped_exact_event_locks(
+    *,
+    client: GeminiLabClient,
+    selected: FeatureChapterSelect,
+    prepared: Mapping[str, Any],
+    selected_option: Mapping[str, Any],
+    contracts: Sequence[EditorialBeatContract],
+    evidence_events: Mapping[tuple[str, str], Mapping[str, Any]],
+    editorial_beat_contracts_path: Path,
+    output_dir: Path,
+    project_start_ms: int,
+) -> tuple[
+    tuple[EditorialBeatContract, ...],
+    tuple[ExactEventLockV2, ...],
+    dict[str, int],
+    dict[str, Any] | None,
+    tuple[EditorialBeatFulfillmentSelection, ...],
+]:
+    """Resolve one 16:9 selected window without entering portrait geometry."""
+
+    selected_contracts = tuple(
+        contract
+        for contract in contracts
+        if contract.feature_id == selected.feature_id
+    )
+    if not selected_contracts:
+        return (), (), {}, None, ()
+    query_hashes = {
+        contract.evidence_query_lock_sha256
+        for contract in selected_contracts
+    }
+    if len(query_hashes) != 1:
+        raise ValueError(
+            "grouped 16:9 exact events require one immutable query binding"
+        )
+    query_sha = next(iter(query_hashes))
+    target_ids = tuple(
+        dict.fromkeys(
+            target_id
+            for contract in selected_contracts
+            for target_id in contract.required_target_ids
+        )
+    )
+    clip = prepared["clip"]
+    media = prepared["media"]
+    start_ms = int(prepared["start_ms"])
+    end_ms = int(prepared["end_ms"])
+    candidate_id = str(selected_option["candidate_id"])
+    (
+        bound_contracts,
+        locks,
+        dense_catalog,
+        fulfillment_selections,
+    ) = _resolve_selected_window_grouped_exact_event_locks(
+        client=client,
+        feature_id=selected.feature_id,
+        candidate_id=candidate_id,
+        source_path=Path(clip.path),
+        source_sha256=clip.sha256,
+        source_asset_id=media.asset_id,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        selected_option=selected_option,
+        contracts=selected_contracts,
+        evidence_events=evidence_events,
+        evidence_query_lock_sha256=query_sha,
+        required_target_ids=target_ids,
+        editorial_beat_contracts_path=editorial_beat_contracts_path,
+        output_dir=output_dir,
+    )
+    dense_root = (
+        output_dir / "exact-events" / selected.feature_id / candidate_id
+    )
+    dense_catalog_path = dense_root / "dense-catalog.json"
+    project_times = {
+        lock.event_id: project_start_ms + lock.source_time_ms - start_ms
+        for lock in locks
+    }
+    selected_window = {
+        "feature_id": selected.feature_id,
+        "candidate_id": candidate_id,
+        "aspect": "16:9",
+        "source_asset_id": media.asset_id,
+        "source_in_ms": start_ms,
+        "source_out_ms": end_ms,
+        "analysis_source_in_ms": dense_catalog.source_start_ms,
+        "analysis_source_out_ms": dense_catalog.source_end_ms,
+        "dense_catalog_path": str(dense_catalog_path.resolve()),
+        "dense_catalog_sha256": sha256_file(dense_catalog_path),
+        "fulfillment_selections": [
+            fulfillment.model_dump(mode="json")
+            for fulfillment in fulfillment_selections
+        ],
+    }
+    return (
+        bound_contracts,
+        locks,
+        project_times,
+        selected_window,
+        fulfillment_selections,
+    )
 
 
 def _candidate_asset_reference_matches(
@@ -11917,6 +14270,7 @@ def _audit_render_source_reuse(
     *,
     aspect: Literal["16x9", "9x16"],
     max_editorial_reprise_overlap_fraction: float | None = None,
+    allowed_reuse_modes: Collection[str] | None = None,
 ) -> dict[str, Any]:
     """Validate typed reuse authority against the rendered source intervals.
 
@@ -12003,6 +14357,11 @@ def _audit_render_source_reuse(
             row_violates = (
                 source_use_index > 2
                 or selected.source_reuse_mode == "none"
+                or (
+                    allowed_reuse_modes is not None
+                    and selected.source_reuse_mode
+                    not in allowed_reuse_modes
+                )
                 or not (
                     selected.source_reuse_justification
                     and selected.source_reuse_justification.strip()
@@ -12058,6 +14417,7 @@ def _runtime_candidate_reuse_violation(
     source_in_ms: int,
     source_out_ms: int,
     max_editorial_reprise_overlap_fraction: float | None = None,
+    allowed_reuse_modes: Collection[str] | None = None,
 ) -> dict[str, Any] | None:
     """Reject unauthorized source reuse before grounding and rendering.
 
@@ -12116,6 +14476,10 @@ def _runtime_candidate_reuse_violation(
         justification = selected.source_reuse_justification
         violates = (
             selected.source_reuse_mode == "none"
+            or (
+                allowed_reuse_modes is not None
+                and selected.source_reuse_mode not in allowed_reuse_modes
+            )
             or not (justification and justification.strip())
             or (
                 selected.source_reuse_mode == "distinct_interval"
@@ -12560,27 +14924,17 @@ def _validate_autonomous_plan_reuse_flags(
     }:
         return
     if reuse_feature_plan_raw_output:
-        if output_dir is None or autonomous_policy_path is None:
-            raise ValueError(
-                "autonomous raw-output normalization requires the current "
-                "output directory and AutonomousEditPolicy"
-            )
-        binding_path = (
-            output_dir.expanduser().resolve()
-            / "gemini-plan"
-            / "feature_edit_plan.raw_output_binding.json"
+        raise ValueError(
+            "autonomous profiles do not accept the legacy "
+            "--reuse-feature-plan-raw-output path; reuse the validated "
+            "direct-video-edit-plan-v2 projection instead"
         )
-        if not binding_path.is_file():
-            raise ValueError(
-                "autonomous raw-output normalization requires its immutable "
-                "paid-request causal binding"
-            )
-        # plan_feature_edit performs the full binding comparison after the
-        # current policy-filtered capability prompt and editorial contracts
-        # have been assembled. This preflight only rejects unbound replay.
-        return
     if not reuse_feature_plan:
-        return
+        raise ValueError(
+            "fresh autonomous feature-cut requires the delivery orchestrator "
+            "to build a policy-bound direct-video-edit-plan-v2 from prepared "
+            "Clip Cards; the legacy catalog-reel planner is not authorized"
+        )
     if output_dir is None or autonomous_policy_path is None:
         raise ValueError(
             "autonomous plan reuse requires the current output directory and "
@@ -13524,6 +15878,283 @@ def _project_locked_cues_to_music_output(
     )
 
 
+def _write_authorized_selected_window_cue_plan(
+    cue_plan_path: Path,
+    *,
+    proposal: Mapping[str, Any],
+    authority_inputs: Mapping[str, Path],
+    policy: AutonomousEditPolicy,
+) -> Path:
+    """Persist a cue proposal and a separate hash-bound AUTO_POLICY decision."""
+
+    proposal_path = cue_plan_path.with_name("cue-plan.proposal.json")
+    write_json(proposal_path, dict(proposal))
+    input_artifacts = {
+        name: {
+            "path": str(path.expanduser().resolve(strict=True)),
+            "sha256": sha256_file(path),
+        }
+        for name, path in authority_inputs.items()
+    }
+    proposal_sha256 = sha256_file(proposal_path)
+    authority = authorize_decision(
+        policy,
+        decision_scope="cue_plan",
+        input_artifact_hashes=tuple(
+            dict.fromkeys(
+                (
+                    f"sha256:{proposal_sha256}",
+                    *(
+                        f"sha256:{artifact['sha256']}"
+                        for artifact in input_artifacts.values()
+                    ),
+                )
+            )
+        ),
+        deterministic_gate_results={
+            "proposal_integrity": "passed",
+            "music_map_lineage": "passed",
+            "exact_event_lineage": "passed",
+            "cue_alignment_measurement": "passed",
+        },
+        decision_codes=(
+            "selected_window_cue_plan_bound",
+            "exact_event_alignment_measured",
+            "cue_plan_auto_policy_approved",
+        ),
+    )
+    write_json(
+        cue_plan_path,
+        {
+            **dict(proposal),
+            "proposal_path": str(proposal_path.resolve()),
+            "proposal_sha256": proposal_sha256,
+            "authority_input_artifacts": input_artifacts,
+            "authority": authority.model_dump(mode="json"),
+        },
+    )
+    validate_authorized_selected_window_cue_plan(
+        cue_plan_path,
+        policy=policy,
+    )
+    return cue_plan_path.resolve(strict=True)
+
+
+def validate_authorized_selected_window_cue_plan(
+    cue_plan_path: Path,
+    *,
+    policy: AutonomousEditPolicy,
+    expected_aspect: str | None = None,
+) -> Mapping[str, Any]:
+    """Fail closed when a selected-window CuePlan or dependency changed."""
+
+    resolved = cue_plan_path.expanduser().resolve(strict=True)
+    payload = read_json(resolved)
+    if not isinstance(payload, Mapping):
+        raise ValueError("selected-window CuePlan must be a JSON object")
+    if payload.get("contract_version") != "selected-window-cue-plan-v2":
+        raise ValueError("selected-window CuePlan contract is unsupported")
+    if expected_aspect is not None and payload.get("aspect") != expected_aspect:
+        raise ValueError("selected-window CuePlan aspect does not match consumer")
+    proposal_path = Path(str(payload.get("proposal_path") or "")).expanduser().resolve(
+        strict=True
+    )
+    proposal_sha256 = str(payload.get("proposal_sha256") or "")
+    if sha256_file(proposal_path) != proposal_sha256:
+        raise ValueError("selected-window CuePlan proposal lineage changed")
+    proposal = read_json(proposal_path)
+    if not isinstance(proposal, Mapping):
+        raise ValueError("selected-window CuePlan proposal is malformed")
+    projected = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {
+            "proposal_path",
+            "proposal_sha256",
+            "authority_input_artifacts",
+            "authority",
+        }
+    }
+    if projected != dict(proposal):
+        raise ValueError("authorized CuePlan differs from its saved proposal")
+    authority = DecisionAuthorityV2.model_validate(payload.get("authority"))
+    validate_authority_binding(authority, policy)
+    if authority.decision_scope != "cue_plan":
+        raise ValueError("selected-window CuePlan authority scope must be cue_plan")
+    authority_hashes = set(authority.input_artifact_hashes)
+    if f"sha256:{proposal_sha256}" not in authority_hashes:
+        raise ValueError("selected-window CuePlan authority omits its proposal")
+    input_artifacts = payload.get("authority_input_artifacts")
+    if not isinstance(input_artifacts, Mapping) or not input_artifacts:
+        raise ValueError("selected-window CuePlan authority inputs are missing")
+    for name, artifact in input_artifacts.items():
+        if not isinstance(artifact, Mapping):
+            raise ValueError(f"CuePlan authority input {name!s} is malformed")
+        path = Path(str(artifact.get("path") or "")).expanduser().resolve(
+            strict=True
+        )
+        digest = str(artifact.get("sha256") or "")
+        if sha256_file(path) != digest:
+            raise ValueError(f"CuePlan authority input {name!s} changed")
+        if f"sha256:{digest}" not in authority_hashes:
+            raise ValueError(
+                f"CuePlan authority does not bind input {name!s}"
+            )
+    return payload
+
+
+def _write_policy_decision_artifact(
+    authority_path: Path,
+    *,
+    proposal_path: Path,
+    authority_inputs: Mapping[str, Path],
+    additional_input_hashes: Sequence[str],
+    policy: AutonomousEditPolicy,
+    decision_scope: Literal["reframe", "feature_cut"],
+    aspect: str | None,
+    deterministic_gate_results: Mapping[str, Literal["passed"]],
+    decision_codes: tuple[str, ...],
+) -> Path:
+    proposal_digest = sha256_file(proposal_path)
+    input_artifacts = {
+        name: {
+            "path": str(path.expanduser().resolve(strict=True)),
+            "sha256": sha256_file(path),
+        }
+        for name, path in authority_inputs.items()
+    }
+    authority = authorize_decision(
+        policy,
+        decision_scope=decision_scope,
+        input_artifact_hashes=tuple(
+            dict.fromkeys(
+                (
+                    f"sha256:{proposal_digest}",
+                    *(
+                        f"sha256:{artifact['sha256']}"
+                        for artifact in input_artifacts.values()
+                    ),
+                    *additional_input_hashes,
+                )
+            )
+        ),
+        deterministic_gate_results=deterministic_gate_results,
+        decision_codes=decision_codes,
+    )
+    write_json(
+        authority_path,
+        {
+            "contract_version": "policy-decision-artifact-v2",
+            "decision_scope": decision_scope,
+            "aspect": aspect,
+            "proposal_path": str(proposal_path.resolve(strict=True)),
+            "proposal_sha256": proposal_digest,
+            "authority_input_artifacts": input_artifacts,
+            "authority": authority.model_dump(mode="json"),
+        },
+    )
+    validate_policy_decision_artifact(
+        authority_path,
+        policy=policy,
+        expected_scope=decision_scope,
+        expected_aspect=aspect,
+    )
+    return authority_path.resolve(strict=True)
+
+
+def validate_policy_decision_artifact(
+    authority_path: Path,
+    *,
+    policy: AutonomousEditPolicy,
+    expected_scope: Literal["reframe", "feature_cut"],
+    expected_aspect: str | None,
+) -> Mapping[str, Any]:
+    """Revalidate a local presentation or feature-cut approval from disk."""
+
+    resolved = authority_path.expanduser().resolve(strict=True)
+    artifact = read_json(resolved)
+    if not isinstance(artifact, Mapping):
+        raise ValueError("policy decision artifact must be a JSON object")
+    if artifact.get("contract_version") != "policy-decision-artifact-v2":
+        raise ValueError("policy decision artifact contract is unsupported")
+    if artifact.get("decision_scope") != expected_scope:
+        raise ValueError("policy decision artifact scope changed")
+    if artifact.get("aspect") != expected_aspect:
+        raise ValueError("policy decision artifact aspect changed")
+    proposal_path = Path(
+        str(artifact.get("proposal_path") or "")
+    ).expanduser().resolve(strict=True)
+    proposal_sha256 = str(artifact.get("proposal_sha256") or "")
+    if sha256_file(proposal_path) != proposal_sha256:
+        raise ValueError("policy decision proposal changed")
+    authority = DecisionAuthorityV2.model_validate(artifact.get("authority"))
+    validate_authority_binding(authority, policy)
+    if authority.decision_scope != expected_scope:
+        raise ValueError("policy decision authority scope changed")
+    authority_hashes = set(authority.input_artifact_hashes)
+    if f"sha256:{proposal_sha256}" not in authority_hashes:
+        raise ValueError("policy decision authority omits its proposal")
+    raw_inputs = artifact.get("authority_input_artifacts")
+    if not isinstance(raw_inputs, Mapping) or not raw_inputs:
+        raise ValueError("policy decision authority inputs are missing")
+    for name, row in raw_inputs.items():
+        if not isinstance(row, Mapping):
+            raise ValueError(f"policy decision input {name!s} is malformed")
+        path = Path(str(row.get("path") or "")).expanduser().resolve(
+            strict=True
+        )
+        digest = str(row.get("sha256") or "")
+        if sha256_file(path) != digest:
+            raise ValueError(f"policy decision input {name!s} changed")
+        if f"sha256:{digest}" not in authority_hashes:
+            raise ValueError(
+                f"policy decision authority omits input {name!s}"
+            )
+    proposal = read_json(proposal_path)
+    if not isinstance(proposal, Mapping):
+        raise ValueError("policy decision proposal is malformed")
+    if proposal.get("aspect") != expected_aspect:
+        raise ValueError("policy decision proposal aspect changed")
+    if expected_scope == "feature_cut":
+        eligibility = FeatureCutEligibilityReport.model_validate(proposal)
+        if (
+            not eligibility.media_rendered
+            or not eligibility.ready_for_human_review
+            or eligibility.blocking_reasons
+            or eligibility.execution_profile.value
+            != policy.execution_profile.value
+        ):
+            raise ValueError(
+                "feature-cut authority requires a locally eligible picture "
+                "handoff"
+            )
+    if expected_scope == "reframe":
+        final_output_path = Path(
+            str(proposal.get("final_output_path") or "")
+        ).expanduser().resolve(strict=True)
+        final_output_sha256 = str(proposal.get("final_output_sha256") or "")
+        if sha256_file(final_output_path) != final_output_sha256:
+            raise ValueError("presentation final output changed")
+        if f"sha256:{final_output_sha256}" not in authority_hashes:
+            raise ValueError("presentation authority omits final output")
+        chapters = proposal.get("chapters")
+        if not isinstance(chapters, list):
+            raise ValueError("presentation proposal chapters are malformed")
+        for chapter in chapters:
+            if not isinstance(chapter, Mapping):
+                raise ValueError("presentation proposal chapter is malformed")
+            segment_path = Path(
+                str(chapter.get("segment_path") or "")
+            ).expanduser().resolve(strict=True)
+            segment_sha256 = str(chapter.get("segment_sha256") or "")
+            if sha256_file(segment_path) != segment_sha256:
+                raise ValueError("presentation segment changed")
+            if f"sha256:{segment_sha256}" not in authority_hashes:
+                raise ValueError("presentation authority omits a segment")
+    return artifact
+
+
 def _resolve_editorial_chapter_durations(
     brief: FeatureEditBrief,
     plan: FeatureEditPlan,
@@ -14126,8 +16757,16 @@ def _build_production_sequence_optimization(
     deterministic: DeterministicDeliveryEvidence,
     policy: AutonomousEditPolicy,
     music_supplied: bool,
+    candidate_aspect: Literal["16:9", "9:16"] = "9:16",
+    pre_render_route: Any | None = None,
 ) -> tuple[Any, tuple[BeatOptionSet, ...]]:
-    """Bind the tested beam search to exact executed production evidence."""
+    """Validate the executed frontier against exact production evidence.
+
+    Selection occurred in the pre-render frontier.  This second use of the
+    evidence-first optimizer is a hard-gate validation of the one actually
+    executed option per beat; it is not represented as a new decision
+    frontier.
+    """
 
     selected_by_id = {chapter.feature_id: chapter for chapter in plan.chapters}
     rhythm_by_id = {
@@ -14139,9 +16778,9 @@ def _build_production_sequence_optimization(
             str(contract.feature_id or contract.beat_id),
             [],
         ).append(contract)
-    lock_by_type: dict[str, list[ExactEventLockV2]] = {}
-    for lock in locks:
-        lock_by_type.setdefault(lock.event_type, []).append(lock)
+    lock_by_id = {lock.event_id: lock for lock in locks}
+    if len(lock_by_id) != len(locks):
+        raise ValueError("production exact-event locks contain duplicate IDs")
     beat_sets: list[BeatOptionSet] = []
     blocked_geometry_codes = {
         "tracking_or_grounding_failed",
@@ -14165,23 +16804,20 @@ def _build_production_sequence_optimization(
             priority = "optional"
         else:
             priority = "preferred"
-        required_event_types = {
-            event.event_type
-            for contract in feature_contracts
-            if contract.priority == "hard"
-            for event in contract.visual_events
-        }
         source_clip = clips[str(chapter["source_clip_id"])]
         source_asset_id = f"sha256:{source_clip.sha256}"
+        feature_event_ids = {
+            f"{contract.beat_id}:{event.event_type}"
+            for contract in feature_contracts
+            for event in contract.visual_events
+        }
         feature_locks = [
-            lock
-            for event_type in {
-                event.event_type
-                for contract in feature_contracts
-                for event in contract.visual_events
-            }
-            for lock in lock_by_type.get(event_type, [])
-            if lock.source_asset_id == source_asset_id
+            lock_by_id[event_id]
+            for event_id in sorted(feature_event_ids)
+            if (
+                event_id in lock_by_id
+                and lock_by_id[event_id].source_asset_id == source_asset_id
+            )
         ]
         cue_event_ids = [
             lock.event_id
@@ -14215,10 +16851,39 @@ def _build_production_sequence_optimization(
             if isinstance(candidate_routing, Mapping)
             else "executed"
         )
+        if pre_render_route is not None:
+            allowed_candidate_ids = tuple(
+                pre_render_route.fallback_candidate_ids_by_beat.get(
+                    feature_id,
+                    (),
+                )
+            )
+            if candidate_id not in allowed_candidate_ids:
+                raise ValueError(
+                    "executed candidate is outside the pre-render sequence "
+                    f"frontier for {feature_id}: {candidate_id}"
+                )
+            planned_selection = next(
+                selection
+                for selection in pre_render_route.selections
+                if selection.beat_id == feature_id
+            )
+            if int(chapter["duration_ms"]) != (
+                planned_selection.trim_duration_ms
+            ):
+                raise ValueError(
+                    "executed trim duration differs from the pre-render "
+                    f"sequence frontier for {feature_id}"
+                )
+        planned_candidates = (
+            selected.horizontal_candidates
+            if candidate_aspect == "16:9"
+            else selected.vertical_candidates
+        )
         candidate = next(
             (
                 item
-                for item in selected.vertical_candidates
+                for item in planned_candidates
                 if item.candidate_id == candidate_id
             ),
             None,
@@ -14261,7 +16926,6 @@ def _build_production_sequence_optimization(
                 }
             )
         )
-        locked_event_types = {lock.event_type for lock in feature_locks}
         technical_quality = max(
             0.0,
             min(1.0, 1.0 - len(risk_codes) * 0.04),
@@ -14313,7 +16977,10 @@ def _build_production_sequence_optimization(
             exit_x=exit_x,
             hard_evidence_satisfied=(
                 selected.evidence_status != "not_found"
-                and required_event_types <= locked_event_types
+                and hard_exact_event_requirements_satisfied(
+                    feature_contracts,
+                    feature_locks,
+                )
             ),
             identity_satisfied=deterministic.identity_passed,
             action_complete=(
@@ -14369,7 +17036,13 @@ def _build_production_sequence_optimization(
         beat_sets.append(
             BeatOptionSet(
                 beat_id=feature_id,
-                priority=priority,
+                # This pass validates media that was already rendered.  An
+                # optional beat present in the render is not an omission
+                # choice here; allowing None would make the validator approve
+                # a different sequence than the delivered file.
+                priority=(
+                    "preferred" if priority == "optional" else priority
+                ),
                 options=(option,),
             )
         )
@@ -14526,6 +17199,18 @@ def _run_feature_cut_experiment_impl(
         editorial_templates = load_editorial_beat_contracts(
             editorial_beat_contracts_path
         )
+        for contract in editorial_templates:
+            policy_tolerance = sync_tolerance_for_priority(
+                autonomous_policy,
+                contract.priority,
+            )
+            for visual_event in contract.visual_events:
+                if visual_event.tolerance_frames > policy_tolerance:
+                    raise ValueError(
+                        "editorial visual-event tolerance exceeds autonomous "
+                        f"policy for {contract.beat_id}: "
+                        f"{visual_event.tolerance_frames} > {policy_tolerance}"
+                    )
         if any(contract.feature_id is None for contract in editorial_templates):
             raise ValueError(
                 "selected-window orchestration requires feature_id on every beat"
@@ -14543,13 +17228,18 @@ def _run_feature_cut_experiment_impl(
         plan_prompt = (
             plan_prompt
             + "\n\n## Autonomous selected-window editorial contracts\n"
-            + "These contracts are immutable selection constraints. For every "
-            "hard or preferred visual event, select a candidate reel event "
-            "whose bounded source window visibly contains that event. Do not "
-            "select a nearby static setup merely because it shows the same "
-            "object. A hard event with no supporting candidate must be returned "
-            "as not_found; never substitute or infer it. Exact frame IDs and "
-            "timestamps will be resolved locally after selection.\n"
+            + "These contracts are immutable selection constraints. Select the "
+            "strongest fulfillment_alternative supported by each candidate's "
+            "supplied evidence provenance and observable predicates. A hard "
+            "beat must reach minimum_fulfillment_level; it does not silently "
+            "make the strongest direct tier mandatory. When the selected tier "
+            "requires an exact visual event, the bounded source window must "
+            "visibly contain it; nearby static setup is not equivalent. An "
+            "authorized contextual tier is illustrative only: preserve its "
+            "degradation and copy-suppression limits and never describe it as "
+            "a direct action, transition, or result. Return not_found only "
+            "when no candidate reaches the minimum. Exact frame IDs and "
+            "timestamps are resolved locally after selection.\n"
             + json.dumps(
                 [
                     contract.model_dump(mode="json")
@@ -14566,7 +17256,10 @@ def _run_feature_cut_experiment_impl(
     ):
         raise ValueError("music file does not match the supplied MusicMap lock")
     client = (
-        GeminiLabClient(budget_ledger=budget_ledger)
+        GeminiLabClient(
+            budget_ledger=budget_ledger,
+            autonomous_policy=autonomous_policy,
+        )
         if budget_ledger is not None
         else GeminiLabClient()
     )
@@ -14843,6 +17536,34 @@ def _run_feature_cut_experiment_impl(
             )
             write_json(plan_binding_path, binding)
             plan_reused = False
+        pre_execution_degradations: tuple[DegradationRecord, ...] = ()
+        execution_plan_path: Path | None = None
+        if autonomous_policy is not None:
+            assert editorial_beat_contracts_path is not None
+            plan, pre_execution_degradations, execution_plan_projection = (
+                _project_autonomous_executable_feature_plan(
+                    plan=plan,
+                    contracts=editorial_templates,
+                    policy=autonomous_policy,
+                    source_plan_sha256=sha256_file(plan_path),
+                    contracts_sha256=sha256_file(
+                        editorial_beat_contracts_path.expanduser().resolve(
+                            strict=True
+                        )
+                    ),
+                )
+            )
+            execution_plan_path = (
+                output_dir / "autonomous-execution-plan-projection.json"
+            )
+            write_json(
+                execution_plan_path,
+                {
+                    **execution_plan_projection,
+                    "projected_plan": plan.model_dump(mode="json"),
+                    "generated_at": utc_now(),
+                },
+            )
         semantic_beat_by_id: dict[str, SemanticBeat] = {}
         if autonomous_policy is not None:
             semantic_ir = _project_feature_semantic_edit_ir(
@@ -14862,6 +17583,11 @@ def _run_feature_cut_experiment_impl(
                     "contract_version": "semantic-edit-ir-binding-v1",
                     "semantic_edit_ir_sha256": semantic_ir.definition_sha256(),
                     "feature_plan_sha256": sha256_file(plan_path),
+                    "execution_plan_projection_sha256": (
+                        sha256_file(execution_plan_path)
+                        if execution_plan_path is not None
+                        else None
+                    ),
                     "brief_sha256": sha256_file(brief_path),
                     "catalog_sha256": sha256_file(catalog_path),
                     "policy_reference": autonomous_policy.policy_reference,
@@ -14877,6 +17603,7 @@ def _run_feature_cut_experiment_impl(
                 plan,
                 editorial_templates,
                 candidate_evidence_events,
+                aspect=aspect,
             )
         shot_cache: dict[str, ShotManifest] = {}
         shots_dir = output_dir / "shots"
@@ -15200,6 +17927,119 @@ def _run_feature_cut_experiment_impl(
                 "generated_at": utc_now(),
             },
         )
+        pre_render_candidate_route = (
+            _build_pre_render_vertical_candidate_route(
+                plan,
+                chapter_durations=chapter_durations,
+                rhythm_plan=rhythm_plan,
+                duration_audit=duration_audit,
+                policy=autonomous_policy,
+            )
+            if autonomous_profile and render_vertical
+            else None
+        )
+        pre_render_candidate_route_path = (
+            editorial_dir / "pre-render-candidate-route.json"
+        )
+        if pre_render_candidate_route is not None:
+            write_json(
+                pre_render_candidate_route_path,
+                {
+                    **pre_render_candidate_route.model_dump(mode="json"),
+                    "semantic_replan_frontier": (
+                        _semantic_replan_frontier_projection(
+                            pre_render_candidate_route
+                        )
+                    ),
+                    "feature_plan_sha256": sha256_file(plan_path),
+                    "interpretation": (
+                        "Candidate, resolved trim duration, music exit, "
+                        "presentation family, and symbolic entry/exit "
+                        "composition were jointly bound before render. Exact "
+                        "evidence, identity, relation, quality, reuse, and "
+                        "pixel geometry remain downstream hard gates; a "
+                        "failed primary advances through the saved global "
+                        "fallback order."
+                    ),
+                    "generated_at": utc_now(),
+                },
+            )
+        pre_render_candidate_id_by_feature = {
+            selection.beat_id: selection.candidate_id
+            for selection in (
+                pre_render_candidate_route.selections
+                if pre_render_candidate_route is not None
+                else ()
+            )
+        }
+        pre_render_candidate_order_by_feature = (
+            dict(
+                pre_render_candidate_route
+                .fallback_candidate_ids_by_beat
+            )
+            if pre_render_candidate_route is not None
+            else {}
+        )
+        pre_render_candidate_bindings_by_feature = (
+            dict(pre_render_candidate_route.option_bindings_by_beat)
+            if pre_render_candidate_route is not None
+            else {}
+        )
+        pre_render_horizontal_candidate_route = (
+            _build_pre_render_horizontal_candidate_route(
+                plan,
+                chapter_durations=chapter_durations,
+                rhythm_plan=rhythm_plan,
+                duration_audit=duration_audit,
+                policy=autonomous_policy,
+            )
+            if autonomous_profile and render_horizontal
+            else None
+        )
+        pre_render_horizontal_candidate_route_path = (
+            editorial_dir / "pre-render-horizontal-candidate-route.json"
+        )
+        if pre_render_horizontal_candidate_route is not None:
+            write_json(
+                pre_render_horizontal_candidate_route_path,
+                {
+                    **pre_render_horizontal_candidate_route.model_dump(
+                        mode="json"
+                    ),
+                    "semantic_replan_frontier": (
+                        _semantic_replan_frontier_projection(
+                            pre_render_horizontal_candidate_route
+                        )
+                    ),
+                    "feature_plan_sha256": sha256_file(plan_path),
+                    "aspect": "16:9",
+                    "generated_at": utc_now(),
+                },
+            )
+        pre_render_horizontal_candidate_id_by_feature = {
+            selection.beat_id: selection.candidate_id
+            for selection in (
+                pre_render_horizontal_candidate_route.selections
+                if pre_render_horizontal_candidate_route is not None
+                else ()
+            )
+        }
+        pre_render_horizontal_candidate_order_by_feature = (
+            dict(
+                pre_render_horizontal_candidate_route
+                .fallback_candidate_ids_by_beat
+            )
+            if pre_render_horizontal_candidate_route is not None
+            else {}
+        )
+        pre_render_horizontal_candidate_bindings_by_feature = (
+            dict(
+                pre_render_horizontal_candidate_route
+                .option_bindings_by_beat
+            )
+            if pre_render_horizontal_candidate_route is not None
+            else {}
+        )
         horizontal_segments: list[Path] = []
         vertical_segments: list[Path] = []
         render_config = {
@@ -15210,6 +18050,16 @@ def _run_feature_cut_experiment_impl(
             "editorial_duration_plan": duration_audit,
             "sequence_rhythm_optimization_sha256": sha256_file(
                 sequence_rhythm_path
+            ),
+            "pre_render_candidate_route_sha256": (
+                sha256_file(pre_render_candidate_route_path)
+                if pre_render_candidate_route is not None
+                else None
+            ),
+            "pre_render_horizontal_candidate_route_sha256": (
+                sha256_file(pre_render_horizontal_candidate_route_path)
+                if pre_render_horizontal_candidate_route is not None
+                else None
             ),
             "music_sha256": music_sha256,
             "sam_analysis_fps": sam_analysis_fps,
@@ -15335,6 +18185,30 @@ def _run_feature_cut_experiment_impl(
                 "sequence_rhythm_optimization_sha256": sha256_file(
                     sequence_rhythm_path
                 ),
+                "pre_render_candidate_route_path": (
+                    str(pre_render_candidate_route_path.resolve())
+                    if pre_render_candidate_route is not None
+                    else None
+                ),
+                "pre_render_candidate_route_sha256": (
+                    sha256_file(pre_render_candidate_route_path)
+                    if pre_render_candidate_route is not None
+                    else None
+                ),
+                "pre_render_horizontal_candidate_route_path": (
+                    str(
+                        pre_render_horizontal_candidate_route_path.resolve()
+                    )
+                    if pre_render_horizontal_candidate_route is not None
+                    else None
+                ),
+                "pre_render_horizontal_candidate_route_sha256": (
+                    sha256_file(
+                        pre_render_horizontal_candidate_route_path
+                    )
+                    if pre_render_horizontal_candidate_route is not None
+                    else None
+                ),
             },
             "horizontal": {
                 "requested": render_horizontal,
@@ -15353,13 +18227,41 @@ def _run_feature_cut_experiment_impl(
         resolved_exact_event_locks: list[ExactEventLockV2] = []
         exact_event_project_times_ms: dict[str, int] = {}
         exact_event_selected_windows: list[dict[str, Any]] = []
-        autonomous_degradations: list[DegradationRecord] = []
+        autonomous_degradations: list[DegradationRecord] = list(
+            pre_execution_degradations
+        )
+        resolved_editorial_contracts_by_aspect: dict[
+            str, list[EditorialBeatContract]
+        ] = {"16:9": [], "9:16": []}
+        resolved_exact_event_locks_by_aspect: dict[
+            str, list[ExactEventLockV2]
+        ] = {"16:9": [], "9:16": []}
+        exact_event_project_times_ms_by_aspect: dict[str, dict[str, int]] = {
+            "16:9": {},
+            "9:16": {},
+        }
+        exact_event_selected_windows_by_aspect: dict[
+            str, list[dict[str, Any]]
+        ] = {"16:9": [], "9:16": []}
+        autonomous_degradations_by_aspect: dict[
+            str, list[DegradationRecord]
+        ] = {
+            "16:9": (
+                list(pre_execution_degradations) if render_horizontal else []
+            ),
+            "9:16": (
+                list(pre_execution_degradations) if render_vertical else []
+            ),
+        }
         source_audio_cache: dict[str, bool] = {}
         source_media_cache: dict[str, MediaInfo] = {}
         exact_event_source_reservations = (
             _autonomous_exact_event_source_reservations(
                 plan,
                 editorial_templates,
+                routed_candidate_ids=(
+                    pre_render_candidate_id_by_feature
+                ),
             )
             if autonomous_profile
             else {}
@@ -15368,6 +18270,7 @@ def _run_feature_cut_experiment_impl(
         for index, selected in enumerate(plan.chapters):
             brief_chapter = brief_by_id[selected.feature_id]
             chapter_duration_seconds = chapter_durations[selected.feature_id]
+            chapter_copy_suppression_codes: tuple[str, ...] = ()
             horizontal_overlay = output_dir / "overlays" / "16x9" / f"{index:02d}.png"
             vertical_overlay = output_dir / "overlays" / "9x16" / f"{index:02d}.png"
             horizontal_segment = (
@@ -15377,6 +18280,52 @@ def _run_feature_cut_experiment_impl(
                 output_dir / "segments" / render_variant / "9x16" / f"{index:02d}.mp4"
             )
             if selected.evidence_status == "not_found":
+                if autonomous_profile:
+                    missing_contracts = tuple(
+                        contract
+                        for contract in editorial_templates
+                        if contract.feature_id == selected.feature_id
+                    )
+                    if not missing_contracts:
+                        raise ValueError(
+                            "autonomous not-found chapter has no editorial "
+                            "contract defining whether omission is legal"
+                        )
+                    blocking_priorities = {
+                        contract.priority
+                        for contract in missing_contracts
+                        if contract.priority in {"hard", "preferred"}
+                    }
+                    if blocking_priorities:
+                        raise ValueError(
+                            "autonomous chapter lacks evidence for "
+                            + ", ".join(sorted(blocking_priorities))
+                            + " editorial requirements"
+                        )
+                    assert autonomous_policy is not None
+                    if (
+                        not autonomous_policy.editorial
+                        .allow_optional_beat_omission
+                    ):
+                        raise ValueError(
+                            "optional beat omission is not policy-authorized"
+                        )
+                    for contract in missing_contracts:
+                        degradation = DegradationRecord(
+                            beat_id=contract.beat_id,
+                            action="optional_beat_omitted",
+                            reason_code="catalog_evidence_not_found",
+                        )
+                        autonomous_degradations.append(degradation)
+                        if render_horizontal:
+                            autonomous_degradations_by_aspect["16:9"].append(
+                                degradation
+                            )
+                        if render_vertical:
+                            autonomous_degradations_by_aspect["9:16"].append(
+                                degradation
+                            )
+                    continue
                 if render_horizontal:
                     if not _segment_is_valid(
                         horizontal_segment,
@@ -15457,13 +18406,59 @@ def _run_feature_cut_experiment_impl(
                         )
                 horizontal_candidate_attempts: list[dict[str, Any]] = []
                 horizontal_selected_option: dict[str, Any] | None = None
+                horizontal_exact_resolution: tuple[
+                    tuple[EditorialBeatContract, ...],
+                    tuple[ExactEventLockV2, ...],
+                    dict[str, int],
+                    dict[str, Any] | None,
+                    tuple[EditorialBeatFulfillmentSelection, ...],
+                ] | None = None
                 if render_horizontal:
                     prepared_horizontal: dict[str, Any] | None = None
-                    for horizontal_option in _horizontal_runtime_candidate_options(
-                        selected
-                    ):
+                    horizontal_options = _apply_pre_render_candidate_route(
+                        _horizontal_runtime_candidate_options(
+                            selected,
+                            max_candidates=4,
+                        ),
+                        selected_candidate_id=(
+                            pre_render_horizontal_candidate_id_by_feature.get(
+                                selected.feature_id
+                            )
+                        ),
+                        ordered_candidate_ids=(
+                            pre_render_horizontal_candidate_order_by_feature.get(
+                                selected.feature_id,
+                                (),
+                            )
+                        ),
+                        sequence_bindings=(
+                            pre_render_horizontal_candidate_bindings_by_feature.get(
+                                selected.feature_id,
+                                {},
+                            )
+                        ),
+                    )
+                    if autonomous_policy is not None:
+                        horizontal_options = horizontal_options[
+                            : autonomous_policy.recovery
+                            .max_candidate_attempts_per_beat
+                        ]
+                    for horizontal_option in horizontal_options:
                         try:
-                            prepared_horizontal = (
+                            _select_runtime_candidate_fulfillments(
+                                tuple(
+                                    contract
+                                    for contract in editorial_templates
+                                    if (
+                                        contract.feature_id
+                                        == selected.feature_id
+                                        and contract.priority == "hard"
+                                    )
+                                ),
+                                option=horizontal_option,
+                                evidence_events=candidate_evidence_events,
+                            )
+                            candidate_window = (
                                 _prepare_horizontal_runtime_candidate(
                                     option=horizontal_option,
                                     selected=selected,
@@ -15489,8 +18484,188 @@ def _run_feature_cut_experiment_impl(
                                     model_request_block_reason=(
                                         gemini_geometry_block_reason
                                     ),
+                                    audit_source_motion=False,
+                                    compile_geometry=not autonomous_profile,
                                 )
                             )
+                            if autonomous_profile:
+                                assert autonomous_policy is not None
+                                assert editorial_beat_contracts_path is not None
+                                candidate_exact_resolution = (
+                                    _resolve_horizontal_grouped_exact_event_locks(
+                                        client=client,
+                                        selected=selected,
+                                        prepared=candidate_window,
+                                        selected_option=horizontal_option,
+                                        contracts=editorial_templates,
+                                        evidence_events=(
+                                            candidate_evidence_events
+                                        ),
+                                        editorial_beat_contracts_path=(
+                                            editorial_beat_contracts_path
+                                        ),
+                                        output_dir=output_dir,
+                                        project_start_ms=sum(
+                                            int(row["duration_ms"])
+                                            for row in manifest[
+                                                "horizontal"
+                                            ]["chapters"]
+                                        ),
+                                    )
+                                )
+                                (
+                                    _candidate_contracts,
+                                    candidate_locks,
+                                    _candidate_project_times,
+                                    candidate_selected_window,
+                                    _candidate_fulfillments,
+                                ) = candidate_exact_resolution
+                                candidate_id = str(
+                                    horizontal_option["candidate_id"]
+                                )
+                                dense_catalog_path = (
+                                    output_dir
+                                    / "exact-events"
+                                    / selected.feature_id
+                                    / candidate_id
+                                    / "dense-catalog.json"
+                                )
+                                if dense_catalog_path.is_file():
+                                    dense_catalog = (
+                                        DenseFrameCatalog.model_validate(
+                                            read_json(dense_catalog_path)
+                                        )
+                                    )
+                                else:
+                                    dense_catalog = (
+                                        create_dense_window_catalog(
+                                            Path(
+                                                candidate_window["clip"].path
+                                            ),
+                                            candidate_window[
+                                                "media"
+                                            ].asset_id,
+                                            selected.feature_id,
+                                            dense_catalog_path.parent,
+                                            sampling_fps=8.0,
+                                            start_ms=int(
+                                                candidate_window["start_ms"]
+                                            ),
+                                            end_ms=int(
+                                                candidate_window["end_ms"]
+                                            ),
+                                        )
+                                    )
+                                authorized_trim, authorized = (
+                                    _authorize_runtime_selected_window_trim(
+                                        policy=autonomous_policy,
+                                        feature_id=selected.feature_id,
+                                        shot_id=str(
+                                            candidate_window["shot_id"]
+                                        ),
+                                        source_path=Path(
+                                            candidate_window["clip"].path
+                                        ),
+                                        source_sha256=(
+                                            candidate_window["clip"].sha256
+                                        ),
+                                        source_asset_id=(
+                                            candidate_window["media"].asset_id
+                                        ),
+                                        start_ms=int(
+                                            candidate_window["start_ms"]
+                                        ),
+                                        end_ms=int(
+                                            candidate_window["end_ms"]
+                                        ),
+                                        trim=candidate_window["trim"],
+                                        locks=candidate_locks,
+                                        dense_catalog=dense_catalog,
+                                        dense_catalog_path=(
+                                            dense_catalog_path
+                                        ),
+                                        output_dir=output_dir,
+                                    )
+                                )
+                                candidate_window["trim"] = authorized_trim
+                                if candidate_selected_window is not None:
+                                    candidate_selected_window.update(
+                                        {
+                                            "authorized_trim_decision_path": (
+                                                authorized_trim[
+                                                    "authorized_trim_decision_path"
+                                                ]
+                                            ),
+                                            "authorized_trim_decision_sha256": (
+                                                authorized_trim[
+                                                    "authorized_trim_decision_sha256"
+                                                ]
+                                            ),
+                                            "authorized_trim_policy_reference": (
+                                                authorized.authority.policy_reference
+                                            ),
+                                        }
+                                    )
+                                grounding_frame = (
+                                    _grounding_anchor_from_exact_event_locks(
+                                        candidate_window["frame"],
+                                        locks=candidate_locks,
+                                        dense_catalog=dense_catalog,
+                                    )
+                                )
+                                prepared_horizontal = (
+                                    _prepare_horizontal_runtime_candidate(
+                                        option=horizontal_option,
+                                        selected=selected,
+                                        brief_chapter=brief_chapter,
+                                        chapter_duration_seconds=(
+                                            chapter_duration_seconds
+                                        ),
+                                        frames=frames,
+                                        clips=clips,
+                                        shot_cache=shot_cache,
+                                        shots_dir=shots_dir,
+                                        scdet_threshold=scdet_threshold,
+                                        trim_decisions=trim_decisions,
+                                        shot_quality_maps=(
+                                            shot_quality_maps
+                                        ),
+                                        source_audio_cache=(
+                                            source_audio_cache
+                                        ),
+                                        source_media_cache=(
+                                            source_media_cache
+                                        ),
+                                        track_cache=track_cache,
+                                        client=client,
+                                        checkpoint_path=checkpoint_path,
+                                        grounding_prompt=grounding_prompt,
+                                        output_dir=output_dir,
+                                        sam_analysis_fps=sam_analysis_fps,
+                                        model_request_block_reason=(
+                                            gemini_geometry_block_reason
+                                        ),
+                                        audit_source_motion=True,
+                                        immutable_window={
+                                            "start_ms": candidate_window[
+                                                "start_ms"
+                                            ],
+                                            "end_ms": candidate_window[
+                                                "end_ms"
+                                            ],
+                                            "shot_id": candidate_window[
+                                                "shot_id"
+                                            ],
+                                            "trim": authorized_trim,
+                                        },
+                                        grounding_frame=grounding_frame,
+                                    )
+                                )
+                                horizontal_exact_resolution = (
+                                    candidate_exact_resolution
+                                )
+                            else:
+                                prepared_horizontal = candidate_window
                         except Exception as error:
                             abort_for_geometry_quota(error)
                             horizontal_candidate_attempts.append(
@@ -15589,8 +18764,24 @@ def _run_feature_cut_experiment_impl(
                         "selected_candidate_rank": (
                             horizontal_selected_option or {}
                         ).get("rank"),
+                        "pre_render_sequence_binding": (
+                            horizontal_selected_option or {}
+                        ).get("_pre_render_sequence_binding"),
                         "attempts": horizontal_candidate_attempts,
                     }
+                    contextual_fallback_possible = any(
+                        alternative.fulfillment_level
+                        == "contextual_identity"
+                        for contract in editorial_templates
+                        if contract.feature_id == selected.feature_id
+                        for alternative in (
+                            contract.effective_fulfillment_alternatives
+                        )
+                    )
+                    if contextual_fallback_possible:
+                        horizontal_geometry[
+                            "title_overlay_suppressed_pending_evidence_tier"
+                        ] = True
                     horizontal_source_interval = _exact_render_source_interval(
                         source_path=Path(horizontal_clip.path),
                         source_sha256=horizontal_clip.sha256,
@@ -15645,7 +18836,10 @@ def _run_feature_cut_experiment_impl(
                             end_ms=h_end,
                             overlay_path=(
                                 horizontal_overlay
-                                if brief.render_title_overlays
+                                if (
+                                    brief.render_title_overlays
+                                    and not contextual_fallback_possible
+                                )
                                 else None
                             ),
                             base_filter=horizontal_filter,
@@ -15668,6 +18862,75 @@ def _run_feature_cut_experiment_impl(
                             / "16x9.json"
                         ),
                     )
+                if autonomous_profile and render_horizontal:
+                    if horizontal_exact_resolution is None:
+                        raise AssertionError(
+                            "autonomous horizontal geometry requires pre-resolved "
+                            "ExactEventLocks and trim authority"
+                        )
+                    (
+                        horizontal_contracts,
+                        horizontal_locks,
+                        horizontal_project_times,
+                        horizontal_selected_window,
+                        horizontal_fulfillments,
+                    ) = horizontal_exact_resolution
+                    resolved_editorial_contracts_by_aspect["16:9"].extend(
+                        horizontal_contracts
+                    )
+                    resolved_exact_event_locks_by_aspect["16:9"].extend(
+                        horizontal_locks
+                    )
+                    exact_event_project_times_ms_by_aspect["16:9"].update(
+                        horizontal_project_times
+                    )
+                    horizontal_degradations: list[DegradationRecord] = []
+                    for fulfillment in horizontal_fulfillments:
+                        if (
+                            fulfillment.fulfillment_level
+                            == "contextual_identity"
+                        ):
+                            horizontal_degradations.append(
+                                DegradationRecord(
+                                    beat_id=fulfillment.beat_id,
+                                    action="contextual_visual_substitution",
+                                    reason_code=";".join(
+                                        fulfillment.degradation_codes
+                                    ),
+                                    copy_suppression_codes=(
+                                        fulfillment.copy_suppression_codes
+                                    ),
+                                )
+                            )
+                    autonomous_degradations_by_aspect["16:9"].extend(
+                        horizontal_degradations
+                    )
+                    if horizontal_selected_window is not None:
+                        exact_event_selected_windows_by_aspect["16:9"].append(
+                            {
+                                **horizontal_selected_window,
+                                "aspect": "16:9",
+                            }
+                        )
+                    # Preserve the flat single-aspect artifact contract.
+                    if not render_vertical:
+                        resolved_editorial_contracts.extend(
+                            horizontal_contracts
+                        )
+                        resolved_exact_event_locks.extend(horizontal_locks)
+                        exact_event_project_times_ms.update(
+                            horizontal_project_times
+                        )
+                        autonomous_degradations.extend(
+                            horizontal_degradations
+                        )
+                        if horizontal_selected_window is not None:
+                            exact_event_selected_windows.append(
+                                {
+                                    **horizontal_selected_window,
+                                    "aspect": "16:9",
+                                }
+                            )
                 if not render_vertical:
                     horizontal_entry = _horizontal_manifest_entry(
                         selected=selected,
@@ -15704,6 +18967,12 @@ def _run_feature_cut_experiment_impl(
                 # advisories; hard-core, atomic, lineage, tracking, and motion
                 # failures still block the candidate.
                 auto_reframe_policy = AutoReframePolicy(
+                    max_candidates=(
+                        autonomous_policy.recovery
+                        .max_candidate_attempts_per_beat
+                        if autonomous_policy is not None
+                        else 4
+                    ),
                     require_semantic_checkpoints_for_tracked_crop=False,
                     soft_extent_below_minimum_is_failure=False,
                 )
@@ -15711,7 +18980,30 @@ def _run_feature_cut_experiment_impl(
                     selected,
                     human_policy_binding_present=human_reframe_policy_requested,
                     candidate_evidence_events=candidate_evidence_events,
-                    max_candidates=auto_reframe_policy.max_candidates,
+                    max_candidates=4,
+                )
+                vertical_options = vertical_options[
+                    : auto_reframe_policy.max_candidates
+                ]
+                vertical_options = _apply_pre_render_candidate_route(
+                    vertical_options,
+                    selected_candidate_id=(
+                        pre_render_candidate_id_by_feature.get(
+                            selected.feature_id
+                        )
+                    ),
+                    ordered_candidate_ids=(
+                        pre_render_candidate_order_by_feature.get(
+                            selected.feature_id,
+                            (),
+                        )
+                    ),
+                    sequence_bindings=(
+                        pre_render_candidate_bindings_by_feature.get(
+                            selected.feature_id,
+                            {},
+                        )
+                    ),
                 )
                 candidate_attempts: list[dict[str, Any]] = []
                 deferred_fit: dict[str, Any] | None = None
@@ -15740,6 +19032,40 @@ def _run_feature_cut_experiment_impl(
                                 "vertical candidate source asset differs from "
                                 f"its frame: {frame_id}"
                             )
+                        candidate_beat_contracts = [
+                            contract
+                            for contract in editorial_templates
+                            if (
+                                contract.feature_id
+                                == selected.feature_id
+                                and contract.priority == "hard"
+                            )
+                        ]
+                        try:
+                            _select_runtime_candidate_fulfillments(
+                                candidate_beat_contracts,
+                                option=option_data,
+                                evidence_events=candidate_evidence_events,
+                            )
+                        except ValueError:
+                            candidate_attempts.append(
+                                {
+                                    "candidate_id": candidate_id,
+                                    "rank": candidate_rank,
+                                    "frame_id": frame_id,
+                                    "source_asset_id": expected_asset,
+                                    "event_id": option_data.get("event_id"),
+                                    "strategy": option_data.get("strategy"),
+                                    "decision": "try_next",
+                                    "reason_code": (
+                                        "candidate_below_hard_fulfillment_minimum"
+                                    ),
+                                    "failure_codes": [],
+                                    "recovery_action": "try_next_candidate",
+                                    "paid_model_calls_added": 0,
+                                }
+                            )
+                            continue
                         future_reservation = exact_event_source_reservations.get(
                             candidate_clip.sha256
                         )
@@ -15825,6 +19151,11 @@ def _run_feature_cut_experiment_impl(
                             source_out_ms=candidate_end,
                             max_editorial_reprise_overlap_fraction=(
                                 0.5 if autonomous_profile else None
+                            ),
+                            allowed_reuse_modes=(
+                                autonomous_policy.editorial.allow_source_reuse
+                                if autonomous_policy is not None
+                                else None
                             ),
                         )
                         if reuse_violation is not None:
@@ -16095,6 +19426,16 @@ def _run_feature_cut_experiment_impl(
                     autonomous_static_audition = False
                     try:
                         candidate_query_lock: EvidenceQueryLockV2 | None = None
+                        candidate_exact_resolution: tuple[
+                            tuple[EditorialBeatContract, ...],
+                            tuple[ExactEventLockV2, ...],
+                            DenseFrameCatalog,
+                            tuple[EditorialBeatFulfillmentSelection, ...],
+                        ] | None = None
+                        candidate_authorized_trim: (
+                            AuthorizedTrimIntentDecisionV2 | None
+                        ) = None
+                        candidate_grounding_frame = candidate_frame
                         if (
                             selected.vertical_candidates
                             and not human_reframe_policy_requested
@@ -16123,6 +19464,187 @@ def _run_feature_cut_experiment_impl(
                                     candidate_query_lock.approval.policy_reference
                                 ),
                             }
+                        if autonomous_profile:
+                            if (
+                                autonomous_policy is None
+                                or editorial_beat_contracts_path is None
+                            ):
+                                raise AssertionError(
+                                    "autonomous selected-window ordering requires "
+                                    "policy and editorial contracts"
+                                )
+                            selected_candidate_contracts = tuple(
+                                contract
+                                for contract in editorial_templates
+                                if contract.feature_id == selected.feature_id
+                            )
+                            if selected_candidate_contracts:
+                                if candidate_query_lock is not None:
+                                    query_sha = (
+                                        candidate_query_lock.definition_sha256()
+                                    )
+                                else:
+                                    query_hashes = {
+                                        contract.evidence_query_lock_sha256
+                                        for contract in (
+                                            selected_candidate_contracts
+                                        )
+                                    }
+                                    if len(query_hashes) != 1:
+                                        raise ValueError(
+                                            "selected 9:16 exact events require "
+                                            "one immutable query binding"
+                                        )
+                                    query_sha = next(iter(query_hashes))
+                                required_target_ids = tuple(
+                                    dict.fromkeys(
+                                        (
+                                            str(
+                                                region.entity_id
+                                                or region.region_id
+                                            )
+                                            for region in candidate_regions
+                                            if region.role == "required"
+                                        ),
+                                    )
+                                ) or tuple(
+                                    dict.fromkeys(
+                                        target_id
+                                        for contract in (
+                                            selected_candidate_contracts
+                                        )
+                                        for target_id in (
+                                            contract.required_target_ids
+                                        )
+                                    )
+                                )
+                                candidate_exact_resolution = (
+                                    _resolve_selected_window_grouped_exact_event_locks(
+                                        client=client,
+                                        feature_id=selected.feature_id,
+                                        candidate_id=candidate_id,
+                                        source_path=Path(
+                                            candidate_clip.path
+                                        ),
+                                        source_sha256=candidate_clip.sha256,
+                                        source_asset_id=(
+                                            candidate_media.asset_id
+                                        ),
+                                        start_ms=candidate_start,
+                                        end_ms=candidate_end,
+                                        selected_option=option_data,
+                                        contracts=(
+                                            selected_candidate_contracts
+                                        ),
+                                        evidence_events=(
+                                            candidate_evidence_events
+                                        ),
+                                        evidence_query_lock_sha256=(
+                                            query_sha
+                                        ),
+                                        required_target_ids=(
+                                            required_target_ids
+                                        ),
+                                        editorial_beat_contracts_path=(
+                                            editorial_beat_contracts_path
+                                        ),
+                                        output_dir=output_dir,
+                                    )
+                                )
+                                (
+                                    _bound_contracts,
+                                    candidate_locks,
+                                    candidate_dense_catalog,
+                                    _fulfillment_selections,
+                                ) = candidate_exact_resolution
+                                dense_catalog_path = (
+                                    output_dir
+                                    / "exact-events"
+                                    / selected.feature_id
+                                    / candidate_id
+                                    / "dense-catalog.json"
+                                )
+                                (
+                                    candidate_trim,
+                                    candidate_authorized_trim,
+                                ) = _authorize_runtime_selected_window_trim(
+                                    policy=autonomous_policy,
+                                    feature_id=selected.feature_id,
+                                    shot_id=candidate_shot,
+                                    source_path=Path(candidate_clip.path),
+                                    source_sha256=candidate_clip.sha256,
+                                    source_asset_id=candidate_media.asset_id,
+                                    start_ms=candidate_start,
+                                    end_ms=candidate_end,
+                                    trim=candidate_trim,
+                                    locks=candidate_locks,
+                                    dense_catalog=candidate_dense_catalog,
+                                    dense_catalog_path=dense_catalog_path,
+                                    output_dir=output_dir,
+                                )
+                                candidate_grounding_frame = (
+                                    _grounding_anchor_from_exact_event_locks(
+                                        candidate_frame,
+                                        locks=candidate_locks,
+                                        dense_catalog=(
+                                            candidate_dense_catalog
+                                        ),
+                                    )
+                                )
+                            else:
+                                dense_root = (
+                                    output_dir
+                                    / "exact-events"
+                                    / selected.feature_id
+                                    / candidate_id
+                                )
+                                dense_catalog_path = (
+                                    dense_root / "dense-catalog.json"
+                                )
+                                if dense_catalog_path.is_file():
+                                    candidate_dense_catalog = (
+                                        DenseFrameCatalog.model_validate(
+                                            read_json(dense_catalog_path)
+                                        )
+                                    )
+                                else:
+                                    candidate_dense_catalog = (
+                                        create_dense_window_catalog(
+                                            Path(candidate_clip.path),
+                                            candidate_media.asset_id,
+                                            selected.feature_id,
+                                            dense_root,
+                                            sampling_fps=8.0,
+                                            start_ms=candidate_start,
+                                            end_ms=candidate_end,
+                                        )
+                                    )
+                                candidate_exact_resolution = (
+                                    (),
+                                    (),
+                                    candidate_dense_catalog,
+                                    (),
+                                )
+                                (
+                                    candidate_trim,
+                                    candidate_authorized_trim,
+                                ) = _authorize_runtime_selected_window_trim(
+                                    policy=autonomous_policy,
+                                    feature_id=selected.feature_id,
+                                    shot_id=candidate_shot,
+                                    source_path=Path(candidate_clip.path),
+                                    source_sha256=candidate_clip.sha256,
+                                    source_asset_id=candidate_media.asset_id,
+                                    start_ms=candidate_start,
+                                    end_ms=candidate_end,
+                                    trim=candidate_trim,
+                                    locks=(),
+                                    dense_catalog=(
+                                        candidate_dense_catalog
+                                    ),
+                                    dense_catalog_path=dense_catalog_path,
+                                    output_dir=output_dir,
+                                )
                         geometry_recompile_request = {
                             "event_description": (
                                 brief_chapter.title
@@ -16227,7 +19749,7 @@ def _run_feature_cut_experiment_impl(
                             ) = _vertical_candidate_geometry(
                                 client=client,
                                 clip=candidate_clip,
-                                frame=candidate_frame,
+                                frame=candidate_grounding_frame,
                                 start_ms=candidate_start,
                                 end_ms=candidate_end,
                                 feature_id=selected.feature_id,
@@ -16728,6 +20250,15 @@ def _run_feature_cut_experiment_impl(
                                 "evidence_query_v2": attempt.get(
                                     "evidence_query_v2"
                                 ),
+                                "_exact_event_resolution": (
+                                    candidate_exact_resolution
+                                ),
+                                "_authorized_trim": (
+                                    candidate_authorized_trim
+                                ),
+                                "_grounding_frame": (
+                                    candidate_grounding_frame
+                                ),
                                 "_geometry_recompile_request": (
                                     geometry_recompile_request
                                 ),
@@ -16807,6 +20338,15 @@ def _run_feature_cut_experiment_impl(
                                     "evidence_query_v2": attempt.get(
                                         "evidence_query_v2"
                                     ),
+                                    "_exact_event_resolution": (
+                                        candidate_exact_resolution
+                                    ),
+                                    "_authorized_trim": (
+                                        candidate_authorized_trim
+                                    ),
+                                    "_grounding_frame": (
+                                        candidate_grounding_frame
+                                    ),
                                 }
                         applied_presentation = str(
                             candidate_geometry.get("applied_strategy")
@@ -16883,6 +20423,15 @@ def _run_feature_cut_experiment_impl(
                                 ),
                                 "_geometry_recompile_request": (
                                     geometry_recompile_request
+                                ),
+                                "_exact_event_resolution": (
+                                    candidate_exact_resolution
+                                ),
+                                "_authorized_trim": (
+                                    candidate_authorized_trim
+                                ),
+                                "_grounding_frame": (
+                                    candidate_grounding_frame
                                 ),
                             }
                             if defer_constructed:
@@ -17056,6 +20605,15 @@ def _run_feature_cut_experiment_impl(
                                 "evidence_query_v2": attempt.get(
                                     "evidence_query_v2"
                                 ),
+                                "_exact_event_resolution": (
+                                    candidate_exact_resolution
+                                ),
+                                "_authorized_trim": (
+                                    candidate_authorized_trim
+                                ),
+                                "_grounding_frame": (
+                                    candidate_grounding_frame
+                                ),
                             }
                         if whole_source_fit_authorized:
                             continue
@@ -17095,8 +20653,59 @@ def _run_feature_cut_experiment_impl(
                             break
 
                 if selected_vertical is None:
+                    deferred_panel_allowed = True
+                    if (
+                        deferred_panel is not None
+                        and autonomous_policy is not None
+                    ):
+                        planned_total_ms = max(
+                            1,
+                            round(sum(chapter_durations.values()) * 1000),
+                        )
+                        deferred_panel_allowed = (
+                            _runtime_panel_budget_allows(
+                                manifest["vertical"]["chapters"],
+                                candidate_duration_ms=round(
+                                    chapter_duration_seconds * 1000
+                                ),
+                                planned_total_ms=planned_total_ms,
+                                maximum_fraction=(
+                                    autonomous_policy.presentation
+                                    .max_panel_runtime_fraction
+                                ),
+                            )
+                        )
+                        if not deferred_panel_allowed:
+                            candidate_attempts.append(
+                                {
+                                    "candidate_id": (
+                                        deferred_panel["option"].get(
+                                            "candidate_id"
+                                        )
+                                    ),
+                                    "rank": deferred_panel["option"].get(
+                                        "rank"
+                                    ),
+                                    "decision": "try_next",
+                                    "reason_code": (
+                                        "global_panel_runtime_fraction_"
+                                        "would_exceed_policy"
+                                    ),
+                                    "failure_codes": [
+                                        "panel_runtime_fraction_exceeded"
+                                    ],
+                                    "recovery_action": (
+                                        "next_non_panel_presentation"
+                                    ),
+                                    "paid_model_calls_added": 0,
+                                }
+                            )
                     selected_vertical = (
-                        deferred_panel
+                        (
+                            deferred_panel
+                            if deferred_panel_allowed
+                            else None
+                        )
                         or deferred_full_bleed
                         or deferred_required_scope_fit
                         or deferred_fit
@@ -17127,7 +20736,10 @@ def _run_feature_cut_experiment_impl(
                         "all 9:16 evidence-bound candidates failed quality, "
                         "capacity, geometry, identity or lineage preflight"
                     )
-                vertical_frame = selected_vertical["frame"]
+                vertical_frame = selected_vertical.get(
+                    "_grounding_frame",
+                    selected_vertical["frame"],
+                )
                 vertical_clip = selected_vertical["clip"]
                 vertical_source_media = selected_vertical["media"]
                 v_start = selected_vertical["start_ms"]
@@ -17396,25 +21008,14 @@ def _run_feature_cut_experiment_impl(
                             contract.priority
                             for contract in selected_beat_templates
                         }
-                        if "hard" in priorities:
-                            raise ValueError(
-                                "hard editorial beat has no selected EvidenceQueryLockV2"
-                            )
-                        if (
-                            autonomous_policy is None
-                            or not autonomous_policy.editorial.allow_optional_beat_omission
-                        ):
-                            raise ValueError(
-                                "editorial beat omission is not policy-authorized"
-                            )
-                        for contract in selected_beat_templates:
-                            autonomous_degradations.append(
-                                DegradationRecord(
-                                    beat_id=contract.beat_id,
-                                    action="optional_beat_omitted",
-                                    reason_code="selected_candidate_has_no_query_lock",
-                                )
-                            )
+                        raise ValueError(
+                            "selected autonomous candidate has no "
+                            "EvidenceQueryLockV2 for "
+                            + ", ".join(sorted(priorities))
+                            + " editorial requirements; a supported candidate "
+                            "cannot be relabeled as an omitted beat after "
+                            "duration and music planning"
+                        )
                     else:
                         query_sha = str(query_lineage["definition_sha256"])
                         target_ids = [
@@ -17426,13 +21027,27 @@ def _run_feature_cut_experiment_impl(
                             for contract in selected_beat_templates
                             for target_id in contract.required_target_ids
                         ]
+                        fulfillment_selections = (
+                            _select_runtime_candidate_fulfillments(
+                                selected_beat_templates,
+                                option=selected_vertical["option"],
+                                evidence_events=candidate_evidence_events,
+                            )
+                        )
                         bound_contracts = [
                             bind_editorial_contract_to_selected_evidence(
-                                contract,
+                                bind_selected_fulfillment(
+                                    contract,
+                                    fulfillment,
+                                ),
                                 evidence_query_lock_sha256=query_sha,
                                 required_target_ids=target_ids,
                             )
-                            for contract in selected_beat_templates
+                            for contract, fulfillment in zip(
+                                selected_beat_templates,
+                                fulfillment_selections,
+                                strict=True,
+                            )
                         ]
                         dense_root = (
                             output_dir
@@ -17500,7 +21115,13 @@ def _run_feature_cut_experiment_impl(
                         locks_path = (
                             dense_root / "resolve" / "exact_event_locks.json"
                         )
-                        if locks_path.is_file():
+                        exact_event_required = any(
+                            contract.visual_events
+                            for contract in bound_contracts
+                        )
+                        if not exact_event_required:
+                            locks = ()
+                        elif locks_path.is_file():
                             saved_locks = read_json(locks_path)
                             locks = tuple(
                                 ExactEventLockV2.model_validate(row)
@@ -17528,6 +21149,33 @@ def _run_feature_cut_experiment_impl(
                                     )
                                 ),
                             )
+                        if not locks and exact_event_required:
+                            fallback_selections = (
+                                _select_runtime_candidate_fulfillments(
+                                    selected_beat_templates,
+                                    option=selected_vertical["option"],
+                                    evidence_events=(
+                                        candidate_evidence_events
+                                    ),
+                                    available_visual_event_types=(),
+                                )
+                            )
+                            bound_contracts = [
+                                bind_editorial_contract_to_selected_evidence(
+                                    bind_selected_fulfillment(
+                                        contract,
+                                        fulfillment,
+                                    ),
+                                    evidence_query_lock_sha256=query_sha,
+                                    required_target_ids=target_ids,
+                                )
+                                for contract, fulfillment in zip(
+                                    selected_beat_templates,
+                                    fallback_selections,
+                                    strict=True,
+                                )
+                            ]
+                            fulfillment_selections = fallback_selections
                         if locks:
                             locks = bind_grouped_event_lock_ids(
                                 locks,
@@ -17668,6 +21316,34 @@ def _run_feature_cut_experiment_impl(
                                 cue_recompile_attempted = not (
                                     trim_invariant_fit
                                 )
+                                shifted_trim = _render_trim_after_window_shift(
+                                    vertical_trim,
+                                    original_start_ms=original_start,
+                                    original_end_ms=original_end,
+                                    shifted_start_ms=shifted_start,
+                                    shifted_end_ms=shifted_end,
+                                )
+                                shifted_trim, _ = (
+                                    _authorize_runtime_selected_window_trim(
+                                        policy=autonomous_policy,
+                                        feature_id=selected.feature_id,
+                                        shot_id=v_shot,
+                                        source_path=Path(vertical_clip.path),
+                                        source_sha256=vertical_clip.sha256,
+                                        source_asset_id=(
+                                            vertical_source_media.asset_id
+                                        ),
+                                        start_ms=shifted_start,
+                                        end_ms=shifted_end,
+                                        trim=shifted_trim,
+                                        locks=locks,
+                                        dense_catalog=dense_catalog,
+                                        dense_catalog_path=(
+                                            dense_catalog_path
+                                        ),
+                                        output_dir=output_dir,
+                                    )
+                                )
                                 recompiled = (
                                     (
                                         vertical_filter,
@@ -17690,15 +21366,7 @@ def _run_feature_cut_experiment_impl(
                                     ) = recompiled
                                     v_start = shifted_start
                                     v_end = shifted_end
-                                    vertical_trim = (
-                                        _render_trim_after_window_shift(
-                                            vertical_trim,
-                                            original_start_ms=original_start,
-                                            original_end_ms=original_end,
-                                            shifted_start_ms=v_start,
-                                            shifted_end_ms=v_end,
-                                        )
-                                    )
+                                    vertical_trim = shifted_trim
                                     cue_alignment_ready = True
                                     cue_alignment_repair = {
                                         "method": (
@@ -17841,6 +21509,42 @@ def _run_feature_cut_experiment_impl(
                                 if disposition == "recompile_required":
                                     original_start = v_start
                                     original_end = v_end
+                                    shifted_trim = (
+                                        _render_trim_after_window_shift(
+                                            vertical_trim,
+                                            original_start_ms=(
+                                                original_start
+                                            ),
+                                            original_end_ms=original_end,
+                                            shifted_start_ms=shifted_start,
+                                            shifted_end_ms=shifted_end,
+                                        )
+                                    )
+                                    shifted_trim, _ = (
+                                        _authorize_runtime_selected_window_trim(
+                                            policy=autonomous_policy,
+                                            feature_id=selected.feature_id,
+                                            shot_id=v_shot,
+                                            source_path=Path(
+                                                vertical_clip.path
+                                            ),
+                                            source_sha256=(
+                                                vertical_clip.sha256
+                                            ),
+                                            source_asset_id=(
+                                                vertical_source_media.asset_id
+                                            ),
+                                            start_ms=shifted_start,
+                                            end_ms=shifted_end,
+                                            trim=shifted_trim,
+                                            locks=locks,
+                                            dense_catalog=dense_catalog,
+                                            dense_catalog_path=(
+                                                dense_catalog_path
+                                            ),
+                                            output_dir=output_dir,
+                                        )
+                                    )
                                     recompiled = (
                                         recompile_selected_vertical_window(
                                             shifted_start_ms=shifted_start,
@@ -17856,17 +21560,7 @@ def _run_feature_cut_experiment_impl(
                                         ) = recompiled
                                         v_start = shifted_start
                                         v_end = shifted_end
-                                        vertical_trim = (
-                                            _render_trim_after_window_shift(
-                                                vertical_trim,
-                                                original_start_ms=(
-                                                    original_start
-                                                ),
-                                                original_end_ms=original_end,
-                                                shifted_start_ms=v_start,
-                                                shifted_end_ms=v_end,
-                                            )
-                                        )
+                                        vertical_trim = shifted_trim
                                         vertical_geometry.setdefault(
                                             "risk_codes",
                                             [],
@@ -17909,31 +21603,96 @@ def _run_feature_cut_experiment_impl(
                                             ),
                                         }
                         for lock in locks:
-                            exact_event_project_times_ms[lock.event_id] = (
+                            project_time_ms = (
                                 project_start_ms + lock.source_time_ms - v_start
                             )
+                            exact_event_project_times_ms[lock.event_id] = (
+                                project_time_ms
+                            )
+                            exact_event_project_times_ms_by_aspect["9:16"][
+                                lock.event_id
+                            ] = project_time_ms
+                        vertical_degradations: list[DegradationRecord] = []
+                        for fulfillment in fulfillment_selections:
+                            if (
+                                fulfillment.fulfillment_level
+                                == "contextual_identity"
+                            ):
+                                degradation = (
+                                    DegradationRecord(
+                                        beat_id=fulfillment.beat_id,
+                                        action=(
+                                            "contextual_visual_substitution"
+                                        ),
+                                        reason_code=";".join(
+                                            fulfillment.degradation_codes
+                                        ),
+                                        copy_suppression_codes=(
+                                            fulfillment.copy_suppression_codes
+                                        ),
+                                    )
+                                )
+                                autonomous_degradations.append(degradation)
+                                vertical_degradations.append(degradation)
+                        autonomous_degradations_by_aspect["9:16"].extend(
+                            vertical_degradations
+                        )
+                        chapter_copy_suppression_codes = tuple(
+                            dict.fromkeys(
+                                code
+                                for fulfillment in fulfillment_selections
+                                for code in (
+                                    fulfillment.copy_suppression_codes
+                                )
+                            )
+                        )
                         resolved_editorial_contracts.extend(bound_contracts)
                         resolved_exact_event_locks.extend(locks)
+                        resolved_editorial_contracts_by_aspect["9:16"].extend(
+                            bound_contracts
+                        )
+                        resolved_exact_event_locks_by_aspect["9:16"].extend(
+                            locks
+                        )
+                        vertical_selected_window = {
+                            "aspect": "9:16",
+                            "feature_id": selected.feature_id,
+                            "candidate_id": selected_candidate_id,
+                            "source_asset_id": vertical_source_media.asset_id,
+                            "source_in_ms": v_start,
+                            "source_out_ms": v_end,
+                            "authorized_trim_decision_path": (
+                                vertical_trim.get(
+                                    "authorized_trim_decision_path"
+                                )
+                            ),
+                            "authorized_trim_decision_sha256": (
+                                vertical_trim.get(
+                                    "authorized_trim_decision_sha256"
+                                )
+                            ),
+                            "fulfillment_selections": [
+                                fulfillment.model_dump(mode="json")
+                                for fulfillment in fulfillment_selections
+                            ],
+                            "analysis_source_in_ms": (
+                                dense_catalog.source_start_ms
+                            ),
+                            "analysis_source_out_ms": (
+                                dense_catalog.source_end_ms
+                            ),
+                            "dense_catalog_path": str(
+                                dense_catalog_path.resolve()
+                            ),
+                            "dense_catalog_sha256": sha256_file(
+                                dense_catalog_path
+                            ),
+                        }
                         exact_event_selected_windows.append(
-                            {
-                                "feature_id": selected.feature_id,
-                                "candidate_id": selected_candidate_id,
-                                "source_asset_id": vertical_source_media.asset_id,
-                                "source_in_ms": v_start,
-                                "source_out_ms": v_end,
-                                "analysis_source_in_ms": (
-                                    dense_catalog.source_start_ms
-                                ),
-                                "analysis_source_out_ms": (
-                                    dense_catalog.source_end_ms
-                                ),
-                                "dense_catalog_path": str(
-                                    dense_catalog_path.resolve()
-                                ),
-                                "dense_catalog_sha256": sha256_file(
-                                    dense_catalog_path
-                                ),
-                            }
+                            vertical_selected_window
+                        )
+                        exact_event_selected_windows_by_aspect["9:16"].append(
+                            vertical_selected_window
                         )
                 vertical_source_has_audio = source_audio_cache[vertical_clip.sha256]
                 vertical_debug = next(
@@ -17952,6 +21711,9 @@ def _run_feature_cut_experiment_impl(
                     ),
                     "selected_candidate_id": selected_candidate_id,
                     "selected_candidate_rank": selected_candidate_rank,
+                    "pre_render_sequence_binding": selected_vertical[
+                        "option"
+                    ].get("_pre_render_sequence_binding"),
                     "attempts": candidate_attempts,
                     "human_policy_binding_present": human_reframe_policy_requested,
                     "center_crop_used_as_unverified_fallback": (
@@ -17976,6 +21738,11 @@ def _run_feature_cut_experiment_impl(
                         / "9x16"
                     ),
                 )
+                if chapter_copy_suppression_codes:
+                    vertical_geometry["copy_suppression_codes"] = list(
+                        chapter_copy_suppression_codes
+                    )
+                    vertical_geometry["title_overlay_suppressed"] = True
                 vertical_segment_fingerprint = _segment_variant_fingerprint(
                     source_sha256=vertical_clip.sha256,
                     start_ms=v_start,
@@ -18011,7 +21778,14 @@ def _run_feature_cut_experiment_impl(
                         source_path=Path(vertical_clip.path),
                         start_ms=v_start,
                         end_ms=v_end,
-                        overlay_path=(vertical_overlay if brief.render_title_overlays else None),
+                        overlay_path=(
+                            vertical_overlay
+                            if (
+                                brief.render_title_overlays
+                                and not chapter_copy_suppression_codes
+                            )
+                            else None
+                        ),
                         base_filter=vertical_filter,
                         output_path=vertical_segment,
                         source_has_audio=vertical_source_has_audio,
@@ -18031,6 +21805,34 @@ def _run_feature_cut_experiment_impl(
                         / selected.feature_id
                         / "9x16.json"
                     ),
+                )
+                vertical_repair_catalog = (
+                    _persist_vertical_segment_repair_catalog(
+                        output_dir=output_dir,
+                        segment_id=f"segment-{index + 1:03d}",
+                        feature_id=selected.feature_id,
+                        source_path=Path(vertical_clip.path),
+                        source_sha256=vertical_clip.sha256,
+                        source_has_audio=vertical_source_has_audio,
+                        start_ms=v_start,
+                        end_ms=v_end,
+                        source_interval=vertical_source_interval,
+                        overlay_path=(
+                            vertical_overlay
+                            if (
+                                brief.render_title_overlays
+                                and not chapter_copy_suppression_codes
+                            )
+                            else None
+                        ),
+                        selected_filter_graph=vertical_filter,
+                        selected_geometry=vertical_geometry,
+                        selected_track_fingerprint=(
+                            vertical_track_fingerprint
+                        ),
+                    )
+                    if autonomous_policy is not None
+                    else None
                 )
                 if render_horizontal:
                     horizontal_entry = _horizontal_manifest_entry(
@@ -18053,6 +21855,7 @@ def _run_feature_cut_experiment_impl(
                         render_boundary_lineage=horizontal_boundary_lineage,
                     )
                 vertical_entry = {
+                    "segment_id": f"segment-{index + 1:03d}",
                     "feature_id": selected.feature_id,
                     "semantic_intent": (
                         brief_chapter.title
@@ -18100,6 +21903,7 @@ def _run_feature_cut_experiment_impl(
                     "grounding_debugs": [
                         str(path.resolve()) for path in vertical_debugs if path.exists()
                     ],
+                    "repair_option_catalog": vertical_repair_catalog,
                     **vertical_trim,
                     **vertical_geometry,
                 }
@@ -18118,6 +21922,11 @@ def _run_feature_cut_experiment_impl(
                 max_editorial_reprise_overlap_fraction=(
                     0.5 if autonomous_profile else None
                 ),
+                allowed_reuse_modes=(
+                    autonomous_policy.editorial.allow_source_reuse
+                    if autonomous_policy is not None
+                    else None
+                ),
             )
         if render_vertical:
             source_reuse_audits["9x16"] = _audit_render_source_reuse(
@@ -18126,6 +21935,11 @@ def _run_feature_cut_experiment_impl(
                 aspect="9x16",
                 max_editorial_reprise_overlap_fraction=(
                     0.5 if autonomous_profile else None
+                ),
+                allowed_reuse_modes=(
+                    autonomous_policy.editorial.allow_source_reuse
+                    if autonomous_policy is not None
+                    else None
                 ),
             )
         write_json(
@@ -18182,8 +21996,8 @@ def _run_feature_cut_experiment_impl(
                 horizontal_segments,
                 horizontal_output,
                 segment_durations_seconds=tuple(
-                    chapter_durations[chapter.feature_id]
-                    for chapter in plan.chapters
+                    int(chapter["duration_ms"]) / 1000
+                    for chapter in manifest["horizontal"]["chapters"]
                 ),
             )
         if vertical_output is not None:
@@ -18191,8 +22005,8 @@ def _run_feature_cut_experiment_impl(
                 vertical_segments,
                 vertical_output,
                 segment_durations_seconds=tuple(
-                    chapter_durations[chapter.feature_id]
-                    for chapter in plan.chapters
+                    int(chapter["duration_ms"]) / 1000
+                    for chapter in manifest["vertical"]["chapters"]
                 ),
             )
         manifest["concat_padding_audits"] = concat_padding_audits
@@ -18255,22 +22069,52 @@ def _run_feature_cut_experiment_impl(
             ),
         }
         autonomous_context_paths: dict[str, Path] = {}
+        autonomous_context_paths_by_aspect: dict[
+            str, dict[str, Path]
+        ] = {}
         deterministic_delivery_evidence_path: Path | None = None
+        deterministic_delivery_evidence_paths_by_aspect: dict[str, Path] = {}
+        autonomous_evidence_bundle_paths_by_aspect: dict[str, Path] = {}
+        presentation_authority_paths_by_aspect: dict[str, Path] = {}
         if autonomous_profile:
             assert autonomous_policy is not None
+            audit_section = "vertical" if render_vertical else "horizontal"
+            audit_aspect = "9x16" if render_vertical else "16x9"
             context_dir = output_dir / "autonomous-context"
+            if render_horizontal and render_vertical:
+                context_dir = context_dir / audit_aspect
+            audit_chapters = manifest[audit_section]["chapters"]
             autonomous_context_paths.update(
                 write_exact_event_bundle(
                     context_dir,
                     contracts=resolved_editorial_contracts,
                     locks=resolved_exact_event_locks,
                     selected_windows=exact_event_selected_windows,
+                    aspect=audit_aspect.replace("x", ":"),
                 )
             )
             music_map_path = context_dir / "music-map.json"
-            if music_lock is None:
-                raise ValueError("autonomous feature-cut requires a MusicMap lock")
-            write_json(music_map_path, music_lock)
+            write_json(
+                music_map_path,
+                (
+                    {
+                        **music_lock.model_dump(mode="json"),
+                        "aspect": audit_aspect.replace("x", ":"),
+                    }
+                    if music_lock is not None
+                    else {
+                        "contract_version": "no-music-map-v1",
+                        "aspect": audit_aspect.replace("x", ":"),
+                        "music_supplied": False,
+                        "cadence_authority": (
+                            "semantic-rhythm-solution-v1"
+                        ),
+                        "sequence_rhythm_sha256": sha256_file(
+                            sequence_rhythm_path
+                        ),
+                    }
+                ),
+            )
             autonomous_context_paths["music_map"] = music_map_path.resolve()
             relation_by_event_id = {
                 f"{contract.beat_id}:{event.event_type}": event
@@ -18284,49 +22128,57 @@ def _run_feature_cut_experiment_impl(
             project_duration_ms = round(
                 sum(chapter_durations.values()) * 1000
             )
-            for lock in resolved_exact_event_locks:
-                event_contract = relation_by_event_id[lock.event_id]
-                project_time_ms = exact_event_project_times_ms[lock.event_id]
-                candidates = _compatible_output_cues(
-                    (
-                        output_timeline_cues
-                        if output_timeline_cues is not None
-                        else music_lock.cues
-                    ),
-                    cue_relation=event_contract.cue_relation,
-                    project_event_time_ms=project_time_ms,
-                    project_duration_ms=project_duration_ms,
-                )
-                if not candidates:
-                    raise ValueError(
-                        f"MusicMap has no cue for {event_contract.cue_relation}"
+            if music_lock is not None:
+                for lock in resolved_exact_event_locks:
+                    event_contract = relation_by_event_id[lock.event_id]
+                    project_time_ms = exact_event_project_times_ms[
+                        lock.event_id
+                    ]
+                    candidates = _compatible_output_cues(
+                        (
+                            output_timeline_cues
+                            if output_timeline_cues is not None
+                            else music_lock.cues
+                        ),
+                        cue_relation=event_contract.cue_relation,
+                        project_event_time_ms=project_time_ms,
+                        project_duration_ms=project_duration_ms,
                     )
-                cue = candidates[0]
-                alignment = build_cue_alignment_evidence(
-                    lock,
-                    cue_id=cue.cue_id,
-                    cue_sample_index=cue.sample_index,
-                    music_sample_rate=music_lock.master_sample_rate,
-                    project_event_time_ms=project_time_ms,
-                    fps_numerator=30,
-                    tolerance_frames=event_contract.tolerance_frames,
-                )
-                cue_rows.append(
-                    {
-                        "event_type": lock.event_type,
-                        "cue_relation": event_contract.cue_relation,
-                        "alignment": alignment.model_dump(mode="json"),
-                    }
-                )
-                cue_deltas[lock.event_id] = alignment.delta_frames
-                cue_tolerances[lock.event_id] = alignment.tolerance_frames
-                cue_ids_by_event[lock.event_id] = alignment.cue_id
+                    if not candidates:
+                        raise ValueError(
+                            "MusicMap has no cue for "
+                            f"{event_contract.cue_relation}"
+                        )
+                    cue = candidates[0]
+                    alignment = build_cue_alignment_evidence(
+                        lock,
+                        cue_id=cue.cue_id,
+                        cue_sample_index=cue.sample_index,
+                        music_sample_rate=music_lock.master_sample_rate,
+                        project_event_time_ms=project_time_ms,
+                        fps_numerator=30,
+                        tolerance_frames=event_contract.tolerance_frames,
+                    )
+                    cue_rows.append(
+                        {
+                            "event_type": lock.event_type,
+                            "cue_relation": event_contract.cue_relation,
+                            "alignment": alignment.model_dump(mode="json"),
+                        }
+                    )
+                    cue_deltas[lock.event_id] = alignment.delta_frames
+                    cue_tolerances[lock.event_id] = (
+                        alignment.tolerance_frames
+                    )
+                    cue_ids_by_event[lock.event_id] = alignment.cue_id
             cue_plan_path = context_dir / "cue-plan.json"
-            write_json(
+            _write_authorized_selected_window_cue_plan(
                 cue_plan_path,
-                {
+                proposal={
                     "contract_version": "selected-window-cue-plan-v2",
+                    "aspect": audit_aspect.replace("x", ":"),
                     "music_map_sha256": sha256_file(music_map_path),
+                    "music_supplied": music_lock is not None,
                     "cue_timeline": (
                         "assembled_output_timeline"
                         if output_timeline_cues is not None
@@ -18339,10 +22191,20 @@ def _run_feature_cut_experiment_impl(
                     ),
                     "alignments": cue_rows,
                 },
+                authority_inputs={
+                    "music_map": music_map_path,
+                    "editorial_beat_contracts": autonomous_context_paths[
+                        "editorial_beat_contracts"
+                    ],
+                    "exact_event_locks": autonomous_context_paths[
+                        "exact_event_locks"
+                    ],
+                },
+                policy=autonomous_policy,
             )
             autonomous_context_paths["cue_plan"] = cue_plan_path.resolve()
             degradation_path = context_dir / "reuse-degradation.json"
-            for chapter in manifest["vertical"]["chapters"]:
+            for chapter in audit_chapters:
                 if chapter.get("applied_strategy") in {
                     "required_scope_solid_fit",
                     "fit_with_solid_matte",
@@ -18373,38 +22235,32 @@ def _run_feature_cut_experiment_impl(
                             ),
                         )
                     )
-            write_json(
-                degradation_path,
-                AutonomousDegradationManifest(
+            degradation_manifest = AutonomousDegradationManifest(
                     policy_reference=autonomous_policy.policy_reference,
                     records=tuple(autonomous_degradations),
                     generated_at=utc_now(),
-                ),
+                )
+            write_json(
+                degradation_path,
+                {
+                    **degradation_manifest.model_dump(mode="json"),
+                    "aspect": audit_aspect.replace("x", ":"),
+                },
             )
             autonomous_context_paths["reuse_degradation"] = (
                 degradation_path.resolve()
             )
-            hard_event_types = {
-                event.event_type
-                for contract in editorial_templates
-                if contract.priority == "hard"
-                for event in contract.visual_events
-            }
-            locked_event_types = {
-                lock.event_type for lock in resolved_exact_event_locks
-            }
             hard_cue_event_ids = {
                 f"{contract.beat_id}:{event.event_type}"
                 for contract in resolved_editorial_contracts
                 if contract.priority == "hard"
                 for event in contract.visual_events
-            }
+            } if music_lock is not None else set()
             reuse_passed = bool(manifest["source_reuse_contract_passed"])
-            vertical_chapters = manifest["vertical"]["chapters"]
-            vertical_quality_report = post_render_reports.get("9x16")
+            audit_quality_report = post_render_reports.get(audit_aspect)
             hard_quality_windows = (
-                vertical_quality_report.get("hard_block_windows", [])
-                if isinstance(vertical_quality_report, Mapping)
+                audit_quality_report.get("hard_block_windows", [])
+                if isinstance(audit_quality_report, Mapping)
                 else []
             )
             quality_reason_codes = {
@@ -18413,11 +22269,11 @@ def _run_feature_cut_experiment_impl(
                 if isinstance(row, Mapping)
             }
             media_playable = (
-                isinstance(vertical_quality_report, Mapping)
+                isinstance(audit_quality_report, Mapping)
                 and "decoder_gap" not in quality_reason_codes
             )
             pts_valid = (
-                isinstance(vertical_quality_report, Mapping)
+                isinstance(audit_quality_report, Mapping)
                 and "duplicate_pts" not in quality_reason_codes
             )
             containment_failure_codes = {
@@ -18452,28 +22308,28 @@ def _run_feature_cut_experiment_impl(
                         chapter["auto_bounded_clip_audit"].get("approved")
                     )
                 )
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
             )
             identity_passed = not any(
                 identity_failure_codes & set(chapter.get("risk_codes") or [])
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
             )
             relation_passed = not any(
                 relation_failure_codes & set(chapter.get("risk_codes") or [])
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
             )
-            total_vertical_duration_ms = sum(
+            total_audit_duration_ms = sum(
                 int(chapter.get("duration_ms") or 0)
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
             )
             panel_duration_ms = sum(
                 int(chapter.get("duration_ms") or 0)
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
                 if chapter.get("applied_strategy") == "two_panel_layout"
             )
             panel_runtime_fraction = (
-                panel_duration_ms / total_vertical_duration_ms
-                if total_vertical_duration_ms > 0
+                panel_duration_ms / total_audit_duration_ms
+                if total_audit_duration_ms > 0
                 else 0.0
             )
             panel_runtime_fraction_passed = (
@@ -18485,8 +22341,9 @@ def _run_feature_cut_experiment_impl(
                 + 1e-9
             )
             manifest["panel_runtime_audit"] = {
+                "aspect": audit_aspect.replace("x", ":"),
                 "panel_duration_ms": panel_duration_ms,
-                "total_vertical_duration_ms": total_vertical_duration_ms,
+                "total_duration_ms": total_audit_duration_ms,
                 "observed_fraction": round(panel_runtime_fraction, 6),
                 "maximum_fraction": (
                     autonomous_policy.presentation
@@ -18496,7 +22353,7 @@ def _run_feature_cut_experiment_impl(
             }
             panel_chapters = [
                 chapter
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
                 if chapter.get("applied_strategy") == "two_panel_layout"
             ]
             panel_same_pts_passed = True
@@ -18546,10 +22403,11 @@ def _run_feature_cut_experiment_impl(
             )
             expected_internal_boundary_count = max(
                 0,
-                len(vertical_chapters) - 1,
+                len(audit_chapters) - 1,
             )
             music_edit_boundary_coverage_passed = (
-                (
+                music_lock is None
+                or (
                     expected_internal_boundary_count == 0
                     and not boundary_rows
                 )
@@ -18585,14 +22443,14 @@ def _run_feature_cut_experiment_impl(
                     -1,
                 )
                 + 34
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
             )
             dwell_bounds_audited = (
-                set(maximum_dwell_ms_by_feature)
-                == {
+                {
                     str(chapter.get("feature_id"))
-                    for chapter in vertical_chapters
+                    for chapter in audit_chapters
                 }
+                <= set(maximum_dwell_ms_by_feature)
             )
             def validated_source_motion(
                 chapter: Mapping[str, Any],
@@ -18624,7 +22482,7 @@ def _run_feature_cut_experiment_impl(
 
             source_motion_by_chapter = [
                 validated_source_motion(chapter)
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
             ]
             source_camera_motion_audited = all(
                 evidence is not None
@@ -18638,7 +22496,7 @@ def _run_feature_cut_experiment_impl(
                 or evidence is None
                 or evidence.isolated_jolt_count > 0
                 for chapter, evidence in zip(
-                    vertical_chapters,
+                    audit_chapters,
                     source_motion_by_chapter,
                     strict=True,
                 )
@@ -18646,23 +22504,23 @@ def _run_feature_cut_experiment_impl(
             hard_dead_air_windows = (
                 [
                     row
-                    for row in vertical_quality_report.get(
+                    for row in audit_quality_report.get(
                         "hard_block_windows",
                         [],
                     )
                     if row.get("reason_code") in {"black", "freeze"}
                 ]
-                if isinstance(vertical_quality_report, Mapping)
+                if isinstance(audit_quality_report, Mapping)
                 else []
             )
-            vertical_concat_audit = concat_padding_audits.get("9x16")
+            audit_concat = concat_padding_audits.get(audit_aspect)
             concat_padding_audited = (
-                isinstance(vertical_concat_audit, Mapping)
-                and vertical_concat_audit.get("audited") is True
+                isinstance(audit_concat, Mapping)
+                and audit_concat.get("audited") is True
             )
             unauthorized_concat_padding_count = (
                 int(
-                    vertical_concat_audit.get(
+                    audit_concat.get(
                         "unauthorized_concat_padding_count",
                         -1,
                     )
@@ -18671,13 +22529,13 @@ def _run_feature_cut_experiment_impl(
                 else None
             )
             dead_air_audited = (
-                isinstance(vertical_quality_report, Mapping)
+                isinstance(audit_quality_report, Mapping)
                 and post_render_quality_qc
                 and concat_padding_audited
             )
             unexpected_freeze_count = sum(
                 int(chapter.get("unexpected_freeze_count") or 0)
-                for chapter in vertical_chapters
+                for chapter in audit_chapters
             ) + sum(
                 row.get("reason_code") == "freeze"
                 for row in hard_quality_windows
@@ -18696,7 +22554,7 @@ def _run_feature_cut_experiment_impl(
                         str(chapter.get("feature_id")),
                         1,
                     )
-                    for chapter in vertical_chapters
+                    for chapter in audit_chapters
                 )
                 and all(
                     lock.support_window_start_ms
@@ -18706,6 +22564,7 @@ def _run_feature_cut_experiment_impl(
                 )
             )
             deterministic = DeterministicDeliveryEvidence(
+                aspect=audit_aspect.replace("x", ":"),
                 media_playable=media_playable,
                 pts_valid=pts_valid,
                 unexpected_freeze_count=unexpected_freeze_count,
@@ -18729,15 +22588,15 @@ def _run_feature_cut_experiment_impl(
                 ),
                 synthetic_motion_motivated=not any(
                     "unmotivated" in str(row.get("risk_codes", []))
-                    for row in manifest["vertical"]["chapters"]
+                    for row in audit_chapters
                 ),
                 synthetic_reversal_count=sum(
                     int(row.get("motion_reversal_count", 0))
-                    for row in manifest["vertical"]["chapters"]
+                    for row in audit_chapters
                 ),
                 settle_passed=not any(
                     "settle" in str(row.get("risk_codes", []))
-                    for row in manifest["vertical"]["chapters"]
+                    for row in audit_chapters
                 ),
                 source_camera_motion_audited=(
                     source_camera_motion_audited
@@ -18759,11 +22618,16 @@ def _run_feature_cut_experiment_impl(
                     autonomous_policy,
                     tuple(autonomous_degradations),
                 ),
-                hard_evidence_passed=hard_event_types <= locked_event_types,
+                hard_evidence_passed=(
+                    hard_exact_event_requirements_satisfied(
+                        resolved_editorial_contracts,
+                        resolved_exact_event_locks,
+                    )
+                ),
             )
             sequence_optimization, executed_beat_sets = (
                 _build_production_sequence_optimization(
-                    vertical_chapters=vertical_chapters,
+                    vertical_chapters=audit_chapters,
                     plan=plan,
                     rhythm_plan=rhythm_plan,
                     clips=clips,
@@ -18775,6 +22639,14 @@ def _run_feature_cut_experiment_impl(
                     deterministic=deterministic,
                     policy=autonomous_policy,
                     music_supplied=music_lock is not None,
+                    candidate_aspect=(
+                        "9:16" if render_vertical else "16:9"
+                    ),
+                    pre_render_route=(
+                        pre_render_candidate_route
+                        if render_vertical
+                        else pre_render_horizontal_candidate_route
+                    ),
                 )
             )
             sequence_optimization_path = (
@@ -18784,21 +22656,54 @@ def _run_feature_cut_experiment_impl(
                 sequence_optimization_path,
                 {
                     "contract_version": (
-                        "production-sequence-optimization-v1"
+                        "production-sequence-execution-validation-v2"
                     ),
+                    "aspect": audit_aspect.replace("x", ":"),
                     "policy_reference": autonomous_policy.policy_reference,
                     "rhythm_optimization": {
                         "path": str(sequence_rhythm_path.resolve()),
                         "sha256": sha256_file(sequence_rhythm_path),
                     },
+                    "pre_render_candidate_route": (
+                        {
+                            "path": str(
+                                pre_render_candidate_route_path.resolve()
+                            ),
+                            "sha256": sha256_file(
+                                pre_render_candidate_route_path
+                            ),
+                        }
+                        if pre_render_candidate_route is not None
+                        else None
+                    ),
+                    "pre_render_horizontal_candidate_route": (
+                        {
+                            "path": str(
+                                pre_render_horizontal_candidate_route_path.resolve()
+                            ),
+                            "sha256": sha256_file(
+                                pre_render_horizontal_candidate_route_path
+                            ),
+                        }
+                        if pre_render_horizontal_candidate_route is not None
+                        else None
+                    ),
                     "executed_option_sets": [
                         beat_set.model_dump(mode="json")
                         for beat_set in executed_beat_sets
                     ],
-                    "result": sequence_optimization.model_dump(mode="json"),
-                    "frontier_scope": (
-                        "executed_exact_trim_and_presentation_options"
+                    "runtime_hard_gate_validation": (
+                        sequence_optimization.model_dump(mode="json")
                     ),
+                    "frontier_scope": (
+                        "pre_render_sequence_frontier_with_bounded_"
+                        "runtime_fallback_and_post_render_validation"
+                    ),
+                    "selection_authority": (
+                        "pre_render_sequence_frontier"
+                    ),
+                    "post_render_role": "hard_gate_validation_only",
+                    "audit_aspect": audit_aspect.replace("x", ":"),
                     "music_supplied": music_lock is not None,
                     "generated_at": utc_now(),
                 },
@@ -18831,6 +22736,7 @@ def _run_feature_cut_experiment_impl(
                 autonomous_evidence_bundle_path,
                 {
                     "contract_version": "autonomous-evidence-bundle-v1",
+                    "aspect": audit_aspect.replace("x", ":"),
                     "policy_reference": autonomous_policy.policy_reference,
                     "artifacts": {
                         key: {
@@ -18858,6 +22764,851 @@ def _run_feature_cut_experiment_impl(
                 "path": str(autonomous_evidence_bundle_path.resolve()),
                 "sha256": sha256_file(autonomous_evidence_bundle_path),
             }
+            autonomous_context_paths_by_aspect[
+                audit_aspect.replace("x", ":")
+            ] = dict(autonomous_context_paths)
+            deterministic_delivery_evidence_paths_by_aspect[
+                audit_aspect.replace("x", ":")
+            ] = deterministic_delivery_evidence_path.resolve()
+            autonomous_evidence_bundle_paths_by_aspect[
+                audit_aspect.replace("x", ":")
+            ] = autonomous_evidence_bundle_path.resolve()
+            if render_horizontal and render_vertical:
+                horizontal_aspect = "16:9"
+                horizontal_context_dir = (
+                    output_dir / "autonomous-context" / "16x9"
+                )
+                horizontal_contracts = (
+                    resolved_editorial_contracts_by_aspect[horizontal_aspect]
+                )
+                horizontal_locks = resolved_exact_event_locks_by_aspect[
+                    horizontal_aspect
+                ]
+                horizontal_project_times = (
+                    exact_event_project_times_ms_by_aspect[horizontal_aspect]
+                )
+                horizontal_windows = (
+                    exact_event_selected_windows_by_aspect[horizontal_aspect]
+                )
+                horizontal_context = write_exact_event_bundle(
+                    horizontal_context_dir,
+                    contracts=horizontal_contracts,
+                    locks=horizontal_locks,
+                    selected_windows=horizontal_windows,
+                    aspect=horizontal_aspect,
+                )
+                horizontal_music_map_path = (
+                    horizontal_context_dir / "music-map.json"
+                )
+                write_json(
+                    horizontal_music_map_path,
+                    (
+                        {
+                            **music_lock.model_dump(mode="json"),
+                            "aspect": horizontal_aspect,
+                        }
+                        if music_lock is not None
+                        else {
+                            "contract_version": "no-music-map-v1",
+                            "aspect": horizontal_aspect,
+                            "music_supplied": False,
+                            "cadence_authority": (
+                                "semantic-rhythm-solution-v1"
+                            ),
+                            "sequence_rhythm_sha256": sha256_file(
+                                sequence_rhythm_path
+                            ),
+                        }
+                    ),
+                )
+                horizontal_context["music_map"] = (
+                    horizontal_music_map_path.resolve()
+                )
+                horizontal_relation_by_event_id = {
+                    f"{contract.beat_id}:{event.event_type}": event
+                    for contract in horizontal_contracts
+                    for event in contract.visual_events
+                }
+                horizontal_cue_rows: list[dict[str, Any]] = []
+                horizontal_cue_deltas: dict[str, int] = {}
+                horizontal_cue_tolerances: dict[str, int] = {}
+                horizontal_cue_ids: dict[str, str] = {}
+                if music_lock is not None:
+                    for lock in horizontal_locks:
+                        event_contract = horizontal_relation_by_event_id[
+                            lock.event_id
+                        ]
+                        candidates = _compatible_output_cues(
+                            (
+                                output_timeline_cues
+                                if output_timeline_cues is not None
+                                else music_lock.cues
+                            ),
+                            cue_relation=event_contract.cue_relation,
+                            project_event_time_ms=horizontal_project_times[
+                                lock.event_id
+                            ],
+                            project_duration_ms=project_duration_ms,
+                        )
+                        if not candidates:
+                            raise ValueError(
+                                "MusicMap has no 16:9 cue for "
+                                f"{event_contract.cue_relation}"
+                            )
+                        cue = candidates[0]
+                        alignment = build_cue_alignment_evidence(
+                            lock,
+                            cue_id=cue.cue_id,
+                            cue_sample_index=cue.sample_index,
+                            music_sample_rate=music_lock.master_sample_rate,
+                            project_event_time_ms=horizontal_project_times[
+                                lock.event_id
+                            ],
+                            fps_numerator=30,
+                            tolerance_frames=(
+                                event_contract.tolerance_frames
+                            ),
+                        )
+                        horizontal_cue_rows.append(
+                            {
+                                "event_type": lock.event_type,
+                                "cue_relation": event_contract.cue_relation,
+                                "alignment": alignment.model_dump(mode="json"),
+                            }
+                        )
+                        horizontal_cue_deltas[lock.event_id] = (
+                            alignment.delta_frames
+                        )
+                        horizontal_cue_tolerances[lock.event_id] = (
+                            alignment.tolerance_frames
+                        )
+                        horizontal_cue_ids[lock.event_id] = alignment.cue_id
+                horizontal_cue_plan_path = (
+                    horizontal_context_dir / "cue-plan.json"
+                )
+                _write_authorized_selected_window_cue_plan(
+                    horizontal_cue_plan_path,
+                    proposal={
+                        "contract_version": "selected-window-cue-plan-v2",
+                        "aspect": horizontal_aspect,
+                        "music_map_sha256": sha256_file(
+                            horizontal_music_map_path
+                        ),
+                        "music_supplied": music_lock is not None,
+                        "cue_timeline": (
+                            "assembled_output_timeline"
+                            if output_timeline_cues is not None
+                            else "locked_source_timeline"
+                        ),
+                        "music_output_timeline_sha256": (
+                            music_output_timeline_definition_sha256
+                            if output_timeline_cues is not None
+                            else None
+                        ),
+                        "alignments": horizontal_cue_rows,
+                    },
+                    authority_inputs={
+                        "music_map": horizontal_music_map_path,
+                        "editorial_beat_contracts": horizontal_context[
+                            "editorial_beat_contracts"
+                        ],
+                        "exact_event_locks": horizontal_context[
+                            "exact_event_locks"
+                        ],
+                    },
+                    policy=autonomous_policy,
+                )
+                horizontal_context["cue_plan"] = (
+                    horizontal_cue_plan_path.resolve()
+                )
+                horizontal_degradations = list(
+                    autonomous_degradations_by_aspect[horizontal_aspect]
+                )
+                horizontal_chapters = manifest["horizontal"]["chapters"]
+                for chapter in horizontal_chapters:
+                    if chapter.get("applied_strategy") in {
+                        "required_scope_solid_fit",
+                        "fit_with_solid_matte",
+                        "solid_matte_fit",
+                    }:
+                        horizontal_degradations.append(
+                            DegradationRecord(
+                                beat_id=str(chapter["feature_id"]),
+                                action="solid_matte_fit_used",
+                                reason_code=str(
+                                    chapter.get("fallback_reason")
+                                    or "scope_preserving_fit"
+                                ),
+                                replacement_artifact_hashes=(
+                                    "sha256:"
+                                    + str(
+                                        chapter[
+                                            "segment_render_fingerprint"
+                                        ]
+                                    ),
+                                ),
+                            )
+                        )
+                    if (
+                        chapter.get("applied_strategy")
+                        == "two_panel_layout"
+                    ):
+                        horizontal_degradations.append(
+                            DegradationRecord(
+                                beat_id=str(chapter["feature_id"]),
+                                action="two_panel_layout_used",
+                                reason_code=(
+                                    "simultaneous_relation_geometry"
+                                ),
+                                replacement_artifact_hashes=(
+                                    "sha256:"
+                                    + str(
+                                        chapter[
+                                            "segment_render_fingerprint"
+                                        ]
+                                    ),
+                                ),
+                            )
+                        )
+                horizontal_degradation_path = (
+                    horizontal_context_dir / "reuse-degradation.json"
+                )
+                write_json(
+                    horizontal_degradation_path,
+                    AutonomousDegradationManifest(
+                        policy_reference=(
+                            autonomous_policy.policy_reference
+                        ),
+                        records=tuple(horizontal_degradations),
+                        aspect=horizontal_aspect,
+                        generated_at=utc_now(),
+                    ),
+                )
+                horizontal_context["reuse_degradation"] = (
+                    horizontal_degradation_path.resolve()
+                )
+                horizontal_quality = post_render_reports.get("16x9")
+                horizontal_hard_windows = (
+                    horizontal_quality.get("hard_block_windows", [])
+                    if isinstance(horizontal_quality, Mapping)
+                    else []
+                )
+                horizontal_quality_codes = {
+                    str(row.get("reason_code"))
+                    for row in horizontal_hard_windows
+                    if isinstance(row, Mapping)
+                }
+                horizontal_panel_chapters = [
+                    chapter
+                    for chapter in horizontal_chapters
+                    if chapter.get("applied_strategy")
+                    == "two_panel_layout"
+                ]
+                horizontal_panel_same_pts = all(
+                    (
+                        isinstance(chapter.get("panel_layout"), Mapping)
+                        and (
+                            (
+                                chapter["panel_layout"].get(
+                                    "temporal_relation"
+                                )
+                                == "different_source_conceptual"
+                            )
+                            or (
+                                chapter["panel_layout"].get(
+                                    "temporal_relation"
+                                )
+                                == "same_source_same_pts"
+                                and isinstance(
+                                    chapter["panel_layout"].get("panels"),
+                                    list,
+                                )
+                                and len(
+                                    {
+                                        (
+                                            row.get("source_asset_id"),
+                                            row.get("source_pts"),
+                                        )
+                                        for row in chapter[
+                                            "panel_layout"
+                                        ]["panels"]
+                                        if isinstance(row, Mapping)
+                                    }
+                                )
+                                == 1
+                            )
+                        )
+                    )
+                    for chapter in horizontal_panel_chapters
+                )
+                horizontal_panel_scale = all(
+                    (
+                        chapter.get("panel_layout") or {}
+                    ).get("relation_mode")
+                    != "simultaneous_comparison"
+                    or (
+                        chapter.get("panel_layout") or {}
+                    ).get("relative_scale_policy")
+                    == "locked"
+                    for chapter in horizontal_panel_chapters
+                )
+                horizontal_total_ms = sum(
+                    int(chapter.get("duration_ms") or 0)
+                    for chapter in horizontal_chapters
+                )
+                horizontal_panel_ms = sum(
+                    int(chapter.get("duration_ms") or 0)
+                    for chapter in horizontal_panel_chapters
+                )
+                horizontal_motion_evidence = [
+                    validated_source_motion(chapter)
+                    for chapter in horizontal_chapters
+                ]
+                horizontal_concat = concat_padding_audits.get("16x9")
+                horizontal_concat_audited = (
+                    isinstance(horizontal_concat, Mapping)
+                    and horizontal_concat.get("audited") is True
+                )
+                horizontal_max_dwell = {
+                    chapter.feature_id: round(
+                        chapter.maximum_duration_seconds * 1000
+                    )
+                    for chapter in rhythm_plan.chapters
+                }
+                horizontal_hard_cues = (
+                    {
+                        f"{contract.beat_id}:{event.event_type}"
+                        for contract in horizontal_contracts
+                        if contract.priority == "hard"
+                        for event in contract.visual_events
+                    }
+                    if music_lock is not None
+                    else set()
+                )
+                horizontal_containment = not any(
+                    chapter.get(
+                        "unverified_geometry_preview_override"
+                    )
+                    is True
+                    or bool(
+                        containment_failure_codes
+                        & set(chapter.get("risk_codes") or [])
+                    )
+                    or (
+                        isinstance(
+                            chapter.get("auto_bounded_clip_audit"),
+                            Mapping,
+                        )
+                        and not bool(
+                            chapter["auto_bounded_clip_audit"].get(
+                                "approved"
+                            )
+                        )
+                    )
+                    for chapter in horizontal_chapters
+                )
+                horizontal_deterministic = deterministic.model_copy(
+                    update={
+                        "media_playable": (
+                            isinstance(horizontal_quality, Mapping)
+                            and "decoder_gap"
+                            not in horizontal_quality_codes
+                        ),
+                        "aspect": horizontal_aspect,
+                        "pts_valid": (
+                            isinstance(horizontal_quality, Mapping)
+                            and "duplicate_pts"
+                            not in horizontal_quality_codes
+                        ),
+                        "unexpected_freeze_count": sum(
+                            int(
+                                chapter.get(
+                                    "unexpected_freeze_count"
+                                )
+                                or 0
+                            )
+                            for chapter in horizontal_chapters
+                        )
+                        + sum(
+                            row.get("reason_code") == "freeze"
+                            for row in horizontal_hard_windows
+                            if isinstance(row, Mapping)
+                        ),
+                        "containment_passed": horizontal_containment,
+                        "identity_passed": not any(
+                            identity_failure_codes
+                            & set(chapter.get("risk_codes") or [])
+                            for chapter in horizontal_chapters
+                        ),
+                        "relation_passed": not any(
+                            relation_failure_codes
+                            & set(chapter.get("risk_codes") or [])
+                            for chapter in horizontal_chapters
+                        ),
+                        "panel_same_pts_passed": (
+                            horizontal_panel_same_pts
+                        ),
+                        "relative_scale_lock_passed": (
+                            horizontal_panel_scale
+                        ),
+                        "panel_runtime_fraction_passed": (
+                            horizontal_panel_ms
+                            / horizontal_total_ms
+                            if horizontal_total_ms
+                            else 0.0
+                        )
+                        <= (
+                            autonomous_policy.presentation
+                            .max_panel_runtime_fraction
+                        )
+                        + 1e-9,
+                        "cue_delta_frames": horizontal_cue_deltas,
+                        "cue_tolerance_frames": (
+                            horizontal_cue_tolerances
+                        ),
+                        "cue_id_by_event": horizontal_cue_ids,
+                        "required_cue_event_ids": tuple(
+                            sorted(horizontal_hard_cues)
+                        ),
+                        "cue_boundary_coverage_audited": (
+                            horizontal_hard_cues
+                            <= set(horizontal_cue_ids)
+                            and horizontal_hard_cues
+                            <= set(horizontal_cue_deltas)
+                            and horizontal_hard_cues
+                            <= set(horizontal_cue_tolerances)
+                        ),
+                        "synthetic_motion_motivated": not any(
+                            "unmotivated"
+                            in str(chapter.get("risk_codes", []))
+                            for chapter in horizontal_chapters
+                        ),
+                        "synthetic_reversal_count": sum(
+                            int(
+                                chapter.get(
+                                    "motion_reversal_count",
+                                    0,
+                                )
+                            )
+                            for chapter in horizontal_chapters
+                        ),
+                        "settle_passed": not any(
+                            "settle"
+                            in str(chapter.get("risk_codes", []))
+                            for chapter in horizontal_chapters
+                        ),
+                        "source_camera_motion_audited": all(
+                            evidence is not None
+                            for evidence in horizontal_motion_evidence
+                        ),
+                        "unwanted_source_camera_motion_count": sum(
+                            (
+                                "unwanted_source_camera_motion"
+                                in set(
+                                    chapter.get("risk_codes") or []
+                                )
+                            )
+                            or evidence is None
+                            or evidence.isolated_jolt_count > 0
+                            for chapter, evidence in zip(
+                                horizontal_chapters,
+                                horizontal_motion_evidence,
+                                strict=True,
+                            )
+                        ),
+                        "dwell_bounds_audited": (
+                            {
+                                str(chapter.get("feature_id"))
+                                for chapter in horizontal_chapters
+                            }
+                            <= set(horizontal_max_dwell)
+                        ),
+                        "excessive_dwell_count": sum(
+                            int(chapter.get("duration_ms") or 0)
+                            > horizontal_max_dwell.get(
+                                str(chapter.get("feature_id")),
+                                -1,
+                            )
+                            + 34
+                            for chapter in horizontal_chapters
+                        ),
+                        "dead_air_audited": (
+                            isinstance(horizontal_quality, Mapping)
+                            and post_render_quality_qc
+                            and horizontal_concat_audited
+                        ),
+                        "dead_air_count": sum(
+                            row.get("reason_code")
+                            in {"black", "freeze"}
+                            for row in horizontal_hard_windows
+                            if isinstance(row, Mapping)
+                        ),
+                        "concat_padding_audited": (
+                            horizontal_concat_audited
+                        ),
+                        "unauthorized_concat_padding_count": (
+                            int(
+                                horizontal_concat.get(
+                                    "unauthorized_concat_padding_count",
+                                    -1,
+                                )
+                            )
+                            if horizontal_concat_audited
+                            else None
+                        ),
+                        "readability_passed": (
+                            all(
+                                round(
+                                    int(
+                                        chapter.get("duration_ms") or 0
+                                    )
+                                    * 30
+                                    / 1000
+                                )
+                                >= {
+                                    str(
+                                        contract.feature_id
+                                        or contract.beat_id
+                                    ): (
+                                        contract.duration
+                                        .minimum_readable_frames
+                                    )
+                                    for contract in horizontal_contracts
+                                }.get(
+                                    str(chapter.get("feature_id")),
+                                    1,
+                                )
+                                for chapter in horizontal_chapters
+                            )
+                            and all(
+                                lock.support_window_start_ms
+                                <= lock.source_time_ms
+                                <= lock.support_window_end_ms
+                                for lock in horizontal_locks
+                            )
+                        ),
+                        "omissions_authorized": (
+                            omissions_are_policy_authorized(
+                                autonomous_policy,
+                                tuple(horizontal_degradations),
+                            )
+                        ),
+                        "hard_evidence_passed": (
+                            hard_exact_event_requirements_satisfied(
+                                horizontal_contracts,
+                                horizontal_locks,
+                            )
+                        ),
+                        "sequence_optimization_audited": False,
+                        "sequence_optimization_passed": False,
+                    }
+                )
+                (
+                    horizontal_sequence,
+                    horizontal_executed_beats,
+                ) = _build_production_sequence_optimization(
+                    vertical_chapters=horizontal_chapters,
+                    plan=plan,
+                    rhythm_plan=rhythm_plan,
+                    clips=clips,
+                    contracts=horizontal_contracts,
+                    locks=horizontal_locks,
+                    cue_deltas=horizontal_cue_deltas,
+                    cue_tolerances=horizontal_cue_tolerances,
+                    cue_ids_by_event=horizontal_cue_ids,
+                    deterministic=horizontal_deterministic,
+                    policy=autonomous_policy,
+                    music_supplied=music_lock is not None,
+                    candidate_aspect="16:9",
+                    pre_render_route=(
+                        pre_render_horizontal_candidate_route
+                    ),
+                )
+                horizontal_sequence_path = (
+                    horizontal_context_dir
+                    / "sequence-optimization.json"
+                )
+                write_json(
+                    horizontal_sequence_path,
+                    {
+                        "contract_version": (
+                            "production-sequence-execution-validation-v2"
+                        ),
+                        "aspect": horizontal_aspect,
+                        "policy_reference": (
+                            autonomous_policy.policy_reference
+                        ),
+                        "rhythm_optimization": {
+                            "path": str(sequence_rhythm_path.resolve()),
+                            "sha256": sha256_file(sequence_rhythm_path),
+                        },
+                        "executed_option_sets": [
+                            beat_set.model_dump(mode="json")
+                            for beat_set in horizontal_executed_beats
+                        ],
+                        "runtime_hard_gate_validation": (
+                            horizontal_sequence.model_dump(
+                                mode="json"
+                            )
+                        ),
+                        "frontier_scope": (
+                            "pre_render_sequence_frontier_with_bounded_"
+                            "runtime_fallback_and_post_render_validation"
+                        ),
+                        "selection_authority": (
+                            "pre_render_sequence_frontier"
+                        ),
+                        "post_render_role": (
+                            "hard_gate_validation_only"
+                        ),
+                        "audit_aspect": horizontal_aspect,
+                        "music_supplied": music_lock is not None,
+                        "generated_at": utc_now(),
+                    },
+                )
+                horizontal_context["sequence_optimization"] = (
+                    horizontal_sequence_path.resolve()
+                )
+                horizontal_deterministic = (
+                    horizontal_deterministic.model_copy(
+                        update={
+                            "sequence_optimization_audited": True,
+                            "sequence_optimization_passed": (
+                                horizontal_sequence.outcome != "blocked"
+                            ),
+                        }
+                    )
+                )
+                horizontal_deterministic_path = (
+                    horizontal_context_dir
+                    / "deterministic-delivery-evidence.json"
+                )
+                write_json(
+                    horizontal_deterministic_path,
+                    horizontal_deterministic,
+                )
+                horizontal_bundle_path = (
+                    horizontal_context_dir
+                    / "autonomous-evidence-bundle.json"
+                )
+                horizontal_bundle_files = {
+                    **horizontal_context,
+                    "deterministic_delivery_evidence": (
+                        horizontal_deterministic_path.resolve()
+                    ),
+                }
+                write_json(
+                    horizontal_bundle_path,
+                    {
+                        "contract_version": (
+                            "autonomous-evidence-bundle-v1"
+                        ),
+                        "aspect": horizontal_aspect,
+                        "policy_reference": (
+                            autonomous_policy.policy_reference
+                        ),
+                        "artifacts": {
+                            key: {
+                                "path": str(path),
+                                "sha256": sha256_file(path),
+                            }
+                            for key, path in (
+                                horizontal_bundle_files.items()
+                            )
+                        },
+                        "artifact_count": len(horizontal_bundle_files),
+                        "generated_at": utc_now(),
+                    },
+                )
+                autonomous_context_paths_by_aspect[
+                    horizontal_aspect
+                ] = horizontal_context
+                deterministic_delivery_evidence_paths_by_aspect[
+                    horizontal_aspect
+                ] = horizontal_deterministic_path.resolve()
+                autonomous_evidence_bundle_paths_by_aspect[
+                    horizontal_aspect
+                ] = horizontal_bundle_path.resolve()
+                manifest["autonomous_context_by_aspect"] = {
+                    aspect_key: {
+                        key: {
+                            "path": str(path),
+                            "sha256": sha256_file(path),
+                        }
+                        for key, path in paths.items()
+                    }
+                    for aspect_key, paths in (
+                        autonomous_context_paths_by_aspect.items()
+                    )
+                }
+                manifest[
+                    "deterministic_delivery_evidence_by_aspect"
+                ] = {
+                    aspect_key: {
+                        "path": str(path),
+                        "sha256": sha256_file(path),
+                    }
+                    for aspect_key, path in (
+                        deterministic_delivery_evidence_paths_by_aspect.items()
+                    )
+                }
+                manifest["autonomous_evidence_bundle_by_aspect"] = {
+                    aspect_key: {
+                        "path": str(path),
+                        "sha256": sha256_file(path),
+                    }
+                    for aspect_key, path in (
+                        autonomous_evidence_bundle_paths_by_aspect.items()
+                    )
+                }
+                # A `both` result must not expose a misleading flat authority
+                # alias. Consumers must choose the bundle matching the final
+                # output aspect.
+                manifest.pop("autonomous_context", None)
+                manifest.pop("deterministic_delivery_evidence", None)
+                manifest.pop("autonomous_evidence_bundle", None)
+            presentation_rows = (
+                (
+                    "16:9",
+                    horizontal_output,
+                    manifest["horizontal"]["chapters"],
+                ),
+                (
+                    "9:16",
+                    vertical_output,
+                    manifest["vertical"]["chapters"],
+                ),
+            )
+            for presentation_aspect, final_output, chapters in presentation_rows:
+                if final_output is None:
+                    continue
+                context_paths = autonomous_context_paths_by_aspect.get(
+                    presentation_aspect
+                )
+                if context_paths is None:
+                    raise ValueError(
+                        f"{presentation_aspect} presentation authority has no "
+                        "selected-window context"
+                    )
+                presentation_dir = (
+                    output_dir
+                    / "autonomous-authority"
+                    / presentation_aspect.replace(":", "x")
+                )
+                presentation_dir.mkdir(parents=True, exist_ok=True)
+                proposal_path = (
+                    presentation_dir
+                    / "presentation-compilation.proposal.json"
+                )
+                chapter_proposals: list[dict[str, Any]] = []
+                segment_hashes: list[str] = []
+                for chapter in chapters:
+                    segment_path = Path(
+                        str(chapter["segment_path"])
+                    ).expanduser().resolve(strict=True)
+                    segment_sha256 = sha256_file(segment_path)
+                    segment_hashes.append(f"sha256:{segment_sha256}")
+                    chapter_proposals.append(
+                        {
+                            "feature_id": chapter.get("feature_id"),
+                            "source_clip_id": chapter.get("source_clip_id"),
+                            "source_sha256": chapter.get("source_sha256"),
+                            "source_interval": chapter.get(
+                                "authorized_source_interval"
+                            ),
+                            "authorized_trim_decision_path": chapter.get(
+                                "authorized_trim_decision_path"
+                            ),
+                            "applied_strategy": chapter.get(
+                                "applied_strategy"
+                            ),
+                            "presentation_compilation": chapter.get(
+                                "presentation_compilation"
+                            ),
+                            "panel_layout": chapter.get("panel_layout"),
+                            "phase_virtual_camera_plan": chapter.get(
+                                "phase_virtual_camera_plan"
+                            ),
+                            "virtual_camera_plan": chapter.get(
+                                "virtual_camera_plan"
+                            ),
+                            "source_camera_motion_evidence_sha256": (
+                                chapter.get(
+                                    "source_camera_motion_evidence_sha256"
+                                )
+                            ),
+                            "track_geometry_fingerprint": chapter.get(
+                                "track_geometry_fingerprint"
+                            ),
+                            "segment_render_fingerprint": chapter.get(
+                                "segment_render_fingerprint"
+                            ),
+                            "segment_path": str(segment_path),
+                            "segment_sha256": segment_sha256,
+                        }
+                    )
+                final_output_sha256 = sha256_file(final_output)
+                write_json(
+                    proposal_path,
+                    {
+                        "contract_version": (
+                            "presentation-compilation-proposal-v2"
+                        ),
+                        "aspect": presentation_aspect,
+                        "final_output_path": str(
+                            final_output.resolve(strict=True)
+                        ),
+                        "final_output_sha256": final_output_sha256,
+                        "chapters": chapter_proposals,
+                        "generated_at": utc_now(),
+                    },
+                )
+                authority_path = (
+                    presentation_dir / "presentation-authority.json"
+                )
+                presentation_authority_paths_by_aspect[
+                    presentation_aspect
+                ] = _write_policy_decision_artifact(
+                    authority_path,
+                    proposal_path=proposal_path,
+                    authority_inputs={
+                        "editorial_beat_contracts": context_paths[
+                            "editorial_beat_contracts"
+                        ],
+                        "exact_event_locks": context_paths[
+                            "exact_event_locks"
+                        ],
+                        "sequence_optimization": context_paths[
+                            "sequence_optimization"
+                        ],
+                    },
+                    additional_input_hashes=(
+                        f"sha256:{final_output_sha256}",
+                        *segment_hashes,
+                    ),
+                    policy=autonomous_policy,
+                    decision_scope="reframe",
+                    aspect=presentation_aspect,
+                    deterministic_gate_results={
+                        "presentation_geometry": "passed",
+                        "rendered_segments": "passed",
+                        "selected_window_lineage": "passed",
+                    },
+                    decision_codes=(
+                        "presentation_compilation_bound",
+                        "rendered_segments_match_compilation",
+                        "reframe_auto_policy_approved",
+                    ),
+                )
+            manifest["presentation_authority_by_aspect"] = {
+                aspect_key: {
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                }
+                for aspect_key, path in (
+                    presentation_authority_paths_by_aspect.items()
+                )
+            }
         eligibility = _build_feature_cut_eligibility_report(
             manifest,
             execution_profile=execution_profile,
@@ -18867,7 +23618,74 @@ def _run_feature_cut_experiment_impl(
         manifest["delivery_eligible"] = eligibility.delivery_eligible
         manifest["delivery_eligibility"] = eligibility.model_dump(mode="json")
         manifest["generated_at"] = utc_now()
-        write_json(output_dir / "delivery-eligibility.json", eligibility)
+        eligibility_path = output_dir / "delivery-eligibility.json"
+        write_json(eligibility_path, eligibility)
+        feature_cut_authority_path: Path | None = None
+        if autonomous_profile and eligibility.ready_for_human_review:
+            assert autonomous_policy is not None
+            if not presentation_authority_paths_by_aspect:
+                raise ValueError(
+                    "autonomous feature-cut eligibility has no presentation "
+                    "authority"
+                )
+            feature_authority_inputs: dict[str, Path] = {
+                "delivery_eligibility": eligibility_path,
+                **{
+                    (
+                        "presentation_authority_"
+                        + aspect_key.replace(":", "x")
+                    ): path
+                    for aspect_key, path in (
+                        presentation_authority_paths_by_aspect.items()
+                    )
+                },
+                **{
+                    (
+                        "deterministic_evidence_"
+                        + aspect_key.replace(":", "x")
+                    ): path
+                    for aspect_key, path in (
+                        deterministic_delivery_evidence_paths_by_aspect.items()
+                    )
+                },
+                **{
+                    (
+                        "evidence_bundle_"
+                        + aspect_key.replace(":", "x")
+                    ): path
+                    for aspect_key, path in (
+                        autonomous_evidence_bundle_paths_by_aspect.items()
+                    )
+                },
+            }
+            output_hashes = tuple(
+                f"sha256:{sha256_file(path)}"
+                for path in (horizontal_output, vertical_output)
+                if path is not None
+            )
+            feature_cut_authority_path = _write_policy_decision_artifact(
+                output_dir / "feature-cut-authority.json",
+                proposal_path=eligibility_path,
+                authority_inputs=feature_authority_inputs,
+                additional_input_hashes=output_hashes,
+                policy=autonomous_policy,
+                decision_scope="feature_cut",
+                aspect=None,
+                deterministic_gate_results={
+                    "feature_cut_handoff": "passed",
+                    "presentation_authority": "passed",
+                    "deterministic_evidence": "passed",
+                },
+                decision_codes=(
+                    "feature_cut_eligibility_bound",
+                    "all_requested_presentations_authorized",
+                    "feature_cut_auto_policy_approved",
+                ),
+            )
+            manifest["feature_cut_authority"] = {
+                "path": str(feature_cut_authority_path),
+                "sha256": sha256_file(feature_cut_authority_path),
+            }
         write_json(output_dir / "render-manifest.json", manifest)
         if post_render_quality_qc and not manifest["post_render_quality_qc"][
             "technical_qc_passed"
@@ -18901,7 +23719,22 @@ def _run_feature_cut_experiment_impl(
             "ready_for_human_review": eligibility.ready_for_human_review,
             "delivery_eligible": eligibility.delivery_eligible,
             "delivery_eligibility_path": str(
-                (output_dir / "delivery-eligibility.json").resolve()
+                eligibility_path.resolve()
+            ),
+            "feature_cut_authority_path": (
+                str(feature_cut_authority_path)
+                if feature_cut_authority_path is not None
+                else None
+            ),
+            "presentation_authority_paths_by_aspect": (
+                {
+                    aspect_key: str(path)
+                    for aspect_key, path in (
+                        presentation_authority_paths_by_aspect.items()
+                    )
+                }
+                if presentation_authority_paths_by_aspect
+                else None
             ),
             "horizontal_output": (
                 str(horizontal_output.resolve()) if horizontal_output is not None else None
@@ -18921,16 +23754,52 @@ def _run_feature_cut_experiment_impl(
                     for key, path in autonomous_context_paths.items()
                 }
                 if autonomous_context_paths
+                and not (render_horizontal and render_vertical)
+                else None
+            ),
+            "autonomous_context_paths_by_aspect": (
+                {
+                    aspect_key: {
+                        key: str(path)
+                        for key, path in paths.items()
+                    }
+                    for aspect_key, paths in (
+                        autonomous_context_paths_by_aspect.items()
+                    )
+                }
+                if autonomous_context_paths_by_aspect
                 else None
             ),
             "deterministic_delivery_evidence_path": (
                 str(deterministic_delivery_evidence_path.resolve())
                 if deterministic_delivery_evidence_path is not None
+                and not (render_horizontal and render_vertical)
+                else None
+            ),
+            "deterministic_delivery_evidence_paths_by_aspect": (
+                {
+                    aspect_key: str(path)
+                    for aspect_key, path in (
+                        deterministic_delivery_evidence_paths_by_aspect.items()
+                    )
+                }
+                if deterministic_delivery_evidence_paths_by_aspect
                 else None
             ),
             "autonomous_evidence_bundle_path": (
                 str(autonomous_evidence_bundle_path.resolve())
                 if autonomous_profile
+                and not (render_horizontal and render_vertical)
+                else None
+            ),
+            "autonomous_evidence_bundle_paths_by_aspect": (
+                {
+                    aspect_key: str(path)
+                    for aspect_key, path in (
+                        autonomous_evidence_bundle_paths_by_aspect.items()
+                    )
+                }
+                if autonomous_evidence_bundle_paths_by_aspect
                 else None
             ),
             "semantic_edit_ir_path": (

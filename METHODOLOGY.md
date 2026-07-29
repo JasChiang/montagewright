@@ -267,7 +267,7 @@ Trim Intent 採相同的 evidence-first 邊界：模型先回 coarse `MM:SS`，�
 
 Autonomous profile 不把 Gemini 的 `pass`、schema-valid output 或 confidence 當核准。完成版先由本機檢查 media/PTS、unexpected freeze、hard evidence、containment、identity、relation、same-PTS panel、relative scale、actual cue delta、motion motivation/reversal/settle、readability、reuse 與 omission authority。任一 hard gate 失敗即停止。
 
-Gemini 的有聲 final QA 只輸出 typed observation 與有限 repair class，不包含可執行 timestamp、frame/PTS 或 geometry。應用程式再以固定 mapping 選 hold、handle 內 shift、next presentation、two-panel、alternate candidate 或 scoped replan。Replan 最多一次，完整 QA 最多兩次；沒有形成可自由重試的 agent loop。
+Gemini 的有聲 final QA 只輸出 typed observation 與有限 repair class，不包含可執行 timestamp、frame/PTS 或 geometry。應用程式再以固定 mapping 選 hold、handle 內 shift、next presentation 或 two-panel。完整 QA 最多兩次；沒有形成可自由重試的 agent loop。Scoped semantic replan 目前只會產生最多三個候選與 adjacent context 的 hash-bound handoff；在 chosen alternate 尚未重新完成 exact-event、trim authority、grounding/SAM 與 presentation compile 前明確 fail closed，不能直接驅動 render。
 
 只有 requested aspects 全部沒有 blocking observation、deterministic report 全通過，且 degradation manifest 綁定同一 policy SHA 時，本機才產生 `DecisionAuthorityV2`。因此可播放 MP4、模型沒報錯、或歷史 human-review artifact 都不能單獨升級成 autonomous delivery。
 

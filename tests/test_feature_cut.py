@@ -17,6 +17,13 @@ from jascue_video_lab.autonomous_policy import (
     DurationPolicy,
 )
 from jascue_video_lab.billing import BudgetExceeded
+from jascue_video_lab.clip_card_observations import (
+    AssessmentStatus,
+    EventCapabilityManifest,
+    EventObservationSupplement,
+    ObservationBasis,
+    effective_event_observation_sha256,
+)
 from jascue_video_lab.editing_capabilities import (
     AttentionIntent,
     SemanticBeat,
@@ -40,6 +47,7 @@ from jascue_video_lab.feature_cut import (
     _audit_feature_plan_candidate_recall,
     _audit_requested_candidate_recall,
     _attempt_trim_shift_operation,
+    _apply_pre_render_candidate_route,
     _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
     _build_production_sequence_optimization,
@@ -62,9 +70,11 @@ from jascue_video_lab.feature_cut import (
     _is_non_retryable_spending_cap_error,
     _load_trim_decisions,
     _load_runtime_candidate_evidence_events,
+    _select_runtime_candidate_fulfillments,
     _order_insensitive_grounding_group_key,
     _migrate_legacy_feature_plan_binding,
     _piecewise_expression,
+    _project_autonomous_executable_feature_plan,
     _project_locked_cues_to_music_output,
     _production_review_preflight_failures,
     _prompt_binds_sha256,
@@ -76,14 +86,17 @@ from jascue_video_lab.feature_cut import (
     _render_trim_after_window_shift,
     _render_text_layer,
     _requested_render_aspects,
+    _runtime_panel_budget_allows,
     _required_track_union,
     _resolve_editorial_chapter_durations,
+    _resolve_horizontal_grouped_exact_event_locks,
     _resolve_vertical_camera_phases,
     _resolve_vertical_candidate_intent,
     _resolved_autonomous_relation_mode,
     _refine_selected_vertical_candidate,
     _segment_variant_fingerprint,
     _selected_source_capacity_seconds,
+    _semantic_replan_frontier_projection,
     _source_motion_clean_recovery_window,
     _should_refine_selected_vertical_candidate,
     _soft_extent_visibility_audit,
@@ -112,8 +125,16 @@ from jascue_video_lab.feature_cut import (
     write_external_feature_plan_projection,
 )
 from jascue_video_lab.auto_reframe import FailureCode
-from jascue_video_lab.models import FramingRegionIntent
+from jascue_video_lab.models import (
+    EvidenceOriginObservation,
+    FramingRegionIntent,
+)
 from jascue_video_lab.final_edit_qa import DeterministicDeliveryEvidence
+from jascue_video_lab.sequence_optimizer import CandidateRouteOption
+from jascue_video_lab.sequence_optimizer import (
+    CandidateRouteBeat,
+    optimize_pre_render_candidate_route,
+)
 
 
 def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
@@ -141,6 +162,113 @@ def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
     )
     assert "two_panel_layout" in forbidden
     assert "solid_matte_fit" in forbidden
+
+
+def test_pre_render_frontier_order_drives_runtime_fallback_sequence() -> None:
+    runtime_options = [
+        {"candidate_id": "rank-1", "rank": 1},
+        {"candidate_id": "rank-2", "rank": 2},
+        {"candidate_id": "rank-3", "rank": 3},
+    ]
+
+    binding = CandidateRouteOption(
+        beat_id="beat",
+        candidate_id="rank-2",
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="event",
+        planner_rank=2,
+        semantic_confidence=0.8,
+        presentation_mode="phase_virtual_camera",
+    )
+    runtime_options[1]["presentation_preference"] = "two_panel_layout"
+    ordered = _apply_pre_render_candidate_route(
+        runtime_options,
+        selected_candidate_id="rank-2",
+        ordered_candidate_ids=("rank-2", "rank-3", "rank-1"),
+        sequence_bindings={"rank-2": binding},
+    )
+
+    assert [option["candidate_id"] for option in ordered] == [
+        "rank-2",
+        "rank-3",
+        "rank-1",
+    ]
+    assert ordered[0]["presentation_preference"] == "phase_virtual_camera"
+    assert (
+        ordered[0]["_pre_render_sequence_binding"]["candidate_id"]
+        == "rank-2"
+    )
+
+
+def test_semantic_replan_frontier_is_bounded_and_carries_adjacent_context() -> None:
+    def option(
+        beat_id: str,
+        candidate_id: str,
+        marker: str,
+    ) -> CandidateRouteOption:
+        return CandidateRouteOption(
+            beat_id=beat_id,
+            candidate_id=candidate_id,
+            source_asset_id="sha256:" + marker * 64,
+            event_id=f"event-{candidate_id}",
+            planner_rank=1,
+            semantic_confidence=0.8,
+        )
+
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(
+                    option("opening", "opening-a", "a"),
+                    option("opening", "opening-b", "b"),
+                    option("opening", "opening-c", "c"),
+                    option("opening", "opening-d", "d"),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="payoff",
+                options=(option("payoff", "payoff-a", "e"),),
+            ),
+        )
+    )
+
+    projection = _semantic_replan_frontier_projection(route)
+
+    assert projection["media_embedded"] is False
+    assert len(projection["beats"][0]["candidate_bindings"]) == 3
+    assert projection["beats"][0]["adjacent_sequence_context"]["next"][
+        "beat_id"
+    ] == "payoff"
+    assert projection["beats"][1]["adjacent_sequence_context"]["previous"][
+        "beat_id"
+    ] == "opening"
+
+
+def test_runtime_panel_fallback_cannot_exceed_global_fraction() -> None:
+    prior = (
+        {
+            "duration_ms": 10_000,
+            "applied_strategy": "two_panel_layout",
+        },
+        {
+            "duration_ms": 20_000,
+            "applied_strategy": "static_full_bleed_crop",
+        },
+    )
+
+    assert not _runtime_panel_budget_allows(
+        prior,
+        candidate_duration_ms=10_000,
+        planned_total_ms=60_000,
+        maximum_fraction=0.25,
+    )
+    assert _runtime_panel_budget_allows(
+        prior,
+        candidate_duration_ms=5_000,
+        planned_total_ms=60_000,
+        maximum_fraction=0.25,
+    )
 
 
 def test_production_sequence_builder_calls_real_beam_search(
@@ -619,7 +747,58 @@ def test_relation_core_preserves_all_clip_card_required_entities() -> None:
     ] == ["left", "right"]
 
 
-def test_autonomous_runtime_requires_provenance_aware_selected_evidence(
+def _runtime_selected_evidence_v3_event() -> dict[str, object]:
+    origin = EvidenceOriginObservation(
+        relation="direct_source_event",
+        observable_reason="The source visibly records the device interaction.",
+    )
+    observation = EventObservationSupplement(
+        event_id="playback",
+        event_fingerprint="b" * 64,
+        observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+        evidence_provenance="direct_ui_interaction",
+        evidence_origin=origin,
+        capabilities=EventCapabilityManifest(
+            evidence_origin=AssessmentStatus.ASSESSED_PRESENT,
+        ),
+    )
+    return {
+        "source_asset_id": "sha256:" + "a" * 64,
+        "event_id": observation.event_id,
+        "evidence_provenance": observation.evidence_provenance,
+        "evidence_origin": origin.model_dump(mode="json"),
+        "effective_observation": observation.model_dump(mode="json"),
+        "effective_observation_sha256": (
+            effective_event_observation_sha256(observation)
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "contract_version",
+    [
+        "clip-card-feature-cut-selected-evidence-v1",
+        "clip-card-feature-cut-selected-evidence-v2",
+    ],
+)
+def test_review_runtime_accepts_legacy_selected_evidence(
+    tmp_path: Path,
+    contract_version: str,
+) -> None:
+    evidence_path = tmp_path / "selected-clip-card-evidence.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "contract_version": contract_version,
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _load_runtime_candidate_evidence_events(tmp_path) == {}
+
+
+def test_autonomous_runtime_requires_provenance_aware_selected_evidence_v3(
     tmp_path: Path,
 ) -> None:
     evidence_path = tmp_path / "selected-clip-card-evidence.json"
@@ -627,7 +806,7 @@ def test_autonomous_runtime_requires_provenance_aware_selected_evidence(
         json.dumps(
             {
                 "contract_version": (
-                    "clip-card-feature-cut-selected-evidence-v1"
+                    "clip-card-feature-cut-selected-evidence-v2"
                 ),
                 "events": [],
             }
@@ -636,35 +815,245 @@ def test_autonomous_runtime_requires_provenance_aware_selected_evidence(
     )
     with pytest.raises(
         ValueError,
-        match="requires provenance-aware selected evidence v2",
+        match="requires provenance-aware selected evidence v3",
     ):
         _load_runtime_candidate_evidence_events(
             tmp_path,
             require_provenance=True,
         )
 
+    event = _runtime_selected_evidence_v3_event()
     evidence_path.write_text(
         json.dumps(
             {
                 "contract_version": (
-                    "clip-card-feature-cut-selected-evidence-v2"
+                    "clip-card-feature-cut-selected-evidence-v3"
                 ),
-                "events": [
-                    {
-                        "source_asset_id": "sha256:" + "a" * 64,
-                        "event_id": "playback",
-                        "evidence_provenance": "unknown",
-                    }
-                ],
+                "events": [event],
             }
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="unknown provenance"):
-        _load_runtime_candidate_evidence_events(
-            tmp_path,
-            require_provenance=True,
+    assert _load_runtime_candidate_evidence_events(
+        tmp_path,
+        require_provenance=True,
+    ) == {
+        (str(event["source_asset_id"]), str(event["event_id"])): event,
+    }
+
+
+def test_runtime_fulfillment_binds_context_without_exact_event() -> None:
+    observation = EventObservationSupplement(
+        event_id="playback",
+        event_fingerprint="b" * 64,
+        observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+        evidence_provenance="prerecorded_screen_playback",
+        evidence_origin=EvidenceOriginObservation(
+            relation="mediated_depiction",
+            observable_reason="A separate recording is playing on the screen.",
+        ),
+        capabilities=EventCapabilityManifest(
+            evidence_origin=AssessmentStatus.ASSESSED_PRESENT,
+        ),
+    )
+    source_asset_id = "sha256:" + "a" * 64
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "contextual-feature",
+            "feature_id": "feature",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["product"],
+            "narrative_function": "feature_evidence",
+            "minimum_fulfillment_level": "contextual_identity",
+            "fulfillment_alternatives": [
+                {
+                    "fulfillment_level": "direct_demonstration",
+                    "accepted_evidence_provenance": ["direct_result"],
+                    "claim_support_level": "direct",
+                    "exact_event_requirement": "required_when_selected",
+                    "visual_events": [
+                        {
+                            "event_type": "result_stable_start",
+                            "cue_relation": "principal_downbeat",
+                            "tolerance_frames": 2,
+                        }
+                    ],
+                },
+                {
+                    "fulfillment_level": "contextual_identity",
+                    "accepted_evidence_provenance": [
+                        "prerecorded_screen_playback"
+                    ],
+                    "claim_support_level": "illustrative_only",
+                    "exact_event_requirement": "none",
+                    "degradation_codes": [
+                        "contextual_visual_substitution"
+                    ],
+                    "copy_suppression_codes": [
+                        "specific_claim_copy_suppressed"
+                    ],
+                },
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    selections = _select_runtime_candidate_fulfillments(
+        (contract,),
+        option={
+            "candidate_id": "rank-01",
+            "source_asset_id": source_asset_id,
+            "event_id": "playback",
+        },
+        evidence_events={
+            (source_asset_id, "playback"): {
+                "evidence_provenance": "prerecorded_screen_playback",
+                "effective_observation": observation.model_dump(mode="json"),
+            }
+        },
+    )
+
+    assert selections[0].fulfillment_level == "contextual_identity"
+    assert selections[0].visual_events == ()
+    assert selections[0].exact_event_required is False
+
+
+def test_selected_evidence_v3_validates_effective_observation_integrity(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "selected-clip-card-evidence.json"
+    valid_event = _runtime_selected_evidence_v3_event()
+
+    def write_event(event: dict[str, object]) -> None:
+        evidence_path.write_text(
+            json.dumps(
+                {
+                    "contract_version": (
+                        "clip-card-feature-cut-selected-evidence-v3"
+                    ),
+                    "events": [event],
+                }
+            ),
+            encoding="utf-8",
         )
+
+    invalid_model = json.loads(json.dumps(valid_event))
+    del invalid_model["effective_observation"]["event_fingerprint"]
+    write_event(invalid_model)
+    with pytest.raises(ValueError, match="invalid effective observation"):
+        _load_runtime_candidate_evidence_events(tmp_path)
+
+    hash_mismatch = json.loads(json.dumps(valid_event))
+    hash_mismatch["effective_observation_sha256"] = "0" * 64
+    write_event(hash_mismatch)
+    with pytest.raises(ValueError, match="effective observation hash mismatch"):
+        _load_runtime_candidate_evidence_events(tmp_path)
+
+    origin_mismatch = json.loads(json.dumps(valid_event))
+    origin_mismatch["evidence_origin"] = {
+        "relation": "mediated_depiction",
+        "observable_reason": "A recording is visible on another display.",
+    }
+    write_event(origin_mismatch)
+    with pytest.raises(ValueError, match="top-level/effective evidence origin mismatch"):
+        _load_runtime_candidate_evidence_events(tmp_path)
+
+    legacy_mismatch = json.loads(json.dumps(valid_event))
+    legacy_mismatch["evidence_provenance"] = "direct_result"
+    write_event(legacy_mismatch)
+    with pytest.raises(
+        ValueError,
+        match="top-level/effective legacy provenance mismatch",
+    ):
+        _load_runtime_candidate_evidence_events(tmp_path)
+
+
+def test_selected_evidence_v3_requires_assessed_non_unknown_origin(
+    tmp_path: Path,
+) -> None:
+    origin = EvidenceOriginObservation(
+        relation="unknown",
+        observable_reason="The source relationship cannot be determined.",
+    )
+    observation = EventObservationSupplement(
+        event_id="uncertain-event",
+        event_fingerprint="c" * 64,
+        observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+        evidence_provenance="unknown",
+        evidence_origin=origin,
+        capabilities=EventCapabilityManifest(
+            evidence_origin=AssessmentStatus.ASSESSED_PRESENT,
+        ),
+    )
+    event = {
+        "source_asset_id": "sha256:" + "d" * 64,
+        "event_id": observation.event_id,
+        "evidence_provenance": observation.evidence_provenance,
+        "evidence_origin": origin.model_dump(mode="json"),
+        "effective_observation": observation.model_dump(mode="json"),
+        "effective_observation_sha256": (
+            effective_event_observation_sha256(observation)
+        ),
+    }
+    (tmp_path / "selected-clip-card-evidence.json").write_text(
+        json.dumps(
+            {
+                "contract_version": (
+                    "clip-card-feature-cut-selected-evidence-v3"
+                ),
+                "events": [event],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError,
+        match="requires assessed non-unknown evidence origin",
+    ):
+        _load_runtime_candidate_evidence_events(tmp_path)
+
+    absent_observation = EventObservationSupplement(
+        event_id="unassessed-event",
+        event_fingerprint="e" * 64,
+        observation_basis=ObservationBasis.FULL_CLIP_VIDEO,
+        evidence_provenance="unknown",
+        capabilities=EventCapabilityManifest(
+            evidence_origin=AssessmentStatus.ASSESSED_ABSENT,
+        ),
+    )
+    absent_event = {
+        "source_asset_id": "sha256:" + "f" * 64,
+        "event_id": absent_observation.event_id,
+        "evidence_provenance": absent_observation.evidence_provenance,
+        "evidence_origin": None,
+        "effective_observation": absent_observation.model_dump(mode="json"),
+        "effective_observation_sha256": (
+            effective_event_observation_sha256(absent_observation)
+        ),
+    }
+    (tmp_path / "selected-clip-card-evidence.json").write_text(
+        json.dumps(
+            {
+                "contract_version": (
+                    "clip-card-feature-cut-selected-evidence-v3"
+                ),
+                "events": [absent_event],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError,
+        match="requires assessed non-unknown evidence origin",
+    ):
+        _load_runtime_candidate_evidence_events(tmp_path)
 
 
 def test_authorized_solid_fit_is_not_execution_authority(
@@ -858,6 +1247,7 @@ from jascue_video_lab.models import (
     FeatureCutRunState,
     FeatureChapterBrief,
     FramingRegionIntent,
+    RushFrame,
     SelectedVerticalFramingProposal,
     VerticalVirtualCameraPhase,
 )
@@ -887,6 +1277,308 @@ def _cue_lock_at(source_time_ms: int) -> ExactEventLockV2:
         input_artifact_hashes=("sha256:" + "d" * 64,),
         generated_at="now",
     )
+
+
+def test_horizontal_only_resolves_grouped_exact_event_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    contracts_path = tmp_path / "contracts.json"
+    contracts_path.write_text("[]", encoding="utf-8")
+    selected = FeatureChapterSelect(
+        feature_id="result",
+        evidence_status="supported",
+        horizontal_frame_id="RF000001",
+        vertical_frame_id="RF000001",
+        observed_visual_evidence="A stable result is directly visible.",
+        selection_reason="The bounded window contains the result.",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        recommended_duration_seconds=3,
+        duration_rationale="The result remains readable.",
+        quality_risks=[],
+        confidence=0.9,
+    )
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "result",
+            "feature_id": "result",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["result"],
+            "narrative_function": "feature_evidence",
+            "visual_events": [
+                {
+                    "event_type": "result_stable_start",
+                    "cue_relation": "principal_downbeat",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    def fake_dense_catalog(
+        _source_path: Path,
+        source_asset_id: str,
+        event_id: str,
+        output_dir: Path,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "dense-catalog.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            source_asset_id=source_asset_id,
+            event_id=event_id,
+            source_start_ms=1_000,
+            source_end_ms=4_000,
+        )
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "create_dense_window_catalog",
+        fake_dense_catalog,
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "exact_event_resolver_binding_sha256",
+        lambda **_kwargs: "2" * 64,
+    )
+
+    class FakeClient:
+        def select_exact_event_locks(
+            self,
+            *,
+            input_artifact_hashes: tuple[str, ...],
+            **_kwargs: object,
+        ) -> tuple[ExactEventLockV2, ...]:
+            return (
+                ExactEventLockV2(
+                    event_id="result-event",
+                    event_type="result_stable_start",
+                    source_asset_id="sha256:" + "a" * 64,
+                    source_frame_id="DF000001",
+                    source_pts=1,
+                    source_time_ms=1_500,
+                    source_frame_hash="b" * 64,
+                    evidence_provenance="direct_result",
+                    support_window_start_frame_id="DF000001",
+                    support_window_end_frame_id="DF000001",
+                    support_window_start_ms=1_500,
+                    support_window_end_ms=1_500,
+                    confidence=0.9,
+                    resolver={
+                        "local_bracket_method": "frame_difference",
+                        "sampling_fps": 8,
+                        "contact_sheet_hashes": ["c" * 64],
+                        "gemini_interaction_id": "interaction-1",
+                    },
+                    input_artifact_hashes=input_artifact_hashes,
+                    generated_at="now",
+                ),
+            )
+
+    bound, locks, project_times, selected_window, fulfillments = (
+        _resolve_horizontal_grouped_exact_event_locks(
+            client=FakeClient(),
+            selected=selected,
+            prepared={
+                "clip": SimpleNamespace(
+                    path=str(source),
+                    sha256="a" * 64,
+                ),
+                "media": SimpleNamespace(
+                    asset_id="sha256:" + "a" * 64,
+                ),
+                "start_ms": 1_000,
+                "end_ms": 4_000,
+            },
+            selected_option={
+                "candidate_id": "horizontal-result",
+                "source_asset_id": "sha256:" + "a" * 64,
+                "event_id": "result-window",
+                "evidence_provenance": "direct_result",
+            },
+            contracts=(contract,),
+            evidence_events={
+                ("sha256:" + "a" * 64, "result-window"): {
+                    "evidence_provenance": "direct_result",
+                }
+            },
+            editorial_beat_contracts_path=contracts_path,
+            output_dir=tmp_path / "out",
+            project_start_ms=5_000,
+        )
+    )
+
+    assert bound[0].required_target_ids == ("result",)
+    assert locks[0].event_id == "result:result_stable_start"
+    assert project_times == {"result:result_stable_start": 5_500}
+    assert selected_window is not None
+    assert selected_window["aspect"] == "16:9"
+    assert fulfillments[0].fulfillment_level == "direct_demonstration"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_locked_event_frame_and_auto_trim_drive_grounding_and_render_boundary(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=1.2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+    media = feature_cut_module.probe_video(source)
+    source_sha256 = feature_cut_module.sha256_file(source)
+    dense_root = tmp_path / "out" / "exact-events" / "beat" / "candidate"
+    catalog = feature_cut_module.create_dense_window_catalog(
+        source,
+        media.asset_id,
+        "beat",
+        dense_root,
+        sampling_fps=8.0,
+        start_ms=0,
+        end_ms=1_000,
+    )
+    locked_frame = catalog.frames[len(catalog.frames) // 2]
+    lock = ExactEventLockV2(
+        event_id="beat:action_apex",
+        event_type="action_apex",
+        source_asset_id=media.asset_id,
+        source_frame_id=locked_frame.frame_id,
+        source_pts=locked_frame.frame_pts,
+        source_time_ms=locked_frame.frame_time_ms,
+        source_frame_hash=locked_frame.frame_hash,
+        support_window_start_frame_id=locked_frame.frame_id,
+        support_window_end_frame_id=locked_frame.frame_id,
+        support_window_start_ms=locked_frame.frame_time_ms,
+        support_window_end_ms=locked_frame.frame_time_ms,
+        confidence=0.9,
+        resolver={
+            "local_bracket_method": "frame_difference",
+            "sampling_fps": 8,
+            "contact_sheet_hashes": list(catalog.contact_sheet_hashes),
+            "gemini_interaction_id": "interaction-1",
+        },
+        input_artifact_hashes=("sha256:" + "d" * 64,),
+        generated_at="now",
+    )
+    coarse_frame = RushFrame(
+        frame_id="RF000001",
+        clip_id="clip",
+        requested_time_ms=100,
+        image_path=locked_frame.transport_image_path,
+    )
+
+    grounding_frame = (
+        feature_cut_module._grounding_anchor_from_exact_event_locks(
+            coarse_frame,
+            locks=(lock,),
+            dense_catalog=catalog,
+        )
+    )
+
+    assert grounding_frame.requested_time_ms == lock.source_time_ms
+    assert grounding_frame.frame_pts == lock.source_pts
+    assert feature_cut_module._tracking_seed_request_ms(
+        grounding_frame,
+        0,
+        1_000,
+    ) == (lock.source_time_ms, "catalog_anchor")
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="visual_demo",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=30_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    trim, authorized = (
+        feature_cut_module._authorize_runtime_selected_window_trim(
+            policy=policy,
+            feature_id="beat",
+            shot_id="shot-1",
+            source_path=source,
+            source_sha256=source_sha256,
+            source_asset_id=media.asset_id,
+            start_ms=0,
+            end_ms=1_000,
+            trim={
+                "source_in_pts": None,
+                "source_out_pts": None,
+                "trim_tail_intent": "action_complete",
+            },
+            locks=(lock,),
+            dense_catalog=catalog,
+            dense_catalog_path=dense_root / "dense-catalog.json",
+            output_dir=tmp_path / "out",
+        )
+    )
+    render_interval = feature_cut_module._exact_render_source_interval(
+        source_path=source,
+        source_sha256=source_sha256,
+        start_ms=0,
+        end_ms=1_000,
+        trim=trim,
+        output_dir=tmp_path / "render-boundary",
+    )
+
+    assert authorized.decision.source_in_ms == 0
+    assert authorized.decision.source_out_ms == 1_000
+    assert render_interval == trim["authorized_source_interval"]
+    assert render_interval["start_pts"] == authorized.decision.source_in_pts
+    assert (
+        render_interval["end_pts_exclusive"]
+        == authorized.decision.source_out_pts
+    )
+    with pytest.raises(
+        ValueError,
+        match="render bounds differ from AUTO_POLICY authorized trim",
+    ):
+        feature_cut_module._exact_render_source_interval(
+            source_path=source,
+            source_sha256=source_sha256,
+            start_ms=1,
+            end_ms=1_000,
+            trim=trim,
+            output_dir=tmp_path / "changed-render-boundary",
+        )
 
 
 def test_intentional_freeze_cue_repair_moves_only_source_in() -> None:
@@ -1011,7 +1703,7 @@ def test_legacy_plan_can_still_request_missing_selected_clip_framing() -> None:
 
 
 def test_autonomous_profile_rejects_unbound_raw_output_reuse() -> None:
-    with pytest.raises(ValueError, match="requires the current output"):
+    with pytest.raises(ValueError, match="do not accept the legacy"):
         _validate_autonomous_plan_reuse_flags(
             FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
             reuse_feature_plan=False,
@@ -1019,7 +1711,7 @@ def test_autonomous_profile_rejects_unbound_raw_output_reuse() -> None:
         )
 
 
-def test_autonomous_profile_allows_bound_raw_output_normalization(
+def test_autonomous_profile_rejects_even_bound_legacy_raw_output_normalization(
     tmp_path: Path,
 ) -> None:
     output_dir = tmp_path / "run"
@@ -1033,13 +1725,14 @@ def test_autonomous_profile_allows_bound_raw_output_normalization(
     policy = tmp_path / "policy.json"
     policy.write_text("{}", encoding="utf-8")
 
-    _validate_autonomous_plan_reuse_flags(
-        FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
-        reuse_feature_plan=False,
-        reuse_feature_plan_raw_output=True,
-        output_dir=output_dir,
-        autonomous_policy_path=policy,
-    )
+    with pytest.raises(ValueError, match="direct-video-edit-plan-v2"):
+        _validate_autonomous_plan_reuse_flags(
+            FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+            reuse_feature_plan=False,
+            reuse_feature_plan_raw_output=True,
+            output_dir=output_dir,
+            autonomous_policy_path=policy,
+        )
 
 
 def test_autonomous_profile_rejects_unbound_plan_reuse() -> None:
@@ -1936,9 +2629,9 @@ def test_editorial_dwell_saves_generic_shortfall_audit_before_fail_closed(
     assert audit["feasible_total_seconds"] == 2.5
     assert audit["shortfall_seconds"] == 57.5
     assert audit["user_duration_range"] == {
-        "minimum_seconds": 60.0,
+        "minimum_seconds": 30.0,
         "preferred_seconds": 60.0,
-        "maximum_seconds": 90.0,
+        "maximum_seconds": 120.0,
         "source": (
             "FeatureEditBrief.target_duration_seconds contract and user brief"
         ),
@@ -5473,6 +6166,77 @@ def test_feature_cut_preview_flag_still_refuses_unusable_proposal(tmp_path) -> N
         _load_trim_decisions([path], allow_proposed_preview=True)
 
 
+def test_feature_cut_consumes_auto_policy_authorized_trim(tmp_path: Path) -> None:
+    evidence = {
+        "frame_id": "DF000001",
+        "requested_time_ms": 1_000,
+        "frame_time_ms": 1_000,
+        "frame_pts": 30,
+        "frame_hash": "b" * 64,
+    }
+    decision = TrimIntentDecision.model_validate(
+        {
+            "source_asset_id": "sha256:" + "a" * 64,
+            "event_id": "event-1",
+            "shot_id": "shot-0001",
+            "usable": True,
+            "first_included_frame": evidence,
+            "last_included_frame": evidence,
+            "exclusive_out_frame": {
+                **evidence,
+                "frame_id": "DF000002",
+                "requested_time_ms": 2_000,
+                "frame_time_ms": 2_000,
+                "frame_pts": 60,
+            },
+            "hold_start_frame": None,
+            "hold_end_frame": None,
+            "source_in_ms": 1_000,
+            "source_out_ms": 2_000,
+            "source_in_pts": 30,
+            "source_out_pts": 60,
+            "handle_in_ms": 1_000,
+            "handle_out_ms": 2_000,
+            "tail_intent": "natural_pause",
+            "proposal_path": "/tmp/proposal.json",
+            "catalog_path": "/tmp/catalog.json",
+        }
+    )
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="visual_demo",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=30_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    authority = feature_cut_module.authorize_decision(
+        policy,
+        decision_scope="trim_intent",
+        input_artifact_hashes=("sha256:" + "c" * 64,),
+        deterministic_gate_results={"trim_bounds": "passed"},
+        decision_codes=("selected_window_trim_locked",),
+    )
+    authorized = feature_cut_module.authorize_trim_intent_decision(
+        decision,
+        exact_event_locks=(),
+        authority=authority,
+        policy=policy,
+    )
+    path = tmp_path / "authorized-trim.json"
+    write_json(path, authorized)
+
+    accepted = _load_trim_decisions([path])
+
+    assert accepted == [(path.resolve(), decision)]
+
+
 def test_feature_cut_applies_only_matching_approved_trim_bounds(tmp_path) -> None:
     clip = RushClip(
         clip_id="clip-1",
@@ -6380,6 +7144,521 @@ def test_vertical_multi_region_reframe_rejects_disagreeing_seed_dimensions() -> 
     assert audit["requires_gemini_review"] is True
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_hash_bound_repair_renders_only_changed_segment_and_concats(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=0.8",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+    source_sha = sha256_file(source)
+    source_interval = {
+        "start_pts": 0,
+        "end_pts_exclusive": 18,
+        "source_time_base": {"numerator": 1, "denominator": 30},
+        "source_start_pts": 0,
+    }
+    selected_filter = _vertical_center_crop_filter()
+    static_filter = feature_cut_module.static_full_bleed_crop_filter(
+        (0.0, 0.0, 316.0, 1000.0)
+    )
+    input_segments: list[Path] = []
+    chapters: list[dict[str, object]] = []
+    for index in range(1, 3):
+        segment_id = f"segment-{index:03d}"
+        segment = tmp_path / "input-segments" / f"{segment_id}.mp4"
+        _render_source_segment(
+            source_path=source,
+            start_ms=0,
+            end_ms=600,
+            overlay_path=None,
+            base_filter=selected_filter,
+            output_path=segment,
+            source_has_audio=False,
+            source_interval=source_interval,
+        )
+        catalog = {
+            "contract_version": "compiled-segment-repair-catalog-v1",
+            "segment_id": segment_id,
+            "feature_id": f"feature-{index}",
+            "source": {
+                "path": str(source.resolve()),
+                "sha256": source_sha,
+                "has_audio": False,
+            },
+            "source_in_ms": 0,
+            "source_out_ms": 600,
+            "source_interval": source_interval,
+            "overlay": None,
+            "track_fingerprint": None,
+            "options": [
+                {
+                    "contract_version": (
+                        "compiled-segment-repair-option-v1"
+                    ),
+                    "option_id": "selected-rendered-presentation",
+                    "action_classes": [],
+                    "mode": "tracked_full_bleed_crop",
+                    "filter_graph": selected_filter,
+                    "geometry": {
+                        "applied_strategy": "tracked_full_bleed_crop"
+                    },
+                    "dependency_hashes": [source_sha],
+                    "hard_constraint_results": [],
+                    "selected": True,
+                },
+                {
+                    "contract_version": (
+                        "compiled-segment-repair-option-v1"
+                    ),
+                    "option_id": "static-safe-option",
+                    "action_classes": ["hold", "next_presentation"],
+                    "mode": "static_full_bleed_crop",
+                    "filter_graph": static_filter,
+                    "geometry": {
+                        "applied_strategy": "static_full_bleed_crop",
+                        "full_bleed": True,
+                        "motion_reversal_count": 0,
+                    },
+                    "dependency_hashes": [source_sha],
+                    "hard_constraint_results": [
+                        {
+                            "constraint_id": "shared_static_crop",
+                            "level": "hard",
+                            "status": "pass",
+                            "reason_code": (
+                                "required_targets_fit_static_full_bleed"
+                            ),
+                        }
+                    ],
+                    "selected": False,
+                },
+            ],
+            "unsafe_action_classes": {
+                "shift_trim_within_handles": (
+                    "trim_shift_requires_precompiled_boundary_event_cue_and_"
+                    "source_motion_evidence"
+                ),
+                "alternate_candidate": (
+                    "top_k_swap_requires_candidate_bound_exact_event_and_"
+                    "identity_evidence"
+                ),
+            },
+        }
+        for option in catalog["options"]:
+            assert isinstance(option, dict)
+            option["definition_sha256"] = (
+                feature_cut_module._stable_fingerprint(option)
+            )
+        catalog["definition_sha256"] = (
+            feature_cut_module._stable_fingerprint(catalog)
+        )
+        catalog_path = (
+            tmp_path / "catalogs" / f"{segment_id}.json"
+        )
+        write_json(catalog_path, catalog)
+        chapters.append(
+            {
+                "segment_id": segment_id,
+                "feature_id": f"feature-{index}",
+                "duration_ms": 600,
+                "segment_path": str(segment.resolve()),
+                "repair_option_catalog": {
+                    "path": str(catalog_path.resolve()),
+                    "sha256": sha256_file(catalog_path),
+                    "definition_sha256": catalog[
+                        "definition_sha256"
+                    ],
+                    "replayable_option_count": 2,
+                },
+            }
+        )
+        input_segments.append(segment)
+    input_picture = tmp_path / "input-picture.mp4"
+    _concat_segments(
+        input_segments,
+        input_picture,
+        segment_durations_seconds=(0.6, 0.6),
+    )
+    manifest_path = tmp_path / "render-manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "vertical": {
+                "chapters": chapters,
+                "output_path": str(input_picture.resolve()),
+            },
+            "horizontal": {"chapters": []},
+            "concat_padding_audits": {},
+        },
+    )
+    context_paths: dict[str, Path] = {}
+    for key in (
+        "editorial_beat_contracts",
+        "music_map",
+        "cue_plan",
+        "exact_event_locks",
+        "sequence_optimization",
+        "reuse_degradation",
+    ):
+        path = tmp_path / "context" / f"{key}.json"
+        write_json(path, {"contract_version": f"test-{key}-v1"})
+        context_paths[key] = path
+    deterministic_path = tmp_path / "deterministic.json"
+    write_json(
+        deterministic_path,
+        DeterministicDeliveryEvidence(
+            media_playable=True,
+            pts_valid=True,
+            unexpected_freeze_count=0,
+            containment_passed=True,
+            identity_passed=True,
+            relation_passed=True,
+            panel_same_pts_passed=True,
+            relative_scale_lock_passed=True,
+            cue_delta_frames={},
+            synthetic_motion_motivated=True,
+            synthetic_reversal_count=0,
+            settle_passed=True,
+            readability_passed=True,
+            reuse_authorized=True,
+            omissions_authorized=True,
+            hard_evidence_passed=True,
+        ),
+    )
+    request = feature_cut_module.compile_repair_request(
+        render_manifest_path=manifest_path,
+        input_picture_path=input_picture,
+        aspect="9:16",
+        actions=(
+            {
+                "issue_id": "issue-motion",
+                "segment_id": "segment-002",
+                "beat_id": "feature-2",
+                "action": "hold",
+                "requires_semantic_replan": False,
+            },
+        ),
+        output_dir=tmp_path / "repair" / "compile",
+    )
+
+    assert request["status"] == "compiled"
+    result = feature_cut_module.render_changed_segments_and_concat(
+        compiled_request_path=Path(request["path"]),
+        deterministic_delivery_evidence_path=deterministic_path,
+        autonomous_context_paths=context_paths,
+        output_dir=tmp_path / "repair" / "render",
+    )
+
+    assert result["changed_segment_ids"] == ("segment-002",)
+    assert result["reused_segment_ids"] == ("segment-001",)
+    assert sha256_file(result["picture_path"]) != sha256_file(input_picture)
+    repaired_manifest = read_json(result["render_manifest_path"])
+    repaired_chapters = repaired_manifest["vertical"]["chapters"]
+    assert repaired_chapters[0]["segment_path"] == str(
+        input_segments[0].resolve()
+    )
+    assert repaired_chapters[1]["segment_path"] != str(
+        input_segments[1].resolve()
+    )
+    assert repaired_chapters[1]["applied_strategy"] == (
+        "static_full_bleed_crop"
+    )
+
+
+def test_compile_repair_request_keeps_unbound_trim_shift_fail_closed(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    segment = tmp_path / "segment.mp4"
+    segment.write_bytes(b"segment")
+    picture = tmp_path / "picture.mp4"
+    picture.write_bytes(b"picture")
+    catalog = {
+        "contract_version": "compiled-segment-repair-catalog-v1",
+        "segment_id": "segment-001",
+        "feature_id": "feature-1",
+        "source": {
+            "path": str(source.resolve()),
+            "sha256": sha256_file(source),
+            "has_audio": False,
+        },
+        "source_in_ms": 0,
+        "source_out_ms": 600,
+        "source_interval": {},
+        "overlay": None,
+        "track_fingerprint": None,
+        "options": [],
+        "unsafe_action_classes": {
+            "shift_trim_within_handles": (
+                "trim_shift_requires_precompiled_boundary_event_cue_and_"
+                "source_motion_evidence"
+            )
+        },
+    }
+    catalog["definition_sha256"] = (
+        feature_cut_module._stable_fingerprint(catalog)
+    )
+    catalog_path = tmp_path / "catalog.json"
+    write_json(catalog_path, catalog)
+    manifest_path = tmp_path / "manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "vertical": {
+                "chapters": [
+                    {
+                        "segment_id": "segment-001",
+                        "segment_path": str(segment.resolve()),
+                        "repair_option_catalog": {
+                            "path": str(catalog_path.resolve()),
+                            "sha256": sha256_file(catalog_path),
+                        },
+                    }
+                ]
+            }
+        },
+    )
+
+    request = feature_cut_module.compile_repair_request(
+        render_manifest_path=manifest_path,
+        input_picture_path=picture,
+        aspect="9:16",
+        actions=(
+            {
+                "issue_id": "cue-miss",
+                "segment_id": "segment-001",
+                "action": "shift_trim_within_handles",
+            },
+        ),
+        output_dir=tmp_path / "repair",
+    )
+
+    assert request["status"] == "blocked"
+    assert request["requires_scoped_semantic_replan"] is True
+    assert request["blockers"] == [
+        {
+            "issue_id": "cue-miss",
+            "reason_code": (
+                "trim_shift_requires_precompiled_boundary_event_cue_and_"
+                "source_motion_evidence"
+            ),
+        }
+    ]
+
+    precompiled_shift = {
+        "contract_version": "compiled-segment-repair-option-v1",
+        "option_id": "shift-plus-100ms",
+        "action_classes": ["shift_trim_within_handles"],
+        "mode": "static_full_bleed_crop",
+        "filter_graph": "[0:v]null[base]",
+        "geometry": {
+            "applied_strategy": "static_full_bleed_crop",
+        },
+        "dependency_hashes": [sha256_file(source)],
+        "hard_constraint_results": [
+            {
+                "constraint_id": "immutable_handles",
+                "level": "hard",
+                "status": "pass",
+                "reason_code": "shift_stays_inside_verified_handles",
+            },
+            {
+                "constraint_id": "exact_event_containment",
+                "level": "hard",
+                "status": "pass",
+                "reason_code": "locked_events_remain_inside_shifted_window",
+            },
+        ],
+        "selected": False,
+        "source_in_ms": 100,
+        "source_out_ms": 700,
+        "source_interval": {
+            "start_pts": 3,
+            "end_pts_exclusive": 21,
+            "source_time_base": {
+                "numerator": 1,
+                "denominator": 30,
+            },
+            "source_start_pts": 0,
+        },
+    }
+    precompiled_shift["definition_sha256"] = (
+        feature_cut_module._stable_fingerprint(precompiled_shift)
+    )
+    catalog["options"] = [precompiled_shift]
+    catalog.pop("definition_sha256")
+    catalog["definition_sha256"] = (
+        feature_cut_module._stable_fingerprint(catalog)
+    )
+    write_json(catalog_path, catalog)
+    manifest = read_json(manifest_path)
+    manifest["vertical"]["chapters"][0]["duration_ms"] = 600
+    manifest["vertical"]["chapters"][0]["repair_option_catalog"][
+        "sha256"
+    ] = sha256_file(catalog_path)
+    write_json(manifest_path, manifest)
+
+    compiled = feature_cut_module.compile_repair_request(
+        render_manifest_path=manifest_path,
+        input_picture_path=picture,
+        aspect="9:16",
+        actions=(
+            {
+                "issue_id": "cue-miss",
+                "segment_id": "segment-001",
+                "action": "shift_trim_within_handles",
+            },
+        ),
+        output_dir=tmp_path / "repair-precompiled",
+    )
+
+    assert compiled["status"] == "compiled"
+    assert compiled["compiled_actions"][0]["source_in_ms"] == 100
+    assert compiled["compiled_actions"][0]["source_out_ms"] == 700
+
+
+def test_scoped_semantic_replan_persists_bounded_frontier_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    segment = tmp_path / "segment.mp4"
+    picture = tmp_path / "picture.mp4"
+    segment.write_bytes(b"segment")
+    picture.write_bytes(b"picture")
+    plan_path = tmp_path / "feature-edit-plan.json"
+    write_json(plan_path, {"contract_version": "test-plan-v1"})
+    plan_sha = sha256_file(plan_path)
+    binding_path = tmp_path / "feature-plan.binding.json"
+    write_json(
+        binding_path,
+        {
+            "plan_path": str(plan_path.resolve()),
+            "plan_sha256": plan_sha,
+        },
+    )
+    frontier_row = {
+        "beat_id": "opening",
+        "selected_candidate_id": "rank-01",
+        "alternate_candidate_ids": ["rank-02", "rank-03"],
+        "candidate_bindings": {
+            candidate_id: {
+                "candidate_id": candidate_id,
+                "source_asset_id": "sha256:" + marker * 64,
+                "event_id": f"event-{candidate_id}",
+                "trim_duration_ms": 2400,
+                "cue_id": "cue-1",
+                "presentation_mode": "static_full_bleed_crop",
+            }
+            for candidate_id, marker in (
+                ("rank-01", "a"),
+                ("rank-02", "b"),
+                ("rank-03", "c"),
+            )
+        },
+        "adjacent_sequence_context": {
+            "previous": None,
+            "next": {"beat_id": "feature-2", "candidate_id": "rank-01"},
+        },
+    }
+    route_path = tmp_path / "pre-render-candidate-route.json"
+    write_json(
+        route_path,
+        {
+            "contract_version": "pre-render-sequence-frontier-v2",
+            "feature_plan_sha256": plan_sha,
+            "semantic_replan_frontier": {
+                "contract_version": "semantic-replan-frontier-v1",
+                "max_alternates_per_beat": 2,
+                "media_embedded": False,
+                "candidate_media_authority": "hash-bound FeatureEditPlan",
+                "beats": [frontier_row],
+            },
+        },
+    )
+    manifest_path = tmp_path / "render-manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "feature_plan_binding": str(binding_path.resolve()),
+            "editorial_planning": {
+                "pre_render_candidate_route_path": str(route_path.resolve()),
+                "pre_render_candidate_route_sha256": sha256_file(route_path),
+                "pre_render_horizontal_candidate_route_path": None,
+                "pre_render_horizontal_candidate_route_sha256": None,
+            },
+            "vertical": {
+                "chapters": [
+                    {
+                        "segment_id": "segment-001",
+                        "feature_id": "opening",
+                        "segment_path": str(segment.resolve()),
+                    }
+                ]
+            },
+            "horizontal": {"chapters": []},
+        },
+    )
+
+    request = feature_cut_module.compile_repair_request(
+        render_manifest_path=manifest_path,
+        input_picture_path=picture,
+        aspect="9:16",
+        actions=(
+            {
+                "issue_id": "weak-opening",
+                "segment_id": "segment-001",
+                "beat_id": "opening",
+                "action": "scoped_semantic_replan",
+                "requires_semantic_replan": True,
+            },
+        ),
+        output_dir=tmp_path / "repair",
+    )
+
+    assert request["status"] == "blocked"
+    assert request["requires_scoped_semantic_replan"] is True
+    assert request["blockers"] == [
+        {
+            "issue_id": "weak-opening",
+            "reason_code": (
+                "alternate_candidate_requires_bounded_execution_not_available"
+            ),
+        }
+    ]
+    handoff = request["scoped_semantic_replans"][0]
+    assert len(handoff["frontier"]["candidate_bindings"]) == 3
+    assert handoff["full_media_resend_allowed"] is False
+    assert handoff["gemini_dispatch_performed"] is False
+    assert handoff["required_execution_chain"] == [
+        "bounded_candidate_media",
+        "exact_event_lock",
+        "trim_authority",
+        "grounding_and_sam",
+        "presentation_compile",
+        "changed_segment_render",
+    ]
+    assert not list(tmp_path.rglob("*.paid_dispatch.json"))
+    assert not list(tmp_path.rglob("*.raw_interaction.json"))
+
+
 def test_vertical_camera_phases_require_contiguous_known_region_anchors() -> None:
     regions = [
         FramingRegionIntent(
@@ -7278,6 +8557,206 @@ def test_required_scope_fit_can_be_policy_authorized_for_delivery() -> None:
     assert audit["requires_gemini_review"] is False
     assert "auto_policy_authorized" in audit["risk_codes"]
     assert audit["autonomous_policy_reference"] == "sha256:" + "a" * 64
+
+
+def test_autonomous_execution_projection_omits_optional_before_timing() -> None:
+    supported = FeatureChapterSelect(
+        feature_id="opening",
+        evidence_status="supported",
+        horizontal_frame_id="RF000001",
+        vertical_frame_id="RF000001",
+        observed_visual_evidence="A product is directly visible.",
+        selection_reason="Evidence-bearing opening.",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+    )
+    missing = FeatureChapterSelect(
+        feature_id="optional_detail",
+        evidence_status="not_found",
+        observed_visual_evidence="No matching detail was observed.",
+        selection_reason="No candidate met the evidence contract.",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+    )
+    plan = FeatureEditPlan(
+        project_id="projection",
+        catalog_id="catalog",
+        title="Projection",
+        chapters=[supported, missing],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "optional-detail",
+            "feature_id": "optional_detail",
+            "priority": "optional",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["detail"],
+            "narrative_function": "feature_evidence",
+            "visual_events": [
+                {
+                    "event_type": "result_stable_start",
+                    "cue_relation": "accent",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_best_effort",
+        content_mode="visual_demo",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=30_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+    projected, degradations, binding = (
+        _project_autonomous_executable_feature_plan(
+            plan=plan,
+            contracts=(contract,),
+            policy=policy,
+            source_plan_sha256="a" * 64,
+            contracts_sha256="b" * 64,
+        )
+    )
+
+    assert [chapter.feature_id for chapter in projected.chapters] == ["opening"]
+    assert [record.action for record in degradations] == [
+        "optional_beat_omitted"
+    ]
+    assert binding["omitted_feature_ids"] == ["optional_detail"]
+    assert binding["policy_reference"] == policy.policy_reference
+
+
+def test_autonomous_execution_projection_blocks_missing_hard_evidence() -> None:
+    missing = FeatureChapterSelect(
+        feature_id="required_result",
+        evidence_status="not_found",
+        observed_visual_evidence="No matching result was observed.",
+        selection_reason="No candidate met the evidence contract.",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+    )
+    plan = FeatureEditPlan(
+        project_id="projection",
+        catalog_id="catalog",
+        title="Projection",
+        chapters=[missing],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "required-result",
+            "feature_id": "required_result",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["result"],
+            "narrative_function": "global_energy_peak",
+            "visual_events": [
+                {
+                    "event_type": "result_stable_start",
+                    "cue_relation": "principal_downbeat",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_best_effort",
+        content_mode="visual_demo",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=30_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="hard editorial requirements"):
+        _project_autonomous_executable_feature_plan(
+            plan=plan,
+            contracts=(contract,),
+            policy=policy,
+            source_plan_sha256="a" * 64,
+            contracts_sha256="b" * 64,
+        )
+
+
+@pytest.mark.parametrize("duration_seconds", [30, 120])
+def test_feature_brief_supports_autonomous_v1_duration_bounds(
+    duration_seconds: int,
+) -> None:
+    brief = FeatureEditBrief(
+        project_id="duration-bounds",
+        title="Duration bounds",
+        target_duration_seconds=duration_seconds,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id="beat",
+                title="Beat",
+                detail_lines=["Observable beat."],
+                target_duration_seconds=5,
+            )
+        ],
+    )
+
+    assert brief.target_duration_seconds == duration_seconds
 
 
 def test_non_square_pixel_source_fails_closed_to_sar_normalized_static_reframe() -> None:
@@ -8386,6 +9865,17 @@ def test_runtime_candidate_reuse_allows_authorized_distinct_interval() -> None:
         is not None
     )
 
+    policy_block = _runtime_candidate_reuse_violation(
+        selected,
+        prior,
+        source_clip_id="clip-a",
+        source_in_ms=4000,
+        source_out_ms=6000,
+        allowed_reuse_modes={"editorial_reprise"},
+    )
+    assert policy_block is not None
+    assert policy_block["reuse_mode"] == "distinct_interval"
+
 
 def test_autonomous_editorial_reprise_rejects_major_interval_overlap() -> None:
     selected = FeatureChapterSelect(
@@ -8713,4 +10203,164 @@ def test_selected_framing_cannot_weaken_group_coverage() -> None:
             upstream_intent="group_coverage",
             upstream_target_descriptions=["participant A", "participant B"],
             proposal=proposal,
+        )
+
+
+def test_presentation_authority_passes_and_rejects_changed_segment(
+    tmp_path: Path,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=50_000,
+            max_ms=70_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    dependency = tmp_path / "exact-event-locks.json"
+    segment = tmp_path / "segment.mp4"
+    final_output = tmp_path / "final.mp4"
+    dependency.write_text("{}")
+    segment.write_bytes(b"segment-v1")
+    final_output.write_bytes(b"final-v1")
+    proposal = tmp_path / "presentation-compilation.proposal.json"
+    write_json(
+        proposal,
+        {
+            "contract_version": "presentation-compilation-proposal-v2",
+            "aspect": "9:16",
+            "final_output_path": str(final_output),
+            "final_output_sha256": sha256_file(final_output),
+            "chapters": [
+                {
+                    "feature_id": "beat",
+                    "segment_path": str(segment),
+                    "segment_sha256": sha256_file(segment),
+                    "presentation_compilation": {
+                        "mode": "static_full_bleed_crop"
+                    },
+                }
+            ],
+        },
+    )
+    authority_path = feature_cut_module._write_policy_decision_artifact(
+        tmp_path / "presentation-authority.json",
+        proposal_path=proposal,
+        authority_inputs={"exact_event_locks": dependency},
+        additional_input_hashes=(
+            f"sha256:{sha256_file(final_output)}",
+            f"sha256:{sha256_file(segment)}",
+        ),
+        policy=policy,
+        decision_scope="reframe",
+        aspect="9:16",
+        deterministic_gate_results={"geometry": "passed"},
+        decision_codes=("presentation_bound",),
+    )
+
+    feature_cut_module.validate_policy_decision_artifact(
+        authority_path,
+        policy=policy,
+        expected_scope="reframe",
+        expected_aspect="9:16",
+    )
+    segment.write_bytes(b"segment-tampered")
+    with pytest.raises(ValueError, match="presentation segment changed"):
+        feature_cut_module.validate_policy_decision_artifact(
+            authority_path,
+            policy=policy,
+            expected_scope="reframe",
+            expected_aspect="9:16",
+        )
+
+
+def test_feature_cut_authority_rejects_tampered_eligibility(
+    tmp_path: Path,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=50_000,
+            max_ms=70_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    eligibility = tmp_path / "delivery-eligibility.json"
+    presentation_authority = tmp_path / "presentation-authority.json"
+    report = _build_feature_cut_eligibility_report(
+        {
+            "horizontal": {
+                "requested": False,
+                "status": "not_requested",
+                "chapters": [],
+            },
+            "vertical": {
+                "requested": True,
+                "status": "rendered",
+                "chapters": [
+                    {
+                        "feature_id": "supported",
+                        "source_clip_id": "clip-a",
+                        "fallback_reason": None,
+                        "risk_codes": [],
+                    }
+                ],
+            },
+            "requested_candidate_recall_audit": {"complete": True},
+            "quality_map_coverage_audit": {"complete": True},
+            "reframe_policy_binding": None,
+            "post_render_quality_qc": {
+                "requested": True,
+                "technical_qc_passed": True,
+            },
+        },
+        execution_profile=FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+    )
+    write_json(eligibility, report)
+    write_json(presentation_authority, {"authority": "bound"})
+    authority_path = feature_cut_module._write_policy_decision_artifact(
+        tmp_path / "feature-cut-authority.json",
+        proposal_path=eligibility,
+        authority_inputs={
+            "delivery_eligibility": eligibility,
+            "presentation_authority_9x16": presentation_authority,
+        },
+        additional_input_hashes=(),
+        policy=policy,
+        decision_scope="feature_cut",
+        aspect=None,
+        deterministic_gate_results={"feature_cut_handoff": "passed"},
+        decision_codes=("feature_cut_bound",),
+    )
+    feature_cut_module.validate_policy_decision_artifact(
+        authority_path,
+        policy=policy,
+        expected_scope="feature_cut",
+        expected_aspect=None,
+    )
+
+    write_json(
+        eligibility,
+        report.model_copy(update={"media_rendered": False}).model_dump(
+            mode="json"
+        ),
+    )
+    with pytest.raises(ValueError, match="policy decision proposal changed"):
+        feature_cut_module.validate_policy_decision_artifact(
+            authority_path,
+            policy=policy,
+            expected_scope="feature_cut",
+            expected_aspect=None,
         )

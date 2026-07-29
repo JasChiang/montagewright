@@ -16,15 +16,19 @@ from jascue_video_lab.autonomous_policy import (
 )
 from jascue_video_lab.event_lock import (
     EditorialBeatContract,
+    EvidenceFulfillmentObservation,
     ExactEventSelection,
     bracket_dense_frames_by_difference,
     build_cue_alignment_evidence,
     authorize_trim_intent_decision,
     bind_editorial_contract_to_selected_evidence,
     bind_grouped_event_lock_ids,
+    bind_selected_fulfillment,
     exact_event_resolver_binding_sha256,
+    hard_exact_event_requirements_satisfied,
     load_editorial_beat_contracts,
     resolve_exact_event_locks,
+    select_strongest_evidence_fulfillment,
     write_exact_event_bundle,
 )
 from jascue_video_lab.gemini import GeminiLabClient, MODEL_ID
@@ -329,6 +333,82 @@ def test_grouped_event_ids_bind_by_type_when_model_reorders(
     ]
 
 
+def test_repeated_event_type_requires_beat_qualified_lock_ids(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    locks = resolve_exact_event_locks(
+        catalog,
+        [
+            ExactEventSelection(
+                event_id="ambiguous-one",
+                event_type="state_change",
+                selected_frame_id="DF000007",
+                support_start_frame_id="DF000006",
+                support_end_frame_id="DF000008",
+                confidence=0.9,
+            ),
+            ExactEventSelection(
+                event_id="ambiguous-two",
+                event_type="state_change",
+                selected_frame_id="DF000009",
+                support_start_frame_id="DF000008",
+                support_end_frame_id="DF000010",
+                confidence=0.9,
+            ),
+        ],
+        gemini_interaction_id="interaction-1",
+        input_artifact_hashes=("sha256:" + "b" * 64,),
+    )
+    contracts = tuple(
+        EditorialBeatContract(
+            beat_id=beat_id,
+            feature_id=beat_id,
+            priority="hard",
+            evidence_query_lock_sha256="a" * 64,
+            required_target_ids=(beat_id,),
+            narrative_function="feature_evidence",
+            visual_events=(
+                {
+                    "event_type": "state_change",
+                    "cue_relation": "music_emphasis",
+                    "tolerance_frames": 2,
+                },
+            ),
+            duration={
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            relation_mode="single_subject",
+            allowed_reconstruction=("continuous",),
+        )
+        for beat_id in ("first-beat", "second-beat")
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="ambiguous legacy ExactEventLock ID",
+    ):
+        bind_grouped_event_lock_ids(locks, contracts)
+
+    qualified = (
+        locks[0].model_copy(update={"event_id": "first-beat:state_change"}),
+        locks[1].model_copy(update={"event_id": "second-beat:state_change"}),
+    )
+    bound = bind_grouped_event_lock_ids(qualified, contracts)
+
+    assert {lock.event_id for lock in bound} == {
+        "first-beat:state_change",
+        "second-beat:state_change",
+    }
+    assert hard_exact_event_requirements_satisfied(contracts, bound)
+    assert not hard_exact_event_requirements_satisfied(
+        contracts,
+        (bound[0],),
+    )
+
+
 def test_trim_authority_requires_exact_event_inside_immutable_trim(
     tmp_path: Path,
 ) -> None:
@@ -396,6 +476,14 @@ def test_trim_authority_requires_exact_event_inside_immutable_trim(
 
     assert authorized.requires_human_review is False
     assert authorized.approval_status == "approved"
+
+    contextual_authorized = authorize_trim_intent_decision(
+        decision,
+        exact_event_locks=[],
+        authority=authority,
+        policy=policy,
+    )
+    assert contextual_authorized.exact_event_lock_sha256s == ()
 
     with pytest.raises(ValueError, match="outside immutable trim"):
         authorize_trim_intent_decision(
@@ -469,6 +557,298 @@ def test_samsung_fixture_encodes_exact_event_music_relations() -> None:
     assert mapping["underwater_lift_apex"][0] == "music_emphasis"
     assert mapping["group_laugh_reaction_peak"][0] == "phrase_ending"
     assert mapping["freeze_start"][0] == "phrase_ending"
+    by_beat = {beat.beat_id: beat for beat in beats}
+    assert (
+        by_beat["ai_generation_payoff"].minimum_fulfillment_level
+        == "contextual_identity"
+    )
+    assert by_beat["watch_ui"].minimum_fulfillment_level == (
+        "contextual_identity"
+    )
+
+
+def test_legacy_editorial_contract_remains_direct_exact_compatible() -> None:
+    beat = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "legacy-result",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["result"],
+            "allowed_evidence_provenance": ["direct_result"],
+            "narrative_function": "feature_evidence",
+            "visual_events": [
+                {
+                    "event_type": "result_stable_start",
+                    "cue_relation": "principal_downbeat",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    selected = select_strongest_evidence_fulfillment(
+        beat,
+        [
+            EvidenceFulfillmentObservation(
+                candidate_id="candidate-direct",
+                evidence_provenance="direct_result",
+                available_visual_event_types=("result_stable_start",),
+            )
+        ],
+    )
+
+    assert selected.fulfillment_level == "direct_demonstration"
+    assert selected.exact_event_required is True
+    assert selected.visual_events == beat.visual_events
+
+
+def test_fulfillment_chooses_direct_before_contextual_fallback() -> None:
+    beat = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "feature-chapter",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["product"],
+            "narrative_function": "feature_evidence",
+            "minimum_fulfillment_level": "contextual_identity",
+            "fulfillment_alternatives": [
+                {
+                    "fulfillment_level": "direct_demonstration",
+                    "accepted_evidence_provenance": [
+                        "direct_ui_interaction",
+                        "direct_result",
+                    ],
+                    "required_observable_predicates": ["visible_result"],
+                    "claim_support_level": "direct",
+                    "exact_event_requirement": "required_when_selected",
+                    "visual_events": [
+                        {
+                            "event_type": "result_stable_start",
+                            "cue_relation": "principal_downbeat",
+                            "tolerance_frames": 2,
+                        }
+                    ],
+                },
+                {
+                    "fulfillment_level": "contextual_identity",
+                    "accepted_evidence_provenance": [
+                        "context_only",
+                        "prerecorded_screen_playback",
+                    ],
+                    "claim_support_level": "illustrative_only",
+                    "exact_event_requirement": "none",
+                    "degradation_codes": [
+                        "direct_demonstration_unavailable",
+                        "contextual_visual_substitution",
+                    ],
+                    "copy_suppression_codes": [
+                        "specific_claim_copy_suppressed"
+                    ],
+                },
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous", "solid_fit"],
+        }
+    )
+
+    selected = select_strongest_evidence_fulfillment(
+        beat,
+        [
+            EvidenceFulfillmentObservation(
+                candidate_id="candidate-context",
+                evidence_provenance="context_only",
+                available_visual_event_types=(),
+            ),
+            EvidenceFulfillmentObservation(
+                candidate_id="candidate-direct",
+                evidence_provenance="direct_result",
+                observable_predicates=("visible_result",),
+                available_visual_event_types=("result_stable_start",),
+            ),
+        ],
+    )
+
+    assert selected.candidate_id == "candidate-direct"
+    assert selected.fulfillment_level == "direct_demonstration"
+    assert selected.claim_support_level == "direct"
+    assert selected.degradation_codes == ()
+
+
+def test_missing_exact_event_uses_context_without_fabricating_event() -> None:
+    beat = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "feature-chapter",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["product"],
+            "narrative_function": "feature_evidence",
+            "minimum_fulfillment_level": "contextual_identity",
+            "fulfillment_alternatives": [
+                {
+                    "fulfillment_level": "direct_demonstration",
+                    "accepted_evidence_provenance": ["direct_result"],
+                    "claim_support_level": "direct",
+                    "exact_event_requirement": "required_when_selected",
+                    "visual_events": [
+                        {
+                            "event_type": "result_stable_start",
+                            "cue_relation": "principal_downbeat",
+                            "tolerance_frames": 2,
+                        }
+                    ],
+                },
+                {
+                    "fulfillment_level": "contextual_identity",
+                    "accepted_evidence_provenance": [
+                        "direct_result",
+                        "prerecorded_screen_playback",
+                        "context_only",
+                    ],
+                    "claim_support_level": "illustrative_only",
+                    "exact_event_requirement": "none",
+                    "degradation_codes": [
+                        "direct_demonstration_unavailable",
+                        "contextual_visual_substitution",
+                    ],
+                    "copy_suppression_codes": [
+                        "specific_claim_copy_suppressed"
+                    ],
+                },
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    selected = select_strongest_evidence_fulfillment(
+        beat,
+        [
+            EvidenceFulfillmentObservation(
+                candidate_id="candidate-playback",
+                evidence_provenance="prerecorded_screen_playback",
+                available_visual_event_types=("state_change",),
+            ),
+            EvidenceFulfillmentObservation(
+                candidate_id="candidate-no-result",
+                evidence_provenance="direct_result",
+                available_visual_event_types=(),
+            ),
+        ],
+    )
+    executable = bind_selected_fulfillment(beat, selected)
+
+    assert selected.fulfillment_level == "contextual_identity"
+    assert selected.claim_support_level == "illustrative_only"
+    assert selected.exact_event_required is False
+    assert selected.visual_events == ()
+    assert "contextual_visual_substitution" in selected.degradation_codes
+    assert (
+        "specific_claim_copy_suppressed"
+        in selected.copy_suppression_codes
+    )
+    assert executable.visual_events == ()
+    assert executable.allowed_evidence_provenance == (
+        "prerecorded_screen_playback",
+    )
+
+
+def test_contextual_fallback_cannot_omit_degradation_or_copy_suppression() -> None:
+    payload = {
+        "beat_id": "feature-chapter",
+        "priority": "hard",
+        "evidence_query_lock_sha256": "1" * 64,
+        "required_target_ids": ["product"],
+        "narrative_function": "feature_evidence",
+        "minimum_fulfillment_level": "contextual_identity",
+        "fulfillment_alternatives": [
+            {
+                "fulfillment_level": "contextual_identity",
+                "accepted_evidence_provenance": ["context_only"],
+                "claim_support_level": "illustrative_only",
+                "exact_event_requirement": "none",
+            }
+        ],
+        "duration": {
+            "minimum_readable_frames": 12,
+            "preferred_frames": 24,
+            "maximum_frames": 48,
+        },
+        "relation_mode": "single_subject",
+        "allowed_reconstruction": ["continuous"],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="contextual fallback must record its substitution",
+    ):
+        EditorialBeatContract.model_validate(payload)
+
+
+def test_direct_minimum_rejects_contextual_only_candidate() -> None:
+    beat = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "hard-proof",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["result"],
+            "narrative_function": "feature_evidence",
+            "minimum_fulfillment_level": "direct_demonstration",
+            "fulfillment_alternatives": [
+                {
+                    "fulfillment_level": "direct_demonstration",
+                    "accepted_evidence_provenance": ["direct_result"],
+                    "claim_support_level": "direct",
+                    "exact_event_requirement": "required_when_selected",
+                    "visual_events": [
+                        {
+                            "event_type": "result_stable_start",
+                            "cue_relation": "principal_downbeat",
+                            "tolerance_frames": 2,
+                        }
+                    ],
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="no evidence candidate satisfies",
+    ):
+        select_strongest_evidence_fulfillment(
+            beat,
+            [
+                EvidenceFulfillmentObservation(
+                    candidate_id="candidate-context",
+                    evidence_provenance="context_only",
+                    available_visual_event_types=(),
+                )
+            ],
+        )
 
 
 def test_grouped_exact_event_call_uses_high_stills_and_no_time_schema(
@@ -563,6 +943,11 @@ def test_grouped_exact_event_call_uses_high_stills_and_no_time_schema(
     schema_text = json.dumps(requests[0]["response_format"]["schema"])
     assert "source_time_ms" not in schema_text
     assert "source_pts" not in schema_text
+    prompt_text = requests[0]["input"][0]["text"]
+    assert (
+        '"required_event_id": "ai-payoff:generation_result_stable_start"'
+        in prompt_text
+    )
 
 
 def test_screen_playback_cannot_trigger_direct_exact_event_paid_call(

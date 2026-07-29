@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
-from jascue_video_lab.billing import summarize_usage_and_list_price
+import pytest
+
+from jascue_video_lab.billing import (
+    BudgetLedger,
+    PaidDispatchAlreadyRecorded,
+    adopt_paid_dispatch_journals,
+    dispatch_paid_interaction,
+    estimate_paid_call,
+    summarize_usage_and_list_price,
+)
 
 
 def test_usage_summary_prices_input_output_and_thought_tokens(tmp_path) -> None:
@@ -256,3 +266,70 @@ def test_missing_usage_is_reported_as_unpriced_not_silently_free(tmp_path) -> No
     assert summary["unpriced_request_paths"] == [
         "attempts/attempt-000001/raw_interaction.json"
     ]
+
+
+def test_ambiguous_dispatch_is_adopted_once_and_exact_request_never_replayed(
+    tmp_path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fail_create(**request):
+        calls.append(request)
+        raise RuntimeError("503 transport unavailable")
+
+    client = SimpleNamespace(
+        interactions=SimpleNamespace(create=fail_create)
+    )
+    estimate = estimate_paid_call(
+        stage="exact_event_group",
+        model_id="gemini-3.6-flash",
+        image_count=8,
+        media_resolution="high",
+        text_input_tokens=200,
+        max_output_tokens=2048,
+        thinking_level="low",
+    )
+    first_ledger = BudgetLedger(
+        max_cost_usd=1.25,
+        max_interactions=25,
+    )
+    request = {"model": "gemini-3.6-flash", "input": [{"type": "text", "text": "x"}]}
+
+    with pytest.raises(RuntimeError, match="503"):
+        dispatch_paid_interaction(
+            client=client,
+            request=request,
+            request_record=request,
+            journal_dir=tmp_path / "picture" / "exact",
+            estimate=estimate,
+            budget_ledger=first_ledger,
+        )
+
+    assert len(calls) == 1
+    assert first_ledger.committed_interactions == 1
+    assert first_ledger.actual_cost_usd == estimate.worst_case_cost_usd
+    resumed_ledger = BudgetLedger(
+        max_cost_usd=1.25,
+        max_interactions=25,
+    )
+    adopted = adopt_paid_dispatch_journals(
+        budget_ledger=resumed_ledger,
+        root=tmp_path,
+        allowed_top_level={"picture"},
+    )
+    assert len(adopted) == 1
+    assert resumed_ledger.committed_interactions == 1
+    assert resumed_ledger.actual_cost_usd == estimate.worst_case_cost_usd
+
+    with pytest.raises(PaidDispatchAlreadyRecorded):
+        dispatch_paid_interaction(
+            client=client,
+            request=request,
+            request_record=request,
+            journal_dir=tmp_path / "picture" / "exact",
+            estimate=estimate,
+            budget_ledger=resumed_ledger,
+        )
+
+    assert len(calls) == 1
+    assert resumed_ledger.committed_interactions == 1

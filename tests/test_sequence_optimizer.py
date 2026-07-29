@@ -13,6 +13,8 @@ from jascue_video_lab.autonomous_policy import (
 )
 from jascue_video_lab.sequence_optimizer import (
     BeatOptionSet,
+    CandidateRouteBeat,
+    CandidateRouteOption,
     MusicBoundaryCue,
     MusicBoundarySpec,
     SegmentRenderCacheKey,
@@ -21,10 +23,207 @@ from jascue_video_lab.sequence_optimizer import (
     SequenceOption,
     concat_manifest_lines,
     optimize_sequence,
+    optimize_pre_render_candidate_route,
     render_segments_incrementally,
     solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
 )
+
+
+def _route_option(
+    beat_id: str,
+    candidate_id: str,
+    source_marker: str,
+    *,
+    rank: int,
+    confidence: float,
+) -> CandidateRouteOption:
+    return CandidateRouteOption(
+        beat_id=beat_id,
+        candidate_id=candidate_id,
+        source_asset_id="sha256:" + source_marker * 64,
+        event_id=f"event-{candidate_id}",
+        planner_rank=rank,
+        semantic_confidence=confidence,
+    )
+
+
+def test_pre_render_route_uses_global_variety_without_discarding_semantics() -> None:
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="a",
+                options=(
+                    _route_option("a", "a1", "a", rank=1, confidence=0.9),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="b",
+                options=(
+                    _route_option("b", "b1", "a", rank=1, confidence=0.90),
+                    _route_option("b", "b2", "b", rank=2, confidence=0.88),
+                ),
+            ),
+        )
+    )
+
+    assert [row.candidate_id for row in route.selections] == ["a1", "b2"]
+    assert "adjacent_source_variety_preferred" in (
+        route.selections[1].decision_codes
+    )
+
+
+def test_pre_render_route_does_not_replace_clear_semantic_winner() -> None:
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="a",
+                options=(
+                    _route_option("a", "a1", "a", rank=1, confidence=0.9),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="b",
+                options=(
+                    _route_option("b", "b1", "a", rank=1, confidence=0.98),
+                    _route_option("b", "b2", "b", rank=2, confidence=0.30),
+                ),
+            ),
+        )
+    )
+
+    assert [row.candidate_id for row in route.selections] == ["a1", "b1"]
+
+
+def test_pre_render_frontier_rejects_known_hard_failure_before_score() -> None:
+    unsafe = _route_option(
+        "payoff",
+        "pretty-but-unsuitable",
+        "a",
+        rank=1,
+        confidence=1.0,
+    ).model_copy(
+        update={
+            "preflight_hard_failures": (
+                "aspect_declared_unsuitable",
+            ),
+            "trim_duration_ms": 12_000,
+            "minimum_readable_ms": 8_000,
+            "preferred_readable_ms": 12_000,
+            "maximum_readable_ms": 15_000,
+            "cue_id": "accent-01",
+            "presentation_mode": "two_panel_layout",
+            "entry_composition": "comparison:a+b",
+            "exit_composition": "comparison:a+b",
+        }
+    )
+    safe = _route_option(
+        "payoff",
+        "proven",
+        "b",
+        rank=2,
+        confidence=0.2,
+    ).model_copy(
+        update={
+            "trim_duration_ms": 12_000,
+            "minimum_readable_ms": 8_000,
+            "preferred_readable_ms": 12_000,
+            "maximum_readable_ms": 15_000,
+            "cue_id": "accent-01",
+            "presentation_mode": "static_full_bleed_crop",
+            "entry_composition": "single:device",
+            "exit_composition": "single:device",
+        }
+    )
+
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="payoff",
+                options=(unsafe, safe),
+            ),
+        )
+    )
+
+    assert route.contract_version == "pre-render-sequence-frontier-v2"
+    assert route.selections[0].candidate_id == "proven"
+    assert route.selections[0].trim_duration_ms == 12_000
+    assert route.selections[0].cue_id == "accent-01"
+    assert route.selections[0].presentation_mode == (
+        "static_full_bleed_crop"
+    )
+    assert route.fallback_candidate_ids_by_beat["payoff"] == ("proven",)
+
+
+def test_pre_render_frontier_fails_closed_when_every_option_is_known_bad() -> None:
+    bad = _route_option(
+        "payoff",
+        "bad",
+        "a",
+        rank=1,
+        confidence=1.0,
+    ).model_copy(
+        update={
+            "preflight_hard_failures": (
+                "aspect_declared_unsuitable",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="no hard-safe option"):
+        optimize_pre_render_candidate_route(
+            (CandidateRouteBeat(beat_id="payoff", options=(bad,)),)
+        )
+
+
+def test_pre_render_frontier_applies_panel_runtime_policy_before_render() -> None:
+    panel = _route_option(
+        "comparison",
+        "panel",
+        "a",
+        rank=1,
+        confidence=1.0,
+    ).model_copy(
+        update={
+            "trim_duration_ms": 10_000,
+            "minimum_readable_ms": 8_000,
+            "preferred_readable_ms": 10_000,
+            "maximum_readable_ms": 12_000,
+            "presentation_mode": "two_panel_layout",
+        }
+    )
+    full_bleed = _route_option(
+        "comparison",
+        "full-bleed",
+        "b",
+        rank=2,
+        confidence=0.2,
+    ).model_copy(
+        update={
+            "trim_duration_ms": 10_000,
+            "minimum_readable_ms": 8_000,
+            "preferred_readable_ms": 10_000,
+            "maximum_readable_ms": 12_000,
+            "presentation_mode": "static_full_bleed_crop",
+        }
+    )
+
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="comparison",
+                options=(panel, full_bleed),
+            ),
+        ),
+        minimum_duration_ms=10_000,
+        maximum_duration_ms=10_000,
+        max_panel_runtime_fraction=0.25,
+    )
+
+    assert route.selections[0].candidate_id == "full-bleed"
+    assert route.fallback_candidate_ids_by_beat["comparison"] == (
+        "full-bleed",
+    )
 
 
 def _policy(

@@ -224,6 +224,17 @@ confidence 與 cache key。Gemini 仍決定注意力與運鏡動機，不負責�
 word-level timing provider 完成後再加入；Gemini只可修正辨識文字，不可取代本機
 timing lineage。
 
+2026-07-29 的 production wiring consolidation 進一步關閉下列隱藏斷點：
+
+- optional `not_found` beat 會在 duration、rhythm、music 與 render 前先投影掉；hard／preferred 缺證據仍 fail closed。
+- refreshed Clip Card／supplement 會使 active shortlist 與 direct plan 失效並移入 archive；direct plan 必須精確綁定目前 shortlist hash。
+- `pre-render-sequence-frontier-v2` 在 render 前共同綁定 candidate、resolved output trim duration、music exit、presentation family 與 symbolic entry／exit，並保存全局 fallback order；render 後只做 executed hard-gate validation，不再冒充決策 optimizer。
+- 每次付費請求先寫 `paid-dispatch-journal-v1`。429／503、transport failure 或 process timeout 會保守計入最壞成本，resume 會收養同一 dispatch，exact request 不可暗中重送。
+- deterministic evidence 會因果綁定目前 final render、render／delivery／music manifests、policy、完整 context 與每個 segment content hash；舊 render 的全通過 JSON 不能授權新 render。
+- MusicMap、CuePlan、presentation/reframe、feature-cut eligibility 與 final delivery 都各自具有 `DecisionAuthorityV2`，downstream 重新驗證 proposal、依賴與輸出 hashes。
+- policy 現在綁定 `gemini-3.6-flash` 與 `content_mode`；未實作的 preferred-beat substitution、deterministic-only delivery、自動 paid retry 與 whole-video text-heavy escalation會在 preflight 明確拒絕，不再被靜默忽略。Worker 數值是 concurrency ceilings；目前 sequential execution 合法但尚未做效能平行化。
+- scoped semantic replan 會保存最多三個候選及 adjacent context 的 hash-bound handoff，禁止 full-media resend；alternate candidate 在尚未重新進入 exact-event／trim authority／grounding/SAM／presentation execution 前明確 block。
+
 selected-window orchestration 現已在最終 source in/out 上重用 dense decoder，依 feature 將多事件合併為一次 grouped ExactEventLock call，並把 template 綁到實際入選候選的 `EvidenceQueryLockV2`。同一 picture run 會產生 beat、music、cue、exact-event、degradation、deterministic QA 六份 evidence 與含路徑／hash 的 bundle index；`feature-delivery` 會直接發現並驗證它們，resume 時也拒絕任何被修改的 context。
 
 Samsung 9:16 舊 selected-window evidence experiment 曾執行 23 次付費 interaction，並產生六個 ExactEventLocks 與完整 bundle；事後稽核確認它明確重用了舊 picture artifacts，輸出音軌也全是 source audio，相關 run 已移至 `artifacts/_archive/2026-07-28-stale-plan-reuse/`。Autonomous resume 現在只接受與當前 policy SHA、music SHA、capability catalog 及 source artifacts 完整綁定的 `direct-video-edit-plan-v2`，不再一律拒絕合法 resume，也不接受未綁定的 raw reuse。

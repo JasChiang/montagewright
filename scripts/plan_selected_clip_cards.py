@@ -146,6 +146,7 @@ model_provenance 必須先原樣回傳以下資料（interaction_id 為 null）�
         "input": [{"type": "text", "text": prompt}],
         "generation_config": {
             "thinking_level": args.thinking_level,
+            "max_output_tokens": 12_000,
         },
         "response_format": {
             "type": "text",

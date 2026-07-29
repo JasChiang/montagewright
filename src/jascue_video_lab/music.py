@@ -235,6 +235,100 @@ def _canonical_hash(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def validate_music_map_lock_integrity(
+    lock: MusicMapLock,
+    *,
+    music_path: Path | None = None,
+    lock_path: Path | None = None,
+    policy: AutonomousEditPolicy | None = None,
+    require_authority_source_binding: bool = True,
+    validate_authority_policy: bool = True,
+) -> MusicMapProposal:
+    """Revalidate every immutable input behind a saved MusicMap lock.
+
+    Model validation alone cannot prove that the proposal or soundtrack still
+    matches disk, and a matching policy reference is not a substitute for that
+    proof.  Autonomous consumers call this even when the saved lock already
+    names the current policy.
+    """
+
+    if lock_path is not None:
+        resolved_lock = lock_path.expanduser().resolve(strict=True)
+        saved_lock = MusicMapLock.model_validate(read_json(resolved_lock))
+        if saved_lock != lock:
+            raise ValueError("in-memory MusicMap lock differs from the saved artifact")
+    resolved_proposal = Path(lock.proposal_path).expanduser().resolve(strict=True)
+    proposal_digest = sha256_file(resolved_proposal)
+    if proposal_digest != lock.proposal_sha256:
+        raise ValueError("MusicMap proposal hash no longer matches the lock")
+    proposal = MusicMapProposal.model_validate(read_json(resolved_proposal))
+    if proposal.music_id != lock.music_id:
+        raise ValueError("MusicMap proposal source identity no longer matches the lock")
+    if music_path is not None:
+        resolved_music = music_path.expanduser().resolve(strict=True)
+        music_hash = f"sha256:{sha256_file(resolved_music)}"
+        if music_hash != lock.music_id:
+            raise ValueError("MusicMap lock does not bind the supplied soundtrack")
+    else:
+        music_hash = lock.music_id
+    definition: dict[str, object]
+    if lock.authority is not None:
+        if validate_authority_policy and policy is None:
+            raise ValueError("AUTO_POLICY MusicMap integrity requires its signed policy")
+        if validate_authority_policy:
+            assert policy is not None
+            validate_authority_binding(lock.authority, policy)
+        if lock.authority.decision_scope != "music_map":
+            raise ValueError("MusicMap authority scope must be music_map")
+        required_authority_hashes = {f"sha256:{proposal_digest}"}
+        if require_authority_source_binding:
+            required_authority_hashes.add(music_hash)
+        if not required_authority_hashes.issubset(
+            set(lock.authority.input_artifact_hashes)
+        ):
+            raise ValueError(
+                "MusicMap authority does not bind both proposal and soundtrack"
+            )
+        definition = {
+            "contract_version": "music-map-lock-v2",
+            "music_id": lock.music_id,
+            "proposal_sha256": lock.proposal_sha256,
+            "authority": lock.authority.model_dump(mode="json"),
+            "master_sample_rate": lock.master_sample_rate,
+            "duration_samples": lock.duration_samples,
+            "duration_ms": lock.duration_ms,
+            "bpm": lock.bpm,
+            "meter": lock.meter,
+            "first_downbeat_sample": lock.first_downbeat_sample,
+            "cues": [cue.model_dump(mode="json") for cue in lock.cues],
+            "sections": [
+                section.model_dump(mode="json") for section in lock.sections
+            ],
+        }
+    else:
+        definition = {
+            "music_id": lock.music_id,
+            "proposal_sha256": lock.proposal_sha256,
+            "review": (
+                lock.review.model_dump(mode="json")
+                if lock.review is not None
+                else None
+            ),
+            "master_sample_rate": lock.master_sample_rate,
+            "duration_samples": lock.duration_samples,
+            "bpm": lock.bpm,
+            "meter": lock.meter,
+            "first_downbeat_sample": lock.first_downbeat_sample,
+            "cues": [cue.model_dump(mode="json") for cue in lock.cues],
+            "sections": [
+                section.model_dump(mode="json") for section in lock.sections
+            ],
+        }
+    if _canonical_hash(definition) != lock.definition_sha256:
+        raise ValueError("MusicMap lock definition integrity check failed")
+    return proposal
+
+
 def _sample_to_ms(sample_index: int, sample_rate: int) -> int:
     return round(Fraction(sample_index * 1000, sample_rate))
 
