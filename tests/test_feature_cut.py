@@ -55,6 +55,7 @@ from jascue_video_lab.feature_cut import (
     _is_exhausted_model_quota_error,
     _is_non_retryable_spending_cap_error,
     _load_trim_decisions,
+    _order_insensitive_grounding_group_key,
     _migrate_legacy_feature_plan_binding,
     _piecewise_expression,
     _project_locked_cues_to_music_output,
@@ -4551,6 +4552,24 @@ def test_hard_single_subject_keeps_extra_planner_context_soft() -> None:
 
     assert [region.role for region in bound] == ["required", "preferred"]
     assert bound[1].evidence_role == "context_reference"
+
+
+def test_grouped_grounding_cache_key_ignores_only_target_order() -> None:
+    first = {
+        "source_frame_hash": "a" * 64,
+        "targets": [
+            {"target_id": "watch", "target_description": "watch"},
+            {"target_id": "hand", "target_description": "hand"},
+        ],
+    }
+    reversed_targets = {
+        **first,
+        "targets": list(reversed(first["targets"])),
+    }
+
+    assert _order_insensitive_grounding_group_key(
+        first
+    ) == _order_insensitive_grounding_group_key(reversed_targets)
 
 
 def test_phrase_ending_includes_downbeat_just_before_final_phrase_window() -> None:

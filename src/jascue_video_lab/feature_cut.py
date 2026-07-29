@@ -6564,6 +6564,22 @@ def _has_complete_cached_primary_track(output_dir: Path) -> bool:
     )
 
 
+def _order_insensitive_grounding_group_key(
+    request_key: Mapping[str, Any],
+) -> str:
+    """Fingerprint an exact-frame Grounding batch independent of target order."""
+
+    normalized = dict(request_key)
+    targets = normalized.get("targets")
+    if not isinstance(targets, list):
+        raise ValueError("grouped Grounding request key has no target list")
+    normalized["targets"] = sorted(
+        targets,
+        key=lambda target: str(target.get("target_id", "")),
+    )
+    return _stable_fingerprint(normalized)
+
+
 def _is_non_retryable_spending_cap_error(error: Exception) -> bool:
     message = str(error).lower()
     return "spending cap" in message or "monthly spend" in message
@@ -7328,39 +7344,102 @@ def _build_framing_region_tracks(
                     read_json(group_path)
                 )
             else:
-                if model_request_block_reason:
-                    raise RuntimeError(
-                        "Gemini multi-target Grounding request skipped by "
-                        "run-level circuit breaker: "
-                        + model_request_block_reason
-                    )
                 write_json(group_dir / "request-key.json", group_key)
-                try:
-                    group = client.ground_multi_target_exact_frame(
-                        source_asset_id=media.asset_id,
-                        source_frame_id=frame.frame_id,
-                        grounding_anchor_id=f"grounding-anchor:{feature_id}",
-                        frame_path=Path(exact_frame.path),
-                        targets=requests,
-                        output_dir=group_dir,
+                equivalent_group = None
+                current_equivalence_key = (
+                    _order_insensitive_grounding_group_key(group_key)
+                )
+                for saved_key_path in sorted(
+                    batch_root.glob("group-*/request-key.json")
+                ):
+                    if saved_key_path == group_dir / "request-key.json":
+                        continue
+                    saved_group_path = (
+                        saved_key_path.parent
+                        / "multi_target_grounding.json"
                     )
-                except BudgetExceeded:
-                    if any(
-                        region.role == "required"
-                        for region in region_chunk
+                    if (
+                        not saved_group_path.is_file()
+                        or _order_insensitive_grounding_group_key(
+                            read_json(saved_key_path)
+                        )
+                        != current_equivalence_key
                     ):
-                        raise
-                    preferred_grounding_omissions.extend(
-                        {
-                            "region_id": region.region_id,
-                            "reason_code": (
-                                "preferred_only_batch_omitted_to_preserve_"
-                                "final_qa_budget"
-                            ),
-                        }
-                        for region in region_chunk
+                        continue
+                    saved_group = MultiTargetGroundingGroup.model_validate(
+                        read_json(saved_group_path)
                     )
-                    continue
+                    saved_results = {
+                        result.target_id: result
+                        for result in saved_group.targets
+                    }
+                    if set(saved_results) != {
+                        request.target_id for request in requests
+                    }:
+                        continue
+                    equivalent_group = saved_group.model_copy(
+                        update={
+                            "targets": tuple(
+                                saved_results[request.target_id]
+                                for request in requests
+                            )
+                        }
+                    )
+                    write_json(group_path, equivalent_group)
+                    write_json(
+                        group_dir / "equivalent-cache-reuse.json",
+                        {
+                            "contract_version": (
+                                "order-insensitive-grounding-cache-reuse-v1"
+                            ),
+                            "source_group_path": str(
+                                saved_group_path.resolve()
+                            ),
+                            "source_group_sha256": sha256_file(
+                                saved_group_path
+                            ),
+                            "paid_model_calls_added": 0,
+                            "generated_at": utc_now(),
+                        },
+                    )
+                    break
+                if equivalent_group is not None:
+                    group = equivalent_group
+                else:
+                    if model_request_block_reason:
+                        raise RuntimeError(
+                            "Gemini multi-target Grounding request skipped by "
+                            "run-level circuit breaker: "
+                            + model_request_block_reason
+                        )
+                    try:
+                        group = client.ground_multi_target_exact_frame(
+                            source_asset_id=media.asset_id,
+                            source_frame_id=frame.frame_id,
+                            grounding_anchor_id=(
+                                f"grounding-anchor:{feature_id}"
+                            ),
+                            frame_path=Path(exact_frame.path),
+                            targets=requests,
+                            output_dir=group_dir,
+                        )
+                    except BudgetExceeded:
+                        if any(
+                            region.role == "required"
+                            for region in region_chunk
+                        ):
+                            raise
+                        preferred_grounding_omissions.extend(
+                            {
+                                "region_id": region.region_id,
+                                "reason_code": (
+                                    "preferred_only_batch_omitted_to_"
+                                    "preserve_final_qa_budget"
+                                ),
+                            }
+                            for region in region_chunk
+                        )
+                        continue
             interaction_path = (
                 group_dir / "multi_target_grounding.raw_interaction.json"
             )
