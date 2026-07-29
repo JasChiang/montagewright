@@ -22,11 +22,13 @@ from jascue_video_lab.event_lock import (
     authorize_trim_intent_decision,
     bind_editorial_contract_to_selected_evidence,
     bind_grouped_event_lock_ids,
+    exact_event_resolver_binding_sha256,
     load_editorial_beat_contracts,
     resolve_exact_event_locks,
     write_exact_event_bundle,
 )
 from jascue_video_lab.gemini import GeminiLabClient, MODEL_ID
+from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
     DenseFrame,
     DenseFrameCatalog,
@@ -41,6 +43,7 @@ def _catalog(tmp_path: Path, *, count: int = 16) -> DenseFrameCatalog:
         path = tmp_path / f"{index:02d}.png"
         color = 0 if index < count // 2 else 255
         Image.new("L", (32, 18), color=color).save(path)
+        frame_hash = sha256_file(path)
         frames.append(
             DenseFrame(
                 frame_id=f"DF{index:06d}",
@@ -48,14 +51,16 @@ def _catalog(tmp_path: Path, *, count: int = 16) -> DenseFrameCatalog:
                 requested_time_ms=index * 125,
                 frame_time_ms=index * 125,
                 frame_pts=index * 4,
-                frame_hash=f"{index + 1:064x}",
+                frame_hash=frame_hash,
                 width=32,
                 height=18,
                 image_path=str(path),
                 transport_image_path=str(path),
-                transport_image_hash=f"{index + 1:064x}",
+                transport_image_hash=frame_hash,
             )
         )
+    contact_path = tmp_path / "contact.jpg"
+    Image.new("RGB", (64, 36), color=(32, 32, 32)).save(contact_path)
     return DenseFrameCatalog(
         source_asset_id="sha256:" + "a" * 64,
         event_id="shot-window",
@@ -63,8 +68,8 @@ def _catalog(tmp_path: Path, *, count: int = 16) -> DenseFrameCatalog:
         source_start_ms=0,
         source_end_ms=count * 125,
         frames=frames,
-        contact_sheet_paths=[str(tmp_path / "contact.jpg")],
-        contact_sheet_hashes=["b" * 64],
+        contact_sheet_paths=[str(contact_path)],
+        contact_sheet_hashes=[sha256_file(contact_path)],
         generated_at="now",
     )
 
@@ -99,6 +104,48 @@ def test_difference_bracket_is_bounded_and_keeps_change_frontier(
     assert {"DF000007", "DF000008"} <= {
         frame.frame_id for frame in bracket
     }
+
+
+def test_exact_event_binding_rehashes_dense_evidence_files(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    contract = EditorialBeatContract(
+        beat_id="gesture",
+        priority="hard",
+        evidence_query_lock_sha256="1" * 64,
+        required_target_ids=("phone",),
+        narrative_function="feature_evidence",
+        visual_events=(
+            {
+                "event_type": "camera_gesture_apex",
+                "cue_relation": "accent",
+                "tolerance_frames": 2,
+            },
+        ),
+        duration={
+            "minimum_readable_frames": 12,
+            "preferred_frames": 24,
+            "maximum_frames": 48,
+        },
+        relation_mode="single_subject",
+        allowed_reconstruction=("continuous",),
+    )
+
+    binding = exact_event_resolver_binding_sha256(
+        catalog=catalog,
+        contracts=(contract,),
+        model_id=MODEL_ID,
+    )
+    assert len(binding) == 64
+
+    Path(catalog.contact_sheet_paths[0]).write_bytes(b"replaced")
+    with pytest.raises(ValueError, match="contact sheet integrity mismatch"):
+        exact_event_resolver_binding_sha256(
+            catalog=catalog,
+            contracts=(contract,),
+            model_id=MODEL_ID,
+        )
 
 
 def test_exact_event_selection_maps_only_existing_ids_to_pts(

@@ -22,6 +22,7 @@ from .models import (
     FrozenStrictModel,
     TrimIntentDecision,
 )
+from .media import sha256_file
 from .schema import gemini_response_schema
 from .storage import utc_now
 
@@ -394,11 +395,64 @@ def exact_event_resolver_binding_sha256(
 ) -> str:
     """Bind reusable locks to the exact dense evidence and resolver contract."""
 
+    verified_files: list[dict[str, str]] = []
+    for frame in catalog.frames:
+        image_path = Path(frame.image_path).expanduser().resolve(strict=True)
+        image_hash = sha256_file(image_path)
+        if image_hash != frame.frame_hash:
+            raise ValueError(
+                f"dense source frame integrity mismatch: {frame.frame_id}"
+            )
+        transport_path = (
+            Path(frame.transport_image_path)
+            .expanduser()
+            .resolve(strict=True)
+        )
+        transport_hash = sha256_file(transport_path)
+        if transport_hash != frame.transport_image_hash:
+            raise ValueError(
+                f"dense transport frame integrity mismatch: {frame.frame_id}"
+            )
+        verified_files.extend(
+            (
+                {
+                    "role": "source_frame",
+                    "frame_id": frame.frame_id,
+                    "sha256": image_hash,
+                },
+                {
+                    "role": "transport_frame",
+                    "frame_id": frame.frame_id,
+                    "sha256": transport_hash,
+                },
+            )
+        )
+    for index, (path_value, declared_hash) in enumerate(
+        zip(
+            catalog.contact_sheet_paths,
+            catalog.contact_sheet_hashes,
+            strict=True,
+        )
+    ):
+        path = Path(path_value).expanduser().resolve(strict=True)
+        actual_hash = sha256_file(path)
+        if actual_hash != declared_hash:
+            raise ValueError(
+                f"dense contact sheet integrity mismatch: {index}"
+            )
+        verified_files.append(
+            {
+                "role": "contact_sheet",
+                "index": str(index),
+                "sha256": actual_hash,
+            }
+        )
     return _canonical_sha256(
         {
             "resolver_version": EXACT_EVENT_RESOLVER_VERSION,
             "model_id": model_id,
             "catalog": catalog.model_dump(mode="json"),
+            "verified_files": verified_files,
             "contracts": [
                 contract.model_dump(mode="json") for contract in contracts
             ],

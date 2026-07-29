@@ -8230,43 +8230,25 @@ def _preferred_capability_ids(
 def _normal_acceptable_capability_ids(
     presentation_preference: str,
 ) -> tuple[str, ...]:
-    """Return the normal execution family, excluding recovery authority.
+    """Enumerate every natural execution family for local feasibility.
 
-    Policy permission for panel/matte is deliberately not included unless the
-    semantic plan selected that constructed presentation.  Runtime recovery
-    remains a separate, typed path after Top-K natural candidates fail.
+    Gemini's presentation choice is a ranking preference, not authority to
+    suppress a locally executable full-bleed, minimal move, or hard-cut
+    option. Constructed panel/matte modes remain opt-in here and are still
+    deferred until all Top-K natural candidates have been attempted.
     """
 
-    natural_by_preference = {
-        "static_full_bleed": (
-            "static_full_bleed_crop",
-            "tracked_full_bleed_crop",
-        ),
-        "tracked_full_bleed": (
-            "tracked_full_bleed_crop",
-            "static_full_bleed_crop",
-        ),
-        "phase_virtual_camera": (
-            "phase_virtual_camera",
-            "hard_cut_between_views",
-            "tracked_full_bleed_crop",
-            "static_full_bleed_crop",
-        ),
-        "two_panel_layout": (
-            "static_full_bleed_crop",
-            "tracked_full_bleed_crop",
-            "two_panel_layout",
-        ),
-        "solid_matte_fit": (
-            "static_full_bleed_crop",
-            "tracked_full_bleed_crop",
-            "solid_matte_fit",
-        ),
-    }
-    return natural_by_preference.get(
-        presentation_preference,
-        ("static_full_bleed_crop", "tracked_full_bleed_crop"),
+    natural = (
+        "static_full_bleed_crop",
+        "tracked_full_bleed_crop",
+        "phase_virtual_camera",
+        "hard_cut_between_views",
     )
+    constructed = {
+        "two_panel_layout": "two_panel_layout",
+        "solid_matte_fit": "solid_matte_fit",
+    }.get(presentation_preference)
+    return (*natural, constructed) if constructed is not None else natural
 
 
 def _candidate_capability_boundaries(
