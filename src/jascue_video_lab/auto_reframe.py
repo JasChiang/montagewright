@@ -1,9 +1,8 @@
 """Auditable, domain-neutral policy for unattended portrait reframing.
 
-The policy never authorizes clipping a hard-core or atomic region.  It only
-accepts a crop that was already solved with ``preserve_all`` and may label the
-result ``auto_bounded_clip_v1`` when optional context is clipped within an
-explicit visible-fraction floor.
+Atomic evidence always requires full visibility. A non-atomic hard target may
+use an explicit, hash-bound visible-fraction floor when the semantic plan
+authorizes controlled clipping; the measured crop must still meet that floor.
 """
 
 from __future__ import annotations
@@ -81,9 +80,8 @@ class RegionAssessment(StrictModel):
 
     @model_validator(mode="after")
     def validate_region(self) -> "RegionAssessment":
-        if self.role == "hard_core" or self.atomic:
-            if self.required_visible_fraction != 1.0:
-                raise ValueError("hard-core and atomic regions require full visibility")
+        if self.atomic and self.required_visible_fraction != 1.0:
+            raise ValueError("atomic regions require full visibility")
         if self.role == "overlay_keepout" and self.required_visible_fraction != 0.0:
             raise ValueError("overlay keepout regions use overlap, not visible fraction")
         return self
@@ -248,7 +246,8 @@ def failure_codes_for_preflight(
                 failures.append(FailureCode.HARD_CORE_NOT_FULLY_RETAINED)
             continue
         if (region.role == "hard_core" or region.atomic) and (
-            region.minimum_visible_fraction < 1.0
+            region.minimum_visible_fraction + 1e-6
+            < region.required_visible_fraction
         ):
             failures.append(
                 FailureCode.ATOMIC_REGION_CLIPPED
@@ -302,8 +301,9 @@ def audit_auto_bounded_clip(
         policy,
         expected_geometry_fingerprint=expected_geometry_fingerprint,
     )
-    clipped_soft_extent = any(
-        region.role == "soft_extent" and region.minimum_visible_fraction < 1.0
+    bounded_clip_applied = any(
+        region.role in {"hard_core", "soft_extent"}
+        and region.minimum_visible_fraction < 1.0
         for region in preflight.regions
     )
     advisory_codes: list[FailureCode] = []
@@ -330,7 +330,7 @@ def audit_auto_bounded_clip(
         "candidate_id": preflight.candidate_id,
         "candidate_rank": preflight.rank,
         "approved": not failures,
-        "auto_bounded_clip_applied": not failures and clipped_soft_extent,
+        "auto_bounded_clip_applied": not failures and bounded_clip_applied,
         "failure_codes": [failure.value for failure in failures],
         "advisory_codes": [code.value for code in advisory_codes],
         "geometry_fingerprint": preflight.geometry_fingerprint,

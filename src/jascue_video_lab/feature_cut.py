@@ -4527,6 +4527,7 @@ def _vertical_filter_from_track(
         "fit_with_background"
     ),
     display_sample_aspect_ratio: float = 1.0,
+    required_regions: Sequence[FramingRegionIntent] = (),
     preferred_tracks: Sequence[SegmentationTrack] = (),
     preferred_regions: Sequence[FramingRegionIntent] = (),
 ) -> tuple[str, dict[str, Any]]:
@@ -4536,8 +4537,11 @@ def _vertical_filter_from_track(
         else _vertical_fit_filter()
     )
     tracks = [track] if isinstance(track, SegmentationTrack) else list(track)
+    required_regions = list(required_regions)
     preferred_tracks = list(preferred_tracks)
     preferred_regions = list(preferred_regions)
+    if required_regions and len(tracks) != len(required_regions):
+        raise ValueError("required tracks and region contracts must align")
     if len(preferred_tracks) != len(preferred_regions):
         raise ValueError("preferred tracks and region contracts must align")
     if not math.isclose(display_sample_aspect_ratio, 1.0, rel_tol=0, abs_tol=1e-6):
@@ -4744,6 +4748,28 @@ def _vertical_filter_from_track(
     y_expression = _piecewise_expression(times, y_values)
     controlled_clip_applied = bool(crop_audit["controlled_clip_applied"])
     risk_codes = ["controlled_required_region_clip"] if controlled_clip_applied else []
+    hard_core_audit: dict[str, Any] = {
+        "hard_core_region_count": 0,
+        "hard_core_visibility_passed": True,
+        "hard_core_regions": [],
+    }
+    if required_regions:
+        measured_hard = _soft_extent_visibility_audit(
+            tracks=tracks,
+            regions=required_regions,
+            crop_audit=crop_audit,
+        )
+        hard_core_audit = {
+            "hard_core_region_count": measured_hard[
+                "soft_extent_count"
+            ],
+            "hard_core_visibility_passed": measured_hard[
+                "soft_extent_visibility_passed"
+            ],
+            "hard_core_regions": measured_hard[
+                "soft_extent_regions"
+            ],
+        }
     soft_extent_audit: dict[str, Any] = {
         "soft_extent_count": 0,
         "soft_extent_visibility_passed": True,
@@ -4786,6 +4812,7 @@ def _vertical_filter_from_track(
             **lineage,
             **coverage,
             **composition_audit,
+            **hard_core_audit,
             **soft_extent_audit,
             **crop_audit,
         },
@@ -8663,6 +8690,7 @@ def _vertical_candidate_geometry(
                 region_ids=[region.region_id for region in hard_regions],
                 fallback_strategy=fallback_strategy,
                 display_sample_aspect_ratio=display_sample_aspect_ratio,
+                required_regions=hard_regions,
                 preferred_tracks=soft_tracks,
                 preferred_regions=available_soft_regions,
             )
@@ -8821,6 +8849,7 @@ def _vertical_candidate_geometry(
                         region_ids=[region.region_id for region in hard_regions],
                         fallback_strategy=fallback_strategy,
                         display_sample_aspect_ratio=display_sample_aspect_ratio,
+                        required_regions=hard_regions,
                         preferred_tracks=soft_tracks,
                         preferred_regions=available_soft_regions,
                     )
@@ -8838,6 +8867,7 @@ def _vertical_candidate_geometry(
                 region_ids=[region.region_id for region in hard_regions],
                 fallback_strategy=fallback_strategy,
                 display_sample_aspect_ratio=display_sample_aspect_ratio,
+                required_regions=hard_regions,
                 preferred_tracks=soft_tracks,
                 preferred_regions=available_soft_regions,
             )
@@ -9168,20 +9198,37 @@ def _vertical_candidate_preflight(
         for item in geometry.get("soft_extent_regions", [])
         if isinstance(item, Mapping)
     }
+    hard_by_id = {
+        str(item.get("region_id")): item
+        for item in geometry.get("hard_core_regions", [])
+        if isinstance(item, Mapping)
+    }
     hard_minimum = float(
         geometry.get("minimum_visible_required_area_fraction", 1.0)
     )
     assessed_regions: list[RegionAssessment] = []
     for region in regions:
         if region.execution_role == "hard_core":
+            item = hard_by_id.get(region.region_id)
             assessed_regions.append(
                 RegionAssessment(
                     region_id=region.region_id,
                     role="hard_core",
                     atomic=region.atomic,
-                    assessed=True,
-                    minimum_visible_fraction=hard_minimum,
-                    required_visible_fraction=1.0,
+                    assessed=item is not None or not hard_by_id,
+                    minimum_visible_fraction=(
+                        float(item["minimum_visible_area_fraction"])
+                        if item is not None
+                        else hard_minimum
+                    ),
+                    required_visible_fraction=(
+                        region.effective_minimum_visible_fraction
+                    ),
+                    clipped_edges=(
+                        list(item.get("clipped_edges", []))
+                        if item is not None
+                        else []
+                    ),
                 )
             )
         elif region.execution_role == "soft_extent":

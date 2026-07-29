@@ -83,6 +83,16 @@ def test_hard_core_or_atomic_clipping_fails_closed() -> None:
     assert FailureCode.HARD_CORE_NOT_FULLY_RETAINED in failures
 
 
+def test_hash_bound_non_atomic_hard_core_floor_can_pass() -> None:
+    candidate = preflight()
+    candidate.regions[0].required_visible_fraction = 0.6
+    candidate.regions[0].minimum_visible_fraction = 0.7
+
+    failures = failure_codes_for_preflight(candidate, AutoReframePolicy())
+
+    assert FailureCode.HARD_CORE_NOT_FULLY_RETAINED not in failures
+
+
 def test_geometry_fingerprint_mismatch_is_not_approved() -> None:
     audit = audit_auto_bounded_clip(
         preflight(),

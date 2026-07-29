@@ -85,6 +85,7 @@ from jascue_video_lab.feature_cut import (
     _validate_feature_plan_binding,
     _validate_shared_sam_session_cache,
     _vertical_crop_geometry,
+    _vertical_candidate_preflight,
     _vertical_candidate_geometry,
     _vertical_center_crop_filter,
     _vertical_delivery_fallback,
@@ -5362,6 +5363,75 @@ def test_vertical_portrait_reframe_uses_track_driven_y_crop() -> None:
         audit["crop_keyframes"][1]["crop_y_pixels"]
     )
     assert audit["containment_failure_count"] == 0
+
+
+def test_controlled_crop_assesses_each_hard_target_independently() -> None:
+    def track(target: str, box: list[int]) -> SimpleNamespace:
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=1000,
+            analysis_fps=2.0,
+            seed_time_ms=0,
+            semantic_seed_box=box,
+            seed_source_width=3840,
+            seed_source_height=2160,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target,
+            state_counts={"tracked": 2},
+            samples=[
+                SimpleNamespace(
+                    analysis_sample_time_ms=index * 500,
+                    tracking_state=TrackingState.TRACKED,
+                    derived_tracking_box=box,
+                )
+                for index in range(2)
+            ],
+        )
+
+    regions = [
+        FramingRegionIntent(
+            region_id="person",
+            entity_id="person",
+            target_description="the central person",
+            role="required",
+            minimum_visible_fraction=0.6,
+        ),
+        FramingRegionIntent(
+            region_id="phone",
+            entity_id="phone",
+            target_description="the primary phone",
+            role="required",
+            minimum_visible_fraction=1.0,
+        ),
+    ]
+    filter_graph, geometry = _vertical_filter_from_track(  # type: ignore[arg-type]
+        [
+            track("the central person", [300, 0, 700, 1000]),
+            track("the primary phone", [450, 300, 550, 600]),
+        ],
+        allow_subject_clipping=True,
+        overflow_policy="controlled_clip",
+        region_ids=["person", "phone"],
+        required_regions=regions,
+    )
+    preflight, _ = _vertical_candidate_preflight(
+        candidate_id="candidate",
+        rank=1,
+        confidence=0.9,
+        source_sha256="a" * 64,
+        filter_graph=filter_graph,
+        geometry=geometry,
+        regions=regions,
+        track_fingerprint="b" * 64,
+        titles_rendered=False,
+    )
+    assessed = {region.region_id: region for region in preflight.regions}
+
+    assert assessed["person"].required_visible_fraction == 0.6
+    assert assessed["phone"].required_visible_fraction == 1.0
+    assert assessed["person"].minimum_visible_fraction < 1.0
+    assert assessed["phone"].minimum_visible_fraction == 1.0
 
 
 def test_vertical_multi_region_reframe_rejects_disagreeing_seed_dimensions() -> None:
