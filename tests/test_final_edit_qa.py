@@ -960,7 +960,10 @@ def test_autonomous_validator_allows_aspect_ratio_but_rejects_timestamp(
             issues=[issue],
             status="issues_observed",
         ),
-        "context_hashes": {},
+        "context_hashes": {
+            f"{key}_sha256": value
+            for key, value in prepared.autonomous_context_hashes.items()
+        },
         "requires_human_review": False,
     }
     normalized, normalization_audit = (
@@ -979,7 +982,10 @@ def test_autonomous_validator_allows_aspect_ratio_but_rejects_timestamp(
         normalization_audit["application_owned_fields"]["context_hashes"][
             "model_value"
         ]
-        == {}
+        == {
+            f"{key}_sha256": value
+            for key, value in prepared.autonomous_context_hashes.items()
+        }
     )
 
     timestamp_issue = {**issue, "observation": "The result becomes visible at 01:23."}

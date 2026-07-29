@@ -26,7 +26,7 @@ from .storage import read_json, utc_now, write_json
 
 FINAL_EDIT_QA_CONTRACT_VERSION = "final-edit-qa-v1"
 FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v3"
-FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v3"
+FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v4"
 FINAL_EDIT_QA_GENERATION_CONFIG = {
     "thinking_level": "low",
     "max_output_tokens": 8192,
@@ -1089,15 +1089,11 @@ def _normalize_application_owned_fields(
             ),
         }
     }
-    if (
-        mode == "autonomous_final_9x16"
-        and autonomous_context_hashes
-        and not payload.get("context_hashes")
-    ):
+    if mode == "autonomous_final_9x16" and autonomous_context_hashes:
         # These hashes bind the request to immutable application artifacts.
-        # They are not a semantic model observation.  A structured response
-        # that omits the echo may be completed locally, while a non-empty but
-        # incorrect echo remains untouched and fails validation below.
+        # They are not a semantic model observation or a field whose key names
+        # may be delegated to Gemini. Preserve the raw response separately,
+        # then always restore the exact application-owned binding locally.
         model_context_hashes = payload.get("context_hashes")
         payload["context_hashes"] = dict(autonomous_context_hashes)
         application_owned_fields["context_hashes"] = {
@@ -1105,7 +1101,7 @@ def _normalize_application_owned_fields(
             "normalized_value": dict(autonomous_context_hashes),
             "reason": (
                 "immutable request context binding is application-owned; "
-                "only a missing or empty echo may be restored locally"
+                "the model echo is audited but cannot rename or change keys"
             ),
         }
     audit = {
