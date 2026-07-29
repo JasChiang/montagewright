@@ -1499,6 +1499,7 @@ def _chapter_bounds_with_approved_trim(
     approved_decisions: Sequence[tuple[Path, TrimIntentDecision]],
     expected_event_id: str | None = None,
     quality_maps: Sequence[tuple[Path, ShotQualityMap]] = (),
+    minimum_duration_seconds: float | None = None,
 ) -> tuple[int, int, str, dict[str, Any]]:
     fallback_start, fallback_end, shot_id = _chapter_bounds(
         frame,
@@ -1549,7 +1550,8 @@ def _chapter_bounds_with_approved_trim(
                 "quality_map_path": None,
                 "quality_safe_interval_id": None,
             }
-        requested_ms = max(1, round(duration_seconds * 1000))
+        preferred_requested_ms = max(1, round(duration_seconds * 1000))
+        requested_ms = preferred_requested_ms
         containing = [
             interval
             for interval in safe_intervals
@@ -1559,10 +1561,27 @@ def _chapter_bounds_with_approved_trim(
             and interval.end_ms - interval.start_ms >= requested_ms
         ]
         if not containing:
-            raise ValueError(
-                "selected evidence frame has no continuous QualitySafeInterval "
-                "long enough for the resolved chapter duration"
+            minimum_requested_ms = (
+                max(1, round(minimum_duration_seconds * 1000))
+                if minimum_duration_seconds is not None
+                else None
             )
+            minimum_containing = [
+                interval
+                for interval in safe_intervals
+                if minimum_requested_ms is not None
+                and interval.start_ms
+                <= frame.requested_time_ms
+                < interval.end_ms
+                and interval.end_ms - interval.start_ms
+                >= minimum_requested_ms
+            ]
+            if not minimum_containing:
+                raise ValueError(
+                    "selected evidence frame has no continuous QualitySafeInterval "
+                    "long enough for the resolved chapter duration"
+                )
+            containing = minimum_containing
         interval = min(
             containing,
             key=lambda item: (
@@ -1570,6 +1589,10 @@ def _chapter_bounds_with_approved_trim(
                 item.end_ms - item.start_ms,
                 item.start_ms,
             ),
+        )
+        requested_ms = min(
+            requested_ms,
+            interval.end_ms - interval.start_ms,
         )
         safe_start = max(
             interval.start_ms,
@@ -1580,7 +1603,18 @@ def _chapter_bounds_with_approved_trim(
         )
         safe_end = safe_start + requested_ms
         return safe_start, safe_end, shot_id, {
-            "trim_method": "keyframe_centered_requested_duration",
+            "trim_method": (
+                "quality_safe_minimum_dwell_recovery"
+                if requested_ms < preferred_requested_ms
+                else "keyframe_centered_requested_duration"
+            ),
+            "preferred_duration_ms": preferred_requested_ms,
+            "resolved_duration_ms": requested_ms,
+            "minimum_duration_ms": (
+                max(1, round(minimum_duration_seconds * 1000))
+                if minimum_duration_seconds is not None
+                else None
+            ),
             "trim_decision_path": None,
             "trim_event_id": None,
             "trim_tail_intent": None,
@@ -14404,6 +14438,15 @@ def _run_feature_cut_experiment_impl(
                             trim_decisions,
                             expected_event_id=option_data.get("event_id"),
                             quality_maps=shot_quality_maps,
+                            minimum_duration_seconds=(
+                                selected.attention_observation.minimum_dwell_seconds
+                                if (
+                                    autonomous_profile
+                                    and selected.attention_observation
+                                    is not None
+                                )
+                                else None
+                            ),
                         )
                         reuse_violation = _runtime_candidate_reuse_violation(
                             selected,

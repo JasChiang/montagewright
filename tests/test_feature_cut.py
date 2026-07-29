@@ -4932,6 +4932,87 @@ def test_trim_decision_can_select_a_better_range_away_from_catalog_anchor(tmp_pa
     assert (start_ms, end_ms) == (1001, 4004)
 
 
+def test_quality_safe_interval_can_contract_to_autonomous_minimum_dwell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"quality-safe-source")
+    clip = RushClip(
+        clip_id="clip-1",
+        path=str(source),
+        sha256=hashlib.sha256(b"quality-safe-source").hexdigest(),
+        duration_ms=10_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=source.stat().st_size,
+    )
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id=clip.clip_id,
+        requested_time_ms=5_000,
+        image_path="/tmp/frame.jpg",
+    )
+    shot_cache = {
+        clip.clip_id: ShotManifest(
+            video_path=clip.path,
+            duration_ms=clip.duration_ms,
+            detector="test",
+            threshold=4,
+            generated_at="2026-07-29T00:00:00Z",
+            boundaries=[],
+            shots=[
+                ShotSegment(
+                    shot_id="shot-0001",
+                    start_time_ms=0,
+                    end_time_ms=10_000,
+                    start_frame_pts=0,
+                    boundary_source="video_start",
+                    boundary_score=None,
+                )
+            ],
+        )
+    }
+    quality_path = tmp_path / "quality.json"
+    quality_path.write_text("{}", encoding="utf-8")
+    quality_map = SimpleNamespace(
+        source_asset_id=f"sha256:{clip.sha256}",
+        source_path=clip.path,
+        shot_id="shot-0001",
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "build_quality_safe_intervals",
+        lambda *_args, **_kwargs: [
+            SimpleNamespace(
+                interval_id="safe-1",
+                start_ms=4_000,
+                end_ms=7_800,
+                requires_human_review=False,
+            )
+        ],
+    )
+
+    start_ms, end_ms, _, audit = _chapter_bounds_with_approved_trim(
+        frame,
+        clip,
+        7.0,
+        shot_cache,
+        tmp_path,
+        4.0,
+        [],
+        quality_maps=[(quality_path, quality_map)],  # type: ignore[list-item]
+        minimum_duration_seconds=3.0,
+    )
+
+    assert (start_ms, end_ms) == (4_000, 7_800)
+    assert audit["trim_method"] == "quality_safe_minimum_dwell_recovery"
+    assert audit["preferred_duration_ms"] == 7_000
+    assert audit["resolved_duration_ms"] == 3_800
+    assert audit["minimum_duration_ms"] == 3_000
+
+
 def test_feature_brief_can_disable_titles_and_choose_primary_center_crop() -> None:
     brief = FeatureEditBrief(
         project_id="clean-cut",
