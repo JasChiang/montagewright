@@ -16,6 +16,7 @@ from jascue_video_lab.autonomous_policy import (
     BudgetPolicy,
     DurationPolicy,
 )
+from jascue_video_lab.billing import BudgetExceeded
 from jascue_video_lab.editing_capabilities import (
     simple_production_capability_catalog,
 )
@@ -4494,6 +4495,11 @@ def test_only_non_retryable_spending_cap_errors_trip_geometry_circuit_breaker() 
     )
     assert not _is_exhausted_model_quota_error(
         RuntimeError("the selected entity is not visible in this frame")
+    )
+    assert not _is_exhausted_model_quota_error(
+        BudgetExceeded(
+            "paid call blocked before request (multi_target_grounding)"
+        )
     )
 
 

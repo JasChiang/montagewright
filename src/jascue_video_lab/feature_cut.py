@@ -6588,7 +6588,7 @@ def _is_exhausted_model_quota_error(error: Exception) -> bool:
         for value in status_values
         if value is not None
     ) or re.match(r"^\s*(?:http(?:\s+status)?\s*)?429(?:\b|:)", message)
-    return isinstance(error, BudgetExceeded) or _is_non_retryable_spending_cap_error(error) or any(
+    return _is_non_retryable_spending_cap_error(error) or any(
         marker in message
         for marker in (
             "resource_exhausted",
@@ -6602,6 +6602,10 @@ def _is_exhausted_model_quota_error(error: Exception) -> bool:
 
 class GeometryModelQuotaError(RuntimeError):
     """Geometry processing stopped because another candidate cannot help."""
+
+
+class GeometryBudgetExceeded(RuntimeError):
+    """Required geometry stopped before dispatch because policy budget ended."""
 
 
 def _ground_tracking_seed(
@@ -7281,8 +7285,18 @@ def _build_framing_region_tracks(
                 exclusions=exclusions,
             )
 
-        for chunk_index in range(0, len(tracked_regions), 4):
-            region_chunk = tracked_regions[chunk_index : chunk_index + 4]
+        # Required evidence always occupies the first available batch slots.
+        # Preferred context may share those already-paid calls, but a trailing
+        # preferred-only batch must never consume the interaction reserved for
+        # final QA or turn otherwise complete hard evidence into a blocked run.
+        grounding_regions = sorted(
+            tracked_regions,
+            key=lambda region: region.role != "required",
+        )
+        grounded_regions: list[FramingRegionIntent] = []
+        omitted_preferred_regions: list[FramingRegionIntent] = []
+        for chunk_index in range(0, len(grounding_regions), 4):
+            region_chunk = grounding_regions[chunk_index : chunk_index + 4]
             requests = [
                 request_by_region[region.region_id]
                 for region in region_chunk
@@ -7321,14 +7335,24 @@ def _build_framing_region_tracks(
                         + model_request_block_reason
                     )
                 write_json(group_dir / "request-key.json", group_key)
-                group = client.ground_multi_target_exact_frame(
-                    source_asset_id=media.asset_id,
-                    source_frame_id=frame.frame_id,
-                    grounding_anchor_id=f"grounding-anchor:{feature_id}",
-                    frame_path=Path(exact_frame.path),
-                    targets=requests,
-                    output_dir=group_dir,
-                )
+                try:
+                    group = client.ground_multi_target_exact_frame(
+                        source_asset_id=media.asset_id,
+                        source_frame_id=frame.frame_id,
+                        grounding_anchor_id=f"grounding-anchor:{feature_id}",
+                        frame_path=Path(exact_frame.path),
+                        targets=requests,
+                        output_dir=group_dir,
+                    )
+                except BudgetExceeded:
+                    if any(
+                        region.role == "required"
+                        for region in region_chunk
+                    ):
+                        raise
+                    omitted_preferred_regions.extend(region_chunk)
+                    continue
+            grounded_regions.extend(region_chunk)
             interaction_path = (
                 group_dir / "multi_target_grounding.raw_interaction.json"
             )
@@ -7431,6 +7455,27 @@ def _build_framing_region_tracks(
                     seed_frame_pts=exact_frame.frame_pts,
                 )
             )
+        if omitted_preferred_regions:
+            write_json(
+                batch_root / "preferred-grounding-degradation.json",
+                {
+                    "contract_version": (
+                        "preferred-grounding-degradation-v1"
+                    ),
+                    "feature_id": feature_id,
+                    "reason": (
+                        "preferred_only_grounding_batch_omitted_to_preserve_"
+                        "final_qa_budget"
+                    ),
+                    "hard_evidence_affected": False,
+                    "omitted_region_ids": [
+                        region.region_id
+                        for region in omitted_preferred_regions
+                    ],
+                    "generated_at": utc_now(),
+                },
+            )
+        tracked_regions = grounded_regions
 
     request_key = {
         "contract_version": "feature-cut-shared-framing-regions-v2",
@@ -13496,6 +13541,11 @@ def _run_feature_cut_experiment_impl(
         return True
 
     def abort_for_geometry_quota(error: Exception) -> None:
+        if isinstance(error, BudgetExceeded):
+            raise GeometryBudgetExceeded(
+                "required Gemini geometry was blocked before dispatch by the "
+                "bounded run budget; no candidate retry was attempted"
+            ) from error
         if not latch_geometry_quota_error(error):
             return
         raise GeometryModelQuotaError(
