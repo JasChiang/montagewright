@@ -10533,33 +10533,38 @@ def _bind_regions_to_editorial_relation(
     regions: Sequence[FramingRegionIntent],
     contracts: Sequence[EditorialBeatContract],
 ) -> list[FramingRegionIntent]:
-    """Keep planner context soft when a hard beat is explicitly single-subject."""
+    """Do not promote more hard crop anchors than the evidence contract names."""
 
-    if not any(
-        contract.priority == "hard"
-        and contract.relation_mode == "single_subject"
+    hard_target_ids = {
+        target_id
         for contract in contracts
-    ):
+        if contract.priority == "hard"
+        for target_id in contract.required_target_ids
+    }
+    if not hard_target_ids:
         return list(regions)
     required_indexes = [
         index
         for index, region in enumerate(regions)
         if region.role == "required"
     ]
-    if len(required_indexes) <= 1:
+    hard_anchor_limit = len(hard_target_ids)
+    if len(required_indexes) <= hard_anchor_limit:
         return list(regions)
-    anchor_index = min(
-        required_indexes,
-        key=lambda index: (
-            not regions[index].atomic,
-            regions[index].kind
-            not in {"text_region", "ui_region", "graphic"},
-            index,
-        ),
+    anchor_indexes = set(
+        sorted(
+            required_indexes,
+            key=lambda index: (
+                not regions[index].atomic,
+                regions[index].kind
+                not in {"text_region", "ui_region", "graphic"},
+                index,
+            ),
+        )[:hard_anchor_limit]
     )
     bound: list[FramingRegionIntent] = []
     for index, region in enumerate(regions):
-        if index == anchor_index or region.role != "required":
+        if index in anchor_indexes or region.role != "required":
             bound.append(region)
             continue
         bound.append(

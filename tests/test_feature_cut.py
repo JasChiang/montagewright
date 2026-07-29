@@ -4512,7 +4512,7 @@ def test_shared_sam_cache_revalidates_hashed_track_and_frame_lineage(
     )
 
 
-def test_hard_single_subject_keeps_extra_planner_context_soft() -> None:
+def test_hard_target_cardinality_keeps_extra_planner_context_soft() -> None:
     regions = [
         FramingRegionIntent(
             region_id="watch",
@@ -4544,7 +4544,7 @@ def test_hard_single_subject_keeps_extra_planner_context_soft() -> None:
             "preferred_frames": 36,
             "maximum_frames": 72,
         },
-        relation_mode="single_subject",
+        relation_mode="context_detail",
         allowed_reconstruction=("continuous", "solid_fit"),
     )
 
