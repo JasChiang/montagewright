@@ -27,6 +27,170 @@ PresentationMode = Literal[
 ]
 
 
+class ConstraintResult(FrozenStrictModel):
+    """Typed, evidence-carrying result shared by every editing capability."""
+
+    constraint_id: str = Field(
+        min_length=1,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    level: Literal["hard", "preference"]
+    status: Literal["pass", "fail", "unknown"]
+    evidence_refs: tuple[str, ...] = ()
+    measured_value: float | int | bool | str | None = None
+    threshold: float | int | bool | str | None = None
+    reason_code: str = Field(min_length=1)
+
+
+class OptionMetrics(FrozenStrictModel):
+    semantic_fit: float = Field(default=0.5, ge=0.0, le=1.0)
+    readability: float = Field(default=0.5, ge=0.0, le=1.0)
+    technical_quality: float = Field(default=0.5, ge=0.0, le=1.0)
+    music_flow: float = Field(default=0.5, ge=0.0, le=1.0)
+    synthetic_motion_distance: float = Field(default=0.0, ge=0.0)
+    intrusion_rank: int = Field(default=0, ge=0, le=10)
+    local_cost_rank: int = Field(default=0, ge=0, le=10)
+
+
+class ExecutableOptionV2(FrozenStrictModel):
+    """Capability-neutral option. Payload stays in the owning executor."""
+
+    option_id: str = Field(min_length=1)
+    capability_id: str = Field(
+        min_length=1,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dependency_hashes: tuple[str, ...] = ()
+    constraints: tuple[ConstraintResult, ...] = Field(min_length=1)
+    metrics: OptionMetrics = OptionMetrics()
+    decision_codes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_constraints(self) -> "ExecutableOptionV2":
+        ids = [item.constraint_id for item in self.constraints]
+        if len(ids) != len(set(ids)):
+            raise ValueError("option constraint IDs must be unique")
+        return self
+
+    @property
+    def hard_failure_codes(self) -> tuple[str, ...]:
+        # Unknown hard facts fail closed. A preference may remain unknown and
+        # merely lower confidence; it can never authorize delivery.
+        return tuple(
+            result.reason_code
+            for result in self.constraints
+            if result.level == "hard" and result.status != "pass"
+        )
+
+
+class ExecutableOptionSelectionV2(FrozenStrictModel):
+    contract_version: Literal["executable-option-selection-v2"] = (
+        "executable-option-selection-v2"
+    )
+    selected_option_id: str | None
+    generated_option_ids: tuple[str, ...]
+    generated_capabilities: Mapping[str, str] = Field(default_factory=dict)
+    rejected_options: Mapping[str, tuple[str, ...]]
+    score: float | None
+    runner_up_option_ids: tuple[str, ...] = ()
+    score_gap: float | None = None
+    semantic_negotiation_recommended: bool = False
+    semantic_ambiguity_codes: tuple[str, ...] = ()
+    decision_codes: tuple[str, ...]
+
+
+def select_executable_option(
+    options: Sequence[ExecutableOptionV2],
+    *,
+    preferred_capability_ids: Sequence[str] = (),
+) -> ExecutableOptionSelectionV2:
+    """Select one legal operation without content-specific fallback branches."""
+
+    generated = tuple(option.option_id for option in options)
+    if len(generated) != len(set(generated)):
+        raise ValueError("executable option IDs must be unique")
+    rejected = {
+        option.option_id: option.hard_failure_codes
+        for option in options
+        if option.hard_failure_codes
+    }
+    generated_capabilities = {
+        option.option_id: option.capability_id for option in options
+    }
+    legal = [option for option in options if not option.hard_failure_codes]
+    if not legal:
+        return ExecutableOptionSelectionV2(
+            selected_option_id=None,
+            generated_option_ids=generated,
+            generated_capabilities=generated_capabilities,
+            rejected_options=rejected,
+            score=None,
+            decision_codes=("no_hard_constraint_safe_option",),
+        )
+    preference_rank = {
+        capability_id: index
+        for index, capability_id in enumerate(preferred_capability_ids)
+    }
+
+    def rank(option: ExecutableOptionV2) -> tuple[float, float, str]:
+        metrics = option.metrics
+        preference_bonus = 0.0
+        if option.capability_id in preference_rank:
+            preference_bonus = max(
+                0.02,
+                0.12 - preference_rank[option.capability_id] * 0.02,
+            )
+        score = (
+            metrics.semantic_fit * 0.34
+            + metrics.readability * 0.28
+            + metrics.technical_quality * 0.22
+            + metrics.music_flow * 0.10
+            - metrics.synthetic_motion_distance * 0.04
+            - metrics.intrusion_rank * 0.012
+            - metrics.local_cost_rank * 0.006
+            + preference_bonus
+        )
+        # Prefer less intrusive and cheaper options on a semantic tie.
+        tie_break = -(metrics.intrusion_rank + metrics.local_cost_rank * 0.1)
+        return score, tie_break, option.option_id
+
+    ranked = sorted(legal, key=rank, reverse=True)
+    selected = ranked[0]
+    selected_score = rank(selected)[0]
+    runners = tuple(option.option_id for option in ranked[1:3])
+    score_gap = (
+        selected_score - rank(ranked[1])[0]
+        if len(ranked) >= 2
+        else None
+    )
+    semantically_ambiguous = bool(
+        len(ranked) >= 2
+        and score_gap is not None
+        and score_gap <= 0.04
+        and selected.capability_id != ranked[1].capability_id
+    )
+    return ExecutableOptionSelectionV2(
+        selected_option_id=selected.option_id,
+        generated_option_ids=generated,
+        generated_capabilities=generated_capabilities,
+        rejected_options=rejected,
+        score=round(selected_score, 6),
+        runner_up_option_ids=runners,
+        score_gap=round(score_gap, 6) if score_gap is not None else None,
+        semantic_negotiation_recommended=semantically_ambiguous,
+        semantic_ambiguity_codes=(
+            ("different_capabilities_have_near_equal_local_scores",)
+            if semantically_ambiguous
+            else ()
+        ),
+        decision_codes=(
+            "hard_constraints_passed",
+            "lexicographic_preference_selected",
+        ),
+    )
+
+
 class SequenceOption(FrozenStrictModel):
     """One executable candidate/trim/cue/presentation choice for a beat."""
 
@@ -146,6 +310,7 @@ class SequenceOptimizationResult(FrozenStrictModel):
 class _BeamState(FrozenStrictModel):
     selections: tuple[SequenceSelection, ...] = ()
     duration_ms: int = Field(default=0, ge=0)
+    panel_duration_ms: int = Field(default=0, ge=0)
     score: float = 0.0
     source_intervals: tuple[tuple[str, int, int], ...] = ()
 
@@ -214,9 +379,18 @@ def optimize_sequence(
             reverse=True,
         )[:beam_width]
 
-    acceptable = [
+    panel_safe_states = [
         state
         for state in states
+        if state.duration_ms == 0
+        or (
+            state.panel_duration_ms / state.duration_ms
+            <= policy.presentation.max_panel_runtime_fraction + 1e-9
+        )
+    ]
+    acceptable = [
+        state
+        for state in panel_safe_states
         if policy.duration.min_ms
         <= state.duration_ms
         <= policy.duration.max_ms
@@ -227,17 +401,27 @@ def optimize_sequence(
         outcome = "complete"
     elif (
         policy.execution_profile == "autonomous_best_effort"
-        and states
-        and max(state.duration_ms for state in states) < policy.duration.min_ms
+        and panel_safe_states
+        and max(
+            state.duration_ms for state in panel_safe_states
+        ) < policy.duration.min_ms
     ):
-        best = max(states, key=lambda state: _final_rank(state, policy))
+        best = max(
+            panel_safe_states,
+            key=lambda state: _final_rank(state, policy),
+        )
         outcome = "best_effort_shortened"
     else:
         closest = max(states, key=lambda state: _final_rank(state, policy))
+        failure = (
+            "panel_runtime_fraction_exceeded"
+            if states and not panel_safe_states
+            else "duration_outside_policy_bounds"
+        )
         return _blocked_result(
             policy=policy,
             selections=closest.selections,
-            hard_failures=("duration_outside_policy_bounds",),
+            hard_failures=(failure,),
         )
 
     omitted = tuple(
@@ -273,6 +457,7 @@ def _extend_state(
                 ),
             ),
             duration_ms=state.duration_ms,
+            panel_duration_ms=state.panel_duration_ms,
             score=state.score - 0.04,
             source_intervals=state.source_intervals,
         )
@@ -317,6 +502,14 @@ def _extend_state(
             ),
         ),
         duration_ms=state.duration_ms + option.duration_ms,
+        panel_duration_ms=(
+            state.panel_duration_ms
+            + (
+                option.duration_ms
+                if option.presentation_mode == "two_panel_layout"
+                else 0
+            )
+        ),
         score=state.score + preference,
         source_intervals=state.source_intervals + (interval,),
     )

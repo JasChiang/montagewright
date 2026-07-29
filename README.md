@@ -9,6 +9,37 @@
 - `autonomous_strict`：所有 hard evidence、exact cue、geometry、technical QA 與有聲 final QA 都通過，才由 `AUTO_POLICY` 產生 `DecisionAuthorityV2` 與 `delivery_eligible`。
 - `autonomous_best_effort`：只允許 policy 預先授權的 optional omission、preferred substitution、Top-K 換帶、two-panel 或 solid matte fit；hard evidence 仍不得省略。所有替代寫入 policy-bound degradation manifest。
 
+## Generalized edit compiler
+
+Autonomous presentation is no longer implemented as a growing product- or
+subject-specific fallback tree. The production path now projects the legacy
+feature plan into an aspect-neutral `semantic-edit-ir-v1`, measures local
+`presentation-scene-facts-v1`, asks every policy-authorized capability to
+enumerate immutable options, rejects failed or unknown hard constraints, and
+then selects with the shared lexicographic optimizer. Every render manifest
+retains generated, rejected, and selected option IDs plus their evidence
+hashes.
+
+`editing-capability-registry-v2` is the runtime counterpart of the planner
+catalog. A capability declares semantic affordances, required artifacts,
+preconditions, guarantees, verifiers, local cost, intrusion rank, executor ID,
+and zero paid-call ownership. Adding a new edit operation therefore adds one
+executor contract; it does not add another content-case branch.
+
+Gemini function calling is an optional semantic negotiation bridge, not an NLE
+remote control. The application exposes only policy-authorized read-only
+inspection functions and the non-committing `propose_edit_decision` function.
+Execution is manual, budget-reserved, limited to one global negotiation and at
+most two tool-result rounds, and accepts only immutable local option IDs.
+Gemini cannot send timestamps, boxes, FFmpeg expressions, render commands, or
+delivery approvals. Clear local decisions add no Gemini call.
+
+Future dialogue-led editing will add transcript and speaker-turn evidence
+providers to the same IR and registry. It is intentionally not part of this
+branch. The planned source of word-level local timing is Apple
+SpeechTranscriber, followed by a bounded Gemini correction pass that may
+correct recognized text but may not rewrite the local timing lineage.
+
 Gemini 只負責語意計畫、既有 frame ID 的事件選擇、exact-frame multi-target grounding 與成片觀察；它不能授予 approval、輸出任意 final timestamp/bbox，或自行形成 repair loop。本機最多允許一次 scoped semantic replan、兩次 full final QA，並在每次付費 final QA 前由 `BudgetLedger` 先 reserve 成本與 interaction。
 
 Autonomous 9:16 final QA 必須取得有聲成片、brief，以及下列自動產生、不可變的 JSON：

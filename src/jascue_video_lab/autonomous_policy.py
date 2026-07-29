@@ -97,6 +97,10 @@ class GeminiOperationLimits(FrozenStrictModel):
         max_output_tokens=4_096,
         thinking_level="low",
     )
+    semantic_negotiation: GeminiOperationLimit = GeminiOperationLimit(
+        max_output_tokens=2_048,
+        thinking_level="low",
+    )
     text_only_schema_repair: GeminiOperationLimit = GeminiOperationLimit(
         max_output_tokens=4_096,
         thinking_level="minimal",
@@ -156,6 +160,46 @@ class RecoveryPolicy(FrozenStrictModel):
     allow_deterministic_delivery_when_semantic_qa_unavailable: bool = False
 
 
+class SemanticNegotiationPolicy(FrozenStrictModel):
+    """Bound Gemini tool use without turning planning into an agent loop."""
+
+    enabled: bool = True
+    max_global_negotiations: Literal[0, 1] = 1
+    max_repair_negotiations: Literal[0, 1] = 1
+    max_tool_result_rounds: int = Field(default=2, ge=1, le=2)
+    max_parallel_read_only_calls: int = Field(default=3, ge=1, le=3)
+    max_preview_options: int = Field(default=3, ge=2, le=3)
+    automatic_function_calling: Literal[False] = False
+    allowed_tools: tuple[
+        Literal[
+            "inspect_edit_evidence",
+            "request_temporal_evidence",
+            "get_music_structure",
+            "enumerate_presentation_options",
+            "preview_presentation_options",
+            "propose_edit_decision",
+        ],
+        ...,
+    ] = (
+        "inspect_edit_evidence",
+        "request_temporal_evidence",
+        "get_music_structure",
+        "enumerate_presentation_options",
+        "preview_presentation_options",
+        "propose_edit_decision",
+    )
+
+    @model_validator(mode="after")
+    def validate_tools(self) -> "SemanticNegotiationPolicy":
+        if len(set(self.allowed_tools)) != len(self.allowed_tools):
+            raise ValueError("semantic negotiation tools must be unique")
+        if self.enabled and "propose_edit_decision" not in self.allowed_tools:
+            raise ValueError(
+                "enabled semantic negotiation requires propose_edit_decision"
+            )
+        return self
+
+
 class WorkerPolicy(FrozenStrictModel):
     ffmpeg_workers: int = Field(default=2, ge=1, le=8)
     proxy_workers: int = Field(default=2, ge=1, le=8)
@@ -179,6 +223,9 @@ class AutonomousEditPolicy(FrozenStrictModel):
     editorial: EditorialPolicy = EditorialPolicy()
     sync: SyncPolicy = SyncPolicy()
     recovery: RecoveryPolicy = RecoveryPolicy()
+    semantic_negotiation: SemanticNegotiationPolicy = (
+        SemanticNegotiationPolicy()
+    )
     workers: WorkerPolicy = WorkerPolicy()
 
     @model_validator(mode="after")

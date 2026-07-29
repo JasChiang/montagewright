@@ -14,10 +14,18 @@ from typing import Any, Literal, Mapping, Sequence
 from pydantic import Field, model_validator
 
 from .autonomous_policy import AutonomousEditPolicy
+from .editing_capabilities import autonomous_capability_registry_v2
 from .event_lock import ExactEventLockV2
 from .models import (
     FrozenStrictModel,
     SharedSam21BBoxSeed,
+)
+from .sequence_optimizer import (
+    ConstraintResult,
+    ExecutableOptionV2,
+    ExecutableOptionSelectionV2,
+    OptionMetrics,
+    select_executable_option,
 )
 
 
@@ -190,12 +198,89 @@ class IntentionalFreezeSpec(FrozenStrictModel):
     motivation: Literal["brief_authorized_phrase_ending"]
 
 
+class SceneFacts(FrozenStrictModel):
+    """Continuous local measurements; never a product/person case label."""
+
+    contract_version: Literal["presentation-scene-facts-v1"] = (
+        "presentation-scene-facts-v1"
+    )
+    source_width: int = Field(gt=0)
+    source_height: int = Field(gt=0)
+    target_ids: tuple[str, ...] = Field(min_length=1)
+    target_center_x: tuple[float, ...] = Field(min_length=1)
+    target_width_fractions: tuple[float, ...] = Field(min_length=1)
+    normalized_distance_matrix: tuple[tuple[float, ...], ...]
+    shared_static_crop_feasible: bool
+    source_camera_motion: SourceCameraMotionEstimate
+    source_camera_motion_measured: bool = False
+    target_readability_by_canvas: Mapping[str, float]
+    same_source_same_pts: bool
+    physical_scale_evidence_available: bool
+
+    @model_validator(mode="after")
+    def validate_facts(self) -> "SceneFacts":
+        count = len(self.target_ids)
+        if len(set(self.target_ids)) != count:
+            raise ValueError("scene fact target IDs must be unique")
+        if len(self.target_center_x) != count:
+            raise ValueError("scene fact target centers are incomplete")
+        if len(self.target_width_fractions) != count:
+            raise ValueError("scene fact target widths are incomplete")
+        if len(self.normalized_distance_matrix) != count or any(
+            len(row) != count for row in self.normalized_distance_matrix
+        ):
+            raise ValueError("scene fact distance matrix dimensions are invalid")
+        return self
+
+    @property
+    def definition_sha256(self) -> str:
+        return _canonical_payload_sha(self.model_dump(mode="json"))
+
+
+class PresentationOption(FrozenStrictModel):
+    option: ExecutableOptionV2
+    mode: Literal[
+        "static_full_bleed_crop",
+        "tracked_full_bleed_crop",
+        "phase_virtual_camera",
+        "hard_cut_between_views",
+        "two_panel_layout",
+        "solid_matte_fit",
+    ]
+    static_crop_box_2d: NormalizedBox | None = None
+    panel_layout: PanelLayoutSpec | None = None
+    filter_graph: str | None = None
+    camera_motion: CameraMotionDecision | None = None
+
+
+class PresentationOptionSet(FrozenStrictModel):
+    contract_version: Literal["presentation-option-set-v2"] = (
+        "presentation-option-set-v2"
+    )
+    scene_facts: SceneFacts
+    options: tuple[PresentationOption, ...] = Field(min_length=1)
+    paid_model_calls_added: Literal[0] = 0
+
+    @model_validator(mode="after")
+    def validate_options(self) -> "PresentationOptionSet":
+        ids = [item.option.option_id for item in self.options]
+        if len(ids) != len(set(ids)):
+            raise ValueError("presentation option IDs must be unique")
+        return self
+
+
 class PresentationCompilation(FrozenStrictModel):
-    contract_version: Literal["presentation-compilation-v1"] = (
-        "presentation-compilation-v1"
+    contract_version: Literal[
+        "presentation-compilation-v1",
+        "presentation-compilation-v2",
+    ] = (
+        "presentation-compilation-v2"
     )
     mode: Literal[
         "static_full_bleed_crop",
+        "tracked_full_bleed_crop",
+        "phase_virtual_camera",
+        "hard_cut_between_views",
         "two_panel_layout",
         "solid_matte_fit",
         "blocked",
@@ -203,6 +288,9 @@ class PresentationCompilation(FrozenStrictModel):
     static_crop_box_2d: NormalizedBox | None = None
     panel_layout: PanelLayoutSpec | None = None
     filter_graph: str | None = None
+    camera_motion: CameraMotionDecision | None = None
+    scene_facts: SceneFacts | None = None
+    selection: ExecutableOptionSelectionV2 | None = None
     decision_codes: tuple[str, ...]
     paid_model_calls_added: Literal[0] = 0
 
@@ -251,14 +339,101 @@ def compile_presentation(
     physical_scale_comparison: bool = False,
     allow_conceptual_different_source: bool = False,
     allow_static_full_bleed: bool = True,
+    tracking_available: bool = True,
+    required_x_values: Sequence[float] = (),
+    source_camera_x_values: Sequence[float] = (),
+    movement_motivated: bool = False,
+    preferred_capability_ids: Sequence[str] = (),
 ) -> PresentationCompilation:
-    """Enumerate static/layout/fit candidates and select locally."""
+    """Compatibility wrapper over the v2 option generator and optimizer."""
 
     if not targets:
         return PresentationCompilation(
             mode="blocked",
             decision_codes=("no_required_targets",),
         )
+    option_set = generate_presentation_options(
+        targets=targets,
+        source_width=source_width,
+        source_height=source_height,
+        relation_mode=relation_mode,
+        policy=policy,
+        physical_scale_comparison=physical_scale_comparison,
+        allow_conceptual_different_source=allow_conceptual_different_source,
+        allow_static_full_bleed=allow_static_full_bleed,
+        tracking_available=tracking_available,
+        required_x_values=required_x_values,
+        source_camera_x_values=source_camera_x_values,
+        movement_motivated=movement_motivated,
+    )
+    selection = select_executable_option(
+        [item.option for item in option_set.options],
+        preferred_capability_ids=preferred_capability_ids,
+    )
+    selected = next(
+        (
+            item
+            for item in option_set.options
+            if item.option.option_id == selection.selected_option_id
+        ),
+        None,
+    )
+    if selected is None:
+        return PresentationCompilation(
+            mode="blocked",
+            scene_facts=option_set.scene_facts,
+            selection=selection,
+            decision_codes=selection.decision_codes,
+        )
+    return PresentationCompilation(
+        mode=selected.mode,
+        static_crop_box_2d=selected.static_crop_box_2d,
+        panel_layout=selected.panel_layout,
+        filter_graph=selected.filter_graph,
+        camera_motion=selected.camera_motion,
+        scene_facts=option_set.scene_facts,
+        selection=selection,
+        decision_codes=(
+            *selected.option.decision_codes,
+            *selection.decision_codes,
+        ),
+    )
+
+
+def generate_presentation_options(
+    *,
+    targets: Sequence[PresentationTarget],
+    source_width: int,
+    source_height: int,
+    relation_mode: Literal[
+        "single_subject",
+        "sequential_focus",
+        "simultaneous_relation",
+        "context_detail",
+    ],
+    policy: AutonomousEditPolicy,
+    physical_scale_comparison: bool = False,
+    allow_conceptual_different_source: bool = False,
+    allow_static_full_bleed: bool = True,
+    tracking_available: bool = True,
+    required_x_values: Sequence[float] = (),
+    source_camera_x_values: Sequence[float] = (),
+    movement_motivated: bool = False,
+) -> PresentationOptionSet:
+    """Enumerate all locally feasible operations before selecting one.
+
+    This function has no content-category branches. It consumes target
+    topology, relation intent, continuous motion facts and policy gates.
+    """
+
+    if not targets:
+        raise ValueError("presentation option generation requires targets")
+    registry = autonomous_capability_registry_v2(
+        allow_two_panel_layout=policy.presentation.allow_two_panel_layout,
+        allow_solid_matte_fit=policy.presentation.allow_solid_matte_fit,
+        allow_intentional_freeze=policy.presentation.allow_intentional_freeze,
+    )
+    capability_specs = registry.by_id()
     shared_crop = (
         _largest_shared_vertical_crop(
             targets,
@@ -268,12 +443,182 @@ def compile_presentation(
         if allow_static_full_bleed
         else None
     )
+    source_motion = estimate_source_camera_motion(
+        source_camera_x_values
+        or tuple(0.5 for _ in targets)
+    )
+    scene_facts = _build_scene_facts(
+        targets=targets,
+        source_width=source_width,
+        source_height=source_height,
+        shared_crop=shared_crop,
+        source_motion=source_motion,
+        source_camera_motion_measured=bool(source_camera_x_values),
+    )
+    options: list[PresentationOption] = []
+
     if shared_crop is not None:
-        return PresentationCompilation(
-            mode="static_full_bleed_crop",
-            static_crop_box_2d=shared_crop,
-            decision_codes=("required_targets_fit_static_full_bleed",),
+        options.append(
+            _presentation_option(
+                capability_id="static_full_bleed_crop",
+                mode="static_full_bleed_crop",
+                scene_facts=scene_facts,
+                payload={
+                    "static_crop_box_2d": shared_crop,
+                },
+                constraints=(
+                    _constraint(
+                        "shared_static_crop",
+                        passed=True,
+                        reason_code="required_targets_fit_static_full_bleed",
+                        evidence_refs=(scene_facts.definition_sha256,),
+                    ),
+                ),
+                semantic_fit=(
+                    0.96
+                    if relation_mode != "sequential_focus"
+                    else 0.78
+                ),
+                readability=1.0,
+                technical_quality=1.0,
+                intrusion_rank=capability_specs[
+                    "static_full_bleed_crop"
+                ].intrusion_rank,
+                decision_codes=(
+                    "required_targets_fit_static_full_bleed",
+                    "stable_hold_selected",
+                ),
+                static_crop_box_2d=shared_crop,
+            )
         )
+
+    if tracking_available:
+        tracked_constraint = (
+            _constraint(
+                "tracking_available",
+                passed=True,
+                reason_code="target_tracks_available",
+                evidence_refs=(scene_facts.definition_sha256,),
+            ),
+            _constraint(
+                "required_relation",
+                passed=(
+                    relation_mode
+                    not in {"simultaneous_relation", "context_detail"}
+                    or shared_crop is not None
+                ),
+                reason_code=(
+                    "required_relation_preserved"
+                    if (
+                        relation_mode
+                        not in {"simultaneous_relation", "context_detail"}
+                        or shared_crop is not None
+                    )
+                    else "tracked_single_view_cannot_preserve_relation"
+                ),
+                evidence_refs=(scene_facts.definition_sha256,),
+            ),
+        )
+        options.append(
+            _presentation_option(
+                capability_id="tracked_full_bleed_crop",
+                mode="tracked_full_bleed_crop",
+                scene_facts=scene_facts,
+                payload={"tracking_required": True},
+                constraints=tracked_constraint,
+                semantic_fit=(
+                    0.90 if relation_mode == "single_subject" else 0.72
+                ),
+                readability=0.92,
+                technical_quality=0.90,
+                intrusion_rank=capability_specs[
+                    "tracked_full_bleed_crop"
+                ].intrusion_rank,
+                local_cost_rank=2,
+                decision_codes=("tracked_full_bleed_candidate_generated",),
+            )
+        )
+
+    motion_positions = tuple(required_x_values)
+    if (
+        tracking_available
+        and relation_mode == "sequential_focus"
+        and len(motion_positions) >= 2
+    ):
+        camera_motion = compile_minimal_camera_motion(
+            motion_positions,
+            source_camera_x_values=source_camera_x_values,
+            movement_motivated=movement_motivated,
+        )
+        motion_mode = (
+            "hard_cut_between_views"
+            if camera_motion.mode == "hard_cut"
+            else "phase_virtual_camera"
+            if camera_motion.mode == "minimal_monotonic_move"
+            else None
+        )
+        if motion_mode is not None:
+            motion_spec = capability_specs[motion_mode]
+            options.append(
+                _presentation_option(
+                    capability_id=motion_mode,
+                    mode=motion_mode,
+                    scene_facts=scene_facts,
+                    payload={
+                        "camera_motion": camera_motion.model_dump(mode="json"),
+                    },
+                    constraints=(
+                        _constraint(
+                            "motion_motivated",
+                            passed=movement_motivated,
+                            reason_code=(
+                                "semantic_attention_transfer"
+                                if movement_motivated
+                                else "unmotivated_synthetic_motion"
+                            ),
+                            evidence_refs=(scene_facts.definition_sha256,),
+                        ),
+                        (
+                            _constraint(
+                                "source_motion_compatible",
+                                passed=(
+                                    camera_motion.source_motion.direction
+                                    == "static"
+                                ),
+                                reason_code=(
+                                    "source_camera_static"
+                                    if camera_motion.source_motion.direction
+                                    == "static"
+                                    else "source_motion_would_be_counteracted"
+                                ),
+                                evidence_refs=(scene_facts.definition_sha256,),
+                            )
+                            if scene_facts.source_camera_motion_measured
+                            else _preference_constraint(
+                                "source_motion_measurement",
+                                status="unknown",
+                                reason_code="source_camera_motion_not_measured",
+                                evidence_refs=(scene_facts.definition_sha256,),
+                            )
+                        ),
+                    ),
+                    semantic_fit=0.98,
+                    readability=0.94,
+                    technical_quality=0.88,
+                    synthetic_motion_distance=(
+                        max(camera_motion.normalized_x_values)
+                        - min(camera_motion.normalized_x_values)
+                    ),
+                    intrusion_rank=motion_spec.intrusion_rank,
+                    local_cost_rank=2,
+                    decision_codes=(
+                        "semantic_attention_order_preserved",
+                        "minimal_camera_motion_compiled",
+                    ),
+                    camera_motion=camera_motion,
+                )
+            )
+
     if (
         relation_mode in {"simultaneous_relation", "context_detail"}
         and len(targets) == 2
@@ -292,27 +637,264 @@ def compile_presentation(
             allowed_modes=policy.presentation.allowed_panel_modes,
         )
         if panel is not None:
-            return PresentationCompilation(
-                mode="two_panel_layout",
-                panel_layout=panel,
-                decision_codes=(
-                    "shared_full_bleed_infeasible",
-                    "two_panel_geometry_passed",
-                ),
+            options.append(
+                _presentation_option(
+                    capability_id="two_panel_layout",
+                    mode="two_panel_layout",
+                    scene_facts=scene_facts,
+                    payload=panel.model_dump(mode="json"),
+                    constraints=(
+                        _constraint(
+                            "two_panel_count",
+                            passed=True,
+                            reason_code="exactly_two_panels",
+                        ),
+                        _constraint(
+                            "same_pts_or_conceptual",
+                            passed=(
+                                panel.temporal_relation
+                                in {
+                                    "same_source_same_pts",
+                                    "different_source_conceptual",
+                                }
+                            ),
+                            reason_code="panel_temporal_relation_bound",
+                            evidence_refs=(scene_facts.definition_sha256,),
+                        ),
+                        _constraint(
+                            "relative_scale",
+                            passed=(
+                                not physical_scale_comparison
+                                or panel.relative_scale_policy == "locked"
+                            ),
+                            reason_code=(
+                                "relative_scale_locked"
+                                if physical_scale_comparison
+                                else "physical_scale_not_claimed"
+                            ),
+                            evidence_refs=(scene_facts.definition_sha256,),
+                        ),
+                    ),
+                    semantic_fit=(
+                        0.94 if shared_crop is None else 0.68
+                    ),
+                    readability=max(0.5, panel.local_layout_score),
+                    technical_quality=0.88,
+                    intrusion_rank=capability_specs[
+                        "two_panel_layout"
+                    ].intrusion_rank,
+                    local_cost_rank=2,
+                    decision_codes=(
+                        "two_panel_geometry_passed",
+                        "panel_does_not_add_model_calls",
+                    ),
+                    panel_layout=panel,
+                )
             )
+
     if policy.presentation.allow_solid_matte_fit:
-        return PresentationCompilation(
-            mode="solid_matte_fit",
-            filter_graph=_vertical_fit_filter(),
-            decision_codes=(
-                "shared_full_bleed_infeasible",
-                "solid_matte_fit_policy_authorized",
-            ),
+        options.append(
+            _presentation_option(
+                capability_id="solid_matte_fit",
+                mode="solid_matte_fit",
+                scene_facts=scene_facts,
+                payload={"filter_graph": _vertical_fit_filter()},
+                constraints=(
+                    _constraint(
+                        "policy_authorized",
+                        passed=True,
+                        reason_code="solid_matte_fit_policy_authorized",
+                    ),
+                ),
+                semantic_fit=0.58,
+                readability=0.72,
+                technical_quality=0.82,
+                intrusion_rank=capability_specs[
+                    "solid_matte_fit"
+                ].intrusion_rank,
+                decision_codes=(
+                    "whole_source_scope_preserved",
+                    "solid_matte_fit_policy_authorized",
+                ),
+                filter_graph=_vertical_fit_filter(),
+            )
         )
-    return PresentationCompilation(
-        mode="blocked",
-        decision_codes=("no_policy_authorized_presentation",),
+
+    if not options:
+        # Preserve an auditable option set even when policy rejects every
+        # operation. The selector will fail closed on its unknown hard fact.
+        options.append(
+            _presentation_option(
+                capability_id="static_full_bleed_crop",
+                mode="static_full_bleed_crop",
+                scene_facts=scene_facts,
+                payload={"unavailable": True},
+                constraints=(
+                    _constraint(
+                        "shared_static_crop",
+                        passed=None,
+                        reason_code="no_policy_authorized_presentation",
+                        evidence_refs=(scene_facts.definition_sha256,),
+                    ),
+                ),
+                semantic_fit=0.0,
+                readability=0.0,
+                technical_quality=0.0,
+                intrusion_rank=0,
+                decision_codes=("no_policy_authorized_presentation",),
+            )
+        )
+    return PresentationOptionSet(
+        scene_facts=scene_facts,
+        options=tuple(options),
     )
+
+
+def _build_scene_facts(
+    *,
+    targets: Sequence[PresentationTarget],
+    source_width: int,
+    source_height: int,
+    shared_crop: NormalizedBox | None,
+    source_motion: SourceCameraMotionEstimate,
+    source_camera_motion_measured: bool,
+) -> SceneFacts:
+    centers = tuple(
+        ((target.box_2d[0] + target.box_2d[2]) / 2) / 1000
+        for target in targets
+    )
+    widths = tuple(
+        (target.box_2d[2] - target.box_2d[0]) / 1000
+        for target in targets
+    )
+    distances = tuple(
+        tuple(abs(first - second) for second in centers)
+        for first in centers
+    )
+    same_source_same_pts = len(
+        {(target.source_asset_id, target.source_pts) for target in targets}
+    ) == 1
+    # This is a geometry proxy, not a semantic claim. Exact text/UI
+    # readability remains a separate evidence provider.
+    portrait_readability = min(1.0, max(0.0, min(widths) * 4.0))
+    return SceneFacts(
+        source_width=source_width,
+        source_height=source_height,
+        target_ids=tuple(target.target_id for target in targets),
+        target_center_x=centers,
+        target_width_fractions=widths,
+        normalized_distance_matrix=distances,
+        shared_static_crop_feasible=shared_crop is not None,
+        source_camera_motion=source_motion,
+        source_camera_motion_measured=source_camera_motion_measured,
+        target_readability_by_canvas={"9:16": round(portrait_readability, 6)},
+        same_source_same_pts=same_source_same_pts,
+        physical_scale_evidence_available=same_source_same_pts,
+    )
+
+
+def _constraint(
+    constraint_id: str,
+    *,
+    passed: bool | None,
+    reason_code: str,
+    evidence_refs: tuple[str, ...] = (),
+) -> ConstraintResult:
+    return ConstraintResult(
+        constraint_id=constraint_id,
+        level="hard",
+        status="pass" if passed is True else "fail" if passed is False else "unknown",
+        evidence_refs=evidence_refs,
+        measured_value=passed,
+        threshold=True,
+        reason_code=reason_code,
+    )
+
+
+def _preference_constraint(
+    constraint_id: str,
+    *,
+    status: Literal["pass", "fail", "unknown"],
+    reason_code: str,
+    evidence_refs: tuple[str, ...] = (),
+) -> ConstraintResult:
+    return ConstraintResult(
+        constraint_id=constraint_id,
+        level="preference",
+        status=status,
+        evidence_refs=evidence_refs,
+        reason_code=reason_code,
+    )
+
+
+def _presentation_option(
+    *,
+    capability_id: str,
+    mode: Literal[
+        "static_full_bleed_crop",
+        "tracked_full_bleed_crop",
+        "phase_virtual_camera",
+        "hard_cut_between_views",
+        "two_panel_layout",
+        "solid_matte_fit",
+    ],
+    scene_facts: SceneFacts,
+    payload: Mapping[str, Any],
+    constraints: tuple[ConstraintResult, ...],
+    semantic_fit: float,
+    readability: float,
+    technical_quality: float,
+    intrusion_rank: int,
+    decision_codes: tuple[str, ...],
+    local_cost_rank: int = 0,
+    synthetic_motion_distance: float = 0.0,
+    static_crop_box_2d: NormalizedBox | None = None,
+    panel_layout: PanelLayoutSpec | None = None,
+    filter_graph: str | None = None,
+    camera_motion: CameraMotionDecision | None = None,
+) -> PresentationOption:
+    payload_sha = _canonical_payload_sha(
+        {
+            "capability_id": capability_id,
+            "scene_facts_sha256": scene_facts.definition_sha256,
+            "payload": dict(payload),
+        }
+    )
+    option = ExecutableOptionV2(
+        option_id=f"{capability_id}:{payload_sha[:16]}",
+        capability_id=capability_id,
+        payload_sha256=payload_sha,
+        dependency_hashes=(scene_facts.definition_sha256,),
+        constraints=constraints,
+        metrics=OptionMetrics(
+            semantic_fit=semantic_fit,
+            readability=readability,
+            technical_quality=technical_quality,
+            music_flow=0.5,
+            synthetic_motion_distance=synthetic_motion_distance,
+            intrusion_rank=intrusion_rank,
+            local_cost_rank=local_cost_rank,
+        ),
+        decision_codes=decision_codes,
+    )
+    return PresentationOption(
+        option=option,
+        mode=mode,
+        static_crop_box_2d=static_crop_box_2d,
+        panel_layout=panel_layout,
+        filter_graph=filter_graph,
+        camera_motion=camera_motion,
+    )
+
+
+def _canonical_payload_sha(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def compile_minimal_camera_motion(

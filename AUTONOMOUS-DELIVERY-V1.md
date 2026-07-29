@@ -26,6 +26,7 @@ Gemini semantic observations
 | M3 | Extracted existing vertical fit/crop/reversal logic into `presentation.py`; added one-call multi-target grounding, shared SAM seeds, two-panel, promoted solid fit, exact-event freeze, and source-motion suppression. |
 | M4 | Evidence-first bounded beam search, duration reconciliation, continuity penalties, and content-addressed segment render cache. |
 | M5 | Audible `autonomous_final_9x16`, typed QA issues, deterministic gate report, local repair mapping, one-replan/two-QA caps, and final `AUTO_POLICY` authority. |
+| Generalized compiler | Added aspect-neutral `SemanticEditIR`, continuous `SceneFacts`, typed hard/preference constraint results, capability registry v2, enumerate-before-select presentation compilation, and a manually executed two-round Gemini function-calling negotiation bridge. |
 
 Legacy `review_preview` and `production_review` continue to normalize final QA to human review and never receive autonomous delivery authority.
 
@@ -38,13 +39,33 @@ Legacy `review_preview` and `production_review` continue to normalize final QA t
 - Two-panel orientation, rects, scale lock, gutter, and same-PTS checks are local and add zero paid calls.
 - Hard evidence, identity, action completeness, required relation, scale, quality-safe interval, cue tolerance, reuse authority, and executable geometry are non-compensable constraints.
 - Final semantic QA can observe an issue but cannot approve delivery. Only a fully passed deterministic report plus non-blocking requested-aspect QA can create `DecisionAuthorityV2`.
+- Clear presentation decisions perform no semantic negotiation. Near-equal
+  feasible capabilities may use the single policy-authorized global
+  negotiation slot; requests and tool results are hash persisted and every
+  round is reserved by `BudgetLedger` before dispatch.
+- Function tools are read-only and return immutable facts/options. The model
+  cannot call FFmpeg, SAM, render, retry, arbitrary paths, timestamps,
+  coordinates, or delivery authority.
+
+## Cross-genre boundary
+
+The compiler core is content neutral. `EditorialObjectiveProfile` expresses
+dialogue, music, instructional order, chronology, hook, source-audio,
+legibility, physical-relation, and reaction goals as continuous values. A
+legacy feature plan is currently only an adapter into that IR.
+
+Future genres add evidence providers and capabilities rather than parallel
+delivery pipelines. Dialogue editing remains intentionally unsupported in V1.
+The intended later provider is Apple SpeechTranscriber for local word-level
+timing, with Gemini limited to correction of recognized text while the local
+timing and audio hashes remain authoritative.
 
 ## Local verification
 
-The final local suite completed with:
+The generalized compiler local suite completed with:
 
 ```text
-626 passed, 1 warning
+655 passed, 1 warning
 ```
 
 The warning is the existing Starlette/httpx deprecation warning and is unrelated to autonomous delivery.

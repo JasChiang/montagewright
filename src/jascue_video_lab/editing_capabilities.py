@@ -9,13 +9,171 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Literal
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class EditorialObjectiveProfile(_StrictModel):
+    """Continuous editorial goals shared by pure and mixed content types."""
+
+    dialogue_dependency: float = Field(default=0.0, ge=0.0, le=1.0)
+    music_dependency: float = Field(default=0.0, ge=0.0, le=1.0)
+    instructional_order_strictness: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+    )
+    chronology_strictness: float = Field(default=0.0, ge=0.0, le=1.0)
+    hook_priority: float = Field(default=0.5, ge=0.0, le=1.0)
+    source_audio_importance: float = Field(default=0.0, ge=0.0, le=1.0)
+    text_legibility_importance: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+    )
+    physical_relation_importance: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+    )
+    reaction_payoff_importance: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+    )
+
+
+class CanvasSpec(_StrictModel):
+    canvas_id: str = Field(min_length=1)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    pixel_aspect_ratio: float = Field(default=1.0, gt=0.0)
+    safe_area_top: float = Field(default=0.0, ge=0.0, lt=0.5)
+    safe_area_right: float = Field(default=0.0, ge=0.0, lt=0.5)
+    safe_area_bottom: float = Field(default=0.0, ge=0.0, lt=0.5)
+    safe_area_left: float = Field(default=0.0, ge=0.0, lt=0.5)
+    background_policy: Literal["none", "solid"] = "none"
+
+
+class VisibilityTarget(_StrictModel):
+    target_id: str = Field(min_length=1)
+    minimum_visible_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
+    minimum_readability: float = Field(default=0.5, ge=0.0, le=1.0)
+    atomic: bool = False
+
+
+class VisibilityContract(_StrictModel):
+    targets: tuple[VisibilityTarget, ...] = Field(min_length=1)
+    temporal_visibility: Literal["one", "ordered", "simultaneous"]
+    preserve_spatial_relation: bool = False
+    preserve_relative_scale: bool = False
+
+    @model_validator(mode="after")
+    def validate_visibility(self) -> "VisibilityContract":
+        ids = [target.target_id for target in self.targets]
+        if len(ids) != len(set(ids)):
+            raise ValueError("visibility target IDs must be unique")
+        if self.temporal_visibility == "one" and len(self.targets) != 1:
+            raise ValueError("one-target visibility requires exactly one target")
+        if self.preserve_relative_scale and len(self.targets) < 2:
+            raise ValueError("relative scale preservation requires two targets")
+        return self
+
+
+class AttentionIntent(_StrictModel):
+    ordered_target_ids: tuple[str, ...] = ()
+    goal: Literal[
+        "hold",
+        "follow",
+        "reveal",
+        "compare",
+        "emphasize",
+        "transfer",
+    ]
+    motion_motivation: Literal[
+        "none",
+        "containment",
+        "attention_transfer",
+        "reveal",
+        "emphasis",
+    ] = "none"
+
+
+class SemanticBeat(_StrictModel):
+    beat_id: str = Field(min_length=1)
+    priority: Literal["hard", "preferred", "optional"]
+    narrative_function: str = Field(min_length=1)
+    evidence_refs: tuple[str, ...] = Field(min_length=1)
+    candidate_refs: tuple[str, ...] = ()
+    visibility_contract: VisibilityContract
+    attention_intent: AttentionIntent
+    sync_intent_ids: tuple[str, ...] = ()
+    minimum_duration_ms: int = Field(gt=0)
+    preferred_duration_ms: int = Field(gt=0)
+    maximum_duration_ms: int = Field(gt=0)
+    acceptable_capability_ids: tuple[str, ...] = Field(min_length=1)
+    forbidden_capability_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_beat(self) -> "SemanticBeat":
+        if not (
+            self.minimum_duration_ms
+            <= self.preferred_duration_ms
+            <= self.maximum_duration_ms
+        ):
+            raise ValueError("semantic beat duration bounds must be ordered")
+        overlap = set(self.acceptable_capability_ids) & set(
+            self.forbidden_capability_ids
+        )
+        if overlap:
+            raise ValueError(
+                "capabilities cannot be both acceptable and forbidden: "
+                + ", ".join(sorted(overlap))
+            )
+        known_targets = {
+            target.target_id for target in self.visibility_contract.targets
+        }
+        unknown_attention = set(
+            self.attention_intent.ordered_target_ids
+        ) - known_targets
+        if unknown_attention:
+            raise ValueError(
+                "attention intent references unknown targets: "
+                + ", ".join(sorted(unknown_attention))
+            )
+        return self
+
+
+class EditProjectIR(_StrictModel):
+    """Aspect-neutral semantic edit contract; it contains no render geometry."""
+
+    contract_version: Literal["semantic-edit-ir-v1"] = "semantic-edit-ir-v1"
+    project_id: str = Field(min_length=1)
+    source_catalog_ref: str = Field(min_length=1)
+    policy_ref: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    objective_profile: EditorialObjectiveProfile
+    outputs: tuple[CanvasSpec, ...] = Field(min_length=1)
+    beats: tuple[SemanticBeat, ...] = Field(min_length=1)
+    global_constraint_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_project(self) -> "EditProjectIR":
+        canvas_ids = [canvas.canvas_id for canvas in self.outputs]
+        beat_ids = [beat.beat_id for beat in self.beats]
+        if len(canvas_ids) != len(set(canvas_ids)):
+            raise ValueError("semantic edit canvas IDs must be unique")
+        if len(beat_ids) != len(set(beat_ids)):
+            raise ValueError("semantic edit beat IDs must be unique")
+        return self
+
+    def definition_sha256(self) -> str:
+        return _canonical_sha256(self.model_dump(mode="json"))
 
 
 class EditingCapability(_StrictModel):
@@ -104,6 +262,104 @@ class EditingCapabilityCatalog(_StrictModel):
             for capability in current.capabilities
         }
         return all(active.get(key) == scope for key, scope in saved.items())
+
+
+class CapabilitySpecV2(_StrictModel):
+    """Declarative planner/runtime contract for one local editing operation."""
+
+    capability_id: str = Field(
+        min_length=1,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    version: str = Field(min_length=1)
+    planner_semantics: tuple[str, ...] = Field(min_length=1)
+    required_artifact_types: tuple[str, ...] = ()
+    precondition_ids: tuple[str, ...] = ()
+    guarantee_ids: tuple[str, ...] = Field(min_length=1)
+    verifier_ids: tuple[str, ...] = Field(min_length=1)
+    policy_gate: str | None = None
+    local_cost_class: Literal["cheap", "tracking", "render_proxy"] = "cheap"
+    intrusion_rank: int = Field(default=0, ge=0, le=10)
+    max_options_per_candidate: int = Field(default=1, ge=1, le=8)
+    executor_id: str = Field(min_length=1)
+    paid_model_calls: Literal[0] = 0
+
+
+class CapabilityRegistryV2(_StrictModel):
+    contract_version: Literal["editing-capability-registry-v2"] = (
+        "editing-capability-registry-v2"
+    )
+    planner_boundary: Literal[
+        "semantic_intent_and_immutable_option_ids_only"
+    ] = "semantic_intent_and_immutable_option_ids_only"
+    capabilities: tuple[CapabilitySpecV2, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_registry(self) -> "CapabilityRegistryV2":
+        ids = [capability.capability_id for capability in self.capabilities]
+        if len(ids) != len(set(ids)):
+            raise ValueError("capability registry IDs must be unique")
+        return self
+
+    def definition_sha256(self) -> str:
+        return _canonical_sha256(self.model_dump(mode="json"))
+
+    def by_id(self) -> dict[str, CapabilitySpecV2]:
+        return {
+            capability.capability_id: capability
+            for capability in self.capabilities
+        }
+
+
+@runtime_checkable
+class CapabilityExecutor(Protocol):
+    spec: CapabilitySpecV2
+
+    def enumerate(self, context: Mapping[str, Any]) -> Sequence[Any]: ...
+
+    def audit(self, option: Any) -> Sequence[Any]: ...
+
+    def compile(self, option: Any) -> Any: ...
+
+
+class RuntimeCapabilityRegistry:
+    """Runtime counterpart of the signed planner catalog.
+
+    Executors only enumerate and compile. Selection remains with the common
+    constraint optimizer, so adding an operation does not extend a fallback
+    decision tree.
+    """
+
+    def __init__(self, manifest: CapabilityRegistryV2) -> None:
+        self.manifest = manifest
+        self._executors: dict[str, CapabilityExecutor] = {}
+
+    def register(self, executor: CapabilityExecutor) -> None:
+        capability_id = executor.spec.capability_id
+        declared = self.manifest.by_id().get(capability_id)
+        if declared is None:
+            raise ValueError(
+                f"executor capability is not declared: {capability_id}"
+            )
+        if executor.spec != declared:
+            raise ValueError(
+                f"executor spec does not match manifest: {capability_id}"
+            )
+        if capability_id in self._executors:
+            raise ValueError(f"executor already registered: {capability_id}")
+        self._executors[capability_id] = executor
+
+    def require_executor(self, capability_id: str) -> CapabilityExecutor:
+        try:
+            return self._executors[capability_id]
+        except KeyError as error:
+            raise ValueError(
+                f"capability has no runtime executor: {capability_id}"
+            ) from error
+
+    @property
+    def registered_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._executors))
 
 
 def simple_production_capability_catalog() -> EditingCapabilityCatalog:
@@ -292,3 +548,162 @@ def autonomous_production_capability_catalog(
             ],
         }
     )
+
+
+def autonomous_capability_registry_v2(
+    *,
+    allow_two_panel_layout: bool = True,
+    allow_solid_matte_fit: bool = True,
+    allow_intentional_freeze: bool = True,
+) -> CapabilityRegistryV2:
+    """Return executable capability contracts without content-specific cases."""
+
+    specs = [
+        CapabilitySpecV2(
+            capability_id="source_hold",
+            version="v1",
+            planner_semantics=("hold", "preserve_source_composition"),
+            guarantee_ids=("exact_pts_preserved", "source_motion_preserved"),
+            verifier_ids=("media_valid", "evidence_contained"),
+            executor_id="presentation.source_hold",
+        ),
+        CapabilitySpecV2(
+            capability_id="static_full_bleed_crop",
+            version="v1",
+            planner_semantics=("hold", "full_bleed", "single_composition"),
+            required_artifact_types=("scene_facts",),
+            precondition_ids=("shared_static_crop_feasible",),
+            guarantee_ids=("exact_pts_preserved", "full_bleed"),
+            verifier_ids=("target_containment", "minimum_readability"),
+            executor_id="presentation.static_full_bleed",
+        ),
+        CapabilitySpecV2(
+            capability_id="tracked_full_bleed_crop",
+            version="v1",
+            planner_semantics=("follow", "full_bleed", "containment"),
+            required_artifact_types=("scene_facts", "target_tracks"),
+            precondition_ids=("valid_tracks", "tracked_crop_feasible"),
+            guarantee_ids=("exact_pts_preserved", "full_bleed"),
+            verifier_ids=(
+                "target_containment",
+                "identity_preserved",
+                "deadband_enforced",
+            ),
+            local_cost_class="tracking",
+            intrusion_rank=1,
+            executor_id="presentation.tracked_full_bleed",
+        ),
+        CapabilitySpecV2(
+            capability_id="phase_virtual_camera",
+            version="v1",
+            planner_semantics=(
+                "sequential_attention",
+                "reveal",
+                "controlled_emphasis",
+            ),
+            required_artifact_types=("scene_facts", "target_tracks"),
+            precondition_ids=(
+                "valid_tracks",
+                "ordered_attention_targets",
+                "motivated_path_feasible",
+            ),
+            guarantee_ids=("exact_pts_preserved", "semantic_order_preserved"),
+            verifier_ids=(
+                "target_containment",
+                "no_unmotivated_reversal",
+                "source_motion_compatible",
+                "settle_present",
+            ),
+            local_cost_class="tracking",
+            intrusion_rank=2,
+            executor_id="presentation.minimal_virtual_camera",
+        ),
+        CapabilitySpecV2(
+            capability_id="hard_cut_between_views",
+            version="v1",
+            planner_semantics=("sequential_attention", "unsafe_pan_replacement"),
+            required_artifact_types=("scene_facts", "target_tracks"),
+            precondition_ids=("cut_boundary_admissible",),
+            guarantee_ids=("semantic_order_preserved",),
+            verifier_ids=("action_complete", "cut_boundary_clean"),
+            local_cost_class="tracking",
+            intrusion_rank=2,
+            executor_id="presentation.hard_cut_between_views",
+        ),
+        CapabilitySpecV2(
+            capability_id="controlled_semantic_clip",
+            version="v1",
+            planner_semantics=("full_bleed", "nonessential_extent_clip"),
+            required_artifact_types=("scene_facts",),
+            precondition_ids=("semantic_core_contained",),
+            guarantee_ids=("hard_core_preserved",),
+            verifier_ids=("controlled_clip_authorized",),
+            policy_gate="controlled_clip_authorized",
+            intrusion_rank=3,
+            executor_id="presentation.controlled_semantic_clip",
+        ),
+    ]
+    if allow_two_panel_layout:
+        specs.append(
+            CapabilitySpecV2(
+                capability_id="two_panel_layout",
+                version="v1",
+                planner_semantics=(
+                    "simultaneous_comparison",
+                    "simultaneous_relation",
+                    "context_detail",
+                ),
+                required_artifact_types=("scene_facts", "target_tracks"),
+                precondition_ids=("exactly_two_panels", "panel_geometry_feasible"),
+                guarantee_ids=("exact_pts_preserved", "required_scope_preserved"),
+                verifier_ids=(
+                    "same_source_same_pts",
+                    "relative_scale_policy",
+                    "minimum_readability",
+                ),
+                policy_gate="allow_two_panel_layout",
+                local_cost_class="tracking",
+                intrusion_rank=5,
+                executor_id="presentation.two_panel_layout",
+            )
+        )
+    if allow_solid_matte_fit:
+        specs.append(
+            CapabilitySpecV2(
+                capability_id="solid_matte_fit",
+                version="v1",
+                planner_semantics=("preserve_inseparable_scope",),
+                required_artifact_types=("scene_facts",),
+                guarantee_ids=("whole_source_scope_preserved",),
+                verifier_ids=("minimum_readability", "solid_background_only"),
+                policy_gate="allow_solid_matte_fit",
+                intrusion_rank=8,
+                executor_id="presentation.solid_matte_fit",
+            )
+        )
+    if allow_intentional_freeze:
+        specs.append(
+            CapabilitySpecV2(
+                capability_id="intentional_freeze",
+                version="v1",
+                planner_semantics=("phrase_ending", "exact_event_emphasis"),
+                required_artifact_types=("exact_event_lock", "music_cue_lock"),
+                precondition_ids=("brief_authorized", "cue_bound"),
+                guarantee_ids=("exact_event_pts_preserved",),
+                verifier_ids=("maximum_freeze_duration", "freeze_motivated"),
+                policy_gate="allow_intentional_freeze",
+                intrusion_rank=4,
+                executor_id="presentation.intentional_freeze",
+            )
+        )
+    return CapabilityRegistryV2(capabilities=tuple(specs))
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

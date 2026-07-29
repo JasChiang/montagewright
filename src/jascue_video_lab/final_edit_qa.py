@@ -246,6 +246,7 @@ class DeterministicDeliveryEvidence(StrictModel):
     relation_passed: bool
     panel_same_pts_passed: bool
     relative_scale_lock_passed: bool
+    panel_runtime_fraction_passed: bool = True
     cue_delta_frames: dict[str, int]
     cue_tolerance_frames: dict[str, int] = Field(default_factory=dict)
     synthetic_motion_motivated: bool
@@ -1074,6 +1075,10 @@ def run_deterministic_delivery_qa(
     gate("relation", evidence.relation_passed)
     gate("panel_same_pts", evidence.panel_same_pts_passed)
     gate("relative_scale_lock", evidence.relative_scale_lock_passed)
+    gate(
+        "panel_runtime_fraction",
+        evidence.panel_runtime_fraction_passed,
+    )
     gate(
         "cue_sync",
         all(

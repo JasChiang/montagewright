@@ -271,6 +271,31 @@ Gemini 的有聲 final QA 只輸出 typed observation 與有限 repair class，�
 
 只有 requested aspects 全部沒有 blocking observation、deterministic report 全通過，且 degradation manifest 綁定同一 policy SHA 時，本機才產生 `DecisionAuthorityV2`。因此可播放 MP4、模型沒報錯、或歷史 human-review artifact 都不能單獨升級成 autonomous delivery。
 
+### 通用剪輯編譯與有限語意協商
+
+剪輯方式不再由產品、人數或 fixture 名稱驅動。Legacy feature plan 先投影成
+aspect-neutral `SemanticEditIR`；本機再以連續的 target topology、距離、
+readability、shared-crop feasibility、track 與 motion facts 建立
+`SceneFacts`。每個 capability 只枚舉候選並附上 typed constraint results；
+hard constraint 的 `unknown` 與 `fail` 都不能進入求解器，偏好分數不能補償。
+
+Gemini function calling 只在兩個不同 capability 的合法候選具有近似本機分數、
+且需要語意取捨時啟用。每個 run 最多一次 global negotiation、每次最多兩輪；
+函式只可讀取 hash-bound evidence／option IDs，不能執行 FFmpeg、SAM、render、
+任意 timestamp／bbox、retry 或 delivery approval。SDK automatic function
+calling 明確停用，每輪在 dispatch 前由 `BudgetLedger` reserve，未知 dispatch
+狀態的 429／503 仍保留 reservation，不能恢復預算後自動再試。
+
+Presentation policy 也在 sequence 與 final deterministic QA 兩層檢查
+`max_panel_runtime_fraction`。Cue alignment 若在 geometry 之後才提出 source
+window shift，不能再繞過 policy 把 full-bleed 偷換成 matte fit；只有 policy
+明確授權 solid fit 時才可使用該 best-effort repair，否則保存原構圖並要求回到
+pre-geometry compile 或 fail closed。
+
+訪談 ASR 不屬於 autonomous V1。後續規劃以 Apple SpeechTranscriber 產生本機
+word-level timing 與 audio lineage，再讓 Gemini在 bounded text/audio evidence
+上修正辨識文字；Gemini不得改寫本機字級時間。
+
 ## 尚未證明的事
 
 - Gemini timestamp 不是 frame-accurate cut point。

@@ -798,6 +798,34 @@ def test_deterministic_qa_uses_event_specific_cue_tolerance() -> None:
     assert report.gate_results["cue_sync"] == "passed"
 
 
+def test_deterministic_qa_blocks_excessive_panel_runtime() -> None:
+    report = run_deterministic_delivery_qa(
+        DeterministicDeliveryEvidence(
+            media_playable=True,
+            pts_valid=True,
+            unexpected_freeze_count=0,
+            containment_passed=True,
+            identity_passed=True,
+            relation_passed=True,
+            panel_same_pts_passed=True,
+            relative_scale_lock_passed=True,
+            panel_runtime_fraction_passed=False,
+            cue_delta_frames={},
+            synthetic_motion_motivated=True,
+            synthetic_reversal_count=0,
+            settle_passed=True,
+            readability_passed=True,
+            reuse_authorized=True,
+            omissions_authorized=True,
+            hard_evidence_passed=True,
+        ),
+        policy=_autonomous_policy(),
+    )
+
+    assert report.passed is False
+    assert report.gate_results["panel_runtime_fraction"] == "failed"
+
+
 def test_recovery_uses_local_mapping_and_enforces_both_caps(
     tmp_path: Path,
 ) -> None:

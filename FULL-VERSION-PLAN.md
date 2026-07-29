@@ -202,6 +202,21 @@ Full Auto v2 executor 與 selection planner v3 已完成 Top-K schema、brief-sp
 
 2026-07-28 的 autonomous-delivery-v1 已加入 policy／authority／budget、ExactEventLockV2、multi-target grounding、two-panel／solid-fit／freeze presentation compiler、bounded sequence optimizer、segment render cache，以及有聲 `autonomous_final_9x16` QA。正式 auto approval 不再由 `requires_human_review` 布林值推導，而是由 policy SHA、不可變輸入 hashes、deterministic gate results、Gemini interaction IDs 與 decision codes 組成 `DecisionAuthorityV2`。舊 review profiles 完全保留人工 gate。
 
+2026-07-29 將上述 feature path 再投影成通用剪輯編譯層：新增
+`SemanticEditIR`、continuous `SceneFacts`、typed `ConstraintResult`、
+`editing-capability-registry-v2` 與 enumerate-before-select presentation
+compiler。Production autonomous geometry 已使用共同 option selector，保存所有
+generated／rejected／selected option IDs；minimal virtual-camera compiler 不再
+只有測試 caller。Gemini function calling 只作為最多一次、最多兩輪、由
+BudgetLedger 事前保留成本的 read-only semantic negotiation，不是自由 Agent 或
+NLE 工具迴圈。Panel runtime fraction 已進入 sequence 與 deterministic QA hard
+gate；post-geometry cue shift 不得繞過 policy 強制產生 matte fit。
+
+跨片型的擴充單位是 evidence provider、objective profile 與 capability executor，
+不是另一條 pipeline。訪談／對話模式待後續 Apple SpeechTranscriber 本機
+word-level timing provider 完成後再加入；Gemini只可修正辨識文字，不可取代本機
+timing lineage。
+
 selected-window orchestration 現已在最終 source in/out 上重用 dense decoder，依 feature 將多事件合併為一次 grouped ExactEventLock call，並把 template 綁到實際入選候選的 `EvidenceQueryLockV2`。同一 picture run 會產生 beat、music、cue、exact-event、degradation、deterministic QA 六份 evidence 與含路徑／hash 的 bundle index；`feature-delivery` 會直接發現並驗證它們，resume 時也拒絕任何被修改的 context。
 
 Samsung 9:16 舊 selected-window evidence experiment 曾執行 23 次付費 interaction，並產生六個 ExactEventLocks 與完整 bundle；事後稽核確認它明確重用了舊 picture artifacts，輸出音軌也全是 source audio，相關 run 已移至 `artifacts/_archive/2026-07-28-stale-plan-reuse/`。Autonomous resume 現在只接受與當前 policy SHA、music SHA、capability catalog 及 source artifacts 完整綁定的 `direct-video-edit-plan-v2`，不再一律拒絕合法 resume，也不接受未綁定的 raw reuse。

@@ -49,11 +49,21 @@ from .event_lock import (
     load_editorial_beat_contracts,
     write_exact_event_bundle,
 )
-from .editing_capabilities import EditingCapabilityCatalog
+from .editing_capabilities import (
+    AttentionIntent,
+    CanvasSpec,
+    EditingCapabilityCatalog,
+    EditProjectIR,
+    EditorialObjectiveProfile,
+    SemanticBeat,
+    VisibilityContract,
+    VisibilityTarget,
+)
 from .final_edit_qa import DeterministicDeliveryEvidence
 from .full_v1 import create_dense_window_catalog
 from .gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
+    FunctionToolDeclaration,
     GeminiLabClient,
     GroundingIdentityReference,
     MODEL_ID,
@@ -7216,6 +7226,280 @@ def _resolved_autonomous_relation_mode(
     return "single_subject"
 
 
+def _preferred_capability_ids(
+    presentation_preference: str,
+) -> tuple[str, ...]:
+    mapped = {
+        "static_full_bleed": "static_full_bleed_crop",
+        "tracked_full_bleed": "tracked_full_bleed_crop",
+        "phase_virtual_camera": "phase_virtual_camera",
+        "two_panel_layout": "two_panel_layout",
+        "solid_matte_fit": "solid_matte_fit",
+    }.get(presentation_preference)
+    return (mapped,) if mapped is not None else ()
+
+
+def _project_feature_semantic_edit_ir(
+    *,
+    brief: FeatureEditBrief,
+    plan: FeatureEditPlan,
+    policy: AutonomousEditPolicy,
+    catalog_sha256: str,
+    music_present: bool,
+) -> EditProjectIR:
+    """Adapt the legacy feature contract into the shared semantic IR."""
+
+    brief_by_id = {chapter.feature_id: chapter for chapter in brief.chapters}
+    beats: list[SemanticBeat] = []
+    for chapter in plan.chapters:
+        brief_chapter = brief_by_id[chapter.feature_id]
+        candidates = sorted(
+            chapter.vertical_candidates,
+            key=lambda candidate: candidate.rank,
+        )
+        primary = candidates[0] if candidates else None
+        regions = (
+            [
+                region
+                for region in primary.regions
+                if region.execution_role != "overlay_keepout"
+            ]
+            if primary is not None
+            else [
+                region
+                for region in brief_chapter.vertical_regions
+                if region.execution_role != "overlay_keepout"
+            ]
+        )
+        if not regions:
+            visibility_targets = (
+                VisibilityTarget(
+                    target_id=f"{chapter.feature_id}:primary",
+                    minimum_visible_fraction=1.0,
+                    minimum_readability=0.5,
+                    atomic=False,
+                ),
+            )
+        else:
+            visibility_targets = tuple(
+                VisibilityTarget(
+                    target_id=region.entity_id or region.region_id,
+                    minimum_visible_fraction=(
+                        region.effective_minimum_visible_fraction
+                    ),
+                    minimum_readability=(
+                        0.9
+                        if region.kind in {"text_region", "ui_region"}
+                        else 0.5
+                    ),
+                    atomic=region.atomic,
+                )
+                for region in regions
+                if region.execution_role == "hard_core"
+            ) or (
+                VisibilityTarget(
+                    target_id=f"{chapter.feature_id}:primary",
+                    minimum_visible_fraction=1.0,
+                    minimum_readability=0.5,
+                ),
+            )
+        coverage_mode = primary.coverage_mode if primary is not None else (
+            "simultaneous"
+        )
+        temporal_visibility: Literal["one", "ordered", "simultaneous"]
+        if len(visibility_targets) == 1:
+            temporal_visibility = "one"
+        elif coverage_mode == "sequential":
+            temporal_visibility = "ordered"
+        else:
+            temporal_visibility = "simultaneous"
+        ordered_ids = tuple(target.target_id for target in visibility_targets)
+        if (
+            primary is not None
+            and primary.virtual_camera_proposal is not None
+        ):
+            semantic_id_by_region_id = {
+                region.region_id: region.entity_id or region.region_id
+                for region in regions
+            }
+            proposed_order = tuple(
+                semantic_id_by_region_id.get(region_id, region_id)
+                for phase in primary.virtual_camera_proposal.phases
+                for region_id in phase.anchor_region_ids
+            )
+            known_target_ids = {
+                target.target_id for target in visibility_targets
+            }
+            proposed_order = tuple(
+                target_id
+                for target_id in dict.fromkeys(proposed_order)
+                if target_id in known_target_ids
+            )
+            ordered_ids = proposed_order or ordered_ids
+        goal = primary.presentation_goal if primary is not None else "hold"
+        attention_goal = (
+            "compare"
+            if goal == "context_detail"
+            else goal
+        )
+        motion_motivation = {
+            "follow": "containment",
+            "reveal": "reveal",
+            "emphasize": "emphasis",
+        }.get(goal, "none")
+        preferred_seconds = (
+            chapter.recommended_duration_seconds
+            or brief_chapter.target_duration_seconds
+        )
+        if chapter.attention_observation is not None:
+            minimum_seconds = (
+                chapter.attention_observation.minimum_dwell_seconds
+            )
+            maximum_seconds = (
+                chapter.attention_observation.maximum_dwell_seconds
+            )
+        else:
+            minimum_seconds = max(0.5, preferred_seconds * 0.7)
+            maximum_seconds = min(15.0, preferred_seconds * 1.3)
+        capability_ids = tuple(
+            dict.fromkeys(
+                capability_id
+                for candidate in candidates
+                for capability_id in _preferred_capability_ids(
+                    candidate.presentation_preference
+                )
+            )
+        ) or ("static_full_bleed_crop", "tracked_full_bleed_crop")
+        evidence_refs = tuple(
+            f"{candidate.source_asset_id}:{candidate.event_id}:{candidate.frame_id}"
+            for candidate in candidates
+        ) or (
+            f"feature-plan:{chapter.feature_id}:{chapter.evidence_status}",
+        )
+        beats.append(
+            SemanticBeat(
+                beat_id=chapter.feature_id,
+                priority=(
+                    "preferred"
+                    if chapter.evidence_status == "supported"
+                    else "optional"
+                    if chapter.evidence_status == "not_found"
+                    else "preferred"
+                ),
+                narrative_function=(
+                    chapter.flow_intent.narrative_role
+                    if chapter.flow_intent is not None
+                    else brief_chapter.title
+                ),
+                evidence_refs=evidence_refs,
+                candidate_refs=tuple(
+                    candidate.candidate_id for candidate in candidates
+                ),
+                visibility_contract=VisibilityContract(
+                    targets=visibility_targets,
+                    temporal_visibility=temporal_visibility,
+                    preserve_spatial_relation=(
+                        coverage_mode
+                        in {"simultaneous", "relation_core"}
+                    ),
+                    preserve_relative_scale=bool(
+                        primary is not None
+                        and primary.physical_scale_comparison
+                        and len(visibility_targets) >= 2
+                    ),
+                ),
+                attention_intent=AttentionIntent(
+                    ordered_target_ids=ordered_ids,
+                    goal=attention_goal,
+                    motion_motivation=motion_motivation,
+                ),
+                sync_intent_ids=(
+                    (
+                        f"{chapter.feature_id}:"
+                        f"{chapter.flow_intent.visual_sync_event}"
+                    ),
+                )
+                if (
+                    chapter.flow_intent is not None
+                    and chapter.flow_intent.visual_sync_event is not None
+                )
+                else (),
+                minimum_duration_ms=round(minimum_seconds * 1000),
+                preferred_duration_ms=round(preferred_seconds * 1000),
+                maximum_duration_ms=round(maximum_seconds * 1000),
+                acceptable_capability_ids=capability_ids,
+            )
+        )
+    outputs = tuple(
+        CanvasSpec(
+            canvas_id=aspect.replace(":", "x"),
+            width=1080 if aspect == "9:16" else 1920,
+            height=1920 if aspect == "9:16" else 1080,
+            background_policy=(
+                "solid"
+                if (
+                    aspect == "9:16"
+                    and policy.presentation.allow_solid_matte_fit
+                )
+                else "none"
+            ),
+        )
+        for aspect in policy.requested_aspects
+    )
+    return EditProjectIR(
+        project_id=brief.project_id,
+        source_catalog_ref=f"sha256:{catalog_sha256}",
+        policy_ref=policy.policy_reference,
+        objective_profile=EditorialObjectiveProfile(
+            music_dependency=0.9 if music_present else 0.0,
+            chronology_strictness=0.2,
+            hook_priority=0.8,
+            source_audio_importance=0.1,
+            text_legibility_importance=0.7,
+            physical_relation_importance=0.6,
+            reaction_payoff_importance=0.5,
+        ),
+        outputs=outputs,
+        beats=tuple(beats),
+        global_constraint_ids=(
+            "hard_evidence_fail_closed",
+            "exact_pts_owned_by_local_compiler",
+            "delivery_authority_owned_by_policy",
+        ),
+    )
+
+
+def _presentation_motion_inputs(
+    *,
+    regions: Sequence[FramingRegionIntent],
+    targets: Sequence[PresentationTarget],
+    phases: Sequence[VerticalVirtualCameraPhase],
+) -> tuple[tuple[float, ...], bool]:
+    """Project semantic phase order into normalized positions, never pixels."""
+
+    centers_by_region_id = {
+        region.region_id: (
+            (target.box_2d[0] + target.box_2d[2]) / 2 / 1000
+        )
+        for region, target in zip(regions, targets, strict=True)
+    }
+    values: list[float] = []
+    movement_motivated = False
+    for phase in phases:
+        centers = [
+            centers_by_region_id[region_id]
+            for region_id in phase.anchor_region_ids
+            if region_id in centers_by_region_id
+        ]
+        if not centers:
+            continue
+        values.append(sum(centers) / len(centers))
+        movement_motivated = movement_motivated or (
+            phase.movement_motivation != "none"
+        )
+    return tuple(values), movement_motivated
+
+
 def _compatible_output_cues(
     cues: Sequence[LockedMusicCue],
     *,
@@ -7256,6 +7540,19 @@ def _compatible_output_cues(
             cue.cue_id,
         ),
     )
+
+
+def _late_cue_shift_disposition(
+    policy: AutonomousEditPolicy | None,
+) -> Literal["solid_fit_authorized", "recompile_required"]:
+    """Never let a post-geometry trim change silently bypass presentation policy."""
+
+    if (
+        policy is not None
+        and policy.presentation.allow_solid_matte_fit
+    ):
+        return "solid_fit_authorized"
+    return "recompile_required"
 
 
 def _bind_freeze_start_to_reaction_peak(
@@ -7484,6 +7781,7 @@ def _vertical_candidate_geometry(
     presentation_preference: str = "tracked_full_bleed",
     relation_mode: str = "single_subject",
     physical_scale_comparison: bool = False,
+    semantic_negotiation_state: dict[str, int] | None = None,
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
     """Evaluate one immutable vertical candidate without rendering a segment."""
 
@@ -7549,14 +7847,9 @@ def _vertical_candidate_geometry(
             for region, track in zip(hard_regions, hard_tracks, strict=True)
         )
         autonomous_compilation = None
+        semantic_negotiation_artifact: dict[str, Any] | None = None
         geometry: dict[str, Any] = {}
-        if _autonomous_panel_fallback_eligible(
-            hard_region_count=len(hard_regions),
-            presentation_preference=presentation_preference,
-            relation_mode=relation_mode,
-            policy=autonomous_policy,
-        ):
-            assert autonomous_policy is not None
+        if autonomous_policy is not None:
             resolved_relation_mode = _resolved_autonomous_relation_mode(
                 relation_mode
             )
@@ -7576,6 +7869,13 @@ def _vertical_candidate_geometry(
                     strict=True,
                 )
             ]
+            required_x_values, movement_motivated = (
+                _presentation_motion_inputs(
+                    regions=hard_regions,
+                    targets=presentation_targets,
+                    phases=camera_phases,
+                )
+            )
             autonomous_compilation = compile_presentation(
                 targets=presentation_targets,
                 source_width=source_width,
@@ -7583,7 +7883,118 @@ def _vertical_candidate_geometry(
                 relation_mode=resolved_relation_mode,
                 policy=autonomous_policy,
                 physical_scale_comparison=physical_scale_comparison,
+                required_x_values=required_x_values,
+                movement_motivated=movement_motivated,
+                preferred_capability_ids=_preferred_capability_ids(
+                    presentation_preference
+                ),
             )
+            selection = autonomous_compilation.selection
+            negotiation_policy = (
+                autonomous_policy.semantic_negotiation
+            )
+            if (
+                selection is not None
+                and selection.semantic_negotiation_recommended
+                and negotiation_policy.enabled
+                and negotiation_policy.max_global_negotiations == 1
+                and semantic_negotiation_state is not None
+                and semantic_negotiation_state.get("global", 0) < 1
+            ):
+                # Claim the single global slot before dispatch. A failed
+                # optional negotiation must never fan out to the next shot.
+                semantic_negotiation_state["global"] = 1
+                negotiation_dir = (
+                    output_dir / "semantic-negotiation"
+                )
+                try:
+                    negotiation_result = client.negotiate_edit_decision(
+                        beat_id=feature_id,
+                        option_ids=selection.generated_option_ids,
+                        prompt=(
+                            "Choose between locally executable presentation "
+                            "options for one immutable selected window. Respect "
+                            f"relation_mode={relation_mode!r}, planner "
+                            f"preference={presentation_preference!r}, and avoid "
+                            "panel, matte, or synthetic motion unless it has a "
+                            "semantic advantage. Do not invent geometry."
+                        ),
+                        tool_declarations=(
+                            FunctionToolDeclaration(
+                                name="enumerate_presentation_options",
+                                description=(
+                                    "Return the immutable local scene facts, "
+                                    "generated capabilities, rejected options "
+                                    "and selected local option."
+                                ),
+                                parameters={
+                                    "type": "object",
+                                    "properties": {
+                                        "beat_id": {"type": "string"}
+                                    },
+                                    "required": ["beat_id"],
+                                    "additionalProperties": False,
+                                },
+                            ),
+                        ),
+                        tool_handlers={
+                            "enumerate_presentation_options": (
+                                lambda arguments: {
+                                    "requested_beat_id": arguments.get(
+                                        "beat_id"
+                                    ),
+                                    "compilation": (
+                                        autonomous_compilation.model_dump(
+                                            mode="json"
+                                        )
+                                    ),
+                                }
+                            )
+                        },
+                        policy=autonomous_policy,
+                        run_dir=negotiation_dir,
+                    )
+                    semantic_negotiation_artifact = (
+                        negotiation_result.model_dump(mode="json")
+                    )
+                    preferred_option_id = (
+                        negotiation_result.decision.selected_option_id
+                    )
+                    preferred_capability_id = (
+                        selection.generated_capabilities[
+                            preferred_option_id
+                        ]
+                    )
+                    autonomous_compilation = compile_presentation(
+                        targets=presentation_targets,
+                        source_width=source_width,
+                        source_height=source_height,
+                        relation_mode=resolved_relation_mode,
+                        policy=autonomous_policy,
+                        physical_scale_comparison=(
+                            physical_scale_comparison
+                        ),
+                        required_x_values=required_x_values,
+                        movement_motivated=movement_motivated,
+                        preferred_capability_ids=(
+                            preferred_capability_id,
+                        ),
+                    )
+                except Exception as error:
+                    semantic_negotiation_artifact = {
+                        "contract_version": (
+                            "bounded-semantic-negotiation-skip-v1"
+                        ),
+                        "reason_code": (
+                            "optional_negotiation_failed_without_retry"
+                        ),
+                        "error": f"{type(error).__name__}:{error}",
+                        "local_selection_preserved": True,
+                    }
+                    write_json(
+                        negotiation_dir / "semantic_negotiation.skipped.json",
+                        semantic_negotiation_artifact,
+                    )
             if autonomous_compilation.mode == "two_panel_layout":
                 assert autonomous_compilation.panel_layout is not None
                 filter_graph = two_panel_ffmpeg_filter(
@@ -7842,6 +8253,14 @@ def _vertical_candidate_geometry(
         )
         if runtime_fallback is not None:
             filter_graph, geometry = runtime_fallback
+        if autonomous_compilation is not None:
+            geometry["presentation_compilation"] = (
+                autonomous_compilation.model_dump(mode="json")
+            )
+        if semantic_negotiation_artifact is not None:
+            geometry["semantic_negotiation"] = (
+                semantic_negotiation_artifact
+            )
     else:
         target = (target_description or "").strip()
         if not target:
@@ -12063,6 +12482,27 @@ def _run_feature_cut_experiment_impl(
             )
             write_json(plan_binding_path, binding)
             plan_reused = False
+        if autonomous_policy is not None:
+            semantic_ir = _project_feature_semantic_edit_ir(
+                brief=brief,
+                plan=plan,
+                policy=autonomous_policy,
+                catalog_sha256=sha256_file(catalog_path),
+                music_present=resolved_music_path is not None,
+            )
+            write_json(output_dir / "semantic-edit-ir.json", semantic_ir)
+            write_json(
+                output_dir / "semantic-edit-ir.binding.json",
+                {
+                    "contract_version": "semantic-edit-ir-binding-v1",
+                    "semantic_edit_ir_sha256": semantic_ir.definition_sha256(),
+                    "feature_plan_sha256": sha256_file(plan_path),
+                    "brief_sha256": sha256_file(brief_path),
+                    "catalog_sha256": sha256_file(catalog_path),
+                    "policy_reference": autonomous_policy.policy_reference,
+                    "generated_at": utc_now(),
+                },
+            )
         candidate_evidence_events = _load_runtime_candidate_evidence_events(
             plan_dir
         )
@@ -12480,6 +12920,7 @@ def _run_feature_cut_experiment_impl(
             },
         }
         track_cache: dict[tuple[str, str, int, int], tuple[GroundingProposal, SegmentationTrack, Path]] = {}
+        semantic_negotiation_state = {"global": 0, "repair": 0}
         resolved_editorial_contracts: list[EditorialBeatContract] = []
         resolved_exact_event_locks: list[ExactEventLockV2] = []
         exact_event_project_times_ms: dict[str, int] = {}
@@ -13309,6 +13750,9 @@ def _run_feature_cut_experiment_impl(
                                         "physical_scale_comparison",
                                         False,
                                     )
+                                ),
+                                semantic_negotiation_state=(
+                                    semantic_negotiation_state
                                 ),
                             )
                         auto_audit = None
@@ -14192,42 +14636,69 @@ def _run_feature_cut_experiment_impl(
                                 and shifted_end <= vertical_clip.duration_ms
                                 and locks_remain_inside
                             ):
-                                original_start = v_start
-                                original_end = v_end
-                                v_start = shifted_start
-                                v_end = shifted_end
-                                vertical_filter = _vertical_fit_filter()
-                                vertical_geometry = {
-                                    "applied_strategy": "solid_matte_fit",
-                                    "fallback_reason": None,
-                                    "risk_codes": [
-                                        "cue_aligned_trim_shift",
-                                        "whole_source_scope_preserving_fit",
-                                    ],
-                                    "full_bleed": False,
-                                    "source_geometry_lineage_passed": True,
-                                    "tracking_confidence_gate_passed": True,
-                                    "coverage_passed": True,
-                                    "minimum_visible_required_area_fraction": 1.0,
-                                    "soft_extent_visibility_passed": True,
-                                    "cue_alignment_repair": {
-                                        "method": (
-                                            "bounded_source_window_shift"
+                                disposition = _late_cue_shift_disposition(
+                                    autonomous_policy
+                                )
+                                if disposition == "solid_fit_authorized":
+                                    original_start = v_start
+                                    original_end = v_end
+                                    v_start = shifted_start
+                                    v_end = shifted_end
+                                    vertical_filter = _vertical_fit_filter()
+                                    vertical_geometry = {
+                                        "applied_strategy": (
+                                            "solid_matte_fit"
                                         ),
-                                        "shift_ms": shift_ms,
-                                        "original_source_in_ms": (
-                                            original_start
+                                        "fallback_reason": None,
+                                        "risk_codes": [
+                                            "cue_aligned_trim_shift",
+                                            (
+                                                "whole_source_scope_"
+                                                "preserving_fit"
+                                            ),
+                                        ],
+                                        "full_bleed": False,
+                                        "source_geometry_lineage_passed": True,
+                                        "tracking_confidence_gate_passed": True,
+                                        "coverage_passed": True,
+                                        "minimum_visible_required_area_fraction": 1.0,
+                                        "soft_extent_visibility_passed": True,
+                                        "cue_alignment_repair": {
+                                            "method": (
+                                                "bounded_source_window_shift"
+                                            ),
+                                            "shift_ms": shift_ms,
+                                            "original_source_in_ms": (
+                                                original_start
+                                            ),
+                                            "original_source_out_ms": (
+                                                original_end
+                                            ),
+                                            "repaired_source_in_ms": v_start,
+                                            "repaired_source_out_ms": v_end,
+                                        },
+                                        "paid_model_calls_added": 0,
+                                        "requires_gemini_review": True,
+                                    }
+                                    vertical_track_fingerprint = None
+                                else:
+                                    vertical_geometry.setdefault(
+                                        "risk_codes",
+                                        [],
+                                    ).append(
+                                        "cue_shift_requires_pre_geometry_recompile"
+                                    )
+                                    vertical_geometry[
+                                        "cue_alignment_repair"
+                                    ] = {
+                                        "method": "not_applied",
+                                        "requested_shift_ms": shift_ms,
+                                        "reason_code": (
+                                            "late_trim_change_cannot_bypass_"
+                                            "presentation_policy"
                                         ),
-                                        "original_source_out_ms": (
-                                            original_end
-                                        ),
-                                        "repaired_source_in_ms": v_start,
-                                        "repaired_source_out_ms": v_end,
-                                    },
-                                    "paid_model_calls_added": 0,
-                                    "requires_gemini_review": True,
-                                }
-                                vertical_track_fingerprint = None
+                                        "original_full_bleed_preserved": True,
+                                    }
                         for lock in locks:
                             exact_event_project_times_ms[lock.event_id] = (
                                 project_start_ms + lock.source_time_ms - v_start
@@ -14745,6 +15216,38 @@ def _run_feature_cut_experiment_impl(
                 relation_failure_codes & set(chapter.get("risk_codes") or [])
                 for chapter in vertical_chapters
             )
+            total_vertical_duration_ms = sum(
+                int(chapter.get("duration_ms") or 0)
+                for chapter in vertical_chapters
+            )
+            panel_duration_ms = sum(
+                int(chapter.get("duration_ms") or 0)
+                for chapter in vertical_chapters
+                if chapter.get("applied_strategy") == "two_panel_layout"
+            )
+            panel_runtime_fraction = (
+                panel_duration_ms / total_vertical_duration_ms
+                if total_vertical_duration_ms > 0
+                else 0.0
+            )
+            panel_runtime_fraction_passed = (
+                panel_runtime_fraction
+                <= (
+                    autonomous_policy.presentation
+                    .max_panel_runtime_fraction
+                )
+                + 1e-9
+            )
+            manifest["panel_runtime_audit"] = {
+                "panel_duration_ms": panel_duration_ms,
+                "total_vertical_duration_ms": total_vertical_duration_ms,
+                "observed_fraction": round(panel_runtime_fraction, 6),
+                "maximum_fraction": (
+                    autonomous_policy.presentation
+                    .max_panel_runtime_fraction
+                ),
+                "passed": panel_runtime_fraction_passed,
+            }
             deterministic = DeterministicDeliveryEvidence(
                 media_playable=technical_passed,
                 pts_valid=technical_passed,
@@ -14754,6 +15257,9 @@ def _run_feature_cut_experiment_impl(
                 relation_passed=relation_passed,
                 panel_same_pts_passed=True,
                 relative_scale_lock_passed=True,
+                panel_runtime_fraction_passed=(
+                    panel_runtime_fraction_passed
+                ),
                 cue_delta_frames=cue_deltas,
                 cue_tolerance_frames=cue_tolerances,
                 synthetic_motion_motivated=not any(
@@ -14897,6 +15403,20 @@ def _run_feature_cut_experiment_impl(
             ),
             "autonomous_evidence_bundle_path": (
                 str(autonomous_evidence_bundle_path.resolve())
+                if autonomous_profile
+                else None
+            ),
+            "semantic_edit_ir_path": (
+                str((output_dir / "semantic-edit-ir.json").resolve())
+                if autonomous_profile
+                else None
+            ),
+            "semantic_edit_ir_binding_path": (
+                str(
+                    (
+                        output_dir / "semantic-edit-ir.binding.json"
+                    ).resolve()
+                )
                 if autonomous_profile
                 else None
             ),

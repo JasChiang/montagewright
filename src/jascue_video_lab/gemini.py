@@ -9,6 +9,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
@@ -16,7 +17,9 @@ from typing import Any, Literal, Sequence
 from google import genai
 from google.genai import types
 from PIL import Image
+from pydantic import Field, model_validator
 
+from .autonomous_policy import AutonomousEditPolicy
 from .billing import BudgetLedger, estimate_paid_call
 from .event_lock import (
     EditorialBeatContract,
@@ -44,6 +47,7 @@ from .models import (
     ExtractedFrame,
     FeatureEditBrief,
     FeatureEditPlan,
+    FrozenStrictModel,
     FullClipCard,
     FullClipEvent,
     GeminiNativeGroundingProposal,
@@ -83,6 +87,50 @@ SDK_NAME = "google-genai"
 SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION = (
     "selected-vertical-framing-normalization-v3"
 )
+
+
+class EditDecisionProposal(FrozenStrictModel):
+    """Semantic preference over immutable local options; never executable."""
+
+    beat_id: str = Field(min_length=1)
+    selected_option_id: str = Field(min_length=1)
+    fallback_option_ids: tuple[str, ...] = Field(default=(), max_length=2)
+    semantic_reason: Literal[
+        "preserve_required_relation",
+        "preserve_readability",
+        "sequential_attention",
+        "reveal",
+        "comparison",
+        "avoid_unmotivated_motion",
+        "preserve_source_motion",
+    ]
+    unresolved_concern_codes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_options(self) -> "EditDecisionProposal":
+        ids = (self.selected_option_id, *self.fallback_option_ids)
+        if len(ids) != len(set(ids)):
+            raise ValueError("edit decision option IDs must be unique")
+        return self
+
+
+class FunctionToolDeclaration(FrozenStrictModel):
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    description: str = Field(min_length=1)
+    parameters: Mapping[str, Any]
+    read_only: Literal[True] = True
+
+
+class BoundedSemanticNegotiationResult(FrozenStrictModel):
+    contract_version: Literal["bounded-semantic-negotiation-v1"] = (
+        "bounded-semantic-negotiation-v1"
+    )
+    decision: EditDecisionProposal
+    interaction_ids: tuple[str, ...] = Field(min_length=1, max_length=2)
+    tool_call_ids: tuple[str, ...] = ()
+    tool_result_hashes: tuple[str, ...] = ()
+    rounds_used: int = Field(ge=1, le=2)
+    automatic_function_calling: Literal[False] = False
 
 
 def canonical_interactions_mime_type(mime_type: str) -> str:
@@ -1277,6 +1325,41 @@ def _raw_dump(value: Any) -> Any:
     return value
 
 
+def _interaction_function_calls(
+    interaction: Any,
+) -> list[dict[str, Any]]:
+    """Extract typed custom calls without accepting unknown executable data."""
+
+    calls: list[dict[str, Any]] = []
+    for step in getattr(interaction, "steps", None) or []:
+        if isinstance(step, Mapping):
+            step_type = step.get("type")
+            call_id = step.get("id")
+            name = step.get("name")
+            arguments = step.get("arguments")
+        else:
+            step_type = getattr(step, "type", None)
+            call_id = getattr(step, "id", None)
+            name = getattr(step, "name", None)
+            arguments = getattr(step, "arguments", None)
+        if step_type != "function_call":
+            continue
+        if not isinstance(call_id, str) or not call_id:
+            raise ValueError("function call has no immutable call ID")
+        if not isinstance(name, str) or not name:
+            raise ValueError("function call has no declared name")
+        if not isinstance(arguments, Mapping):
+            raise ValueError("function call arguments must be an object")
+        calls.append(
+            {
+                "id": call_id,
+                "name": name,
+                "arguments": dict(arguments),
+            }
+        )
+    return calls
+
+
 def _record_interaction_attempt(
     *,
     run_dir: Path,
@@ -1509,6 +1592,272 @@ class GeminiLabClient:
             },
         )
         return uploaded, False
+
+    def negotiate_edit_decision(
+        self,
+        *,
+        beat_id: str,
+        option_ids: Sequence[str],
+        prompt: str,
+        tool_declarations: Sequence[FunctionToolDeclaration],
+        tool_handlers: Mapping[str, Callable[[Mapping[str, Any]], Any]],
+        policy: AutonomousEditPolicy,
+        run_dir: Path,
+        recovery_call: bool = False,
+    ) -> BoundedSemanticNegotiationResult:
+        """Run at most two manually executed, read-only function-call rounds.
+
+        This is an exception path after local compilation, not a per-shot
+        default. The model may inspect immutable facts and then propose an
+        option ID. It cannot render, mutate the timeline, choose coordinates,
+        or grant delivery authority.
+        """
+
+        negotiation = policy.semantic_negotiation
+        if not negotiation.enabled:
+            raise ValueError("semantic negotiation is disabled by policy")
+        if self.budget_ledger is None:
+            raise ValueError(
+                "semantic negotiation requires a BudgetLedger before dispatch"
+            )
+        known_options = tuple(dict.fromkeys(option_ids))
+        if not known_options:
+            raise ValueError("semantic negotiation requires immutable options")
+        if len(known_options) != len(option_ids):
+            raise ValueError("semantic negotiation option IDs must be unique")
+        declarations = {item.name: item for item in tool_declarations}
+        if "propose_edit_decision" in declarations:
+            raise ValueError(
+                "propose_edit_decision is reserved by the negotiation protocol"
+            )
+        unknown_tools = set(declarations) - set(negotiation.allowed_tools)
+        if unknown_tools:
+            raise ValueError(
+                "tools are not policy authorized: "
+                + ", ".join(sorted(unknown_tools))
+            )
+        missing_handlers = set(declarations) - set(tool_handlers)
+        if missing_handlers:
+            raise ValueError(
+                "read-only tools have no handler: "
+                + ", ".join(sorted(missing_handlers))
+            )
+        extra_handlers = set(tool_handlers) - set(declarations)
+        if extra_handlers:
+            raise ValueError(
+                "handlers exist without declarations: "
+                + ", ".join(sorted(extra_handlers))
+            )
+        decision_declaration = {
+            "type": "function",
+            "name": "propose_edit_decision",
+            "description": (
+                "Propose one semantic preference over immutable, locally "
+                "executable option IDs. This does not commit or render."
+            ),
+            "parameters": gemini_response_schema(EditDecisionProposal),
+        }
+        tools = [
+            {
+                "type": "function",
+                "name": item.name,
+                "description": item.description,
+                "parameters": dict(item.parameters),
+            }
+            for item in tool_declarations
+        ] + [decision_declaration]
+        allowed_names = [item["name"] for item in tools]
+        run_dir.mkdir(parents=True, exist_ok=True)
+        input_value: Any = [
+            {
+                "type": "text",
+                "text": (
+                    prompt
+                    + "\n\nOnly choose from these immutable option IDs:\n"
+                    + json.dumps(known_options, ensure_ascii=False)
+                    + "\nUse read-only tools only when supplied facts are "
+                    "insufficient. End by calling propose_edit_decision."
+                ),
+            }
+        ]
+        previous_interaction_id: str | None = None
+        interaction_ids: list[str] = []
+        tool_call_ids: list[str] = []
+        tool_result_hashes: list[str] = []
+        total_rounds = negotiation.max_tool_result_rounds
+        for round_number in range(1, total_rounds + 1):
+            request_record: dict[str, Any] = {
+                "model": self.model_id,
+                "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+                # Stateful context is bounded to this at-most-two-round
+                # negotiation. All request/response artifacts are also local.
+                "store": True,
+                "input": input_value,
+                "tools": tools,
+                "generation_config": {
+                    "thinking_level": (
+                        policy.gemini_limits.semantic_negotiation.thinking_level
+                    ),
+                    "max_output_tokens": (
+                        policy.gemini_limits.semantic_negotiation.max_output_tokens
+                    ),
+                    "tool_choice": {
+                        "allowed_tools": {
+                            "mode": "any",
+                            "tools": allowed_names,
+                        }
+                    },
+                },
+            }
+            if previous_interaction_id is not None:
+                request_record["previous_interaction_id"] = (
+                    previous_interaction_id
+                )
+            write_json(
+                run_dir / f"semantic_negotiation.round-{round_number}.request.json",
+                request_record,
+            )
+            text_tokens = max(
+                256,
+                len(
+                    json.dumps(
+                        input_value,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                // 4,
+            )
+            reservation = self.budget_ledger.reserve(
+                estimate_paid_call(
+                    stage="semantic_negotiation",
+                    model_id=self.model_id,
+                    text_input_tokens=text_tokens,
+                    max_output_tokens=(
+                        policy.gemini_limits.semantic_negotiation.max_output_tokens
+                    ),
+                    thinking_level=(
+                        policy.gemini_limits.semantic_negotiation.thinking_level
+                    ),
+                ),
+                recovery_call=recovery_call,
+            )
+            try:
+                interaction = self.client.interactions.create(**request_record)
+            except Exception:
+                # Dispatch status is unknown once the SDK call begins. Keep
+                # the worst-case reservation active so a 429/503/transport
+                # failure cannot silently restore budget and trigger another
+                # paid attempt later in the run.
+                raise
+            raw_interaction, _ = _record_interaction_attempt(
+                run_dir=run_dir,
+                operation=f"semantic_negotiation_round_{round_number}",
+                canonical_filename=(
+                    f"semantic_negotiation.round-{round_number}."
+                    "raw_interaction.json"
+                ),
+                interaction=interaction,
+            )
+            if reservation is not None:
+                self.budget_ledger.reconcile(
+                    reservation.reservation_id,
+                    usage=raw_interaction.get("usage") or {},
+                    model_id=self.model_id,
+                )
+            interaction_id = str(getattr(interaction, "id", "") or "")
+            if not interaction_id:
+                raise ValueError("semantic negotiation response has no ID")
+            interaction_ids.append(interaction_id)
+            calls = _interaction_function_calls(interaction)
+            if not calls:
+                raise ValueError(
+                    "semantic negotiation returned no declared function call"
+                )
+            proposal_calls = [
+                call
+                for call in calls
+                if call["name"] == "propose_edit_decision"
+            ]
+            inspection_calls = [
+                call
+                for call in calls
+                if call["name"] != "propose_edit_decision"
+            ]
+            if proposal_calls and inspection_calls:
+                raise ValueError(
+                    "decision cannot be parallel with inspection tool calls"
+                )
+            if len(proposal_calls) > 1:
+                raise ValueError("semantic negotiation proposed multiple decisions")
+            tool_call_ids.extend(str(call["id"]) for call in calls)
+            if proposal_calls:
+                proposal = EditDecisionProposal.model_validate(
+                    proposal_calls[0]["arguments"]
+                )
+                if proposal.beat_id != beat_id:
+                    raise ValueError("semantic decision beat ID changed")
+                proposed_ids = (
+                    proposal.selected_option_id,
+                    *proposal.fallback_option_ids,
+                )
+                invalid_ids = set(proposed_ids) - set(known_options)
+                if invalid_ids:
+                    raise ValueError(
+                        "semantic decision invented option IDs: "
+                        + ", ".join(sorted(invalid_ids))
+                    )
+                result = BoundedSemanticNegotiationResult(
+                    decision=proposal,
+                    interaction_ids=tuple(interaction_ids),
+                    tool_call_ids=tuple(tool_call_ids),
+                    tool_result_hashes=tuple(tool_result_hashes),
+                    rounds_used=round_number,
+                )
+                write_json(run_dir / "semantic_negotiation.json", result)
+                return result
+            if round_number >= total_rounds:
+                raise ValueError(
+                    "semantic negotiation exhausted its tool-result rounds"
+                )
+            if (
+                len(inspection_calls)
+                > negotiation.max_parallel_read_only_calls
+            ):
+                raise ValueError(
+                    "semantic negotiation exceeded parallel read-only call cap"
+                )
+            function_results: list[dict[str, Any]] = []
+            for call in inspection_calls:
+                name = str(call["name"])
+                if name not in declarations:
+                    raise ValueError(f"model called undeclared tool: {name}")
+                result_payload = tool_handlers[name](call["arguments"])
+                result_hash = _canonical_json_sha256(result_payload)
+                tool_result_hashes.append(result_hash)
+                function_results.append(
+                    {
+                        "type": "function_result",
+                        "name": name,
+                        "call_id": str(call["id"]),
+                        "result": json.dumps(
+                            {
+                                "artifact_sha256": result_hash,
+                                "result": result_payload,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    }
+                )
+            write_json(
+                run_dir
+                / f"semantic_negotiation.round-{round_number}.tool_results.json",
+                function_results,
+            )
+            input_value = function_results
+            previous_interaction_id = interaction_id
+        raise AssertionError("bounded semantic negotiation did not terminate")
 
     def suggest_targets(
         self,

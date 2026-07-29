@@ -234,6 +234,35 @@ def test_best_effort_shortens_total_without_accidental_freeze() -> None:
     assert result.selections[0].option.presentation_mode != "intentional_freeze"
 
 
+def test_panel_runtime_fraction_is_a_sequence_hard_gate() -> None:
+    result = optimize_sequence(
+        [
+            BeatOptionSet(
+                beat_id="comparison",
+                priority="hard",
+                options=(
+                    _option(
+                        "panel",
+                        "comparison",
+                        duration_ms=30_000,
+                        presentation="two_panel_layout",
+                    ),
+                ),
+            )
+        ],
+        policy=_policy(
+            target_ms=30_000,
+            min_ms=30_000,
+            max_ms=31_000,
+        ),
+    )
+
+    assert result.outcome == "blocked"
+    assert result.hard_failure_codes == (
+        "panel_runtime_fraction_exceeded",
+    )
+
+
 def test_intentional_freeze_requires_exact_event_lock() -> None:
     with pytest.raises(ValidationError, match="exact event lock"):
         _option(
