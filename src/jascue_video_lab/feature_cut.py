@@ -3713,11 +3713,22 @@ def _required_track_union(
     low_confidence_region_ids: list[str] = []
     for label, track in zip(labels, tracks, strict=True):
         diagnostics = _track_confidence_diagnostics(track)
+        bridged = _bounded_track_gap_bridges(track)
+        bridged_low_confidence_count = sum(
+            sample.analysis_sample_time_ms in bridged
+            and sample.tracking_state == TrackingState.LOW_CONFIDENCE
+            for sample in track.samples
+        )
+        blocking_low_confidence_count = max(
+            0,
+            int(diagnostics["low_confidence_sample_count"])
+            - bridged_low_confidence_count,
+        )
         low_confidence_required_sample_count += int(
-            diagnostics["low_confidence_sample_count"]
+            blocking_low_confidence_count
         )
         required_sample_count += int(diagnostics["tracking_sample_count"])
-        if not diagnostics["tracking_confidence_gate_passed"]:
+        if blocking_low_confidence_count:
             low_confidence_region_ids.append(label)
         usable = {
             sample.analysis_sample_time_ms: [
@@ -3727,6 +3738,7 @@ def _required_track_union(
             if sample.tracking_state in usable_states
             and sample.derived_tracking_box is not None
         }
+        usable.update(bridged)
         usable_by_region[label] = usable
         per_region.append(
             {
@@ -3737,7 +3749,15 @@ def _required_track_union(
                 },
                 "usable_sample_count": len(usable),
                 "total_sample_count": len(track.samples),
+                "bridged_sample_count": len(bridged),
+                "bridged_sample_times_ms": sorted(bridged),
+                "blocking_low_confidence_sample_count": (
+                    blocking_low_confidence_count
+                ),
                 **diagnostics,
+                "tracking_confidence_gate_passed": (
+                    blocking_low_confidence_count == 0
+                ),
             }
         )
 
@@ -3841,6 +3861,137 @@ def _required_track_union(
     return times, centers, boxes, coverage
 
 
+def _normalized_box_iou(
+    first: Sequence[int | float],
+    second: Sequence[int | float],
+) -> float:
+    first_x_min, first_y_min, first_x_max, first_y_max = (
+        float(value) for value in first
+    )
+    second_x_min, second_y_min, second_x_max, second_y_max = (
+        float(value) for value in second
+    )
+    intersection_width = max(
+        0.0,
+        min(first_x_max, second_x_max)
+        - max(first_x_min, second_x_min),
+    )
+    intersection_height = max(
+        0.0,
+        min(first_y_max, second_y_max)
+        - max(first_y_min, second_y_min),
+    )
+    intersection = intersection_width * intersection_height
+    first_area = (first_x_max - first_x_min) * (
+        first_y_max - first_y_min
+    )
+    second_area = (second_x_max - second_x_min) * (
+        second_y_max - second_y_min
+    )
+    return intersection / max(1e-6, first_area + second_area - intersection)
+
+
+def _bounded_track_gap_bridges(
+    track: SegmentationTrack,
+) -> dict[int, list[int]]:
+    """Interpolate only short, geometrically consistent tracker state gaps."""
+
+    samples = sorted(
+        track.samples,
+        key=lambda sample: sample.analysis_sample_time_ms,
+    )
+    tracked_indexes = [
+        index
+        for index, sample in enumerate(samples)
+        if sample.tracking_state == TrackingState.TRACKED
+        and sample.derived_tracking_box is not None
+    ]
+    analysis_fps = getattr(track, "analysis_fps", None)
+    if isinstance(analysis_fps, (int, float)) and analysis_fps > 0:
+        expected_interval_ms = 1000 / float(analysis_fps)
+    else:
+        sample_deltas = sorted(
+            following.analysis_sample_time_ms
+            - current.analysis_sample_time_ms
+            for current, following in zip(
+                samples[:-1],
+                samples[1:],
+                strict=True,
+            )
+            if following.analysis_sample_time_ms
+            > current.analysis_sample_time_ms
+        )
+        if not sample_deltas:
+            return {}
+        expected_interval_ms = sample_deltas[len(sample_deltas) // 2]
+    bridged: dict[int, list[int]] = {}
+    allowed_gap_states = {
+        TrackingState.LOW_CONFIDENCE,
+        TrackingState.DRIFT_SUSPECTED,
+    }
+    for before_index, after_index in zip(
+        tracked_indexes[:-1],
+        tracked_indexes[1:],
+        strict=True,
+    ):
+        gap = samples[before_index + 1 : after_index]
+        if not gap or len(gap) > 2:
+            continue
+        before = samples[before_index]
+        after = samples[after_index]
+        assert (
+            before.derived_tracking_box is not None
+            and after.derived_tracking_box is not None
+        )
+        if (
+            after.analysis_sample_time_ms - before.analysis_sample_time_ms
+            > expected_interval_ms * 3.25 + 35
+            or any(
+                sample.tracking_state not in allowed_gap_states
+                or sample.derived_tracking_box is None
+                for sample in gap
+            )
+            or _normalized_box_iou(
+                before.derived_tracking_box,
+                after.derived_tracking_box,
+            )
+            < 0.85
+        ):
+            continue
+        interpolated: dict[int, list[int]] = {}
+        gap_consistent = True
+        elapsed = (
+            after.analysis_sample_time_ms
+            - before.analysis_sample_time_ms
+        )
+        for sample in gap:
+            progress = (
+                sample.analysis_sample_time_ms
+                - before.analysis_sample_time_ms
+            ) / elapsed
+            box = [
+                round(
+                    float(start)
+                    + (float(end) - float(start)) * progress
+                )
+                for start, end in zip(
+                    before.derived_tracking_box,
+                    after.derived_tracking_box,
+                    strict=True,
+                )
+            ]
+            if _normalized_box_iou(
+                sample.derived_tracking_box,
+                box,
+            ) < 0.75:
+                gap_consistent = False
+                break
+            interpolated[sample.analysis_sample_time_ms] = box
+        if gap_consistent:
+            bridged.update(interpolated)
+    return bridged
+
+
 def _aligned_required_region_boxes(
     tracks: Sequence[SegmentationTrack],
     times: Sequence[float],
@@ -3859,6 +4010,7 @@ def _aligned_required_region_boxes(
             if sample.tracking_state == TrackingState.TRACKED
             and sample.derived_tracking_box is not None
         }
+        | _bounded_track_gap_bridges(track)
         for track in tracks
     ]
     aligned: list[list[list[int]]] = []
@@ -3973,6 +4125,14 @@ def _soft_extent_visibility_audit(
             if sample.tracking_state == TrackingState.TRACKED
             and sample.derived_tracking_box is not None
         }
+        boxes_by_relative_ms.update(
+            {
+                time_ms - track.analysis_start_ms: box
+                for time_ms, box in _bounded_track_gap_bridges(
+                    track
+                ).items()
+            }
+        )
         fractions: list[float] = []
         clipped_edges: set[str] = set()
         missing_samples = 0

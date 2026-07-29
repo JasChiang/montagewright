@@ -4609,7 +4609,11 @@ def test_required_track_union_fails_closed_on_any_low_confidence_sample() -> Non
                 if index == 5
                 else TrackingState.TRACKED
             ),
-            derived_tracking_box=[300, 100, 600, 900],
+            derived_tracking_box=(
+                [0, 0, 100, 100]
+                if index == 5
+                else [300, 100, 600, 900]
+            ),
         )
         for index in range(10)
     ]
@@ -4639,6 +4643,64 @@ def test_required_track_union_fails_closed_on_any_low_confidence_sample() -> Non
     assert audit["fallback_reason"] == "required_region_tracking_confidence_failed"
     assert "required_region_low_confidence" in audit["risk_codes"]
     assert audit["requires_gemini_review"] is True
+
+
+def test_required_track_union_bridges_short_consistent_confidence_gap() -> None:
+    states = [
+        TrackingState.TRACKED,
+        TrackingState.TRACKED,
+        TrackingState.LOW_CONFIDENCE,
+        TrackingState.DRIFT_SUSPECTED,
+        TrackingState.TRACKED,
+        TrackingState.TRACKED,
+    ]
+    boxes = [
+        [548, 202, 838, 1000],
+        [548, 202, 838, 1000],
+        [552, 256, 834, 1000],
+        [548, 204, 838, 1000],
+        [548, 202, 836, 1000],
+        [548, 200, 836, 1000],
+    ]
+    track = SimpleNamespace(
+        analysis_start_ms=0,
+        analysis_end_ms=3000,
+        analysis_fps=2.0,
+        seed_time_ms=1000,
+        semantic_seed_box=boxes[2],
+        seed_source_width=3840,
+        seed_source_height=2160,
+        analysis_width=960,
+        analysis_height=540,
+        target_description="the required product",
+        state_counts={
+            "tracked": 4,
+            "low_confidence": 1,
+            "drift_suspected": 1,
+        },
+        samples=[
+            SimpleNamespace(
+                analysis_sample_time_ms=index * 500,
+                tracking_state=state,
+                derived_tracking_box=box,
+            )
+            for index, (state, box) in enumerate(
+                zip(states, boxes, strict=True)
+            )
+        ],
+    )
+
+    _, _, _, coverage = _required_track_union([track])  # type: ignore[arg-type]
+    _, audit = _vertical_filter_from_track([track])  # type: ignore[list-item]
+
+    assert coverage["coverage_passed"] is True
+    assert coverage["tracking_confidence_gate_passed"] is True
+    assert coverage["per_region"][0]["bridged_sample_count"] == 2
+    assert coverage["per_region"][0][
+        "blocking_low_confidence_sample_count"
+    ] == 0
+    assert audit["applied_strategy"] == "tracked_crop"
+    assert audit["hard_core_visibility_passed"] is True
 
 
 def test_primary_center_relaxes_margin_but_never_clips_primary_target() -> None:
