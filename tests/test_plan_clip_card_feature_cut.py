@@ -514,6 +514,48 @@ def test_direct_video_canonicalization_only_removes_incomplete_optional_sync() -
     }
 
 
+def test_direct_video_canonicalization_disables_clipping_for_fit() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                },
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "fit_with_background",
+                    "crop_mode": "strict",
+                    "coverage_mode": "simultaneous",
+                    "allow_controlled_clip": True,
+                    "required_entity_indices": [1, 2],
+                    "preferred_entity_indices": [],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [],
+                },
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    vertical = json.loads(canonical)["chapters"][0]["vertical"]
+
+    assert vertical["allow_controlled_clip"] is False
+    assert any(
+        change["json_path"]
+        == "chapters[0].vertical.allow_controlled_clip"
+        and change["rule"]
+        == "fit_with_background_preserves_scope_without_controlled_clipping"
+        for change in changes
+    )
+
+
 def test_direct_video_canonicalization_fails_safe_for_missing_duration_and_attention() -> None:
     payload = {
         "chapters": [

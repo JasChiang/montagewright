@@ -1210,6 +1210,22 @@ def canonicalize_direct_video_edit_plan_output(
                 }
             )
             vertical["crop_mode"] = "primary_center"
+        if (
+            vertical.get("strategy") == "fit_with_background"
+            and vertical.get("allow_controlled_clip") is True
+        ):
+            vertical["allow_controlled_clip"] = False
+            changes.append(
+                {
+                    "json_path": f"{base}.vertical.allow_controlled_clip",
+                    "before": True,
+                    "after": False,
+                    "rule": (
+                        "fit_with_background_preserves_scope_without_"
+                        "controlled_clipping"
+                    ),
+                }
+            )
         if not isinstance(chapter.get("horizontal"), dict):
             fallback_rank = vertical.get("candidate_rank")
             chapter["horizontal"] = {
