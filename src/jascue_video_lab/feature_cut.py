@@ -46,6 +46,7 @@ from .event_lock import (
     bind_editorial_contract_to_selected_evidence,
     bind_grouped_event_lock_ids,
     build_cue_alignment_evidence,
+    exact_event_resolver_binding_sha256,
     load_editorial_beat_contracts,
     write_exact_event_bundle,
 )
@@ -193,6 +194,11 @@ from .editorial_planning import (
     build_attention_profile,
     build_rhythm_plan,
     reconcile_attention_delivery_floor,
+)
+from .sequence_optimizer import (
+    MusicBoundaryCue,
+    MusicBoundarySpec,
+    solve_music_aligned_boundaries,
 )
 from .storage import read_json, utc_now, write_json
 
@@ -2041,7 +2047,7 @@ def _concat_segments(
     output_path: Path,
     *,
     segment_durations_seconds: Sequence[float] | None = None,
-) -> None:
+) -> dict[str, Any]:
     if not segment_paths:
         raise ValueError("cannot concatenate an empty segment list")
     if isinstance(segment_durations_seconds, Mapping):
@@ -2056,6 +2062,8 @@ def _concat_segments(
     inputs: list[str] = []
     filters: list[str] = []
     filter_inputs: list[str] = []
+    maximum_video_padding_seconds = (1 / 30) + 0.005
+    padding_rows: list[dict[str, Any]] = []
     for index, path in enumerate(segment_paths):
         inputs.extend(["-i", str(path.resolve())])
         duration = (
@@ -2065,15 +2073,34 @@ def _concat_segments(
         )
         if duration <= 0:
             raise ValueError("segment durations must be positive")
+        video_duration = _probe_video_duration_seconds(path)
+        padding_required = max(0.0, duration - video_duration)
+        if padding_required > maximum_video_padding_seconds:
+            raise ValueError(
+                "segment video is shorter than its immutable editorial "
+                "duration by more than one output frame; refusing accidental "
+                f"freeze padding for {path}: required={padding_required:.6f}s "
+                f"allowed={maximum_video_padding_seconds:.6f}s"
+            )
+        padding_rows.append(
+            {
+                "segment_path": str(path.resolve()),
+                "editorial_duration_seconds": round(duration, 6),
+                "video_duration_seconds": round(video_duration, 6),
+                "clone_padding_seconds": round(padding_required, 6),
+                "within_one_frame_encoder_tolerance": True,
+            }
+        )
         # The concat filter requires every input to start at timestamp zero.
         # Segment renderers may preserve a source time base or differ by one
-        # frame/AAC packet at their tails, so normalize both streams and pad
-        # only up to the immutable editorial duration before concatenating.
+        # output frame/AAC packet at their tails.  Normalize both streams and
+        # allow only that one-frame encoder tolerance; longer holds require an
+        # explicit intentional-freeze presentation with event/cue authority.
         filters.extend(
             [
                 (
                     f"[{index}:v:0]fps=30,setpts=PTS-STARTPTS,"
-                    f"tpad=stop_mode=clone:stop_duration=1,"
+                    "tpad=stop_mode=clone:stop_duration=0.038334,"
                     f"trim=duration={duration:.6f},setpts=PTS-STARTPTS[v{index}]"
                 ),
                 (
@@ -2155,6 +2182,14 @@ def _concat_segments(
         ]
     )
     temporary_path.replace(output_path)
+    return {
+        "contract_version": "concat-padding-audit-v1",
+        "output_path": str(output_path.resolve()),
+        "maximum_padding_seconds": round(maximum_video_padding_seconds, 6),
+        "segments": padding_rows,
+        "unauthorized_concat_padding_count": 0,
+        "audited": True,
+    }
 
 
 def _output_media_metadata(path: Path) -> dict[str, Any]:
@@ -2210,6 +2245,32 @@ def _probe_duration_seconds(path: Path) -> float:
         text=True,
     )
     return float(json.loads(completed.stdout)["format"]["duration"])
+
+
+def _probe_video_duration_seconds(path: Path) -> float:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    streams = json.loads(completed.stdout).get("streams", [])
+    if not streams or streams[0].get("duration") in {None, "N/A"}:
+        # Format duration is a conservative fallback for containers that omit
+        # per-stream duration metadata.  It never authorizes extra clone time.
+        return _probe_duration_seconds(path)
+    return float(streams[0]["duration"])
 
 
 def _segment_is_valid(
@@ -8128,6 +8189,7 @@ def _resolved_autonomous_relation_mode(
     relation_mode: str,
     *,
     presentation_preference: str = "",
+    panel_semantically_admissible: bool = False,
 ) -> Literal[
     "single_subject",
     "sequential_focus",
@@ -8141,7 +8203,10 @@ def _resolved_autonomous_relation_mode(
         # canvas unless the semantic plan explicitly selects two-panel.
         return (
             "context_detail"
-            if presentation_preference == "two_panel_layout"
+            if (
+                presentation_preference == "two_panel_layout"
+                or panel_semantically_admissible
+            )
             else "single_subject"
         )
     if relation_mode == "sequential":
@@ -8219,6 +8284,11 @@ def _candidate_capability_boundaries(
         candidate_family.add("two_panel_layout")
     if semantic_beat is None:
         return tuple(sorted(candidate_family)), ()
+    if (
+        getattr(semantic_beat, "panel_target_groups", ())
+        and "two_panel_layout" in semantic_beat.acceptable_capability_ids
+    ):
+        candidate_family.add("two_panel_layout")
 
     beat_acceptable = set(semantic_beat.acceptable_capability_ids)
     known_capabilities = (
@@ -8360,10 +8430,17 @@ def _project_feature_semantic_edit_ir(
                 )
             )
         ) or ("static_full_bleed_crop", "tracked_full_bleed_crop")
-        if (
+        panel_semantically_admissible = bool(
             primary is not None
-            and primary.physical_scale_comparison
             and len(visibility_targets) == 2
+            and (
+                primary.physical_scale_comparison
+                or primary.presentation_goal in {"compare", "context_detail"}
+                or primary.presentation_preference == "two_panel_layout"
+            )
+        )
+        if (
+            panel_semantically_admissible
             and "two_panel_layout" not in capability_ids
         ):
             capability_ids = (*capability_ids, "two_panel_layout")
@@ -8372,11 +8449,7 @@ def _project_feature_semantic_edit_ir(
             if (
                 len(visibility_targets) == 2
                 and primary is not None
-                and (
-                    primary.presentation_preference
-                    == "two_panel_layout"
-                    or primary.physical_scale_comparison
-                )
+                and panel_semantically_admissible
             )
             else ()
         )
@@ -8849,6 +8922,10 @@ def _runtime_scope_preserving_presentation_fallback(
             relation_mode=_resolved_autonomous_relation_mode(
                 relation_mode,
                 presentation_preference=presentation_preference,
+                panel_semantically_admissible=bool(
+                    semantic_beat is not None
+                    and getattr(semantic_beat, "panel_target_groups", ())
+                ),
             ),
             policy=policy,
             physical_scale_comparison=physical_scale_comparison,
@@ -9104,6 +9181,10 @@ def _vertical_candidate_geometry(
             resolved_relation_mode = _resolved_autonomous_relation_mode(
                 relation_mode,
                 presentation_preference=presentation_preference,
+                panel_semantically_admissible=bool(
+                    semantic_beat is not None
+                    and getattr(semantic_beat, "panel_target_groups", ())
+                ),
             )
             if presentation_preference == "solid_matte_fit":
                 resolved_relation_mode = "single_subject"
@@ -9127,6 +9208,11 @@ def _vertical_candidate_geometry(
                     targets=presentation_targets,
                     phases=camera_phases,
                 )
+            )
+            movement_motivated = movement_motivated or bool(
+                semantic_beat is not None
+                and semantic_beat.attention_intent.motion_motivation
+                != "none"
             )
             source_camera_motion_evidence = measure_source_camera_motion(
                 source_path=Path(clip.path),
@@ -9181,12 +9267,13 @@ def _vertical_candidate_geometry(
                     }
                 ),
                 panel_semantically_admissible=(
-                    presentation_preference == "two_panel_layout"
-                    and (
-                        semantic_beat is None
-                        or "two_panel_layout"
+                    (
+                        semantic_beat is not None
+                        and bool(semantic_beat.panel_target_groups)
+                        and "two_panel_layout"
                         in semantic_beat.acceptable_capability_ids
                     )
+                    or presentation_preference == "two_panel_layout"
                 ),
                 panel_target_groups=(
                     semantic_beat.panel_target_groups
@@ -9707,6 +9794,14 @@ def _vertical_candidate_geometry(
                     )
                 )
             ):
+                whole_source_motion_evidence = measure_source_camera_motion(
+                    source_path=Path(clip.path),
+                    source_asset_id=f"sha256:{clip.sha256}",
+                    window_start_ms=start_ms,
+                    window_end_ms=end_ms,
+                    subject_tracks=(),
+                    output_dir=output_dir / "source-camera-motion",
+                )
                 whole_source_compilation = compile_presentation(
                     targets=(
                         PresentationTarget(
@@ -9726,6 +9821,9 @@ def _vertical_candidate_geometry(
                     policy=autonomous_policy,
                     allow_static_full_bleed=True,
                     tracking_available=False,
+                    source_camera_motion_evidence=(
+                        whole_source_motion_evidence
+                    ),
                     preferred_capability_ids=("solid_matte_fit",),
                     acceptable_capability_ids=("solid_matte_fit",),
                 )
@@ -9755,6 +9853,21 @@ def _vertical_candidate_geometry(
                         ],
                         "presentation_compilation": (
                             whole_source_compilation.model_dump(mode="json")
+                        ),
+                        "source_camera_motion_evidence": (
+                            whole_source_motion_evidence.model_dump(
+                                mode="json"
+                            )
+                        ),
+                        "source_camera_motion_measured": True,
+                        "source_camera_motion_detected": (
+                            whole_source_motion_evidence.classification
+                        ),
+                        "source_camera_motion_reliable": (
+                            whole_source_motion_evidence.reliable
+                        ),
+                        "source_camera_motion_evidence_sha256": (
+                            whole_source_motion_evidence.definition_sha256
                         ),
                         "paid_model_calls_added": 0,
                         "framing_regions": [],
@@ -10594,6 +10707,7 @@ def _refine_selected_vertical_candidate(
         proposal=proposal,
     )
     refined = dict(option_data)
+    refined.setdefault("evidence_provenance", "unknown")
     refined["source_asset_id"] = source_asset_id
     refined["event_id"] = event_id
     refined["framing_refinement"] = {
@@ -10661,6 +10775,7 @@ def _refine_selected_vertical_candidate(
                     "event_id",
                     "frame_id",
                     "observed_visual_evidence",
+                    "evidence_provenance",
                     "selection_reason",
                     "strategy",
                     "crop_mode",
@@ -10725,6 +10840,7 @@ def _vertical_runtime_candidate_options(
             "event_id": None,
             "frame_id": selected.vertical_frame_id,
             "observed_visual_evidence": selected.observed_visual_evidence,
+            "evidence_provenance": selected.evidence_provenance,
             "selection_reason": selected.selection_reason,
             "strategy": selected.vertical_strategy,
             "crop_mode": "strict",
@@ -10800,6 +10916,19 @@ def _bind_runtime_candidate_coverage(
     """Bind one Top-K option to its own entity-backed coverage obligation."""
 
     bound = dict(option)
+    if evidence_event is not None:
+        evidence_provenance = str(
+            evidence_event.get("evidence_provenance") or "unknown"
+        )
+        planned_provenance = str(
+            bound.get("evidence_provenance") or "unknown"
+        )
+        if planned_provenance not in {"unknown", evidence_provenance}:
+            raise ValueError(
+                "candidate evidence provenance differs from the immutable "
+                "selected Clip Card event"
+            )
+        bound["evidence_provenance"] = evidence_provenance
     raw_regions = list(bound.get("regions") or [])
     if raw_regions:
         regions = [
@@ -10989,6 +11118,8 @@ def _bind_runtime_candidate_coverage(
 
 def _load_runtime_candidate_evidence_events(
     plan_dir: Path,
+    *,
+    require_provenance: bool = False,
 ) -> dict[tuple[str, str], Mapping[str, Any]]:
     """Load the already hash-validated selected Clip Card event snapshot."""
 
@@ -10996,13 +11127,29 @@ def _load_runtime_candidate_evidence_events(
     if not path.is_file():
         return {}
     payload = read_json(path)
+    contract_version = (
+        payload.get("contract_version")
+        if isinstance(payload, Mapping)
+        else None
+    )
+    supported_versions = {
+        "clip-card-feature-cut-selected-evidence-v1",
+        "clip-card-feature-cut-selected-evidence-v2",
+    }
     if (
         not isinstance(payload, Mapping)
-        or payload.get("contract_version")
-        != "clip-card-feature-cut-selected-evidence-v1"
+        or contract_version not in supported_versions
         or not isinstance(payload.get("events"), list)
     ):
         raise ValueError("selected Clip Card evidence has an unsupported contract")
+    if (
+        require_provenance
+        and contract_version
+        != "clip-card-feature-cut-selected-evidence-v2"
+    ):
+        raise ValueError(
+            "autonomous editing requires provenance-aware selected evidence v2"
+        )
     events: dict[tuple[str, str], Mapping[str, Any]] = {}
     for event in payload["events"]:
         if not isinstance(event, Mapping):
@@ -11011,6 +11158,15 @@ def _load_runtime_candidate_evidence_events(
         event_id = event.get("event_id")
         if not isinstance(source_asset_id, str) or not isinstance(event_id, str):
             raise ValueError("selected Clip Card evidence event lacks immutable IDs")
+        if require_provenance:
+            evidence_provenance = event.get("evidence_provenance")
+            if not isinstance(evidence_provenance, str) or (
+                evidence_provenance == "unknown"
+            ):
+                raise ValueError(
+                    "autonomous selected evidence has unknown provenance: "
+                    f"{source_asset_id}/{event_id}"
+                )
         key = (source_asset_id, event_id)
         if key in events:
             raise ValueError(f"duplicate selected Clip Card evidence event: {key}")
@@ -13351,11 +13507,6 @@ def _resolve_editorial_chapter_durations(
 
     boundary_audit: list[dict[str, Any]] = []
     snapped_boundaries_ms: list[int] | None = None
-    capped_feature_ids = {
-        feature_id
-        for feature_id, allocated in allocated_ms.items()
-        if feature_id in capacity_ms and allocated >= capacity_ms[feature_id]
-    } | set(fixed_ms)
     if music_lock is not None and len(unsnapped) > 1:
         music_lock_prefix_used = (
             allow_music_lock_prefix
@@ -13379,200 +13530,107 @@ def _resolve_editorial_chapter_durations(
             )
             if cue.kind in {"section_boundary", "downbeat", "accent", "ending_hit"}
         ]
-        proposed_boundaries: list[int] = []
-        running_ms = 0
-        for _, _, _, seconds in unsnapped[:-1]:
-            running_ms += round(seconds * 1000)
-            proposed_boundaries.append(running_ms)
-        snapped_boundaries_ms = []
-        previous = 0
-        for boundary_index, proposed_ms in enumerate(proposed_boundaries):
-            remaining_minimum_ms = sum(
-                minimum_ms.get(item[0].feature_id, 750)
-                for item in unsnapped[boundary_index + 1 :]
+        specs: list[MusicBoundarySpec] = []
+        for selected, _, _, seconds in unsnapped:
+            feature_id = selected.feature_id
+            fixed = feature_id in fixed_ms
+            preferred_ms = round(seconds * 1000)
+            specs.append(
+                MusicBoundarySpec(
+                    beat_id=feature_id,
+                    preferred_duration_ms=preferred_ms,
+                    minimum_duration_ms=(
+                        preferred_ms
+                        if fixed
+                        else minimum_ms.get(feature_id, 1)
+                    ),
+                    maximum_duration_ms=(
+                        preferred_ms
+                        if fixed
+                        else capacity_ms.get(feature_id, target_duration_ms)
+                    ),
+                    boundary_priority=(
+                        rhythm_by_id[feature_id].boundary_priority
+                        if feature_id in rhythm_by_id
+                        else "normal"
+                    ),
+                    boundary_alignment=(
+                        rhythm_by_id[feature_id].boundary_alignment
+                        if feature_id in rhythm_by_id
+                        else "free"
+                    ),
+                    semantic_music_target=(
+                        selected.flow_intent.music_target
+                        if selected.flow_intent is not None
+                        else None
+                    ),
+                )
             )
-            latest_ms = target_duration_ms - remaining_minimum_ms
-            current_feature_id = unsnapped[boundary_index][0].feature_id
-            next_feature_id = unsnapped[boundary_index + 1][0].feature_id
-            current_capacity_ms = capacity_ms.get(
-                current_feature_id,
-                target_duration_ms,
-            )
-            remaining_capacity_ms = sum(
-                capacity_ms.get(item[0].feature_id, target_duration_ms)
-                for item in unsnapped[boundary_index + 1 :]
-            )
-            boundary_priority = (
-                rhythm_by_id[current_feature_id].boundary_priority
-                if current_feature_id in rhythm_by_id
-                else "normal"
-            )
-            boundary_alignment = (
-                rhythm_by_id[current_feature_id].boundary_alignment
-                if current_feature_id in rhythm_by_id
-                else "free"
-            )
-            semantic_music_target = (
-                unsnapped[boundary_index][0].flow_intent.music_target
-                if unsnapped[boundary_index][0].flow_intent is not None
-                else None
-            )
+        solution = solve_music_aligned_boundaries(
+            specs,
+            [
+                MusicBoundaryCue(
+                    cue_id=cue.cue_id,
+                    time_ms=cue.time_ms,
+                    kind=cue.kind,
+                    strength=cue.strength,
+                )
+                for cue in cue_candidates
+            ],
+            total_duration_ms=target_duration_ms,
+        )
+        snapped_boundaries_ms = [
+            selection.resolved_boundary_ms
+            for selection in solution.selections
+        ]
+        for index, selection in enumerate(solution.selections):
+            spec = specs[index]
             semantic_preferred_cue_kinds = {
-                "phrase_start": {
-                    "section_boundary",
-                    "downbeat",
-                },
-                "phrase_end": {
-                    "section_boundary",
-                    "ending_hit",
-                },
+                "phrase_start": {"section_boundary", "downbeat"},
+                "phrase_end": {"section_boundary", "ending_hit"},
                 "downbeat": {"downbeat"},
                 "accent": {"accent"},
                 "section_change": {"section_boundary"},
-            }.get(semantic_music_target, set())
-            snap_window_ms = {
-                "low": 250,
-                "normal": 450,
-                "high": 650,
-            }[boundary_priority]
-            if boundary_alignment == "content_locked":
-                snap_window_ms = 0
-                allowed_cue_kinds: set[str] = set()
-            elif boundary_alignment == "phrase_preferred":
-                snap_window_ms = max(snap_window_ms, 650)
-                allowed_cue_kinds = {"section_boundary", "downbeat", "ending_hit"}
-            elif boundary_alignment == "accent_preferred":
-                snap_window_ms = max(snap_window_ms, 650)
-                allowed_cue_kinds = {
-                    "section_boundary",
-                    "downbeat",
-                    "accent",
-                    "ending_hit",
-                }
-            else:
-                allowed_cue_kinds = (
-                    {"section_boundary", "downbeat"}
-                    if boundary_priority == "low"
-                    else {
-                        "section_boundary",
-                        "downbeat",
-                        "accent",
-                        "ending_hit",
-                    }
-                )
-            eligible = [
-                cue
-                for cue in cue_candidates
-                if (
-                    current_feature_id not in capped_feature_ids
-                    and next_feature_id not in capped_feature_ids
-                    and previous
-                    + minimum_ms.get(current_feature_id, 750)
-                    <= cue.time_ms
-                    <= latest_ms
-                    and cue.kind in allowed_cue_kinds
-                    and abs(cue.time_ms - proposed_ms) <= snap_window_ms
-                    and cue.time_ms - previous <= current_capacity_ms
-                    and target_duration_ms - cue.time_ms
-                    <= remaining_capacity_ms
-                )
-            ]
-            if eligible:
-                chosen = min(
-                    eligible,
-                    key=lambda cue: (
-                        (
-                            0
-                            if cue.kind in semantic_preferred_cue_kinds
-                            else 1
-                        ),
-                        0 if cue.kind == "section_boundary" else 1,
-                        0 if cue.kind == "downbeat" else 1,
-                        abs(cue.time_ms - proposed_ms),
-                        -cue.strength,
-                        cue.time_ms,
-                    ),
-                )
-                applied_ms = chosen.time_ms
-                cue_id = chosen.cue_id
-                cue_kind = chosen.kind
-            else:
-                applied_ms = proposed_ms
-                cue_id = None
-                cue_kind = None
-            snapped_boundaries_ms.append(applied_ms)
+            }.get(spec.semantic_music_target, set())
             boundary_audit.append(
                 {
-                    "boundary_after_feature_id": unsnapped[boundary_index][
-                        0
-                    ].feature_id,
-                    "gemini_relative_boundary_ms": proposed_ms,
-                    "resolved_boundary_ms": applied_ms,
-                    "snap_delta_ms": applied_ms - proposed_ms,
-                    "music_cue_id": cue_id,
-                    "music_cue_kind": cue_kind,
-                    "rhythm_boundary_priority": boundary_priority,
-                    "flow_boundary_alignment": boundary_alignment,
-                    "semantic_music_target": semantic_music_target,
+                    "boundary_after_feature_id": (
+                        selection.boundary_after_beat_id
+                    ),
+                    "gemini_relative_boundary_ms": (
+                        selection.preferred_boundary_ms
+                    ),
+                    "resolved_boundary_ms": selection.resolved_boundary_ms,
+                    "snap_delta_ms": selection.snap_delta_ms,
+                    "music_cue_id": selection.cue_id,
+                    "music_cue_kind": selection.cue_kind,
+                    "rhythm_boundary_priority": spec.boundary_priority,
+                    "flow_boundary_alignment": spec.boundary_alignment,
+                    "semantic_music_target": spec.semantic_music_target,
                     "semantic_cue_kind_matched": (
-                        cue_kind in semantic_preferred_cue_kinds
-                        if cue_kind is not None
+                        selection.cue_kind in semantic_preferred_cue_kinds
+                        if selection.cue_kind is not None
                         and semantic_preferred_cue_kinds
                         else None
                     ),
-                    "rhythm_snap_window_ms": snap_window_ms,
+                    "rhythm_snap_window_ms": {
+                        "low": 250,
+                        "normal": 450,
+                        "high": 650,
+                    }[spec.boundary_priority],
+                    "music_snap_applied": selection.snap_applied,
+                    "music_snap_rejected_reason": (
+                        None
+                        if selection.snap_applied
+                        else (
+                            "content_locked"
+                            if spec.boundary_alignment == "content_locked"
+                            else "no_globally_feasible_cue_in_window"
+                        )
+                    ),
+                    "joint_boundary_solver": True,
                 }
             )
-            previous = applied_ms
-
-        candidate_boundaries = [
-            0,
-            *snapped_boundaries_ms,
-            target_duration_ms,
-        ]
-        capacity_violations: list[dict[str, Any]] = []
-        for index, (start_ms, end_ms) in enumerate(
-            zip(
-                candidate_boundaries[:-1],
-                candidate_boundaries[1:],
-                strict=True,
-            )
-        ):
-            feature_id = unsnapped[index][0].feature_id
-            chapter_ms = end_ms - start_ms
-            feature_capacity_ms = capacity_ms.get(feature_id, target_duration_ms)
-            feature_minimum_ms = minimum_ms.get(feature_id, 1)
-            if (
-                chapter_ms < feature_minimum_ms
-                or chapter_ms > feature_capacity_ms
-            ):
-                capacity_violations.append(
-                    {
-                        "feature_id": feature_id,
-                        "candidate_duration_ms": chapter_ms,
-                        "attention_minimum_ms": feature_minimum_ms,
-                        "source_capacity_ms": feature_capacity_ms,
-                    }
-                )
-        if capacity_violations:
-            snapped_boundaries_ms = None
-            for row in boundary_audit:
-                row["music_snap_applied"] = False
-                row["music_snap_rejected_reason"] = (
-                    "global_source_capacity_validation_failed"
-                )
-                row["candidate_resolved_boundary_ms"] = row[
-                    "resolved_boundary_ms"
-                ]
-                row["resolved_boundary_ms"] = row[
-                    "gemini_relative_boundary_ms"
-                ]
-                row["snap_delta_ms"] = 0
-                row["source_capacity_violations"] = capacity_violations
-        else:
-            for row in boundary_audit:
-                row["music_snap_applied"] = row["music_cue_id"] is not None
-                row["music_snap_rejected_reason"] = None
 
     resolved: dict[str, float] = {}
     rows: list[dict[str, Any]] = []
@@ -13670,6 +13728,13 @@ def _resolve_editorial_chapter_durations(
             "assembled_output_timeline"
             if output_timeline_cues is not None
             else "locked_source_timeline"
+        ),
+        "joint_boundary_solver_applied": bool(boundary_audit),
+        "music_cue_aligned_boundary_count": sum(
+            bool(row["music_snap_applied"]) for row in boundary_audit
+        ),
+        "music_cue_unaligned_boundary_count": sum(
+            not bool(row["music_snap_applied"]) for row in boundary_audit
         ),
         "project_timeline_end_ms": target_duration_ms,
         "music_boundary_refinements": boundary_audit,
@@ -13831,6 +13896,10 @@ def _run_feature_cut_experiment_impl(
             raise ValueError(
                 "selected-window orchestration requires feature_id on every beat"
             )
+        # Autonomous duration is a policy range, not a command to inflate every
+        # selected window until the preferred target is hit.  Review profiles
+        # retain their explicit CLI opt-in for backward compatibility.
+        allow_shorter_within_delivery_range = True
         # The global semantic planner must choose a candidate event that can
         # actually satisfy the selected-window contracts. Supplying these only
         # after planning lets a visually related but temporally wrong event
@@ -14166,7 +14235,8 @@ def _run_feature_cut_experiment_impl(
                 },
             )
         candidate_evidence_events = _load_runtime_candidate_evidence_events(
-            plan_dir
+            plan_dir,
+            require_provenance=autonomous_profile,
         )
         shot_cache: dict[str, ShotManifest] = {}
         shots_dir = output_dir / "shots"
@@ -14296,7 +14366,9 @@ def _run_feature_cut_experiment_impl(
             ):
                 project_duration_seconds = attention_preferred_seconds
                 duration_resolution_authority = (
-                    "operator_authorized_preferred_dwell_within_delivery_range"
+                    "autonomous_policy_preferred_dwell_within_delivery_range"
+                    if autonomous_profile
+                    else "operator_authorized_preferred_dwell_within_delivery_range"
                 )
             elif attention_maximum_seconds + 0.001 < project_duration_seconds:
                 if attention_maximum_seconds < delivery_floor_seconds:
@@ -14324,8 +14396,10 @@ def _run_feature_cut_experiment_impl(
                     delivery_ceiling_seconds,
                 )
                 duration_resolution_authority = (
-                    "operator_authorized_shorter_attention_maximum"
-        )
+                    "autonomous_policy_shorter_attention_maximum"
+                    if autonomous_profile
+                    else "operator_authorized_shorter_attention_maximum"
+                )
         write_json(attention_path, attention_profile)
         attention_definition_sha256 = _stable_fingerprint(
             attention_profile.model_dump(
@@ -14940,6 +15014,7 @@ def _run_feature_cut_experiment_impl(
                 )
                 candidate_attempts: list[dict[str, Any]] = []
                 deferred_fit: dict[str, Any] | None = None
+                deferred_panel: dict[str, Any] | None = None
                 deferred_full_bleed: dict[str, Any] | None = None
                 deferred_required_scope_fit: dict[str, Any] | None = None
                 selected_vertical: dict[str, Any] | None = None
@@ -16000,12 +16075,37 @@ def _run_feature_cut_experiment_impl(
                                         "evidence_query_v2"
                                     ),
                                 }
+                        applied_presentation = str(
+                            candidate_geometry.get("applied_strategy")
+                            or candidate_geometry.get(
+                                "base_presentation_strategy"
+                            )
+                            or ""
+                        )
+                        defer_constructed = bool(
+                            hard_gate_passed
+                            and autonomous_policy is not None
+                            and applied_presentation
+                            in {
+                                "two_panel_layout",
+                                "solid_matte_fit",
+                                "required_scope_solid_fit",
+                                "fit_with_solid_matte",
+                            }
+                        )
                         attempt.update(
                             {
                                 "decision": (
-                                    "accepted" if hard_gate_passed else "try_next"
+                                    "deferred_constructed_presentation"
+                                    if defer_constructed
+                                    else "accepted"
+                                    if hard_gate_passed
+                                    else "try_next"
                                 ),
                                 "reason_code": (
+                                    "try_natural_top_k_before_constructed_layout"
+                                    if defer_constructed
+                                    else
                                     "all_hard_gates_passed"
                                     if hard_gate_passed
                                     else ",".join(
@@ -16030,7 +16130,7 @@ def _run_feature_cut_experiment_impl(
                         )
                         candidate_attempts.append(attempt)
                         if hard_gate_passed:
-                            selected_vertical = {
+                            accepted_candidate = {
                                 "option": option_data,
                                 "frame": candidate_frame,
                                 "clip": candidate_clip,
@@ -16052,6 +16152,17 @@ def _run_feature_cut_experiment_impl(
                                     geometry_recompile_request
                                 ),
                             }
+                            if defer_constructed:
+                                if (
+                                    applied_presentation
+                                    == "two_panel_layout"
+                                    and deferred_panel is None
+                                ):
+                                    deferred_panel = accepted_candidate
+                                elif deferred_fit is None:
+                                    deferred_fit = accepted_candidate
+                                continue
+                            selected_vertical = accepted_candidate
                             break
                     except Exception as error:
                         abort_for_geometry_quota(error)
@@ -16252,7 +16363,8 @@ def _run_feature_cut_experiment_impl(
 
                 if selected_vertical is None:
                     selected_vertical = (
-                        deferred_full_bleed
+                        deferred_panel
+                        or deferred_full_bleed
                         or deferred_required_scope_fit
                         or deferred_fit
                     )
@@ -16628,6 +16740,24 @@ def _run_feature_cut_experiment_impl(
                             f"sha256:{vertical_clip.sha256}",
                             f"sha256:{query_sha}",
                             "sha256:"
+                            + hashlib.sha256(
+                                (
+                                    "feature-evidence-provenance-v1:"
+                                    + str(
+                                        selected_vertical["option"].get(
+                                            "evidence_provenance",
+                                            "unknown",
+                                        )
+                                    )
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                            "sha256:"
+                            + exact_event_resolver_binding_sha256(
+                                catalog=dense_catalog,
+                                contracts=bound_contracts,
+                                model_id=MODEL_ID,
+                            ),
+                            "sha256:"
                             + sha256_file(
                                 editorial_beat_contracts_path.expanduser().resolve(
                                     strict=True
@@ -16658,6 +16788,12 @@ def _run_feature_cut_experiment_impl(
                                 beat_contracts=bound_contracts,
                                 run_dir=dense_root / "resolve",
                                 input_artifact_hashes=exact_input_hashes,
+                                evidence_provenance=str(
+                                    selected_vertical["option"].get(
+                                        "evidence_provenance",
+                                        "unknown",
+                                    )
+                                ),
                             )
                         if locks:
                             locks = bind_grouped_event_lock_ids(
@@ -17302,8 +17438,9 @@ def _run_feature_cut_experiment_impl(
             else None
         )
         stage = monotonic()
+        concat_padding_audits: dict[str, dict[str, Any]] = {}
         if horizontal_output is not None:
-            _concat_segments(
+            concat_padding_audits["16x9"] = _concat_segments(
                 horizontal_segments,
                 horizontal_output,
                 segment_durations_seconds=tuple(
@@ -17312,7 +17449,7 @@ def _run_feature_cut_experiment_impl(
                 ),
             )
         if vertical_output is not None:
-            _concat_segments(
+            concat_padding_audits["9x16"] = _concat_segments(
                 vertical_segments,
                 vertical_output,
                 segment_durations_seconds=tuple(
@@ -17320,6 +17457,7 @@ def _run_feature_cut_experiment_impl(
                     for chapter in plan.chapters
                 ),
             )
+        manifest["concat_padding_audits"] = concat_padding_audits
         timings["concat_seconds"] = round(monotonic() - stage, 3)
         timings["total_seconds"] = round(monotonic() - started, 3)
         if horizontal_output is not None:
@@ -17404,6 +17542,7 @@ def _run_feature_cut_experiment_impl(
             cue_rows: list[dict[str, Any]] = []
             cue_deltas: dict[str, int] = {}
             cue_tolerances: dict[str, int] = {}
+            cue_ids_by_event: dict[str, str] = {}
             project_duration_ms = round(
                 sum(chapter_durations.values()) * 1000
             )
@@ -17443,6 +17582,7 @@ def _run_feature_cut_experiment_impl(
                 )
                 cue_deltas[lock.event_id] = alignment.delta_frames
                 cue_tolerances[lock.event_id] = alignment.tolerance_frames
+                cue_ids_by_event[lock.event_id] = alignment.cue_id
             cue_plan_path = context_dir / "cue-plan.json"
             write_json(
                 cue_plan_path,
@@ -17515,11 +17655,33 @@ def _run_feature_cut_experiment_impl(
             locked_event_types = {
                 lock.event_type for lock in resolved_exact_event_locks
             }
-            technical_passed = bool(
-                manifest["post_render_quality_qc"]["technical_qc_passed"]
-            )
+            hard_cue_event_ids = {
+                f"{contract.beat_id}:{event.event_type}"
+                for contract in resolved_editorial_contracts
+                if contract.priority == "hard"
+                for event in contract.visual_events
+            }
             reuse_passed = bool(manifest["source_reuse_contract_passed"])
             vertical_chapters = manifest["vertical"]["chapters"]
+            vertical_quality_report = post_render_reports.get("9x16")
+            hard_quality_windows = (
+                vertical_quality_report.get("hard_block_windows", [])
+                if isinstance(vertical_quality_report, Mapping)
+                else []
+            )
+            quality_reason_codes = {
+                str(row.get("reason_code"))
+                for row in hard_quality_windows
+                if isinstance(row, Mapping)
+            }
+            media_playable = (
+                isinstance(vertical_quality_report, Mapping)
+                and "decoder_gap" not in quality_reason_codes
+            )
+            pts_valid = (
+                isinstance(vertical_quality_report, Mapping)
+                and "duplicate_pts" not in quality_reason_codes
+            )
             containment_failure_codes = {
                 "hard_core_not_fully_retained",
                 "tracking_or_grounding_failed",
@@ -17594,20 +17756,200 @@ def _run_feature_cut_experiment_impl(
                 ),
                 "passed": panel_runtime_fraction_passed,
             }
+            panel_chapters = [
+                chapter
+                for chapter in vertical_chapters
+                if chapter.get("applied_strategy") == "two_panel_layout"
+            ]
+            panel_same_pts_passed = True
+            for chapter in panel_chapters:
+                panel_layout = chapter.get("panel_layout")
+                if not isinstance(panel_layout, Mapping):
+                    panel_same_pts_passed = False
+                    break
+                panels = panel_layout.get("panels")
+                if (
+                    panel_layout.get("temporal_relation")
+                    == "same_source_same_pts"
+                ):
+                    if not isinstance(panels, list) or len(panels) != 2:
+                        panel_same_pts_passed = False
+                        break
+                    source_pts = {
+                        (row.get("source_asset_id"), row.get("source_pts"))
+                        for row in panels
+                        if isinstance(row, Mapping)
+                    }
+                    if len(source_pts) != 1:
+                        panel_same_pts_passed = False
+                        break
+                elif (
+                    panel_layout.get("temporal_relation")
+                    != "different_source_conceptual"
+                ):
+                    panel_same_pts_passed = False
+                    break
+            relative_scale_lock_passed = all(
+                (
+                    chapter.get("panel_layout") or {}
+                ).get("relation_mode")
+                not in {
+                    "simultaneous_comparison",
+                }
+                or (
+                    chapter.get("panel_layout") or {}
+                ).get("relative_scale_policy")
+                == "locked"
+                for chapter in panel_chapters
+            )
+            boundary_rows = duration_audit.get(
+                "music_boundary_refinements",
+                [],
+            )
+            expected_internal_boundary_count = max(
+                0,
+                len(vertical_chapters) - 1,
+            )
+            music_edit_boundary_coverage_passed = (
+                (
+                    expected_internal_boundary_count == 0
+                    and not boundary_rows
+                )
+                or (
+                    duration_audit.get("joint_boundary_solver_applied") is True
+                    and len(boundary_rows) == expected_internal_boundary_count
+                    and all(
+                        row.get("music_cue_id")
+                        or row.get("music_snap_rejected_reason")
+                        in {
+                            "content_locked",
+                            "no_globally_feasible_cue_in_window",
+                        }
+                        for row in boundary_rows
+                    )
+                )
+            )
+            cue_boundary_coverage_audited = (
+                hard_cue_event_ids <= set(cue_ids_by_event)
+                and hard_cue_event_ids <= set(cue_deltas)
+                and hard_cue_event_ids <= set(cue_tolerances)
+            )
+            maximum_dwell_ms_by_feature = {
+                chapter.feature_id: round(
+                    chapter.maximum_duration_seconds * 1000
+                )
+                for chapter in rhythm_plan.chapters
+            }
+            excessive_dwell_count = sum(
+                int(chapter.get("duration_ms") or 0)
+                > maximum_dwell_ms_by_feature.get(
+                    str(chapter.get("feature_id")),
+                    -1,
+                )
+                + 34
+                for chapter in vertical_chapters
+            )
+            dwell_bounds_audited = (
+                set(maximum_dwell_ms_by_feature)
+                == {
+                    str(chapter.get("feature_id"))
+                    for chapter in vertical_chapters
+                }
+            )
+            source_camera_motion_audited = all(
+                chapter.get("source_camera_motion_measured") is True
+                and chapter.get("source_camera_motion_reliable") is True
+                for chapter in vertical_chapters
+            )
+            unwanted_source_camera_motion_count = sum(
+                "unwanted_source_camera_motion"
+                in set(chapter.get("risk_codes") or [])
+                for chapter in vertical_chapters
+            )
+            hard_dead_air_windows = (
+                [
+                    row
+                    for row in vertical_quality_report.get(
+                        "hard_block_windows",
+                        [],
+                    )
+                    if row.get("reason_code") in {"black", "freeze"}
+                ]
+                if isinstance(vertical_quality_report, Mapping)
+                else []
+            )
+            vertical_concat_audit = concat_padding_audits.get("9x16")
+            concat_padding_audited = (
+                isinstance(vertical_concat_audit, Mapping)
+                and vertical_concat_audit.get("audited") is True
+            )
+            unauthorized_concat_padding_count = (
+                int(
+                    vertical_concat_audit.get(
+                        "unauthorized_concat_padding_count",
+                        -1,
+                    )
+                )
+                if concat_padding_audited
+                else None
+            )
+            dead_air_audited = (
+                isinstance(vertical_quality_report, Mapping)
+                and post_render_quality_qc
+                and concat_padding_audited
+            )
+            unexpected_freeze_count = sum(
+                int(chapter.get("unexpected_freeze_count") or 0)
+                for chapter in vertical_chapters
+            ) + sum(
+                row.get("reason_code") == "freeze"
+                for row in hard_quality_windows
+                if isinstance(row, Mapping)
+            )
+            minimum_readable_frames_by_feature = {
+                str(contract.feature_id or contract.beat_id): (
+                    contract.duration.minimum_readable_frames
+                )
+                for contract in resolved_editorial_contracts
+            }
+            readability_passed = (
+                all(
+                    round(int(chapter.get("duration_ms") or 0) * 30 / 1000)
+                    >= minimum_readable_frames_by_feature.get(
+                        str(chapter.get("feature_id")),
+                        1,
+                    )
+                    for chapter in vertical_chapters
+                )
+                and all(
+                    lock.support_window_start_ms
+                    <= lock.source_time_ms
+                    <= lock.support_window_end_ms
+                    for lock in resolved_exact_event_locks
+                )
+            )
             deterministic = DeterministicDeliveryEvidence(
-                media_playable=technical_passed,
-                pts_valid=technical_passed,
-                unexpected_freeze_count=0,
+                media_playable=media_playable,
+                pts_valid=pts_valid,
+                unexpected_freeze_count=unexpected_freeze_count,
                 containment_passed=containment_passed,
                 identity_passed=identity_passed,
                 relation_passed=relation_passed,
-                panel_same_pts_passed=True,
-                relative_scale_lock_passed=True,
+                panel_same_pts_passed=panel_same_pts_passed,
+                relative_scale_lock_passed=relative_scale_lock_passed,
                 panel_runtime_fraction_passed=(
                     panel_runtime_fraction_passed
                 ),
                 cue_delta_frames=cue_deltas,
                 cue_tolerance_frames=cue_tolerances,
+                cue_id_by_event=cue_ids_by_event,
+                required_cue_event_ids=tuple(sorted(hard_cue_event_ids)),
+                cue_boundary_coverage_audited=(
+                    cue_boundary_coverage_audited
+                ),
+                music_edit_boundary_coverage_passed=(
+                    music_edit_boundary_coverage_passed
+                ),
                 synthetic_motion_motivated=not any(
                     "unmotivated" in str(row.get("risk_codes", []))
                     for row in manifest["vertical"]["chapters"]
@@ -17620,12 +17962,21 @@ def _run_feature_cut_experiment_impl(
                     "settle" in str(row.get("risk_codes", []))
                     for row in manifest["vertical"]["chapters"]
                 ),
-                readability_passed=all(
-                    lock.support_window_start_ms
-                    <= lock.source_time_ms
-                    <= lock.support_window_end_ms
-                    for lock in resolved_exact_event_locks
+                source_camera_motion_audited=(
+                    source_camera_motion_audited
                 ),
+                unwanted_source_camera_motion_count=(
+                    unwanted_source_camera_motion_count
+                ),
+                dwell_bounds_audited=dwell_bounds_audited,
+                excessive_dwell_count=excessive_dwell_count,
+                dead_air_audited=dead_air_audited,
+                dead_air_count=len(hard_dead_air_windows),
+                concat_padding_audited=concat_padding_audited,
+                unauthorized_concat_padding_count=(
+                    unauthorized_concat_padding_count
+                ),
+                readability_passed=readability_passed,
                 reuse_authorized=reuse_passed,
                 omissions_authorized=omissions_are_policy_authorized(
                     autonomous_policy,

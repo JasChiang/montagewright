@@ -917,6 +917,10 @@ def run_feature_delivery_pipeline(
         if policy is not None:
             assert deterministic_evidence is not None
             assert deterministic_report is not None
+            if resolved_deterministic_evidence is None:
+                raise DeliveryPipelineBlocked(
+                    "deterministic delivery evidence has no immutable artifact"
+                )
             degradation_path = resolved_autonomous_context.get(
                 "reuse_degradation"
             )
@@ -927,14 +931,32 @@ def run_feature_delivery_pipeline(
             degradation = AutonomousDegradationManifest.model_validate(
                 read_json(degradation_path)
             )
+            deterministic_report_path = (
+                resolved_output / "deterministic-delivery-qa.json"
+            )
+            write_json(deterministic_report_path, deterministic_report)
             authority_hashes = {
                 f"sha256:{policy.definition_sha256()}",
+                f"sha256:{sha256_file(resolved_deterministic_evidence)}",
+                f"sha256:{sha256_file(deterministic_report_path)}",
                 *(
                     f"sha256:{sha256_file(path)}"
                     for path in resolved_autonomous_context.values()
                 ),
                 *(
                     f"sha256:{row['final_output_sha256']}"
+                    for row in final_results.values()
+                ),
+                *(
+                    f"sha256:{sha256_file(Path(row[path_key]))}"
+                    for row in final_results.values()
+                    for path_key in (
+                        "delivery_manifest",
+                        "music_assembly_manifest",
+                    )
+                ),
+                *(
+                    f"sha256:{sha256_file(Path(row['qa_run_dir']) / 'validated.json')}"
                     for row in final_results.values()
                 ),
             }
@@ -947,10 +969,6 @@ def run_feature_delivery_pipeline(
                 gemini_interaction_ids=tuple(
                     dict.fromkeys(qa_interaction_ids)
                 ),
-            )
-            write_json(
-                resolved_output / "deterministic-delivery-qa.json",
-                deterministic_report,
             )
             write_json(
                 resolved_output / "decision-authority.json",

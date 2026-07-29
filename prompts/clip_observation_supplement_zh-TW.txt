@@ -13,6 +13,11 @@
 - `observation_basis` 必須如實標示本次看的是完整影片、含上下文事件影片、事件短片、抽樣影格或媒體 metadata。
 - 只有本次輸入確實包含音訊時，才能把 `audio_role` 標成 `assessed_present` 或 `assessed_absent`。
 - 所有 Entity ID 只能逐字引用 Base Clip Card。
+- `evidence_provenance` 必須依本次 bounded media 重新觀察並如實分類：
+  direct physical action、direct UI interaction、direct result、prerecorded
+  screen playback、promotional graphic、textual claim only、context only 或
+  unknown。螢幕內播放內容不得升級成來源場景中直接發生的功能證據；不確定時
+  使用 `unknown`。
 
 Capability 規則：
 

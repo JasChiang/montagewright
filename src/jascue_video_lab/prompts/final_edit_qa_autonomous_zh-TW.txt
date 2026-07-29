@@ -11,6 +11,43 @@
 - 說明實際觀察，不用產品常識補完。
 - 選擇一個有限 repair_class；這只是問題分類，不是可執行指令。
 - music sync 必須同時依可聽音樂與可見事件判斷。
+- 音樂已混入成片不等於剪點已對拍。若畫面已讀完才離開、連續鏡頭
+  停留長度近乎相同、樂句能量與畫面能量不一致、或有可聽／可見的空轉，
+  分別使用 `excessive_dwell`、`cadence_monotony`、
+  `rhythm_flow_mismatch`、`dead_air`。
+- 不得只用聲音波峰宣稱節奏成立；要同時觀察樂句功能（建立、推進、重拍、
+  釋放、收尾）、畫面事件與相鄰剪點形成的 cadence。
+- 來源素材本身的 pan／tilt／zoom／手持位移，和後製 crop motion 是兩種
+  不同運動。若來源運鏡在成片中被保留且造成髒開鏡、反向運動、過度移動或
+  破壞觀看焦點，使用 `unwanted_source_camera_motion`；不可因 manifest
+  宣稱 synthetic motion 為零就忽略來源運動。
+- 若完成版出現非 brief/policy 授權的尾格複製、靜格補秒、黑畫面或只有音樂
+  而畫面已停止提供資訊，使用 `unauthorized_concat_padding` 或 `dead_air`。
+- 每一個應卡音樂的 required visual event 都必須在 CuePlan 有 event ID、
+  cue ID、實測 delta_frames 與 tolerance_frames。缺任何一項時使用
+  `missing_cue_boundary_coverage`，不得用聽感猜測通過。
+
+## Cue alignment 宣稱
+
+`cue_alignment_claims` 只能逐字引用 CuePlan `alignments[].alignment` 中已存在的：
+
+- `event_id`
+- `cue_id`
+- `delta_frames`（填入 `measured_delta_frames`）
+- `tolerance_frames`
+
+模型只判斷該已量測對位在成片中聽起來／看起來是否有效。沒有完整本機量測
+tuple 就不要建立 claim；也不得在 opening／ending／sequence observation
+以「已對齊、已同步、on beat、卡點成功」等文字繞過結構化 claim。一般描述
+音樂連續、能量關係或收尾感受不算 cue alignment 通過證據。
+
+## 本機量測與語意 QA 的界線
+
+本機 deterministic gate 負責可精確量測的 cue ID／frame delta、dwell 上下界、
+黑格／未授權 freeze／音訊缺口、source-camera motion evidence 與 concat padding。
+`cadence_monotony` 與 `rhythm_flow_mismatch` 不能只靠鏡頭長度變異或聲音波峰
+機械判定，必須由你觀看並聆聽完整成片後回報。manifest 的 deterministic pass
+不得取代這兩項有聲語意觀察；反過來，你的聽感也不得補完缺失的本機 cue 證據。
 
 `required_subjects`／`required_subject_contracts` 才是 hard framing evidence。
 `preferred_context_subjects` 是可犧牲的輔助脈絡，不得當成 required。當

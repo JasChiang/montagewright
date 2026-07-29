@@ -416,6 +416,10 @@ def _cache_fingerprint(prompt: str) -> dict[str, str]:
         "model": MODEL_ID,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "schema_sha256": hashlib.sha256(schema_json.encode()).hexdigest(),
+        "system_instruction_sha256": hashlib.sha256(
+            VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
+        ).hexdigest(),
+        "media_resolution": "low",
     }
 
 

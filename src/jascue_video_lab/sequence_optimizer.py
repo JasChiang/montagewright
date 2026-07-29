@@ -333,6 +333,294 @@ class SequenceOptimizationResult(FrozenStrictModel):
     hard_failure_codes: tuple[str, ...] = ()
 
 
+class MusicBoundaryCue(FrozenStrictModel):
+    """One immutable cue projected onto the assembled music timeline."""
+
+    cue_id: str = Field(min_length=1)
+    time_ms: int = Field(ge=0)
+    kind: Literal["section_boundary", "downbeat", "accent", "ending_hit"]
+    strength: float = Field(ge=0.0, le=1.0)
+
+
+class MusicBoundarySpec(FrozenStrictModel):
+    """Duration bounds and semantic preference for one picture chapter."""
+
+    beat_id: str = Field(min_length=1)
+    preferred_duration_ms: int = Field(gt=0)
+    minimum_duration_ms: int = Field(gt=0)
+    maximum_duration_ms: int = Field(gt=0)
+    boundary_priority: Literal["low", "normal", "high"] = "normal"
+    boundary_alignment: Literal[
+        "free",
+        "content_locked",
+        "phrase_preferred",
+        "accent_preferred",
+    ] = "free"
+    semantic_music_target: Literal[
+        "phrase_start",
+        "phrase_end",
+        "downbeat",
+        "accent",
+        "section_change",
+    ] | None = None
+
+    @model_validator(mode="after")
+    def validate_duration_bounds(self) -> "MusicBoundarySpec":
+        if not (
+            self.minimum_duration_ms
+            <= self.preferred_duration_ms
+            <= self.maximum_duration_ms
+        ):
+            raise ValueError("music boundary duration bounds must be ordered")
+        return self
+
+
+class MusicBoundarySelection(FrozenStrictModel):
+    boundary_after_beat_id: str
+    preferred_boundary_ms: int = Field(gt=0)
+    resolved_boundary_ms: int = Field(gt=0)
+    cue_id: str | None = None
+    cue_kind: str | None = None
+    snap_delta_ms: int
+    snap_applied: bool
+
+
+class MusicBoundarySolution(FrozenStrictModel):
+    """Globally feasible picture boundaries for one fixed-duration timeline."""
+
+    contract_version: Literal["music-boundary-solution-v1"] = (
+        "music-boundary-solution-v1"
+    )
+    total_duration_ms: int = Field(gt=0)
+    selections: tuple[MusicBoundarySelection, ...]
+    chapter_durations_ms: tuple[int, ...]
+    cue_aligned_boundary_count: int = Field(ge=0)
+
+
+def solve_music_aligned_boundaries(
+    specs: Sequence[MusicBoundarySpec],
+    cues: Sequence[MusicBoundaryCue],
+    *,
+    total_duration_ms: int,
+) -> MusicBoundarySolution:
+    """Jointly choose legal picture boundaries instead of greedily snapping.
+
+    Source/attention capacities are duration *bounds*, not reasons to disable
+    music alignment.  The solver considers every internal boundary together,
+    so moving one cut onto a cue can never make a later chapter unreadable or
+    exceed its source-safe interval.  The unsnapped preferred boundary remains
+    a legal deterministic fallback when no cue combination is globally safe.
+    """
+
+    if total_duration_ms <= 0:
+        raise ValueError("music boundary total duration must be positive")
+    if not specs:
+        raise ValueError("music boundary solver requires at least one chapter")
+    if (
+        sum(spec.minimum_duration_ms for spec in specs) > total_duration_ms
+        or sum(spec.maximum_duration_ms for spec in specs) < total_duration_ms
+    ):
+        raise ValueError("chapter bounds cannot satisfy the timeline duration")
+    cue_ids = [cue.cue_id for cue in cues]
+    if len(cue_ids) != len(set(cue_ids)):
+        raise ValueError("music boundary cue IDs must be unique")
+    ordered_cues = sorted(cues, key=lambda cue: (cue.time_ms, cue.cue_id))
+
+    preferred_boundaries: list[int] = []
+    running = 0
+    for spec in specs[:-1]:
+        running += spec.preferred_duration_ms
+        preferred_boundaries.append(running)
+
+    # State: accumulated objective cost, selected boundaries.  Candidate count
+    # is bounded by the cue window and the public chapter limit (16).
+    states: list[tuple[float, tuple[MusicBoundarySelection, ...]]] = [(0.0, ())]
+    for index, spec in enumerate(specs[:-1]):
+        preferred_boundary = preferred_boundaries[index]
+        window_ms = {
+            "low": 250,
+            "normal": 450,
+            "high": 650,
+        }[spec.boundary_priority]
+        if spec.boundary_alignment == "content_locked":
+            window_ms = 0
+            allowed_kinds: set[str] = set()
+        elif spec.boundary_alignment == "phrase_preferred":
+            window_ms = max(window_ms, 650)
+            allowed_kinds = {"section_boundary", "downbeat", "ending_hit"}
+        elif spec.boundary_alignment == "accent_preferred":
+            window_ms = max(window_ms, 650)
+            allowed_kinds = {
+                "section_boundary",
+                "downbeat",
+                "accent",
+                "ending_hit",
+            }
+        else:
+            allowed_kinds = (
+                {"section_boundary", "downbeat"}
+                if spec.boundary_priority == "low"
+                else {
+                    "section_boundary",
+                    "downbeat",
+                    "accent",
+                    "ending_hit",
+                }
+            )
+        semantic_kinds = {
+            "phrase_start": {"section_boundary", "downbeat"},
+            "phrase_end": {"section_boundary", "ending_hit"},
+            "downbeat": {"downbeat"},
+            "accent": {"accent"},
+            "section_change": {"section_boundary"},
+        }.get(spec.semantic_music_target, set())
+        candidates: list[tuple[int, MusicBoundaryCue | None]] = [
+            (preferred_boundary, None)
+        ]
+        candidates.extend(
+            (cue.time_ms, cue)
+            for cue in ordered_cues
+            if (
+                cue.kind in allowed_kinds
+                and abs(cue.time_ms - preferred_boundary) <= window_ms
+            )
+        )
+        # Multiple cue labels may share a sample; retain the semantically
+        # strongest candidate while keeping the preferred fallback.
+        deduped: dict[tuple[int, str | None], MusicBoundaryCue | None] = {}
+        for position, cue in candidates:
+            deduped[(position, cue.cue_id if cue is not None else None)] = cue
+
+        expanded: list[tuple[float, tuple[MusicBoundarySelection, ...]]] = []
+        for cost, prior in states:
+            previous_boundary = (
+                prior[-1].resolved_boundary_ms if prior else 0
+            )
+            for (position, _), cue in deduped.items():
+                chapter_duration = position - previous_boundary
+                if not (
+                    spec.minimum_duration_ms
+                    <= chapter_duration
+                    <= spec.maximum_duration_ms
+                ):
+                    continue
+                remaining_specs = specs[index + 1 :]
+                remaining_duration = total_duration_ms - position
+                if not (
+                    sum(item.minimum_duration_ms for item in remaining_specs)
+                    <= remaining_duration
+                    <= sum(item.maximum_duration_ms for item in remaining_specs)
+                ):
+                    continue
+                if cue is None:
+                    # Prefer real musical exits, especially at high-pressure
+                    # boundaries, while keeping content-locked cuts untouched.
+                    candidate_cost = (
+                        0.0
+                        if spec.boundary_alignment == "content_locked"
+                        else {"low": 1.4, "normal": 2.0, "high": 2.6}[
+                            spec.boundary_priority
+                        ]
+                    )
+                else:
+                    distance_cost = abs(position - preferred_boundary) / max(
+                        window_ms,
+                        1,
+                    )
+                    semantic_cost = (
+                        0.0
+                        if not semantic_kinds or cue.kind in semantic_kinds
+                        else 0.8
+                    )
+                    structural_cost = (
+                        0.0
+                        if cue.kind == "section_boundary"
+                        else 0.15 if cue.kind == "downbeat" else 0.3
+                    )
+                    candidate_cost = (
+                        distance_cost
+                        + semantic_cost
+                        + structural_cost
+                        - cue.strength * 0.25
+                    )
+                selection = MusicBoundarySelection(
+                    boundary_after_beat_id=spec.beat_id,
+                    preferred_boundary_ms=preferred_boundary,
+                    resolved_boundary_ms=position,
+                    cue_id=cue.cue_id if cue is not None else None,
+                    cue_kind=cue.kind if cue is not None else None,
+                    snap_delta_ms=position - preferred_boundary,
+                    snap_applied=cue is not None,
+                )
+                expanded.append((cost + candidate_cost, prior + (selection,)))
+        if not expanded:
+            raise ValueError(
+                "no globally feasible music boundary sequence satisfies "
+                f"chapter {spec.beat_id}"
+            )
+        # Keep the solver bounded without discarding distinct timeline states.
+        best_by_position: dict[
+            int,
+            tuple[float, tuple[MusicBoundarySelection, ...]],
+        ] = {}
+        for state in sorted(
+            expanded,
+            key=lambda item: (
+                item[0],
+                tuple(
+                    selection.resolved_boundary_ms
+                    for selection in item[1]
+                ),
+                tuple(selection.cue_id or "" for selection in item[1]),
+            ),
+        ):
+            position = state[1][-1].resolved_boundary_ms
+            best_by_position.setdefault(position, state)
+        states = list(best_by_position.values())[:256]
+
+    feasible: list[tuple[float, tuple[MusicBoundarySelection, ...]]] = []
+    for state in states:
+        prior = state[1]
+        previous = prior[-1].resolved_boundary_ms if prior else 0
+        final_duration = total_duration_ms - previous
+        final_spec = specs[-1]
+        if (
+            final_spec.minimum_duration_ms
+            <= final_duration
+            <= final_spec.maximum_duration_ms
+        ):
+            feasible.append(state)
+    if not feasible:
+        raise ValueError(
+            "no globally feasible music boundary sequence satisfies final chapter"
+        )
+    _, selections = min(
+        feasible,
+        key=lambda item: (
+            item[0],
+            tuple(selection.resolved_boundary_ms for selection in item[1]),
+            tuple(selection.cue_id or "" for selection in item[1]),
+        ),
+    )
+    boundaries = [
+        0,
+        *(selection.resolved_boundary_ms for selection in selections),
+        total_duration_ms,
+    ]
+    durations = tuple(
+        end - start
+        for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+    )
+    return MusicBoundarySolution(
+        total_duration_ms=total_duration_ms,
+        selections=selections,
+        chapter_durations_ms=durations,
+        cue_aligned_boundary_count=sum(
+            selection.snap_applied for selection in selections
+        ),
+    )
+
+
 class _BeamState(FrozenStrictModel):
     selections: tuple[SequenceSelection, ...] = ()
     duration_ms: int = Field(default=0, ge=0)

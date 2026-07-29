@@ -518,6 +518,62 @@ def test_grouped_exact_event_call_uses_high_stills_and_no_time_schema(
     assert "source_pts" not in schema_text
 
 
+def test_screen_playback_cannot_trigger_direct_exact_event_paid_call(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path, count=8)
+    beat = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "ai-payoff",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["generation_result"],
+            "allowed_evidence_provenance": [
+                "direct_ui_interaction",
+                "direct_result",
+            ],
+            "narrative_function": "global_energy_peak",
+            "visual_events": [
+                {
+                    "event_type": "generation_result_stable_start",
+                    "cue_relation": "principal_downbeat",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 24,
+                "preferred_frames": 54,
+                "maximum_frames": 90,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+    requests: list[dict[str, Any]] = []
+    client = object.__new__(GeminiLabClient)
+    client.model_id = MODEL_ID
+    client.client = SimpleNamespace(
+        interactions=SimpleNamespace(
+            create=lambda **request: requests.append(request)
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="provenance cannot satisfy exact-event contracts",
+    ):
+        client.select_exact_event_locks(
+            catalog=catalog,
+            beat_contracts=[beat],
+            run_dir=tmp_path / "exact",
+            input_artifact_hashes=("sha256:" + "c" * 64,),
+            evidence_provenance="prerecorded_screen_playback",
+            max_bracket_frames=8,
+        )
+
+    assert requests == []
+
+
 def test_grouped_exact_event_empty_selection_is_persisted_fail_closed(
     tmp_path: Path,
 ) -> None:

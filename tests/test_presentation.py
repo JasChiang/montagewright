@@ -258,6 +258,7 @@ def test_static_subject_compiles_without_synthetic_motion() -> None:
 
     assert compilation.mode == "static_full_bleed_crop"
     assert compilation.static_crop_box_2d is not None
+
     assert not any(
         "motion" in code for code in compilation.decision_codes
     )
@@ -358,6 +359,21 @@ def test_source_camera_pan_is_measured_from_background_geometry(
     )
     assert compilation.mode == "static_full_bleed_crop"
     assert compilation.static_crop_box_2d is not None
+    unmotivated = compile_presentation(
+        targets=[_target("subject", (430, 250, 570, 750))],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="single_subject",
+        policy=_policy(),
+        source_camera_motion_evidence=evidence,
+        movement_motivated=False,
+    )
+    assert unmotivated.mode == "blocked"
+    assert unmotivated.selection is not None
+    assert any(
+        "unmotivated_source_camera_motion" in failures
+        for failures in unmotivated.selection.rejected_options.values()
+    )
     filter_graph = static_full_bleed_crop_filter(
         compilation.static_crop_box_2d
     )
@@ -707,6 +723,36 @@ def test_common_motion_and_tracked_relation_are_measured_per_pts() -> None:
         compilation.scene_facts.aligned_track_sample_count_matrix[0][1]
         == 3
     )
+
+    panel = compile_presentation(
+        targets=[
+            _target(
+                "context",
+                (100, 200, 340, 800),
+                track_boxes_by_pts=shared_samples_a,
+            ),
+            _target(
+                "detail",
+                (280, 300, 420, 700),
+                track_boxes_by_pts=shared_samples_b,
+            ),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="simultaneous_relation",
+        policy=_policy(),
+        physical_scale_comparison=True,
+        allow_static_full_bleed=False,
+        tracking_available=False,
+        acceptable_capability_ids=("two_panel_layout",),
+        panel_semantically_admissible=True,
+        panel_target_groups=(("context",), ("detail",)),
+    )
+
+    assert panel.mode == "two_panel_layout"
+    assert panel.panel_layout is not None
+    assert panel.panel_layout.temporal_relation == "same_source_same_pts"
+    assert panel.panel_layout.relative_scale_policy == "locked"
 
 
 def test_scene_facts_v1_artifact_remains_loadable() -> None:

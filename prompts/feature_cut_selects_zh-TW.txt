@@ -13,6 +13,18 @@
 1. 最適合 16:9 的 `horizontal_frame_id`。
 2. 最適合 9:16 的 `vertical_frame_id`，可以與橫式不同。
 3. 只描述畫面直接可見的 `observed_visual_evidence`。
+   同時為外層 chapter 與每個候選填寫 `evidence_provenance`：
+   - `direct_physical_action`：原始場景中直接拍到動作、手勢、反應或物理事件。
+   - `direct_ui_interaction`：直接拍到使用者操作 UI，且可見狀態真的改變。
+   - `direct_result`：直接拍到流程完成後穩定、可讀的實際結果。
+   - `prerecorded_screen_playback`：鏡頭裡的螢幕只是在播放既錄影片、demo reel
+     或另一段內容；這只能證明播放／顯示，不能證明螢幕裡的功能或事件在現場發生。
+   - `promotional_graphic`：廣告圖、動畫、產品宣傳卡或示意畫面。
+   - `textual_claim_only`：只有文字、標題或標示聲稱某功能。
+   - `context_only`：只有相關產品／人物／環境，沒有 brief 要求的動作或結果。
+   - `unknown`：目前抽樣無法可靠分辨。不得把 unknown 當 direct evidence。
+   外層 `evidence_provenance` 必須與 rank-1 vertical candidate 相同。螢幕中螢幕、
+   宣傳字卡或文字 claim 不得因內容「看起來像」功能結果，就標成 direct result。
 4. 如果精確功能 UI 沒有被 2 秒 sampling 捕捉，但有相近產品／操作 B-roll，使用 `partial`，並清楚寫明差距。
 5. 完全沒有合理畫面則使用 `not_found`，兩個 frame ID 都回傳 null；不得拿相近但不符合事件條件的素材假裝是直接證據。
 6. 對 supported／partial chapter 提出 `recommended_duration_seconds` 與 `duration_rationale`。停留長度必須依本次畫面真正包含的資訊量、動作 setup／action／result、brief 中的敘事重要性，以及本次實際提供的音樂流動綜合判斷；不得套用「靜態畫面固定幾秒」或「動作畫面固定幾秒」之類的硬規則。這只是相對剪輯建議，不是原片 timestamp；本機會依總長、shot、原始 PTS 與合法 handles 校正。

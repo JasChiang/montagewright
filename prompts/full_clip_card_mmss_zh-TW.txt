@@ -29,8 +29,19 @@
 - 品牌、產品型號、人物姓名與專有名詞只能來自影片中逐字清楚可讀的文字、清楚可辨識的語音，或明確提供的 metadata。本請求未提供檔名或其他 metadata；不得僅憑外觀、產品知識或最可能答案猜測特定型號。
 - 如果只能確認品牌而不能確認型號，label 應使用「可辨識品牌＋最具體的可見類別泛稱」，並在 `uncertainties` 說明型號無法由畫面直接確認。模糊文字、相似外觀或模型既有知識都不是身分證據。
 - `evidence` 與 `observable_evidence` 必須描述實際可見／可聽證據，不得把推論改寫成觀察事實。
+- 每個事件必須填寫 `evidence_provenance`，區分
+  `direct_physical_action`、`direct_ui_interaction`、`direct_result`、
+  `prerecorded_screen_playback`、`promotional_graphic`、
+  `textual_claim_only`、`context_only` 與 `unknown`。螢幕中正在播放的既錄
+  影片只能證明該螢幕正在播放內容，不能證明內嵌影片裡的功能、操作或結果在
+  本次來源場景中發生。宣傳圖卡與文字 claim 也不能當成 direct result。
+  無法可靠判斷時必須使用 `unknown`，不得猜成 direct evidence。
 - `grounding_targets` 只列出後續確實可能需要重新構圖、callout、去背或身份確認的指定實例；`target_kind` 必須與引用 Entity 的 kind 完全相同，描述必須包含物件層級、辨識特徵與排除條件。指定物件局部時不可引用整體 Entity；指定整體時也不可擴大到持有人、支架或周邊背景。
 - 複合目標必須拆成多個可獨立驗證的 target，不要要求單一 mask 同時表示數個不同實例。
+- 當事件意義只由產品局部、邊緣、鉸鏈、厚度、尺寸參照物或 UI 小區域承擔時，
+  必須為該最小可見 relation carrier 建立獨立 Entity／grounding target；不得把
+  整台產品或整個人物誤標成 required evidence。只有「完整外形本身」是比較
+  證據時，whole entity 才可成為必要 target。
 - 本次是可跨 brief 重用的 Base Clip Card。不要在此決定注意力順序、camera behavior、運鏡、固定左右方向或 9:16／16:9 的最終呈現方式；這些會在 shortlisted bounded clip 的 observation supplement 與 brief-aware planner 中分開處理。
 - `portrait_attention_sequence` 是舊版相容欄位，本次固定回傳空陣列。空陣列代表這項能力未在 Base Clip Card 評估，不代表畫面沒有注意力轉移。
 

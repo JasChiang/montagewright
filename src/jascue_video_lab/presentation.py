@@ -801,10 +801,7 @@ def generate_presentation_options(
     }
     split_coupled_pairs = tuple(
         pair
-        for pair in (
-            *scene_facts.nested_target_pairs,
-            *scene_facts.common_motion_pairs,
-        )
+        for pair in scene_facts.nested_target_pairs
         if panel_group_index_by_target.get(pair[0])
         != panel_group_index_by_target.get(pair[1])
     )
@@ -838,6 +835,59 @@ def generate_presentation_options(
             for target_id in scene_facts.target_ids
         )
 
+    def source_motion_acceptance() -> ConstraintResult:
+        strict = str(policy.execution_profile) == "autonomous_strict"
+        if not scene_facts.source_camera_motion_measured:
+            return _preference_constraint(
+                "source_camera_motion_quality",
+                status="unknown",
+                reason_code="source_camera_motion_not_measured",
+                evidence_refs=(scene_facts.definition_sha256,),
+            )
+        if not scene_facts.source_camera_motion_reliable:
+            return (
+                _constraint(
+                    "source_camera_motion_quality",
+                    passed=False,
+                    reason_code="source_camera_motion_unreliable",
+                    evidence_refs=(scene_facts.definition_sha256,),
+                )
+                if strict
+                else _preference_constraint(
+                    "source_camera_motion_quality",
+                    status="unknown",
+                    reason_code="source_camera_motion_unreliable",
+                    evidence_refs=(scene_facts.definition_sha256,),
+                )
+            )
+        accepted = (
+            scene_facts.source_camera_motion.direction == "static"
+            or (
+                movement_motivated
+                and scene_facts.source_camera_motion.direction != "mixed"
+                and scene_facts.source_camera_motion.reversal_count <= 1
+            )
+        )
+        return _constraint(
+            "source_camera_motion_quality",
+            passed=accepted,
+            reason_code=(
+                "source_camera_static"
+                if scene_facts.source_camera_motion.direction == "static"
+                else "source_camera_motion_semantically_motivated"
+                if movement_motivated
+                else "unmotivated_source_camera_motion"
+            ),
+            evidence_refs=(
+                scene_facts.definition_sha256,
+                *(
+                    (scene_facts.source_camera_motion_evidence_sha256,)
+                    if scene_facts.source_camera_motion_evidence_sha256
+                    else ()
+                ),
+            ),
+        )
+
     if shared_crop is not None:
         options.append(
             _presentation_option(
@@ -849,6 +899,7 @@ def generate_presentation_options(
                 },
                 constraints=(
                     capability_boundary("static_full_bleed_crop"),
+                    source_motion_acceptance(),
                     _constraint(
                         "shared_static_crop",
                         passed=True,
@@ -887,6 +938,7 @@ def generate_presentation_options(
     if tracking_available:
         tracked_constraint = (
             capability_boundary("tracked_full_bleed_crop"),
+            source_motion_acceptance(),
             _constraint(
                 "tracking_available",
                 passed=True,
@@ -1122,6 +1174,7 @@ def generate_presentation_options(
                     payload=panel.model_dump(mode="json"),
                     constraints=(
                         capability_boundary("two_panel_layout"),
+                        source_motion_acceptance(),
                         _constraint(
                             "panel_semantic_admissibility",
                             passed=panel_admissible,
@@ -1214,6 +1267,7 @@ def generate_presentation_options(
                 payload={"filter_graph": _vertical_fit_filter()},
                 constraints=(
                     capability_boundary("solid_matte_fit"),
+                    source_motion_acceptance(),
                     _constraint(
                         "policy_authorized",
                         passed=True,

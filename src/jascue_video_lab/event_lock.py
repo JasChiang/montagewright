@@ -15,7 +15,14 @@ from .autonomous_policy import (
     DecisionAuthorityV2,
     validate_authority_binding,
 )
-from .models import DenseFrame, DenseFrameCatalog, FrozenStrictModel, TrimIntentDecision
+from .models import (
+    DenseFrame,
+    DenseFrameCatalog,
+    FeatureEvidenceProvenance,
+    FrozenStrictModel,
+    TrimIntentDecision,
+)
+from .schema import gemini_response_schema
 from .storage import utc_now
 
 
@@ -39,6 +46,7 @@ CueRelation = Literal[
     "music_emphasis",
     "phrase_ending",
 ]
+EXACT_EVENT_RESOLVER_VERSION = "exact-event-frame-selection-v2"
 
 
 class ReadabilityDuration(FrozenStrictModel):
@@ -81,6 +89,13 @@ class EditorialBeatContract(FrozenStrictModel):
     priority: Literal["hard", "preferred", "optional"]
     evidence_query_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     required_target_ids: tuple[str, ...] = Field(min_length=1, max_length=8)
+    allowed_evidence_provenance: tuple[
+        FeatureEvidenceProvenance, ...
+    ] = (
+        "direct_physical_action",
+        "direct_ui_interaction",
+        "direct_result",
+    )
     narrative_function: Literal[
         "opening",
         "setup",
@@ -125,6 +140,14 @@ class EditorialBeatContract(FrozenStrictModel):
             self.allowed_reconstruction
         ):
             raise ValueError("allowed reconstruction modes must be unique")
+        if not self.allowed_evidence_provenance:
+            raise ValueError(
+                "editorial beats require at least one evidence provenance"
+            )
+        if len(set(self.allowed_evidence_provenance)) != len(
+            self.allowed_evidence_provenance
+        ):
+            raise ValueError("allowed evidence provenance values must be unique")
         return self
 
 
@@ -161,6 +184,7 @@ class ExactEventLockV2(FrozenStrictModel):
     source_pts: int
     source_time_ms: int = Field(ge=0)
     source_frame_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     support_window_start_frame_id: str = Field(pattern=r"^DF[0-9]{6}$")
     support_window_end_frame_id: str = Field(pattern=r"^DF[0-9]{6}$")
     support_window_start_ms: int = Field(ge=0)
@@ -278,6 +302,7 @@ def resolve_exact_event_locks(
     *,
     gemini_interaction_id: str,
     input_artifact_hashes: tuple[str, ...],
+    evidence_provenance: FeatureEvidenceProvenance = "unknown",
 ) -> tuple[ExactEventLockV2, ...]:
     """Map model-selected immutable IDs to local PTS; arbitrary time is absent."""
 
@@ -317,6 +342,7 @@ def resolve_exact_event_locks(
                 source_pts=selected.frame_pts,
                 source_time_ms=selected.frame_time_ms,
                 source_frame_hash=selected.frame_hash,
+                evidence_provenance=evidence_provenance,
                 support_window_start_frame_id=support_start.frame_id,
                 support_window_end_frame_id=support_end.frame_id,
                 support_window_start_ms=support_start.frame_time_ms,
@@ -333,6 +359,56 @@ def resolve_exact_event_locks(
             )
         )
     return tuple(locks)
+
+
+def validate_exact_event_evidence_provenance(
+    evidence_provenance: FeatureEvidenceProvenance,
+    contracts: Sequence[EditorialBeatContract],
+) -> None:
+    """Fail before a paid exact-frame call when the selected shot is ineligible.
+
+    A dense-frame resolver can locate a change inside a nested playback, but it
+    cannot prove that the depicted event happened in the captured scene.  The
+    editorial contract therefore binds which provenance classes may satisfy
+    each requested event.
+    """
+
+    incompatible = [
+        contract.beat_id
+        for contract in contracts
+        if evidence_provenance not in contract.allowed_evidence_provenance
+    ]
+    if incompatible:
+        raise ValueError(
+            "selected evidence provenance cannot satisfy exact-event contracts "
+            f"({evidence_provenance}): "
+            + ", ".join(incompatible)
+        )
+
+
+def exact_event_resolver_binding_sha256(
+    *,
+    catalog: DenseFrameCatalog,
+    contracts: Sequence[EditorialBeatContract],
+    model_id: str,
+) -> str:
+    """Bind reusable locks to the exact dense evidence and resolver contract."""
+
+    return _canonical_sha256(
+        {
+            "resolver_version": EXACT_EVENT_RESOLVER_VERSION,
+            "model_id": model_id,
+            "catalog": catalog.model_dump(mode="json"),
+            "contracts": [
+                contract.model_dump(mode="json") for contract in contracts
+            ],
+            "response_schema": gemini_response_schema(
+                ExactEventSelectionGroup
+            ),
+            "media_resolution": "high",
+            "local_bracket_method": "frame_difference",
+        }
+    )
 
 
 def authorize_trim_intent_decision(

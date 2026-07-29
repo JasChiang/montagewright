@@ -25,8 +25,8 @@ from .storage import read_json, utc_now, write_json
 
 
 FINAL_EDIT_QA_CONTRACT_VERSION = "final-edit-qa-v1"
-FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v3"
-FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v4"
+FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v4"
+FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v5"
 FINAL_EDIT_QA_GENERATION_CONFIG = {
     "thinking_level": "low",
     "max_output_tokens": 8192,
@@ -189,6 +189,13 @@ AutonomousIssueType = Literal[
     "relative_scale_misleading",
     "layout_confusing",
     "repetition_excess",
+    "unwanted_source_camera_motion",
+    "excessive_dwell",
+    "cadence_monotony",
+    "rhythm_flow_mismatch",
+    "dead_air",
+    "missing_cue_boundary_coverage",
+    "unauthorized_concat_padding",
     "weak_opening",
     "weak_ending",
 ]
@@ -216,6 +223,38 @@ class AutonomousQaIssue(StrictModel):
     repair_class: AutonomousRepairClass
 
 
+class AutonomousCueAlignmentClaim(StrictModel):
+    """One model observation bound to application-measured cue evidence.
+
+    The model may judge whether an alignment feels editorially effective, but
+    it may only cite cue IDs and frame deltas already present in CuePlan.  The
+    local validator checks the exact tuple before accepting the observation.
+    """
+
+    event_id: str = Field(min_length=1)
+    cue_id: str = Field(min_length=1)
+    measured_delta_frames: int
+    tolerance_frames: int = Field(ge=0, le=24)
+    perceived_relationship: Literal[
+        "effective",
+        "acceptable",
+        "miss",
+        "uncertain",
+    ]
+    observation: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def reject_false_measured_pass(self) -> "AutonomousCueAlignmentClaim":
+        if (
+            abs(self.measured_delta_frames) > self.tolerance_frames
+            and self.perceived_relationship in {"effective", "acceptable"}
+        ):
+            raise ValueError(
+                "cue alignment cannot claim a measured pass outside tolerance"
+            )
+        return self
+
+
 class AutonomousFinalEditQa(StrictModel):
     contract_version: Literal["final-edit-qa-v1"] = FINAL_EDIT_QA_CONTRACT_VERSION
     mode: Literal["autonomous_final_9x16"]
@@ -228,6 +267,7 @@ class AutonomousFinalEditQa(StrictModel):
     opening_observation: str = Field(min_length=1)
     ending_observation: str = Field(min_length=1)
     sequence_observation: str = Field(min_length=1)
+    cue_alignment_claims: tuple[AutonomousCueAlignmentClaim, ...] = ()
     qa_observation_status: Literal[
         "no_blocking_observation",
         "issues_observed",
@@ -236,8 +276,43 @@ class AutonomousFinalEditQa(StrictModel):
     limitations: list[str]
     requires_human_review: Literal[False] = False
 
+    @model_validator(mode="after")
+    def validate_observation_disposition(self) -> "AutonomousFinalEditQa":
+        if (
+            self.qa_observation_status == "no_blocking_observation"
+            and self.issues
+        ):
+            raise ValueError(
+                "no-blocking autonomous QA cannot contain typed issues"
+            )
+        if (
+            self.qa_observation_status == "issues_observed"
+            and not self.issues
+        ):
+            raise ValueError(
+                "issues-observed autonomous QA requires a typed issue"
+            )
+        if any(
+            claim.perceived_relationship == "miss"
+            for claim in self.cue_alignment_claims
+        ) and not any(
+            issue.issue_type == "music_sync_miss" for issue in self.issues
+        ):
+            raise ValueError(
+                "a perceived cue miss requires a music_sync_miss issue"
+            )
+        return self
+
 
 class DeterministicDeliveryEvidence(StrictModel):
+    """Application-measured delivery facts.
+
+    These fields intentionally exclude cadence monotony and semantic
+    music-flow quality: those require the audible final-video observation and
+    are represented by typed autonomous QA issues.  Unknown local evidence is
+    nullable and fails closed in ``run_deterministic_delivery_qa``.
+    """
+
     media_playable: bool
     pts_valid: bool
     unexpected_freeze_count: int = Field(ge=0)
@@ -249,13 +324,33 @@ class DeterministicDeliveryEvidence(StrictModel):
     panel_runtime_fraction_passed: bool = True
     cue_delta_frames: dict[str, int]
     cue_tolerance_frames: dict[str, int] = Field(default_factory=dict)
+    cue_id_by_event: dict[str, str] = Field(default_factory=dict)
+    required_cue_event_ids: tuple[str, ...] = ()
+    cue_boundary_coverage_audited: bool | None = None
+    music_edit_boundary_coverage_passed: bool | None = None
     synthetic_motion_motivated: bool
     synthetic_reversal_count: int = Field(ge=0)
     settle_passed: bool
+    source_camera_motion_audited: bool | None = None
+    unwanted_source_camera_motion_count: int | None = Field(default=None, ge=0)
+    dwell_bounds_audited: bool | None = None
+    excessive_dwell_count: int | None = Field(default=None, ge=0)
+    dead_air_audited: bool | None = None
+    dead_air_count: int | None = Field(default=None, ge=0)
+    concat_padding_audited: bool | None = None
+    unauthorized_concat_padding_count: int | None = Field(default=None, ge=0)
     readability_passed: bool
     reuse_authorized: bool
     omissions_authorized: bool
     hard_evidence_passed: bool
+
+    @model_validator(mode="after")
+    def validate_audit_identities(self) -> "DeterministicDeliveryEvidence":
+        if len(set(self.required_cue_event_ids)) != len(
+            self.required_cue_event_ids
+        ):
+            raise ValueError("required cue event IDs must be unique")
+        return self
 
 
 class DeterministicDeliveryQaReport(StrictModel):
@@ -486,6 +581,27 @@ def build_final_qa_segment_contract(
     mode: FinalQaMode,
 ) -> list[dict[str, Any]]:
     chapters = _timeline_chapters(manifest, mode)
+    duration_plan = manifest.get("editorial_duration_plan")
+    duration_rows = (
+        duration_plan.get("chapters", [])
+        if isinstance(duration_plan, Mapping)
+        else []
+    )
+    duration_by_feature_id = {
+        str(row["feature_id"]): row
+        for row in duration_rows
+        if isinstance(row, Mapping) and row.get("feature_id")
+    }
+    boundary_rows = (
+        duration_plan.get("music_boundary_refinements", [])
+        if isinstance(duration_plan, Mapping)
+        else []
+    )
+    boundary_by_feature_id = {
+        str(row["boundary_after_feature_id"]): row
+        for row in boundary_rows
+        if isinstance(row, Mapping) and row.get("boundary_after_feature_id")
+    }
     contract: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for order, chapter in enumerate(chapters, start=1):
@@ -639,7 +755,27 @@ def build_final_qa_segment_contract(
                     ).get("crop_motion_episode_count"),
                     "source_camera_motion_detected": (
                         chapter.get("motion_quality_audit") or {}
-                    ).get("source_camera_motion_detected"),
+                    ).get("source_camera_motion_detected")
+                    or chapter.get("source_camera_motion_detected"),
+                    "source_camera_motion_measured": (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("source_camera_motion_measured")
+                    if (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("source_camera_motion_measured")
+                    is not None
+                    else chapter.get("source_camera_motion_measured"),
+                    "source_camera_motion_reliable": (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("source_camera_motion_reliable")
+                    if (
+                        chapter.get("motion_quality_audit") or {}
+                    ).get("source_camera_motion_reliable")
+                    is not None
+                    else chapter.get("source_camera_motion_reliable"),
+                    "source_camera_motion_evidence_sha256": (
+                        chapter.get("source_camera_motion_evidence_sha256")
+                    ),
                     "perceived_reframe_class": (
                         chapter.get("motion_quality_audit") or {}
                     ).get("perceived_reframe_class"),
@@ -657,6 +793,19 @@ def build_final_qa_segment_contract(
                 "duration_interpretation": (
                     "navigation metadata only; never a fixed dwell-quality rule"
                 ),
+                "editorial_rhythm_contract": {
+                    "dwell_bounds": duration_by_feature_id.get(
+                        brief_item_id
+                    ),
+                    "exit_boundary": boundary_by_feature_id.get(
+                        brief_item_id
+                    ),
+                    "interpretation": (
+                        "Application-owned duration bounds and music-boundary "
+                        "attempts. They constrain claims but do not prove "
+                        "perceived cadence or music flow."
+                    ),
+                },
             }
         )
     return contract
@@ -1028,6 +1177,45 @@ def _validate_result(
         expected_segment_ids = {
             item["segment_id"] for item in prepared.segment_contract
         }
+        cue_plan = read_json(prepared.autonomous_context_paths["cue_plan"])
+        authorized_cue_rows = _cue_alignment_rows(cue_plan)
+        seen_claim_keys: set[tuple[str, str]] = set()
+        for claim in result.cue_alignment_claims:
+            claim_key = (claim.event_id, claim.cue_id)
+            if claim_key in seen_claim_keys:
+                raise ValueError(
+                    "autonomous QA repeated one cue-alignment claim"
+                )
+            seen_claim_keys.add(claim_key)
+            expected = authorized_cue_rows.get(claim_key)
+            if expected is None:
+                raise ValueError(
+                    "autonomous QA claimed cue alignment without a matching "
+                    "CuePlan event/cue ID"
+                )
+            if (
+                claim.measured_delta_frames != expected["delta_frames"]
+                or claim.tolerance_frames != expected["tolerance_frames"]
+            ):
+                raise ValueError(
+                    "autonomous QA changed the application-measured cue "
+                    "delta or tolerance"
+                )
+        observation_text = " ".join(
+            (
+                result.opening_observation,
+                result.ending_observation,
+                result.sequence_observation,
+            )
+        )
+        if (
+            _contains_positive_cue_alignment_claim(observation_text)
+            and not result.cue_alignment_claims
+        ):
+            raise ValueError(
+                "autonomous QA claimed cue alignment without cue IDs and "
+                "measured frame deltas"
+            )
         for issue in result.issues:
             if (
                 issue.segment_id is not None
@@ -1056,6 +1244,61 @@ def _validate_result(
                     "autonomous QA observation contains an executable "
                     "timestamp/frame/geometry reference"
                 )
+
+
+def _cue_alignment_rows(value: Any) -> dict[tuple[str, str], dict[str, int]]:
+    """Extract only complete measured event/cue tuples from a CuePlan payload."""
+
+    rows: dict[tuple[str, str], dict[str, int]] = {}
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            event_id = item.get("event_id")
+            cue_id = item.get("cue_id")
+            delta = item.get("delta_frames")
+            tolerance = item.get("tolerance_frames")
+            if (
+                isinstance(event_id, str)
+                and event_id
+                and isinstance(cue_id, str)
+                and cue_id
+                and isinstance(delta, int)
+                and not isinstance(delta, bool)
+                and isinstance(tolerance, int)
+                and not isinstance(tolerance, bool)
+            ):
+                key = (event_id, cue_id)
+                row = {
+                    "delta_frames": delta,
+                    "tolerance_frames": tolerance,
+                }
+                previous = rows.get(key)
+                if previous is not None and previous != row:
+                    raise ValueError(
+                        "CuePlan contains conflicting alignment evidence"
+                    )
+                rows[key] = row
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return rows
+
+
+_POSITIVE_CUE_ALIGNMENT_RE = re.compile(
+    r"(?i)(?:\b(?:perfectly |exactly |successfully )?"
+    r"(?:aligned|synchroni[sz]ed|on[- ]beat|on the (?:cue|downbeat|accent))\b"
+    r"|(?:精確|成功|已)?(?:對齊|同步|卡點|卡拍))"
+)
+
+
+def _contains_positive_cue_alignment_claim(text: str) -> bool:
+    """Recognize explicit success claims, not general music-flow observations."""
+
+    return bool(_POSITIVE_CUE_ALIGNMENT_RE.search(text))
 
 
 def _normalize_application_owned_fields(
@@ -1138,8 +1381,20 @@ def run_deterministic_delivery_qa(
         evidence.panel_runtime_fraction_passed,
     )
     gate(
+        "cue_boundary_coverage",
+        evidence.cue_boundary_coverage_audited is True
+        and evidence.music_edit_boundary_coverage_passed is True
+        and all(
+            event_id in evidence.cue_id_by_event
+            and event_id in evidence.cue_delta_frames
+            and event_id in evidence.cue_tolerance_frames
+            for event_id in evidence.required_cue_event_ids
+        ),
+    )
+    gate(
         "cue_sync",
-        all(
+        evidence.cue_boundary_coverage_audited is True
+        and all(
             abs(delta)
             <= evidence.cue_tolerance_frames.get(
                 event_id,
@@ -1151,6 +1406,26 @@ def run_deterministic_delivery_qa(
     gate("synthetic_motion_motivated", evidence.synthetic_motion_motivated)
     gate("no_synthetic_reversal", evidence.synthetic_reversal_count == 0)
     gate("motion_settle", evidence.settle_passed)
+    gate(
+        "source_camera_motion",
+        evidence.source_camera_motion_audited is True
+        and evidence.unwanted_source_camera_motion_count == 0,
+    )
+    gate(
+        "dwell_bounds",
+        evidence.dwell_bounds_audited is True
+        and evidence.excessive_dwell_count == 0,
+    )
+    gate(
+        "no_dead_air",
+        evidence.dead_air_audited is True
+        and evidence.dead_air_count == 0,
+    )
+    gate(
+        "no_unauthorized_concat_padding",
+        evidence.concat_padding_audited is True
+        and evidence.unauthorized_concat_padding_count == 0,
+    )
     gate("readability", evidence.readability_passed)
     gate("reuse_authorized", evidence.reuse_authorized)
     gate("omissions_authorized", evidence.omissions_authorized)
@@ -1172,6 +1447,13 @@ _LOCAL_REPAIR_BY_ISSUE: dict[AutonomousIssueType, AutonomousRepairClass] = {
     "relative_scale_misleading": "alternate_candidate",
     "layout_confusing": "alternate_candidate",
     "repetition_excess": "alternate_candidate",
+    "unwanted_source_camera_motion": "alternate_candidate",
+    "excessive_dwell": "earlier_legal_cue",
+    "cadence_monotony": "earlier_legal_cue",
+    "rhythm_flow_mismatch": "earlier_legal_cue",
+    "dead_air": "shift_trim_within_handles",
+    "missing_cue_boundary_coverage": "blocked",
+    "unauthorized_concat_padding": "blocked",
     "result_not_readable": "shift_trim_within_handles",
     "action_incomplete": "alternate_candidate",
     "missing_required_evidence": "alternate_candidate",
@@ -1225,6 +1507,27 @@ def plan_autonomous_recovery(
     next_replans = semantic_replans_used
     for issue in qa.issues:
         action = _LOCAL_REPAIR_BY_ISSUE[issue.issue_type]
+        if action == "blocked":
+            return AutonomousRecoveryPlan(
+                qa_passes_completed=qa_passes_completed,
+                semantic_replans_used=next_replans,
+                actions=tuple(
+                    [
+                        *actions,
+                        AutonomousRepairAction(
+                            issue_id=issue.issue_id,
+                            segment_id=issue.segment_id,
+                            beat_id=issue.beat_id,
+                            action="blocked",
+                        ),
+                    ]
+                ),
+                requires_another_qa=False,
+                outcome="blocked",
+                decision_codes=(
+                    "semantic_qa_reported_missing_deterministic_evidence",
+                ),
+            )
         semantic = action == "scoped_semantic_replan"
         if semantic:
             if next_replans >= policy.budget.max_semantic_replans:

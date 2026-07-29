@@ -13,12 +13,15 @@ from jascue_video_lab.autonomous_policy import (
 )
 from jascue_video_lab.sequence_optimizer import (
     BeatOptionSet,
+    MusicBoundaryCue,
+    MusicBoundarySpec,
     SegmentRenderCacheKey,
     SegmentRenderRequest,
     SequenceOption,
     concat_manifest_lines,
     optimize_sequence,
     render_segments_incrementally,
+    solve_music_aligned_boundaries,
 )
 
 
@@ -270,6 +273,88 @@ def test_intentional_freeze_requires_exact_event_lock() -> None:
             "ending",
             presentation="intentional_freeze",
         )
+
+
+def test_music_boundary_solver_treats_source_capacity_as_a_bound() -> None:
+    result = solve_music_aligned_boundaries(
+        [
+            MusicBoundarySpec(
+                beat_id="opening",
+                preferred_duration_ms=9_800,
+                minimum_duration_ms=5_000,
+                maximum_duration_ms=10_000,
+                boundary_priority="high",
+            ),
+            MusicBoundarySpec(
+                beat_id="payoff",
+                preferred_duration_ms=10_200,
+                minimum_duration_ms=8_000,
+                maximum_duration_ms=15_000,
+            ),
+        ],
+        [
+            MusicBoundaryCue(
+                cue_id="cue-capacity-edge",
+                time_ms=10_000,
+                kind="downbeat",
+                strength=0.95,
+            )
+        ],
+        total_duration_ms=20_000,
+    )
+
+    assert result.chapter_durations_ms == (10_000, 10_000)
+    assert result.selections[0].cue_id == "cue-capacity-edge"
+    assert result.cue_aligned_boundary_count == 1
+
+
+def test_music_boundary_solver_preserves_global_readability_bounds() -> None:
+    result = solve_music_aligned_boundaries(
+        [
+            MusicBoundarySpec(
+                beat_id="first",
+                preferred_duration_ms=10_000,
+                minimum_duration_ms=9_500,
+                maximum_duration_ms=10_500,
+                boundary_priority="high",
+            ),
+            MusicBoundarySpec(
+                beat_id="second",
+                preferred_duration_ms=10_000,
+                minimum_duration_ms=9_500,
+                maximum_duration_ms=10_500,
+                boundary_priority="high",
+            ),
+            MusicBoundarySpec(
+                beat_id="third",
+                preferred_duration_ms=10_000,
+                minimum_duration_ms=9_500,
+                maximum_duration_ms=10_500,
+            ),
+        ],
+        [
+            MusicBoundaryCue(
+                cue_id="cue-first-too-late-for-pair",
+                time_ms=10_500,
+                kind="accent",
+                strength=1.0,
+            ),
+            MusicBoundaryCue(
+                cue_id="cue-second",
+                time_ms=19_600,
+                kind="downbeat",
+                strength=0.9,
+            ),
+        ],
+        total_duration_ms=30_000,
+    )
+
+    assert all(
+        9_500 <= duration <= 10_500
+        for duration in result.chapter_durations_ms
+    )
+    assert result.selections[1].cue_id == "cue-second"
+    assert result.selections[0].cue_id is None
 
 
 def _cache_key(

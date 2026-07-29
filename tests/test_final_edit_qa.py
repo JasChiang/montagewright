@@ -214,11 +214,32 @@ def _canonical_output(prepared: Any) -> dict[str, Any]:
 
 def test_autonomous_segment_contract_separates_required_from_preferred_context() -> None:
     manifest = {
+        "editorial_duration_plan": {
+            "chapters": [
+                {
+                    "feature_id": "opening",
+                    "minimum_attention_dwell_seconds": 2.0,
+                    "resolved_duration_seconds": 3.5,
+                }
+            ],
+            "music_boundary_refinements": [
+                {
+                    "boundary_after_feature_id": "opening",
+                    "music_cue_id": "cue-1",
+                    "snap_delta_ms": 120,
+                    "music_snap_applied": True,
+                }
+            ],
+        },
         "vertical": {
             "chapters": [
                 {
                     "feature_id": "opening",
                     "applied_strategy": "tracked_crop",
+                    "source_camera_motion_measured": True,
+                    "source_camera_motion_reliable": True,
+                    "source_camera_motion_detected": "pan_right",
+                    "source_camera_motion_evidence_sha256": "a" * 64,
                     "secondary_context_clipping_allowed": True,
                     "duration_ms": 6_000,
                     "vertical_regions": [
@@ -261,6 +282,18 @@ def test_autonomous_segment_contract_separates_required_from_preferred_context()
         }
     ]
     assert contract[0]["presentation_strategy"] == "tracked_crop"
+    assert contract[0]["synthetic_camera_motion"][
+        "source_camera_motion_measured"
+    ] is True
+    assert contract[0]["synthetic_camera_motion"][
+        "source_camera_motion_detected"
+    ] == "pan_right"
+    assert contract[0]["editorial_rhythm_contract"]["dwell_bounds"][
+        "resolved_duration_seconds"
+    ] == 3.5
+    assert contract[0]["editorial_rhythm_contract"]["exit_boundary"][
+        "music_cue_id"
+    ] == "cue-1"
 
 
 def _autonomous_policy() -> AutonomousEditPolicy:
@@ -806,9 +839,22 @@ def test_deterministic_qa_measures_cue_delta_and_fails_independently() -> None:
             panel_same_pts_passed=True,
             relative_scale_lock_passed=True,
             cue_delta_frames={"result-stable": 3},
+            cue_tolerance_frames={"result-stable": 2},
+            cue_id_by_event={"result-stable": "principal-downbeat"},
+            required_cue_event_ids=("result-stable",),
+            cue_boundary_coverage_audited=True,
+            music_edit_boundary_coverage_passed=True,
             synthetic_motion_motivated=True,
             synthetic_reversal_count=0,
             settle_passed=True,
+            source_camera_motion_audited=True,
+            unwanted_source_camera_motion_count=0,
+            dwell_bounds_audited=True,
+            excessive_dwell_count=0,
+            dead_air_audited=True,
+            dead_air_count=0,
+            concat_padding_audited=True,
+            unauthorized_concat_padding_count=0,
             readability_passed=True,
             reuse_authorized=True,
             omissions_authorized=True,
@@ -834,9 +880,21 @@ def test_deterministic_qa_uses_event_specific_cue_tolerance() -> None:
             relative_scale_lock_passed=True,
             cue_delta_frames={"preferred-apex": 4},
             cue_tolerance_frames={"preferred-apex": 4},
+            cue_id_by_event={"preferred-apex": "accent-1"},
+            required_cue_event_ids=("preferred-apex",),
+            cue_boundary_coverage_audited=True,
+            music_edit_boundary_coverage_passed=True,
             synthetic_motion_motivated=True,
             synthetic_reversal_count=0,
             settle_passed=True,
+            source_camera_motion_audited=True,
+            unwanted_source_camera_motion_count=0,
+            dwell_bounds_audited=True,
+            excessive_dwell_count=0,
+            dead_air_audited=True,
+            dead_air_count=0,
+            concat_padding_audited=True,
+            unauthorized_concat_padding_count=0,
             readability_passed=True,
             reuse_authorized=True,
             omissions_authorized=True,
@@ -862,6 +920,43 @@ def test_deterministic_qa_blocks_excessive_panel_runtime() -> None:
             relative_scale_lock_passed=True,
             panel_runtime_fraction_passed=False,
             cue_delta_frames={},
+            cue_boundary_coverage_audited=True,
+            music_edit_boundary_coverage_passed=True,
+            synthetic_motion_motivated=True,
+            synthetic_reversal_count=0,
+            settle_passed=True,
+            source_camera_motion_audited=True,
+            unwanted_source_camera_motion_count=0,
+            dwell_bounds_audited=True,
+            excessive_dwell_count=0,
+            dead_air_audited=True,
+            dead_air_count=0,
+            concat_padding_audited=True,
+            unauthorized_concat_padding_count=0,
+            readability_passed=True,
+            reuse_authorized=True,
+            omissions_authorized=True,
+            hard_evidence_passed=True,
+        ),
+        policy=_autonomous_policy(),
+    )
+
+    assert report.passed is False
+    assert report.gate_results["panel_runtime_fraction"] == "failed"
+
+
+def test_deterministic_qa_fails_closed_when_new_audits_are_unknown() -> None:
+    report = run_deterministic_delivery_qa(
+        DeterministicDeliveryEvidence(
+            media_playable=True,
+            pts_valid=True,
+            unexpected_freeze_count=0,
+            containment_passed=True,
+            identity_passed=True,
+            relation_passed=True,
+            panel_same_pts_passed=True,
+            relative_scale_lock_passed=True,
+            cue_delta_frames={},
             synthetic_motion_motivated=True,
             synthetic_reversal_count=0,
             settle_passed=True,
@@ -874,7 +969,110 @@ def test_deterministic_qa_blocks_excessive_panel_runtime() -> None:
     )
 
     assert report.passed is False
-    assert report.gate_results["panel_runtime_fraction"] == "failed"
+    assert report.gate_results["cue_boundary_coverage"] == "failed"
+    assert report.gate_results["source_camera_motion"] == "failed"
+    assert report.gate_results["dwell_bounds"] == "failed"
+    assert report.gate_results["no_dead_air"] == "failed"
+    assert report.gate_results["no_unauthorized_concat_padding"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "gate_name"),
+    [
+        ("unwanted_source_camera_motion_count", 1, "source_camera_motion"),
+        ("excessive_dwell_count", 1, "dwell_bounds"),
+        ("dead_air_count", 1, "no_dead_air"),
+        (
+            "unauthorized_concat_padding_count",
+            1,
+            "no_unauthorized_concat_padding",
+        ),
+    ],
+)
+def test_deterministic_qa_blocks_generic_motion_rhythm_and_padding_defects(
+    field: str,
+    value: Any,
+    gate_name: str,
+) -> None:
+    payload = {
+        "media_playable": True,
+        "pts_valid": True,
+        "unexpected_freeze_count": 0,
+        "containment_passed": True,
+        "identity_passed": True,
+        "relation_passed": True,
+        "panel_same_pts_passed": True,
+        "relative_scale_lock_passed": True,
+        "cue_delta_frames": {"result-stable": 0},
+        "cue_tolerance_frames": {"result-stable": 2},
+        "cue_id_by_event": {"result-stable": "principal-downbeat"},
+        "required_cue_event_ids": ["result-stable"],
+        "cue_boundary_coverage_audited": True,
+        "music_edit_boundary_coverage_passed": True,
+        "synthetic_motion_motivated": True,
+        "synthetic_reversal_count": 0,
+        "settle_passed": True,
+        "source_camera_motion_audited": True,
+        "unwanted_source_camera_motion_count": 0,
+        "dwell_bounds_audited": True,
+        "excessive_dwell_count": 0,
+        "dead_air_audited": True,
+        "dead_air_count": 0,
+        "concat_padding_audited": True,
+        "unauthorized_concat_padding_count": 0,
+        "readability_passed": True,
+        "reuse_authorized": True,
+        "omissions_authorized": True,
+        "hard_evidence_passed": True,
+    }
+    payload[field] = value
+
+    report = run_deterministic_delivery_qa(
+        DeterministicDeliveryEvidence.model_validate(payload),
+        policy=_autonomous_policy(),
+    )
+
+    assert report.passed is False
+    assert report.gate_results[gate_name] == "failed"
+
+
+def test_deterministic_qa_requires_ids_and_deltas_for_required_cues() -> None:
+    report = run_deterministic_delivery_qa(
+        DeterministicDeliveryEvidence(
+            media_playable=True,
+            pts_valid=True,
+            unexpected_freeze_count=0,
+            containment_passed=True,
+            identity_passed=True,
+            relation_passed=True,
+            panel_same_pts_passed=True,
+            relative_scale_lock_passed=True,
+            cue_delta_frames={},
+            cue_tolerance_frames={},
+            cue_id_by_event={},
+            required_cue_event_ids=("result-stable",),
+            cue_boundary_coverage_audited=True,
+            music_edit_boundary_coverage_passed=True,
+            synthetic_motion_motivated=True,
+            synthetic_reversal_count=0,
+            settle_passed=True,
+            source_camera_motion_audited=True,
+            unwanted_source_camera_motion_count=0,
+            dwell_bounds_audited=True,
+            excessive_dwell_count=0,
+            dead_air_audited=True,
+            dead_air_count=0,
+            concat_padding_audited=True,
+            unauthorized_concat_padding_count=0,
+            readability_passed=True,
+            reuse_authorized=True,
+            omissions_authorized=True,
+            hard_evidence_passed=True,
+        ),
+        policy=_autonomous_policy(),
+    )
+
+    assert report.gate_results["cue_boundary_coverage"] == "failed"
 
 
 def test_recovery_uses_local_mapping_and_enforces_both_caps(
@@ -1001,6 +1199,146 @@ def test_autonomous_validator_allows_aspect_ratio_but_rejects_timestamp(
     )
     with pytest.raises(ValueError, match="executable timestamp"):
         final_edit_qa_module._validate_result(prepared, rejected)
+
+
+def test_autonomous_cue_alignment_claim_must_match_measured_cue_plan(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(tmp_path)
+    write_json(
+        contexts["cue_plan"],
+        {
+            "alignments": [
+                {
+                    "alignment": {
+                        "event_id": "result-stable",
+                        "cue_id": "principal-downbeat",
+                        "delta_frames": 1,
+                        "tolerance_frames": 2,
+                    }
+                }
+            ]
+        },
+    )
+    prepared = prepare_final_edit_qa(
+        mode="autonomous_final_9x16",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=tmp_path / "qa",
+        model_id="gemini-3.6-flash",
+    )
+    payload = {
+        **_autonomous_output(prepared),
+        "cue_alignment_claims": [
+            {
+                "event_id": "result-stable",
+                "cue_id": "principal-downbeat",
+                "measured_delta_frames": 1,
+                "tolerance_frames": 2,
+                "perceived_relationship": "effective",
+                "observation": "The measured downbeat relationship feels effective.",
+            }
+        ],
+        "requires_human_review": False,
+    }
+    accepted = AutonomousFinalEditQa.model_validate(payload)
+    final_edit_qa_module._validate_result(prepared, accepted)
+
+    changed = AutonomousFinalEditQa.model_validate(
+        {
+            **payload,
+            "cue_alignment_claims": [
+                {
+                    **payload["cue_alignment_claims"][0],
+                    "measured_delta_frames": 0,
+                }
+            ],
+        }
+    )
+    with pytest.raises(ValueError, match="changed.*measured cue"):
+        final_edit_qa_module._validate_result(prepared, changed)
+
+
+def test_autonomous_global_observation_cannot_claim_unmeasured_alignment(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(tmp_path)
+    prepared = prepare_final_edit_qa(
+        mode="autonomous_final_9x16",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=tmp_path / "qa",
+        model_id="gemini-3.6-flash",
+    )
+    result = AutonomousFinalEditQa.model_validate(
+        {
+            **_autonomous_output(prepared),
+            "ending_observation": "The ending is exactly aligned to the downbeat.",
+            "requires_human_review": False,
+        }
+    )
+
+    with pytest.raises(ValueError, match="without cue IDs"):
+        final_edit_qa_module._validate_result(prepared, result)
+
+
+def test_cadence_and_music_flow_remain_semantic_final_video_issues(
+    tmp_path: Path,
+) -> None:
+    render, manifest, brief, contexts = _autonomous_files(tmp_path)
+    prepared = prepare_final_edit_qa(
+        mode="autonomous_final_9x16",
+        render_path=render,
+        manifest_path=manifest,
+        brief_path=brief,
+        autonomous_context_paths=contexts,
+        output_dir=tmp_path / "qa",
+        model_id="gemini-3.6-flash",
+    )
+    assert "cadence_monotony_detected" not in (
+        DeterministicDeliveryEvidence.model_fields
+    )
+    assert "rhythm_flow_mismatch_detected" not in (
+        DeterministicDeliveryEvidence.model_fields
+    )
+    assert "cadence_monotony" in prepared.prompt
+    assert "rhythm_flow_mismatch" in prepared.prompt
+
+    qa = AutonomousFinalEditQa.model_validate(
+        {
+            **_autonomous_output(
+                prepared,
+                issues=[
+                    {
+                        "issue_id": "cadence",
+                        "issue_type": "cadence_monotony",
+                        "severity": "medium",
+                        "segment_id": "payoff",
+                        "beat_id": "generation-result",
+                        "observation": (
+                            "Adjacent units hold with the same perceived pulse."
+                        ),
+                        "evidence_modality": "visual_and_audio",
+                        "repair_class": "earlier_legal_cue",
+                    }
+                ],
+                status="issues_observed",
+            ),
+            "requires_human_review": False,
+        }
+    )
+    recovery = plan_autonomous_recovery(
+        qa,
+        policy=_autonomous_policy(),
+        qa_passes_completed=1,
+        semantic_replans_used=0,
+    )
+    assert recovery.actions[0].action == "earlier_legal_cue"
+    assert recovery.outcome == "repair"
 
 
 def test_semantic_replan_is_scoped_and_limited_to_one(

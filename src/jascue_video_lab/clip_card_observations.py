@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
 from .models import (
     EntityKind,
     EvidenceModality,
+    FeatureEvidenceProvenance,
     FrozenStrictModel,
     FullClipCard,
     FullClipEvent,
@@ -148,6 +149,7 @@ class EventObservationSupplement(FrozenStrictModel):
     event_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     observation_basis: ObservationBasis | None = None
     audio_included: bool = False
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     capabilities: EventCapabilityManifest
     source_action_completeness: Literal[
         "complete",
@@ -298,6 +300,7 @@ def event_fingerprint(event: FullClipEvent) -> str:
             "end_mmss": event.end_mmss,
             "label": event.label,
             "observable_evidence": event.observable_evidence,
+            "evidence_provenance": event.evidence_provenance,
             "entity_ids": event.entity_ids,
         }
     )
@@ -334,6 +337,7 @@ def legacy_event_observation(event: FullClipEvent) -> EventObservationSupplement
                 else AssessmentStatus.NOT_ASSESSED
             )
         ),
+        evidence_provenance=event.evidence_provenance,
         observable_beats=beats,
     )
 

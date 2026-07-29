@@ -8,6 +8,7 @@
       "priority": "preferred",
       "evidence_query_lock_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "required_target_ids": ["camera_gesture"],
+      "allowed_evidence_provenance": ["direct_physical_action"],
       "narrative_function": "feature_evidence",
       "visual_events": [
         {
@@ -30,6 +31,10 @@
       "priority": "hard",
       "evidence_query_lock_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
       "required_target_ids": ["generation_result"],
+      "allowed_evidence_provenance": [
+        "direct_ui_interaction",
+        "direct_result"
+      ],
       "narrative_function": "global_energy_peak",
       "visual_events": [
         {
@@ -52,6 +57,7 @@
       "priority": "hard",
       "evidence_query_lock_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
       "required_target_ids": ["watch_ui"],
+      "allowed_evidence_provenance": ["direct_ui_interaction"],
       "narrative_function": "feature_evidence",
       "visual_events": [
         {
@@ -74,6 +80,7 @@
       "priority": "preferred",
       "evidence_query_lock_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
       "required_target_ids": ["underwater_watch"],
+      "allowed_evidence_provenance": ["direct_physical_action"],
       "narrative_function": "feature_evidence",
       "visual_events": [
         {
@@ -96,6 +103,7 @@
       "priority": "preferred",
       "evidence_query_lock_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
       "required_target_ids": ["group_laugh"],
+      "allowed_evidence_provenance": ["direct_physical_action"],
       "narrative_function": "closing",
       "visual_events": [
         {

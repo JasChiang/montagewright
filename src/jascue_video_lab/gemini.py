@@ -27,6 +27,7 @@ from .event_lock import (
     ExactEventSelectionGroup,
     bracket_dense_frames_by_difference,
     resolve_exact_event_locks,
+    validate_exact_event_evidence_provenance,
 )
 from .geometry import native_yxyx_to_canonical_xyxy
 from .identity_checkpoints import IdentityCheckpointModelDecision
@@ -47,6 +48,7 @@ from .models import (
     ExtractedFrame,
     FeatureEditBrief,
     FeatureEditPlan,
+    FeatureEvidenceProvenance,
     FrozenStrictModel,
     FullClipCard,
     FullClipEvent,
@@ -1044,6 +1046,48 @@ def canonicalize_feature_edit_plan_output(
                         "after": candidate_value,
                         "rule": (
                             "rank_one_candidate_is_authoritative_legacy_projection"
+                        ),
+                    }
+                )
+        vertical_candidates_for_provenance = chapter.get(
+            "vertical_candidates"
+        )
+        if isinstance(vertical_candidates_for_provenance, list):
+            rank_one_vertical = next(
+                (
+                    candidate
+                    for candidate in vertical_candidates_for_provenance
+                    if isinstance(candidate, dict)
+                    and candidate.get("rank") == 1
+                    and isinstance(
+                        candidate.get("evidence_provenance"),
+                        str,
+                    )
+                ),
+                None,
+            )
+            if (
+                rank_one_vertical is not None
+                and chapter.get("evidence_provenance")
+                != rank_one_vertical["evidence_provenance"]
+            ):
+                before = chapter.get("evidence_provenance")
+                chapter["evidence_provenance"] = rank_one_vertical[
+                    "evidence_provenance"
+                ]
+                changes.append(
+                    {
+                        "json_path": (
+                            f"$.chapters[{chapter_index}]"
+                            ".evidence_provenance"
+                        ),
+                        "before": before,
+                        "after": rank_one_vertical[
+                            "evidence_provenance"
+                        ],
+                        "rule": (
+                            "rank_one_vertical_candidate_projects_evidence_"
+                            "provenance"
                         ),
                     }
                 )
@@ -3393,6 +3437,7 @@ model_provenance (return it unchanged with interaction_id=null):
         beat_contracts: Sequence[EditorialBeatContract],
         run_dir: Path,
         input_artifact_hashes: tuple[str, ...],
+        evidence_provenance: FeatureEvidenceProvenance | None = None,
         max_bracket_frames: int = 12,
     ) -> tuple[ExactEventLockV2, ...]:
         """Resolve grouped event locks from supplied IDs without model timecodes."""
@@ -3407,6 +3452,12 @@ model_provenance (return it unchanged with interaction_id=null):
             raise ValueError("exact-event resolution requires a visual event")
         if len(requested_events) > 8:
             raise ValueError("one exact-event group supports at most eight events")
+        if evidence_provenance is not None:
+            validate_exact_event_evidence_provenance(
+                evidence_provenance,
+                beat_contracts,
+            )
+        resolved_evidence_provenance = evidence_provenance or "unknown"
         bracket = bracket_dense_frames_by_difference(
             catalog,
             max_frames=max_bracket_frames,
@@ -3421,6 +3472,7 @@ model_provenance (return it unchanged with interaction_id=null):
             "必須回傳 selections=[]，不得猜測，也不得用近似動作代替。\n"
             f"source_asset_id={catalog.source_asset_id}\n"
             f"catalog_event_id={catalog.event_id}\n"
+            f"evidence_provenance={resolved_evidence_provenance}\n"
             "allowed_frame_ids="
             + json.dumps(allowed_ids, ensure_ascii=False)
             + "\neditorial_events="
@@ -3575,6 +3627,7 @@ model_provenance (return it unchanged with interaction_id=null):
                 group.selections,
                 gemini_interaction_id=interaction.id,
                 input_artifact_hashes=input_artifact_hashes,
+                evidence_provenance=resolved_evidence_provenance,
             )
             write_json(
                 run_dir / "exact_event_locks.json",

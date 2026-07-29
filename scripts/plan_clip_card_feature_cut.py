@@ -50,6 +50,7 @@ from jascue_video_lab.event_lock import load_editorial_beat_contracts
 from jascue_video_lab.gemini import (
     GeminiLabClient,
     MODEL_ID,
+    VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
     _raw_dump,
     canonical_interactions_mime_type,
 )
@@ -59,6 +60,7 @@ from jascue_video_lab.models import (
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
+    FeatureEvidenceProvenance,
     FeatureHorizontalCandidate,
     FeatureVerticalCandidate,
     FramingRegionIntent,
@@ -76,6 +78,33 @@ from jascue_video_lab.storage import read_json, utc_now, write_json
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+def _expected_clip_card_cache_key(
+    card: FullClipCard,
+    prompt: str,
+) -> dict[str, str]:
+    schema = json.dumps(
+        gemini_response_schema(FullClipCard),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "model": MODEL_ID,
+        "prompt_sha256": hashlib.sha256(
+            prompt.encode("utf-8")
+        ).hexdigest(),
+        "schema_sha256": hashlib.sha256(
+            schema.encode("utf-8")
+        ).hexdigest(),
+        "system_instruction_sha256": hashlib.sha256(
+            VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
+        ).hexdigest(),
+        "media_resolution": "low",
+        "source_asset_id": card.source_asset_id,
+        "proxy_asset_id": card.proxy_asset_id,
+    }
 
 
 # Keep these two v1 models byte-for-byte schema compatible with the historical
@@ -1001,6 +1030,11 @@ class SelectedEvidenceGroundingTarget(StrictModel):
 class SelectedEvidenceEvent(StrictModel):
     source_asset_id: str
     event_id: str
+    observable_evidence: str = ""
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
+    action_completeness: Literal[
+        "complete", "partial", "uncertain"
+    ] = "uncertain"
     entity_ids: list[str]
     primary_entity_ids: list[str]
     required_entity_ids: list[str]
@@ -1013,7 +1047,10 @@ class SelectedEvidenceEvent(StrictModel):
 class SelectedClipCardEvidence(StrictModel):
     """Hash-bound local evidence required to reproduce a v3 projection."""
 
-    contract_version: Literal["clip-card-feature-cut-selected-evidence-v1"]
+    contract_version: Literal[
+        "clip-card-feature-cut-selected-evidence-v1",
+        "clip-card-feature-cut-selected-evidence-v2",
+    ]
     events: list[SelectedEvidenceEvent]
 
 
@@ -2728,6 +2765,9 @@ def build_selected_clip_card_evidence(
             SelectedEvidenceEvent(
                 source_asset_id=asset_id,
                 event_id=event_id,
+                observable_evidence=event.observable_evidence,
+                evidence_provenance=event.evidence_provenance,
+                action_completeness=event.action_completeness,
                 entity_ids=list(event.entity_ids),
                 primary_entity_ids=list(event.primary_entity_ids),
                 required_entity_ids=list(event.required_entity_ids),
@@ -2754,7 +2794,7 @@ def build_selected_clip_card_evidence(
             )
         )
     return SelectedClipCardEvidence(
-        contract_version="clip-card-feature-cut-selected-evidence-v1",
+        contract_version="clip-card-feature-cut-selected-evidence-v2",
         events=events,
     )
 
@@ -3044,6 +3084,9 @@ def project_feature_contracts_v3(
                 event_id=candidate.event_id,
                 frame_id=candidate.frame_id,
                 observed_visual_evidence=candidate.observed_visual_evidence,
+                evidence_provenance=(
+                    evidence_event(candidate).evidence_provenance
+                ),
                 selection_reason=candidate.selection_reason,
                 strategy=candidate.vertical_strategy,
                 crop_mode=candidate.vertical_crop_mode,
@@ -3103,6 +3146,9 @@ def project_feature_contracts_v3(
                 horizontal_frame_id=horizontal_primary.frame_id,
                 vertical_frame_id=vertical_primary.frame_id,
                 observed_visual_evidence=observed,
+                evidence_provenance=(
+                    evidence_event(vertical_primary).evidence_provenance
+                ),
                 selection_reason=reason,
                 horizontal_strategy=horizontal_primary.horizontal_strategy,
                 horizontal_zoom_intent=horizontal_primary.horizontal_zoom_intent,
@@ -3140,6 +3186,9 @@ def project_feature_contracts_v3(
                         event_id=candidate.event_id,
                         frame_id=candidate.frame_id,
                         observed_visual_evidence=candidate.observed_visual_evidence,
+                        evidence_provenance=(
+                            evidence_event(candidate).evidence_provenance
+                        ),
                         selection_reason=candidate.selection_reason,
                         strategy=candidate.horizontal_strategy,
                         zoom_intent=candidate.horizontal_zoom_intent,
@@ -3838,6 +3887,8 @@ def main() -> int:
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not args.reuse_raw_output and not api_key:
         raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required")
+    if not args.reuse_raw_output and not args.resume_failed_plan:
+        _assert_fresh_feature_namespace_empty(args.output_dir)
     catalog = RushesCatalog.model_validate(read_json(args.catalog_json))
     brief = FeatureEditBrief.model_validate(read_json(args.brief_json))
     music_path = (
@@ -3894,23 +3945,41 @@ def main() -> int:
     frames = {frame.frame_id: frame for frame in catalog.frames}
     clips = {clip.clip_id: clip for clip in catalog.clips}
     asset_to_clip = {f"sha256:{clip.sha256}": clip for clip in catalog.clips}
+    clip_card_prompt = (
+        Path(__file__).resolve().parents[1]
+        / "prompts"
+        / "full_clip_card_mmss_zh-TW.txt"
+    ).read_text("utf-8")
 
     cards: dict[str, FullClipCard] = {}
     for clip in catalog.clips:
-        path = (
+        clip_card_dir = (
             args.prepared_library
             / "clips"
             / clip.sha256[:16]
             / "gemini"
             / "clip-card"
-            / "clip_card.json"
         )
+        path = clip_card_dir / "clip_card.json"
         if not path.exists():
             raise FileNotFoundError(f"Clip Card missing for {clip.clip_id}: {path}")
         card = FullClipCard.model_validate(read_json(path))
         expected_asset = f"sha256:{clip.sha256}"
         if card.source_asset_id != expected_asset:
             raise ValueError(f"Clip Card asset mismatch for {clip.clip_id}")
+        cache_key_path = clip_card_dir / "cache-key.json"
+        cache_binding_stale = (
+            not cache_key_path.is_file()
+            or read_json(cache_key_path)
+            != _expected_clip_card_cache_key(card, clip_card_prompt)
+        )
+        if cache_binding_stale and (
+            policy is not None or not args.reuse_raw_output
+        ):
+            raise ValueError(
+                "Clip Card cache binding is stale; regenerate before paid "
+                f"planning: {clip.clip_id}"
+            )
         cards[expected_asset] = card
     supplements: dict[str, list[ClipObservationSupplement]] = {}
     for path in args.supplement:
@@ -4166,6 +4235,10 @@ def main() -> int:
 - presentation_preference 只表達語意可接受的呈現類型；本機仍會枚舉 geometry。
   無須運鏡就用 static_full_bleed；需要保持活動主體才用 tracked_full_bleed；
   有可觀察 attention handoff 才用 phase_virtual_camera。
+- required_entity_indices 必須選真正承擔 brief 的最小可見證據範圍。若比較的是
+  厚度、鉸鏈、邊緣、尺寸參照或 UI 局部，應選 Clip Card 中對應的 relation
+  carrier Entity，不得為求保守把整台產品、整個人物或所有共現物件都升成
+  100% hard core。完整外形本身是證據時才要求 whole entity。
 - 必須同時比較或保留 context+detail、共同滿版又不可行時，可以允許
   two_panel_layout；只回傳語意許可與 compare/context_detail goal，不指定上下、
   左右、panel 尺寸或 crop。物理尺寸比較需 physical_scale_comparison=true。

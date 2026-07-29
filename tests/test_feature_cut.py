@@ -55,6 +55,7 @@ from jascue_video_lab.feature_cut import (
     _is_exhausted_model_quota_error,
     _is_non_retryable_spending_cap_error,
     _load_trim_decisions,
+    _load_runtime_candidate_evidence_events,
     _order_insensitive_grounding_group_key,
     _migrate_legacy_feature_plan_binding,
     _piecewise_expression,
@@ -351,6 +352,54 @@ def test_relation_core_preserves_all_clip_card_required_entities() -> None:
         for region in bound["regions"]
         if region["role"] == "required"
     ] == ["left", "right"]
+
+
+def test_autonomous_runtime_requires_provenance_aware_selected_evidence(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "selected-clip-card-evidence.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "contract_version": (
+                    "clip-card-feature-cut-selected-evidence-v1"
+                ),
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError,
+        match="requires provenance-aware selected evidence v2",
+    ):
+        _load_runtime_candidate_evidence_events(
+            tmp_path,
+            require_provenance=True,
+        )
+
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "contract_version": (
+                    "clip-card-feature-cut-selected-evidence-v2"
+                ),
+                "events": [
+                    {
+                        "source_asset_id": "sha256:" + "a" * 64,
+                        "event_id": "playback",
+                        "evidence_provenance": "unknown",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown provenance"):
+        _load_runtime_candidate_evidence_events(
+            tmp_path,
+            require_provenance=True,
+        )
 
 
 def test_authorized_solid_fit_is_not_execution_authority(
@@ -1128,7 +1177,7 @@ def test_editorial_dwell_can_snap_to_longer_music_prefix_when_authorized() -> No
                 priority=CuePriority.PREFERRED,
             )
             for index, time_ms in enumerate(
-                (10_100, 20_100, 30_100, 40_100, 50_100),
+                (10_000, 20_000, 30_000, 40_000, 50_000),
                 start=1,
             )
         ],
@@ -1149,22 +1198,31 @@ def test_editorial_dwell_can_snap_to_longer_music_prefix_when_authorized() -> No
         brief,
         plan,
         music_lock=music_lock,
+        source_capacity_seconds={
+            feature_id: 10 for feature_id in feature_ids
+        },
         project_duration_seconds=60,
         allow_music_lock_prefix=True,
     )
 
     assert sum(durations.values()) == 60
-    assert durations["opening"] == 10.1
+    assert durations["opening"] == 10
     assert audit["music_lock_prefix_used"] is True
     assert audit["music_lock_duration_ms"] == 61_000
     assert audit["project_timeline_end_ms"] == 60_000
     assert audit["music_boundary_refinements"][0]["music_snap_applied"] is True
+    assert audit["joint_boundary_solver_applied"] is True
+    assert audit["music_cue_aligned_boundary_count"] == 5
+    assert audit["music_cue_unaligned_boundary_count"] == 0
 
     assembled_durations, assembled_audit = (
         _resolve_editorial_chapter_durations(
             brief,
             plan,
             music_lock=music_lock,
+            source_capacity_seconds={
+                feature_id: 10 for feature_id in feature_ids
+            },
             project_duration_seconds=60,
             output_timeline_cues=music_lock.cues,
         )
@@ -7139,7 +7197,7 @@ def test_concat_normalizes_mixed_frame_rates_to_editorial_durations(
                 "-f",
                 "lavfi",
                 "-i",
-                f"color=c=black:s=320x180:r={frame_rate}:d=0.93",
+                f"color=c=black:s=320x180:r={frame_rate}:d=0.96",
                 "-f",
                 "lavfi",
                 "-i",
@@ -7159,10 +7217,10 @@ def test_concat_normalizes_mixed_frame_rates_to_editorial_durations(
         segments.append(segment)
 
     output = tmp_path / "normalized.mp4"
-    _concat_segments(
+    padding_audit = _concat_segments(
         segments,
         output,
-        segment_durations_seconds=(1.0, 1.0),
+        segment_durations_seconds=(0.99, 0.99),
     )
     probe = subprocess.run(
         [
@@ -7185,9 +7243,54 @@ def test_concat_normalizes_mixed_frame_rates_to_editorial_durations(
         for stream in metadata["streams"]
         if stream["codec_type"] == "video"
     )
-    assert float(metadata["format"]["duration"]) == pytest.approx(2.0, abs=0.04)
+    assert float(metadata["format"]["duration"]) == pytest.approx(1.98, abs=0.04)
     assert video["avg_frame_rate"] == "30/1"
     assert int(video["nb_frames"]) == 60
+    assert padding_audit["audited"] is True
+    assert padding_audit["unauthorized_concat_padding_count"] == 0
+    assert all(
+        row["clone_padding_seconds"] <= padding_audit["maximum_padding_seconds"]
+        for row in padding_audit["segments"]
+    )
+
+
+def test_concat_refuses_unauthorized_tail_clone_beyond_one_frame(
+    tmp_path: Path,
+) -> None:
+    segment = tmp_path / "short-segment.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=320x180:r=30:d=0.8",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+            "-t",
+            "0.8",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-pix_fmt",
+            "yuv420p",
+            str(segment),
+        ],
+        check=True,
+    )
+
+    with pytest.raises(ValueError, match="refusing accidental freeze padding"):
+        _concat_segments(
+            [segment],
+            tmp_path / "joined.mp4",
+            segment_durations_seconds=(1.0,),
+        )
 
 
 def test_concat_rejects_unordered_duration_mapping(tmp_path: Path) -> None:

@@ -13,6 +13,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 NormalizedCoordinate = Annotated[int, Field(ge=0, le=1000)]
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 MmSs = Annotated[str, Field(pattern=r"^\d{2,}:[0-5]\d$")]
+FeatureEvidenceProvenance = Literal[
+    "direct_physical_action",
+    "direct_ui_interaction",
+    "direct_result",
+    "prerecorded_screen_playback",
+    "promotional_graphic",
+    "textual_claim_only",
+    "context_only",
+    "unknown",
+]
 
 
 class StrictModel(BaseModel):
@@ -1153,6 +1163,7 @@ class FullClipEvent(StrictModel):
     label: str
     description: str
     observable_evidence: str
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     evidence_modalities: EvidenceModality
     entity_ids: list[str]
     primary_entity_ids: list[str]
@@ -4233,6 +4244,7 @@ class FeatureHorizontalCandidate(StrictModel):
         max_length=8,
     )
     observed_visual_evidence: str = Field(min_length=1)
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     selection_reason: str = Field(min_length=1)
     strategy: Literal["original", "tracked_reframe"]
     zoom_intent: Literal["none", "subtle", "detail"]
@@ -4262,6 +4274,7 @@ class FeatureVerticalCandidate(StrictModel):
     event_id: str = Field(min_length=1)
     frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
     observed_visual_evidence: str = Field(min_length=1)
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     selection_reason: str = Field(min_length=1)
     strategy: Literal["tracked_crop", "fit_with_background"]
     crop_mode: Literal["strict", "primary_center"] = "strict"
@@ -4564,6 +4577,7 @@ class FeatureChapterSelect(StrictModel):
         max_length=8,
     )
     observed_visual_evidence: str
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     selection_reason: str
     horizontal_strategy: Literal["original", "tracked_reframe"]
     horizontal_zoom_intent: Literal["none", "subtle", "detail"]
@@ -4759,6 +4773,7 @@ class FeatureChapterSelect(StrictModel):
             primary = min(self.vertical_candidates, key=lambda item: item.rank)
             if (
                 self.vertical_frame_id != primary.frame_id
+                or self.evidence_provenance != primary.evidence_provenance
                 or self.vertical_strategy != primary.strategy
                 or self.vertical_target_description != primary.target_description
             ):
