@@ -56,6 +56,26 @@ def test_extract_frame_at_pts_reselects_exact_decoded_frame(tmp_path: Path) -> N
     assert exact.requested_time_ms == exact.frame_time_ms
 
 
+def test_extract_frame_near_container_eof_uses_last_decodable_pts(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "eof.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+            "-i", "testsrc2=s=320x180:r=10:d=2", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", str(video),
+        ],
+        check=True,
+    )
+
+    frame = extract_frame(video, 1_999, tmp_path / "eof.png")
+
+    assert frame.requested_time_ms == 1_999
+    assert frame.frame_time_ms == 1_900
+    assert frame.frame_time_ms < frame.requested_time_ms
+
+
 def test_probe_preserves_non_square_sample_aspect_ratio(tmp_path: Path) -> None:
     video = tmp_path / "anamorphic.mp4"
     subprocess.run(

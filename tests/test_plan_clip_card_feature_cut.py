@@ -37,6 +37,7 @@ from jascue_video_lab.models import (
     EvidenceModality,
     FeatureChapterBrief,
     FeatureEditBrief,
+    FeatureEditPlan,
     FullClipCard,
     FullClipAttentionPhase,
     FullClipEvent,
@@ -82,6 +83,7 @@ from scripts.plan_clip_card_feature_cut import (
     _resolve_feature_reuse_artifacts,
     _verified_feature_raw_output_text,
     _write_feature_normalization_artifacts,
+    audit_editorial_freshness,
     build_selected_clip_card_evidence,
     canonicalize_direct_video_edit_plan_output,
     canonicalize_feature_plan_output,
@@ -98,6 +100,7 @@ from scripts.plan_clip_card_feature_cut import (
     planning_candidate_id,
     planning_candidate_slice,
     planning_capability_catalog,
+    prior_vertical_selections,
     project_direct_video_edit_plan,
     validate_candidate_video_budget,
 )
@@ -185,6 +188,74 @@ def test_candidate_video_budget_fails_before_upload_or_paid_planning() -> None:
             total_duration_ms=360_001,
             maximum_duration_ms=360_000,
         )
+
+
+def test_alternate_edit_freshness_changes_only_substitutable_events() -> None:
+    prior = project_feature_contracts(
+        _v2_plan(),
+        brief=_brief(),
+        catalog=_catalog(),
+    )
+    unchanged_payload = prior.model_dump(mode="json")
+    unchanged_payload["chapters"][0]["vertical_candidates"][1][
+        "event_id"
+    ] = "alternate-demo"
+    unchanged = FeatureEditPlan.model_validate(unchanged_payload)
+
+    failed = audit_editorial_freshness(
+        unchanged,
+        prior=prior,
+        minimum_change_fraction=0.5,
+    )
+
+    assert failed["passed"] is False
+    assert failed["substitutable_beat_count"] == 1
+    assert failed["changed_substitutable_beat_count"] == 0
+    assert prior_vertical_selections(prior) == {
+        "feature-1": (ASSET_ID, "demo")
+    }
+
+    changed_payload = unchanged.model_dump(mode="json")
+    changed_payload["chapters"][0]["vertical_candidates"][0][
+        "event_id"
+    ] = "alternate-demo"
+    changed_payload["chapters"][0]["vertical_candidates"][1][
+        "event_id"
+    ] = "demo"
+    changed = FeatureEditPlan.model_validate(changed_payload)
+    passed = audit_editorial_freshness(
+        changed,
+        prior=prior,
+        minimum_change_fraction=0.5,
+    )
+
+    assert passed["passed"] is True
+    assert passed["changed_substitutable_beat_count"] == 1
+    assert passed["rows"][0]["changed"] is True
+
+
+def test_alternate_edit_never_forces_hard_evidence_to_change() -> None:
+    prior = project_feature_contracts(
+        _v2_plan(),
+        brief=_brief(),
+        catalog=_catalog(),
+    )
+    payload = prior.model_dump(mode="json")
+    payload["chapters"][0]["vertical_candidates"][1][
+        "event_id"
+    ] = "alternate-demo"
+    current = FeatureEditPlan.model_validate(payload)
+
+    audit = audit_editorial_freshness(
+        current,
+        prior=prior,
+        hard_protected_feature_ids=frozenset({"feature-1"}),
+        minimum_change_fraction=1.0,
+    )
+
+    assert audit["passed"] is True
+    assert audit["substitutable_beat_count"] == 0
+    assert audit["rows"][0]["hard_evidence_protected"] is True
 
 
 def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> None:

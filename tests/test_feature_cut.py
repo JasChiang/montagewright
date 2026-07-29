@@ -34,7 +34,10 @@ from jascue_video_lab.feature_cut import (
     _chapter_bounds_with_approved_trim,
     _audit_feature_plan_candidate_recall,
     _audit_requested_candidate_recall,
+    _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
+    _bounded_cue_shifted_window,
+    _bind_runtime_candidate_coverage,
     _audit_render_source_reuse,
     _autonomous_panel_fallback_eligible,
     _runtime_candidate_reuse_violation,
@@ -76,6 +79,7 @@ from jascue_video_lab.feature_cut import (
     _validate_feature_plan_binding,
     _validate_shared_sam_session_cache,
     _vertical_crop_geometry,
+    _vertical_candidate_geometry,
     _vertical_center_crop_filter,
     _vertical_delivery_fallback,
     _vertical_filter_from_track,
@@ -125,6 +129,163 @@ def test_simultaneous_relation_enables_local_two_panel_fallback() -> None:
         relation_mode="simultaneous",
         policy=policy,
     )
+
+
+def test_relation_core_preserves_all_clip_card_required_entities() -> None:
+    selected = FeatureChapterSelect(
+        feature_id="comparison",
+        evidence_status="supported",
+        observed_visual_evidence="Two devices are compared side by side.",
+        selection_reason="The relative sizes are the evidence.",
+        horizontal_frame_id="RF000001",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000001",
+        vertical_strategy="fit_with_background",
+        vertical_target_description="left | right",
+        quality_risks=[],
+        confidence=0.9,
+    )
+    option = {
+        "candidate_id": "rank-01",
+        "rank": 1,
+        "coverage_mode": "relation_core",
+        "physical_scale_comparison": True,
+        "regions": [],
+    }
+    evidence_event = {
+        "required_entity_ids": ["left", "right"],
+        "primary_entity_ids": ["left", "right"],
+        "entities": [
+            {"entity_id": "left", "kind": "device", "label": "Left device"},
+            {"entity_id": "right", "kind": "device", "label": "Right device"},
+        ],
+        "grounding_targets": [
+            {"entity_id": "left", "target_description": "left device"},
+            {"entity_id": "right", "target_description": "right device"},
+        ],
+    }
+
+    bound = _bind_runtime_candidate_coverage(
+        option,
+        selected=selected,
+        evidence_event=evidence_event,
+    )
+
+    assert bound["coverage_intent"] == "simultaneous_relation"
+    assert bound["coverage_target_descriptions"] == [
+        "left device",
+        "right device",
+    ]
+    assert [
+        region["entity_id"]
+        for region in bound["regions"]
+        if region["role"] == "required"
+    ] == ["left", "right"]
+
+
+def test_authorized_solid_fit_does_not_require_grounding_or_sam(
+    tmp_path: Path,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=75_000,
+            min_ms=60_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    region = FramingRegionIntent(
+        region_id="group",
+        entity_id="group",
+        target_description="three people holding products",
+        role="required",
+        evidence_role="primary_subject",
+        minimum_visible_fraction=1.0,
+    )
+
+    _, geometry, debug_paths, track_fingerprint = (
+        _vertical_candidate_geometry(
+            client=SimpleNamespace(),
+            clip=SimpleNamespace(),
+            frame=SimpleNamespace(),
+            start_ms=0,
+            end_ms=5_000,
+            feature_id="closing",
+            event_description="ending group hold",
+            target_description=region.target_description,
+            regions=[region],
+            camera_phases=[],
+            camera_phase_origin="gemini_proposed",
+            crop_mode="primary_center",
+            overflow_policy="preserve_all",
+            edge_priority="balanced",
+            fallback_strategy="center_crop",
+            checkpoint_path=tmp_path / "sam.pt",
+            grounding_prompt="unused",
+            output_dir=tmp_path,
+            analysis_fps=2.0,
+            scdet_threshold=27.0,
+            display_sample_aspect_ratio=1.0,
+            track_cache={},
+            autonomous_policy=policy,
+            presentation_preference="solid_matte_fit",
+            relation_mode="simultaneous",
+        )
+    )
+
+    assert geometry["applied_strategy"] == "solid_matte_fit"
+    assert geometry["coverage_passed"] is True
+    assert geometry["relation_preserved_by_whole_source"] is True
+    assert geometry["paid_model_calls_added"] == 0
+    assert debug_paths == []
+    assert track_fingerprint is None
+
+
+def test_exact_event_source_is_reserved_from_earlier_flexible_beat() -> None:
+    source_sha256 = "a" * 64
+    plan = SimpleNamespace(
+        chapters=[
+            SimpleNamespace(
+                feature_id="opening",
+                vertical_candidates=[
+                    SimpleNamespace(
+                        rank=1,
+                        source_asset_id=f"sha256:{source_sha256}",
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                feature_id="closing",
+                vertical_candidates=[
+                    SimpleNamespace(
+                        rank=1,
+                        source_asset_id=f"sha256:{source_sha256}",
+                    )
+                ],
+            ),
+        ]
+    )
+    contracts = [
+        SimpleNamespace(
+            feature_id="closing",
+            visual_events=[SimpleNamespace(event_type="freeze_start")],
+        )
+    ]
+
+    reservations = _autonomous_exact_event_source_reservations(
+        plan,
+        contracts,
+    )
+
+    assert reservations == {source_sha256: (1, "closing")}
 from jascue_video_lab.cli import build_parser
 from jascue_video_lab.models import (
     FeatureCutExecutionProfile,
@@ -134,6 +295,59 @@ from jascue_video_lab.models import (
     SelectedVerticalFramingProposal,
     VerticalVirtualCameraPhase,
 )
+from jascue_video_lab.event_lock import ExactEventLockV2
+
+
+def _cue_lock_at(source_time_ms: int) -> ExactEventLockV2:
+    return ExactEventLockV2(
+        event_id="ending:freeze_start",
+        event_type="freeze_start",
+        source_asset_id="sha256:" + "a" * 64,
+        source_frame_id="DF000001",
+        source_pts=1,
+        source_time_ms=source_time_ms,
+        source_frame_hash="b" * 64,
+        support_window_start_frame_id="DF000001",
+        support_window_end_frame_id="DF000001",
+        support_window_start_ms=source_time_ms,
+        support_window_end_ms=source_time_ms,
+        confidence=0.9,
+        resolver={
+            "local_bracket_method": "frame_difference",
+            "sampling_fps": 8,
+            "contact_sheet_hashes": ["c" * 64],
+            "gemini_interaction_id": "interaction-1",
+        },
+        input_artifact_hashes=("sha256:" + "d" * 64,),
+        generated_at="now",
+    )
+
+
+def test_intentional_freeze_cue_repair_moves_only_source_in() -> None:
+    repaired = _bounded_cue_shifted_window(
+        start_ms=1_604,
+        end_ms=9_009,
+        source_duration_ms=9_009,
+        locks=(_cue_lock_at(8_742),),
+        requested_shifts_ms=(133, 133),
+        preserve_end_for_freeze=True,
+    )
+
+    assert repaired == (1_737, 9_009, 133)
+
+
+def test_cue_repair_rejects_materially_inconsistent_event_shifts() -> None:
+    assert (
+        _bounded_cue_shifted_window(
+            start_ms=1_604,
+            end_ms=9_009,
+            source_duration_ms=9_009,
+            locks=(_cue_lock_at(8_742),),
+            requested_shifts_ms=(0, 133),
+            preserve_end_for_freeze=True,
+        )
+        is None
+    )
 
 
 def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
@@ -6922,6 +7136,60 @@ def test_runtime_candidate_reuse_allows_authorized_distinct_interval() -> None:
             source_out_ms=4500,
         )
         is not None
+    )
+
+
+def test_autonomous_editorial_reprise_rejects_major_interval_overlap() -> None:
+    selected = FeatureChapterSelect(
+        feature_id="closing",
+        evidence_status="supported",
+        observed_visual_evidence="The group holds the products for the ending.",
+        selection_reason="A brief ending reprise.",
+        horizontal_frame_id="RF000002",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000002",
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+        source_reuse_mode="editorial_reprise",
+        source_reuse_justification="Return to the group at the ending.",
+    )
+    prior = [
+        {
+            "feature_id": "opening",
+            "source_clip_id": "clip-a",
+            "source_in_ms": 0,
+            "source_out_ms": 6_000,
+        }
+    ]
+
+    violation = _runtime_candidate_reuse_violation(
+        selected,
+        prior,
+        source_clip_id="clip-a",
+        source_in_ms=1_500,
+        source_out_ms=9_000,
+        max_editorial_reprise_overlap_fraction=0.5,
+    )
+
+    assert violation is not None
+    assert violation["reason_code"] == (
+        "editorial_reprise_overlap_exceeds_autonomous_limit"
+    )
+    assert violation["current_interval_overlap_fraction"] == 0.6
+    assert (
+        _runtime_candidate_reuse_violation(
+            selected,
+            prior,
+            source_clip_id="clip-a",
+            source_in_ms=5_000,
+            source_out_ms=9_000,
+            max_editorial_reprise_overlap_fraction=0.5,
+        )
+        is None
     )
 
 

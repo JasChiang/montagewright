@@ -153,6 +153,15 @@ local executors
 
 `editing-capability-catalog-v1` 是小型、run-level 能力目錄，不是每支素材一份龐大 schema。新增工具時必須同時加入一個可泛化的 capability ID、對應的本機 compiler／executor，以及 success／fallback／adversarial tests。目錄內容的 SHA-256 會寫進 `direct-video-edit-plan-v2`；若工具、限制或 fallback 改變，舊 Gemini plan 不能被靜默套到新執行器。
 
+Direct-video planning 明確區分 `fresh` 與 `alternate` editorial run；後續
+`feature-delivery --reuse-feature-plan` 只是把已完成、hash-bound 的選片決策交給
+geometry／render pipeline，不代表該決策來自舊版試剪。`alternate` 必須綁定上一版
+`feature_edit_plan.json`，只在 frontier 內確實存在替代 evidence 的非 hard beat
+要求變更，並產生可重算的 `editorial-freshness-manifest-v1`。Hard evidence 不會為了
+表面新鮮度被較差 take 取代。Bounded candidate video 預設深度為每章 3 個；仍受
+總秒數 preflight 上限約束，不會用增加 paid interaction 的 speculative fan-out
+換取多樣性。
+
 Agent 只適合研究、偵錯、比較策略或協助人類改 brief。正式剪輯由 deterministic compiler 與有界 state machine 執行；未來若接上 semantic replan，最多只允許一次，不形成可自行反覆看片、改策略的 Agent loop。
 
 ### 可播放不等於可交付

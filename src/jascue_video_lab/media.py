@@ -214,30 +214,57 @@ def extract_frame(
         filters.append(f"scale='min({max_width},iw)':-2")
     filters.append("showinfo")
     filter_graph = ",".join(filters)
-    completed = _run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "info",
-            "-copyts",
-            "-i",
-            str(resolved_source),
-            "-map",
-            "0:v:0",
-            "-vf",
-            filter_graph,
-            "-fps_mode",
-            "vfr",
-            "-frames:v",
-            "1",
-            "-y",
-            str(output),
-        ]
-    )
-    match = _SHOWINFO_RE.search(completed.stderr)
-    if not match:
-        raise MediaCommandError("could not parse selected frame PTS from ffmpeg showinfo")
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-copyts",
+        "-i",
+        str(resolved_source),
+        "-map",
+        "0:v:0",
+        "-vf",
+        filter_graph,
+        "-fps_mode",
+        "vfr",
+        "-frames:v",
+        "1",
+        "-y",
+        str(output),
+    ]
+    try:
+        completed = _run(command)
+        match = _SHOWINFO_RE.search(completed.stderr)
+        if not match:
+            raise MediaCommandError(
+                "could not parse selected frame PTS from ffmpeg showinfo"
+            )
+    except MediaCommandError as original_error:
+        # Container duration and edit-list endpoints are frequently a few
+        # milliseconds later than the final decodable frame.  A semantic
+        # request in that final sub-frame interval has no later frame for
+        # select=gte(t), so use the authoritative last decoded PTS.  Keep the
+        # tolerance narrow: corruption or a materially out-of-range request
+        # must still fail instead of being disguised as a valid selection.
+        last_pts = last_decoded_video_frame_pts(resolved_source)
+        last_time_ms = round(
+            Fraction(last_pts - source_start_pts)
+            * source_time_base
+            * 1000
+        )
+        eof_delta_ms = requested_time_ms - last_time_ms
+        if not 0 <= eof_delta_ms <= 250:
+            raise original_error
+        fallback = extract_frame_at_pts(
+            resolved_source,
+            last_pts,
+            output,
+            max_width=max_width,
+        )
+        return fallback.model_copy(
+            update={"requested_time_ms": requested_time_ms}
+        )
     frame_pts = int(match.group("pts"))
     frame_time_ms = round(
         Fraction(frame_pts - source_start_pts) * source_time_base * 1000

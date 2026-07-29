@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import uuid
@@ -1697,6 +1698,140 @@ def planning_candidate_slice(
     if direct_video_evidence:
         return candidates[:depth]
     return candidates
+
+
+def _selected_vertical_signature(
+    chapter: FeatureChapterSelect,
+) -> tuple[str, str] | None:
+    """Return the selected immutable event from a projected feature plan."""
+
+    if chapter.evidence_status == "not_found":
+        return None
+    if not chapter.vertical_candidates:
+        raise ValueError(
+            "alternate editorial comparison requires V2/V3 vertical candidates"
+        )
+    selected = min(chapter.vertical_candidates, key=lambda item: item.rank)
+    return selected.source_asset_id, selected.event_id
+
+
+def prior_vertical_selections(
+    plan: FeatureEditPlan,
+) -> dict[str, tuple[str, str] | None]:
+    """Index a prior edit without relying on mutable candidate rank numbers."""
+
+    return {
+        chapter.feature_id: _selected_vertical_signature(chapter)
+        for chapter in plan.chapters
+    }
+
+
+def audit_editorial_freshness(
+    current: FeatureEditPlan,
+    *,
+    prior: FeatureEditPlan,
+    hard_protected_feature_ids: frozenset[str] = frozenset(),
+    minimum_change_fraction: float = 0.5,
+) -> dict[str, Any]:
+    """Prove that an alternate edition changed replaceable evidence.
+
+    Hard evidence is never displaced just to make a version look different.
+    A beat is counted as substitutable only when the current bounded frontier
+    contains a real event other than the event used by the prior edit.
+    """
+
+    if not 0.0 <= minimum_change_fraction <= 1.0:
+        raise ValueError("minimum change fraction must be between zero and one")
+    if (
+        current.project_id != prior.project_id
+        or current.catalog_id != prior.catalog_id
+    ):
+        raise ValueError("prior edit plan belongs to a different project/catalog")
+    prior_by_feature = {
+        chapter.feature_id: chapter for chapter in prior.chapters
+    }
+    if [chapter.feature_id for chapter in current.chapters] != [
+        chapter.feature_id for chapter in prior.chapters
+    ]:
+        raise ValueError("prior edit plan chapter order differs from current brief")
+
+    rows: list[dict[str, Any]] = []
+    substitutable_count = 0
+    changed_substitutable_count = 0
+    for chapter in current.chapters:
+        previous = prior_by_feature[chapter.feature_id]
+        previous_signature = _selected_vertical_signature(previous)
+        current_signature = _selected_vertical_signature(chapter)
+        frontier = {
+            (candidate.source_asset_id, candidate.event_id)
+            for candidate in chapter.vertical_candidates
+        }
+        protected = chapter.feature_id in hard_protected_feature_ids
+        has_real_alternative = bool(
+            previous_signature is not None
+            and any(item != previous_signature for item in frontier)
+        )
+        substitutable = (
+            not protected
+            and previous_signature is not None
+            and current_signature is not None
+            and has_real_alternative
+        )
+        changed = current_signature != previous_signature
+        if substitutable:
+            substitutable_count += 1
+            changed_substitutable_count += int(changed)
+        rows.append(
+            {
+                "feature_id": chapter.feature_id,
+                "hard_evidence_protected": protected,
+                "has_real_alternative_in_frontier": has_real_alternative,
+                "substitutable": substitutable,
+                "changed": changed,
+                "previous_source_asset_id": (
+                    previous_signature[0] if previous_signature else None
+                ),
+                "previous_event_id": (
+                    previous_signature[1] if previous_signature else None
+                ),
+                "current_source_asset_id": (
+                    current_signature[0] if current_signature else None
+                ),
+                "current_event_id": (
+                    current_signature[1] if current_signature else None
+                ),
+            }
+        )
+
+    required_changes = math.ceil(
+        substitutable_count * minimum_change_fraction
+    )
+    passed = changed_substitutable_count >= required_changes
+    body = {
+        "contract_version": "editorial-freshness-manifest-v1",
+        "mode": "alternate_edit",
+        "minimum_substitutable_change_fraction": minimum_change_fraction,
+        "substitutable_beat_count": substitutable_count,
+        "required_changed_beat_count": required_changes,
+        "changed_substitutable_beat_count": changed_substitutable_count,
+        "passed": passed,
+        "decision_code": (
+            "alternate_edit_freshness_passed"
+            if passed
+            else "alternate_edit_insufficient_change"
+        ),
+        "rows": rows,
+    }
+    canonical = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        **body,
+        "audit_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
 
 
 def planning_candidate_id(rank: int) -> str:
@@ -3447,12 +3582,55 @@ def reproject_direct_video_edit_plan(
                     )
         elif proposal is not None:
             raise ValueError("derived plan invented a virtual camera proposal")
-    return brief, project_feature_contracts_v3(
+    projected = project_feature_contracts_v3(
         derived,
         brief=brief,
         catalog=catalog,
         selected_evidence=selected_evidence,
     )
+    prior_path = source_artifacts.get("prior_edit_plan")
+    freshness_path = source_artifacts.get("editorial_freshness_manifest")
+    if (prior_path is None) != (freshness_path is None):
+        raise ValueError(
+            "alternate direct-video projection requires both prior edit and "
+            "freshness manifest"
+        )
+    if prior_path is not None and freshness_path is not None:
+        prior = FeatureEditPlan.model_validate(read_json(prior_path))
+        saved_freshness = read_json(freshness_path)
+        threshold = saved_freshness.get(
+            "minimum_substitutable_change_fraction"
+        )
+        if not isinstance(threshold, (float, int)):
+            raise ValueError(
+                "editorial freshness manifest has no numeric threshold"
+            )
+        protected = frozenset()
+        contracts_path = source_artifacts.get("editorial_beat_contracts")
+        if contracts_path is not None:
+            protected = frozenset(
+                contract.feature_id
+                for contract in load_editorial_beat_contracts(contracts_path)
+                if (
+                    contract.priority == "hard"
+                    and contract.feature_id is not None
+                )
+            )
+        expected_freshness = audit_editorial_freshness(
+            projected,
+            prior=prior,
+            hard_protected_feature_ids=protected,
+            minimum_change_fraction=float(threshold),
+        )
+        if saved_freshness != expected_freshness:
+            raise ValueError(
+                "editorial freshness manifest differs from deterministic audit"
+            )
+        if not bool(expected_freshness["passed"]):
+            raise ValueError(
+                "alternate direct-video projection failed its freshness gate"
+            )
+    return brief, projected
 
 
 def main() -> int:
@@ -3560,8 +3738,36 @@ def main() -> int:
     parser.add_argument(
         "--candidate-video-depth",
         type=int,
-        default=2,
+        default=3,
         help="Maximum ranked shortlist candidates per chapter sent as video evidence.",
+    )
+    parser.add_argument(
+        "--editorial-run-mode",
+        choices=["fresh", "alternate"],
+        default="fresh",
+        help=(
+            "fresh creates an independent editorial decision. alternate binds "
+            "a prior projected edit and requires meaningful changes on beats "
+            "that have real non-hard-evidence alternatives."
+        ),
+    )
+    parser.add_argument(
+        "--prior-edit-plan",
+        type=Path,
+        help=(
+            "Prior projected feature_edit_plan.json used only by "
+            "--editorial-run-mode alternate. It is hash-bound into the new "
+            "projection and never authorizes replacing unique hard evidence."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-alternate-change-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum fraction of substitutable beats that must select a "
+            "different immutable source event in alternate mode."
+        ),
     )
     parser.add_argument(
         "--candidate-video-context-seconds",
@@ -3583,8 +3789,21 @@ def main() -> int:
         parser.error("--candidate-video-context-seconds must be non-negative")
     if args.maximum_candidate_video_seconds <= 0:
         parser.error("--maximum-candidate-video-seconds must be positive")
+    if not 0.0 <= args.minimum_alternate_change_fraction <= 1.0:
+        parser.error(
+            "--minimum-alternate-change-fraction must be between zero and one"
+        )
     if args.candidate_video_evidence and args.shortlist is None:
         parser.error("--candidate-video-evidence requires --shortlist")
+    if args.editorial_run_mode == "alternate":
+        if args.prior_edit_plan is None:
+            parser.error("--editorial-run-mode alternate requires --prior-edit-plan")
+        if not args.candidate_video_evidence or args.shortlist is None:
+            parser.error(
+                "alternate editorial mode requires shortlist-backed candidate videos"
+            )
+    elif args.prior_edit_plan is not None:
+        parser.error("--prior-edit-plan is only valid in alternate editorial mode")
     if args.reuse_raw_output and args.resume_failed_plan:
         parser.error("--reuse-raw-output and --resume-failed-plan are exclusive")
 
@@ -3612,6 +3831,26 @@ def main() -> int:
         load_editorial_beat_contracts(editorial_contracts_path)
         if editorial_contracts_path is not None
         else ()
+    )
+    hard_protected_feature_ids = frozenset(
+        contract.feature_id
+        for contract in editorial_contracts
+        if contract.priority == "hard" and contract.feature_id is not None
+    )
+    prior_edit_plan_path = (
+        args.prior_edit_plan.expanduser().resolve(strict=True)
+        if args.prior_edit_plan is not None
+        else None
+    )
+    prior_edit_plan = (
+        FeatureEditPlan.model_validate(read_json(prior_edit_plan_path))
+        if prior_edit_plan_path is not None
+        else None
+    )
+    prior_selections = (
+        prior_vertical_selections(prior_edit_plan)
+        if prior_edit_plan is not None
+        else {}
     )
     policy: AutonomousEditPolicy | None = None
     if autonomous_policy_path is not None:
@@ -3857,6 +4096,28 @@ def main() -> int:
                     "feature_id": chapter.feature_id,
                     "retrieval_status": chapter.evidence_status,
                     "retrieval_uncertainty": chapter.uncertainty,
+                    "alternate_edit_context": (
+                        {
+                            "hard_evidence_protected": (
+                                chapter.feature_id
+                                in hard_protected_feature_ids
+                            ),
+                            "previously_selected_candidate_ranks": [
+                                rank
+                                for rank, candidate in enumerate(
+                                    planning_candidates,
+                                    start=1,
+                                )
+                                if (
+                                    candidate.source_asset_id,
+                                    candidate.event_id,
+                                )
+                                == prior_selections.get(chapter.feature_id)
+                            ],
+                        }
+                        if prior_edit_plan is not None
+                        else None
+                    ),
                     "candidate_events": candidate_events,
                 }
             )
@@ -3912,6 +4173,28 @@ resolved downstream.
         )
         if editorial_contracts
         else ""
+    )
+    alternate_edit_rules = (
+        f"""
+## Alternate edition contract
+This is a new editorial edition, not a geometry-only resume. The
+alternate_edit_context marks candidate ranks selected by the prior edit.
+Preserve unique hard evidence even when it repeats. For every other chapter
+with a genuine alternative, prefer a different visible source event when it
+still satisfies evidence, action completeness, 9:16 suitability, and music
+flow. Across substitutable chapters, at least
+{args.minimum_alternate_change_fraction:.3f} must change from the prior edit.
+Do not choose a worse or incomplete take merely for novelty; explain any
+necessary repeat in selection_reason. Candidate diversity is an editorial
+constraint after evidence safety, not randomness.
+""".strip()
+        if prior_edit_plan is not None
+        else """
+## Fresh edition contract
+This planning call creates a new editorial decision. It is not permitted to
+reuse a saved feature plan implicitly. Rank candidates from the evidence and
+music in this request.
+""".strip()
     )
     prompt = f"""
 你是 evidence-bound 的資深短影音挑帶剪輯師。請使用完整 Clip Card library，為使用者 brief 的每個 chapter 保留有排序的候選 take，再分別選出橫式與直式代表。你只能引用輸入列出的 source_asset_id、event_id、entity_id 與 RF frame_id。
@@ -4028,6 +4311,8 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
 {brief.model_dump_json(indent=2)}
 
 {exact_event_selection_rules}
+
+{alternate_edit_rules}
 
 ## 每章可選的 bounded candidate 索引
 {json.dumps(evidence, ensure_ascii=False, indent=2)}
@@ -4181,6 +4466,17 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                     "rank_depth_per_chapter": args.candidate_video_depth,
                     "context_ms": context_ms,
                     "maximum_total_ms": maximum_evidence_ms,
+                    "editorial_run_mode": args.editorial_run_mode,
+                    "prior_edit_plan_sha256": (
+                        sha256_file(prior_edit_plan_path)
+                        if prior_edit_plan_path is not None
+                        else None
+                    ),
+                    "minimum_alternate_change_fraction": (
+                        args.minimum_alternate_change_fraction
+                        if prior_edit_plan_path is not None
+                        else None
+                    ),
                 },
                 "total_duration_ms": total_evidence_ms,
                 "candidate_count": len(direct_rows),
@@ -4217,6 +4513,33 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         ):
             raise ValueError(
                 "direct-video candidate depth differs from the paid request"
+            )
+        expected_prior_hash = (
+            sha256_file(prior_edit_plan_path)
+            if prior_edit_plan_path is not None
+            else None
+        )
+        if (
+            manifest_policy.get("editorial_run_mode", "fresh")
+            != args.editorial_run_mode
+            or manifest_policy.get("prior_edit_plan_sha256")
+            != expected_prior_hash
+        ):
+            raise ValueError(
+                "editorial run mode or prior edit differs from the paid request"
+            )
+        if (
+            prior_edit_plan_path is not None
+            and float(
+                manifest_policy.get(
+                    "minimum_alternate_change_fraction",
+                    -1.0,
+                )
+            )
+            != args.minimum_alternate_change_fraction
+        ):
+            raise ValueError(
+                "alternate freshness threshold differs from the paid request"
             )
         direct_video_observed_events = {
             (str(row["source_asset_id"]), str(row["event_id"]))
@@ -4306,6 +4629,8 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         extra_projection_artifacts["autonomous_policy"] = (
             autonomous_policy_path
         )
+    if prior_edit_plan_path is not None:
+        extra_projection_artifacts["prior_edit_plan"] = prior_edit_plan_path
     if args.reuse_raw_output:
         artifacts = _resolve_feature_reuse_artifacts(args.output_dir)
         source_request_path = artifacts["request"]
@@ -4777,6 +5102,41 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         selected_evidence,
     )
     write_json(args.output_dir / "feature_edit_plan.json", final_plan)
+    if prior_edit_plan is not None:
+        freshness_manifest = audit_editorial_freshness(
+            final_plan,
+            prior=prior_edit_plan,
+            hard_protected_feature_ids=hard_protected_feature_ids,
+            minimum_change_fraction=(
+                args.minimum_alternate_change_fraction
+            ),
+        )
+        freshness_manifest_path = (
+            args.output_dir / "editorial-freshness-manifest.json"
+        )
+        write_json(freshness_manifest_path, freshness_manifest)
+        extra_projection_artifacts["editorial_freshness_manifest"] = (
+            freshness_manifest_path
+        )
+        if not freshness_manifest["passed"]:
+            write_json(
+                args.output_dir / "clip-card-feature-plan.schema-validation.json",
+                {
+                    "ok": False,
+                    "error_type": "EditorialFreshnessError",
+                    "error": (
+                        "alternate edit did not change enough substitutable "
+                        "beats; inspect editorial-freshness-manifest.json"
+                    ),
+                    "freshness_manifest": str(
+                        freshness_manifest_path.resolve()
+                    ),
+                },
+            )
+            raise ValueError(
+                "alternate edit freshness gate failed after the single paid "
+                "planning call; no render is authorized"
+            )
     write_json(
         args.output_dir / "clip-card-feature-plan.schema-validation.json",
         {"ok": True, "clip_card_count": len(cards), "frame_count": len(frames)},

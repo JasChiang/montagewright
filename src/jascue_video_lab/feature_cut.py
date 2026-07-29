@@ -7558,6 +7558,49 @@ def _late_cue_shift_disposition(
     return "recompile_required"
 
 
+def _bounded_cue_shifted_window(
+    *,
+    start_ms: int,
+    end_ms: int,
+    source_duration_ms: int,
+    locks: Sequence[ExactEventLockV2],
+    requested_shifts_ms: Sequence[int],
+    preserve_end_for_freeze: bool = False,
+) -> tuple[int, int, int] | None:
+    """Return one safe local trim repair for a shared cue miss.
+
+    A normal presentation translates the complete immutable window. An
+    intentional ending freeze may keep its source end fixed and move only the
+    source start; concat can then pad the already-authorized frozen result to
+    the chapter duration. This aligns the exact reaction frame without reading
+    beyond the source or inventing a new event.
+    """
+
+    if not requested_shifts_ms:
+        return None
+    spread_ms = max(requested_shifts_ms) - min(requested_shifts_ms)
+    shift_ms = round(sum(requested_shifts_ms) / len(requested_shifts_ms))
+    if spread_ms > 67 or abs(shift_ms) > 1_000:
+        return None
+    shifted_start = start_ms + shift_ms
+    shifted_end = (
+        end_ms
+        if preserve_end_for_freeze
+        else end_ms + shift_ms
+    )
+    if (
+        shifted_start < 0
+        or shifted_end > source_duration_ms
+        or shifted_start >= shifted_end
+        or not all(
+            shifted_start <= lock.source_time_ms < shifted_end
+            for lock in locks
+        )
+    ):
+        return None
+    return shifted_start, shifted_end, shift_ms
+
+
 def _bind_freeze_start_to_reaction_peak(
     locks: Sequence[ExactEventLockV2],
 ) -> tuple[ExactEventLockV2, ...]:
@@ -7801,9 +7844,56 @@ def _vertical_candidate_geometry(
     track_fingerprint: str | None = None
     optional_region_failures: list[dict[str, str]] = []
     identity_tracks: list[tuple[str, str, SegmentationTrack]] = []
+    if crop_regions and not hard_regions:
+        raise ValueError("candidate region contract has no hard core")
+    if (
+        autonomous_policy is not None
+        and presentation_preference == "solid_matte_fit"
+        and autonomous_policy.presentation.allow_solid_matte_fit
+    ):
+        return (
+            _vertical_fit_filter(),
+            {
+                "applied_strategy": "solid_matte_fit",
+                "fallback_reason": None,
+                "risk_codes": [],
+                "full_bleed": False,
+                "source_geometry_lineage_passed": True,
+                "tracking_confidence_gate_passed": True,
+                "coverage_passed": True,
+                "minimum_visible_required_area_fraction": 1.0,
+                "soft_extent_visibility_passed": True,
+                "semantic_checkpoint_status": (
+                    SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY.value
+                ),
+                "presentation_decision_codes": [
+                    "whole_source_scope_preserved",
+                    "solid_matte_fit_policy_authorized",
+                    "grounding_not_required_for_whole_source_fit",
+                ],
+                "paid_model_calls_added": 0,
+                "framing_regions": [
+                    region.model_dump(mode="json") for region in crop_regions
+                ],
+                "vertical_camera_phases": [],
+                "relation_preserved_by_whole_source": (
+                    relation_mode
+                    in {
+                        "simultaneous",
+                        "relation_core",
+                        "simultaneous_relation",
+                    }
+                ),
+                "relative_scale_locked": bool(physical_scale_comparison),
+                "semantic_review_reasons": [
+                    "solid_matte_fit_requires_final_qa"
+                ],
+                "requires_gemini_review": True,
+            },
+            [],
+            None,
+        )
     if crop_regions:
-        if not hard_regions:
-            raise ValueError("candidate region contract has no hard core")
         _, all_tracks, all_debug_paths = _build_framing_region_tracks(
             client=client,
             clip=clip,
@@ -9453,15 +9543,32 @@ def _bind_runtime_candidate_coverage(
         # co-visible entities into a relation/group contract after watching the
         # bounded video.  Until then, bind the first primary as the conservative
         # identity lock and expose the remaining entities as reviewable context.
-        primary_id = required_ids[0] if required_ids else None
+        coverage_mode = str(bound.get("coverage_mode") or "simultaneous")
+        relation_members_are_hard = (
+            coverage_mode == "relation_core"
+            or (
+                coverage_mode == "simultaneous"
+                and bool(bound.get("physical_scale_comparison"))
+            )
+        )
+        hard_ids = (
+            required_ids
+            if relation_members_are_hard
+            else required_ids[:1]
+        )
         contextual_ids = [
-            entity_id for entity_id in required_ids[1:]
-            if entity_id not in preferred_ids
+            entity_id
+            for entity_id in required_ids
+            if entity_id not in hard_ids and entity_id not in preferred_ids
         ]
-        preferred_ids = contextual_ids + preferred_ids
+        preferred_ids = contextual_ids + [
+            entity_id
+            for entity_id in preferred_ids
+            if entity_id not in hard_ids
+        ]
         regions: list[FramingRegionIntent] = []
         for role, ids in (
-            ("required", [primary_id] if primary_id is not None else []),
+            ("required", hard_ids),
             ("preferred", preferred_ids),
         ):
             for entity_id in ids:
@@ -9515,10 +9622,14 @@ def _bind_runtime_candidate_coverage(
             bound["regions"] = [
                 region.model_dump(mode="python") for region in regions
             ]
-            bound["coverage_intent"] = "single_primary"
+            bound["coverage_intent"] = (
+                "simultaneous_relation"
+                if relation_members_are_hard
+                else "single_primary"
+            )
             bound["coverage_target_descriptions"] = [
-                description(primary_id)
-            ] if primary_id is not None else []
+                description(entity_id) for entity_id in hard_ids
+            ]
             bound["candidate_coverage_source"] = (
                 "hash_bound_selected_clip_card_event"
             )
@@ -9567,6 +9678,44 @@ def _load_runtime_candidate_evidence_events(
             raise ValueError(f"duplicate selected Clip Card evidence event: {key}")
         events[key] = event
     return events
+
+
+def _autonomous_exact_event_source_reservations(
+    plan: FeatureEditPlan,
+    contracts: Sequence[EditorialBeatContract],
+) -> dict[str, tuple[int, str]]:
+    """Reserve primary source windows for later exact-event beats.
+
+    A flexible earlier beat must not consume the primary source of a later
+    beat that requires frame-accurate music evidence when the earlier beat
+    still has another Top-K candidate.  This is a local look-ahead rule, not a
+    semantic replan: it only uses the immutable plan and typed contracts.
+    """
+
+    exact_event_features = {
+        contract.feature_id
+        for contract in contracts
+        if contract.visual_events
+    }
+    reservations: dict[str, tuple[int, str]] = {}
+    for chapter_index, chapter in enumerate(plan.chapters):
+        if chapter.feature_id not in exact_event_features:
+            continue
+        candidates = sorted(
+            chapter.vertical_candidates,
+            key=lambda candidate: candidate.rank,
+        )
+        if not candidates:
+            continue
+        source_asset_id = candidates[0].source_asset_id
+        if not source_asset_id:
+            continue
+        source_sha256 = str(source_asset_id).removeprefix("sha256:")
+        reservations.setdefault(
+            source_sha256,
+            (chapter_index, chapter.feature_id),
+        )
+    return reservations
 
 
 def _horizontal_runtime_candidate_options(
@@ -10023,6 +10172,7 @@ def _audit_render_source_reuse(
     chapters: Sequence[Mapping[str, Any]],
     *,
     aspect: Literal["16x9", "9x16"],
+    max_editorial_reprise_overlap_fraction: float | None = None,
 ) -> dict[str, Any]:
     """Validate typed reuse authority against the rendered source intervals.
 
@@ -10033,6 +10183,13 @@ def _audit_render_source_reuse(
     """
 
     plan_by_id = {chapter.feature_id: chapter for chapter in plan.chapters}
+    if (
+        max_editorial_reprise_overlap_fraction is not None
+        and not 0 <= max_editorial_reprise_overlap_fraction <= 1
+    ):
+        raise ValueError(
+            "max_editorial_reprise_overlap_fraction must be between 0 and 1"
+        )
     prior_by_source: dict[str, list[Mapping[str, Any]]] = {}
     rows: list[dict[str, Any]] = []
     violations: list[dict[str, Any]] = []
@@ -10059,6 +10216,12 @@ def _audit_render_source_reuse(
                 0,
                 min(current_end, prior_end) - max(current_start, prior_start),
             )
+            current_duration_ms = current_end - current_start
+            reprise_overlap_fraction = (
+                overlap_ms / current_duration_ms
+                if current_duration_ms > 0
+                else 1.0
+            )
             exact_interval = (
                 current_start == prior_start and current_end == prior_end
             )
@@ -10077,6 +10240,10 @@ def _audit_render_source_reuse(
                 "prior_source_in_ms": prior_start,
                 "prior_source_out_ms": prior_end,
                 "overlap_ms": overlap_ms,
+                "current_interval_overlap_fraction": round(
+                    reprise_overlap_fraction,
+                    6,
+                ),
                 "exact_interval_repeat": exact_interval,
                 "same_presentation": same_presentation,
                 "reuse_mode": selected.source_reuse_mode,
@@ -10103,6 +10270,12 @@ def _audit_render_source_reuse(
                 or (
                     selected.source_reuse_mode == "alternate_presentation"
                     and same_presentation
+                )
+                or (
+                    selected.source_reuse_mode == "editorial_reprise"
+                    and max_editorial_reprise_overlap_fraction is not None
+                    and reprise_overlap_fraction
+                    > max_editorial_reprise_overlap_fraction
                 )
             )
             row["status"] = "blocked" if row_violates else "authorized_review"
@@ -10140,6 +10313,7 @@ def _runtime_candidate_reuse_violation(
     source_clip_id: str,
     source_in_ms: int,
     source_out_ms: int,
+    max_editorial_reprise_overlap_fraction: float | None = None,
 ) -> dict[str, Any] | None:
     """Reject unauthorized source reuse before grounding and rendering.
 
@@ -10149,6 +10323,13 @@ def _runtime_candidate_reuse_violation(
     SAM, exact-event, or render work before failing.
     """
 
+    if (
+        max_editorial_reprise_overlap_fraction is not None
+        and not 0 <= max_editorial_reprise_overlap_fraction <= 1
+    ):
+        raise ValueError(
+            "max_editorial_reprise_overlap_fraction must be between 0 and 1"
+        )
     prior_source_uses = [
         prior
         for prior in prior_chapters
@@ -10182,6 +10363,12 @@ def _runtime_candidate_reuse_violation(
             0,
             min(source_out_ms, prior_end) - max(source_in_ms, prior_start),
         )
+        current_duration_ms = source_out_ms - source_in_ms
+        reprise_overlap_fraction = (
+            overlap_ms / current_duration_ms
+            if current_duration_ms > 0
+            else 1.0
+        )
         justification = selected.source_reuse_justification
         violates = (
             selected.source_reuse_mode == "none"
@@ -10189,6 +10376,12 @@ def _runtime_candidate_reuse_violation(
             or (
                 selected.source_reuse_mode == "distinct_interval"
                 and overlap_ms > 0
+            )
+            or (
+                selected.source_reuse_mode == "editorial_reprise"
+                and max_editorial_reprise_overlap_fraction is not None
+                and reprise_overlap_fraction
+                > max_editorial_reprise_overlap_fraction
             )
         )
         if violates:
@@ -10200,9 +10393,22 @@ def _runtime_candidate_reuse_violation(
                 "prior_source_in_ms": prior_start,
                 "prior_source_out_ms": prior_end,
                 "overlap_ms": overlap_ms,
+                "current_interval_overlap_fraction": round(
+                    reprise_overlap_fraction,
+                    6,
+                ),
                 "reuse_mode": selected.source_reuse_mode,
                 "justification": justification,
-                "reason_code": "source_reuse_authority_failed",
+                "reason_code": (
+                    "editorial_reprise_overlap_exceeds_autonomous_limit"
+                    if (
+                        selected.source_reuse_mode == "editorial_reprise"
+                        and max_editorial_reprise_overlap_fraction is not None
+                        and reprise_overlap_fraction
+                        > max_editorial_reprise_overlap_fraction
+                    )
+                    else "source_reuse_authority_failed"
+                ),
             }
     return None
 
@@ -13035,6 +13241,14 @@ def _run_feature_cut_experiment_impl(
         autonomous_degradations: list[DegradationRecord] = []
         source_audio_cache: dict[str, bool] = {}
         source_media_cache: dict[str, MediaInfo] = {}
+        exact_event_source_reservations = (
+            _autonomous_exact_event_source_reservations(
+                plan,
+                editorial_templates,
+            )
+            if autonomous_profile
+            else {}
+        )
         stage = monotonic()
         for index, selected in enumerate(plan.chapters):
             brief_chapter = brief_by_id[selected.feature_id]
@@ -13397,6 +13611,43 @@ def _run_feature_cut_experiment_impl(
                                 "vertical candidate source asset differs from "
                                 f"its frame: {frame_id}"
                             )
+                        future_reservation = exact_event_source_reservations.get(
+                            candidate_clip.sha256
+                        )
+                        if (
+                            future_reservation is not None
+                            and future_reservation[0] > index
+                            and option_index + 1 < len(vertical_options)
+                        ):
+                            candidate_attempts.append(
+                                {
+                                    "candidate_id": candidate_id,
+                                    "rank": candidate_rank,
+                                    "frame_id": frame_id,
+                                    "source_asset_id": (
+                                        f"sha256:{candidate_clip.sha256}"
+                                    ),
+                                    "event_id": option_data.get("event_id"),
+                                    "strategy": option_data.get("strategy"),
+                                    "decision": "try_next",
+                                    "reason_code": (
+                                        "source_reserved_for_future_exact_event"
+                                    ),
+                                    "failure_codes": [],
+                                    "recovery_action": "try_next_candidate",
+                                    "reservation": {
+                                        "reserved_for_feature_id": (
+                                            future_reservation[1]
+                                        ),
+                                        "reserved_feature_index": (
+                                            future_reservation[0]
+                                        ),
+                                        "current_feature_index": index,
+                                        "paid_model_calls_added": 0,
+                                    },
+                                }
+                            )
+                            continue
                         if candidate_clip.sha256 not in source_audio_cache:
                             source_audio_cache[candidate_clip.sha256] = (
                                 has_audio_stream(Path(candidate_clip.path))
@@ -13434,6 +13685,9 @@ def _run_feature_cut_experiment_impl(
                             source_clip_id=candidate_clip.clip_id,
                             source_in_ms=candidate_start,
                             source_out_ms=candidate_end,
+                            max_editorial_reprise_overlap_fraction=(
+                                0.5 if autonomous_profile else None
+                            ),
                         )
                         if reuse_violation is not None:
                             candidate_attempts.append(
@@ -14664,6 +14918,36 @@ def _run_feature_cut_experiment_impl(
                             and autonomous_policy.presentation
                             .allow_intentional_freeze
                         ):
+                            cue_shifted_window = _bounded_cue_shifted_window(
+                                start_ms=v_start,
+                                end_ms=v_end,
+                                source_duration_ms=(
+                                    vertical_clip.duration_ms
+                                ),
+                                locks=locks,
+                                requested_shifts_ms=requested_shifts_ms,
+                                preserve_end_for_freeze=True,
+                            )
+                            cue_alignment_repair = None
+                            if cue_shifted_window is not None:
+                                original_start = v_start
+                                original_end = v_end
+                                v_start, v_end, shift_ms = (
+                                    cue_shifted_window
+                                )
+                                cue_alignment_repair = {
+                                    "method": (
+                                        "bounded_freeze_source_in_shift"
+                                    ),
+                                    "shift_ms": shift_ms,
+                                    "original_source_in_ms": original_start,
+                                    "original_source_out_ms": original_end,
+                                    "repaired_source_in_ms": v_start,
+                                    "repaired_source_out_ms": v_end,
+                                    "chapter_duration_reconciliation": (
+                                        "pad_authorized_frozen_tail"
+                                    ),
+                                }
                             freeze_duration_ms = (
                                 v_end - reaction_lock.source_time_ms
                             )
@@ -14701,6 +14985,12 @@ def _run_feature_cut_experiment_impl(
                                     "risk_codes": [
                                         "brief_authorized_phrase_ending_freeze",
                                         "whole_source_scope_preserving_fit",
+                                        *(
+                                            ["cue_aligned_trim_shift"]
+                                            if cue_alignment_repair
+                                            is not None
+                                            else []
+                                        ),
                                     ],
                                     "full_bleed": False,
                                     "source_geometry_lineage_passed": True,
@@ -14711,6 +15001,9 @@ def _run_feature_cut_experiment_impl(
                                     "intentional_freeze_spec": (
                                         freeze_spec.model_dump(mode="json")
                                     ),
+                                    "cue_alignment_repair": (
+                                        cue_alignment_repair
+                                    ),
                                     "unexpected_freeze_count": 0,
                                     "paid_model_calls_added": 0,
                                     "requires_gemini_review": True,
@@ -14720,29 +15013,19 @@ def _run_feature_cut_experiment_impl(
                                 freeze_applied = True
 
                         if requested_shifts_ms and not freeze_applied:
-                            shift_spread_ms = (
-                                max(requested_shifts_ms)
-                                - min(requested_shifts_ms)
+                            shifted_window = _bounded_cue_shifted_window(
+                                start_ms=v_start,
+                                end_ms=v_end,
+                                source_duration_ms=(
+                                    vertical_clip.duration_ms
+                                ),
+                                locks=locks,
+                                requested_shifts_ms=requested_shifts_ms,
                             )
-                            shift_ms = round(
-                                sum(requested_shifts_ms)
-                                / len(requested_shifts_ms)
-                            )
-                            shifted_start = v_start + shift_ms
-                            shifted_end = v_end + shift_ms
-                            locks_remain_inside = all(
-                                shifted_start
-                                <= lock.source_time_ms
-                                < shifted_end
-                                for lock in locks
-                            )
-                            if (
-                                shift_spread_ms <= 67
-                                and abs(shift_ms) <= 1_000
-                                and shifted_start >= 0
-                                and shifted_end <= vertical_clip.duration_ms
-                                and locks_remain_inside
-                            ):
+                            if shifted_window is not None:
+                                shifted_start, shifted_end, shift_ms = (
+                                    shifted_window
+                                )
                                 disposition = _late_cue_shift_disposition(
                                     autonomous_policy
                                 )
@@ -15008,12 +15291,18 @@ def _run_feature_cut_experiment_impl(
                 plan,
                 manifest["horizontal"]["chapters"],
                 aspect="16x9",
+                max_editorial_reprise_overlap_fraction=(
+                    0.5 if autonomous_profile else None
+                ),
             )
         if render_vertical:
             source_reuse_audits["9x16"] = _audit_render_source_reuse(
                 plan,
                 manifest["vertical"]["chapters"],
                 aspect="9x16",
+                max_editorial_reprise_overlap_fraction=(
+                    0.5 if autonomous_profile else None
+                ),
             )
         write_json(
             output_dir / "render-source-reuse-audit.json",
