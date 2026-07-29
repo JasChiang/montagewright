@@ -2060,6 +2060,83 @@ from jascue_video_lab.models import (
     VerticalVirtualCameraProposal,
     VerticalVirtualCameraProposalPhase,
 )
+
+
+def test_grouped_grounding_single_survivor_uses_single_sam_without_paid_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video_path = tmp_path / "source.mp4"
+    checkpoint_path = tmp_path / "sam.pt"
+    grounding_path = tmp_path / "grouped-grounding.json"
+    video_path.write_bytes(b"video")
+    checkpoint_path.write_bytes(b"checkpoint")
+    grounding_path.write_text("{}\n", encoding="utf-8")
+    seed = SharedSam21BBoxSeed(
+        target_id="watch.required.smartwatch",
+        target_description="the required smartwatch",
+        seed_source=str(grounding_path),
+        seed_time_ms=14_000,
+        seed_frame_pts=420_000,
+        seed_frame_sha256="a" * 64,
+        seed_source_width=3840,
+        seed_source_height=2160,
+        seed_box_2d=[320, 220, 680, 780],
+    )
+    calls: list[dict[str, object]] = []
+    fake_track = SimpleNamespace()
+
+    def fake_single_tracker(**kwargs: object) -> object:
+        calls.append(kwargs)
+        output_dir = Path(str(kwargs["output_dir"]))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "segmentation-track.json").write_text(
+            '{"test": true}\n',
+            encoding="utf-8",
+        )
+        return fake_track
+
+    monkeypatch.setattr(feature_cut_module, "track_bbox_sam21", fake_single_tracker)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "require_bbox_track_request_match",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "track_bboxes_shared_sam21",
+        lambda **_kwargs: pytest.fail(
+            "one surviving grouped target must not enter shared SAM"
+        ),
+    )
+
+    result = feature_cut_module._track_single_seed_from_grouped_grounding(
+        video_path=video_path,
+        checkpoint_path=checkpoint_path,
+        seed=seed,
+        output_dir=tmp_path / "geometry",
+        asset_id="sha256:" + "b" * 64,
+        start_ms=11_000,
+        end_ms=17_000,
+        analysis_fps=4.0,
+        analysis_max_side=960,
+        scdet_threshold=27.0,
+        seed_box_padding_ratio=0.04,
+        query_target_id="smartwatch_01",
+    )
+
+    assert result is fake_track
+    assert len(calls) == 1
+    assert calls[0]["target_description"] == "the required smartwatch"
+    assert calls[0]["seed_time_ms"] == 14_000
+    degradation = read_json(
+        tmp_path
+        / "geometry"
+        / "grouped-grounding-single-target-degradation.json"
+    )
+    assert degradation["hard_evidence_affected"] is False
+    assert degradation["paid_model_calls_added"] == 0
+
 from jascue_video_lab.music import (
     CuePriority,
     LockedMusicCue,

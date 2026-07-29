@@ -7145,6 +7145,133 @@ def _validate_shared_sam_session_cache(
     return tracks
 
 
+def _track_single_seed_from_grouped_grounding(
+    *,
+    video_path: Path,
+    checkpoint_path: Path,
+    seed: SharedSam21BBoxSeed,
+    output_dir: Path,
+    asset_id: str,
+    start_ms: int,
+    end_ms: int,
+    analysis_fps: float,
+    analysis_max_side: int,
+    scdet_threshold: float,
+    seed_box_padding_ratio: float,
+    query_lock_v2: EvidenceQueryLockV2 | None = None,
+    query_target_id: str,
+) -> SegmentationTrack:
+    """Track the sole surviving grouped target without another model request.
+
+    A grouped exact-frame Grounding request may contain required and preferred
+    targets. If preferred targets are not visible, the valid group can shrink
+    to one required seed. That is a normal evidence-preserving degradation,
+    not a reason to reject the selected candidate or call Gemini again.
+    """
+
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+    seed_manifest = {
+        "contract_version": "grouped-grounding-single-sam-seed-v1",
+        "asset_id": asset_id,
+        "target_id": seed.target_id,
+        "target_description": seed.target_description,
+        "seed_source": seed.seed_source,
+        "seed_time_ms": seed.seed_time_ms,
+        "seed_frame_pts": seed.seed_frame_pts,
+        "seed_frame_sha256": seed.seed_frame_sha256,
+        "seed_source_width": seed.seed_source_width,
+        "seed_source_height": seed.seed_source_height,
+        "seed_box_2d": list(seed.seed_box_2d),
+        "source_start_ms": start_ms,
+        "source_end_ms": end_ms,
+        "analysis_fps": analysis_fps,
+        "analysis_max_side": analysis_max_side,
+        "ffmpeg_scdet_threshold": scdet_threshold,
+        "seed_box_padding_ratio": seed_box_padding_ratio,
+        "device_request": _TRACKING_DEVICE,
+        "sam_config": SAM21_CONFIG,
+        "sam_implementation_revision": SAM21_IMPLEMENTATION_REVISION,
+        "checkpoint_sha256": checkpoint_sha256,
+    }
+    seed_fingerprint = _stable_fingerprint(seed_manifest)
+    track_dir = output_dir / "single-sam21" / f"bbox-{seed_fingerprint[:16]}"
+    seed_manifest_path = track_dir / "seed-selection.json"
+    write_json(
+        seed_manifest_path,
+        {**seed_manifest, "seed_fingerprint": seed_fingerprint},
+    )
+    track_path = track_dir / "segmentation-track.json"
+    if track_path.is_file():
+        track = SegmentationTrack.model_validate(read_json(track_path))
+    else:
+        track = track_bbox_sam21(
+            video_path=video_path,
+            checkpoint_path=checkpoint_path,
+            seed_time_ms=seed.seed_time_ms,
+            seed_box_2d=seed.seed_box_2d,
+            target_description=seed.target_description,
+            output_dir=track_dir,
+            seed_source=str(seed_manifest_path.resolve()),
+            asset_id=asset_id,
+            seed_frame_pts=seed.seed_frame_pts,
+            seed_frame_sha256=seed.seed_frame_sha256,
+            seed_source_width=seed.seed_source_width,
+            seed_source_height=seed.seed_source_height,
+            analysis_fps=analysis_fps,
+            max_side=analysis_max_side,
+            device=_TRACKING_DEVICE,
+            ffmpeg_scdet_threshold=scdet_threshold,
+            seed_box_padding_ratio=seed_box_padding_ratio,
+            allowed_start_ms=start_ms,
+            allowed_end_ms=end_ms,
+        )
+    require_bbox_track_request_match(
+        track,
+        video_path=video_path,
+        asset_id=asset_id,
+        target_description=seed.target_description,
+        seed_time_ms=seed.seed_time_ms,
+        seed_box_2d=seed.seed_box_2d,
+        seed_box_padding_ratio=seed_box_padding_ratio,
+        analysis_fps=analysis_fps,
+        analysis_start_ms=start_ms,
+        analysis_end_ms=end_ms,
+        checkpoint_sha256=checkpoint_sha256,
+        seed_frame_pts=seed.seed_frame_pts,
+        seed_frame_sha256=seed.seed_frame_sha256,
+        seed_source_width=seed.seed_source_width,
+        seed_source_height=seed.seed_source_height,
+    )
+    if query_lock_v2 is not None:
+        runtime_lineage = _query_lock_v2_runtime_geometry_lineage(
+            lock=query_lock_v2,
+            target_id=query_target_id,
+            target_description=seed.target_description,
+            seed_fingerprint=seed_fingerprint,
+            seed_manifest_path=seed_manifest_path,
+            track_path=track_path,
+            track=track,
+        )
+        write_json(
+            track_dir
+            / "runtime-geometry-lineage-"
+            f"{runtime_lineage['evidence_query_v2']['definition_sha256'][:16]}.json",
+            runtime_lineage,
+        )
+    write_json(
+        output_dir / "grouped-grounding-single-target-degradation.json",
+        {
+            "contract_version": "grouped-grounding-single-target-degradation-v1",
+            "hard_evidence_affected": False,
+            "target_id": seed.target_id,
+            "track_sha256": sha256_file(track_path),
+            "paid_model_calls_added": 0,
+            "generated_at": utc_now(),
+        },
+    )
+    return track
+
+
 def _build_framing_region_tracks(
     *,
     client: GeminiLabClient,
@@ -7579,6 +7706,29 @@ def _build_framing_region_tracks(
                 },
             )
         tracked_regions = grounded_regions
+
+    if not seeds:
+        raise ValueError("grouped Grounding produced no trackable framing targets")
+    if len(seeds) == 1:
+        region = tracked_regions[0]
+        track = _track_single_seed_from_grouped_grounding(
+            video_path=Path(clip.path),
+            checkpoint_path=checkpoint_path,
+            seed=seeds[0],
+            output_dir=output_dir,
+            asset_id=proposals[0].asset_id,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            analysis_fps=analysis_fps,
+            analysis_max_side=_TRACKING_MAX_SIDE,
+            scdet_threshold=scdet_threshold,
+            seed_box_padding_ratio=_TRACKING_SEED_BOX_PADDING_RATIO,
+            query_lock_v2=query_lock_v2,
+            query_target_id=(
+                region.entity_id or f"reframe_{region.region_id}"
+            ),
+        )
+        return proposals, [track], debug_paths
 
     request_key = {
         "contract_version": "feature-cut-shared-framing-regions-v2",
