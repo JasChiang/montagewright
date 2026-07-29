@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from jascue_video_lab.autonomous_policy import (
     AutonomousEditPolicy,
@@ -21,15 +23,27 @@ from jascue_video_lab.event_lock import (
     ExactEventLockV2,
     ExactEventResolverProvenance,
 )
+from jascue_video_lab.fixtures import HEIGHT, WIDTH, _encode
 from jascue_video_lab.gemini import GeminiLabClient, MODEL_ID
+from jascue_video_lab.media import probe_video, sha256_file
+from jascue_video_lab.models import (
+    SegmentationModelProvenance,
+    SegmentationSample,
+    SegmentationTrack,
+    SemanticIdentityStatus,
+    TrackingState,
+)
 from jascue_video_lab.presentation import (
     GroundingTargetRequest,
     PresentationTarget,
+    SourceCameraMotionEvidence,
     choose_two_panel_layout,
     compile_intentional_freeze,
     compile_minimal_camera_motion,
     compile_presentation,
+    measure_source_camera_motion,
     shared_sam_seeds_from_grounding,
+    static_full_bleed_crop_filter,
     two_panel_ffmpeg_filter,
 )
 
@@ -92,6 +106,137 @@ def _event_lock(
         ),
         input_artifact_hashes=("sha256:" + "d" * 64,),
         generated_at="now",
+    )
+
+
+def _textured_background(width: int) -> Image.Image:
+    image = Image.new("RGB", (width, HEIGHT), "#203048")
+    draw = ImageDraw.Draw(image)
+    randomizer = random.Random(20260729)
+    for index in range(220):
+        x = randomizer.randrange(5, width - 30)
+        y = randomizer.randrange(5, HEIGHT - 30)
+        size = randomizer.randrange(5, 20)
+        color = (
+            randomizer.randrange(80, 255),
+            randomizer.randrange(80, 255),
+            randomizer.randrange(80, 255),
+        )
+        if index % 2:
+            draw.rectangle((x, y, x + size, y + size), fill=color)
+        else:
+            draw.ellipse((x, y, x + size, y + size), fill=color)
+    return image
+
+
+def _source_pan_video(path: Path) -> Path:
+    background = _textured_background(WIDTH + 240)
+
+    def render(time_seconds: float) -> Image.Image:
+        camera_x = min(220, round(time_seconds * 90))
+        return background.crop(
+            (camera_x, 0, camera_x + WIDTH, HEIGHT)
+        )
+
+    _encode(path, 2.0, render)
+    return path
+
+
+def _static_video_with_moving_foreground(path: Path) -> Path:
+    background = _textured_background(WIDTH)
+
+    def render(time_seconds: float) -> Image.Image:
+        frame = background.copy()
+        draw = ImageDraw.Draw(frame)
+        x = round(430 + time_seconds * 140)
+        draw.rectangle(
+            (x, 150, x + 320, 620),
+            fill="#f8f8f8",
+            outline="#101010",
+            width=12,
+        )
+        for offset in range(0, 300, 35):
+            draw.line(
+                (x + offset, 155, x + offset + 20, 615),
+                fill="#101010",
+                width=8,
+            )
+        return frame
+
+    _encode(path, 2.0, render)
+    return path
+
+
+def _sam_subject_track(root: Path, source: Path) -> SegmentationTrack:
+    media = probe_video(source)
+    mask_path = root / "subject-mask.png"
+    mask_path.parent.mkdir(parents=True, exist_ok=True)
+    mask = Image.new("L", (WIDTH, HEIGHT), 0)
+    ImageDraw.Draw(mask).rectangle(
+        (350, 90, 900, 680),
+        fill=255,
+    )
+    mask.save(mask_path)
+    mask_hash = sha256_file(mask_path)
+    box = [270, 120, 730, 950]
+    samples = [
+        SegmentationSample(
+            sample_index=index,
+            analysis_sample_time_ms=time_ms,
+            source_pts=None,
+            timing_basis="uniform_ffmpeg_analysis_sample",
+            mask_path=str(mask_path),
+            mask_sha256=mask_hash,
+            mask_area_pixels=550 * 590,
+            mask_area_ratio=0.35,
+            connected_components=1,
+            derived_tracking_box=box,
+            center_2d=[500.0, 535.0],
+            mean_positive_probability=0.95,
+            scene_cut_score=None,
+            shot_boundary=False,
+            tracking_state=TrackingState.TRACKED,
+            state_reasons=[],
+            semantic_identity_status=(
+                SemanticIdentityStatus.NOT_REVALIDATED
+            ),
+        )
+        for index, time_ms in enumerate((0, 500, 1_000, 1_500, 1_900))
+    ]
+    return SegmentationTrack(
+        method="bbox_seed_sam2_video_mask_propagation",
+        asset_id=media.asset_id,
+        video_path=str(source),
+        target_description="moving foreground subject",
+        seed_source="test",
+        seed_time_ms=1_000,
+        seed_sample_index=2,
+        semantic_seed_box=box,
+        seed_prompt_type="box",
+        sam_prompt_box=box,
+        seed_box_padding_ratio=0.0,
+        refined_seed_mask_path=str(mask_path),
+        analysis_fps=2.0,
+        analysis_width=WIDTH,
+        analysis_height=HEIGHT,
+        analysis_start_ms=0,
+        analysis_end_ms=2_000,
+        timing_warning="synthetic test timing",
+        semantic_warning="synthetic test identity",
+        total_samples=len(samples),
+        state_counts={TrackingState.TRACKED: len(samples)},
+        elapsed_seconds=0.0,
+        effective_fps=2.0,
+        model_provenance=SegmentationModelProvenance(
+            model_id="sam2.1_hiera_tiny",
+            implementation="synthetic-test",
+            implementation_revision="v1",
+            checkpoint_sha256="a" * 64,
+            device="cpu",
+            torch_version="test",
+            generated_at="2026-07-29T00:00:00Z",
+        ),
+        samples=samples,
     )
 
 
@@ -158,6 +303,206 @@ def test_existing_source_pan_suppresses_synthetic_camera_motion() -> None:
     assert decision.mode == "hold"
     assert decision.source_motion.direction == "right"
     assert decision.movement_motivation == "none"
+
+
+def test_source_camera_pan_is_measured_from_background_geometry(
+    tmp_path: Path,
+) -> None:
+    source = _source_pan_video(tmp_path / "source-pan.mp4")
+    media = probe_video(source)
+
+    evidence = measure_source_camera_motion(
+        source_path=source,
+        source_asset_id=media.asset_id,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        subject_tracks=(),
+        output_dir=tmp_path / "motion",
+    )
+
+    assert evidence.reliable is True
+    assert evidence.classification == "pan_right"
+    assert evidence.normalized_translation_x_per_second > 0.03
+    assert evidence.confidence > 0.35
+    assert len(evidence.sample_frame_hashes) >= 6
+    assert (next((tmp_path / "motion").glob("*/evidence.json"))).exists()
+
+    decision = compile_minimal_camera_motion(
+        (0.2, 0.8),
+        source_camera_motion=evidence.as_motion_estimate(),
+        movement_motivated=True,
+    )
+    assert decision.mode == "hold"
+    assert decision.source_motion.direction == "right"
+
+    compilation = compile_presentation(
+        targets=[
+            _target("first", (430, 250, 500, 750)),
+            _target("second", (500, 250, 570, 750)),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="sequential_focus",
+        policy=_policy(),
+        required_x_values=(0.465, 0.535),
+        source_camera_motion_evidence=evidence,
+        movement_motivated=True,
+        preferred_capability_ids=("phase_virtual_camera",),
+    )
+    assert compilation.mode == "static_full_bleed_crop"
+    assert compilation.static_crop_box_2d is not None
+    filter_graph = static_full_bleed_crop_filter(
+        compilation.static_crop_box_2d
+    )
+    assert "crop=w=" in filter_graph
+    assert "scale=1080:1920" in filter_graph
+    rendered = tmp_path / "static-full-bleed.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            "[base]",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(rendered),
+        ],
+        check=True,
+    )
+    rendered_media = probe_video(rendered)
+    assert rendered_media.video.display_width == 1080
+    assert rendered_media.video.display_height == 1920
+
+
+def test_sam_subject_exclusion_prevents_foreground_motion_from_becoming_pan(
+    tmp_path: Path,
+) -> None:
+    source = _static_video_with_moving_foreground(
+        tmp_path / "moving-subject.mp4"
+    )
+    media = probe_video(source)
+    track = _sam_subject_track(tmp_path / "track", source)
+
+    evidence = measure_source_camera_motion(
+        source_path=source,
+        source_asset_id=media.asset_id,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        subject_tracks=(track,),
+        output_dir=tmp_path / "motion",
+    )
+
+    assert evidence.reliable is True
+    assert evidence.classification == "static"
+    assert evidence.subject_exclusion_mode == "sam_track_boxes"
+    assert evidence.mean_excluded_area_fraction > 0.25
+
+
+def test_source_motion_reuses_sam_analysis_frames_without_redecoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _static_video_with_moving_foreground(
+        tmp_path / "reuse-source.mp4"
+    )
+    media = probe_video(source)
+    track_root = tmp_path / "reused-track"
+    original_track = _sam_subject_track(track_root, source)
+    track = original_track.model_copy(
+        update={
+            "seed_source": str(track_root / "seed-selection.json"),
+            "samples": [
+                sample.model_copy(
+                    update={"source_pts": sample.sample_index}
+                )
+                for sample in original_track.samples
+            ],
+        }
+    )
+    frames_dir = track_root / "analysis-frames"
+    frames_dir.mkdir(parents=True)
+    background = _textured_background(WIDTH)
+    for sample in track.samples:
+        background.save(
+            frames_dir / f"{sample.sample_index:06d}.jpg",
+            quality=92,
+        )
+
+    def fail_decode(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("existing SAM analysis frames must be reused")
+
+    monkeypatch.setattr(
+        "jascue_video_lab.presentation.extract_frame",
+        fail_decode,
+    )
+    evidence = measure_source_camera_motion(
+        source_path=source,
+        source_asset_id=media.asset_id,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        subject_tracks=(track,),
+        output_dir=tmp_path / "motion",
+    )
+
+    assert evidence.reliable is True
+    assert evidence.classification == "static"
+    assert len(evidence.sample_frame_pts) == len(track.samples)
+
+
+def test_unreliable_source_motion_forbids_virtual_pan_but_allows_hard_cut() -> None:
+    evidence = SourceCameraMotionEvidence(
+        source_asset_id="sha256:" + "a" * 64,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        sample_times_ms=(),
+        sample_frame_pts=(),
+        sample_frame_hashes=(),
+        subject_exclusion_mode="none",
+        mean_excluded_area_fraction=0.0,
+        pairs=(),
+        classification="unreliable",
+        reliable=False,
+        confidence=0.0,
+        normalized_translation_x_per_second=0.0,
+        normalized_translation_y_per_second=0.0,
+        scale_rate_per_second=0.0,
+        rotation_degrees_per_second=0.0,
+        normalized_travel=0.0,
+        reversal_count=0,
+        reason_codes=("insufficient_background_features",),
+        cache_key_sha256="b" * 64,
+    )
+
+    compilation = compile_presentation(
+        targets=[
+            _target("first", (100, 250, 300, 750)),
+            _target("second", (700, 250, 900, 750)),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="sequential_focus",
+        policy=_policy(),
+        required_x_values=(0.2, 0.8),
+        source_camera_motion_evidence=evidence,
+        movement_motivated=True,
+        preferred_capability_ids=("phase_virtual_camera",),
+    )
+
+    assert compilation.mode != "phase_virtual_camera"
+    assert compilation.scene_facts is not None
+    assert compilation.scene_facts.source_camera_motion_measured is True
+    assert compilation.scene_facts.source_camera_motion_reliable is False
 
 
 def test_impossible_two_device_crop_uses_scale_locked_two_panel() -> None:

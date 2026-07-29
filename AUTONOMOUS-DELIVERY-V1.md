@@ -23,7 +23,7 @@ Gemini semantic observations
 | M0 | Baseline test and historical artifact usage audit. |
 | M1 | `AutonomousEditPolicy`, `DecisionAuthorityV2`, `BudgetLedger`, low/high media-resolution contracts, and text-only schema repair. |
 | M2 | `EditorialBeatContract`, `ExactEventLockV2`, grouped frame-ID event selection, cue delta evidence, AUTO_POLICY MusicMap/CuePlan/TrimIntent. |
-| M3 | Extracted existing vertical fit/crop/reversal logic into `presentation.py`; added one-call multi-target grounding, shared SAM seeds, two-panel, promoted solid fit, exact-event freeze, and source-motion suppression. |
+| M3 | Extracted existing vertical fit/crop/reversal logic into `presentation.py`; added one-call multi-target grounding, shared SAM seeds, two-panel, promoted solid fit, exact-event freeze, and a selected-window background-affine source-camera estimator that excludes SAM subject regions. |
 | M4 | Evidence-first bounded beam search, duration reconciliation, continuity penalties, and content-addressed segment render cache. |
 | M5 | Audible `autonomous_final_9x16`, typed QA issues, deterministic gate report, local repair mapping, one-replan/two-QA caps, and final `AUTO_POLICY` authority. |
 | Generalized compiler | Added aspect-neutral `SemanticEditIR`, continuous `SceneFacts`, typed hard/preference constraint results, capability registry v2, enumerate-before-select presentation compilation, and a manually executed two-round Gemini function-calling negotiation bridge. |
@@ -37,6 +37,10 @@ Legacy `review_preview` and `production_review` continue to normalize final QA t
 - General video uses low media resolution; exact event and bbox images use high.
 - Direct-video-edit-plan-v2 does not trigger the legacy selected-clip framing rewatch.
 - Two-panel orientation, rects, scale lock, gutter, and same-PTS checks are local and add zero paid calls.
+- Source-camera pan/tilt/zoom/static measurement is local and adds zero paid
+  calls. It stores exact decoded frame PTS/hashes, foreground-exclusion mode,
+  forward/backward flow validation, RANSAC inlier ratio and residual. An
+  unreliable result fails closed against synthetic pan/zoom.
 - Hard evidence, identity, action completeness, required relation, scale, quality-safe interval, cue tolerance, reuse authority, and executable geometry are non-compensable constraints.
 - Final semantic QA can observe an issue but cannot approve delivery. Only a fully passed deterministic report plus non-blocking requested-aspect QA can create `DecisionAuthorityV2`.
 - Clear presentation decisions perform no semantic negotiation. Near-equal

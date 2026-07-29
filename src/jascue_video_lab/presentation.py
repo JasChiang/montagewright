@@ -9,15 +9,21 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from pathlib import Path
+from statistics import median
 from typing import Any, Literal, Mapping, Sequence
 
+from PIL import Image
 from pydantic import Field, model_validator
 
 from .autonomous_policy import AutonomousEditPolicy
 from .editing_capabilities import autonomous_capability_registry_v2
 from .event_lock import ExactEventLockV2
+from .media import extract_frame
 from .models import (
+    ExtractedFrame,
     FrozenStrictModel,
+    SegmentationTrack,
     SharedSam21BBoxSeed,
 )
 from .sequence_optimizer import (
@@ -27,6 +33,7 @@ from .sequence_optimizer import (
     OptionMetrics,
     select_executable_option,
 )
+from .storage import read_json, write_json
 
 
 NormalizedBox = tuple[int, int, int, int]
@@ -213,6 +220,11 @@ class SceneFacts(FrozenStrictModel):
     shared_static_crop_feasible: bool
     source_camera_motion: SourceCameraMotionEstimate
     source_camera_motion_measured: bool = False
+    source_camera_motion_reliable: bool = False
+    source_camera_motion_evidence_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     target_readability_by_canvas: Mapping[str, float]
     same_source_same_pts: bool
     physical_scale_evidence_available: bool
@@ -306,9 +318,123 @@ class PresentationCompilation(FrozenStrictModel):
 
 
 class SourceCameraMotionEstimate(FrozenStrictModel):
-    direction: Literal["static", "left", "right", "mixed"]
+    direction: Literal[
+        "static",
+        "left",
+        "right",
+        "up",
+        "down",
+        "zoom_in",
+        "zoom_out",
+        "mixed",
+        "unreliable",
+    ]
     normalized_travel: float = Field(ge=0.0)
     reversal_count: int = Field(ge=0)
+
+
+class SourceCameraMotionPairEvidence(FrozenStrictModel):
+    before_frame_pts: int
+    after_frame_pts: int
+    delta_ms: int = Field(gt=0)
+    detected_features: int = Field(ge=0)
+    tracked_background_features: int = Field(ge=0)
+    inlier_ratio: float = Field(ge=0.0, le=1.0)
+    median_residual_pixels: float = Field(ge=0.0)
+    camera_translation_x_normalized: float
+    camera_translation_y_normalized: float
+    camera_scale_delta: float
+    camera_rotation_degrees: float
+    reliable: bool
+
+
+class SourceCameraMotionEvidence(FrozenStrictModel):
+    """Auditable background-geometry evidence for one immutable trim.
+
+    The estimator never decides the editorial purpose of motion. It measures
+    the source camera so the presentation compiler can avoid canceling or
+    stacking synthetic motion on top of the photographed move.
+    """
+
+    contract_version: Literal["source-camera-motion-evidence-v1"] = (
+        "source-camera-motion-evidence-v1"
+    )
+    estimator_version: Literal[
+        "background-gftt-lk-ransac-affine-v1"
+    ] = "background-gftt-lk-ransac-affine-v1"
+    source_asset_id: str
+    window_start_ms: int = Field(ge=0)
+    window_end_ms: int = Field(gt=0)
+    sample_times_ms: tuple[int, ...]
+    sample_frame_pts: tuple[int, ...]
+    sample_frame_hashes: tuple[str, ...]
+    subject_exclusion_mode: Literal[
+        "sam_track_boxes",
+        "none",
+    ]
+    mean_excluded_area_fraction: float = Field(ge=0.0, le=1.0)
+    pairs: tuple[SourceCameraMotionPairEvidence, ...]
+    classification: Literal[
+        "static",
+        "pan_left",
+        "pan_right",
+        "tilt_up",
+        "tilt_down",
+        "zoom_in",
+        "zoom_out",
+        "mixed",
+        "unreliable",
+    ]
+    reliable: bool
+    confidence: float = Field(ge=0.0, le=1.0)
+    normalized_translation_x_per_second: float
+    normalized_translation_y_per_second: float
+    scale_rate_per_second: float
+    rotation_degrees_per_second: float
+    normalized_travel: float = Field(ge=0.0)
+    reversal_count: int = Field(ge=0)
+    reason_codes: tuple[str, ...]
+    cache_key_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_window_and_samples(self) -> "SourceCameraMotionEvidence":
+        if self.window_end_ms <= self.window_start_ms:
+            raise ValueError("source camera motion window must be non-empty")
+        if len(self.sample_times_ms) != len(self.sample_frame_pts):
+            raise ValueError("source camera sample PTS count is incomplete")
+        if len(self.sample_times_ms) != len(self.sample_frame_hashes):
+            raise ValueError("source camera sample hashes are incomplete")
+        if self.reliable and len(self.sample_times_ms) < 2:
+            raise ValueError("reliable source motion needs at least two frames")
+        if tuple(sorted(self.sample_times_ms)) != self.sample_times_ms:
+            raise ValueError("source camera sample times must be monotonic")
+        if self.reliable == (self.classification == "unreliable"):
+            raise ValueError(
+                "source camera reliability and classification disagree"
+            )
+        return self
+
+    @property
+    def definition_sha256(self) -> str:
+        return _canonical_payload_sha(self.model_dump(mode="json"))
+
+    def as_motion_estimate(self) -> SourceCameraMotionEstimate:
+        direction_by_classification = {
+            "static": "static",
+            "pan_left": "left",
+            "pan_right": "right",
+            "tilt_up": "up",
+            "tilt_down": "down",
+            "zoom_in": "zoom_in",
+            "zoom_out": "zoom_out",
+            "mixed": "mixed",
+            "unreliable": "unreliable",
+        }
+        return SourceCameraMotionEstimate(
+            direction=direction_by_classification[self.classification],
+            normalized_travel=self.normalized_travel,
+            reversal_count=self.reversal_count,
+        )
 
 
 class CameraMotionDecision(FrozenStrictModel):
@@ -342,6 +468,7 @@ def compile_presentation(
     tracking_available: bool = True,
     required_x_values: Sequence[float] = (),
     source_camera_x_values: Sequence[float] = (),
+    source_camera_motion_evidence: SourceCameraMotionEvidence | None = None,
     movement_motivated: bool = False,
     preferred_capability_ids: Sequence[str] = (),
 ) -> PresentationCompilation:
@@ -364,6 +491,7 @@ def compile_presentation(
         tracking_available=tracking_available,
         required_x_values=required_x_values,
         source_camera_x_values=source_camera_x_values,
+        source_camera_motion_evidence=source_camera_motion_evidence,
         movement_motivated=movement_motivated,
     )
     selection = select_executable_option(
@@ -418,6 +546,7 @@ def generate_presentation_options(
     tracking_available: bool = True,
     required_x_values: Sequence[float] = (),
     source_camera_x_values: Sequence[float] = (),
+    source_camera_motion_evidence: SourceCameraMotionEvidence | None = None,
     movement_motivated: bool = False,
 ) -> PresentationOptionSet:
     """Enumerate all locally feasible operations before selecting one.
@@ -443,9 +572,12 @@ def generate_presentation_options(
         if allow_static_full_bleed
         else None
     )
-    source_motion = estimate_source_camera_motion(
-        source_camera_x_values
-        or tuple(0.5 for _ in targets)
+    source_motion = (
+        source_camera_motion_evidence.as_motion_estimate()
+        if source_camera_motion_evidence is not None
+        else estimate_source_camera_motion(
+            source_camera_x_values or tuple(0.5 for _ in targets)
+        )
     )
     scene_facts = _build_scene_facts(
         targets=targets,
@@ -453,7 +585,20 @@ def generate_presentation_options(
         source_height=source_height,
         shared_crop=shared_crop,
         source_motion=source_motion,
-        source_camera_motion_measured=bool(source_camera_x_values),
+        source_camera_motion_measured=(
+            source_camera_motion_evidence is not None
+            or bool(source_camera_x_values)
+        ),
+        source_camera_motion_reliable=(
+            source_camera_motion_evidence.reliable
+            if source_camera_motion_evidence is not None
+            else bool(source_camera_x_values)
+        ),
+        source_camera_motion_evidence_sha256=(
+            source_camera_motion_evidence.definition_sha256
+            if source_camera_motion_evidence is not None
+            else None
+        ),
     )
     options: list[PresentationOption] = []
 
@@ -548,6 +693,7 @@ def generate_presentation_options(
         camera_motion = compile_minimal_camera_motion(
             motion_positions,
             source_camera_x_values=source_camera_x_values,
+            source_camera_motion=source_motion,
             movement_motivated=movement_motivated,
         )
         motion_mode = (
@@ -582,23 +728,60 @@ def generate_presentation_options(
                             _constraint(
                                 "source_motion_compatible",
                                 passed=(
+                                    motion_mode == "hard_cut_between_views"
+                                    or
                                     camera_motion.source_motion.direction
                                     == "static"
                                 ),
                                 reason_code=(
-                                    "source_camera_static"
-                                    if camera_motion.source_motion.direction
-                                    == "static"
+                                    "hard_cut_does_not_stack_source_motion"
+                                    if motion_mode == "hard_cut_between_views"
+                                    else "source_camera_static"
+                                    if (
+                                        camera_motion.source_motion.direction
+                                        == "static"
+                                    )
                                     else "source_motion_would_be_counteracted"
                                 ),
                                 evidence_refs=(scene_facts.definition_sha256,),
                             )
-                            if scene_facts.source_camera_motion_measured
-                            else _preference_constraint(
-                                "source_motion_measurement",
-                                status="unknown",
-                                reason_code="source_camera_motion_not_measured",
-                                evidence_refs=(scene_facts.definition_sha256,),
+                            if (
+                                scene_facts.source_camera_motion_measured
+                                and scene_facts.source_camera_motion_reliable
+                            )
+                            else (
+                                _constraint(
+                                    "source_motion_compatible",
+                                    passed=(
+                                        motion_mode
+                                        == "hard_cut_between_views"
+                                    ),
+                                    reason_code=(
+                                        "hard_cut_does_not_require_source_"
+                                        "motion_measurement"
+                                        if (
+                                            motion_mode
+                                            == "hard_cut_between_views"
+                                        )
+                                        else
+                                        "source_camera_motion_unreliable_"
+                                        "synthetic_motion_forbidden"
+                                    ),
+                                    evidence_refs=(
+                                        scene_facts.definition_sha256,
+                                    ),
+                                )
+                                if scene_facts.source_camera_motion_measured
+                                else _preference_constraint(
+                                    "source_motion_measurement",
+                                    status="unknown",
+                                    reason_code=(
+                                        "source_camera_motion_not_measured"
+                                    ),
+                                    evidence_refs=(
+                                        scene_facts.definition_sha256,
+                                    ),
+                                )
                             )
                         ),
                     ),
@@ -758,6 +941,8 @@ def _build_scene_facts(
     shared_crop: NormalizedBox | None,
     source_motion: SourceCameraMotionEstimate,
     source_camera_motion_measured: bool,
+    source_camera_motion_reliable: bool,
+    source_camera_motion_evidence_sha256: str | None,
 ) -> SceneFacts:
     centers = tuple(
         ((target.box_2d[0] + target.box_2d[2]) / 2) / 1000
@@ -787,6 +972,10 @@ def _build_scene_facts(
         shared_static_crop_feasible=shared_crop is not None,
         source_camera_motion=source_motion,
         source_camera_motion_measured=source_camera_motion_measured,
+        source_camera_motion_reliable=source_camera_motion_reliable,
+        source_camera_motion_evidence_sha256=(
+            source_camera_motion_evidence_sha256
+        ),
         target_readability_by_canvas={"9:16": round(portrait_readability, 6)},
         same_source_same_pts=same_source_same_pts,
         physical_scale_evidence_available=same_source_same_pts,
@@ -901,6 +1090,7 @@ def compile_minimal_camera_motion(
     required_x_values: Sequence[float],
     *,
     source_camera_x_values: Sequence[float] = (),
+    source_camera_motion: SourceCameraMotionEstimate | None = None,
     movement_motivated: bool,
     initial_position_optimizable: bool = True,
     deadband: float = 0.05,
@@ -911,8 +1101,9 @@ def compile_minimal_camera_motion(
         raise ValueError("camera motion compiler requires positions")
     if any(not 0.0 <= value <= 1.0 for value in required_x_values):
         raise ValueError("camera positions must be normalized")
-    source = estimate_source_camera_motion(
-        source_camera_x_values or tuple(0.5 for _ in required_x_values),
+    source = source_camera_motion or estimate_source_camera_motion(
+        source_camera_x_values
+        or tuple(0.5 for _ in required_x_values),
         threshold=deadband,
     )
     required_span = max(required_x_values) - min(required_x_values)
@@ -925,6 +1116,18 @@ def compile_minimal_camera_motion(
             source_motion=source,
             synthetic_reversal_count=0,
             settle_required=False,
+        )
+    if source.direction == "unreliable":
+        # When source motion cannot be measured, a hard cut is the only
+        # attention-transfer operation that cannot accidentally counteract or
+        # amplify photographed motion.
+        return CameraMotionDecision(
+            mode="hard_cut",
+            normalized_x_values=tuple(required_x_values),
+            movement_motivation="attention_transfer",
+            source_motion=source,
+            synthetic_reversal_count=0,
+            settle_required=True,
         )
     if source.direction != "static":
         # Source pan already supplies motion. Without a separately proven need
@@ -1000,6 +1203,783 @@ def estimate_source_camera_motion(
         direction=direction,
         normalized_travel=round(travel, 6),
         reversal_count=reversals,
+    )
+
+
+def measure_source_camera_motion(
+    *,
+    source_path: Path,
+    source_asset_id: str,
+    window_start_ms: int,
+    window_end_ms: int,
+    subject_tracks: Sequence[SegmentationTrack],
+    output_dir: Path,
+    sample_count: int = 8,
+    max_width: int = 640,
+) -> SourceCameraMotionEvidence:
+    """Measure source-camera motion from background features, without Gemini.
+
+    Frames are decoded through FFmpeg's orientation-corrected path. Foreground
+    regions come from the nearest SAM track boxes and are excluded before
+    forward/backward optical-flow matching and RANSAC affine fitting.
+    """
+
+    if window_start_ms < 0 or window_end_ms <= window_start_ms:
+        raise ValueError("source camera motion window must be non-empty")
+    if sample_count < 3 or sample_count > 16:
+        raise ValueError("source camera sample_count must be in [3, 16]")
+    if max_width < 320 or max_width > 1_280:
+        raise ValueError("source camera max_width must be in [320, 1280]")
+    resolved_source = source_path.expanduser().resolve()
+    track_facts = _source_motion_track_facts(subject_tracks)
+    cache_key = _canonical_payload_sha(
+        {
+            "estimator_version": "background-gftt-lk-ransac-affine-v1",
+            "source_asset_id": source_asset_id,
+            "source_size": (
+                resolved_source.stat().st_size
+                if resolved_source.exists()
+                else None
+            ),
+            "window_start_ms": window_start_ms,
+            "window_end_ms": window_end_ms,
+            "sample_count": sample_count,
+            "max_width": max_width,
+            "subject_tracks": track_facts,
+        }
+    )
+    artifact_dir = output_dir / f"source-camera-motion-{cache_key[:16]}"
+    artifact_path = artifact_dir / "evidence.json"
+    if artifact_path.exists():
+        cached = SourceCameraMotionEvidence.model_validate(
+            read_json(artifact_path)
+        )
+        if cached.cache_key_sha256 == cache_key:
+            return cached
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    if not resolved_source.is_file():
+        evidence = _unreliable_source_motion_evidence(
+            source_asset_id=source_asset_id,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+            cache_key=cache_key,
+            reason_codes=(
+                "source_motion_media_unavailable",
+                "synthetic_motion_fail_closed",
+            ),
+            subject_exclusion_mode=(
+                "sam_track_boxes" if subject_tracks else "none"
+            ),
+        )
+        write_json(artifact_path, evidence.model_dump(mode="json"))
+        return evidence
+
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        evidence = _unreliable_source_motion_evidence(
+            source_asset_id=source_asset_id,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+            cache_key=cache_key,
+            reason_codes=("opencv_tracking_dependency_unavailable",),
+        )
+        write_json(artifact_path, evidence.model_dump(mode="json"))
+        return evidence
+
+    extracted_frames = _reuse_tracking_analysis_frames(
+        subject_tracks,
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
+        sample_count=sample_count,
+    )
+    if not extracted_frames:
+        requested_times = _source_motion_sample_times(
+            window_start_ms,
+            window_end_ms,
+            sample_count=sample_count,
+        )
+        try:
+            for index, requested_ms in enumerate(requested_times):
+                extracted = extract_frame(
+                    resolved_source,
+                    requested_ms,
+                    artifact_dir / "frames" / f"frame-{index:02d}.jpg",
+                    max_width=max_width,
+                )
+                if (
+                    not extracted_frames
+                    or extracted.frame_pts != extracted_frames[-1].frame_pts
+                ):
+                    extracted_frames.append(extracted)
+        except Exception as error:
+            evidence = _unreliable_source_motion_evidence(
+                source_asset_id=source_asset_id,
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+                cache_key=cache_key,
+                reason_codes=(
+                    "source_motion_frame_decode_failed",
+                    f"{type(error).__name__}",
+                ),
+                extracted_frames=extracted_frames,
+            )
+            write_json(artifact_path, evidence.model_dump(mode="json"))
+            return evidence
+
+    if len(extracted_frames) < 2:
+        evidence = _unreliable_source_motion_evidence(
+            source_asset_id=source_asset_id,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+            cache_key=cache_key,
+            reason_codes=("insufficient_distinct_decoded_frames",),
+            extracted_frames=extracted_frames,
+        )
+        write_json(artifact_path, evidence.model_dump(mode="json"))
+        return evidence
+
+    gray_frames = []
+    background_masks = []
+    excluded_fractions = []
+    for extracted in extracted_frames:
+        frame = cv2.imread(extracted.path)
+        if frame is None:
+            evidence = _unreliable_source_motion_evidence(
+                source_asset_id=source_asset_id,
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+                cache_key=cache_key,
+                reason_codes=("source_motion_frame_read_failed",),
+                extracted_frames=extracted_frames,
+            )
+            write_json(artifact_path, evidence.model_dump(mode="json"))
+            return evidence
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        background_mask, excluded_fraction = _background_feature_mask(
+            width=gray.shape[1],
+            height=gray.shape[0],
+            time_ms=extracted.frame_time_ms,
+            subject_tracks=subject_tracks,
+            cv2=cv2,
+            np=np,
+        )
+        gray_frames.append(gray)
+        background_masks.append(background_mask)
+        excluded_fractions.append(excluded_fraction)
+
+    pairs = tuple(
+        _measure_background_motion_pair(
+            before_gray=gray_frames[index],
+            after_gray=gray_frames[index + 1],
+            before_mask=background_masks[index],
+            after_mask=background_masks[index + 1],
+            before_frame_pts=extracted_frames[index].frame_pts,
+            after_frame_pts=extracted_frames[index + 1].frame_pts,
+            delta_ms=max(
+                1,
+                extracted_frames[index + 1].frame_time_ms
+                - extracted_frames[index].frame_time_ms,
+            ),
+            cv2=cv2,
+            np=np,
+        )
+        for index in range(len(extracted_frames) - 1)
+    )
+    reliable_pairs = tuple(pair for pair in pairs if pair.reliable)
+    required_pair_count = max(2, math.ceil(len(pairs) * 0.5))
+    if len(reliable_pairs) < required_pair_count:
+        evidence = _unreliable_source_motion_evidence(
+            source_asset_id=source_asset_id,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+            cache_key=cache_key,
+            reason_codes=(
+                "insufficient_reliable_background_pairs",
+                "synthetic_motion_fail_closed",
+            ),
+            extracted_frames=extracted_frames,
+            pairs=pairs,
+            mean_excluded_area_fraction=(
+                sum(excluded_fractions) / len(excluded_fractions)
+            ),
+            subject_exclusion_mode=(
+                "sam_track_boxes" if subject_tracks else "none"
+            ),
+        )
+        write_json(artifact_path, evidence.model_dump(mode="json"))
+        return evidence
+
+    x_rates = [
+        pair.camera_translation_x_normalized * 1000 / pair.delta_ms
+        for pair in reliable_pairs
+    ]
+    y_rates = [
+        pair.camera_translation_y_normalized * 1000 / pair.delta_ms
+        for pair in reliable_pairs
+    ]
+    scale_rates = [
+        pair.camera_scale_delta * 1000 / pair.delta_ms
+        for pair in reliable_pairs
+    ]
+    rotation_rates = [
+        pair.camera_rotation_degrees * 1000 / pair.delta_ms
+        for pair in reliable_pairs
+    ]
+    x_rate = float(median(x_rates))
+    y_rate = float(median(y_rates))
+    scale_rate = float(median(scale_rates))
+    rotation_rate = float(median(rotation_rates))
+    normalized_travel = sum(
+        math.hypot(
+            pair.camera_translation_x_normalized,
+            pair.camera_translation_y_normalized,
+        )
+        for pair in reliable_pairs
+    )
+    dominant_deltas = (
+        [
+            pair.camera_translation_x_normalized
+            for pair in reliable_pairs
+        ]
+        if abs(x_rate) >= abs(y_rate)
+        else [
+            pair.camera_translation_y_normalized
+            for pair in reliable_pairs
+        ]
+    )
+    cumulative_positions = [0.5]
+    for delta in dominant_deltas:
+        cumulative_positions.append(cumulative_positions[-1] + delta)
+    reversals = _signed_motion_reversal_count(
+        cumulative_positions,
+        perceptual_threshold=0.006,
+    )
+    classification = _classify_measured_source_motion(
+        x_rate=x_rate,
+        y_rate=y_rate,
+        scale_rate=scale_rate,
+        rotation_rate=rotation_rate,
+        reversal_count=reversals,
+    )
+    median_inlier_ratio = float(
+        median(pair.inlier_ratio for pair in reliable_pairs)
+    )
+    median_residual = float(
+        median(pair.median_residual_pixels for pair in reliable_pairs)
+    )
+    valid_fraction = len(reliable_pairs) / len(pairs)
+    confidence = max(
+        0.0,
+        min(
+            1.0,
+            valid_fraction
+            * median_inlier_ratio
+            * max(0.25, 1.0 - median_residual / 5.0),
+        ),
+    )
+    evidence = SourceCameraMotionEvidence(
+        source_asset_id=source_asset_id,
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
+        sample_times_ms=tuple(
+            frame.frame_time_ms for frame in extracted_frames
+        ),
+        sample_frame_pts=tuple(
+            frame.frame_pts for frame in extracted_frames
+        ),
+        sample_frame_hashes=tuple(
+            frame.frame_hash for frame in extracted_frames
+        ),
+        subject_exclusion_mode=(
+            "sam_track_boxes" if subject_tracks else "none"
+        ),
+        mean_excluded_area_fraction=round(
+            sum(excluded_fractions) / len(excluded_fractions),
+            6,
+        ),
+        pairs=pairs,
+        classification=classification,
+        reliable=True,
+        confidence=round(confidence, 6),
+        normalized_translation_x_per_second=round(x_rate, 6),
+        normalized_translation_y_per_second=round(y_rate, 6),
+        scale_rate_per_second=round(scale_rate, 6),
+        rotation_degrees_per_second=round(rotation_rate, 6),
+        normalized_travel=round(normalized_travel, 6),
+        reversal_count=reversals,
+        reason_codes=(
+            "background_features_exclude_tracked_subjects",
+            "forward_backward_flow_validated",
+            "ransac_affine_motion_measured",
+        ),
+        cache_key_sha256=cache_key,
+    )
+    write_json(artifact_path, evidence.model_dump(mode="json"))
+    return evidence
+
+
+def _source_motion_sample_times(
+    start_ms: int,
+    end_ms: int,
+    *,
+    sample_count: int,
+) -> tuple[int, ...]:
+    duration_ms = end_ms - start_ms
+    # Keep the final request inside the half-open trim even for low-FPS media;
+    # asking at end-1ms can legitimately have no following decoded frame.
+    end_guard_ms = min(100, max(1, duration_ms // 4))
+    last_ms = max(start_ms, end_ms - end_guard_ms)
+    if last_ms == start_ms:
+        return (start_ms, start_ms + 1)
+    return tuple(
+        round(start_ms + (last_ms - start_ms) * index / (sample_count - 1))
+        for index in range(sample_count)
+    )
+
+
+def _reuse_tracking_analysis_frames(
+    tracks: Sequence[SegmentationTrack],
+    *,
+    window_start_ms: int,
+    window_end_ms: int,
+    sample_count: int,
+) -> list[ExtractedFrame]:
+    """Reuse the SAM decoder frontier instead of decoding the trim again."""
+
+    for track in tracks:
+        seed_source = Path(track.seed_source).expanduser()
+        roots = (
+            seed_source.parent,
+            seed_source.parent.parent,
+            seed_source.parent.parent.parent,
+        )
+        frames_dir = next(
+            (
+                root / "analysis-frames"
+                for root in roots
+                if (root / "analysis-frames").is_dir()
+            ),
+            None,
+        )
+        if frames_dir is None:
+            continue
+        available: list[ExtractedFrame] = []
+        for sample in track.samples:
+            if (
+                sample.source_pts is None
+                or not (
+                    window_start_ms
+                    <= sample.analysis_sample_time_ms
+                    < window_end_ms
+                )
+            ):
+                continue
+            frame_path = frames_dir / f"{sample.sample_index:06d}.jpg"
+            if not frame_path.is_file():
+                continue
+            with Image.open(frame_path) as image:
+                width, height = image.size
+            available.append(
+                ExtractedFrame(
+                    path=str(frame_path.resolve()),
+                    requested_time_ms=sample.analysis_sample_time_ms,
+                    frame_time_ms=sample.analysis_sample_time_ms,
+                    frame_pts=sample.source_pts,
+                    frame_hash=_sha256_path(frame_path),
+                    width=width,
+                    height=height,
+                )
+            )
+        if len(available) < 2:
+            continue
+        if len(available) <= sample_count:
+            return available
+        selected_indexes = sorted(
+            {
+                round(
+                    index
+                    * (len(available) - 1)
+                    / (sample_count - 1)
+                )
+                for index in range(sample_count)
+            }
+        )
+        return [available[index] for index in selected_indexes]
+    return []
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_motion_track_facts(
+    tracks: Sequence[SegmentationTrack],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "asset_id": track.asset_id,
+            "target_id": track.target_id,
+            "analysis_frames_manifest_sha256": (
+                track.analysis_frames_manifest_sha256
+            ),
+            "analysis_start_ms": track.analysis_start_ms,
+            "analysis_end_ms": track.analysis_end_ms,
+            "samples": [
+                {
+                    "time_ms": sample.analysis_sample_time_ms,
+                    "box": sample.derived_tracking_box,
+                    "mask_sha256": sample.mask_sha256,
+                    "tracking_state": str(sample.tracking_state),
+                }
+                for sample in track.samples
+            ],
+        }
+        for track in tracks
+    ]
+
+
+def _nearest_track_box(
+    track: SegmentationTrack,
+    time_ms: int,
+) -> tuple[int, int, int, int] | None:
+    candidates = [
+        sample
+        for sample in track.samples
+        if sample.derived_tracking_box is not None
+    ]
+    if not candidates:
+        return None
+    sample = min(
+        candidates,
+        key=lambda item: abs(item.analysis_sample_time_ms - time_ms),
+    )
+    max_gap_ms = max(750, round(2_500 / track.analysis_fps))
+    if abs(sample.analysis_sample_time_ms - time_ms) > max_gap_ms:
+        return None
+    assert sample.derived_tracking_box is not None
+    return tuple(int(value) for value in sample.derived_tracking_box)
+
+
+def _background_feature_mask(
+    *,
+    width: int,
+    height: int,
+    time_ms: int,
+    subject_tracks: Sequence[SegmentationTrack],
+    cv2: Any,
+    np: Any,
+) -> tuple[Any, float]:
+    mask = np.full((height, width), 255, dtype=np.uint8)
+    for track in subject_tracks:
+        box = _nearest_track_box(track, time_ms)
+        if box is None:
+            continue
+        x_min, y_min, x_max, y_max = box
+        padding_x = round((x_max - x_min) * 0.12)
+        padding_y = round((y_max - y_min) * 0.12)
+        left = max(0, math.floor((x_min - padding_x) * width / 1000))
+        top = max(0, math.floor((y_min - padding_y) * height / 1000))
+        right = min(
+            width,
+            math.ceil((x_max + padding_x) * width / 1000),
+        )
+        bottom = min(
+            height,
+            math.ceil((y_max + padding_y) * height / 1000),
+        )
+        cv2.rectangle(mask, (left, top), (right, bottom), 0, thickness=-1)
+    excluded_fraction = 1.0 - float(cv2.countNonZero(mask)) / mask.size
+    return mask, max(0.0, min(1.0, excluded_fraction))
+
+
+def _measure_background_motion_pair(
+    *,
+    before_gray: Any,
+    after_gray: Any,
+    before_mask: Any,
+    after_mask: Any,
+    before_frame_pts: int,
+    after_frame_pts: int,
+    delta_ms: int,
+    cv2: Any,
+    np: Any,
+) -> SourceCameraMotionPairEvidence:
+    features = cv2.goodFeaturesToTrack(
+        before_gray,
+        mask=before_mask,
+        maxCorners=500,
+        qualityLevel=0.01,
+        minDistance=7,
+        blockSize=7,
+    )
+    detected_count = 0 if features is None else len(features)
+    if features is None or detected_count < 16:
+        return _unreliable_motion_pair(
+            before_frame_pts,
+            after_frame_pts,
+            delta_ms,
+            detected_count,
+        )
+    after_points, forward_status, _ = cv2.calcOpticalFlowPyrLK(
+        before_gray,
+        after_gray,
+        features,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            30,
+            0.01,
+        ),
+    )
+    if after_points is None or forward_status is None:
+        return _unreliable_motion_pair(
+            before_frame_pts,
+            after_frame_pts,
+            delta_ms,
+            detected_count,
+        )
+    back_points, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+        after_gray,
+        before_gray,
+        after_points,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            30,
+            0.01,
+        ),
+    )
+    if back_points is None or backward_status is None:
+        return _unreliable_motion_pair(
+            before_frame_pts,
+            after_frame_pts,
+            delta_ms,
+            detected_count,
+        )
+    before_points = features.reshape(-1, 2)
+    after_points_2d = after_points.reshape(-1, 2)
+    back_points_2d = back_points.reshape(-1, 2)
+    forward_ok = forward_status.reshape(-1).astype(bool)
+    backward_ok = backward_status.reshape(-1).astype(bool)
+    round_trip_error = np.linalg.norm(
+        before_points - back_points_2d,
+        axis=1,
+    )
+    after_x = np.clip(
+        np.rint(after_points_2d[:, 0]).astype(int),
+        0,
+        after_gray.shape[1] - 1,
+    )
+    after_y = np.clip(
+        np.rint(after_points_2d[:, 1]).astype(int),
+        0,
+        after_gray.shape[0] - 1,
+    )
+    stays_on_background = after_mask[after_y, after_x] > 0
+    valid = (
+        forward_ok
+        & backward_ok
+        & (round_trip_error <= 1.5)
+        & stays_on_background
+    )
+    before_valid = before_points[valid]
+    after_valid = after_points_2d[valid]
+    tracked_count = len(before_valid)
+    if tracked_count < 12:
+        return _unreliable_motion_pair(
+            before_frame_pts,
+            after_frame_pts,
+            delta_ms,
+            detected_count,
+            tracked_count,
+        )
+    affine, inlier_mask = cv2.estimateAffinePartial2D(
+        before_valid,
+        after_valid,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=2.0,
+        maxIters=2_000,
+        confidence=0.99,
+        refineIters=10,
+    )
+    if affine is None or inlier_mask is None:
+        return _unreliable_motion_pair(
+            before_frame_pts,
+            after_frame_pts,
+            delta_ms,
+            detected_count,
+            tracked_count,
+        )
+    inliers = inlier_mask.reshape(-1).astype(bool)
+    inlier_ratio = float(inliers.mean())
+    predicted = cv2.transform(
+        before_valid.reshape(-1, 1, 2),
+        affine,
+    ).reshape(-1, 2)
+    residuals = np.linalg.norm(predicted - after_valid, axis=1)
+    median_residual = float(np.median(residuals[inliers]))
+    a = float(affine[0, 0])
+    b = float(affine[0, 1])
+    scale = math.hypot(a, b)
+    image_dx = float(affine[0, 2])
+    image_dy = float(affine[1, 2])
+    reliable = (
+        inlier_ratio >= 0.45
+        and median_residual <= 3.5
+        and 0.85 <= scale <= 1.15
+    )
+    return SourceCameraMotionPairEvidence(
+        before_frame_pts=before_frame_pts,
+        after_frame_pts=after_frame_pts,
+        delta_ms=delta_ms,
+        detected_features=detected_count,
+        tracked_background_features=tracked_count,
+        inlier_ratio=round(inlier_ratio, 6),
+        median_residual_pixels=round(median_residual, 6),
+        # Background displacement is inverse source-camera movement.
+        camera_translation_x_normalized=round(
+            -image_dx / before_gray.shape[1],
+            8,
+        ),
+        camera_translation_y_normalized=round(
+            -image_dy / before_gray.shape[0],
+            8,
+        ),
+        camera_scale_delta=round(scale - 1.0, 8),
+        camera_rotation_degrees=round(
+            -math.degrees(math.atan2(b, a)),
+            6,
+        ),
+        reliable=reliable,
+    )
+
+
+def _unreliable_motion_pair(
+    before_frame_pts: int,
+    after_frame_pts: int,
+    delta_ms: int,
+    detected_features: int,
+    tracked_features: int = 0,
+) -> SourceCameraMotionPairEvidence:
+    return SourceCameraMotionPairEvidence(
+        before_frame_pts=before_frame_pts,
+        after_frame_pts=after_frame_pts,
+        delta_ms=delta_ms,
+        detected_features=detected_features,
+        tracked_background_features=tracked_features,
+        inlier_ratio=0.0,
+        median_residual_pixels=0.0,
+        camera_translation_x_normalized=0.0,
+        camera_translation_y_normalized=0.0,
+        camera_scale_delta=0.0,
+        camera_rotation_degrees=0.0,
+        reliable=False,
+    )
+
+
+def _classify_measured_source_motion(
+    *,
+    x_rate: float,
+    y_rate: float,
+    scale_rate: float,
+    rotation_rate: float,
+    reversal_count: int,
+) -> Literal[
+    "static",
+    "pan_left",
+    "pan_right",
+    "tilt_up",
+    "tilt_down",
+    "zoom_in",
+    "zoom_out",
+    "mixed",
+]:
+    x_strength = abs(x_rate) / 0.010
+    y_strength = abs(y_rate) / 0.010
+    scale_strength = abs(scale_rate) / 0.010
+    rotation_strength = abs(rotation_rate) / 0.6
+    strengths = {
+        "x": x_strength,
+        "y": y_strength,
+        "scale": scale_strength,
+        "rotation": rotation_strength,
+    }
+    dominant_axis, dominant_strength = max(
+        strengths.items(),
+        key=lambda item: item[1],
+    )
+    if dominant_strength < 1.0:
+        return "static"
+    ordered_strengths = sorted(strengths.values(), reverse=True)
+    if (
+        reversal_count > 0
+        or dominant_axis == "rotation"
+        or (
+            len(ordered_strengths) > 1
+            and ordered_strengths[1] >= dominant_strength * 0.67
+        )
+    ):
+        return "mixed"
+    if dominant_axis == "x":
+        return "pan_right" if x_rate > 0 else "pan_left"
+    if dominant_axis == "y":
+        return "tilt_down" if y_rate > 0 else "tilt_up"
+    return "zoom_in" if scale_rate > 0 else "zoom_out"
+
+
+def _unreliable_source_motion_evidence(
+    *,
+    source_asset_id: str,
+    window_start_ms: int,
+    window_end_ms: int,
+    cache_key: str,
+    reason_codes: tuple[str, ...],
+    extracted_frames: Sequence[Any] = (),
+    pairs: Sequence[SourceCameraMotionPairEvidence] = (),
+    mean_excluded_area_fraction: float = 0.0,
+    subject_exclusion_mode: Literal[
+        "sam_track_boxes",
+        "none",
+    ] = "none",
+) -> SourceCameraMotionEvidence:
+    return SourceCameraMotionEvidence(
+        source_asset_id=source_asset_id,
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
+        sample_times_ms=tuple(
+            frame.frame_time_ms for frame in extracted_frames
+        ),
+        sample_frame_pts=tuple(frame.frame_pts for frame in extracted_frames),
+        sample_frame_hashes=tuple(
+            frame.frame_hash for frame in extracted_frames
+        ),
+        subject_exclusion_mode=subject_exclusion_mode,
+        mean_excluded_area_fraction=round(
+            mean_excluded_area_fraction,
+            6,
+        ),
+        pairs=tuple(pairs),
+        classification="unreliable",
+        reliable=False,
+        confidence=0.0,
+        normalized_translation_x_per_second=0.0,
+        normalized_translation_y_per_second=0.0,
+        scale_rate_per_second=0.0,
+        rotation_degrees_per_second=0.0,
+        normalized_travel=0.0,
+        reversal_count=0,
+        reason_codes=reason_codes,
+        cache_key_sha256=cache_key,
     )
 
 
@@ -1397,6 +2377,28 @@ def _vertical_center_crop_filter() -> str:
         "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
         "scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920:x=(iw-ow)/2:y=(ih-oh)/2,setsar=1[base]"
+    )
+
+
+def static_full_bleed_crop_filter(crop_box_2d: NormalizedBox) -> str:
+    """Render one normalized, geometry-proven 9:16 crop without tracking."""
+
+    x_min, y_min, x_max, y_max = crop_box_2d
+    if not (
+        0 <= x_min < x_max <= 1000
+        and 0 <= y_min < y_max <= 1000
+    ):
+        raise ValueError("static full-bleed crop is outside normalized source")
+    crop_width = x_max - x_min
+    crop_height = y_max - y_min
+    return (
+        "[0:v]fps=30,"
+        "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
+        f"crop=w='max(2,trunc(iw*{crop_width}/1000/2)*2)':"
+        f"h='max(2,trunc(ih*{crop_height}/1000/2)*2)':"
+        f"x='trunc(iw*{x_min}/1000/2)*2':"
+        f"y='trunc(ih*{y_min}/1000/2)*2',"
+        "scale=1080:1920,setsar=1[base]"
     )
 
 

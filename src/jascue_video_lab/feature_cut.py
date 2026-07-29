@@ -160,7 +160,9 @@ from .presentation import (
     _vertical_required_scope_fit_filter,
     compile_intentional_freeze,
     compile_presentation,
+    measure_source_camera_motion,
     shared_sam_seeds_from_grounding,
+    static_full_bleed_crop_filter,
     two_panel_ffmpeg_filter,
 )
 from .reframe_policy import (
@@ -5700,8 +5702,9 @@ def _vertical_virtual_camera_filter_from_tracks(
         "source_camera_motion_measured": False,
         "source_camera_motion_detected": None,
         "source_camera_motion_note": (
-            "This audit measures synthetic crop motion only. A later global "
-            "motion estimator is required to compare it with source-camera motion."
+            "This low-level audit measures synthetic crop motion only. The "
+            "autonomous selected-window caller overlays separately hashed "
+            "background-affine source-camera motion evidence."
         ),
     }
     shared_hold_transitions_valid = all(
@@ -7876,6 +7879,14 @@ def _vertical_candidate_geometry(
                     phases=camera_phases,
                 )
             )
+            source_camera_motion_evidence = measure_source_camera_motion(
+                source_path=Path(clip.path),
+                source_asset_id=f"sha256:{clip.sha256}",
+                window_start_ms=start_ms,
+                window_end_ms=end_ms,
+                subject_tracks=hard_tracks,
+                output_dir=output_dir / "source-camera-motion",
+            )
             autonomous_compilation = compile_presentation(
                 targets=presentation_targets,
                 source_width=source_width,
@@ -7884,6 +7895,9 @@ def _vertical_candidate_geometry(
                 policy=autonomous_policy,
                 physical_scale_comparison=physical_scale_comparison,
                 required_x_values=required_x_values,
+                source_camera_motion_evidence=(
+                    source_camera_motion_evidence
+                ),
                 movement_motivated=movement_motivated,
                 preferred_capability_ids=_preferred_capability_ids(
                     presentation_preference
@@ -7975,6 +7989,9 @@ def _vertical_candidate_geometry(
                             physical_scale_comparison
                         ),
                         required_x_values=required_x_values,
+                        source_camera_motion_evidence=(
+                            source_camera_motion_evidence
+                        ),
                         movement_motivated=movement_motivated,
                         preferred_capability_ids=(
                             preferred_capability_id,
@@ -8031,9 +8048,37 @@ def _vertical_candidate_geometry(
                     ),
                     **source_lineage,
                 }
+            elif autonomous_compilation.mode == "static_full_bleed_crop":
+                assert autonomous_compilation.static_crop_box_2d is not None
+                filter_graph = static_full_bleed_crop_filter(
+                    autonomous_compilation.static_crop_box_2d
+                )
+                geometry = {
+                    "applied_strategy": "static_full_bleed_crop",
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                    "full_bleed": True,
+                    "source_geometry_lineage_passed": True,
+                    "tracking_confidence_gate_passed": all(
+                        _track_confidence_diagnostics(track)[
+                            "tracking_confidence_gate_passed"
+                        ]
+                        for track in hard_tracks
+                    ),
+                    "coverage_passed": True,
+                    "minimum_visible_required_area_fraction": 1.0,
+                    "soft_extent_visibility_passed": True,
+                    "paid_model_calls_added": 0,
+                    "presentation_decision_codes": list(
+                        autonomous_compilation.decision_codes
+                    ),
+                    "static_crop_box_2d": list(
+                        autonomous_compilation.static_crop_box_2d
+                    ),
+                    **source_lineage,
+                }
             elif (
                 autonomous_compilation.mode == "solid_matte_fit"
-                and presentation_preference == "solid_matte_fit"
             ):
                 assert autonomous_compilation.filter_graph is not None
                 filter_graph = autonomous_compilation.filter_graph
@@ -8094,8 +8139,53 @@ def _vertical_candidate_geometry(
         if geometry.get("applied_strategy") in {
             "two_panel_layout",
             "solid_matte_fit",
+            "static_full_bleed_crop",
         }:
             pass
+        elif (
+            autonomous_compilation is not None
+            and autonomous_compilation.mode == "tracked_full_bleed_crop"
+        ):
+            filter_graph, geometry = _vertical_filter_from_track(
+                hard_tracks,
+                allow_subject_clipping=crop_mode == "primary_center",
+                overflow_policy=overflow_policy,
+                edge_priority=edge_priority,
+                region_ids=[region.region_id for region in hard_regions],
+                fallback_strategy=fallback_strategy,
+                display_sample_aspect_ratio=display_sample_aspect_ratio,
+                preferred_tracks=soft_tracks,
+                preferred_regions=available_soft_regions,
+            )
+            geometry.setdefault("risk_codes", []).append(
+                "presentation_compiler_selected_containment_tracking"
+            )
+        elif (
+            autonomous_compilation is not None
+            and autonomous_compilation.mode == "hard_cut_between_views"
+            and effective_camera_phases
+        ):
+            cut_phases = [
+                phase.model_copy(
+                    update={
+                        "transition_in": "cut",
+                        "transition_duration_fraction": 0.0,
+                    }
+                )
+                for phase in effective_camera_phases
+            ]
+            filter_graph, geometry = _vertical_virtual_camera_filter_from_tracks(
+                tracks_by_region=tracks_by_region,
+                phases=cut_phases,
+                phase_origin=camera_phase_origin,
+                display_sample_aspect_ratio=display_sample_aspect_ratio,
+            )
+            geometry.setdefault("risk_codes", []).append(
+                "source_motion_safe_hard_cut_selected"
+            )
+            geometry["vertical_camera_phases"] = [
+                phase.model_dump(mode="json") for phase in cut_phases
+            ]
         elif effective_camera_phases:
             try:
                 filter_graph, geometry = (
@@ -8256,6 +8346,23 @@ def _vertical_candidate_geometry(
         if autonomous_compilation is not None:
             geometry["presentation_compilation"] = (
                 autonomous_compilation.model_dump(mode="json")
+            )
+            geometry["source_camera_motion_evidence"] = (
+                source_camera_motion_evidence.model_dump(mode="json")
+            )
+            geometry["source_camera_motion_measured"] = True
+            geometry["source_camera_motion_detected"] = (
+                source_camera_motion_evidence.classification
+            )
+            geometry["source_camera_motion_reliable"] = (
+                source_camera_motion_evidence.reliable
+            )
+            geometry["source_camera_motion_evidence_sha256"] = (
+                source_camera_motion_evidence.definition_sha256
+            )
+            geometry["source_camera_motion_note"] = (
+                "Measured locally from background features after excluding "
+                "SAM-track subject boxes; Gemini did not infer geometry."
             )
         if semantic_negotiation_artifact is not None:
             geometry["semantic_negotiation"] = (

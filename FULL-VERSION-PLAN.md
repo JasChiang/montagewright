@@ -212,6 +212,13 @@ BudgetLedger 事前保留成本的 read-only semantic negotiation，不是自由
 NLE 工具迴圈。Panel runtime fraction 已進入 sequence 與 deterministic QA hard
 gate；post-geometry cue shift 不得繞過 policy 強制產生 matte fit。
 
+Selected-window source-camera motion estimator 也已接入 production
+presentation compile：本機低頻抽取 FFmpeg 自動旋轉後的 exact frames，排除
+SAM track 衍生的主體區域，以 forward/backward optical flow 與 RANSAC affine
+量測 pan／tilt／zoom／static，並保存 PTS、frame hash、inlier ratio、residual、
+confidence 與 cache key。Gemini 仍決定注意力與運鏡動機，不負責猜幾何；量測
+不可靠時禁止 synthetic pan／zoom，只能使用靜態構圖或語意允許的 hard cut。
+
 跨片型的擴充單位是 evidence provider、objective profile 與 capability executor，
 不是另一條 pipeline。訪談／對話模式待後續 Apple SpeechTranscriber 本機
 word-level timing provider 完成後再加入；Gemini只可修正辨識文字，不可取代本機

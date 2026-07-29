@@ -20,6 +20,15 @@ then selects with the shared lexicographic optimizer. Every render manifest
 retains generated, rejected, and selected option IDs plus their evidence
 hashes.
 
+For each selected trim, the local source-camera estimator decodes a small set
+of orientation-corrected exact frames, excludes SAM-track subject regions,
+validates background optical flow in both directions, and fits a RANSAC affine
+transform. The resulting pan/tilt/zoom/static classification retains frame
+hashes, PTS, inlier ratio, residual, confidence, and a cache key. Gemini still
+owns semantic attention and movement motivation; it does not guess photographed
+camera geometry. Unreliable measurement forbids synthetic pan/zoom and falls
+back to static framing or a semantically admissible hard cut.
+
 `editing-capability-registry-v2` is the runtime counterpart of the planner
 catalog. A capability declares semantic affordances, required artifacts,
 preconditions, guarantees, verifiers, local cost, intrusion rank, executor ID,

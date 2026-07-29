@@ -292,6 +292,16 @@ window shift，不能再繞過 policy 把 full-bleed 偷換成 matte fit；只�
 明確授權 solid fit 時才可使用該 best-effort repair，否則保存原構圖並要求回到
 pre-geometry compile 或 fail closed。
 
+### 原始攝影機與虛擬攝影機分離
+
+Gemini 描述語意注意力順序與移動動機；原始鏡頭本身如何移動則由 selected
+trim 的本機幾何 evidence 決定。本機抽取少量 exact frames、排除 SAM track
+主體區域，以 forward/backward optical flow 驗證背景對應，再以 RANSAC affine
+估計平移、scale 與 rotation。Manifest 保存 frame PTS/hash、inlier ratio、
+residual、信心與分類，presentation compiler 才比較 photographed motion 與
+synthetic crop motion。若背景不足、殘差過高或可靠 pair 太少，狀態是
+`unreliable`，不得用 Gemini 猜測補值，也不得啟用 synthetic pan/zoom。
+
 訪談 ASR 不屬於 autonomous V1。後續規劃以 Apple SpeechTranscriber 產生本機
 word-level timing 與 audio lineage，再讓 Gemini在 bounded text/audio evidence
 上修正辨識文字；Gemini不得改寫本機字級時間。
