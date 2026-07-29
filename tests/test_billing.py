@@ -73,6 +73,31 @@ def test_usage_summary_counts_identical_immutable_attempts_separately(
     assert summary["estimated_total_cost_usd"] == 0.0048
 
 
+def test_usage_summary_deduplicates_copied_immutable_attempt_uuid(
+    tmp_path,
+) -> None:
+    interaction = {
+        "model": "gemini-3.6-flash",
+        "usage": {"total_input_tokens": 100, "total_output_tokens": 10},
+    }
+    attempt_name = (
+        "grounding.unknown."
+        "0123456789abcdef0123456789abcdef.raw_interaction.json"
+    )
+    for branch in ("original", "trim-recompile"):
+        directory = tmp_path / branch / "attempts"
+        directory.mkdir(parents=True)
+        (directory / attempt_name).write_text(
+            json.dumps(interaction),
+            encoding="utf-8",
+        )
+
+    summary = summarize_usage_and_list_price(tmp_path)
+
+    assert summary["request_count"] == 1
+    assert summary["duplicate_artifact_count"] == 1
+
+
 def test_usage_summary_counts_identical_attempts_in_nested_attempts_tree(
     tmp_path,
 ) -> None:

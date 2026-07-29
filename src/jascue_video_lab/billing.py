@@ -30,6 +30,9 @@ _NUMBERED_ATTEMPT_COMPONENT = re.compile(r"^attempt-[0-9]+$")
 _LEGACY_ATTEMPT_INTERACTION = re.compile(
     r"(?:^|\.)attempt-[0-9]+\.raw_interaction\.json$"
 )
+_IMMUTABLE_ATTEMPT_UUID = re.compile(
+    r"\.([0-9a-f]{32})\.raw_interaction\.json$"
+)
 
 
 def _is_paid_attempt_artifact(path: Path) -> bool:
@@ -62,6 +65,7 @@ def summarize_usage_files(paths: list[Path], *, relative_to: Path | None = None)
     usage_by_model: dict[str, dict[str, int | float]] = {}
     seen_canonical_payloads: set[str] = set()
     immutable_attempt_payloads: set[str] = set()
+    immutable_attempt_ids: dict[str, str] = {}
     duplicate_paths: list[str] = []
     unpriced_paths: list[str] = []
     ordered_paths = sorted(
@@ -74,6 +78,22 @@ def summarize_usage_files(paths: list[Path], *, relative_to: Path | None = None)
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
         is_immutable_attempt = _is_paid_attempt_artifact(path)
+        attempt_match = (
+            _IMMUTABLE_ATTEMPT_UUID.search(path.name)
+            if is_immutable_attempt
+            else None
+        )
+        attempt_id = attempt_match.group(1) if attempt_match else None
+        if attempt_id is not None and attempt_id in immutable_attempt_ids:
+            if immutable_attempt_ids[attempt_id] != fingerprint:
+                raise ValueError(
+                    "immutable paid-attempt UUID maps to different payloads: "
+                    f"{path}"
+                )
+            duplicate_paths.append(
+                str(path.relative_to(relative_to)) if relative_to else str(path)
+            )
+            continue
         if not is_immutable_attempt and (
             fingerprint in immutable_attempt_payloads
             or fingerprint in seen_canonical_payloads
@@ -84,8 +104,12 @@ def summarize_usage_files(paths: list[Path], *, relative_to: Path | None = None)
             continue
         if is_immutable_attempt:
             # Two identical responses can still represent two paid calls.  The
-            # immutable attempt path, not payload equality, defines cardinality.
+            # generated attempt UUID, not payload equality, defines cardinality.
+            # Cache projection may copy the same immutable attempt directory;
+            # those path aliases retain one UUID and must not be billed twice.
             immutable_attempt_payloads.add(fingerprint)
+            if attempt_id is not None:
+                immutable_attempt_ids[attempt_id] = fingerprint
         else:
             seen_canonical_payloads.add(fingerprint)
         usage = payload.get("usage") or {}

@@ -7294,7 +7294,7 @@ def _build_framing_region_tracks(
             key=lambda region: region.role != "required",
         )
         grounded_regions: list[FramingRegionIntent] = []
-        omitted_preferred_regions: list[FramingRegionIntent] = []
+        preferred_grounding_omissions: list[dict[str, str]] = []
         for chunk_index in range(0, len(grounding_regions), 4):
             region_chunk = grounding_regions[chunk_index : chunk_index + 4]
             requests = [
@@ -7350,9 +7350,17 @@ def _build_framing_region_tracks(
                         for region in region_chunk
                     ):
                         raise
-                    omitted_preferred_regions.extend(region_chunk)
+                    preferred_grounding_omissions.extend(
+                        {
+                            "region_id": region.region_id,
+                            "reason_code": (
+                                "preferred_only_batch_omitted_to_preserve_"
+                                "final_qa_budget"
+                            ),
+                        }
+                        for region in region_chunk
+                    )
                     continue
-            grounded_regions.extend(region_chunk)
             interaction_path = (
                 group_dir / "multi_target_grounding.raw_interaction.json"
             )
@@ -7373,6 +7381,8 @@ def _build_framing_region_tracks(
             group_results = {
                 result.target_id: result for result in group.targets
             }
+            valid_results = []
+            valid_requests = []
             for region in region_chunk:
                 result = group_results[region.region_id]
                 candidates = [
@@ -7402,6 +7412,21 @@ def _build_framing_region_tracks(
                         else MatchStatus.NOT_VISIBLE
                     )
                 )
+                if match_status != MatchStatus.MATCHED:
+                    if region.role == "required":
+                        raise ValueError(
+                            "required grouped Grounding target is not one "
+                            f"visible unambiguous instance: {region.region_id}"
+                        )
+                    preferred_grounding_omissions.append(
+                        {
+                            "region_id": region.region_id,
+                            "reason_code": (
+                                "preferred_target_not_visible_or_ambiguous"
+                            ),
+                        }
+                    )
+                    continue
                 proposal = GroundingProposal(
                     asset_id=media.asset_id,
                     event_id=feature_id,
@@ -7447,15 +7472,21 @@ def _build_framing_region_tracks(
                 debug_paths.append(
                     region_root / "grounding-debug.png"
                 )
+                grounded_regions.append(region)
+                valid_results.append(result)
+                valid_requests.append(request_by_region[region.region_id])
+            filtered_group = group.model_copy(
+                update={"targets": tuple(valid_results)}
+            )
             seeds.extend(
                 shared_sam_seeds_from_grounding(
-                    group,
-                    target_requests=requests,
+                    filtered_group,
+                    target_requests=valid_requests,
                     seed_time_ms=exact_frame.frame_time_ms,
                     seed_frame_pts=exact_frame.frame_pts,
                 )
             )
-        if omitted_preferred_regions:
+        if preferred_grounding_omissions:
             write_json(
                 batch_root / "preferred-grounding-degradation.json",
                 {
@@ -7463,15 +7494,8 @@ def _build_framing_region_tracks(
                         "preferred-grounding-degradation-v1"
                     ),
                     "feature_id": feature_id,
-                    "reason": (
-                        "preferred_only_grounding_batch_omitted_to_preserve_"
-                        "final_qa_budget"
-                    ),
                     "hard_evidence_affected": False,
-                    "omitted_region_ids": [
-                        region.region_id
-                        for region in omitted_preferred_regions
-                    ],
+                    "omissions": preferred_grounding_omissions,
                     "generated_at": utc_now(),
                 },
             )
@@ -8239,7 +8263,10 @@ def _compatible_output_cues(
         # The final assembled span may end on a locked accent rather than a
         # separately labeled section boundary. Treat only final-phrase accents
         # as ending candidates; earlier accents remain ineligible.
-        final_phrase_start_ms = max(0, project_duration_ms - 2_000)
+        # Include a small pre-roll around the nominal final two-second phrase.
+        # A downbeat a few frames before that boundary is a better executable
+        # ending anchor than a much earlier section boundary.
+        final_phrase_start_ms = max(0, project_duration_ms - 2_250)
         candidates.extend(
             cue
             for cue in cues
@@ -8332,6 +8359,16 @@ def _copy_grounding_cache_for_trim_recompile(
     """Reuse paid exact-frame grounding while rebuilding only local tracks."""
 
     copied: list[str] = []
+    def ignore_paid_attempt_records(
+        _directory: str,
+        names: list[str],
+    ) -> set[str]:
+        return {
+            name
+            for name in names
+            if name == "attempts" or name == "pricing.observed.json"
+        }
+
     cache_roots = (
         source_root / "grounding",
         source_root / "multi-target-grounding",
@@ -8344,6 +8381,7 @@ def _copy_grounding_cache_for_trim_recompile(
             cache_root,
             destination_root / relative,
             dirs_exist_ok=True,
+            ignore=ignore_paid_attempt_records,
         )
         copied.append(str(relative))
     regions_root = source_root / "regions"
@@ -8354,6 +8392,7 @@ def _copy_grounding_cache_for_trim_recompile(
                 cache_root,
                 destination_root / relative,
                 dirs_exist_ok=True,
+                ignore=ignore_paid_attempt_records,
             )
             copied.append(str(relative))
     return tuple(sorted(copied))
@@ -10409,6 +10448,52 @@ def _vertical_runtime_candidate_options(
             "confidence": selected.confidence,
         }
     ]
+
+
+def _bind_regions_to_editorial_relation(
+    regions: Sequence[FramingRegionIntent],
+    contracts: Sequence[EditorialBeatContract],
+) -> list[FramingRegionIntent]:
+    """Keep planner context soft when a hard beat is explicitly single-subject."""
+
+    if not any(
+        contract.priority == "hard"
+        and contract.relation_mode == "single_subject"
+        for contract in contracts
+    ):
+        return list(regions)
+    required_indexes = [
+        index
+        for index, region in enumerate(regions)
+        if region.role == "required"
+    ]
+    if len(required_indexes) <= 1:
+        return list(regions)
+    anchor_index = min(
+        required_indexes,
+        key=lambda index: (
+            not regions[index].atomic,
+            regions[index].kind
+            not in {"text_region", "ui_region", "graphic"},
+            index,
+        ),
+    )
+    bound: list[FramingRegionIntent] = []
+    for index, region in enumerate(regions):
+        if index == anchor_index or region.role != "required":
+            bound.append(region)
+            continue
+        bound.append(
+            region.model_copy(
+                update={
+                    "role": "preferred",
+                    "atomic": False,
+                    "minimum_visible_fraction": None,
+                    "evidence_role": "context_reference",
+                }
+            )
+        )
+    return bound
 
 
 def _bind_runtime_candidate_coverage(
@@ -12981,9 +13066,11 @@ def _resolve_editorial_chapter_durations(
             allow_music_lock_prefix
             and music_lock.duration_ms >= target_duration_ms
         )
+        assembled_music_timeline_used = output_timeline_cues is not None
         if (
             abs(music_lock.duration_ms - target_duration_ms) > 80
             and not music_lock_prefix_used
+            and not assembled_music_timeline_used
         ):
             raise ValueError(
                 "music lock duration differs from the requested project duration"
@@ -14814,6 +14901,14 @@ def _run_feature_cut_experiment_impl(
                             ),
                         )
                     )
+                    candidate_regions = _bind_regions_to_editorial_relation(
+                        candidate_regions,
+                        [
+                            contract
+                            for contract in editorial_templates
+                            if contract.feature_id == selected.feature_id
+                        ],
+                    )
                     candidate_crop_mode = str(
                         option_data.get(
                             "crop_mode", brief_chapter.vertical_crop_mode
@@ -16394,9 +16489,30 @@ def _run_feature_cut_experiment_impl(
                                 shifted_start, shifted_end, shift_ms = (
                                     cue_shifted_window
                                 )
-                                cue_recompile_attempted = True
+                                trim_invariant_fit = (
+                                    vertical_geometry.get(
+                                        "applied_strategy"
+                                    )
+                                    in {
+                                        "required_scope_solid_fit",
+                                        "fit_with_solid_matte",
+                                        "solid_matte_fit",
+                                    }
+                                    and shifted_start >= original_start
+                                    and shifted_end <= original_end
+                                )
+                                cue_recompile_attempted = not (
+                                    trim_invariant_fit
+                                )
                                 recompiled = (
-                                    recompile_selected_vertical_window(
+                                    (
+                                        vertical_filter,
+                                        vertical_geometry,
+                                        vertical_debugs,
+                                        vertical_track_fingerprint,
+                                    )
+                                    if trim_invariant_fit
+                                    else recompile_selected_vertical_window(
                                         shifted_start_ms=shifted_start,
                                         shifted_end_ms=shifted_end,
                                     )
@@ -16422,8 +16538,15 @@ def _run_feature_cut_experiment_impl(
                                     cue_alignment_ready = True
                                     cue_alignment_repair = {
                                         "method": (
-                                            "bounded_freeze_source_in_shift_"
-                                            "with_dependency_recompile"
+                                            (
+                                                "bounded_freeze_source_in_"
+                                                "shift_on_trim_invariant_fit"
+                                            )
+                                            if trim_invariant_fit
+                                            else (
+                                                "bounded_freeze_source_in_"
+                                                "shift_with_dependency_recompile"
+                                            )
                                         ),
                                         "shift_ms": shift_ms,
                                         "original_source_in_ms": original_start,

@@ -39,6 +39,7 @@ from jascue_video_lab.feature_cut import (
     _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
     _bounded_cue_shifted_window,
+    _bind_regions_to_editorial_relation,
     _candidate_capability_boundaries,
     _bind_runtime_candidate_coverage,
     _audit_render_source_reuse,
@@ -61,6 +62,7 @@ from jascue_video_lab.feature_cut import (
     _prompt_binds_sha256,
     _concat_segments,
     _controlled_primary_center_preview_allowed,
+    _compatible_output_cues,
     _copy_grounding_cache_for_trim_recompile,
     _render_source_segment,
     _render_trim_after_window_shift,
@@ -255,6 +257,14 @@ def test_trim_recompile_reuses_only_paid_grounding_not_stale_tracks(
     stale_track.parent.mkdir(parents=True)
     grounding.write_text("{}", encoding="utf-8")
     stale_track.write_text("{}", encoding="utf-8")
+    paid_attempt = (
+        grounding.parent
+        / "attempts"
+        / "grounding.unknown."
+        "0123456789abcdef0123456789abcdef.raw_interaction.json"
+    )
+    paid_attempt.parent.mkdir()
+    paid_attempt.write_text("{}", encoding="utf-8")
 
     copied = _copy_grounding_cache_for_trim_recompile(
         source_root=source_root,
@@ -277,6 +287,14 @@ def test_trim_recompile_reuses_only_paid_grounding_not_stale_tracks(
         / "sam21"
         / "bbox-key"
         / "segmentation-track.json"
+    ).exists()
+    assert not (
+        destination_root
+        / "regions"
+        / "subject"
+        / "grounding"
+        / "bbox-key"
+        / "attempts"
     ).exists()
 
 
@@ -528,7 +546,7 @@ from jascue_video_lab.models import (
     SelectedVerticalFramingProposal,
     VerticalVirtualCameraPhase,
 )
-from jascue_video_lab.event_lock import ExactEventLockV2
+from jascue_video_lab.event_lock import EditorialBeatContract, ExactEventLockV2
 
 
 def _cue_lock_at(source_time_ms: int) -> ExactEventLockV2:
@@ -1140,6 +1158,22 @@ def test_editorial_dwell_can_snap_to_longer_music_prefix_when_authorized() -> No
     assert audit["music_lock_duration_ms"] == 61_000
     assert audit["project_timeline_end_ms"] == 60_000
     assert audit["music_boundary_refinements"][0]["music_snap_applied"] is True
+
+    assembled_durations, assembled_audit = (
+        _resolve_editorial_chapter_durations(
+            brief,
+            plan,
+            music_lock=music_lock,
+            project_duration_seconds=60,
+            output_timeline_cues=music_lock.cues,
+        )
+    )
+    assert sum(assembled_durations.values()) == 60
+    assert assembled_audit["music_lock_prefix_used"] is False
+    assert (
+        assembled_audit["music_cue_timeline"]
+        == "assembled_output_timeline"
+    )
 
 
 def test_editorial_dwell_refuses_approved_trim_beyond_safe_capacity() -> None:
@@ -4474,7 +4508,79 @@ def test_shared_sam_cache_revalidates_hashed_track_and_frame_lineage(
             checkpoint_sha256=checkpoint_sha256,
             seeds=seeds,
             seed_box_padding_ratio=0.04,
-        )
+    )
+
+
+def test_hard_single_subject_keeps_extra_planner_context_soft() -> None:
+    regions = [
+        FramingRegionIntent(
+            region_id="watch",
+            target_description="the watch UI",
+            role="required",
+        ),
+        FramingRegionIntent(
+            region_id="hand",
+            target_description="a contextual hand",
+            role="required",
+        ),
+    ]
+    contract = EditorialBeatContract(
+        beat_id="watch-ui",
+        feature_id="watch",
+        priority="hard",
+        evidence_query_lock_sha256="a" * 64,
+        required_target_ids=("watch-ui",),
+        narrative_function="feature_evidence",
+        visual_events=(
+            {
+                "event_type": "watch_ui_state_change",
+                "cue_relation": "music_emphasis",
+                "tolerance_frames": 2,
+            },
+        ),
+        duration={
+            "minimum_readable_frames": 18,
+            "preferred_frames": 36,
+            "maximum_frames": 72,
+        },
+        relation_mode="single_subject",
+        allowed_reconstruction=("continuous", "solid_fit"),
+    )
+
+    bound = _bind_regions_to_editorial_relation(regions, [contract])
+
+    assert [region.role for region in bound] == ["required", "preferred"]
+    assert bound[1].evidence_role == "context_reference"
+
+
+def test_phrase_ending_includes_downbeat_just_before_final_phrase_window() -> None:
+    cues = [
+        LockedMusicCue(
+            cue_id="locked-cue-00001",
+            kind="section_boundary",
+            sample_index=79_857 * 48,
+            time_ms=79_857,
+            strength=0.6,
+            priority=CuePriority.HARD,
+        ),
+        LockedMusicCue(
+            cue_id="locked-cue-00002",
+            kind="downbeat",
+            sample_index=81_948 * 48,
+            time_ms=81_948,
+            strength=0.8,
+            priority=CuePriority.PREFERRED,
+        ),
+    ]
+
+    compatible = _compatible_output_cues(
+        cues,
+        cue_relation="phrase_ending",
+        project_event_time_ms=82_033,
+        project_duration_ms=84_000,
+    )
+
+    assert compatible[0].cue_id == "locked-cue-00002"
 
 
 def test_only_non_retryable_spending_cap_errors_trip_geometry_circuit_breaker() -> None:
