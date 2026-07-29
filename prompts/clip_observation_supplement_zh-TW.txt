@@ -13,14 +13,22 @@
 - `observation_basis` 必須如實標示本次看的是完整影片、含上下文事件影片、事件短片、抽樣影格或媒體 metadata。
 - 只有本次輸入確實包含音訊時，才能把 `audio_role` 標成 `assessed_present` 或 `assessed_absent`。
 - 所有 Entity ID 只能逐字引用 Base Clip Card。
-- `evidence_provenance` 必須依本次 bounded media 重新觀察並如實分類：
-  direct physical action、direct UI interaction、direct result、prerecorded
-  screen playback、promotional graphic、textual claim only、context only 或
-  unknown。螢幕內播放內容不得升級成來源場景中直接發生的功能證據；不確定時
+- 若 request 包含 `evidence_origin` capability，必須依本次 bounded media
+  重新觀察來源關係，使用 domain-neutral relation：
+  `direct_source_event`、`mediated_depiction`、`graphic_or_text_claim`、
+  `context_only` 或 `unknown`，並提供只引用可見／可聽證據的
+  `observable_reason`。這套分類對人物、活動、文件、表演、產品、UI 與訪談
+  都相同，不新增內容類型專用 enum。
+- `evidence_provenance` 只保留給舊 reader。它必須由相同觀察映射，不得和
+  `evidence_origin` 衝突。螢幕／投影／喇叭內播放的內容是
+  `mediated_depiction`，不得升級成來源場景直接發生的動作或結果；不確定時
   使用 `unknown`。
 
 Capability 規則：
 
+- `evidence_origin`：只回答證據與來源場景的關係，不判斷 brief claim 是否已
+  滿足，也不推測內容真偽。是否足以支持特定 claim 由 brief-aware contract
+  另行比對。
 - `action_structure`：觀察來源事件是否包含完整動作、乾淨進點與乾淨出點。這是 source event 層級，不代表未來選出的短 window 一定完整。
 - `evidence_roles`：辨識 primary subject、relation carrier、context anchor、result evidence、readable region，以及是否依賴共同上下文或相對尺度。角色必須由畫面直接支持。
 - `observable_beats`：依實際可見順序列出 setup、action onset、interaction、state change、result、reaction 或 readable hold。只描述觀眾需要看到的狀態，不描述鏡頭怎麼移動。

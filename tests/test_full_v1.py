@@ -741,6 +741,30 @@ def test_full_clip_audio_off_strips_existing_audio(tmp_path: Path) -> None:
     assert has_audio_stream(output / "analysis-proxy.mp4") is False
 
 
+def test_full_clip_refuses_stale_proxy_configuration(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "prepared"
+    _make_video_only(source, duration=1)
+    run_full_clip(
+        source,
+        output,
+        clip_card_prompt="unused",
+        dense_prompt="unused",
+        proxy_max_side=640,
+        prepare_only=True,
+    )
+
+    with pytest.raises(ValueError, match="analysis proxy is stale"):
+        run_full_clip(
+            source,
+            output,
+            clip_card_prompt="unused",
+            dense_prompt="unused",
+            proxy_max_side=960,
+            prepare_only=True,
+        )
+
+
 def test_full_clip_audio_required_rejects_video_only_source(tmp_path: Path) -> None:
     source = tmp_path / "video-only.mp4"
     _make_video_only(source, duration=1)

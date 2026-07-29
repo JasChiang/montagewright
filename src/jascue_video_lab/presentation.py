@@ -38,6 +38,15 @@ from .storage import read_json, write_json
 
 NormalizedBox = tuple[int, int, int, int]
 
+_SOURCE_MOTION_ESTIMATOR_V1 = "background-gftt-lk-ransac-affine-v1"
+_SOURCE_MOTION_ESTIMATOR_V2 = "background-gftt-lk-ransac-affine-v2"
+_SOURCE_MOTION_SAMPLING_V1 = "legacy-uniform-or-sam-v1"
+_SOURCE_MOTION_SAMPLING_V2 = "hybrid-edge-dense-bounded-gap-v2"
+_SOURCE_MOTION_MAX_SAMPLE_GAP_MS = 250
+_SOURCE_MOTION_EDGE_DENSE_WINDOW_MS = 750
+_SOURCE_MOTION_EDGE_SAMPLE_STEP_MS = 100
+_SOURCE_MOTION_EDGE_SETTLE_PADDING_MS = 200
+
 
 class GroundingTargetRequest(FrozenStrictModel):
     target_id: str = Field(
@@ -478,6 +487,8 @@ class SourceCameraMotionPairEvidence(FrozenStrictModel):
     before_frame_pts: int
     after_frame_pts: int
     delta_ms: int = Field(gt=0)
+    before_time_ms: int | None = Field(default=None, ge=0)
+    after_time_ms: int | None = Field(default=None, ge=0)
     detected_features: int = Field(ge=0)
     tracked_background_features: int = Field(ge=0)
     inlier_ratio: float = Field(ge=0.0, le=1.0)
@@ -486,7 +497,25 @@ class SourceCameraMotionPairEvidence(FrozenStrictModel):
     camera_translation_y_normalized: float
     camera_scale_delta: float
     camera_rotation_degrees: float
+    normalized_translation_speed_per_second: float = Field(
+        default=0.0,
+        ge=0.0,
+    )
+    isolated_jolt: bool = False
+    dirty_edge: Literal["head", "tail"] | None = None
     reliable: bool
+
+    @model_validator(mode="after")
+    def validate_pair_times(self) -> "SourceCameraMotionPairEvidence":
+        if (self.before_time_ms is None) != (self.after_time_ms is None):
+            raise ValueError("source motion pair times must be both present or absent")
+        if (
+            self.before_time_ms is not None
+            and self.after_time_ms is not None
+            and self.after_time_ms <= self.before_time_ms
+        ):
+            raise ValueError("source motion pair times must be strictly increasing")
+        return self
 
 
 class SourceCameraMotionEvidence(FrozenStrictModel):
@@ -497,12 +526,23 @@ class SourceCameraMotionEvidence(FrozenStrictModel):
     stacking synthetic motion on top of the photographed move.
     """
 
-    contract_version: Literal["source-camera-motion-evidence-v1"] = (
-        "source-camera-motion-evidence-v1"
-    )
+    contract_version: Literal[
+        "source-camera-motion-evidence-v1",
+        "source-camera-motion-evidence-v2",
+    ] = "source-camera-motion-evidence-v1"
     estimator_version: Literal[
-        "background-gftt-lk-ransac-affine-v1"
-    ] = "background-gftt-lk-ransac-affine-v1"
+        "background-gftt-lk-ransac-affine-v1",
+        "background-gftt-lk-ransac-affine-v2",
+    ] = _SOURCE_MOTION_ESTIMATOR_V1
+    sampling_version: Literal[
+        "legacy-uniform-or-sam-v1",
+        "hybrid-edge-dense-bounded-gap-v2",
+    ] = _SOURCE_MOTION_SAMPLING_V1
+    requested_max_sample_gap_ms: int | None = Field(default=None, gt=0)
+    actual_max_sample_gap_ms: int | None = Field(default=None, ge=0)
+    head_sample_coverage_ms: int | None = Field(default=None, ge=0)
+    tail_sample_coverage_ms: int | None = Field(default=None, ge=0)
+    sampling_complete: bool = False
     source_asset_id: str
     window_start_ms: int = Field(ge=0)
     window_end_ms: int = Field(gt=0)
@@ -534,6 +574,22 @@ class SourceCameraMotionEvidence(FrozenStrictModel):
     rotation_degrees_per_second: float
     normalized_travel: float = Field(ge=0.0)
     reversal_count: int = Field(ge=0)
+    p95_translation_speed_per_second: float = Field(default=0.0, ge=0.0)
+    max_translation_speed_per_second: float = Field(default=0.0, ge=0.0)
+    max_translation_acceleration_per_second_squared: float = Field(
+        default=0.0,
+        ge=0.0,
+    )
+    max_translation_jerk_per_second_cubed: float = Field(
+        default=0.0,
+        ge=0.0,
+    )
+    isolated_jolt_count: int = Field(default=0, ge=0)
+    jolt_pair_indexes: tuple[int, ...] = ()
+    dirty_head: bool = False
+    dirty_tail: bool = False
+    clean_head_start_ms: int | None = Field(default=None, ge=0)
+    clean_tail_end_ms: int | None = Field(default=None, ge=0)
     reason_codes: tuple[str, ...]
     cache_key_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -553,11 +609,112 @@ class SourceCameraMotionEvidence(FrozenStrictModel):
             raise ValueError(
                 "source camera reliability and classification disagree"
             )
+        if len(set(self.jolt_pair_indexes)) != len(self.jolt_pair_indexes):
+            raise ValueError("source camera jolt pair indexes must be unique")
+        if any(
+            index < 0 or index >= len(self.pairs)
+            for index in self.jolt_pair_indexes
+        ):
+            raise ValueError("source camera jolt pair index is out of range")
+        if self.isolated_jolt_count != len(self.jolt_pair_indexes):
+            raise ValueError("source camera jolt count disagrees with pair indexes")
+        if self.contract_version == "source-camera-motion-evidence-v2":
+            if self.sampling_version != _SOURCE_MOTION_SAMPLING_V2:
+                raise ValueError("V2 source motion requires V2 sampling evidence")
+            if self.pairs and (
+                len(self.pairs) != max(0, len(self.sample_times_ms) - 1)
+            ):
+                raise ValueError("V2 source motion pairs must cover adjacent samples")
+            if self.sample_times_ms and (
+                self.head_sample_coverage_ms is None
+                or self.tail_sample_coverage_ms is None
+                or self.actual_max_sample_gap_ms is None
+                or self.requested_max_sample_gap_ms is None
+            ):
+                raise ValueError("V2 source motion sampling coverage is incomplete")
+            if self.sampling_complete and (
+                self.actual_max_sample_gap_ms is None
+                or self.requested_max_sample_gap_ms is None
+                or self.head_sample_coverage_ms is None
+                or self.tail_sample_coverage_ms is None
+                or self.actual_max_sample_gap_ms
+                > self.requested_max_sample_gap_ms + 100
+                or self.head_sample_coverage_ms
+                > _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS + 100
+                or self.tail_sample_coverage_ms
+                > _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS + 100
+            ):
+                raise ValueError(
+                    "complete V2 sampling exceeds its bounded coverage"
+                )
+            if self.clean_head_start_ms is not None and not (
+                self.window_start_ms
+                <= self.clean_head_start_ms
+                <= self.window_end_ms
+            ):
+                raise ValueError("clean source-motion head is outside the window")
+            if self.clean_tail_end_ms is not None and not (
+                self.window_start_ms
+                <= self.clean_tail_end_ms
+                <= self.window_end_ms
+            ):
+                raise ValueError("clean source-motion tail is outside the window")
+            if (
+                self.clean_head_start_ms is not None
+                and self.clean_tail_end_ms is not None
+                and self.clean_head_start_ms > self.clean_tail_end_ms
+            ):
+                raise ValueError("source-motion clean interval is empty")
         return self
 
     @property
     def definition_sha256(self) -> str:
-        return _canonical_payload_sha(self.model_dump(mode="json"))
+        payload = self.model_dump(mode="json")
+        if self.contract_version == "source-camera-motion-evidence-v1":
+            v1_pair_fields = (
+                "before_frame_pts",
+                "after_frame_pts",
+                "delta_ms",
+                "detected_features",
+                "tracked_background_features",
+                "inlier_ratio",
+                "median_residual_pixels",
+                "camera_translation_x_normalized",
+                "camera_translation_y_normalized",
+                "camera_scale_delta",
+                "camera_rotation_degrees",
+                "reliable",
+            )
+            payload["pairs"] = [
+                {field: pair[field] for field in v1_pair_fields}
+                for pair in payload["pairs"]
+            ]
+            v1_fields = (
+                "contract_version",
+                "estimator_version",
+                "source_asset_id",
+                "window_start_ms",
+                "window_end_ms",
+                "sample_times_ms",
+                "sample_frame_pts",
+                "sample_frame_hashes",
+                "subject_exclusion_mode",
+                "mean_excluded_area_fraction",
+                "pairs",
+                "classification",
+                "reliable",
+                "confidence",
+                "normalized_translation_x_per_second",
+                "normalized_translation_y_per_second",
+                "scale_rate_per_second",
+                "rotation_degrees_per_second",
+                "normalized_travel",
+                "reversal_count",
+                "reason_codes",
+                "cache_key_sha256",
+            )
+            payload = {field: payload[field] for field in v1_fields}
+        return _canonical_payload_sha(payload)
 
     def as_motion_estimate(self) -> SourceCameraMotionEstimate:
         direction_by_classification = {
@@ -859,6 +1016,34 @@ def generate_presentation_options(
                     reason_code="source_camera_motion_unreliable",
                     evidence_refs=(scene_facts.definition_sha256,),
                 )
+            )
+        if (
+            source_camera_motion_evidence is not None
+            and source_camera_motion_evidence.contract_version
+            == "source-camera-motion-evidence-v2"
+            and not source_camera_motion_evidence.sampling_complete
+        ):
+            return _constraint(
+                "source_camera_motion_quality",
+                passed=False,
+                reason_code="source_camera_motion_sampling_incomplete",
+                evidence_refs=(
+                    scene_facts.definition_sha256,
+                    source_camera_motion_evidence.definition_sha256,
+                ),
+            )
+        if (
+            source_camera_motion_evidence is not None
+            and source_camera_motion_evidence.isolated_jolt_count > 0
+        ):
+            return _constraint(
+                "source_camera_motion_quality",
+                passed=False,
+                reason_code="unresolved_source_camera_jolt",
+                evidence_refs=(
+                    scene_facts.definition_sha256,
+                    source_camera_motion_evidence.definition_sha256,
+                ),
             )
         accepted = (
             scene_facts.source_camera_motion.direction == "static"
@@ -1864,7 +2049,13 @@ def measure_source_camera_motion(
     track_facts = _source_motion_track_facts(subject_tracks)
     cache_key = _canonical_payload_sha(
         {
-            "estimator_version": "background-gftt-lk-ransac-affine-v1",
+            "estimator_version": _SOURCE_MOTION_ESTIMATOR_V2,
+            "sampling_version": _SOURCE_MOTION_SAMPLING_V2,
+            "requested_max_sample_gap_ms": (
+                _SOURCE_MOTION_MAX_SAMPLE_GAP_MS
+            ),
+            "edge_dense_window_ms": _SOURCE_MOTION_EDGE_DENSE_WINDOW_MS,
+            "edge_sample_step_ms": _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS,
             "source_asset_id": source_asset_id,
             "source_size": (
                 resolved_source.stat().st_size
@@ -1918,45 +2109,66 @@ def measure_source_camera_motion(
         write_json(artifact_path, evidence.model_dump(mode="json"))
         return evidence
 
+    requested_times = _source_motion_sample_times(
+        window_start_ms,
+        window_end_ms,
+        sample_count=sample_count,
+    )
     extracted_frames = _reuse_tracking_analysis_frames(
         subject_tracks,
         window_start_ms=window_start_ms,
         window_end_ms=window_end_ms,
-        sample_count=sample_count,
+        sample_count=len(requested_times),
     )
-    if not extracted_frames:
-        requested_times = _source_motion_sample_times(
-            window_start_ms,
-            window_end_ms,
-            sample_count=sample_count,
-        )
-        try:
-            for index, requested_ms in enumerate(requested_times):
-                extracted = extract_frame(
-                    resolved_source,
-                    requested_ms,
-                    artifact_dir / "frames" / f"frame-{index:02d}.jpg",
-                    max_width=max_width,
-                )
-                if (
-                    not extracted_frames
-                    or extracted.frame_pts != extracted_frames[-1].frame_pts
-                ):
-                    extracted_frames.append(extracted)
-        except Exception as error:
-            evidence = _unreliable_source_motion_evidence(
-                source_asset_id=source_asset_id,
-                window_start_ms=window_start_ms,
-                window_end_ms=window_end_ms,
-                cache_key=cache_key,
-                reason_codes=(
-                    "source_motion_frame_decode_failed",
-                    f"{type(error).__name__}",
-                ),
-                extracted_frames=extracted_frames,
+    try:
+        reusable_times = {
+            frame.frame_time_ms
+            for frame in extracted_frames
+        }
+        for index, requested_ms in enumerate(requested_times):
+            if any(
+                abs(requested_ms - reusable_ms)
+                <= _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS // 2
+                for reusable_ms in reusable_times
+            ):
+                continue
+            extracted = extract_frame(
+                resolved_source,
+                requested_ms,
+                artifact_dir / "frames" / f"frame-{index:03d}.jpg",
+                max_width=max_width,
             )
-            write_json(artifact_path, evidence.model_dump(mode="json"))
-            return evidence
+            extracted_frames.append(extracted)
+            reusable_times.add(extracted.frame_time_ms)
+    except Exception as error:
+        evidence = _unreliable_source_motion_evidence(
+            source_asset_id=source_asset_id,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+            cache_key=cache_key,
+            reason_codes=(
+                "source_motion_frame_decode_failed",
+                f"{type(error).__name__}",
+            ),
+            extracted_frames=extracted_frames,
+        )
+        write_json(artifact_path, evidence.model_dump(mode="json"))
+        return evidence
+
+    # Reused SAM frames and newly decoded samples share the same immutable
+    # source timeline.  Sort and collapse seek aliases before measuring pairs.
+    extracted_frames = sorted(
+        extracted_frames,
+        key=lambda frame: (frame.frame_time_ms, frame.frame_pts),
+    )
+    distinct_frames: list[ExtractedFrame] = []
+    seen_pts: set[int] = set()
+    for extracted in extracted_frames:
+        if extracted.frame_pts in seen_pts:
+            continue
+        distinct_frames.append(extracted)
+        seen_pts.add(extracted.frame_pts)
+    extracted_frames = distinct_frames
 
     if len(extracted_frames) < 2:
         evidence = _unreliable_source_motion_evidence(
@@ -1970,9 +2182,7 @@ def measure_source_camera_motion(
         write_json(artifact_path, evidence.model_dump(mode="json"))
         return evidence
 
-    gray_frames = []
-    background_masks = []
-    excluded_fractions = []
+    decoded_frames = []
     for extracted in extracted_frames:
         frame = cv2.imread(extracted.path)
         if frame is None:
@@ -1986,6 +2196,27 @@ def measure_source_camera_motion(
             )
             write_json(artifact_path, evidence.model_dump(mode="json"))
             return evidence
+        decoded_frames.append(frame)
+    common_width = min(frame.shape[1] for frame in decoded_frames)
+    common_height = min(frame.shape[0] for frame in decoded_frames)
+
+    gray_frames = []
+    background_masks = []
+    excluded_fractions = []
+    for extracted, frame in zip(
+        extracted_frames,
+        decoded_frames,
+        strict=True,
+    ):
+        if (
+            frame.shape[1] != common_width
+            or frame.shape[0] != common_height
+        ):
+            frame = cv2.resize(
+                frame,
+                (common_width, common_height),
+                interpolation=cv2.INTER_AREA,
+            )
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         background_mask, excluded_fraction = _background_feature_mask(
             width=gray.shape[1],
@@ -1999,7 +2230,7 @@ def measure_source_camera_motion(
         background_masks.append(background_mask)
         excluded_fractions.append(excluded_fraction)
 
-    pairs = tuple(
+    raw_pairs = tuple(
         _measure_background_motion_pair(
             before_gray=gray_frames[index],
             after_gray=gray_frames[index + 1],
@@ -2016,6 +2247,12 @@ def measure_source_camera_motion(
             np=np,
         )
         for index in range(len(extracted_frames) - 1)
+    )
+    pairs = _annotate_source_motion_pairs(
+        raw_pairs,
+        extracted_frames=extracted_frames,
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
     )
     reliable_pairs = tuple(pair for pair in pairs if pair.reliable)
     required_pair_count = max(2, math.ceil(len(pairs) * 0.5))
@@ -2061,6 +2298,53 @@ def measure_source_camera_motion(
     y_rate = float(median(y_rates))
     scale_rate = float(median(scale_rates))
     rotation_rate = float(median(rotation_rates))
+    translation_speeds = [
+        pair.normalized_translation_speed_per_second
+        for pair in reliable_pairs
+    ]
+    p95_translation_speed = _percentile(translation_speeds, 0.95)
+    max_translation_speed = max(translation_speeds, default=0.0)
+    (
+        max_translation_acceleration,
+        max_translation_jerk,
+    ) = _source_motion_temporal_extrema(reliable_pairs)
+    jolt_pair_indexes = tuple(
+        index
+        for index, pair in enumerate(pairs)
+        if pair.isolated_jolt
+    )
+    dirty_head = any(
+        pairs[index].dirty_edge == "head"
+        for index in jolt_pair_indexes
+    )
+    dirty_tail = any(
+        pairs[index].dirty_edge == "tail"
+        for index in jolt_pair_indexes
+    )
+    clean_head_start_ms = window_start_ms
+    if dirty_head:
+        clean_head_start_ms = min(
+            window_end_ms,
+            max(
+                pair.after_time_ms or window_start_ms
+                for pair in pairs
+                if pair.dirty_edge == "head"
+            )
+            + _SOURCE_MOTION_EDGE_SETTLE_PADDING_MS,
+        )
+    clean_tail_end_ms = window_end_ms
+    if dirty_tail:
+        clean_tail_end_ms = max(
+            window_start_ms,
+            min(
+                pair.before_time_ms or window_end_ms
+                for pair in pairs
+                if pair.dirty_edge == "tail"
+            )
+            - _SOURCE_MOTION_EDGE_SETTLE_PADDING_MS,
+        )
+    if clean_head_start_ms > clean_tail_end_ms:
+        clean_head_start_ms = clean_tail_end_ms
     normalized_travel = sum(
         math.hypot(
             pair.camera_translation_x_normalized,
@@ -2109,7 +2393,32 @@ def measure_source_camera_motion(
             * max(0.25, 1.0 - median_residual / 5.0),
         ),
     )
+    actual_max_sample_gap_ms = _maximum_sample_gap_ms(extracted_frames)
+    head_sample_coverage_ms = max(
+        0,
+        extracted_frames[0].frame_time_ms - window_start_ms,
+    )
+    tail_sample_coverage_ms = max(
+        0,
+        window_end_ms - extracted_frames[-1].frame_time_ms,
+    )
+    sampling_complete = (
+        actual_max_sample_gap_ms
+        <= _SOURCE_MOTION_MAX_SAMPLE_GAP_MS + 100
+        and head_sample_coverage_ms
+        <= _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS + 100
+        and tail_sample_coverage_ms
+        <= _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS + 100
+    )
     evidence = SourceCameraMotionEvidence(
+        contract_version="source-camera-motion-evidence-v2",
+        estimator_version=_SOURCE_MOTION_ESTIMATOR_V2,
+        sampling_version=_SOURCE_MOTION_SAMPLING_V2,
+        requested_max_sample_gap_ms=_SOURCE_MOTION_MAX_SAMPLE_GAP_MS,
+        actual_max_sample_gap_ms=actual_max_sample_gap_ms,
+        head_sample_coverage_ms=head_sample_coverage_ms,
+        tail_sample_coverage_ms=tail_sample_coverage_ms,
+        sampling_complete=sampling_complete,
         source_asset_id=source_asset_id,
         window_start_ms=window_start_ms,
         window_end_ms=window_end_ms,
@@ -2139,10 +2448,43 @@ def measure_source_camera_motion(
         rotation_degrees_per_second=round(rotation_rate, 6),
         normalized_travel=round(normalized_travel, 6),
         reversal_count=reversals,
+        p95_translation_speed_per_second=round(
+            p95_translation_speed,
+            6,
+        ),
+        max_translation_speed_per_second=round(
+            max_translation_speed,
+            6,
+        ),
+        max_translation_acceleration_per_second_squared=round(
+            max_translation_acceleration,
+            6,
+        ),
+        max_translation_jerk_per_second_cubed=round(
+            max_translation_jerk,
+            6,
+        ),
+        isolated_jolt_count=len(jolt_pair_indexes),
+        jolt_pair_indexes=jolt_pair_indexes,
+        dirty_head=dirty_head,
+        dirty_tail=dirty_tail,
+        clean_head_start_ms=clean_head_start_ms,
+        clean_tail_end_ms=clean_tail_end_ms,
         reason_codes=(
             "background_features_exclude_tracked_subjects",
             "forward_backward_flow_validated",
             "ransac_affine_motion_measured",
+            "hybrid_edge_dense_sampling",
+            *(
+                ()
+                if sampling_complete
+                else ("source_motion_sampling_incomplete",)
+            ),
+            *(
+                ("isolated_source_camera_jolt_detected",)
+                if jolt_pair_indexes
+                else ()
+            ),
         ),
         cache_key_sha256=cache_key,
     )
@@ -2163,9 +2505,208 @@ def _source_motion_sample_times(
     last_ms = max(start_ms, end_ms - end_guard_ms)
     if last_ms == start_ms:
         return (start_ms, start_ms + 1)
-    return tuple(
+    requested = {
         round(start_ms + (last_ms - start_ms) * index / (sample_count - 1))
         for index in range(sample_count)
+    }
+    requested.update(
+        range(
+            start_ms,
+            last_ms + 1,
+            _SOURCE_MOTION_MAX_SAMPLE_GAP_MS,
+        )
+    )
+    requested.add(last_ms)
+    leading_end = min(
+        last_ms,
+        start_ms + _SOURCE_MOTION_EDGE_DENSE_WINDOW_MS,
+    )
+    requested.update(
+        range(
+            start_ms,
+            leading_end + 1,
+            _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS,
+        )
+    )
+    trailing_start = max(
+        start_ms,
+        last_ms - _SOURCE_MOTION_EDGE_DENSE_WINDOW_MS,
+    )
+    requested.update(
+        range(
+            trailing_start,
+            last_ms + 1,
+            _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS,
+        )
+    )
+    return tuple(sorted(requested))
+
+
+def _maximum_sample_gap_ms(
+    frames: Sequence[ExtractedFrame],
+) -> int:
+    return max(
+        (
+            after.frame_time_ms - before.frame_time_ms
+            for before, after in zip(frames, frames[1:])
+        ),
+        default=0,
+    )
+
+
+def _percentile(values: Sequence[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _annotate_source_motion_pairs(
+    pairs: Sequence[SourceCameraMotionPairEvidence],
+    *,
+    extracted_frames: Sequence[ExtractedFrame],
+    window_start_ms: int,
+    window_end_ms: int,
+) -> tuple[SourceCameraMotionPairEvidence, ...]:
+    speeds = [
+        (
+            math.hypot(
+                pair.camera_translation_x_normalized,
+                pair.camera_translation_y_normalized,
+            )
+            * 1000
+            / pair.delta_ms
+            if pair.reliable
+            else 0.0
+        )
+        for pair in pairs
+    ]
+    reliable_speeds = [
+        speed
+        for speed, pair in zip(speeds, pairs, strict=True)
+        if pair.reliable
+    ]
+    central_speed = float(median(reliable_speeds)) if reliable_speeds else 0.0
+    speed_mad = (
+        float(
+            median(
+                abs(speed - central_speed)
+                for speed in reliable_speeds
+            )
+        )
+        if reliable_speeds
+        else 0.0
+    )
+    # The central statistic still describes a steady photographed move, while
+    # the independent peak threshold preserves a short move-and-return jolt.
+    jolt_threshold = max(
+        0.08,
+        central_speed * 3.0,
+        central_speed + speed_mad * 6.0 + 0.02,
+    )
+    annotated: list[SourceCameraMotionPairEvidence] = []
+    for index, (pair, speed) in enumerate(
+        zip(pairs, speeds, strict=True)
+    ):
+        before_time_ms = extracted_frames[index].frame_time_ms
+        after_time_ms = extracted_frames[index + 1].frame_time_ms
+        prior_speed = speeds[index - 1] if index > 0 else central_speed
+        next_speed = (
+            speeds[index + 1]
+            if index + 1 < len(speeds)
+            else central_speed
+        )
+        isolated = bool(
+            pair.reliable
+            and speed >= jolt_threshold
+            and (
+                prior_speed < speed * 0.55
+                or next_speed < speed * 0.55
+                or _pair_direction_reverses(
+                    pair,
+                    pairs[index + 1]
+                    if index + 1 < len(pairs)
+                    else None,
+                )
+            )
+        )
+        dirty_edge: Literal["head", "tail"] | None = None
+        if isolated and (
+            before_time_ms
+            < window_start_ms + _SOURCE_MOTION_EDGE_DENSE_WINDOW_MS
+        ):
+            dirty_edge = "head"
+        elif isolated and (
+            after_time_ms
+            > window_end_ms - _SOURCE_MOTION_EDGE_DENSE_WINDOW_MS
+        ):
+            dirty_edge = "tail"
+        annotated.append(
+            pair.model_copy(
+                update={
+                    "before_time_ms": before_time_ms,
+                    "after_time_ms": after_time_ms,
+                    "normalized_translation_speed_per_second": round(
+                        speed,
+                        8,
+                    ),
+                    "isolated_jolt": isolated,
+                    "dirty_edge": dirty_edge,
+                }
+            )
+        )
+    return tuple(annotated)
+
+
+def _pair_direction_reverses(
+    first: SourceCameraMotionPairEvidence,
+    second: SourceCameraMotionPairEvidence | None,
+) -> bool:
+    if second is None or not second.reliable:
+        return False
+    first_x = first.camera_translation_x_normalized
+    first_y = first.camera_translation_y_normalized
+    second_x = second.camera_translation_x_normalized
+    second_y = second.camera_translation_y_normalized
+    first_magnitude = math.hypot(first_x, first_y)
+    second_magnitude = math.hypot(second_x, second_y)
+    if first_magnitude < 0.002 or second_magnitude < 0.002:
+        return False
+    return first_x * second_x + first_y * second_y < 0
+
+
+def _source_motion_temporal_extrema(
+    pairs: Sequence[SourceCameraMotionPairEvidence],
+) -> tuple[float, float]:
+    if len(pairs) < 2:
+        return 0.0, 0.0
+    accelerations: list[tuple[float, float]] = []
+    for before, after in zip(pairs, pairs[1:]):
+        dt_seconds = max(
+            0.001,
+            (before.delta_ms + after.delta_ms) / 2000,
+        )
+        acceleration = abs(
+            after.normalized_translation_speed_per_second
+            - before.normalized_translation_speed_per_second
+        ) / dt_seconds
+        accelerations.append((acceleration, dt_seconds))
+    jerks = [
+        abs(after[0] - before[0])
+        / max(0.001, (before[1] + after[1]) / 2)
+        for before, after in zip(accelerations, accelerations[1:])
+    ]
+    return (
+        max((item[0] for item in accelerations), default=0.0),
+        max(jerks, default=0.0),
     )
 
 
@@ -2582,16 +3123,51 @@ def _unreliable_source_motion_evidence(
         "none",
     ] = "none",
 ) -> SourceCameraMotionEvidence:
+    ordered_frames = tuple(
+        sorted(
+            extracted_frames,
+            key=lambda frame: (frame.frame_time_ms, frame.frame_pts),
+        )
+    )
+    sample_times_ms = tuple(
+        frame.frame_time_ms for frame in ordered_frames
+    )
     return SourceCameraMotionEvidence(
+        contract_version="source-camera-motion-evidence-v2",
+        estimator_version=_SOURCE_MOTION_ESTIMATOR_V2,
+        sampling_version=_SOURCE_MOTION_SAMPLING_V2,
+        requested_max_sample_gap_ms=_SOURCE_MOTION_MAX_SAMPLE_GAP_MS,
+        actual_max_sample_gap_ms=(
+            max(
+                (
+                    after - before
+                    for before, after in zip(
+                        sample_times_ms,
+                        sample_times_ms[1:],
+                    )
+                ),
+                default=0,
+            )
+            if sample_times_ms
+            else None
+        ),
+        head_sample_coverage_ms=(
+            max(0, sample_times_ms[0] - window_start_ms)
+            if sample_times_ms
+            else None
+        ),
+        tail_sample_coverage_ms=(
+            max(0, window_end_ms - sample_times_ms[-1])
+            if sample_times_ms
+            else None
+        ),
         source_asset_id=source_asset_id,
         window_start_ms=window_start_ms,
         window_end_ms=window_end_ms,
-        sample_times_ms=tuple(
-            frame.frame_time_ms for frame in extracted_frames
-        ),
-        sample_frame_pts=tuple(frame.frame_pts for frame in extracted_frames),
+        sample_times_ms=sample_times_ms,
+        sample_frame_pts=tuple(frame.frame_pts for frame in ordered_frames),
         sample_frame_hashes=tuple(
-            frame.frame_hash for frame in extracted_frames
+            frame.frame_hash for frame in ordered_frames
         ),
         subject_exclusion_mode=subject_exclusion_mode,
         mean_excluded_area_fraction=round(

@@ -586,9 +586,38 @@ def run_full_clip(
     proxy_path = output_dir / "analysis-proxy.mp4"
     if proxy_path.exists():
         proxy_media = probe_video(proxy_path)
-        proxy_record = read_json(output_dir / "analysis-proxy.json")
+        proxy_record_path = output_dir / "analysis-proxy.json"
+        if not proxy_record_path.is_file():
+            raise ValueError(
+                "existing analysis proxy has no source/config binding; use a "
+                "new output directory instead of reusing unbound media"
+            )
+        proxy_record = read_json(proxy_record_path)
         proxy_has_audio = has_audio_stream(proxy_path)
-        if proxy_has_audio != include_audio:
+        expected_proxy_binding = {
+            "source_asset_id": source_media.asset_id,
+            "proxy_asset_id": proxy_media.asset_id,
+            "max_side": proxy_max_side,
+            "fps": proxy_fps,
+            "preserve_audio": include_audio,
+        }
+        mismatches = {
+            key: {
+                "expected": expected,
+                "observed": proxy_record.get(key),
+            }
+            for key, expected in expected_proxy_binding.items()
+            if proxy_record.get(key) != expected
+        }
+        if mismatches:
+            raise ValueError(
+                "existing analysis proxy is stale for the current source or "
+                f"proxy configuration: {mismatches}; use a new output directory"
+            )
+        if (
+            proxy_record.get("proxy_has_audio") != proxy_has_audio
+            or proxy_has_audio != include_audio
+        ):
             raise ValueError(
                 "existing analysis proxy audio policy differs from --audio-mode; "
                 "use a new output directory"
@@ -622,6 +651,17 @@ def run_full_clip(
     shot_catalog_path = output_dir / "shot-catalog" / "shot-catalog.json"
     if shot_catalog_path.exists():
         shot_catalog = ClipShotCatalog.model_validate(read_json(shot_catalog_path))
+        current_shot_ids = {shot.shot_id for shot in shots.shots}
+        catalog_shot_ids = {frame.shot_id for frame in shot_catalog.frames}
+        if (
+            shot_catalog.source_asset_id != source_media.asset_id
+            or shot_catalog.duration_ms != shots.duration_ms
+            or catalog_shot_ids != current_shot_ids
+        ):
+            raise ValueError(
+                "existing shot catalog is stale for the current source or "
+                "shot-detection manifest; use a new output directory"
+            )
     else:
         shot_catalog = create_shot_catalog(
             video_path,

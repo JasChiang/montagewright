@@ -9,16 +9,19 @@ from pydantic import Field, model_validator
 
 from .models import (
     EntityKind,
+    EvidenceOriginObservation,
+    EvidenceRelation,
     EvidenceModality,
     FeatureEvidenceProvenance,
     FrozenStrictModel,
     FullClipCard,
     FullClipEvent,
     ModelProvenance,
+    evidence_relation_from_legacy,
 )
 
 
-SUPPLEMENT_CONTRACT_VERSION = "clip-observation-supplement-v1"
+SUPPLEMENT_CONTRACT_VERSION = "clip-observation-supplement-v2"
 
 
 class AssessmentStatus(StrEnum):
@@ -52,6 +55,7 @@ class ClaimDecision(StrEnum):
 
 
 class EventCapabilityManifest(FrozenStrictModel):
+    evidence_origin: AssessmentStatus = AssessmentStatus.NOT_ASSESSED
     action_structure: AssessmentStatus = AssessmentStatus.NOT_ASSESSED
     evidence_roles: AssessmentStatus = AssessmentStatus.NOT_ASSESSED
     observable_beats: AssessmentStatus = AssessmentStatus.NOT_ASSESSED
@@ -150,6 +154,7 @@ class EventObservationSupplement(FrozenStrictModel):
     observation_basis: ObservationBasis | None = None
     audio_included: bool = False
     evidence_provenance: FeatureEvidenceProvenance = "unknown"
+    evidence_origin: EvidenceOriginObservation | None = None
     capabilities: EventCapabilityManifest
     source_action_completeness: Literal[
         "complete",
@@ -182,6 +187,7 @@ class EventObservationSupplement(FrozenStrictModel):
     @model_validator(mode="after")
     def validate_capability_payloads(self) -> "EventObservationSupplement":
         payload_presence = {
+            "evidence_origin": self.evidence_origin is not None,
             "action_structure": self.source_action_completeness != "uncertain"
             or self.clean_entry != "unknown"
             or self.clean_exit != "unknown",
@@ -204,6 +210,15 @@ class EventObservationSupplement(FrozenStrictModel):
                 AssessmentStatus.NOT_APPLICABLE,
             } and present:
                 raise ValueError(f"{capability} payload conflicts with status {status}")
+        if (
+            self.evidence_origin is not None
+            and self.evidence_provenance != "unknown"
+            and self.evidence_origin.relation
+            != evidence_relation_from_legacy(self.evidence_provenance)
+        ):
+            raise ValueError(
+                "legacy evidence_provenance conflicts with generic evidence_origin"
+            )
         assessed = {
             name: getattr(self.capabilities, name)
             for name in type(self.capabilities).model_fields
@@ -230,7 +245,10 @@ class EventObservationSupplement(FrozenStrictModel):
 
 
 class ClipObservationSupplement(FrozenStrictModel):
-    contract_version: Literal["clip-observation-supplement-v1"] = (
+    contract_version: Literal[
+        "clip-observation-supplement-v1",
+        "clip-observation-supplement-v2",
+    ] = (
         SUPPLEMENT_CONTRACT_VERSION
     )
     supplement_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
@@ -301,8 +319,41 @@ def event_fingerprint(event: FullClipEvent) -> str:
             "label": event.label,
             "observable_evidence": event.observable_evidence,
             "evidence_provenance": event.evidence_provenance,
+            "evidence_origin": (
+                event.evidence_origin.model_dump(mode="json")
+                if event.evidence_origin
+                else None
+            ),
             "entity_ids": event.entity_ids,
         }
+    )
+
+
+def _legacy_provenance_from_relation(
+    relation: EvidenceRelation,
+) -> FeatureEvidenceProvenance:
+    """Best-effort compatibility mirror for readers that still require v1."""
+
+    return {
+        "direct_source_event": "unknown",
+        "mediated_depiction": "prerecorded_screen_playback",
+        "graphic_or_text_claim": "promotional_graphic",
+        "context_only": "context_only",
+        "unknown": "unknown",
+    }[relation]
+
+
+def _migrated_evidence_origin(
+    provenance: FeatureEvidenceProvenance,
+) -> EvidenceOriginObservation | None:
+    if provenance == "unknown":
+        return None
+    return EvidenceOriginObservation(
+        relation=evidence_relation_from_legacy(provenance),
+        observable_reason=(
+            "Migrated from the legacy evidence_provenance classification "
+            f"{provenance!r}."
+        ),
     )
 
 
@@ -324,13 +375,23 @@ def legacy_event_observation(event: FullClipEvent) -> EventObservationSupplement
         )
         for phase in event.portrait_attention_sequence
     ]
+    evidence_origin = event.evidence_origin or _migrated_evidence_origin(
+        event.evidence_provenance
+    )
     return EventObservationSupplement(
         event_id=event.event_id,
         event_fingerprint=event_fingerprint(event),
         observation_basis=(
-            ObservationBasis.FULL_CLIP_VIDEO if beats else None
+            ObservationBasis.FULL_CLIP_VIDEO
+            if beats or evidence_origin is not None
+            else None
         ),
         capabilities=EventCapabilityManifest(
+            evidence_origin=(
+                AssessmentStatus.ASSESSED_PRESENT
+                if evidence_origin is not None
+                else AssessmentStatus.NOT_ASSESSED
+            ),
             observable_beats=(
                 AssessmentStatus.ASSESSED_PRESENT
                 if beats
@@ -338,6 +399,7 @@ def legacy_event_observation(event: FullClipEvent) -> EventObservationSupplement
             )
         ),
         evidence_provenance=event.evidence_provenance,
+        evidence_origin=evidence_origin,
         observable_beats=beats,
     )
 
@@ -433,9 +495,25 @@ def effective_event_observations(
             capabilities = current.capabilities.model_dump(mode="json")
             for capability in capabilities:
                 incoming_status = getattr(incoming.capabilities, capability)
+                incoming_origin = None
+                if capability == "evidence_origin":
+                    incoming_origin = incoming.evidence_origin
+                    if (
+                        incoming_status == AssessmentStatus.NOT_ASSESSED
+                        and incoming_origin is None
+                    ):
+                        incoming_origin = _migrated_evidence_origin(
+                            incoming.evidence_provenance
+                        )
+                        if incoming_origin is not None:
+                            incoming_status = AssessmentStatus.ASSESSED_PRESENT
                 if incoming_status == AssessmentStatus.NOT_ASSESSED:
                     continue
-                payload = _capability_payload(incoming, capability)
+                payload = (
+                    incoming_origin.model_dump(mode="json")
+                    if incoming_origin is not None
+                    else _capability_payload(incoming, capability)
+                )
                 payload_sha = _canonical_sha256(
                     {
                         "status": incoming_status,
@@ -452,7 +530,19 @@ def effective_event_observations(
                     continue
                 explicit_payloads[key] = payload_sha
                 capabilities[capability] = incoming_status
-                if capability == "action_structure":
+                if capability == "evidence_origin":
+                    values["evidence_origin"] = payload
+                    if incoming.evidence_provenance != "unknown":
+                        values["evidence_provenance"] = incoming.evidence_provenance
+                    elif incoming_origin is not None:
+                        values["evidence_provenance"] = (
+                            _legacy_provenance_from_relation(
+                                incoming_origin.relation
+                            )
+                        )
+                    else:
+                        values["evidence_provenance"] = "unknown"
+                elif capability == "action_structure":
                     values["source_action_completeness"] = (
                         incoming.source_action_completeness
                     )
@@ -511,6 +601,29 @@ def _capability_payload(
             for item in value
         ]
     return value
+
+
+def effective_event_observation_sha256(
+    observation: EventObservationSupplement,
+) -> str:
+    """Content hash for one fully merged observation."""
+
+    return _canonical_sha256(observation.model_dump(mode="json"))
+
+
+def effective_event_observations_sha256(
+    card: FullClipCard,
+    supplements: Iterable[ClipObservationSupplement] = (),
+) -> str:
+    """Order-stable content hash for every effective event observation."""
+
+    observations = effective_event_observations(card, supplements)
+    return _canonical_sha256(
+        {
+            event_id: observation.model_dump(mode="json")
+            for event_id, observation in sorted(observations.items())
+        }
+    )
 
 
 _CLAIM_CAPABILITIES: dict[EditingClaim, tuple[str, ...]] = {

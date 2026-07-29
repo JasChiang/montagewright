@@ -150,6 +150,79 @@ def test_legacy_profile_preserves_unknown_attention_as_null(tmp_path) -> None:
     assert profile.chapters[0].uncertainties == [
         "attention_vector_unavailable_for_legacy_plan"
     ]
+    assert profile.chapters[0].minimum_dwell_seconds == 1
+    assert profile.chapters[0].preferred_dwell_seconds == 10
+    assert profile.chapters[0].maximum_dwell_seconds == 12
+    assert (
+        profile.chapters[0].maximum_dwell_seconds
+        != brief.target_duration_seconds
+    )
+
+
+def test_preferred_six_seven_eight_second_dwells_remain_bounded_options(
+    tmp_path,
+) -> None:
+    brief = _brief()
+    plan = _plan(with_attention=True)
+    preferred_values = [6.0, 7.0, 8.0, 6.0, 7.0, 8.0]
+    capacity_values = [5.5, 6.5, 7.5, 5.25, 6.25, 7.25]
+    revised_chapters = []
+    for selected, preferred in zip(
+        plan.chapters,
+        preferred_values,
+        strict=True,
+    ):
+        observation = selected.attention_observation
+        assert observation is not None
+        revised_chapters.append(
+            selected.model_copy(
+                update={
+                    "recommended_duration_seconds": preferred,
+                    "attention_observation": observation.model_copy(
+                        update={
+                            "minimum_dwell_seconds": 2.0,
+                            "maximum_dwell_seconds": 9.0,
+                        }
+                    ),
+                }
+            )
+        )
+    plan = plan.model_copy(update={"chapters": revised_chapters})
+    brief_path = tmp_path / "brief.json"
+    plan_path = tmp_path / "plan.json"
+    attention_path = tmp_path / "attention.json"
+    write_json(brief_path, brief)
+    write_json(plan_path, plan)
+
+    profile = build_attention_profile(
+        brief,
+        plan,
+        source_brief_sha256=sha256_file(brief_path),
+        source_feature_plan_sha256=sha256_file(plan_path),
+        quality_safe_capacity_seconds={
+            f"chapter-{index}": capacity
+            for index, capacity in enumerate(capacity_values, start=1)
+        },
+    )
+    write_json(attention_path, profile)
+    rhythm = build_rhythm_plan(
+        profile,
+        target_duration_seconds=sum(capacity_values),
+        attention_profile_sha256=sha256_file(attention_path),
+    )
+
+    assert [chapter.minimum_duration_seconds for chapter in rhythm.chapters] == [
+        2.0
+    ] * 6
+    assert [
+        chapter.preferred_duration_seconds for chapter in rhythm.chapters
+    ] == capacity_values
+    assert [
+        chapter.maximum_duration_seconds for chapter in rhythm.chapters
+    ] == capacity_values
+    assert [
+        chapter.preferred_duration_seconds for chapter in rhythm.chapters
+    ] != preferred_values
 
 
 def test_rhythm_plan_uses_vector_without_inventing_cut_timestamp(

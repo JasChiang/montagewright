@@ -21,6 +21,24 @@ from .models import (
 from .storage import utc_now
 
 
+def _bounded_legacy_dwell_envelope(
+    preferred_dwell_seconds: float,
+) -> tuple[float, float]:
+    """Migrate a legacy single dwell value without inventing a wide window.
+
+    Legacy plans predate attention observations.  Their one chapter-local
+    duration remains the preferred value, while the migration permits at most
+    two seconds (or half the preferred dwell for short shots) of extra hold.
+    The lower bound intentionally preserves the historical one-second floor
+    for compatibility.  Quality-safe capacity is applied separately below.
+    """
+
+    minimum = min(1.0, preferred_dwell_seconds)
+    extension = min(2.0, preferred_dwell_seconds * 0.5)
+    maximum = preferred_dwell_seconds + extension
+    return round(minimum, 3), round(maximum, 3)
+
+
 def build_attention_profile(
     brief: FeatureEditBrief,
     plan: FeatureEditPlan,
@@ -65,10 +83,10 @@ def build_attention_profile(
             requires_review = observation.requires_human_review
         else:
             # Legacy plans contain a preferred relative dwell but no diagnostic
-            # vector. Preserve that known value and leave all unknown metrics
-            # null rather than manufacturing a pseudo attention score.
-            minimum = min(1.0, preferred)
-            maximum = brief.target_duration_seconds
+            # vector. Preserve that chapter-local preferred value and use only
+            # a narrow deterministic migration envelope. Never let one missing
+            # observation expand a chapter to the duration of the whole brief.
+            minimum, maximum = _bounded_legacy_dwell_envelope(preferred)
             authority = (
                 "gemini_relative_dwell_legacy"
                 if selected.recommended_duration_seconds is not None
@@ -356,10 +374,29 @@ def build_rhythm_plan(
                 evidence_authority=chapter.evidence_authority,
             )
         )
+    resolved_target_duration_seconds = target_duration_seconds
+    if any(
+        chapter.evidence_authority
+        in {"gemini_relative_dwell_legacy", "brief_fallback"}
+        for chapter in attention.chapters
+    ):
+        # A legacy brief may carry a historical project target that cannot be
+        # filled by its chapter-local evidence.  Do not re-expand one shot to
+        # that target; bound the review plan to the aggregate migrated envelope.
+        resolved_target_duration_seconds = max(
+            sum(chapter.minimum_dwell_seconds for chapter in attention.chapters),
+            min(
+                target_duration_seconds,
+                sum(
+                    chapter.maximum_dwell_seconds
+                    for chapter in attention.chapters
+                ),
+            ),
+        )
     return RhythmPlan(
         project_id=attention.project_id,
         style_profile=style_profile,
-        target_duration_seconds=target_duration_seconds,
+        target_duration_seconds=resolved_target_duration_seconds,
         attention_profile_sha256=attention_profile_sha256,
         chapters=chapters,
         generated_at=utc_now(),

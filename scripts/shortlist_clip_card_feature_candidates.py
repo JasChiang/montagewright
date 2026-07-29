@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -21,7 +22,10 @@ from jascue_video_lab.clip_card_retrieval import (
 )
 from jascue_video_lab.clip_card_observations import ClipObservationSupplement
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
-from jascue_video_lab.event_lock import load_editorial_beat_contracts
+from jascue_video_lab.event_lock import (
+    EditorialBeatContract,
+    load_editorial_beat_contracts,
+)
 from jascue_video_lab.models import (
     FeatureEditBrief,
     FullClipCard,
@@ -30,6 +34,45 @@ from jascue_video_lab.models import (
 )
 from jascue_video_lab.schema import gemini_response_schema
 from jascue_video_lab.storage import append_error, read_json, utc_now, write_json
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _shortlist_input_binding(
+    *,
+    catalog: RushesCatalog,
+    brief: FeatureEditBrief,
+    editorial_contracts: tuple[EditorialBeatContract, ...],
+    evidence: list[dict[str, object]],
+    thinking_level: str,
+) -> dict[str, object]:
+    """Stable inputs that authorize reuse of a saved paid shortlist response."""
+
+    schema = gemini_response_schema(FeatureShortlistPlan)
+    return {
+        "contract_version": "feature-shortlist-input-binding-v1",
+        "model": MODEL_ID,
+        "catalog_sha256": _canonical_sha256(catalog.model_dump(mode="json")),
+        "brief_sha256": _canonical_sha256(brief.model_dump(mode="json")),
+        "editorial_contracts_sha256": _canonical_sha256(
+            [
+                contract.model_dump(mode="json")
+                for contract in editorial_contracts
+            ]
+        ),
+        "effective_evidence_sha256": _canonical_sha256(evidence),
+        "response_schema_sha256": _canonical_sha256(schema),
+        "thinking_level": thinking_level,
+        "max_output_tokens": 12_000,
+    }
 
 
 def main() -> int:
@@ -113,7 +156,10 @@ frame、bbox、crop、剪點或最終排名。
 
 規則：
 1. brief 是使用者允許的敘事 claim，不是畫面證據。只能依 observable_evidence
-   判斷候選；不得使用品牌／產品常識補足畫面。
+   與 generic evidence_origin 判斷候選；不得使用品牌、人物、活動或物件常識
+   補足畫面。direct_source_event、mediated_depiction、
+   graphic_or_text_claim、context_only 與 unknown 描述的是證據來源關係，
+   不是內容類型，也不是 claim 已成立的結論。
 2. chapters 必須依 brief 順序恰好回傳一次。
 3. supported 回傳 2–8 個不同 asset/event；partial 回傳 1–8 個；
    not_found 回傳空 candidates。真實證據不足時不得為了數量虛構候選。
@@ -128,6 +174,10 @@ frame、bbox、crop、剪點或最終排名。
    相同物件的靜態 setup 不能取代 UI state change、action apex、reaction peak
    或 result stable start；完整 library 都沒有可觀察描述時，hard event 才是
    not_found。
+9. mediated depiction、圖文 claim 或 context-only 畫面可以保留為 contextual
+   候選，但不得用它們冒充 hard predicate 的 direct source event。若 brief
+   允許替代表達，retrieval_reason 必須明確說明它只支持哪一部分、缺少哪個
+   observable predicate。
 
 contract_version 必須原樣回傳：clip-card-feature-shortlist-v1
 project_id 必須原樣回傳：{brief.project_id}
@@ -163,7 +213,15 @@ model_provenance 必須原樣回傳：
         },
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(args.output_dir / "feature-shortlist.request.json", request)
+    request_path = args.output_dir / "feature-shortlist.request.json"
+    binding_path = args.output_dir / "feature-shortlist.input-binding.json"
+    current_binding = _shortlist_input_binding(
+        catalog=catalog,
+        brief=brief,
+        editorial_contracts=tuple(editorial_contracts),
+        evidence=evidence,
+        thinking_level=args.thinking_level,
+    )
     raw_path = args.output_dir / "feature-shortlist.raw_interaction.json"
     raw_output_path = args.output_dir / "feature-shortlist.raw_output.json"
     if args.reuse_raw_output:
@@ -171,10 +229,26 @@ model_provenance 必須原樣回傳：
             raise FileNotFoundError(
                 "shortlist raw reuse requires saved interaction and output"
             )
+        if not binding_path.is_file():
+            raise FileNotFoundError(
+                "shortlist raw reuse requires a saved input binding"
+            )
+        saved_binding = read_json(binding_path)
+        if saved_binding != current_binding:
+            raise ValueError(
+                "shortlist raw output is stale for the current brief, catalog, "
+                "contracts, effective Clip Card observations, schema, or model"
+            )
+        write_json(
+            args.output_dir / "feature-shortlist.reprojection-request.json",
+            request,
+        )
         raw_interaction = read_json(raw_path)
         output_text = str(read_json(raw_output_path)["output_text"])
         interaction_id = str(raw_interaction.get("id") or "")
     else:
+        write_json(request_path, request)
+        write_json(binding_path, current_binding)
         client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(

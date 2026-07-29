@@ -23,6 +23,13 @@ FeatureEvidenceProvenance = Literal[
     "context_only",
     "unknown",
 ]
+EvidenceRelation = Literal[
+    "direct_source_event",
+    "mediated_depiction",
+    "graphic_or_text_claim",
+    "context_only",
+    "unknown",
+]
 
 
 class StrictModel(BaseModel):
@@ -31,6 +38,33 @@ class StrictModel(BaseModel):
 
 class FrozenStrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class EvidenceOriginObservation(FrozenStrictModel):
+    """Origin relationship of visible evidence, independent of its subject matter."""
+
+    relation: EvidenceRelation
+    observable_reason: str = Field(min_length=1, max_length=800)
+
+
+_LEGACY_EVIDENCE_RELATIONS: dict[FeatureEvidenceProvenance, EvidenceRelation] = {
+    "direct_physical_action": "direct_source_event",
+    "direct_ui_interaction": "direct_source_event",
+    "direct_result": "direct_source_event",
+    "prerecorded_screen_playback": "mediated_depiction",
+    "promotional_graphic": "graphic_or_text_claim",
+    "textual_claim_only": "graphic_or_text_claim",
+    "context_only": "context_only",
+    "unknown": "unknown",
+}
+
+
+def evidence_relation_from_legacy(
+    provenance: FeatureEvidenceProvenance,
+) -> EvidenceRelation:
+    """Project the legacy mixed enum onto its subject-neutral origin relation."""
+
+    return _LEGACY_EVIDENCE_RELATIONS[provenance]
 
 
 def _mmss_to_ms(value: str) -> int:
@@ -1164,6 +1198,7 @@ class FullClipEvent(StrictModel):
     description: str
     observable_evidence: str
     evidence_provenance: FeatureEvidenceProvenance = "unknown"
+    evidence_origin: EvidenceOriginObservation | None = None
     evidence_modalities: EvidenceModality
     entity_ids: list[str]
     primary_entity_ids: list[str]
@@ -1211,6 +1246,15 @@ class FullClipEvent(StrictModel):
             keyframe_ms = _mmss_to_ms(self.recommended_keyframe_mmss)
             if not start_ms <= keyframe_ms < end_ms:
                 raise ValueError("recommended MM:SS keyframe must be inside [start, end)")
+        if (
+            self.evidence_origin is not None
+            and self.evidence_provenance != "unknown"
+            and self.evidence_origin.relation
+            != evidence_relation_from_legacy(self.evidence_provenance)
+        ):
+            raise ValueError(
+                "legacy evidence_provenance conflicts with generic evidence_origin"
+            )
         return self
 
     def resolved_end_ms(self, duration_ms: int) -> int:

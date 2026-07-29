@@ -18,6 +18,10 @@ from jascue_video_lab.autonomous_policy import (
 )
 from jascue_video_lab.billing import BudgetExceeded
 from jascue_video_lab.editing_capabilities import (
+    AttentionIntent,
+    SemanticBeat,
+    VisibilityContract,
+    VisibilityTarget,
     simple_production_capability_catalog,
 )
 from scripts.plan_clip_card_open_edit import (
@@ -41,6 +45,7 @@ from jascue_video_lab.feature_cut import (
     _bounded_cue_shifted_window,
     _bind_regions_to_editorial_relation,
     _candidate_capability_boundaries,
+    _semantic_beat_for_runtime_candidate,
     _bind_runtime_candidate_coverage,
     _audit_render_source_reuse,
     _runtime_candidate_reuse_violation,
@@ -78,6 +83,7 @@ from jascue_video_lab.feature_cut import (
     _refine_selected_vertical_candidate,
     _segment_variant_fingerprint,
     _selected_source_capacity_seconds,
+    _source_motion_clean_recovery_window,
     _should_refine_selected_vertical_candidate,
     _soft_extent_visibility_audit,
     _summarize_automatic_reframe,
@@ -105,6 +111,7 @@ from jascue_video_lab.feature_cut import (
     write_external_feature_plan_projection,
 )
 from jascue_video_lab.auto_reframe import FailureCode
+from jascue_video_lab.models import FramingRegionIntent
 
 
 def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
@@ -149,6 +156,76 @@ def test_primary_with_context_stays_single_canvas_without_panel_intent() -> None
         )
         == "context_detail"
     )
+
+
+def test_runtime_candidate_rebinds_rank_one_panel_topology() -> None:
+    rank_one_beat = SemanticBeat(
+        beat_id="comparison",
+        priority="preferred",
+        narrative_function="compare",
+        evidence_refs=("rank-1", "rank-2"),
+        candidate_refs=("rank-1", "rank-2"),
+        visibility_contract=VisibilityContract(
+            targets=(
+                VisibilityTarget(target_id="device-a"),
+                VisibilityTarget(target_id="device-b"),
+            ),
+            temporal_visibility="simultaneous",
+            preserve_spatial_relation=True,
+            preserve_relative_scale=True,
+        ),
+        attention_intent=AttentionIntent(
+            ordered_target_ids=("device-a", "device-b"),
+            goal="compare",
+        ),
+        minimum_duration_ms=2_000,
+        preferred_duration_ms=3_000,
+        maximum_duration_ms=4_000,
+        acceptable_capability_ids=(
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+            "two_panel_layout",
+        ),
+        forbidden_capability_ids=(
+            "phase_virtual_camera",
+            "hard_cut_between_views",
+            "solid_matte_fit",
+        ),
+        panel_target_groups=(("device-a",), ("device-b",)),
+    )
+    rank_two = {
+        "coverage_mode": "sequential",
+        "presentation_preference": "phase_virtual_camera",
+        "presentation_goal": "reveal",
+        "physical_scale_comparison": False,
+        "regions": [
+            FramingRegionIntent(
+                region_id="region-c",
+                entity_id="person-c",
+                target_description="first visible person",
+                role="required",
+            ),
+            FramingRegionIntent(
+                region_id="region-d",
+                entity_id="person-d",
+                target_description="second visible person",
+                role="required",
+            ),
+        ],
+    }
+
+    rebound = _semantic_beat_for_runtime_candidate(rank_one_beat, rank_two)
+
+    assert rebound is not None
+    assert rebound.visibility_contract.temporal_visibility == "ordered"
+    assert rebound.visibility_contract.preserve_spatial_relation is False
+    assert rebound.visibility_contract.preserve_relative_scale is False
+    assert tuple(
+        target.target_id for target in rebound.visibility_contract.targets
+    ) == ("person-c", "person-d")
+    assert "phase_virtual_camera" in rebound.acceptable_capability_ids
+    assert "two_panel_layout" in rebound.forbidden_capability_ids
+    assert rebound.panel_target_groups == ()
 
 
 def test_trim_window_shift_invalidates_stale_exact_pts() -> None:
@@ -208,6 +285,46 @@ def test_tracking_coverage_recovery_preserves_locked_evidence_frame() -> None:
     assert recovered is not None
     assert recovered[0] <= 3_000 < recovered[1]
     assert recovered[1] - recovered[0] == 3_500
+
+
+def test_source_motion_recovery_trims_dirty_edges_without_losing_evidence() -> None:
+    recovered = _source_motion_clean_recovery_window(
+        {
+            "source_camera_motion_evidence": {
+                "contract_version": "source-camera-motion-evidence-v2",
+                "dirty_head": True,
+                "dirty_tail": True,
+                "clean_head_start_ms": 2_350,
+                "clean_tail_end_ms": 8_700,
+            }
+        },
+        current_start_ms=2_000,
+        current_end_ms=9_000,
+        evidence_time_ms=6_000,
+        minimum_duration_ms=4_000,
+    )
+
+    assert recovered == (2_350, 8_700)
+
+
+def test_source_motion_recovery_refuses_to_trim_locked_evidence() -> None:
+    recovered = _source_motion_clean_recovery_window(
+        {
+            "source_camera_motion_evidence": {
+                "contract_version": "source-camera-motion-evidence-v2",
+                "dirty_head": True,
+                "dirty_tail": False,
+                "clean_head_start_ms": 2_350,
+                "clean_tail_end_ms": 9_000,
+            }
+        },
+        current_start_ms=2_000,
+        current_end_ms=9_000,
+        evidence_time_ms=2_200,
+        minimum_duration_ms=4_000,
+    )
+
+    assert recovered is None
 
 
 def test_trim_shift_failure_is_recorded_without_hidden_retry(

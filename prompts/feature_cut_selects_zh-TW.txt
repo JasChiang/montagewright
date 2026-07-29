@@ -12,8 +12,10 @@
 
 1. 最適合 16:9 的 `horizontal_frame_id`。
 2. 最適合 9:16 的 `vertical_frame_id`，可以與橫式不同。
-3. 只描述畫面直接可見的 `observed_visual_evidence`。
-   同時為外層 chapter 與每個候選填寫 `evidence_provenance`：
+3. 只描述畫面直接可見的 `observed_visual_evidence`。先使用輸入 Clip Card
+   的通用 `evidence_origin` 判斷這是來源場景中的直接事件、內嵌媒體、圖文
+   claim、脈絡或未知；它適用於任何內容類型。輸出的
+   `evidence_provenance` 只是舊 reader 所需的相容 mirror：
    - `direct_physical_action`：原始場景中直接拍到動作、手勢、反應或物理事件。
    - `direct_ui_interaction`：直接拍到使用者操作 UI，且可見狀態真的改變。
    - `direct_result`：直接拍到流程完成後穩定、可讀的實際結果。
@@ -23,7 +25,8 @@
    - `textual_claim_only`：只有文字、標題或標示聲稱某功能。
    - `context_only`：只有相關產品／人物／環境，沒有 brief 要求的動作或結果。
    - `unknown`：目前抽樣無法可靠分辨。不得把 unknown 當 direct evidence。
-   外層 `evidence_provenance` 必須與 rank-1 vertical candidate 相同。螢幕中螢幕、
+   外層 `evidence_provenance` 必須與 rank-1 vertical candidate 相同，且不得
+   與輸入的 generic evidence origin 衝突。螢幕中螢幕、
    宣傳字卡或文字 claim 不得因內容「看起來像」功能結果，就標成 direct result。
 4. 如果精確功能 UI 沒有被 2 秒 sampling 捕捉，但有相近產品／操作 B-roll，使用 `partial`，並清楚寫明差距。
 5. 完全沒有合理畫面則使用 `not_found`，兩個 frame ID 都回傳 null；不得拿相近但不符合事件條件的素材假裝是直接證據。

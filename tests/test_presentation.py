@@ -149,6 +149,42 @@ def _source_pan_video(path: Path) -> Path:
     return path
 
 
+def _source_head_jolt_video(path: Path) -> Path:
+    background = _textured_background(WIDTH + 160)
+
+    def render(time_seconds: float) -> Image.Image:
+        if 0.10 <= time_seconds < 0.20:
+            camera_x = 64
+        elif 0.20 <= time_seconds < 0.30:
+            camera_x = 20
+        else:
+            camera_x = 0
+        return background.crop(
+            (camera_x, 0, camera_x + WIDTH, HEIGHT)
+        )
+
+    _encode(path, 2.0, render)
+    return path
+
+
+def _source_tail_jolt_video(path: Path) -> Path:
+    background = _textured_background(WIDTH + 160)
+
+    def render(time_seconds: float) -> Image.Image:
+        if 1.70 <= time_seconds < 1.80:
+            camera_x = 64
+        elif 1.80 <= time_seconds < 1.90:
+            camera_x = 20
+        else:
+            camera_x = 0
+        return background.crop(
+            (camera_x, 0, camera_x + WIDTH, HEIGHT)
+        )
+
+    _encode(path, 2.0, render)
+    return path
+
+
 def _static_video_with_moving_foreground(path: Path) -> Path:
     background = _textured_background(WIDTH)
 
@@ -432,7 +468,7 @@ def test_sam_subject_exclusion_prevents_foreground_motion_from_becoming_pan(
     assert evidence.mean_excluded_area_fraction > 0.25
 
 
-def test_source_motion_reuses_sam_analysis_frames_without_redecoding(
+def test_source_motion_reuses_and_supplements_sparse_sam_analysis_frames(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -462,12 +498,18 @@ def test_source_motion_reuses_sam_analysis_frames_without_redecoding(
             quality=92,
         )
 
-    def fail_decode(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("existing SAM analysis frames must be reused")
+    from jascue_video_lab import presentation
+
+    original_extract_frame = presentation.extract_frame
+    decode_times: list[int] = []
+
+    def record_decode(*args: Any, **kwargs: Any):
+        decode_times.append(int(args[1]))
+        return original_extract_frame(*args, **kwargs)
 
     monkeypatch.setattr(
         "jascue_video_lab.presentation.extract_frame",
-        fail_decode,
+        record_decode,
     )
     evidence = measure_source_camera_motion(
         source_path=source,
@@ -480,7 +522,121 @@ def test_source_motion_reuses_sam_analysis_frames_without_redecoding(
 
     assert evidence.reliable is True
     assert evidence.classification == "static"
-    assert len(evidence.sample_frame_pts) == len(track.samples)
+    assert decode_times
+    assert len(decode_times) < len(evidence.sample_frame_pts)
+    assert evidence.sampling_version == "hybrid-edge-dense-bounded-gap-v2"
+    assert evidence.actual_max_sample_gap_ms is not None
+    assert (
+        evidence.actual_max_sample_gap_ms
+        <= evidence.requested_max_sample_gap_ms + 100
+    )
+
+
+def test_edge_dense_sampling_preserves_short_opening_jolt(
+    tmp_path: Path,
+) -> None:
+    source = _source_head_jolt_video(tmp_path / "head-jolt.mp4")
+    media = probe_video(source)
+
+    evidence = measure_source_camera_motion(
+        source_path=source,
+        source_asset_id=media.asset_id,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        subject_tracks=(),
+        output_dir=tmp_path / "motion",
+    )
+
+    assert evidence.contract_version == "source-camera-motion-evidence-v2"
+    assert evidence.estimator_version == "background-gftt-lk-ransac-affine-v2"
+    assert evidence.sampling_version == "hybrid-edge-dense-bounded-gap-v2"
+    assert evidence.head_sample_coverage_ms is not None
+    assert evidence.head_sample_coverage_ms <= 100
+    assert evidence.isolated_jolt_count >= 1
+    assert evidence.dirty_head is True
+    assert evidence.clean_head_start_ms is not None
+    assert evidence.clean_head_start_ms >= 300
+    assert evidence.max_translation_speed_per_second > (
+        evidence.normalized_travel / 2.0
+    )
+    assert "isolated_source_camera_jolt_detected" in evidence.reason_codes
+    assert any(pair.isolated_jolt for pair in evidence.pairs)
+    compilation = compile_presentation(
+        targets=[_target("device", (430, 250, 570, 750))],
+        source_width=WIDTH,
+        source_height=HEIGHT,
+        relation_mode="single_subject",
+        policy=_policy(),
+        source_camera_motion_evidence=evidence,
+    )
+    assert compilation.mode == "blocked"
+    assert compilation.selection is not None
+    assert any(
+        "unresolved_source_camera_jolt" in failures
+        for failures in compilation.selection.rejected_options.values()
+    )
+
+
+def test_edge_dense_sampling_reports_clean_tail_before_closing_jolt(
+    tmp_path: Path,
+) -> None:
+    source = _source_tail_jolt_video(tmp_path / "tail-jolt.mp4")
+    media = probe_video(source)
+
+    evidence = measure_source_camera_motion(
+        source_path=source,
+        source_asset_id=media.asset_id,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        subject_tracks=(),
+        output_dir=tmp_path / "motion",
+    )
+
+    assert evidence.isolated_jolt_count >= 1
+    assert evidence.dirty_tail is True
+    assert evidence.clean_tail_end_ms is not None
+    assert evidence.clean_tail_end_ms <= 1_700
+
+
+def test_legacy_source_motion_artifact_remains_loadable() -> None:
+    payload = {
+        "contract_version": "source-camera-motion-evidence-v1",
+        "estimator_version": "background-gftt-lk-ransac-affine-v1",
+        "source_asset_id": "sha256:" + "a" * 64,
+        "window_start_ms": 0,
+        "window_end_ms": 2_000,
+        "sample_times_ms": [0, 1_900],
+        "sample_frame_pts": [0, 57],
+        "sample_frame_hashes": ["b" * 64, "c" * 64],
+        "subject_exclusion_mode": "none",
+        "mean_excluded_area_fraction": 0.0,
+        "pairs": [],
+        "classification": "static",
+        "reliable": True,
+        "confidence": 0.8,
+        "normalized_translation_x_per_second": 0.0,
+        "normalized_translation_y_per_second": 0.0,
+        "scale_rate_per_second": 0.0,
+        "rotation_degrees_per_second": 0.0,
+        "normalized_travel": 0.0,
+        "reversal_count": 0,
+        "reason_codes": ["legacy"],
+        "cache_key_sha256": "d" * 64,
+    }
+    legacy = SourceCameraMotionEvidence.model_validate(payload)
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert legacy.contract_version == "source-camera-motion-evidence-v1"
+    assert legacy.sampling_version == "legacy-uniform-or-sam-v1"
+    assert legacy.isolated_jolt_count == 0
+    assert legacy.definition_sha256 == expected_sha
 
 
 def test_unreliable_source_motion_forbids_virtual_pan_but_allows_hard_cut() -> None:

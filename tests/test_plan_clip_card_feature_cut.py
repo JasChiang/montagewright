@@ -34,6 +34,7 @@ from jascue_video_lab.models import (
     CardOpportunity,
     Entity,
     EntityKind,
+    EvidenceOriginObservation,
     EvidenceModality,
     FeatureChapterBrief,
     FeatureEditBrief,
@@ -106,9 +107,33 @@ from scripts.plan_clip_card_feature_cut import (
     validate_candidate_video_budget,
     validate_hard_shortlist_provenance,
 )
+from scripts.shortlist_clip_card_feature_candidates import (
+    _shortlist_input_binding,
+)
 
 
 ASSET_ID = "sha256:" + "a" * 64
+
+
+def test_shortlist_reuse_binding_changes_with_effective_evidence() -> None:
+    common = {
+        "catalog": _catalog(),
+        "brief": _brief(),
+        "editorial_contracts": (),
+        "thinking_level": "low",
+    }
+    first = _shortlist_input_binding(
+        **common,
+        evidence=[{"event_id": "demo", "evidence_origin": "direct_source_event"}],
+    )
+    second = _shortlist_input_binding(
+        **common,
+        evidence=[{"event_id": "demo", "evidence_origin": "mediated_depiction"}],
+    )
+
+    assert first["effective_evidence_sha256"] != second[
+        "effective_evidence_sha256"
+    ]
 
 
 def test_autonomous_planner_catalog_exposes_policy_gated_presentations() -> None:
@@ -720,6 +745,113 @@ def test_hard_shortlist_provenance_blocks_prerecorded_playback() -> None:
             candidate_depth=3,
             direct_video_evidence=True,
         )
+
+
+def test_hard_shortlist_and_selected_snapshot_use_effective_origin() -> None:
+    card = _card().model_copy(
+        update={
+            "events": [
+                _card().events[0].model_copy(
+                    update={"evidence_provenance": "direct_result"}
+                )
+            ]
+        }
+    )
+    event = card.events[0]
+    supplement = ClipObservationSupplement(
+        supplement_id="origin-correction",
+        source_asset_id=card.source_asset_id,
+        proxy_asset_id=card.proxy_asset_id,
+        base_card_sha256=clip_card_sha256(card),
+        supplement_prompt_sha256="c" * 64,
+        response_schema_sha256="d" * 64,
+        event_observations=[
+            EventObservationSupplement(
+                event_id=event.event_id,
+                event_fingerprint=event_fingerprint(event),
+                observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+                evidence_provenance="prerecorded_screen_playback",
+                evidence_origin=EvidenceOriginObservation(
+                    relation="mediated_depiction",
+                    observable_reason=(
+                        "The source scene shows a display playing another video."
+                    ),
+                ),
+                capabilities=EventCapabilityManifest(
+                    evidence_origin=AssessmentStatus.ASSESSED_PRESENT,
+                ),
+            )
+        ],
+        model_provenance=card.model_provenance,
+    )
+    shortlist = FeatureShortlistPlan(
+        project_id="project-1",
+        catalog_id="catalog-1",
+        chapters=[
+            FeatureChapterShortlist(
+                feature_id="feature-1",
+                evidence_status="partial",
+                candidates=[
+                    FeatureShortlistCandidate(
+                        source_asset_id=ASSET_ID,
+                        event_id="demo",
+                        retrieval_reason="A displayed result is visible.",
+                    )
+                ],
+            )
+        ],
+        uncertainties=[],
+        model_provenance=_provenance(),
+    )
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "hard-result",
+            "feature_id": "feature-1",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["result"],
+            "allowed_evidence_provenance": ["direct_result"],
+            "narrative_function": "global_energy_peak",
+            "visual_events": [
+                {
+                    "event_type": "result_stable_start",
+                    "cue_relation": "principal_downbeat",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="blocked before candidate-video upload"):
+        validate_hard_shortlist_provenance(
+            shortlist,
+            cards={ASSET_ID: card},
+            contracts=(contract,),
+            candidate_depth=3,
+            direct_video_evidence=True,
+            supplements={ASSET_ID: [supplement]},
+        )
+
+    evidence = build_selected_clip_card_evidence(
+        _v3_plan(),
+        cards={ASSET_ID: card},
+        supplements={ASSET_ID: [supplement]},
+    )
+    selected = evidence.events[0]
+    assert evidence.contract_version == (
+        "clip-card-feature-cut-selected-evidence-v3"
+    )
+    assert selected.evidence_provenance == "prerecorded_screen_playback"
+    assert selected.evidence_origin is not None
+    assert selected.evidence_origin.relation == "mediated_depiction"
+    assert selected.effective_observation_sha256 is not None
 
 
 def test_direct_video_canonicalization_fails_safe_for_missing_duration_and_attention() -> None:

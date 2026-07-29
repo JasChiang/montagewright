@@ -9,6 +9,7 @@ slot before selecting the horizontal and vertical representatives.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import html
 import importlib.metadata
@@ -125,7 +126,14 @@ class OpenEditShot(StrictModel):
         "closing",
     ]
     intended_effect: str
-    target_duration_seconds: float = Field(ge=3.0, le=10.0)
+    target_duration_seconds: float = Field(
+        ge=3.0,
+        le=10.0,
+        description=(
+            "Preferred editorial dwell for selection and legacy compatibility; "
+            "never a fixed trim or source timestamp."
+        ),
+    )
     attention_observation: AttentionObservation | None = None
     candidates: list[OpenEditCandidate] = Field(min_length=2, max_length=4)
     horizontal_candidate_id: str = Field(
@@ -203,6 +211,51 @@ class OpenEditPlan(StrictModel):
 
 
 OPEN_EDIT_NORMALIZATION_VERSION = "clip-card-open-edit-normalization-v1"
+
+
+def generated_open_edit_response_schema() -> dict[str, object]:
+    """Require a complete attention envelope for every newly generated shot.
+
+    ``OpenEditPlan`` keeps the field nullable so saved v1 plans can still be
+    reprojected.  A fresh paid generation has no such compatibility need, so
+    its request schema removes the nullable branch and makes the field
+    required.  The runtime assertion below remains a fail-closed second layer.
+    """
+
+    schema = copy.deepcopy(gemini_response_schema(OpenEditPlan))
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict):
+        raise ValueError("open-edit response schema is missing definitions")
+    shot_schema = definitions.get("OpenEditShot")
+    if not isinstance(shot_schema, dict):
+        raise ValueError("open-edit response schema is missing OpenEditShot")
+    properties = shot_schema.get("properties")
+    if not isinstance(properties, dict):
+        raise ValueError("OpenEditShot response schema is missing properties")
+    properties["attention_observation"] = {
+        "$ref": "#/$defs/AttentionObservation",
+    }
+    required = shot_schema.setdefault("required", [])
+    if not isinstance(required, list):
+        raise ValueError("OpenEditShot response schema has invalid required fields")
+    if "attention_observation" not in required:
+        required.append("attention_observation")
+    return schema
+
+
+def assert_generated_attention_envelopes(plan: OpenEditPlan) -> None:
+    """Reject fresh generated plans that omit a chapter dwell envelope."""
+
+    missing = [
+        shot.feature_id
+        for shot in plan.shots
+        if shot.attention_observation is None
+    ]
+    if missing:
+        raise ValueError(
+            "fresh open-edit output requires attention_observation for every "
+            f"shot; missing={missing}"
+        )
 
 
 def canonicalize_open_edit_output(
@@ -800,7 +853,7 @@ model_provenance 必須先原樣回傳：
         "response_format": {
             "type": "text",
             "mime_type": "application/json",
-            "schema": gemini_response_schema(OpenEditPlan),
+            "schema": generated_open_edit_response_schema(),
         },
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -897,6 +950,8 @@ model_provenance 必須先原樣回傳：
         )
         write_json(args.output_dir / "open-edit.raw-output-reuse.json", reuse_record)
     plan = OpenEditPlan.model_validate_json(output_text)
+    if not args.reuse_raw_output:
+        assert_generated_attention_envelopes(plan)
     validate_evidence(plan, project_id=args.project_id, catalog=catalog, cards=cards)
     if args.reuse_raw_output and plan.model_provenance.model_id != MODEL_ID:
         raise ValueError(

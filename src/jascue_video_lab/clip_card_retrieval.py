@@ -97,6 +97,18 @@ def compact_retrieval_card(
                 "editing_uses": event.editing_uses,
                 "quality_risks": event.quality_risks,
                 "entity_ids": event.entity_ids,
+                "evidence_origin": (
+                    observations[event.event_id].evidence_origin.model_dump(
+                        mode="json"
+                    )
+                    if observations[event.event_id].evidence_origin
+                    else None
+                ),
+                "observation_basis": (
+                    observations[event.event_id].observation_basis.value
+                    if observations[event.event_id].observation_basis
+                    else None
+                ),
                 "capabilities": observations[
                     event.event_id
                 ].capabilities.model_dump(mode="json"),

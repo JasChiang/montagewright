@@ -33,7 +33,9 @@ from jascue_video_lab.clip_card_observations import (
     ClaimDecision,
     ClipObservationSupplement,
     EditingClaim,
+    EventObservationSupplement,
     assess_editing_claim,
+    effective_event_observation_sha256,
     effective_event_observations,
 )
 from jascue_video_lab.clip_card_supplement_runner import (
@@ -60,6 +62,7 @@ from jascue_video_lab.gemini import (
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
     AttentionObservation,
+    EvidenceOriginObservation,
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
@@ -1035,6 +1038,12 @@ class SelectedEvidenceEvent(StrictModel):
     event_id: str
     observable_evidence: str = ""
     evidence_provenance: FeatureEvidenceProvenance = "unknown"
+    evidence_origin: EvidenceOriginObservation | None = None
+    effective_observation: EventObservationSupplement | None = None
+    effective_observation_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     action_completeness: Literal[
         "complete", "partial", "uncertain"
     ] = "uncertain"
@@ -1053,6 +1062,7 @@ class SelectedClipCardEvidence(StrictModel):
     contract_version: Literal[
         "clip-card-feature-cut-selected-evidence-v1",
         "clip-card-feature-cut-selected-evidence-v2",
+        "clip-card-feature-cut-selected-evidence-v3",
     ]
     events: list[SelectedEvidenceEvent]
 
@@ -1067,6 +1077,7 @@ def validate_hard_shortlist_provenance(
     contracts: tuple[EditorialBeatContract, ...],
     candidate_depth: int,
     direct_video_evidence: bool,
+    supplements: dict[str, list[ClipObservationSupplement]] | None = None,
 ) -> None:
     """Fail before multimodal planning when hard evidence is absent.
 
@@ -1076,6 +1087,7 @@ def validate_hard_shortlist_provenance(
     upload and ground those candidates would be wasteful and misleading.
     """
 
+    supplements = supplements or {}
     chapter_by_id = {
         chapter.feature_id: chapter for chapter in shortlist.chapters
     }
@@ -1102,9 +1114,13 @@ def validate_hard_shortlist_provenance(
                 for event in card.events
                 if event.event_id == candidate.event_id
             )
-            observed.append(str(event.evidence_provenance))
+            observation = effective_event_observations(
+                card,
+                supplements.get(candidate.source_asset_id, ()),
+            )[event.event_id]
+            observed.append(str(observation.evidence_provenance))
             eligible = eligible or (
-                event.evidence_provenance
+                observation.evidence_provenance
                 in contract.allowed_evidence_provenance
             )
         if not eligible:
@@ -2585,6 +2601,18 @@ def compact_card_v3(
                 "required_entity_ids": event.required_entity_ids,
                 "optional_entity_ids": event.optional_entity_ids,
                 "avoid_overlay_entity_ids": event.avoid_overlay_entity_ids,
+                "evidence_origin": (
+                    observations[event.event_id].evidence_origin.model_dump(
+                        mode="json"
+                    )
+                    if observations[event.event_id].evidence_origin
+                    else None
+                ),
+                "observation_basis": (
+                    observations[event.event_id].observation_basis.value
+                    if observations[event.event_id].observation_basis
+                    else None
+                ),
                 "observation_capabilities": observations[
                     event.event_id
                 ].capabilities.model_dump(mode="json"),
@@ -2878,9 +2906,11 @@ def build_selected_clip_card_evidence(
     plan: ClipCardFeaturePlanV3,
     *,
     cards: dict[str, FullClipCard],
+    supplements: dict[str, list[ClipObservationSupplement]] | None = None,
 ) -> SelectedClipCardEvidence:
     """Snapshot only locally validated events referenced by the v3 source plan."""
 
+    supplements = supplements or {}
     keys = sorted(
         {
             (candidate.source_asset_id, candidate.event_id)
@@ -2896,6 +2926,10 @@ def build_selected_clip_card_evidence(
         event = next((item for item in card.events if item.event_id == event_id), None)
         if event is None:
             raise ValueError(f"cannot snapshot unknown event: {asset_id}/{event_id}")
+        observation = effective_event_observations(
+            card,
+            supplements.get(asset_id, ()),
+        )[event_id]
         referenced_ids = set(
             event.entity_ids
             + event.primary_entity_ids
@@ -2910,8 +2944,17 @@ def build_selected_clip_card_evidence(
                 source_asset_id=asset_id,
                 event_id=event_id,
                 observable_evidence=event.observable_evidence,
-                evidence_provenance=event.evidence_provenance,
-                action_completeness=event.action_completeness,
+                evidence_provenance=observation.evidence_provenance,
+                evidence_origin=observation.evidence_origin,
+                effective_observation=observation,
+                effective_observation_sha256=(
+                    effective_event_observation_sha256(observation)
+                ),
+                action_completeness=(
+                    observation.source_action_completeness
+                    if observation.source_action_completeness != "uncertain"
+                    else event.action_completeness
+                ),
                 entity_ids=list(event.entity_ids),
                 primary_entity_ids=list(event.primary_entity_ids),
                 required_entity_ids=list(event.required_entity_ids),
@@ -2938,7 +2981,7 @@ def build_selected_clip_card_evidence(
             )
         )
     return SelectedClipCardEvidence(
-        contract_version="clip-card-feature-cut-selected-evidence-v2",
+        contract_version="clip-card-feature-cut-selected-evidence-v3",
         events=events,
     )
 
@@ -4174,6 +4217,7 @@ def main() -> int:
             contracts=tuple(editorial_contracts),
             candidate_depth=args.candidate_video_depth,
             direct_video_evidence=args.candidate_video_evidence,
+            supplements=supplements,
         )
 
     def validate_shortlist_membership(plan: ClipCardFeaturePlanV3) -> None:
@@ -4261,6 +4305,10 @@ def main() -> int:
                     for item in card.events
                     if item.event_id == candidate.event_id
                 )
+                observation = effective_event_observations(
+                    card,
+                    tuple(supplements.get(candidate.source_asset_id, [])),
+                )[event.event_id]
                 if args.candidate_video_evidence:
                     event_entity_ids = set(
                         event.entity_ids
@@ -4296,7 +4344,45 @@ def main() -> int:
                             "event_id": event.event_id,
                             "label": event.label,
                             "observable_evidence": event.observable_evidence,
-                            "action_completeness": event.action_completeness,
+                            "action_completeness": (
+                                observation.source_action_completeness
+                                if observation.source_action_completeness
+                                != "uncertain"
+                                else event.action_completeness
+                            ),
+                            "evidence_origin": (
+                                observation.evidence_origin.model_dump(
+                                    mode="json"
+                                )
+                                if observation.evidence_origin
+                                else None
+                            ),
+                            "observation_basis": (
+                                observation.observation_basis.value
+                                if observation.observation_basis
+                                else None
+                            ),
+                            "observation_capabilities": (
+                                observation.capabilities.model_dump(mode="json")
+                            ),
+                            "observable_beats": [
+                                beat.model_dump(mode="json")
+                                for beat in observation.observable_beats
+                            ],
+                            "evidence_roles": (
+                                observation.evidence_roles.model_dump(
+                                    mode="json"
+                                )
+                            ),
+                            "readability": [
+                                item.model_dump(mode="json")
+                                for item in observation.readability
+                            ],
+                            "audio_role": (
+                                observation.audio_role.model_dump(mode="json")
+                                if observation.audio_role
+                                else None
+                            ),
                             "quality_risks": event.quality_risks,
                             "entity_ids": event.entity_ids,
                             "primary_entity_ids": event.primary_entity_ids,
@@ -4382,13 +4468,14 @@ def main() -> int:
     autonomous_presentation_rules = (
         """
 - 先評估每個候選對 9:16 是 natural、reconstructable 或 unsuitable，並列出
-  suitability_risks；不能只在選完素材後才發現必要人物、產品或 UI 裁不下。
+  suitability_risks；不能只在選完素材後才發現必要人物、物件、文字或狀態
+  裁不下。
 - presentation_preference 只表達語意可接受的呈現類型；本機仍會枚舉 geometry。
   無須運鏡就用 static_full_bleed；需要保持活動主體才用 tracked_full_bleed；
   有可觀察 attention handoff 才用 phase_virtual_camera。
 - required_entity_indices 必須選真正承擔 brief 的最小可見證據範圍。若比較的是
-  厚度、鉸鏈、邊緣、尺寸參照或 UI 局部，應選 Clip Card 中對應的 relation
-  carrier Entity，不得為求保守把整台產品、整個人物或所有共現物件都升成
+  邊緣、接觸點、尺寸參照、文字或 UI 局部，應選 Clip Card 中對應的 relation
+  carrier Entity，不得為求保守把整個物件、整個人物或所有共現物件都升成
   100% hard core。完整外形本身是證據時才要求 whole entity。
 - 必須同時比較或保留 context+detail、共同滿版又不可行時，可以允許
   two_panel_layout；只回傳語意許可與 compare/context_detail goal，不指定上下、
@@ -4452,7 +4539,11 @@ music in this request.
 你是 evidence-bound 的資深短影音挑帶剪輯師。請使用完整 Clip Card library，為使用者 brief 的每個 chapter 保留有排序的候選 take，再分別選出橫式與直式代表。你只能引用輸入列出的 source_asset_id、event_id、entity_id 與 RF frame_id。
 
 規則：
-1. brief 是允許使用的產品 claim，不是畫面證據；observed_visual_evidence 只能寫 Clip Card 直接支持的內容。
+1. brief 是允許使用的敘事 claim，不是畫面證據；observed_visual_evidence 只能
+   寫 Clip Card 直接支持的內容。`evidence_origin` 是跨內容類型的來源關係：
+   direct_source_event、mediated_depiction、graphic_or_text_claim、
+   context_only 或 unknown。它不是 claim 是否成立的結論；內嵌媒體、圖文
+   陳述與相關空景都不得自動升級成來源場景中直接發生的事件或結果。
 2. 每個 brief feature_id 必須依原順序恰好回傳一次。supported chapter 必須保留 2–4 個、partial chapter 保留 1–4 個依品質排序且 evidence frame 不重複的 candidates；優先完整動作、清楚結果、低遮擋、低反光與不同 take。candidate_id 必須從該章 candidate_events 逐字複製，不得自行命名。not_found 不得虛構候選。
 2a. {evidence_scope_rule}
 3. selected frame 的 local_mmss 必須位於所引用 event 的 [start_mmss,end_mmss)；不得自行創造 frame ID 或 timestamp。RF frame_id 必須從 available_catalog_frames 逐字複製並保留全部六位數與前導零，例如 RF000204 不可縮成 RF00204。
@@ -4517,6 +4608,10 @@ model_provenance 必須先原樣回傳：
    有新的閱讀目的，或明確 editorial reprise 時才能重用，並填入 typed reuse
    authority 與具體理由。第一版同一 source 最多使用兩次；手機加立牌等相似構圖
    即使來自不同時間，也不能反覆充當無差別 coverage。
+8. 候選索引中的 `evidence_origin` 只描述來源關係。內嵌影片、投影、圖文 claim
+   或相關空景可以作為經 brief 授權的 contextual presentation，但不得被描述成
+   來源場景中直接發生的動作、狀態轉換或功能結果。若 hard predicate 只得到
+   contextual／mediated evidence，必須保留缺口，不得自行改寫成 direct。
 
 禁止回傳或推測：
 - project_id、catalog_id、feature_id、source_asset_id、event_id、frame_id、
@@ -4529,6 +4624,10 @@ model_provenance 必須先原樣回傳：
 構圖規則：
 - 9:16 優先採可安全滿版的靜態或 tracked crop；不要因為 brief 有 primary target
   就製造跟隨，也不要因為邊緣略有裁切就退回補邊。
+- `presentation_preference` 是語意上可接受的偏好，不是直接執行命令。若共同
+  靜態滿版能保留必要證據，本機應先用滿版；只有共同滿版不可行，而且關係確實
+  需要同時理解時，two-panel 才是候選。sequential relation 則先考慮最小必要
+  虛擬鏡頭或合法 hard cut。不要因畫面「有兩個東西」就要求 two-panel。
 {autonomous_presentation_rules}
 - coverage_mode=sequential：兩個以上主體可以依序看懂，每個 phase 只鎖自己的
   anchor；本機可平移或在距離過遠時切換視角。
@@ -5341,6 +5440,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
     selected_evidence = build_selected_clip_card_evidence(
         final_audit,
         cards=cards,
+        supplements=supplements,
     )
     final_plan = project_feature_contracts_v3(
         final_audit,

@@ -12,12 +12,15 @@ from jascue_video_lab.clip_card_observations import (
     ObservableBeat,
     assess_editing_claim,
     clip_card_sha256,
+    effective_event_observation_sha256,
     effective_event_observations,
+    effective_event_observations_sha256,
     event_fingerprint,
     plan_supplement_needs,
 )
 from jascue_video_lab.clip_card_retrieval import compact_retrieval_card
 from jascue_video_lab.clip_card_supplement_runner import (
+    CAPABILITY_NAMES,
     bounded_event_window_ms,
     validate_requested_observation,
 )
@@ -25,6 +28,7 @@ from jascue_video_lab.models import (
     BoundaryPrecision,
     Entity,
     EntityKind,
+    EvidenceOriginObservation,
     EvidenceModality,
     FullClipAttentionPhase,
     FullClipCard,
@@ -194,6 +198,173 @@ def test_compact_retrieval_carries_capabilities_and_evidence_roles() -> None:
     assert "portrait_reframe_feasibility" not in compact
 
 
+def test_legacy_provenance_migrates_to_generic_origin() -> None:
+    card = _card()
+    card.events[0].evidence_provenance = "prerecorded_screen_playback"
+
+    observation = effective_event_observations(card)["event"]
+
+    assert (
+        observation.capabilities.evidence_origin
+        == AssessmentStatus.ASSESSED_PRESENT
+    )
+    assert observation.evidence_origin is not None
+    assert observation.evidence_origin.relation == "mediated_depiction"
+    assert observation.observation_basis == ObservationBasis.FULL_CLIP_VIDEO
+    compact_event = compact_retrieval_card(card)["events"][0]
+    assert compact_event["evidence_origin"]["relation"] == "mediated_depiction"
+    assert compact_event["observation_basis"] == "full_clip_video"
+
+
+def test_base_clip_event_accepts_generic_origin_without_legacy_enum() -> None:
+    card = _card()
+    card.events[0].evidence_origin = EvidenceOriginObservation(
+        relation="mediated_depiction",
+        observable_reason="The source scene visibly contains replayed media.",
+    )
+
+    observation = effective_event_observations(card)["event"]
+
+    assert observation.evidence_origin == card.events[0].evidence_origin
+    assert observation.evidence_provenance == "unknown"
+    assert event_fingerprint(card.events[0]) != event_fingerprint(_card().events[0])
+
+
+def test_base_clip_event_rejects_conflicting_legacy_and_generic_origin() -> None:
+    payload = _card().events[0].model_dump(mode="json")
+    payload["evidence_provenance"] = "direct_result"
+    payload["evidence_origin"] = {
+        "relation": "mediated_depiction",
+        "observable_reason": "Only a replayed depiction is visible.",
+    }
+
+    try:
+        FullClipEvent.model_validate(payload)
+    except ValueError as error:
+        assert "conflicts with generic evidence_origin" in str(error)
+    else:
+        raise AssertionError("conflicting base evidence origins were accepted")
+
+
+def test_legacy_v1_supplement_remains_readable() -> None:
+    card = _card()
+    payload = _supplement(card).model_dump(mode="json")
+    payload["contract_version"] = "clip-observation-supplement-v1"
+
+    restored = ClipObservationSupplement.model_validate(payload)
+
+    assert restored.contract_version == "clip-observation-supplement-v1"
+    assert restored.event_observations[0].evidence_origin is None
+    assert _supplement(card).contract_version == "clip-observation-supplement-v2"
+
+
+def test_generic_origin_override_replaces_stale_legacy_directness() -> None:
+    card = _card()
+    card.events[0].evidence_provenance = "direct_result"
+    supplement = _supplement(card)
+    incoming = supplement.event_observations[0]
+    supplement = supplement.model_copy(
+        update={
+            "event_observations": [
+                incoming.model_copy(
+                    update={
+                        "capabilities": incoming.capabilities.model_copy(
+                            update={
+                                "evidence_origin": (
+                                    AssessmentStatus.ASSESSED_PRESENT
+                                )
+                            }
+                        ),
+                        "evidence_origin": EvidenceOriginObservation(
+                            relation="mediated_depiction",
+                            observable_reason=(
+                                "The bounded media shows a display replaying footage."
+                            ),
+                        ),
+                        "evidence_provenance": "prerecorded_screen_playback",
+                    }
+                )
+            ]
+        }
+    )
+
+    observation = effective_event_observations(card, [supplement])["event"]
+
+    assert observation.evidence_origin is not None
+    assert observation.evidence_origin.relation == "mediated_depiction"
+    assert observation.evidence_provenance == "prerecorded_screen_playback"
+
+
+def test_conflicting_generic_origins_fail_closed() -> None:
+    card = _card()
+    first = _supplement(card)
+    incoming = first.event_observations[0]
+    first = first.model_copy(
+        update={
+            "event_observations": [
+                incoming.model_copy(
+                    update={
+                        "capabilities": incoming.capabilities.model_copy(
+                            update={
+                                "evidence_origin": (
+                                    AssessmentStatus.ASSESSED_PRESENT
+                                )
+                            }
+                        ),
+                        "evidence_origin": EvidenceOriginObservation(
+                            relation="direct_source_event",
+                            observable_reason="The source event itself is visible.",
+                        ),
+                    }
+                )
+            ]
+        }
+    )
+    second_observation = first.event_observations[0].model_copy(
+        update={
+            "evidence_origin": EvidenceOriginObservation(
+                relation="mediated_depiction",
+                observable_reason="Only a replayed depiction is visible.",
+            ),
+            "evidence_provenance": "prerecorded_screen_playback",
+        }
+    )
+    second = first.model_copy(
+        update={
+            "supplement_id": "observation-002",
+            "event_observations": [second_observation],
+        }
+    )
+
+    try:
+        effective_event_observations(card, [first, second])
+    except ValueError as error:
+        assert "conflicting evidence_origin" in str(error)
+    else:
+        raise AssertionError("conflicting evidence origins were merged")
+
+
+def test_effective_observation_hash_is_order_stable_and_content_bound() -> None:
+    card = _card()
+    first = _supplement(card)
+    second = first.model_copy(
+        update={
+            "supplement_id": "observation-002",
+            "supersedes": [first.supplement_id],
+        }
+    )
+    forward = effective_event_observations_sha256(card, [first, second])
+    reverse = effective_event_observations_sha256(card, [second, first])
+    merged = effective_event_observations(card, [first, second])["event"]
+
+    assert forward == reverse
+    assert effective_event_observation_sha256(merged) != (
+        effective_event_observation_sha256(
+            merged.model_copy(update={"clean_exit": "reset"})
+        )
+    )
+
+
 def test_generic_supplement_triggers_do_not_depend_on_product_labels() -> None:
     card = _card()
     needs = plan_supplement_needs(
@@ -321,3 +492,175 @@ def test_unrequested_capability_cannot_leak_from_supplement_call() -> None:
         assert "unrequested capability evidence_roles" in str(error)
     else:
         raise AssertionError("unrequested assessed capability leaked through")
+
+
+def test_evidence_origin_is_a_requestable_bounded_capability() -> None:
+    card = _card()
+    event = card.events[0]
+    observation = EventObservationSupplement(
+        event_id=event.event_id,
+        event_fingerprint=event_fingerprint(event),
+        observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+        capabilities=EventCapabilityManifest(
+            evidence_origin=AssessmentStatus.ASSESSED_PRESENT,
+        ),
+        evidence_origin=EvidenceOriginObservation(
+            relation="mediated_depiction",
+            observable_reason="The bounded video visibly contains replayed media.",
+        ),
+    )
+
+    validate_requested_observation(
+        observation,
+        event=event,
+        requested_capabilities=["evidence_origin"],
+        audio_included=False,
+    )
+
+    assert "evidence_origin" in CAPABILITY_NAMES
+
+
+def test_runner_accepts_v1_legacy_origin_for_requested_capability() -> None:
+    card = _card()
+    event = card.events[0]
+    legacy = EventObservationSupplement(
+        event_id=event.event_id,
+        event_fingerprint=event_fingerprint(event),
+        observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+        evidence_provenance="prerecorded_screen_playback",
+        capabilities=EventCapabilityManifest(),
+    )
+
+    validate_requested_observation(
+        legacy,
+        event=event,
+        requested_capabilities=["evidence_origin"],
+        audio_included=False,
+    )
+
+    merged = effective_event_observations(
+        card,
+        [
+            ClipObservationSupplement(
+                contract_version="clip-observation-supplement-v1",
+                supplement_id="legacy-origin",
+                source_asset_id=card.source_asset_id,
+                proxy_asset_id=card.proxy_asset_id,
+                base_card_sha256=clip_card_sha256(card),
+                supplement_prompt_sha256="c" * 64,
+                response_schema_sha256="d" * 64,
+                event_observations=[legacy],
+                model_provenance=card.model_provenance,
+            )
+        ],
+    )["event"]
+    assert merged.evidence_origin is not None
+    assert merged.evidence_origin.relation == "mediated_depiction"
+
+
+def test_unrequested_evidence_origin_cannot_leak_from_bounded_call() -> None:
+    card = _card()
+    event = card.events[0]
+    observation = EventObservationSupplement(
+        event_id=event.event_id,
+        event_fingerprint=event_fingerprint(event),
+        observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+        capabilities=EventCapabilityManifest(
+            evidence_origin=AssessmentStatus.ASSESSED_PRESENT,
+        ),
+        evidence_origin=EvidenceOriginObservation(
+            relation="direct_source_event",
+            observable_reason="The source event itself is directly visible.",
+        ),
+    )
+
+    try:
+        validate_requested_observation(
+            observation,
+            event=event,
+            requested_capabilities=["action_structure"],
+            audio_included=False,
+        )
+    except ValueError as error:
+        assert "unrequested capability evidence_origin" in str(error)
+    else:
+        raise AssertionError("unrequested evidence origin leaked through")
+
+
+def test_no_bounded_media_keeps_unknown_origin_not_assessed() -> None:
+    card = _card()
+    event = card.events[0]
+    observation = EventObservationSupplement(
+        event_id=event.event_id,
+        event_fingerprint=event_fingerprint(event),
+        capabilities=EventCapabilityManifest(),
+    )
+
+    validate_requested_observation(
+        observation,
+        event=event,
+        requested_capabilities=["evidence_origin"],
+        audio_included=False,
+        expected_observation_basis=None,
+    )
+
+    assert (
+        observation.capabilities.evidence_origin
+        == AssessmentStatus.NOT_ASSESSED
+    )
+    assert observation.evidence_origin is None
+
+
+def test_no_bounded_media_cannot_claim_evidence_origin_absent() -> None:
+    card = _card()
+    event = card.events[0]
+    observation = EventObservationSupplement(
+        event_id=event.event_id,
+        event_fingerprint=event_fingerprint(event),
+        observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+        capabilities=EventCapabilityManifest(
+            evidence_origin=AssessmentStatus.ASSESSED_ABSENT,
+        ),
+    )
+
+    try:
+        validate_requested_observation(
+            observation,
+            event=event,
+            requested_capabilities=["evidence_origin"],
+            audio_included=False,
+            expected_observation_basis=None,
+        )
+    except ValueError as error:
+        assert "without bounded observation media" in str(error)
+    else:
+        raise AssertionError("missing bounded media proved evidence absence")
+
+
+def test_assessed_unknown_origin_must_remain_not_assessed() -> None:
+    card = _card()
+    event = card.events[0]
+    observation = EventObservationSupplement(
+        event_id=event.event_id,
+        event_fingerprint=event_fingerprint(event),
+        observation_basis=ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO,
+        capabilities=EventCapabilityManifest(
+            evidence_origin=AssessmentStatus.ASSESSED_PRESENT,
+        ),
+        evidence_origin=EvidenceOriginObservation(
+            relation="unknown",
+            observable_reason="The bounded media does not support a classification.",
+        ),
+    )
+
+    try:
+        validate_requested_observation(
+            observation,
+            event=event,
+            requested_capabilities=["evidence_origin"],
+            audio_included=False,
+        )
+    except ValueError as error:
+        assert "unknown evidence origin must remain not_assessed" in str(error)
+    else:
+        raise AssertionError("unknown evidence origin was marked assessed")

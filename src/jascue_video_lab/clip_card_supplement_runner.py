@@ -9,6 +9,7 @@ from typing import Iterable
 from .clip_card_observations import (
     AssessmentStatus,
     EventObservationSupplement,
+    ObservationBasis,
     event_fingerprint,
 )
 from .media import has_audio_stream, sha256_file
@@ -16,6 +17,7 @@ from .models import FullClipCard, FullClipEvent
 
 
 CAPABILITY_NAMES = (
+    "evidence_origin",
     "action_structure",
     "evidence_roles",
     "observable_beats",
@@ -105,6 +107,9 @@ def validate_requested_observation(
     event: FullClipEvent,
     requested_capabilities: Iterable[str],
     audio_included: bool,
+    expected_observation_basis: ObservationBasis | None = (
+        ObservationBasis.EVENT_PLUS_CONTEXT_VIDEO
+    ),
 ) -> None:
     requested = set(requested_capabilities)
     unknown = requested - set(CAPABILITY_NAMES)
@@ -122,6 +127,45 @@ def validate_requested_observation(
             raise ValueError(
                 f"unrequested capability {capability} must remain not_assessed"
             )
+    assessed = {
+        capability
+        for capability in CAPABILITY_NAMES
+        if getattr(observation.capabilities, capability)
+        != AssessmentStatus.NOT_ASSESSED
+    }
+    if expected_observation_basis is None and (
+        assessed or observation.observation_basis is not None
+    ):
+        raise ValueError(
+            "capabilities cannot be assessed without bounded observation media"
+        )
+    if (
+        expected_observation_basis is not None
+        and observation.observation_basis != expected_observation_basis
+    ):
+        raise ValueError(
+            "bounded observation changed immutable observation_basis"
+        )
+    origin_status = observation.capabilities.evidence_origin
+    if (
+        origin_status == AssessmentStatus.ASSESSED_PRESENT
+        and observation.evidence_origin is not None
+        and observation.evidence_origin.relation == "unknown"
+    ):
+        raise ValueError(
+            "unknown evidence origin must remain not_assessed, not assessed_present"
+        )
+    if (
+        origin_status
+        in {
+            AssessmentStatus.ASSESSED_ABSENT,
+            AssessmentStatus.NOT_APPLICABLE,
+        }
+        and observation.evidence_provenance != "unknown"
+    ):
+        raise ValueError(
+            "absent or inapplicable evidence origin conflicts with legacy provenance"
+        )
 
 
 def supplement_cache_key(
@@ -136,7 +180,7 @@ def supplement_cache_key(
     response_schema_sha256: str,
 ) -> dict[str, object]:
     return {
-        "contract_version": "clip-observation-supplement-cache-v1",
+        "contract_version": "clip-observation-supplement-cache-v2",
         "source_video_sha256": sha256_file(source_video),
         "source_asset_id": card.source_asset_id,
         "proxy_asset_id": card.proxy_asset_id,

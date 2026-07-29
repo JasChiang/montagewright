@@ -154,6 +154,7 @@ from .presentation import (
     GroundingTargetRequest,
     MultiTargetGroundingGroup,
     PresentationTarget,
+    SourceCameraMotionEvidence,
     _signed_motion_reversal_count,
     _vertical_center_crop_filter,
     _vertical_delivery_fallback,
@@ -4146,6 +4147,41 @@ def _tracking_coverage_recovery_window(
         recovery_end - recovery_start < minimum_duration_ms
         or recovery_start < current_start_ms
         or recovery_end > current_end_ms
+        or recovery_end - recovery_start
+        >= current_end_ms - current_start_ms
+    ):
+        return None
+    return recovery_start, recovery_end
+
+
+def _source_motion_clean_recovery_window(
+    geometry: Mapping[str, Any],
+    *,
+    current_start_ms: int,
+    current_end_ms: int,
+    evidence_time_ms: int,
+    minimum_duration_ms: int,
+) -> tuple[int, int] | None:
+    """Contract dirty camera-settle edges while preserving locked evidence."""
+
+    payload = geometry.get("source_camera_motion_evidence")
+    if not isinstance(payload, Mapping) or minimum_duration_ms <= 0:
+        return None
+    if payload.get("contract_version") != "source-camera-motion-evidence-v2":
+        return None
+    if not payload.get("dirty_head") and not payload.get("dirty_tail"):
+        return None
+    clean_start = payload.get("clean_head_start_ms")
+    clean_end = payload.get("clean_tail_end_ms")
+    if not isinstance(clean_start, (int, float)) or not isinstance(
+        clean_end, (int, float)
+    ):
+        return None
+    recovery_start = max(current_start_ms, round(clean_start))
+    recovery_end = min(current_end_ms, round(clean_end))
+    if (
+        recovery_end - recovery_start < minimum_duration_ms
+        or not recovery_start <= evidence_time_ms < recovery_end
         or recovery_end - recovery_start
         >= current_end_ms - current_start_ms
     ):
@@ -8281,6 +8317,149 @@ def _candidate_capability_boundaries(
     return acceptable, forbidden
 
 
+def _semantic_beat_for_runtime_candidate(
+    semantic_beat: SemanticBeat | None,
+    option: Mapping[str, Any],
+) -> SemanticBeat | None:
+    """Bind beat-level intent to the concrete Top-K candidate being tried.
+
+    The shared semantic IR preserves story-level duration and evidence
+    obligations.  Geometry, relation topology, and executable presentation
+    families belong to the concrete candidate, however.  Reusing rank one's
+    topology for every fallback take can incorrectly force a panel or suppress
+    a valid full-bleed/virtual-camera option.
+    """
+
+    if semantic_beat is None:
+        return None
+    regions = tuple(
+        region
+        if isinstance(region, FramingRegionIntent)
+        else FramingRegionIntent.model_validate(region)
+        for region in (option.get("regions") or ())
+    )
+    hard_regions = tuple(
+        region
+        for region in regions
+        if region.execution_role == "hard_core"
+    )
+    if hard_regions:
+        visibility_targets = tuple(
+            VisibilityTarget(
+                target_id=region.entity_id or region.region_id,
+                minimum_visible_fraction=(
+                    region.effective_minimum_visible_fraction
+                ),
+                minimum_readability=(
+                    0.9
+                    if region.kind in {"text_region", "ui_region"}
+                    else 0.5
+                ),
+                atomic=region.atomic,
+            )
+            for region in hard_regions
+        )
+    else:
+        visibility_targets = semantic_beat.visibility_contract.targets
+
+    coverage_mode = str(option.get("coverage_mode") or "simultaneous")
+    if len(visibility_targets) <= 1:
+        temporal_visibility: Literal["one", "ordered", "simultaneous"] = "one"
+    elif coverage_mode == "sequential":
+        temporal_visibility = "ordered"
+    else:
+        temporal_visibility = "simultaneous"
+
+    presentation_preference = str(
+        option.get("presentation_preference") or "tracked_full_bleed"
+    )
+    presentation_goal = str(option.get("presentation_goal") or "hold")
+    physical_scale_comparison = bool(
+        option.get("physical_scale_comparison", False)
+    )
+    panel_semantically_admissible = (
+        len(visibility_targets) == 2
+        and (
+            physical_scale_comparison
+            or presentation_goal in {"compare", "context_detail"}
+            or presentation_preference == "two_panel_layout"
+        )
+    )
+    acceptable = set(
+        _normal_acceptable_capability_ids(presentation_preference)
+    )
+    if panel_semantically_admissible:
+        acceptable.add("two_panel_layout")
+    known = (
+        set(semantic_beat.acceptable_capability_ids)
+        | set(semantic_beat.forbidden_capability_ids)
+        | set(acceptable)
+    )
+
+    ordered_target_ids = tuple(
+        target.target_id for target in visibility_targets
+    )
+    proposal = option.get("virtual_camera_proposal")
+    if proposal is not None:
+        proposal_data = (
+            proposal.model_dump(mode="python")
+            if hasattr(proposal, "model_dump")
+            else proposal
+        )
+        region_target_by_id = {
+            region.region_id: region.entity_id or region.region_id
+            for region in regions
+        }
+        proposed_order = tuple(
+            region_target_by_id.get(str(region_id), str(region_id))
+            for phase in proposal_data.get("phases", ())
+            for region_id in phase.get("anchor_region_ids", ())
+        )
+        visible_ids = {
+            target.target_id for target in visibility_targets
+        }
+        ordered_target_ids = tuple(
+            target_id
+            for target_id in dict.fromkeys(proposed_order)
+            if target_id in visible_ids
+        ) or ordered_target_ids
+
+    attention_goal = (
+        "compare" if presentation_goal == "context_detail" else presentation_goal
+    )
+    motion_motivation = {
+        "follow": "containment",
+        "reveal": "reveal",
+        "emphasize": "emphasis",
+    }.get(presentation_goal, "none")
+    return semantic_beat.model_copy(
+        update={
+            "visibility_contract": VisibilityContract(
+                targets=visibility_targets,
+                temporal_visibility=temporal_visibility,
+                preserve_spatial_relation=coverage_mode
+                in {"simultaneous", "relation_core"},
+                preserve_relative_scale=(
+                    physical_scale_comparison
+                    and len(visibility_targets) >= 2
+                ),
+            ),
+            "attention_intent": AttentionIntent(
+                ordered_target_ids=ordered_target_ids,
+                goal=attention_goal,
+                motion_motivation=motion_motivation,
+            ),
+            "acceptable_capability_ids": tuple(sorted(acceptable)),
+            "forbidden_capability_ids": tuple(sorted(known - acceptable)),
+            "panel_target_groups": (
+                tuple((target.target_id,) for target in visibility_targets)
+                if panel_semantically_admissible
+                else ()
+            ),
+        }
+    )
+
+
 def _project_feature_semantic_edit_ir(
     *,
     brief: FeatureEditBrief,
@@ -8835,6 +9014,7 @@ def _runtime_scope_preserving_presentation_fallback(
     relation_mode: str,
     physical_scale_comparison: bool,
     semantic_beat: SemanticBeat | None,
+    source_camera_motion_evidence: SourceCameraMotionEvidence | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     """Recover locally after whole-window evidence invalidates a crop.
 
@@ -8913,6 +9093,7 @@ def _runtime_scope_preserving_presentation_fallback(
             physical_scale_comparison=physical_scale_comparison,
             allow_static_full_bleed=True,
             tracking_available=False,
+            source_camera_motion_evidence=source_camera_motion_evidence,
             acceptable_capability_ids=acceptable_capability_ids,
             forbidden_capability_ids=forbidden_capability_ids,
             required_readability_by_target={
@@ -9399,6 +9580,36 @@ def _vertical_candidate_geometry(
                         negotiation_dir / "semantic_negotiation.skipped.json",
                         semantic_negotiation_artifact,
                     )
+            if autonomous_compilation.mode == "blocked":
+                filter_graph = _vertical_center_crop_filter()
+                geometry = {
+                    "applied_strategy": "blocked",
+                    "fallback_reason": (
+                        "autonomous_presentation_blocked:"
+                        + ",".join(autonomous_compilation.decision_codes)
+                    ),
+                    "risk_codes": list(
+                        dict.fromkeys(
+                            (
+                                *autonomous_compilation.decision_codes,
+                                "autonomous_presentation_hard_constraint_failed",
+                            )
+                        )
+                    ),
+                    "full_bleed": False,
+                    "source_geometry_lineage_passed": True,
+                    "tracking_confidence_gate_passed": all(
+                        _track_confidence_diagnostics(track)[
+                            "tracking_confidence_gate_passed"
+                        ]
+                        for track in hard_tracks
+                    ),
+                    "coverage_passed": False,
+                    "minimum_visible_required_area_fraction": 0.0,
+                    "soft_extent_visibility_passed": False,
+                    "paid_model_calls_added": 0,
+                    **source_lineage,
+                }
             if autonomous_compilation.mode == "two_panel_layout":
                 assert autonomous_compilation.panel_layout is not None
                 filter_graph = two_panel_ffmpeg_filter(
@@ -9523,6 +9734,7 @@ def _vertical_candidate_geometry(
             }
         )
         if geometry.get("applied_strategy") in {
+            "blocked",
             "two_panel_layout",
             "solid_matte_fit",
             "static_full_bleed_crop",
@@ -9730,6 +9942,11 @@ def _vertical_candidate_geometry(
             relation_mode=relation_mode,
             physical_scale_comparison=physical_scale_comparison,
             semantic_beat=semantic_beat,
+            source_camera_motion_evidence=(
+                source_camera_motion_evidence
+                if autonomous_compilation is not None
+                else None
+            ),
         )
         if runtime_fallback is not None:
             filter_graph, geometry = runtime_fallback
@@ -14392,7 +14609,20 @@ def _run_feature_cut_experiment_impl(
             if autonomous_policy is not None
             else 90.0
         )
-        if allow_shorter_within_delivery_range and not fixed_duration_seconds:
+        legacy_attention_contract = any(
+            chapter.evidence_authority
+            in {"gemini_relative_dwell_legacy", "brief_fallback"}
+            for chapter in attention_profile.chapters
+        )
+        if legacy_attention_contract and not fixed_duration_seconds:
+            # Old review briefs may carry a global 60–90 second placeholder
+            # while their chapter-local selections only justify a few seconds.
+            # Preserve those local dwells instead of manufacturing a long hold.
+            project_duration_seconds = attention_preferred_seconds
+            duration_resolution_authority = (
+                "legacy_chapter_dwell_not_global_fill"
+            )
+        elif allow_shorter_within_delivery_range and not fixed_duration_seconds:
             if (
                 delivery_floor_seconds
                 <= attention_preferred_seconds
@@ -14962,7 +15192,7 @@ def _run_feature_cut_experiment_impl(
                         / "16x9"
                         / f"{index:02d}-{horizontal_segment_fingerprint[:12]}.mp4"
                     )
-                    horizontal_segment = (
+                    cached_horizontal_segment = (
                         _reuse_content_addressed_segment(
                             output_dir=output_dir,
                             aspect="16x9",
@@ -14970,9 +15200,13 @@ def _run_feature_cut_experiment_impl(
                             expected_duration=(h_end - h_start) / 1000,
                             dimensions=(1920, 1080),
                         )
-                        or horizontal_segment
                     )
-                    if not _segment_is_valid(
+                    horizontal_cache_hit = (
+                        cached_horizontal_segment is not None
+                    )
+                    if cached_horizontal_segment is not None:
+                        horizontal_segment = cached_horizontal_segment
+                    elif not _segment_is_valid(
                         horizontal_segment,
                         expected_duration=(h_end - h_start) / 1000,
                         dimensions=(1920, 1080),
@@ -14991,6 +15225,11 @@ def _run_feature_cut_experiment_impl(
                             source_has_audio=horizontal_source_has_audio,
                             source_interval=horizontal_source_interval,
                         )
+                    horizontal_geometry["segment_cache"] = {
+                        "content_addressed_hit": horizontal_cache_hit,
+                        "fingerprint": horizontal_segment_fingerprint,
+                        "cache_hit_validated_once": horizontal_cache_hit,
+                    }
                     horizontal_boundary_lineage = _write_render_boundary_lineage(
                         segment_path=horizontal_segment,
                         source_interval=horizontal_source_interval,
@@ -15057,8 +15296,9 @@ def _run_feature_cut_experiment_impl(
                     candidate_id = str(option_data["candidate_id"])
                     candidate_rank = int(option_data["rank"])
                     frame_id = str(option_data["frame_id"])
-                    candidate_semantic_beat = semantic_beat_by_id.get(
-                        selected.feature_id
+                    candidate_semantic_beat = _semantic_beat_for_runtime_candidate(
+                        semantic_beat_by_id.get(selected.feature_id),
+                        option_data,
                     )
                     try:
                         candidate_frame = frames[frame_id]
@@ -15523,9 +15763,7 @@ def _run_feature_cut_experiment_impl(
                                     False,
                                 )
                             ),
-                            "semantic_beat": semantic_beat_by_id.get(
-                                selected.feature_id
-                            ),
+                            "semantic_beat": candidate_semantic_beat,
                         }
                         if autonomous_static_audition:
                             candidate_filter = (
@@ -15677,7 +15915,7 @@ def _run_feature_cut_experiment_impl(
                             and bool(contract.visual_events)
                             for contract in editorial_templates
                         )
-                        recovery_window = (
+                        tracking_recovery_window = (
                             _tracking_coverage_recovery_window(
                                 candidate_geometry,
                                 current_start_ms=candidate_start,
@@ -15695,6 +15933,29 @@ def _run_feature_cut_experiment_impl(
                                 and not has_explicit_event_contract
                             )
                             else None
+                        )
+                        source_motion_recovery_window = (
+                            _source_motion_clean_recovery_window(
+                                candidate_geometry,
+                                current_start_ms=candidate_start,
+                                current_end_ms=candidate_end,
+                                evidence_time_ms=(
+                                    candidate_frame.requested_time_ms
+                                ),
+                                minimum_duration_ms=round(
+                                    minimum_dwell_seconds * 1000
+                                ),
+                            )
+                            if (
+                                autonomous_profile
+                                and minimum_dwell_seconds is not None
+                                and not has_explicit_event_contract
+                            )
+                            else None
+                        )
+                        recovery_window = (
+                            source_motion_recovery_window
+                            or tracking_recovery_window
                         )
                         if recovery_window is not None:
                             recovery_start, recovery_end = recovery_window
@@ -15792,6 +16053,10 @@ def _run_feature_cut_experiment_impl(
                                     candidate_trim = {
                                         **candidate_trim,
                                         "trim_method": (
+                                            "source_motion_clean_edge_recovery"
+                                            if source_motion_recovery_window
+                                            is not None
+                                            else
                                             "tracking_coverage_minimum_"
                                             "dwell_recovery"
                                         ),
@@ -15810,6 +16075,12 @@ def _run_feature_cut_experiment_impl(
                                     candidate_geometry[
                                         "tracking_coverage_trim_recovery"
                                     ] = {
+                                        "recovery_reason": (
+                                            "source_camera_dirty_edge"
+                                            if source_motion_recovery_window
+                                            is not None
+                                            else "tracking_coverage"
+                                        ),
                                         "previous_start_ms": (
                                             previous_start
                                         ),
@@ -17293,17 +17564,17 @@ def _run_feature_cut_experiment_impl(
                     / "9x16"
                     / f"{index:02d}-{vertical_segment_fingerprint[:12]}.mp4"
                 )
-                vertical_segment = (
-                    _reuse_content_addressed_segment(
-                        output_dir=output_dir,
-                        aspect="9x16",
-                        fingerprint=vertical_segment_fingerprint,
-                        expected_duration=(v_end - v_start) / 1000,
-                        dimensions=(1080, 1920),
-                    )
-                    or vertical_segment
+                cached_vertical_segment = _reuse_content_addressed_segment(
+                    output_dir=output_dir,
+                    aspect="9x16",
+                    fingerprint=vertical_segment_fingerprint,
+                    expected_duration=(v_end - v_start) / 1000,
+                    dimensions=(1080, 1920),
                 )
-                if not _segment_is_valid(
+                vertical_cache_hit = cached_vertical_segment is not None
+                if cached_vertical_segment is not None:
+                    vertical_segment = cached_vertical_segment
+                elif not _segment_is_valid(
                     vertical_segment,
                     expected_duration=(v_end - v_start) / 1000,
                     dimensions=(1080, 1920),
@@ -17318,6 +17589,11 @@ def _run_feature_cut_experiment_impl(
                         source_has_audio=vertical_source_has_audio,
                         source_interval=vertical_source_interval,
                     )
+                vertical_geometry["segment_cache"] = {
+                    "content_addressed_hit": vertical_cache_hit,
+                    "fingerprint": vertical_segment_fingerprint,
+                    "cache_hit_validated_once": vertical_cache_hit,
+                }
                 vertical_boundary_lineage = _write_render_boundary_lineage(
                     segment_path=vertical_segment,
                     source_interval=vertical_source_interval,
@@ -17890,15 +18166,54 @@ def _run_feature_cut_experiment_impl(
                     for chapter in vertical_chapters
                 }
             )
-            source_camera_motion_audited = all(
-                chapter.get("source_camera_motion_measured") is True
-                and chapter.get("source_camera_motion_reliable") is True
+            def validated_source_motion(
+                chapter: Mapping[str, Any],
+            ) -> SourceCameraMotionEvidence | None:
+                payload = chapter.get("source_camera_motion_evidence")
+                if (
+                    chapter.get("source_camera_motion_measured") is not True
+                    or chapter.get("source_camera_motion_reliable") is not True
+                    or not isinstance(payload, Mapping)
+                ):
+                    return None
+                try:
+                    evidence = SourceCameraMotionEvidence.model_validate(
+                        payload
+                    )
+                except Exception:
+                    return None
+                if (
+                    evidence.contract_version
+                    != "source-camera-motion-evidence-v2"
+                    or not evidence.sampling_complete
+                    or chapter.get(
+                        "source_camera_motion_evidence_sha256"
+                    )
+                    != evidence.definition_sha256
+                ):
+                    return None
+                return evidence
+
+            source_motion_by_chapter = [
+                validated_source_motion(chapter)
                 for chapter in vertical_chapters
+            ]
+            source_camera_motion_audited = all(
+                evidence is not None
+                for evidence in source_motion_by_chapter
             )
             unwanted_source_camera_motion_count = sum(
-                "unwanted_source_camera_motion"
-                in set(chapter.get("risk_codes") or [])
-                for chapter in vertical_chapters
+                (
+                    "unwanted_source_camera_motion"
+                    in set(chapter.get("risk_codes") or [])
+                )
+                or evidence is None
+                or evidence.isolated_jolt_count > 0
+                for chapter, evidence in zip(
+                    vertical_chapters,
+                    source_motion_by_chapter,
+                    strict=True,
+                )
             )
             hard_dead_air_windows = (
                 [

@@ -2,6 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from jascue_video_lab.models import (
+    AttentionObservation,
+    FramingRegionIntent,
+    ModelProvenance,
+)
 from scripts.apply_open_edit_candidate_overrides import (
     CandidateOverride,
     CandidateOverridePatch,
@@ -14,12 +21,12 @@ from scripts.plan_clip_card_open_edit import (
     OpenEditPlan,
     OpenEditShot,
     VerticalOverflowProposal,
+    assert_generated_attention_envelopes,
+    generated_open_edit_response_schema,
     project_feature_contracts,
     reproject_external_feature_plan,
     reproject_external_feature_plan_v2,
 )
-import pytest
-from jascue_video_lab.models import FramingRegionIntent, ModelProvenance
 
 
 def candidate(candidate_id: str, frame_id: str) -> OpenEditCandidate:
@@ -39,6 +46,102 @@ def candidate(candidate_id: str, frame_id: str) -> OpenEditCandidate:
         vertical_crop_mode="strict",
         confidence=0.9,
     )
+
+
+def attention_observation(
+    *,
+    minimum: float = 3.0,
+    maximum: float = 9.0,
+) -> AttentionObservation:
+    return AttentionObservation(
+        semantic_novelty=0.7,
+        action_progress=0.8,
+        visual_motion=0.5,
+        composition_change=0.4,
+        reading_load=0.2,
+        unresolved_tension=0.1,
+        emotional_hold_value=0.3,
+        repetition_pressure=0.6,
+        music_transition_opportunity=0.8,
+        minimum_dwell_seconds=minimum,
+        maximum_dwell_seconds=maximum,
+        rationale="Bounded editorial attention envelope.",
+        uncertainties=[],
+        requires_human_review=True,
+    )
+
+
+def test_fresh_open_edit_schema_requires_non_null_attention_envelope() -> None:
+    schema = generated_open_edit_response_schema()
+    shot_schema = schema["$defs"]["OpenEditShot"]
+
+    assert "attention_observation" in shot_schema["required"]
+    assert shot_schema["properties"]["attention_observation"] == {
+        "$ref": "#/$defs/AttentionObservation",
+    }
+    target_description = shot_schema["properties"]["target_duration_seconds"][
+        "description"
+    ]
+    assert "Preferred editorial dwell" in target_description
+    assert "never a fixed trim" in target_description
+
+
+def test_fresh_open_edit_runtime_rejects_missing_attention_envelope() -> None:
+    shots = []
+    for index in range(10):
+        role = "hook" if index == 0 else "closing" if index == 9 else "action"
+        shots.append(
+            OpenEditShot(
+                feature_id=f"scene_{index}",
+                title="scene",
+                editorial_role=role,
+                intended_effect="progress",
+                target_duration_seconds=6,
+                candidates=[
+                    candidate(f"a{index}", f"RF{index * 2 + 1:06d}"),
+                    candidate(f"b{index}", f"RF{index * 2 + 2:06d}"),
+                ],
+                horizontal_candidate_id=f"a{index}",
+                vertical_candidate_id=f"a{index}",
+            )
+        )
+    legacy_plan = OpenEditPlan(
+        project_id="project",
+        catalog_id="catalog",
+        inferred_title="title",
+        inferred_theme="theme",
+        intended_audience_hypothesis="audience",
+        story_arc="arc",
+        shots=shots,
+        excluded_patterns=[],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id="gemini-3.6-flash",
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires attention_observation for every shot",
+    ):
+        assert_generated_attention_envelopes(legacy_plan)
+
+    complete_plan = legacy_plan.model_copy(
+        update={
+            "shots": [
+                shot.model_copy(
+                    update={"attention_observation": attention_observation()}
+                )
+                for shot in legacy_plan.shots
+            ]
+        }
+    )
+    assert_generated_attention_envelopes(complete_plan)
 
 
 def test_candidate_override_changes_only_requested_aspect() -> None:
