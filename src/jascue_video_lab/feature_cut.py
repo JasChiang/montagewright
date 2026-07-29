@@ -3575,6 +3575,25 @@ def _required_track_union(
     unavailable_ratio = unavailable_count / len(all_times) if all_times else 1.0
     max_edge_gap_ms = expected_interval_ms * 1.35 + 35
     max_allowed_internal_gap_ms = expected_interval_ms * 2.25 + 35
+    contiguous_groups: list[list[int]] = []
+    for time_ms in common_times:
+        if (
+            not contiguous_groups
+            or time_ms - contiguous_groups[-1][-1]
+            > max_allowed_internal_gap_ms
+        ):
+            contiguous_groups.append([time_ms])
+        else:
+            contiguous_groups[-1].append(time_ms)
+    largest_contiguous_group = max(
+        contiguous_groups,
+        key=lambda group: (
+            group[-1] - group[0],
+            len(group),
+            group[-1],
+        ),
+        default=[],
+    )
     tracking_confidence_gate_passed = low_confidence_required_sample_count == 0
     coverage_passed = (
         tracking_confidence_gate_passed
@@ -3606,10 +3625,85 @@ def _required_track_union(
         "expected_sample_interval_ms": round(expected_interval_ms, 3),
         "max_allowed_edge_gap_ms": round(max_edge_gap_ms, 3),
         "max_allowed_internal_gap_ms": round(max_allowed_internal_gap_ms, 3),
+        "largest_contiguous_usable_start_ms": (
+            largest_contiguous_group[0]
+            if largest_contiguous_group
+            else None
+        ),
+        "largest_contiguous_usable_end_ms": (
+            largest_contiguous_group[-1]
+            if largest_contiguous_group
+            else None
+        ),
+        "largest_contiguous_usable_sample_count": len(
+            largest_contiguous_group
+        ),
         "coverage_passed": coverage_passed,
         "per_region": per_region,
     }
     return times, centers, boxes, coverage
+
+
+def _tracking_coverage_recovery_window(
+    geometry: Mapping[str, Any],
+    *,
+    current_start_ms: int,
+    current_end_ms: int,
+    evidence_time_ms: int,
+    minimum_duration_ms: int,
+) -> tuple[int, int] | None:
+    """Contract an unlocked trim to its strongest tracked evidence interval.
+
+    This is a bounded local recovery for a selected candidate whose long
+    setup/exit handles make SAM coverage fail.  It never expands the approved
+    source interval, never moves away from the immutable evidence frame, and
+    only proposes a window that still satisfies the semantic minimum dwell.
+    """
+
+    if geometry.get("coverage_passed") is not False:
+        return None
+    usable_start = geometry.get("largest_contiguous_usable_start_ms")
+    usable_end = geometry.get("largest_contiguous_usable_end_ms")
+    edge_gap = geometry.get("max_allowed_edge_gap_ms")
+    if (
+        not isinstance(usable_start, (int, float))
+        or not isinstance(usable_end, (int, float))
+        or not isinstance(edge_gap, (int, float))
+        or usable_end <= usable_start
+        or minimum_duration_ms <= 0
+    ):
+        return None
+    recovery_end = min(
+        current_end_ms,
+        round(usable_end + edge_gap),
+    )
+    recovery_start = max(
+        current_start_ms,
+        min(round(usable_start), recovery_end - minimum_duration_ms),
+    )
+    if recovery_end - recovery_start < minimum_duration_ms:
+        recovery_start = max(
+            current_start_ms,
+            recovery_end - minimum_duration_ms,
+        )
+    if not recovery_start <= evidence_time_ms < recovery_end:
+        recovery_start = max(
+            current_start_ms,
+            min(
+                evidence_time_ms - minimum_duration_ms // 2,
+                current_end_ms - minimum_duration_ms,
+            ),
+        )
+        recovery_end = recovery_start + minimum_duration_ms
+    if (
+        recovery_end - recovery_start < minimum_duration_ms
+        or recovery_start < current_start_ms
+        or recovery_end > current_end_ms
+        or recovery_end - recovery_start
+        >= current_end_ms - current_start_ms
+    ):
+        return None
+    return recovery_start, recovery_end
 
 
 def _soft_extent_visibility_audit(
@@ -14561,6 +14655,167 @@ def _run_feature_cut_experiment_impl(
                                 ),
                                 semantic_beat=candidate_semantic_beat,
                             )
+                        minimum_dwell_seconds = (
+                            selected.attention_observation.minimum_dwell_seconds
+                            if selected.attention_observation is not None
+                            else None
+                        )
+                        has_explicit_event_contract = any(
+                            contract.feature_id == selected.feature_id
+                            and bool(contract.visual_events)
+                            for contract in editorial_templates
+                        )
+                        recovery_window = (
+                            _tracking_coverage_recovery_window(
+                                candidate_geometry,
+                                current_start_ms=candidate_start,
+                                current_end_ms=candidate_end,
+                                evidence_time_ms=(
+                                    candidate_frame.requested_time_ms
+                                ),
+                                minimum_duration_ms=round(
+                                    minimum_dwell_seconds * 1000
+                                ),
+                            )
+                            if (
+                                autonomous_profile
+                                and minimum_dwell_seconds is not None
+                                and not has_explicit_event_contract
+                            )
+                            else None
+                        )
+                        if recovery_window is not None:
+                            recovery_start, recovery_end = recovery_window
+                            recovery_root = (
+                                candidate_root
+                                / "coverage-trim-recompile"
+                                / f"{recovery_start}-{recovery_end}"
+                            )
+                            copied_grounding = (
+                                _copy_grounding_cache_for_trim_recompile(
+                                    source_root=candidate_root,
+                                    destination_root=recovery_root,
+                                )
+                            )
+                            recovery_request = dict(
+                                geometry_recompile_request
+                            )
+                            recovery_request["output_dir"] = recovery_root
+                            recovery_request[
+                                "model_request_block_reason"
+                            ] = (
+                                "tracking_coverage_trim_recompile_paid_"
+                                "grounding_cache_miss_forbidden"
+                            )
+                            try:
+                                (
+                                    recovered_filter,
+                                    recovered_geometry,
+                                    recovered_debugs,
+                                    recovered_track_fingerprint,
+                                ) = _vertical_candidate_geometry(
+                                    client=client,
+                                    clip=candidate_clip,
+                                    frame=candidate_frame,
+                                    start_ms=recovery_start,
+                                    end_ms=recovery_end,
+                                    feature_id=selected.feature_id,
+                                    target_description=(
+                                        str(candidate_target)
+                                        if candidate_target
+                                        else None
+                                    ),
+                                    regions=candidate_regions,
+                                    track_cache=track_cache,
+                                    autonomous_policy=autonomous_policy,
+                                    semantic_negotiation_state={
+                                        "global": 1
+                                    },
+                                    **recovery_request,
+                                )
+                            except Exception as recovery_error:
+                                write_json(
+                                    recovery_root
+                                    / "coverage-trim-recompile.failed.json",
+                                    {
+                                        "contract_version": (
+                                            "tracking-coverage-trim-"
+                                            "recompile-failure-v1"
+                                        ),
+                                        "feature_id": selected.feature_id,
+                                        "candidate_id": candidate_id,
+                                        "previous_start_ms": candidate_start,
+                                        "previous_end_ms": candidate_end,
+                                        "recovery_start_ms": recovery_start,
+                                        "recovery_end_ms": recovery_end,
+                                        "error": (
+                                            f"{type(recovery_error).__name__}:"
+                                            f"{recovery_error}"
+                                        ),
+                                        "paid_model_calls_added": 0,
+                                    },
+                                )
+                            else:
+                                if (
+                                    recovered_geometry.get(
+                                        "coverage_passed"
+                                    )
+                                    and recovered_geometry.get(
+                                        "fallback_reason"
+                                    )
+                                    is None
+                                ):
+                                    previous_start = candidate_start
+                                    previous_end = candidate_end
+                                    candidate_start = recovery_start
+                                    candidate_end = recovery_end
+                                    candidate_filter = recovered_filter
+                                    candidate_geometry = (
+                                        recovered_geometry
+                                    )
+                                    candidate_debugs = recovered_debugs
+                                    candidate_track_fingerprint = (
+                                        recovered_track_fingerprint
+                                    )
+                                    candidate_trim = {
+                                        **candidate_trim,
+                                        "trim_method": (
+                                            "tracking_coverage_minimum_"
+                                            "dwell_recovery"
+                                        ),
+                                        "previous_source_in_ms": (
+                                            previous_start
+                                        ),
+                                        "previous_source_out_ms": (
+                                            previous_end
+                                        ),
+                                        "source_in_ms": candidate_start,
+                                        "source_out_ms": candidate_end,
+                                        "minimum_dwell_seconds": (
+                                            minimum_dwell_seconds
+                                        ),
+                                    }
+                                    candidate_geometry[
+                                        "tracking_coverage_trim_recovery"
+                                    ] = {
+                                        "previous_start_ms": (
+                                            previous_start
+                                        ),
+                                        "previous_end_ms": previous_end,
+                                        "recovery_start_ms": (
+                                            candidate_start
+                                        ),
+                                        "recovery_end_ms": candidate_end,
+                                        "grounding_cache_roots_copied": (
+                                            list(copied_grounding)
+                                        ),
+                                        "paid_grounding_cache_miss_"
+                                        "forbidden": True,
+                                        "paid_model_calls_added": 0,
+                                    }
+                                    candidate_geometry[
+                                        "paid_model_calls_added"
+                                    ] = 0
                         auto_audit = None
                         failure_codes: list[FailureCode] = []
                         candidate_execution_verified = False

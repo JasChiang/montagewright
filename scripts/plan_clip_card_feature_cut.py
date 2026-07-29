@@ -2884,6 +2884,17 @@ def _project_candidate_regions_v3(
             "ui_region",
             "graphic",
         }
+        minimum_visible_fraction = None
+        if role == "required":
+            minimum_visible_fraction = (
+                0.6
+                if (
+                    candidate.allow_controlled_clip
+                    and kind == "subject"
+                    and not atomic
+                )
+                else 1.0
+            )
         projected.append(
             FramingRegionIntent(
                 region_id=(
@@ -2895,7 +2906,7 @@ def _project_candidate_regions_v3(
                 kind=kind,
                 role=role,
                 atomic=atomic,
-                minimum_visible_fraction=1.0 if role == "required" else None,
+                minimum_visible_fraction=minimum_visible_fraction,
                 observable_relations=list(
                     dict.fromkeys(
                         _observable_entity_relations(event, entity_id)

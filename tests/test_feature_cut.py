@@ -76,6 +76,7 @@ from jascue_video_lab.feature_cut import (
     _should_refine_selected_vertical_candidate,
     _soft_extent_visibility_audit,
     _summarize_automatic_reframe,
+    _tracking_coverage_recovery_window,
     _tracking_seed_request_ms,
     _tracked_crop_geometry,
     _usable_track_centers,
@@ -165,6 +166,42 @@ def test_trim_window_shift_invalidates_stale_exact_pts() -> None:
     assert shifted["cue_shift_render_binding"][
         "stale_exact_pts_invalidated"
     ]
+
+
+def test_tracking_coverage_recovery_contracts_to_minimum_dwell() -> None:
+    recovered = _tracking_coverage_recovery_window(
+        {
+            "coverage_passed": False,
+            "largest_contiguous_usable_start_ms": 6_006,
+            "largest_contiguous_usable_end_ms": 9_009,
+            "max_allowed_edge_gap_ms": 710,
+        },
+        current_start_ms=2_500,
+        current_end_ms=9_500,
+        evidence_time_ms=7_140,
+        minimum_duration_ms=3_500,
+    )
+
+    assert recovered == (6_000, 9_500)
+
+
+def test_tracking_coverage_recovery_preserves_locked_evidence_frame() -> None:
+    recovered = _tracking_coverage_recovery_window(
+        {
+            "coverage_passed": False,
+            "largest_contiguous_usable_start_ms": 6_000,
+            "largest_contiguous_usable_end_ms": 8_000,
+            "max_allowed_edge_gap_ms": 500,
+        },
+        current_start_ms=2_000,
+        current_end_ms=10_000,
+        evidence_time_ms=3_000,
+        minimum_duration_ms=3_500,
+    )
+
+    assert recovered is not None
+    assert recovered[0] <= 3_000 < recovered[1]
+    assert recovered[1] - recovered[0] == 3_500
 
 
 def test_trim_shift_failure_is_recorded_without_hidden_retry(

@@ -301,8 +301,9 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
                 vertical=DirectVideoVerticalDecision(
                     candidate_rank=1,
                     strategy="tracked_crop",
-                    crop_mode="strict",
+                    crop_mode="primary_center",
                     coverage_mode="sequential",
+                    allow_controlled_clip=True,
                     framing_intent="Observe the subject, then the sign.",
                     required_entity_indices=[1, 2],
                     preferred_entity_indices=[],
@@ -377,6 +378,23 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
     assert (
         projected.chapters[0].attention_observation is not None
     )
+    executable = project_feature_contracts_v3(
+        projected,
+        brief=_brief(),
+        catalog=_catalog(),
+        selected_evidence=build_selected_clip_card_evidence(
+            projected,
+            cards={ASSET_ID: _card()},
+        ),
+    )
+    minimum_visibility = {
+        region.entity_id: region.minimum_visible_fraction
+        for region in executable.chapters[0].vertical_candidates[0].regions
+    }
+    assert minimum_visibility == {
+        "subject-1": 0.6,
+        "sign-1": 1.0,
+    }
     virtual_camera = projected.chapters[0].candidates[0].virtual_camera_proposal
     assert virtual_camera is not None
     assert virtual_camera.phases[1].transition_in == "cut"
