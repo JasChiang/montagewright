@@ -7160,6 +7160,7 @@ def _track_single_seed_from_grouped_grounding(
     seed_box_padding_ratio: float,
     query_lock_v2: EvidenceQueryLockV2 | None = None,
     query_target_id: str,
+    query_target_description: str,
 ) -> SegmentationTrack:
     """Track the sole surviving grouped target without another model request.
 
@@ -7246,7 +7247,7 @@ def _track_single_seed_from_grouped_grounding(
         runtime_lineage = _query_lock_v2_runtime_geometry_lineage(
             lock=query_lock_v2,
             target_id=query_target_id,
-            target_description=seed.target_description,
+            target_description=query_target_description,
             seed_fingerprint=seed_fingerprint,
             seed_manifest_path=seed_manifest_path,
             track_path=track_path,
@@ -7727,6 +7728,7 @@ def _build_framing_region_tracks(
             query_target_id=(
                 region.entity_id or f"reframe_{region.region_id}"
             ),
+            query_target_description=region.target_description,
         )
         return proposals, [track], debug_paths
 

@@ -2109,6 +2109,21 @@ def test_grouped_grounding_single_survivor_uses_single_sam_without_paid_retry(
             "one surviving grouped target must not enter shared SAM"
         ),
     )
+    lineage_descriptions: list[str] = []
+
+    def fake_runtime_lineage(**kwargs: object) -> dict[str, object]:
+        lineage_descriptions.append(str(kwargs["target_description"]))
+        return {
+            "evidence_query_v2": {
+                "definition_sha256": "c" * 64,
+            }
+        }
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_query_lock_v2_runtime_geometry_lineage",
+        fake_runtime_lineage,
+    )
 
     result = feature_cut_module._track_single_seed_from_grouped_grounding(
         video_path=video_path,
@@ -2122,13 +2137,16 @@ def test_grouped_grounding_single_survivor_uses_single_sam_without_paid_retry(
         analysis_max_side=960,
         scdet_threshold=27.0,
         seed_box_padding_ratio=0.04,
+        query_lock_v2=object(),
         query_target_id="smartwatch_01",
+        query_target_description="canonical locked smartwatch",
     )
 
     assert result is fake_track
     assert len(calls) == 1
     assert calls[0]["target_description"] == "the required smartwatch"
     assert calls[0]["seed_time_ms"] == 14_000
+    assert lineage_descriptions == ["canonical locked smartwatch"]
     degradation = read_json(
         tmp_path
         / "geometry"
