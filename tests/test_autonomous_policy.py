@@ -324,6 +324,41 @@ def test_autonomous_pipeline_discovers_selected_window_bundle(
             "hard_evidence_passed": True,
         },
     )
+    preflight_deterministic = tmp_path / "preflight-deterministic.json"
+    write_json(
+        preflight_deterministic,
+        {
+            "media_playable": True,
+            "pts_valid": True,
+            "unexpected_freeze_count": 0,
+            "containment_passed": True,
+            "identity_passed": True,
+            "relation_passed": True,
+            "panel_same_pts_passed": True,
+            "relative_scale_lock_passed": True,
+            "cue_delta_frames": {"hard-event": 0},
+            "cue_tolerance_frames": {"hard-event": 2},
+            "cue_id_by_event": {"hard-event": "cue-1"},
+            "required_cue_event_ids": ["hard-event"],
+            "cue_boundary_coverage_audited": True,
+            "music_edit_boundary_coverage_passed": True,
+            "synthetic_motion_motivated": True,
+            "synthetic_reversal_count": 0,
+            "settle_passed": True,
+            "source_camera_motion_audited": True,
+            "unwanted_source_camera_motion_count": 0,
+            "dwell_bounds_audited": True,
+            "excessive_dwell_count": 0,
+            "dead_air_audited": True,
+            "dead_air_count": 0,
+            "concat_padding_audited": True,
+            "unauthorized_concat_padding_count": 0,
+            "readability_passed": True,
+            "reuse_authorized": True,
+            "omissions_authorized": True,
+            "hard_evidence_passed": True,
+        },
+    )
     received: dict[str, object] = {}
 
     def generated(**kwargs: object) -> object:
@@ -353,6 +388,10 @@ def test_autonomous_pipeline_discovers_selected_window_bundle(
             output_dir=tmp_path / "delivery",
             execution_profile="autonomous_strict",
             autonomous_policy_path=policy_path,
+            autonomous_context_paths={
+                key: Path(path) for key, path in context_paths.items()
+            },
+            deterministic_delivery_evidence_path=preflight_deterministic,
             editorial_beat_contracts_path=beat_templates,
         )
 

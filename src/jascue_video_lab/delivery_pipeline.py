@@ -610,7 +610,7 @@ def run_feature_delivery_pipeline(
         else:
             feature_result = run_feature_cut_experiment(**kwargs)
         outputs["feature_cut"] = feature_result
-        if policy is not None and not resolved_autonomous_context:
+        if policy is not None:
             generated_context = feature_result.get(
                 "autonomous_context_paths"
             )
@@ -626,7 +626,7 @@ def run_feature_delivery_pipeline(
                 str(key): Path(str(path)).expanduser().resolve(strict=True)
                 for key, path in generated_context.items()
             }
-        if policy is not None and deterministic_evidence is None:
+        if policy is not None:
             generated_evidence = feature_result.get(
                 "deterministic_delivery_evidence_path"
             )
@@ -939,6 +939,7 @@ def run_feature_delivery_pipeline(
                 f"sha256:{policy.definition_sha256()}",
                 f"sha256:{sha256_file(resolved_deterministic_evidence)}",
                 f"sha256:{sha256_file(deterministic_report_path)}",
+                f"sha256:{sha256_file(render_manifest_path)}",
                 *(
                     f"sha256:{sha256_file(path)}"
                     for path in resolved_autonomous_context.values()
@@ -956,8 +957,13 @@ def run_feature_delivery_pipeline(
                     )
                 ),
                 *(
-                    f"sha256:{sha256_file(Path(row['qa_run_dir']) / 'validated.json')}"
+                    f"sha256:{sha256_file(Path(row['qa_run_dir']) / qa_artifact)}"
                     for row in final_results.values()
+                    for qa_artifact in (
+                        "input_hashes.json",
+                        "schema_validation.json",
+                        "validated.json",
+                    )
                 ),
             }
             state, delivery_authority = authorize_autonomous_delivery(
