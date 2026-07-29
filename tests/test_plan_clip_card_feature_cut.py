@@ -259,6 +259,16 @@ def test_alternate_edit_never_forces_hard_evidence_to_change() -> None:
 
 
 def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> None:
+    card = _card()
+    card = card.model_copy(
+        update={
+            "events": [
+                card.events[0].model_copy(
+                    update={"primary_entity_ids": ["sign-1"]}
+                )
+            ]
+        }
+    )
     shortlist = FeatureShortlistPlan(
         project_id="project-1",
         catalog_id="catalog-1",
@@ -364,7 +374,7 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
         candidate_depth=2,
         brief=_brief(),
         catalog=_catalog(),
-        cards={ASSET_ID: _card()},
+        cards={ASSET_ID: card},
         provenance=_provenance(),
     )
 
@@ -384,7 +394,7 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
         catalog=_catalog(),
         selected_evidence=build_selected_clip_card_evidence(
             projected,
-            cards={ASSET_ID: _card()},
+            cards={ASSET_ID: card},
         ),
     )
     minimum_visibility = {

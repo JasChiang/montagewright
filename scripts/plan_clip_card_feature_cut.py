@@ -2892,6 +2892,7 @@ def _project_candidate_regions_v3(
                     candidate.allow_controlled_clip
                     and kind == "subject"
                     and not atomic
+                    and entity_id not in event.primary_entity_ids
                 )
                 else 1.0
             )
