@@ -183,6 +183,81 @@ def test_option_generator_exposes_static_and_motivated_virtual_camera() -> None:
     assert compilation.selection.semantic_negotiation_recommended is False
 
 
+def test_semantic_capability_boundary_is_hard_not_a_saved_annotation() -> None:
+    compilation = compile_presentation(
+        targets=[_target("phone", (350, 200, 650, 800))],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="single_subject",
+        policy=_policy(),
+        preferred_capability_ids=("solid_matte_fit",),
+        acceptable_capability_ids=("static_full_bleed_crop",),
+    )
+
+    assert compilation.mode == "static_full_bleed_crop"
+    assert compilation.selection is not None
+    rejected_capabilities = {
+        compilation.selection.generated_capabilities[option_id]: reasons
+        for option_id, reasons in compilation.selection.rejected_options.items()
+    }
+    assert rejected_capabilities["tracked_full_bleed_crop"] == (
+        "capability_outside_semantic_boundary",
+    )
+    assert rejected_capabilities["solid_matte_fit"] == (
+        "capability_outside_semantic_boundary",
+    )
+
+
+def test_constructed_presentation_cannot_outscore_safe_single_canvas() -> None:
+    def option(
+        option_id: str,
+        capability_id: str,
+        *,
+        semantic_fit: float,
+        intrusion_rank: int,
+    ) -> ExecutableOptionV2:
+        return ExecutableOptionV2(
+            option_id=option_id,
+            capability_id=capability_id,
+            payload_sha256="e" * 64,
+            constraints=(
+                ConstraintResult(
+                    constraint_id="safe",
+                    level="hard",
+                    status="pass",
+                    reason_code="safe",
+                ),
+            ),
+            metrics=OptionMetrics(
+                semantic_fit=semantic_fit,
+                readability=semantic_fit,
+                technical_quality=semantic_fit,
+                intrusion_rank=intrusion_rank,
+            ),
+        )
+
+    selection = select_executable_option(
+        (
+            option(
+                "natural",
+                "tracked_full_bleed_crop",
+                semantic_fit=0.7,
+                intrusion_rank=1,
+            ),
+            option(
+                "constructed",
+                "two_panel_layout",
+                semantic_fit=1.0,
+                intrusion_rank=5,
+            ),
+        ),
+        preferred_capability_ids=("two_panel_layout",),
+    )
+
+    assert selection.selected_option_id == "natural"
+    assert "single_canvas_minimality_applied" in selection.decision_codes
+
+
 def test_unknown_hard_constraint_fails_closed_before_scoring() -> None:
     option = ExecutableOptionV2(
         option_id="unknown-option",
@@ -222,7 +297,7 @@ def test_late_cue_shift_cannot_force_policy_forbidden_matte_fit() -> None:
         _late_cue_shift_disposition(
             _policy(allow_solid_matte_fit=True)
         )
-        == "solid_fit_authorized"
+        == "recompile_required"
     )
 
 

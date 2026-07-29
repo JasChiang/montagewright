@@ -58,6 +58,7 @@ from .editing_capabilities import (
     SemanticBeat,
     VisibilityContract,
     VisibilityTarget,
+    autonomous_capability_registry_v2,
 )
 from .final_edit_qa import DeterministicDeliveryEvidence
 from .full_v1 import create_dense_window_catalog
@@ -156,7 +157,7 @@ from .presentation import (
     _vertical_center_crop_filter,
     _vertical_delivery_fallback,
     _vertical_fit_filter,
-    _vertical_intentional_freeze_fit_filter,
+    _vertical_intentional_freeze_filter,
     _vertical_required_scope_fit_filter,
     compile_intentional_freeze,
     compile_presentation,
@@ -2813,11 +2814,22 @@ def _presentation_target_from_track(
         raise ValueError(
             f"two_panel_target_has_no_exact_pts:{target_id}"
         )
+    boxes_by_pts = {
+        sample.source_pts: tuple(
+            round(float(coordinate))
+            for coordinate in sample.derived_tracking_box
+        )
+        for sample in track.samples
+        if sample.source_pts is not None
+        and sample.derived_tracking_box is not None
+        and sample.tracking_state == TrackingState.TRACKED
+    }
     return PresentationTarget(
         target_id=target_id,
         source_asset_id=track.asset_id,
         source_pts=source_pts,
         box_2d=(x_min, y_min, x_max, y_max),
+        track_boxes_by_pts=tuple(sorted(boxes_by_pts.items())),
     )
 
 
@@ -7188,32 +7200,50 @@ def _combined_semantic_checkpoint_status(
     return SemanticCheckpointStatus.PASSED
 
 
-def _autonomous_panel_fallback_eligible(
+def _whole_source_fit_recovery_allowed(
     *,
-    hard_region_count: int,
-    presentation_preference: str,
-    relation_mode: str,
     policy: AutonomousEditPolicy | None,
+    regions: Sequence[FramingRegionIntent],
+    hard_editorial_beat: bool,
+    semantic_beat: SemanticBeat | None = None,
+    candidate_acceptable_capability_ids: Sequence[str] | None = None,
 ) -> bool:
-    if policy is None or hard_region_count != 2:
+    """Authorize a last-resort fit only when readability is not unproven."""
+
+    if (
+        policy is None
+        or not policy.presentation.allow_solid_matte_fit
+        or not hard_editorial_beat
+        or (
+            candidate_acceptable_capability_ids is not None
+            and "solid_matte_fit"
+            not in candidate_acceptable_capability_ids
+        )
+        or (
+            semantic_beat is not None
+            and (
+                "solid_matte_fit"
+                not in semantic_beat.acceptable_capability_ids
+                or "solid_matte_fit"
+                in semantic_beat.forbidden_capability_ids
+            )
+        )
+    ):
         return False
-    if presentation_preference in {
-        "two_panel_layout",
-        "solid_matte_fit",
-    }:
-        return True
-    return (
-        relation_mode in {
-            "simultaneous",
-            "relation_core",
-            "primary_with_context",
-        }
-        and policy.presentation.allow_two_panel_layout
+    return not any(
+        region.execution_role == "hard_core"
+        and (
+            region.atomic
+            or region.kind in {"text_region", "ui_region", "graphic"}
+        )
+        for region in regions
     )
 
 
 def _resolved_autonomous_relation_mode(
     relation_mode: str,
+    *,
+    presentation_preference: str = "",
 ) -> Literal[
     "single_subject",
     "sequential_focus",
@@ -7223,7 +7253,13 @@ def _resolved_autonomous_relation_mode(
     if relation_mode in {"simultaneous", "relation_core"}:
         return "simultaneous_relation"
     if relation_mode == "primary_with_context":
-        return "context_detail"
+        # A primary target and its contextual/detail evidence stay on one
+        # canvas unless the semantic plan explicitly selects two-panel.
+        return (
+            "context_detail"
+            if presentation_preference == "two_panel_layout"
+            else "single_subject"
+        )
     if relation_mode == "sequential":
         return "sequential_focus"
     return "single_subject"
@@ -7240,6 +7276,73 @@ def _preferred_capability_ids(
         "solid_matte_fit": "solid_matte_fit",
     }.get(presentation_preference)
     return (mapped,) if mapped is not None else ()
+
+
+def _normal_acceptable_capability_ids(
+    presentation_preference: str,
+) -> tuple[str, ...]:
+    """Return the normal execution family, excluding recovery authority.
+
+    Policy permission for panel/matte is deliberately not included unless the
+    semantic plan selected that constructed presentation.  Runtime recovery
+    remains a separate, typed path after Top-K natural candidates fail.
+    """
+
+    natural_by_preference = {
+        "static_full_bleed": (
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+        ),
+        "tracked_full_bleed": (
+            "tracked_full_bleed_crop",
+            "static_full_bleed_crop",
+        ),
+        "phase_virtual_camera": (
+            "phase_virtual_camera",
+            "hard_cut_between_views",
+            "tracked_full_bleed_crop",
+            "static_full_bleed_crop",
+        ),
+        "two_panel_layout": (
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+            "two_panel_layout",
+        ),
+        "solid_matte_fit": (
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+            "solid_matte_fit",
+        ),
+    }
+    return natural_by_preference.get(
+        presentation_preference,
+        ("static_full_bleed_crop", "tracked_full_bleed_crop"),
+    )
+
+
+def _candidate_capability_boundaries(
+    *,
+    presentation_preference: str,
+    semantic_beat: SemanticBeat | None,
+    physical_scale_comparison: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Narrow a beat-level union to one candidate's immutable authority."""
+
+    candidate_family = set(
+        _normal_acceptable_capability_ids(presentation_preference)
+    )
+    if physical_scale_comparison:
+        candidate_family.add("two_panel_layout")
+    if semantic_beat is None:
+        return tuple(sorted(candidate_family)), ()
+
+    beat_acceptable = set(semantic_beat.acceptable_capability_ids)
+    known_capabilities = (
+        beat_acceptable | set(semantic_beat.forbidden_capability_ids)
+    )
+    acceptable = tuple(sorted(candidate_family & beat_acceptable))
+    forbidden = tuple(sorted(known_capabilities - set(acceptable)))
+    return acceptable, forbidden
 
 
 def _project_feature_semantic_edit_ir(
@@ -7368,11 +7471,47 @@ def _project_feature_semantic_edit_ir(
             dict.fromkeys(
                 capability_id
                 for candidate in candidates
-                for capability_id in _preferred_capability_ids(
+                for capability_id in _normal_acceptable_capability_ids(
                     candidate.presentation_preference
                 )
             )
         ) or ("static_full_bleed_crop", "tracked_full_bleed_crop")
+        if (
+            primary is not None
+            and primary.physical_scale_comparison
+            and len(visibility_targets) == 2
+            and "two_panel_layout" not in capability_ids
+        ):
+            capability_ids = (*capability_ids, "two_panel_layout")
+        panel_target_groups = (
+            tuple((target.target_id,) for target in visibility_targets)
+            if (
+                len(visibility_targets) == 2
+                and primary is not None
+                and (
+                    primary.presentation_preference
+                    == "two_panel_layout"
+                    or primary.physical_scale_comparison
+                )
+            )
+            else ()
+        )
+        registry_capability_ids = set(
+            autonomous_capability_registry_v2(
+                allow_two_panel_layout=(
+                    policy.presentation.allow_two_panel_layout
+                ),
+                allow_solid_matte_fit=(
+                    policy.presentation.allow_solid_matte_fit
+                ),
+                allow_intentional_freeze=(
+                    policy.presentation.allow_intentional_freeze
+                ),
+            ).by_id()
+        )
+        forbidden_capability_ids = tuple(
+            sorted(registry_capability_ids - set(capability_ids))
+        )
         evidence_refs = tuple(
             f"{candidate.source_asset_id}:{candidate.event_id}:{candidate.frame_id}"
             for candidate in candidates
@@ -7431,6 +7570,8 @@ def _project_feature_semantic_edit_ir(
                 preferred_duration_ms=round(preferred_seconds * 1000),
                 maximum_duration_ms=round(maximum_seconds * 1000),
                 acceptable_capability_ids=capability_ids,
+                forbidden_capability_ids=forbidden_capability_ids,
+                panel_target_groups=panel_target_groups,
             )
         )
     outputs = tuple(
@@ -7546,16 +7687,103 @@ def _compatible_output_cues(
 
 
 def _late_cue_shift_disposition(
-    policy: AutonomousEditPolicy | None,
-) -> Literal["solid_fit_authorized", "recompile_required"]:
+    _policy: AutonomousEditPolicy | None,
+) -> Literal["recompile_required"]:
     """Never let a post-geometry trim change silently bypass presentation policy."""
 
-    if (
-        policy is not None
-        and policy.presentation.allow_solid_matte_fit
-    ):
-        return "solid_fit_authorized"
     return "recompile_required"
+
+
+def _render_trim_after_window_shift(
+    trim: Mapping[str, Any],
+    *,
+    original_start_ms: int,
+    original_end_ms: int,
+    shifted_start_ms: int,
+    shifted_end_ms: int,
+) -> dict[str, Any]:
+    """Invalidate stale exact PTS so render rebinds the shifted window."""
+
+    rebound = dict(trim)
+    rebound.update(
+        {
+            "source_in_ms": shifted_start_ms,
+            "source_out_ms": shifted_end_ms,
+            "source_in_pts": None,
+            "source_out_pts": None,
+            "cue_shift_render_binding": {
+                "original_source_in_ms": original_start_ms,
+                "original_source_out_ms": original_end_ms,
+                "shifted_source_in_ms": shifted_start_ms,
+                "shifted_source_out_ms": shifted_end_ms,
+                "stale_exact_pts_invalidated": True,
+                "render_pts_rebound_from_shifted_ms": True,
+            },
+        }
+    )
+    return rebound
+
+
+def _attempt_trim_shift_operation(
+    operation: Any,
+    *,
+    failure_path: Path,
+    failure_context: Mapping[str, Any],
+) -> Any | None:
+    """Run one dependency rebuild without turning failure into a retry loop."""
+
+    try:
+        return operation()
+    except Exception as error:
+        write_json(
+            failure_path,
+            {
+                "contract_version": (
+                    "trim-shift-presentation-recompile-failure-v1"
+                ),
+                **failure_context,
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "hidden_retry_performed": False,
+                "original_presentation_preserved": True,
+            },
+        )
+        return None
+
+
+def _copy_grounding_cache_for_trim_recompile(
+    *,
+    source_root: Path,
+    destination_root: Path,
+) -> tuple[str, ...]:
+    """Reuse paid exact-frame grounding while rebuilding only local tracks."""
+
+    copied: list[str] = []
+    cache_roots = (
+        source_root / "grounding",
+        source_root / "multi-target-grounding",
+    )
+    for cache_root in cache_roots:
+        if not cache_root.is_dir():
+            continue
+        relative = cache_root.relative_to(source_root)
+        shutil.copytree(
+            cache_root,
+            destination_root / relative,
+            dirs_exist_ok=True,
+        )
+        copied.append(str(relative))
+    regions_root = source_root / "regions"
+    if regions_root.is_dir():
+        for cache_root in regions_root.glob("*/grounding"):
+            relative = cache_root.relative_to(source_root)
+            shutil.copytree(
+                cache_root,
+                destination_root / relative,
+                dirs_exist_ok=True,
+            )
+            copied.append(str(relative))
+    return tuple(sorted(copied))
 
 
 def _bounded_cue_shifted_window(
@@ -7652,6 +7880,7 @@ def _runtime_scope_preserving_presentation_fallback(
     presentation_preference: str,
     relation_mode: str,
     physical_scale_comparison: bool,
+    semantic_beat: SemanticBeat | None,
 ) -> tuple[str, dict[str, Any]] | None:
     """Recover locally after whole-window evidence invalidates a crop.
 
@@ -7690,16 +7919,18 @@ def _runtime_scope_preserving_presentation_fallback(
         or "runtime_geometry_not_delivery_safe:"
         + ",".join(sorted(observed_unsafe_risks))
     )
+    acceptable_capability_ids, forbidden_capability_ids = (
+        _candidate_capability_boundaries(
+            presentation_preference=presentation_preference,
+            semantic_beat=semantic_beat,
+            physical_scale_comparison=physical_scale_comparison,
+        )
+    )
+    compilation = None
 
     if (
         original_coverage_passed
         and tracking_gate_passed
-        and _autonomous_panel_fallback_eligible(
-            hard_region_count=len(hard_regions),
-            presentation_preference=presentation_preference,
-            relation_mode=relation_mode,
-            policy=policy,
-        )
     ):
         targets = [
             _presentation_target_from_track(
@@ -7716,11 +7947,69 @@ def _runtime_scope_preserving_presentation_fallback(
             targets=targets,
             source_width=source_width,
             source_height=source_height,
-            relation_mode=_resolved_autonomous_relation_mode(relation_mode),
+            relation_mode=_resolved_autonomous_relation_mode(
+                relation_mode,
+                presentation_preference=presentation_preference,
+            ),
             policy=policy,
             physical_scale_comparison=physical_scale_comparison,
-            allow_static_full_bleed=False,
+            allow_static_full_bleed=True,
+            tracking_available=False,
+            acceptable_capability_ids=acceptable_capability_ids,
+            forbidden_capability_ids=forbidden_capability_ids,
+            required_readability_by_target={
+                region.entity_id or region.region_id: (
+                    0.9
+                    if region.kind in {"text_region", "ui_region"}
+                    or region.atomic
+                    else 0.5
+                )
+                for region in hard_regions
+            },
+            panel_semantically_admissible=(
+                presentation_preference == "two_panel_layout"
+                or relation_mode in {"simultaneous", "relation_core"}
+            ),
+            panel_target_groups=(
+                semantic_beat.panel_target_groups
+                if semantic_beat is not None
+                else ()
+            ),
         )
+        if compilation.mode == "static_full_bleed_crop":
+            assert compilation.static_crop_box_2d is not None
+            return (
+                static_full_bleed_crop_filter(
+                    compilation.static_crop_box_2d
+                ),
+                {
+                    "applied_strategy": "static_full_bleed_crop",
+                    "fallback_reason": None,
+                    "runtime_full_bleed_failure_reason": failed_reason,
+                    "risk_codes": [
+                        "runtime_tracking_geometry_failed",
+                        "static_full_bleed_recompiled_from_verified_scope",
+                    ],
+                    "full_bleed": True,
+                    "source_geometry_lineage_passed": True,
+                    "tracking_confidence_gate_passed": True,
+                    "coverage_passed": True,
+                    "minimum_visible_required_area_fraction": 1.0,
+                    "soft_extent_visibility_passed": True,
+                    "paid_model_calls_added": 0,
+                    "presentation_decision_codes": [
+                        "whole_window_tracks_verified",
+                        *compilation.decision_codes,
+                    ],
+                    "presentation_compilation": compilation.model_dump(
+                        mode="json"
+                    ),
+                    "static_crop_box_2d": list(
+                        compilation.static_crop_box_2d
+                    ),
+                    **source_lineage,
+                },
+            )
         if compilation.mode == "two_panel_layout":
             assert compilation.panel_layout is not None
             return (
@@ -7744,6 +8033,9 @@ def _runtime_scope_preserving_presentation_fallback(
                         "whole_window_tracks_verified",
                         *compilation.decision_codes,
                     ],
+                    "presentation_compilation": compilation.model_dump(
+                        mode="json"
+                    ),
                     "panel_layout": compilation.panel_layout.model_dump(
                         mode="json"
                     ),
@@ -7756,9 +8048,15 @@ def _runtime_scope_preserving_presentation_fallback(
                 },
             )
 
-    if policy.presentation.allow_solid_matte_fit:
+    if (
+        original_coverage_passed
+        and tracking_gate_passed
+        and compilation is not None
+        and compilation.mode == "solid_matte_fit"
+    ):
+        assert compilation.filter_graph is not None
         return (
-            _vertical_fit_filter(),
+            compilation.filter_graph,
             {
                 "applied_strategy": "solid_matte_fit",
                 "fallback_reason": None,
@@ -7783,8 +8081,11 @@ def _runtime_scope_preserving_presentation_fallback(
                 "presentation_decision_codes": [
                     "tracked_full_bleed_failed_runtime_evidence",
                     "whole_source_scope_preserved",
-                    "solid_matte_fit_policy_authorized",
+                    *compilation.decision_codes,
                 ],
+                "presentation_compilation": compilation.model_dump(
+                    mode="json"
+                ),
                 "requires_gemini_review": True,
                 **source_lineage,
             },
@@ -7828,6 +8129,7 @@ def _vertical_candidate_geometry(
     relation_mode: str = "single_subject",
     physical_scale_comparison: bool = False,
     semantic_negotiation_state: dict[str, int] | None = None,
+    semantic_beat: SemanticBeat | None = None,
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
     """Evaluate one immutable vertical candidate without rendering a segment."""
 
@@ -7846,53 +8148,6 @@ def _vertical_candidate_geometry(
     identity_tracks: list[tuple[str, str, SegmentationTrack]] = []
     if crop_regions and not hard_regions:
         raise ValueError("candidate region contract has no hard core")
-    if (
-        autonomous_policy is not None
-        and presentation_preference == "solid_matte_fit"
-        and autonomous_policy.presentation.allow_solid_matte_fit
-    ):
-        return (
-            _vertical_fit_filter(),
-            {
-                "applied_strategy": "solid_matte_fit",
-                "fallback_reason": None,
-                "risk_codes": [],
-                "full_bleed": False,
-                "source_geometry_lineage_passed": True,
-                "tracking_confidence_gate_passed": True,
-                "coverage_passed": True,
-                "minimum_visible_required_area_fraction": 1.0,
-                "soft_extent_visibility_passed": True,
-                "semantic_checkpoint_status": (
-                    SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY.value
-                ),
-                "presentation_decision_codes": [
-                    "whole_source_scope_preserved",
-                    "solid_matte_fit_policy_authorized",
-                    "grounding_not_required_for_whole_source_fit",
-                ],
-                "paid_model_calls_added": 0,
-                "framing_regions": [
-                    region.model_dump(mode="json") for region in crop_regions
-                ],
-                "vertical_camera_phases": [],
-                "relation_preserved_by_whole_source": (
-                    relation_mode
-                    in {
-                        "simultaneous",
-                        "relation_core",
-                        "simultaneous_relation",
-                    }
-                ),
-                "relative_scale_locked": bool(physical_scale_comparison),
-                "semantic_review_reasons": [
-                    "solid_matte_fit_requires_final_qa"
-                ],
-                "requires_gemini_review": True,
-            },
-            [],
-            None,
-        )
     if crop_regions:
         _, all_tracks, all_debug_paths = _build_framing_region_tracks(
             client=client,
@@ -7944,7 +8199,8 @@ def _vertical_candidate_geometry(
         geometry: dict[str, Any] = {}
         if autonomous_policy is not None:
             resolved_relation_mode = _resolved_autonomous_relation_mode(
-                relation_mode
+                relation_mode,
+                presentation_preference=presentation_preference,
             )
             if presentation_preference == "solid_matte_fit":
                 resolved_relation_mode = "single_subject"
@@ -7977,6 +8233,14 @@ def _vertical_candidate_geometry(
                 subject_tracks=hard_tracks,
                 output_dir=output_dir / "source-camera-motion",
             )
+            (
+                candidate_acceptable_capability_ids,
+                candidate_forbidden_capability_ids,
+            ) = _candidate_capability_boundaries(
+                presentation_preference=presentation_preference,
+                semantic_beat=semantic_beat,
+                physical_scale_comparison=physical_scale_comparison,
+            )
             autonomous_compilation = compile_presentation(
                 targets=presentation_targets,
                 source_width=source_width,
@@ -7991,6 +8255,40 @@ def _vertical_candidate_geometry(
                 movement_motivated=movement_motivated,
                 preferred_capability_ids=_preferred_capability_ids(
                     presentation_preference
+                ),
+                acceptable_capability_ids=(
+                    candidate_acceptable_capability_ids
+                ),
+                forbidden_capability_ids=(
+                    candidate_forbidden_capability_ids
+                ),
+                required_readability_by_target=(
+                    {
+                        target.target_id: target.minimum_readability
+                        for target in semantic_beat.visibility_contract.targets
+                    }
+                    if semantic_beat is not None
+                    else {
+                        region.entity_id or region.region_id: (
+                            0.9
+                            if region.kind in {"text_region", "ui_region"}
+                            else 0.5
+                        )
+                        for region in hard_regions
+                    }
+                ),
+                panel_semantically_admissible=(
+                    presentation_preference == "two_panel_layout"
+                    and (
+                        semantic_beat is None
+                        or "two_panel_layout"
+                        in semantic_beat.acceptable_capability_ids
+                    )
+                ),
+                panel_target_groups=(
+                    semantic_beat.panel_target_groups
+                    if semantic_beat is not None
+                    else ()
                 ),
             )
             selection = autonomous_compilation.selection
@@ -8085,6 +8383,33 @@ def _vertical_candidate_geometry(
                         movement_motivated=movement_motivated,
                         preferred_capability_ids=(
                             preferred_capability_id,
+                        ),
+                        acceptable_capability_ids=(
+                            candidate_acceptable_capability_ids
+                        ),
+                        forbidden_capability_ids=(
+                            candidate_forbidden_capability_ids
+                        ),
+                        required_readability_by_target=(
+                            {
+                                target.target_id: (
+                                    target.minimum_readability
+                                )
+                                for target in (
+                                    semantic_beat.visibility_contract.targets
+                                )
+                            }
+                            if semantic_beat is not None
+                            else None
+                        ),
+                        panel_semantically_admissible=(
+                            presentation_preference
+                            == "two_panel_layout"
+                        ),
+                        panel_target_groups=(
+                            semantic_beat.panel_target_groups
+                            if semantic_beat is not None
+                            else ()
                         ),
                     )
                 except Exception as error:
@@ -8430,11 +8755,13 @@ def _vertical_candidate_geometry(
             presentation_preference=presentation_preference,
             relation_mode=relation_mode,
             physical_scale_comparison=physical_scale_comparison,
+            semantic_beat=semantic_beat,
         )
         if runtime_fallback is not None:
             filter_graph, geometry = runtime_fallback
         if autonomous_compilation is not None:
-            geometry["presentation_compilation"] = (
+            geometry.setdefault(
+                "presentation_compilation",
                 autonomous_compilation.model_dump(mode="json")
             )
             geometry["source_camera_motion_evidence"] = (
@@ -8465,9 +8792,45 @@ def _vertical_candidate_geometry(
                 autonomous_policy is not None
                 and presentation_preference == "solid_matte_fit"
                 and autonomous_policy.presentation.allow_solid_matte_fit
+                and (
+                    semantic_beat is None
+                    or (
+                        "solid_matte_fit"
+                        in semantic_beat.acceptable_capability_ids
+                        and "solid_matte_fit"
+                        not in semantic_beat.forbidden_capability_ids
+                    )
+                )
             ):
+                whole_source_compilation = compile_presentation(
+                    targets=(
+                        PresentationTarget(
+                            target_id=f"{feature_id}:whole_source",
+                            source_asset_id=(
+                                "sha256:" + str(clip.sha256)
+                            ),
+                            source_pts=(
+                                getattr(frame, "frame_pts", None) or 0
+                            ),
+                            box_2d=(0, 0, 1000, 1000),
+                        ),
+                    ),
+                    source_width=clip.width,
+                    source_height=clip.height,
+                    relation_mode="single_subject",
+                    policy=autonomous_policy,
+                    allow_static_full_bleed=True,
+                    tracking_available=False,
+                    preferred_capability_ids=("solid_matte_fit",),
+                    acceptable_capability_ids=("solid_matte_fit",),
+                )
+                if whole_source_compilation.mode != "solid_matte_fit":
+                    raise ValueError(
+                        "whole-source fit did not pass presentation compiler"
+                    )
+                assert whole_source_compilation.filter_graph is not None
                 return (
-                    _vertical_fit_filter(),
+                    whole_source_compilation.filter_graph,
                     {
                         "applied_strategy": "solid_matte_fit",
                         "fallback_reason": None,
@@ -8483,9 +8846,11 @@ def _vertical_candidate_geometry(
                             .NOT_REQUIRED_BY_POLICY.value
                         ),
                         "presentation_decision_codes": [
-                            "whole_source_scope_preserved",
-                            "solid_matte_fit_policy_authorized",
+                            *whole_source_compilation.decision_codes,
                         ],
+                        "presentation_compilation": (
+                            whole_source_compilation.model_dump(mode="json")
+                        ),
                         "paid_model_calls_added": 0,
                         "framing_regions": [],
                         "vertical_camera_phases": [],
@@ -12795,6 +13160,7 @@ def _run_feature_cut_experiment_impl(
             )
             write_json(plan_binding_path, binding)
             plan_reused = False
+        semantic_beat_by_id: dict[str, SemanticBeat] = {}
         if autonomous_policy is not None:
             semantic_ir = _project_feature_semantic_edit_ir(
                 brief=brief,
@@ -12803,6 +13169,9 @@ def _run_feature_cut_experiment_impl(
                 catalog_sha256=sha256_file(catalog_path),
                 music_present=resolved_music_path is not None,
             )
+            semantic_beat_by_id = {
+                beat.beat_id: beat for beat in semantic_ir.beats
+            }
             write_json(output_dir / "semantic-edit-ir.json", semantic_ir)
             write_json(
                 output_dir / "semantic-edit-ir.binding.json",
@@ -13599,6 +13968,9 @@ def _run_feature_cut_experiment_impl(
                     candidate_id = str(option_data["candidate_id"])
                     candidate_rank = int(option_data["rank"])
                     frame_id = str(option_data["frame_id"])
+                    candidate_semantic_beat = semantic_beat_by_id.get(
+                        selected.feature_id
+                    )
                     try:
                         candidate_frame = frames[frame_id]
                         candidate_clip = clips[candidate_frame.clip_id]
@@ -13977,6 +14349,78 @@ def _run_feature_cut_experiment_impl(
                                     candidate_query_lock.approval.policy_reference
                                 ),
                             }
+                        geometry_recompile_request = {
+                            "event_description": (
+                                brief_chapter.title
+                                + "；"
+                                + str(
+                                    option_data[
+                                        "observed_visual_evidence"
+                                    ]
+                                )
+                            ),
+                            "camera_phases": candidate_camera_phases,
+                            "camera_phase_origin": (
+                                candidate_camera_phase_origin
+                            ),
+                            "crop_mode": candidate_crop_mode,
+                            "overflow_policy": (
+                                brief_chapter.vertical_overflow_policy
+                                if human_reframe_policy_requested
+                                else (
+                                    "controlled_clip"
+                                    if controlled_preview_requested
+                                    else "preserve_all"
+                                )
+                            ),
+                            "edge_priority": (
+                                brief_chapter.vertical_edge_priority
+                                if human_reframe_policy_requested
+                                else "balanced"
+                            ),
+                            "fallback_strategy": (
+                                brief.vertical_fallback_strategy
+                                if human_reframe_policy_requested
+                                else "center_crop"
+                            ),
+                            "checkpoint_path": checkpoint_path,
+                            "grounding_prompt": grounding_prompt,
+                            "output_dir": candidate_root,
+                            "analysis_fps": sam_analysis_fps,
+                            "scdet_threshold": scdet_threshold,
+                            "display_sample_aspect_ratio": (
+                                candidate_display_sar
+                            ),
+                            "model_request_block_reason": (
+                                gemini_geometry_block_reason
+                            ),
+                            "query_lock_v2": candidate_query_lock,
+                            "allow_review_sequential_fallback": False,
+                            "max_identity_model_checks": (
+                                0 if autonomous_profile else 1
+                            ),
+                            "presentation_preference": str(
+                                option_data.get(
+                                    "presentation_preference",
+                                    "tracked_full_bleed",
+                                )
+                            ),
+                            "relation_mode": str(
+                                option_data.get(
+                                    "coverage_mode",
+                                    "simultaneous",
+                                )
+                            ),
+                            "physical_scale_comparison": bool(
+                                option_data.get(
+                                    "physical_scale_comparison",
+                                    False,
+                                )
+                            ),
+                            "semantic_beat": semantic_beat_by_id.get(
+                                selected.feature_id
+                            ),
+                        }
                         if autonomous_static_audition:
                             candidate_filter = (
                                 _vertical_center_crop_filter()
@@ -14115,6 +14559,7 @@ def _run_feature_cut_experiment_impl(
                                 semantic_negotiation_state=(
                                     semantic_negotiation_state
                                 ),
+                                semantic_beat=candidate_semantic_beat,
                             )
                         auto_audit = None
                         failure_codes: list[FailureCode] = []
@@ -14317,6 +14762,9 @@ def _run_feature_cut_experiment_impl(
                                 "evidence_query_v2": attempt.get(
                                     "evidence_query_v2"
                                 ),
+                                "_geometry_recompile_request": (
+                                    geometry_recompile_request
+                                ),
                             }
                         if (
                             not hard_gate_passed
@@ -14442,20 +14890,84 @@ def _run_feature_cut_experiment_impl(
                                 "evidence_query_v2": attempt.get(
                                     "evidence_query_v2"
                                 ),
+                                "_geometry_recompile_request": (
+                                    geometry_recompile_request
+                                ),
                             }
                             break
                     except Exception as error:
                         abort_for_geometry_quota(error)
                         failure_codes = _failure_codes_from_geometry_error(error)
+                        (
+                            candidate_acceptable_capability_ids,
+                            _,
+                        ) = _candidate_capability_boundaries(
+                            presentation_preference=str(
+                                option_data.get(
+                                    "presentation_preference",
+                                    "tracked_full_bleed",
+                                )
+                            ),
+                            semantic_beat=candidate_semantic_beat,
+                            physical_scale_comparison=bool(
+                                option_data.get(
+                                    "physical_scale_comparison",
+                                    False,
+                                )
+                            ),
+                        )
                         whole_source_fit_authorized = (
-                            autonomous_policy is not None
-                            and autonomous_policy.presentation.allow_solid_matte_fit
-                            and any(
-                                contract.feature_id == selected.feature_id
-                                and contract.priority == "hard"
-                                for contract in editorial_templates
+                            _whole_source_fit_recovery_allowed(
+                                policy=autonomous_policy,
+                                regions=candidate_regions,
+                                hard_editorial_beat=any(
+                                    contract.feature_id == selected.feature_id
+                                    and contract.priority == "hard"
+                                    for contract in editorial_templates
+                                ),
+                                semantic_beat=candidate_semantic_beat,
+                                candidate_acceptable_capability_ids=(
+                                    candidate_acceptable_capability_ids
+                                ),
                             )
                         )
+                        whole_source_fit_compilation = None
+                        if whole_source_fit_authorized:
+                            whole_source_fit_compilation = (
+                                compile_presentation(
+                                    targets=(
+                                        PresentationTarget(
+                                            target_id=(
+                                                f"{selected.feature_id}:"
+                                                "whole_source_recovery"
+                                            ),
+                                            source_asset_id=(
+                                                "sha256:"
+                                                + candidate_clip.sha256
+                                            ),
+                                            source_pts=(
+                                                candidate_frame.frame_pts or 0
+                                            ),
+                                            box_2d=(0, 0, 1000, 1000),
+                                        ),
+                                    ),
+                                    source_width=candidate_clip.width,
+                                    source_height=candidate_clip.height,
+                                    relation_mode="single_subject",
+                                    policy=autonomous_policy,
+                                    tracking_available=False,
+                                    preferred_capability_ids=(
+                                        "solid_matte_fit",
+                                    ),
+                                    acceptable_capability_ids=(
+                                        "solid_matte_fit",
+                                    ),
+                                )
+                            )
+                            whole_source_fit_authorized = (
+                                whole_source_fit_compilation.mode
+                                == "solid_matte_fit"
+                            )
                         recovery = choose_recovery(
                             failure_codes,
                             candidates_remaining=(
@@ -14465,7 +14977,7 @@ def _run_feature_cut_experiment_impl(
                         attempt.update(
                             {
                                 "decision": (
-                                    "accepted_scope_preserving_fit"
+                                    "deferred_scope_preserving_fit"
                                     if whole_source_fit_authorized
                                     else "try_next"
                                 ),
@@ -14489,8 +15001,16 @@ def _run_feature_cut_experiment_impl(
                             }
                         )
                         candidate_attempts.append(attempt)
-                        if whole_source_fit_authorized:
-                            selected_vertical = {
+                        if (
+                            whole_source_fit_authorized
+                            and whole_source_fit_compilation is not None
+                            and deferred_fit is None
+                        ):
+                            assert (
+                                whole_source_fit_compilation.filter_graph
+                                is not None
+                            )
+                            deferred_fit = {
                                 "option": option_data,
                                 "frame": candidate_frame,
                                 "clip": candidate_clip,
@@ -14501,7 +15021,9 @@ def _run_feature_cut_experiment_impl(
                                 "trim": candidate_trim,
                                 "regions": candidate_regions,
                                 "target": candidate_target,
-                                "filter": _vertical_fit_filter(),
+                                "filter": (
+                                    whole_source_fit_compilation.filter_graph
+                                ),
                                 "geometry": {
                                     "applied_strategy": "solid_matte_fit",
                                     "fallback_reason": None,
@@ -14518,9 +15040,13 @@ def _run_feature_cut_experiment_impl(
                                     "paid_model_calls_added": 0,
                                     "presentation_decision_codes": [
                                         "hard_event_candidate_preserved",
-                                        "whole_source_scope_preserved",
-                                        "solid_matte_fit_policy_authorized",
+                                        *whole_source_fit_compilation.decision_codes,
                                     ],
+                                    "presentation_compilation": (
+                                        whole_source_fit_compilation.model_dump(
+                                            mode="json"
+                                        )
+                                    ),
                                     "requires_gemini_review": True,
                                 },
                                 "debugs": [],
@@ -14529,7 +15055,8 @@ def _run_feature_cut_experiment_impl(
                                     "evidence_query_v2"
                                 ),
                             }
-                            break
+                        if whole_source_fit_authorized:
+                            continue
                         if human_reframe_policy_requested:
                             selected_vertical = {
                                 "option": option_data,
@@ -14618,6 +15145,168 @@ def _run_feature_cut_experiment_impl(
                 selected_candidate_rank = int(
                     selected_vertical["option"]["rank"]
                 )
+
+                def recompile_selected_vertical_window(
+                    *,
+                    shifted_start_ms: int,
+                    shifted_end_ms: int,
+                ) -> tuple[
+                    str,
+                    dict[str, Any],
+                    list[Path],
+                    str | None,
+                ] | None:
+                    """Invalidate every geometry dependency after a trim shift."""
+
+                    request = selected_vertical.get(
+                        "_geometry_recompile_request"
+                    )
+                    if not isinstance(request, Mapping):
+                        return None
+                    request_data = dict(request)
+                    original_geometry_root = Path(
+                        request_data["output_dir"]
+                    )
+                    recompile_dir = (
+                        original_geometry_root
+                        / "trim-recompile"
+                        / f"{shifted_start_ms}-{shifted_end_ms}"
+                    )
+                    reused_grounding_cache = (
+                        _copy_grounding_cache_for_trim_recompile(
+                            source_root=original_geometry_root,
+                            destination_root=recompile_dir,
+                        )
+                    )
+                    request_data["output_dir"] = recompile_dir
+                    request_data["model_request_block_reason"] = (
+                        "trim_shift_recompile_paid_grounding_cache_miss_"
+                        "forbidden"
+                    )
+                    recompile_result = _attempt_trim_shift_operation(
+                        lambda: _vertical_candidate_geometry(
+                            client=client,
+                            clip=vertical_clip,
+                            frame=vertical_frame,
+                            start_ms=shifted_start_ms,
+                            end_ms=shifted_end_ms,
+                            feature_id=selected.feature_id,
+                            target_description=(
+                                str(vertical_target_description)
+                                if vertical_target_description
+                                else None
+                            ),
+                            regions=vertical_regions,
+                            track_cache=track_cache,
+                            autonomous_policy=autonomous_policy,
+                            semantic_negotiation_state={"global": 1},
+                            **request_data,
+                        ),
+                        failure_path=(
+                            recompile_dir / "trim-recompile.failed.json"
+                        ),
+                        failure_context={
+                            "feature_id": selected.feature_id,
+                            "candidate_id": selected_candidate_id,
+                            "shifted_start_ms": shifted_start_ms,
+                            "shifted_end_ms": shifted_end_ms,
+                            "failed_stage": "presentation_dependency_rebuild",
+                        },
+                    )
+                    if recompile_result is None:
+                        return None
+                    (
+                        recompiled_filter,
+                        recompiled_geometry,
+                        recompiled_debugs,
+                        recompiled_track_fingerprint,
+                    ) = recompile_result
+                    recompiled_preflight, expected_fingerprint = (
+                        _vertical_candidate_preflight(
+                            candidate_id=selected_candidate_id,
+                            rank=selected_candidate_rank,
+                            confidence=float(
+                                selected_vertical["option"]["confidence"]
+                            ),
+                            source_sha256=vertical_clip.sha256,
+                            filter_graph=recompiled_filter,
+                            geometry=recompiled_geometry,
+                            regions=vertical_regions,
+                            track_fingerprint=(
+                                recompiled_track_fingerprint
+                            ),
+                            titles_rendered=brief.render_title_overlays,
+                        )
+                    )
+                    recompiled_audit = audit_auto_bounded_clip(
+                        recompiled_preflight,
+                        auto_reframe_policy,
+                        expected_geometry_fingerprint=expected_fingerprint,
+                    )
+                    if not recompiled_audit.approved:
+                        write_json(
+                            recompile_dir / "trim-recompile.failed.json",
+                            {
+                                "contract_version": (
+                                    "trim-shift-presentation-recompile-"
+                                    "failure-v1"
+                                ),
+                                "feature_id": selected.feature_id,
+                                "candidate_id": selected_candidate_id,
+                                "shifted_start_ms": shifted_start_ms,
+                                "shifted_end_ms": shifted_end_ms,
+                                "failed_stage": (
+                                    "recompiled_geometry_hard_gate"
+                                ),
+                                "audit": recompiled_audit.model_dump(
+                                    mode="json"
+                                ),
+                                "hidden_retry_performed": False,
+                                "original_presentation_preserved": True,
+                            },
+                        )
+                        return None
+                    recompiled_geometry.setdefault(
+                        "risk_codes",
+                        [],
+                    ).append("trim_shift_dependencies_recompiled")
+                    recompiled_geometry["paid_model_calls_added"] = 0
+                    recompiled_geometry[
+                        "trim_shift_grounding_cache_reuse"
+                    ] = {
+                        "copied_cache_roots": list(
+                            reused_grounding_cache
+                        ),
+                        "paid_grounding_cache_miss_forbidden": True,
+                        "paid_model_calls_added": 0,
+                    }
+                    recompiled_geometry[
+                        "trim_shift_invalidation"
+                    ] = {
+                        "previous_start_ms": v_start,
+                        "previous_end_ms": v_end,
+                        "shifted_start_ms": shifted_start_ms,
+                        "shifted_end_ms": shifted_end_ms,
+                        "invalidated": [
+                            "source_camera_motion",
+                            "grounding_window",
+                            "sam_tracks",
+                            "scene_facts",
+                            "presentation_options",
+                            "filter_graph",
+                        ],
+                        "recompiled": True,
+                    }
+                    recompiled_geometry[
+                        "auto_bounded_clip_audit"
+                    ] = recompiled_audit.model_dump(mode="json")
+                    return (
+                        recompiled_filter,
+                        recompiled_geometry,
+                        recompiled_debugs,
+                        recompiled_track_fingerprint,
+                    )
+
                 candidate_attempt_dir = (
                     output_dir / "candidate-attempts" / selected.feature_id
                 )
@@ -14911,6 +15600,7 @@ def _run_feature_cut_experiment_impl(
                             None,
                         )
                         freeze_applied = False
+                        cue_recompile_attempted = False
                         if (
                             reaction_lock is not None
                             and freeze_lock is not None
@@ -14929,29 +15619,78 @@ def _run_feature_cut_experiment_impl(
                                 preserve_end_for_freeze=True,
                             )
                             cue_alignment_repair = None
+                            cue_alignment_ready = not requested_shifts_ms
                             if cue_shifted_window is not None:
                                 original_start = v_start
                                 original_end = v_end
-                                v_start, v_end, shift_ms = (
+                                shifted_start, shifted_end, shift_ms = (
                                     cue_shifted_window
                                 )
-                                cue_alignment_repair = {
-                                    "method": (
-                                        "bounded_freeze_source_in_shift"
-                                    ),
-                                    "shift_ms": shift_ms,
-                                    "original_source_in_ms": original_start,
-                                    "original_source_out_ms": original_end,
-                                    "repaired_source_in_ms": v_start,
-                                    "repaired_source_out_ms": v_end,
-                                    "chapter_duration_reconciliation": (
-                                        "pad_authorized_frozen_tail"
-                                    ),
-                                }
+                                cue_recompile_attempted = True
+                                recompiled = (
+                                    recompile_selected_vertical_window(
+                                        shifted_start_ms=shifted_start,
+                                        shifted_end_ms=shifted_end,
+                                    )
+                                )
+                                if recompiled is not None:
+                                    (
+                                        vertical_filter,
+                                        vertical_geometry,
+                                        vertical_debugs,
+                                        vertical_track_fingerprint,
+                                    ) = recompiled
+                                    v_start = shifted_start
+                                    v_end = shifted_end
+                                    vertical_trim = (
+                                        _render_trim_after_window_shift(
+                                            vertical_trim,
+                                            original_start_ms=original_start,
+                                            original_end_ms=original_end,
+                                            shifted_start_ms=v_start,
+                                            shifted_end_ms=v_end,
+                                        )
+                                    )
+                                    cue_alignment_ready = True
+                                    cue_alignment_repair = {
+                                        "method": (
+                                            "bounded_freeze_source_in_shift_"
+                                            "with_dependency_recompile"
+                                        ),
+                                        "shift_ms": shift_ms,
+                                        "original_source_in_ms": original_start,
+                                        "original_source_out_ms": original_end,
+                                        "repaired_source_in_ms": v_start,
+                                        "repaired_source_out_ms": v_end,
+                                        "chapter_duration_reconciliation": (
+                                            "pad_authorized_frozen_tail"
+                                        ),
+                                    }
+                                else:
+                                    vertical_geometry.setdefault(
+                                        "risk_codes",
+                                        [],
+                                    ).append(
+                                        "cue_shift_recompile_failed"
+                                    )
+                                    vertical_geometry[
+                                        "cue_alignment_repair"
+                                    ] = {
+                                        "method": "not_applied",
+                                        "requested_shift_ms": shift_ms,
+                                        "reason_code": (
+                                            "trim_dependency_recompile_"
+                                            "did_not_pass_hard_gates"
+                                        ),
+                                        "original_presentation_preserved": (
+                                            True
+                                        ),
+                                        "hidden_retry_performed": False,
+                                    }
                             freeze_duration_ms = (
                                 v_end - reaction_lock.source_time_ms
                             )
-                            if 0 < freeze_duration_ms <= (
+                            if cue_alignment_ready and 0 < freeze_duration_ms <= (
                                 autonomous_policy.presentation
                                 .max_intentional_freeze_ms
                             ):
@@ -14964,8 +15703,15 @@ def _run_feature_cut_experiment_impl(
                                     duration_ms=freeze_duration_ms,
                                     policy=autonomous_policy,
                                 )
+                                base_presentation_strategy = str(
+                                    vertical_geometry.get(
+                                        "applied_strategy",
+                                        "unknown",
+                                    )
+                                )
                                 vertical_filter = (
-                                    _vertical_intentional_freeze_fit_filter(
+                                    _vertical_intentional_freeze_filter(
+                                        vertical_filter,
                                         freeze_start_seconds=(
                                             reaction_lock.source_time_ms
                                             - v_start
@@ -14978,26 +15724,31 @@ def _run_feature_cut_experiment_impl(
                                     )
                                 )
                                 vertical_geometry = {
-                                    "applied_strategy": (
-                                        "intentional_freeze"
+                                    **vertical_geometry,
+                                    "applied_strategy": "intentional_freeze",
+                                    "base_presentation_strategy": (
+                                        base_presentation_strategy
                                     ),
-                                    "fallback_reason": None,
-                                    "risk_codes": [
-                                        "brief_authorized_phrase_ending_freeze",
-                                        "whole_source_scope_preserving_fit",
-                                        *(
-                                            ["cue_aligned_trim_shift"]
-                                            if cue_alignment_repair
-                                            is not None
-                                            else []
-                                        ),
-                                    ],
-                                    "full_bleed": False,
-                                    "source_geometry_lineage_passed": True,
-                                    "tracking_confidence_gate_passed": True,
-                                    "coverage_passed": True,
-                                    "minimum_visible_required_area_fraction": 1.0,
-                                    "soft_extent_visibility_passed": True,
+                                    "risk_codes": list(
+                                        dict.fromkeys(
+                                            [
+                                                *vertical_geometry.get(
+                                                    "risk_codes",
+                                                    [],
+                                                ),
+                                                (
+                                                    "brief_authorized_phrase_"
+                                                    "ending_freeze"
+                                                ),
+                                                *(
+                                                    ["cue_aligned_trim_shift"]
+                                                    if cue_alignment_repair
+                                                    is not None
+                                                    else []
+                                                ),
+                                            ]
+                                        )
+                                    ),
                                     "intentional_freeze_spec": (
                                         freeze_spec.model_dump(mode="json")
                                     ),
@@ -15008,11 +15759,14 @@ def _run_feature_cut_experiment_impl(
                                     "paid_model_calls_added": 0,
                                     "requires_gemini_review": True,
                                 }
-                                vertical_track_fingerprint = None
                                 requested_shifts_ms = []
                                 freeze_applied = True
 
-                        if requested_shifts_ms and not freeze_applied:
+                        if (
+                            requested_shifts_ms
+                            and not freeze_applied
+                            and not cue_recompile_attempted
+                        ):
                             shifted_window = _bounded_cue_shifted_window(
                                 start_ms=v_start,
                                 end_ms=v_end,
@@ -15029,33 +15783,45 @@ def _run_feature_cut_experiment_impl(
                                 disposition = _late_cue_shift_disposition(
                                     autonomous_policy
                                 )
-                                if disposition == "solid_fit_authorized":
+                                if disposition == "recompile_required":
                                     original_start = v_start
                                     original_end = v_end
-                                    v_start = shifted_start
-                                    v_end = shifted_end
-                                    vertical_filter = _vertical_fit_filter()
-                                    vertical_geometry = {
-                                        "applied_strategy": (
-                                            "solid_matte_fit"
-                                        ),
-                                        "fallback_reason": None,
-                                        "risk_codes": [
-                                            "cue_aligned_trim_shift",
-                                            (
-                                                "whole_source_scope_"
-                                                "preserving_fit"
-                                            ),
-                                        ],
-                                        "full_bleed": False,
-                                        "source_geometry_lineage_passed": True,
-                                        "tracking_confidence_gate_passed": True,
-                                        "coverage_passed": True,
-                                        "minimum_visible_required_area_fraction": 1.0,
-                                        "soft_extent_visibility_passed": True,
-                                        "cue_alignment_repair": {
+                                    recompiled = (
+                                        recompile_selected_vertical_window(
+                                            shifted_start_ms=shifted_start,
+                                            shifted_end_ms=shifted_end,
+                                        )
+                                    )
+                                    if recompiled is not None:
+                                        (
+                                            vertical_filter,
+                                            vertical_geometry,
+                                            vertical_debugs,
+                                            vertical_track_fingerprint,
+                                        ) = recompiled
+                                        v_start = shifted_start
+                                        v_end = shifted_end
+                                        vertical_trim = (
+                                            _render_trim_after_window_shift(
+                                                vertical_trim,
+                                                original_start_ms=(
+                                                    original_start
+                                                ),
+                                                original_end_ms=original_end,
+                                                shifted_start_ms=v_start,
+                                                shifted_end_ms=v_end,
+                                            )
+                                        )
+                                        vertical_geometry.setdefault(
+                                            "risk_codes",
+                                            [],
+                                        ).append("cue_aligned_trim_shift")
+                                        vertical_geometry[
+                                            "cue_alignment_repair"
+                                        ] = {
                                             "method": (
-                                                "bounded_source_window_shift"
+                                                "bounded_source_window_shift_"
+                                                "with_dependency_recompile"
                                             ),
                                             "shift_ms": shift_ms,
                                             "original_source_in_ms": (
@@ -15066,29 +15832,27 @@ def _run_feature_cut_experiment_impl(
                                             ),
                                             "repaired_source_in_ms": v_start,
                                             "repaired_source_out_ms": v_end,
-                                        },
-                                        "paid_model_calls_added": 0,
-                                        "requires_gemini_review": True,
-                                    }
-                                    vertical_track_fingerprint = None
-                                else:
-                                    vertical_geometry.setdefault(
-                                        "risk_codes",
-                                        [],
-                                    ).append(
-                                        "cue_shift_requires_pre_geometry_recompile"
-                                    )
-                                    vertical_geometry[
-                                        "cue_alignment_repair"
-                                    ] = {
-                                        "method": "not_applied",
-                                        "requested_shift_ms": shift_ms,
-                                        "reason_code": (
-                                            "late_trim_change_cannot_bypass_"
-                                            "presentation_policy"
-                                        ),
-                                        "original_full_bleed_preserved": True,
-                                    }
+                                        }
+                                    else:
+                                        vertical_geometry.setdefault(
+                                            "risk_codes",
+                                            [],
+                                        ).append(
+                                            "cue_shift_recompile_failed"
+                                        )
+                                        vertical_geometry[
+                                            "cue_alignment_repair"
+                                        ] = {
+                                            "method": "not_applied",
+                                            "requested_shift_ms": shift_ms,
+                                            "reason_code": (
+                                                "trim_dependency_recompile_"
+                                                "did_not_pass_hard_gates"
+                                            ),
+                                            "original_presentation_preserved": (
+                                                True
+                                            ),
+                                        }
                         for lock in locks:
                             exact_event_project_times_ms[lock.event_id] = (
                                 project_start_ms + lock.source_time_ms - v_start

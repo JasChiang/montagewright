@@ -36,7 +36,9 @@ from jascue_video_lab.models import (
 from jascue_video_lab.presentation import (
     GroundingTargetRequest,
     PresentationTarget,
+    SceneFacts,
     SourceCameraMotionEvidence,
+    _vertical_intentional_freeze_filter,
     choose_two_panel_layout,
     compile_intentional_freeze,
     compile_minimal_camera_motion,
@@ -71,12 +73,17 @@ def _target(
     *,
     asset: str = "sha256:" + "a" * 64,
     pts: int = 30,
+    track_boxes_by_pts: tuple[
+        tuple[int, tuple[int, int, int, int]],
+        ...,
+    ] = (),
 ) -> PresentationTarget:
     return PresentationTarget(
         target_id=target_id,
         source_asset_id=asset,
         source_pts=pts,
         box_2d=box,
+        track_boxes_by_pts=track_boxes_by_pts,
     )
 
 
@@ -535,7 +542,7 @@ def test_impossible_two_device_crop_uses_scale_locked_two_panel() -> None:
     assert ",pad=" not in filter_graph
 
 
-def test_runtime_crop_failure_can_force_two_panel_enumeration() -> None:
+def test_nested_context_targets_do_not_create_panels_from_target_count() -> None:
     compilation = compile_presentation(
         targets=[
             _target("person", (380, 120, 620, 980)),
@@ -546,11 +553,216 @@ def test_runtime_crop_failure_can_force_two_panel_enumeration() -> None:
         relation_mode="context_detail",
         policy=_policy(),
         allow_static_full_bleed=False,
+        panel_semantically_admissible=False,
+    )
+
+    assert compilation.mode != "two_panel_layout"
+    assert compilation.scene_facts is not None
+    assert compilation.scene_facts.nested_target_pairs == (
+        ("person", "phone"),
+    )
+    assert compilation.paid_model_calls_added == 0
+
+
+def test_explicit_context_detail_may_split_nested_targets() -> None:
+    compilation = compile_presentation(
+        targets=[
+            _target("person", (380, 120, 620, 980)),
+            _target("phone", (470, 420, 540, 610)),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="context_detail",
+        policy=_policy(),
+        allow_static_full_bleed=False,
+        tracking_available=False,
+        acceptable_capability_ids=("two_panel_layout",),
+        panel_semantically_admissible=True,
     )
 
     assert compilation.mode == "two_panel_layout"
     assert compilation.panel_layout is not None
-    assert compilation.paid_model_calls_added == 0
+
+
+def test_two_panels_use_semantic_groups_not_bbox_count() -> None:
+    targets = [
+        _target("person", (40, 100, 280, 900)),
+        _target("held_phone", (170, 350, 250, 600)),
+        _target("comparison_phone", (720, 250, 950, 750)),
+    ]
+    without_groups = compile_presentation(
+        targets=targets,
+        source_width=1920,
+        source_height=1080,
+        relation_mode="simultaneous_relation",
+        policy=_policy(),
+        allow_static_full_bleed=False,
+        tracking_available=False,
+        acceptable_capability_ids=("two_panel_layout",),
+        panel_semantically_admissible=True,
+    )
+    with_groups = compile_presentation(
+        targets=targets,
+        source_width=1920,
+        source_height=1080,
+        relation_mode="simultaneous_relation",
+        policy=_policy(),
+        allow_static_full_bleed=False,
+        tracking_available=False,
+        acceptable_capability_ids=("two_panel_layout",),
+        panel_semantically_admissible=True,
+        panel_target_groups=(
+            ("person", "held_phone"),
+            ("comparison_phone",),
+        ),
+    )
+
+    assert without_groups.mode == "blocked"
+    assert with_groups.mode == "two_panel_layout"
+    assert with_groups.panel_layout is not None
+    assert with_groups.panel_layout.panels[0].target_ids == (
+        "person",
+        "held_phone",
+    )
+    assert with_groups.panel_layout.panels[1].target_ids == (
+        "comparison_phone",
+    )
+
+
+def test_panel_group_cannot_hide_one_unreadable_required_target() -> None:
+    compilation = compile_presentation(
+        targets=[
+            _target("person", (40, 100, 300, 900)),
+            _target("tiny_ui", (180, 460, 190, 470)),
+            _target("comparison_phone", (720, 250, 950, 750)),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="simultaneous_relation",
+        policy=_policy(),
+        allow_static_full_bleed=False,
+        tracking_available=False,
+        acceptable_capability_ids=("two_panel_layout",),
+        required_readability_by_target={
+            "person": 0.5,
+            "tiny_ui": 0.9,
+            "comparison_phone": 0.5,
+        },
+        panel_semantically_admissible=True,
+        panel_target_groups=(
+            ("person", "tiny_ui"),
+            ("comparison_phone",),
+        ),
+    )
+
+    assert compilation.mode == "blocked"
+    assert compilation.selection is not None
+    rejected_codes = {
+        code
+        for reasons in compilation.selection.rejected_options.values()
+        for code in reasons
+    }
+    assert "minimum_readability_failed" in rejected_codes
+
+
+def test_common_motion_and_tracked_relation_are_measured_per_pts() -> None:
+    shared_samples_a = (
+        (0, (100, 200, 300, 800)),
+        (30, (120, 200, 320, 800)),
+        (60, (140, 200, 340, 800)),
+    )
+    shared_samples_b = (
+        (0, (280, 300, 380, 700)),
+        (30, (300, 300, 400, 700)),
+        (60, (320, 300, 420, 700)),
+    )
+    compilation = compile_presentation(
+        targets=[
+            _target(
+                "context",
+                (100, 200, 340, 800),
+                track_boxes_by_pts=shared_samples_a,
+            ),
+            _target(
+                "detail",
+                (280, 300, 420, 700),
+                track_boxes_by_pts=shared_samples_b,
+            ),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="simultaneous_relation",
+        policy=_policy(),
+        allow_static_full_bleed=False,
+        acceptable_capability_ids=("tracked_full_bleed_crop",),
+    )
+
+    assert compilation.mode == "tracked_full_bleed_crop"
+    assert compilation.scene_facts is not None
+    assert compilation.scene_facts.shared_tracked_crop_feasible is True
+    assert compilation.scene_facts.common_motion_pairs == (
+        ("context", "detail"),
+    )
+    assert (
+        compilation.scene_facts.aligned_track_sample_count_matrix[0][1]
+        == 3
+    )
+
+
+def test_scene_facts_v1_artifact_remains_loadable() -> None:
+    compilation = compile_presentation(
+        targets=[_target("subject", (300, 100, 700, 900))],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="single_subject",
+        policy=_policy(),
+    )
+    assert compilation.scene_facts is not None
+    payload = compilation.scene_facts.model_dump(mode="json")
+    payload["contract_version"] = "presentation-scene-facts-v1"
+    for field_name in (
+        "target_center_y",
+        "target_height_fractions",
+        "normalized_xy_distance_matrix",
+        "intersection_over_union_matrix",
+        "containment_fraction_matrix",
+        "nested_target_pairs",
+        "aligned_track_sample_count_matrix",
+        "co_visibility_fraction_matrix",
+        "common_motion_residual_matrix",
+        "common_motion_pairs",
+        "shared_tracked_crop_feasible",
+        "target_short_edge_pixels_by_mode",
+    ):
+        payload.pop(field_name)
+
+    expected_sha256 = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    restored = SceneFacts.model_validate(payload)
+    assert restored.contract_version == "presentation-scene-facts-v1"
+    assert restored.definition_sha256 == expected_sha256
+
+
+def test_intentional_freeze_composes_after_selected_presentation() -> None:
+    base = (
+        "[0:v]crop=720:1080:100:0,"
+        "scale=1080:1920,setsar=1[base]"
+    )
+    graph = _vertical_intentional_freeze_filter(
+        base,
+        freeze_start_seconds=2.0,
+        total_duration_seconds=3.0,
+    )
+
+    assert "crop=720:1080:100:0" in graph
+    assert "[presented]trim=end=2.000000" in graph
+    assert "force_original_aspect_ratio=decrease" not in graph
 
 
 def test_different_sources_cannot_claim_physical_simultaneity() -> None:

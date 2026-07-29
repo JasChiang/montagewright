@@ -119,6 +119,7 @@ class SemanticBeat(_StrictModel):
     maximum_duration_ms: int = Field(gt=0)
     acceptable_capability_ids: tuple[str, ...] = Field(min_length=1)
     forbidden_capability_ids: tuple[str, ...] = ()
+    panel_target_groups: tuple[tuple[str, ...], ...] = ()
 
     @model_validator(mode="after")
     def validate_beat(self) -> "SemanticBeat":
@@ -147,6 +148,28 @@ class SemanticBeat(_StrictModel):
                 "attention intent references unknown targets: "
                 + ", ".join(sorted(unknown_attention))
             )
+        if self.panel_target_groups:
+            if len(self.panel_target_groups) != 2:
+                raise ValueError(
+                    "panel semantics must declare exactly two target groups"
+                )
+            flattened = [
+                target_id
+                for group in self.panel_target_groups
+                for target_id in group
+            ]
+            if any(not group for group in self.panel_target_groups):
+                raise ValueError("panel target groups cannot be empty")
+            if len(flattened) != len(set(flattened)):
+                raise ValueError(
+                    "panel target groups cannot repeat target IDs"
+                )
+            unknown_panel_targets = set(flattened) - known_targets
+            if unknown_panel_targets:
+                raise ValueError(
+                    "panel groups reference unknown targets: "
+                    + ", ".join(sorted(unknown_panel_targets))
+                )
         return self
 
 

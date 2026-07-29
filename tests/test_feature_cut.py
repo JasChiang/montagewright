@@ -34,13 +34,15 @@ from jascue_video_lab.feature_cut import (
     _chapter_bounds_with_approved_trim,
     _audit_feature_plan_candidate_recall,
     _audit_requested_candidate_recall,
+    _attempt_trim_shift_operation,
     _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
     _bounded_cue_shifted_window,
+    _candidate_capability_boundaries,
     _bind_runtime_candidate_coverage,
     _audit_render_source_reuse,
-    _autonomous_panel_fallback_eligible,
     _runtime_candidate_reuse_violation,
+    _whole_source_fit_recovery_allowed,
     _candidate_asset_reference_matches,
     _feature_vertical_candidate_from_runtime_option,
     _cover_transform,
@@ -58,13 +60,16 @@ from jascue_video_lab.feature_cut import (
     _prompt_binds_sha256,
     _concat_segments,
     _controlled_primary_center_preview_allowed,
+    _copy_grounding_cache_for_trim_recompile,
     _render_source_segment,
+    _render_trim_after_window_shift,
     _render_text_layer,
     _requested_render_aspects,
     _required_track_union,
     _resolve_editorial_chapter_durations,
     _resolve_vertical_camera_phases,
     _resolve_vertical_candidate_intent,
+    _resolved_autonomous_relation_mode,
     _refine_selected_vertical_candidate,
     _segment_variant_fingerprint,
     _selected_source_capacity_seconds,
@@ -95,40 +100,145 @@ from jascue_video_lab.feature_cut import (
 from jascue_video_lab.auto_reframe import FailureCode
 
 
-def test_simultaneous_relation_enables_local_two_panel_fallback() -> None:
-    policy = AutonomousEditPolicy(
-        execution_profile="autonomous_strict",
-        content_mode="music_led_feature",
-        requested_aspects=("9:16",),
-        duration=DurationPolicy(
-            target_ms=75_000,
-            min_ms=60_000,
-            max_ms=90_000,
+def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
+    semantic_beat = SimpleNamespace(
+        acceptable_capability_ids=(
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+            "two_panel_layout",
         ),
-        budget=BudgetPolicy(
-            max_gemini_cost_usd=1.25,
-            max_paid_interactions=25,
+        forbidden_capability_ids=(
+            "solid_matte_fit",
+            "phase_virtual_camera",
         ),
     )
 
-    assert _autonomous_panel_fallback_eligible(
-        hard_region_count=2,
+    acceptable, forbidden = _candidate_capability_boundaries(
         presentation_preference="tracked_full_bleed",
-        relation_mode="simultaneous",
-        policy=policy,
+        semantic_beat=semantic_beat,
+        physical_scale_comparison=False,
     )
-    assert _autonomous_panel_fallback_eligible(
-        hard_region_count=2,
-        presentation_preference="tracked_full_bleed",
-        relation_mode="primary_with_context",
-        policy=policy,
+
+    assert acceptable == (
+        "static_full_bleed_crop",
+        "tracked_full_bleed_crop",
     )
-    assert not _autonomous_panel_fallback_eligible(
-        hard_region_count=3,
-        presentation_preference="tracked_full_bleed",
-        relation_mode="simultaneous",
-        policy=policy,
+    assert "two_panel_layout" in forbidden
+    assert "solid_matte_fit" in forbidden
+
+
+def test_primary_with_context_stays_single_canvas_without_panel_intent() -> None:
+    assert (
+        _resolved_autonomous_relation_mode(
+            "primary_with_context",
+            presentation_preference="tracked_full_bleed",
+        )
+        == "single_subject"
     )
+    assert (
+        _resolved_autonomous_relation_mode(
+            "primary_with_context",
+            presentation_preference="two_panel_layout",
+        )
+        == "context_detail"
+    )
+
+
+def test_trim_window_shift_invalidates_stale_exact_pts() -> None:
+    shifted = _render_trim_after_window_shift(
+        {
+            "source_in_ms": 1_000,
+            "source_out_ms": 4_000,
+            "source_in_pts": 90_000,
+            "source_out_pts": 360_000,
+        },
+        original_start_ms=1_000,
+        original_end_ms=4_000,
+        shifted_start_ms=1_100,
+        shifted_end_ms=4_100,
+    )
+
+    assert shifted["source_in_ms"] == 1_100
+    assert shifted["source_out_ms"] == 4_100
+    assert shifted["source_in_pts"] is None
+    assert shifted["source_out_pts"] is None
+    assert shifted["cue_shift_render_binding"][
+        "stale_exact_pts_invalidated"
+    ]
+
+
+def test_trim_shift_failure_is_recorded_without_hidden_retry(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    def fail_once() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("grounding unavailable")
+
+    failure_path = tmp_path / "trim-recompile.failed.json"
+    result = _attempt_trim_shift_operation(
+        fail_once,
+        failure_path=failure_path,
+        failure_context={"feature_id": "feature"},
+    )
+
+    assert result is None
+    assert attempts == 1
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert failure["hidden_retry_performed"] is False
+    assert failure["original_presentation_preserved"] is True
+
+
+def test_trim_recompile_reuses_only_paid_grounding_not_stale_tracks(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "candidate"
+    destination_root = source_root / "trim-recompile" / "1100-4100"
+    grounding = (
+        source_root
+        / "regions"
+        / "subject"
+        / "grounding"
+        / "bbox-key"
+        / "grounding.json"
+    )
+    stale_track = (
+        source_root
+        / "regions"
+        / "subject"
+        / "sam21"
+        / "bbox-key"
+        / "segmentation-track.json"
+    )
+    grounding.parent.mkdir(parents=True)
+    stale_track.parent.mkdir(parents=True)
+    grounding.write_text("{}", encoding="utf-8")
+    stale_track.write_text("{}", encoding="utf-8")
+
+    copied = _copy_grounding_cache_for_trim_recompile(
+        source_root=source_root,
+        destination_root=destination_root,
+    )
+
+    assert copied == ("regions/subject/grounding",)
+    assert (
+        destination_root
+        / "regions"
+        / "subject"
+        / "grounding"
+        / "bbox-key"
+        / "grounding.json"
+    ).is_file()
+    assert not (
+        destination_root
+        / "regions"
+        / "subject"
+        / "sam21"
+        / "bbox-key"
+        / "segmentation-track.json"
+    ).exists()
 
 
 def test_relation_core_preserves_all_clip_card_required_entities() -> None:
@@ -185,8 +295,9 @@ def test_relation_core_preserves_all_clip_card_required_entities() -> None:
     ] == ["left", "right"]
 
 
-def test_authorized_solid_fit_does_not_require_grounding_or_sam(
+def test_authorized_solid_fit_is_not_execution_authority(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     policy = AutonomousEditPolicy(
         execution_profile="autonomous_strict",
@@ -211,7 +322,20 @@ def test_authorized_solid_fit_does_not_require_grounding_or_sam(
         minimum_visible_fraction=1.0,
     )
 
-    _, geometry, debug_paths, track_fingerprint = (
+    attempted = False
+
+    def fail_if_grounding_is_bypassed(**_kwargs: object) -> object:
+        nonlocal attempted
+        attempted = True
+        raise RuntimeError("grounding attempted")
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_build_framing_region_tracks",
+        fail_if_grounding_is_bypassed,
+    )
+
+    with pytest.raises(RuntimeError, match="grounding attempted"):
         _vertical_candidate_geometry(
             client=SimpleNamespace(),
             clip=SimpleNamespace(),
@@ -239,14 +363,84 @@ def test_authorized_solid_fit_does_not_require_grounding_or_sam(
             presentation_preference="solid_matte_fit",
             relation_mode="simultaneous",
         )
+    assert attempted is True
+
+
+def test_whole_source_fit_fails_closed_for_unmeasured_atomic_readability() -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=75_000,
+            min_ms=60_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    ui = FramingRegionIntent(
+        region_id="ui",
+        entity_id="ui",
+        target_description="generated result on phone screen",
+        role="required",
+        kind="ui_region",
+        atomic=True,
+        evidence_role="primary_subject",
+        minimum_visible_fraction=1.0,
     )
 
-    assert geometry["applied_strategy"] == "solid_matte_fit"
-    assert geometry["coverage_passed"] is True
-    assert geometry["relation_preserved_by_whole_source"] is True
-    assert geometry["paid_model_calls_added"] == 0
-    assert debug_paths == []
-    assert track_fingerprint is None
+    assert not _whole_source_fit_recovery_allowed(
+        policy=policy,
+        regions=(ui,),
+        hard_editorial_beat=True,
+    )
+
+
+def test_whole_source_fit_cannot_override_semantic_capability_boundary() -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=75_000,
+            min_ms=60_000,
+            max_ms=90_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    subject = FramingRegionIntent(
+        region_id="subject",
+        entity_id="subject",
+        target_description="person holding a device",
+        role="required",
+        kind="subject",
+        atomic=False,
+        evidence_role="primary_subject",
+        minimum_visible_fraction=1.0,
+    )
+    semantic_beat = SimpleNamespace(
+        acceptable_capability_ids=(
+            "static_full_bleed_crop",
+            "solid_matte_fit",
+        ),
+        forbidden_capability_ids=(),
+    )
+
+    assert not _whole_source_fit_recovery_allowed(
+        policy=policy,
+        regions=(subject,),
+        hard_editorial_beat=True,
+        semantic_beat=semantic_beat,
+        candidate_acceptable_capability_ids=(
+            "static_full_bleed_crop",
+        ),
+    )
 
 
 def test_exact_event_source_is_reserved_from_earlier_flexible_beat() -> None:

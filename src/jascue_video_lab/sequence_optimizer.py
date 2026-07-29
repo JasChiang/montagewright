@@ -105,7 +105,13 @@ def select_executable_option(
     *,
     preferred_capability_ids: Sequence[str] = (),
 ) -> ExecutableOptionSelectionV2:
-    """Select one legal operation without content-specific fallback branches."""
+    """Select one legal operation with hard-first, bounded minimality.
+
+    The local compiler must not let a high aesthetic score compensate for a
+    more intrusive construction.  Planner preferences order operations inside
+    the same natural/constructed tier; they never promote panel or matte above
+    a hard-safe single-canvas presentation.
+    """
 
     generated = tuple(option.option_id for option in options)
     if len(generated) != len(set(generated)):
@@ -133,41 +139,60 @@ def select_executable_option(
         for index, capability_id in enumerate(preferred_capability_ids)
     }
 
-    def rank(option: ExecutableOptionV2) -> tuple[float, float, str]:
-        metrics = option.metrics
-        preference_bonus = 0.0
-        if option.capability_id in preference_rank:
-            preference_bonus = max(
-                0.02,
-                0.12 - preference_rank[option.capability_id] * 0.02,
-            )
-        score = (
-            metrics.semantic_fit * 0.34
-            + metrics.readability * 0.28
-            + metrics.technical_quality * 0.22
-            + metrics.music_flow * 0.10
-            - metrics.synthetic_motion_distance * 0.04
-            - metrics.intrusion_rank * 0.012
-            - metrics.local_cost_rank * 0.006
-            + preference_bonus
-        )
-        # Prefer less intrusive and cheaper options on a semantic tie.
-        tie_break = -(metrics.intrusion_rank + metrics.local_cost_rank * 0.1)
-        return score, tie_break, option.option_id
+    def construction_tier(option: ExecutableOptionV2) -> int:
+        # Ranks below four are single-canvas editorial operations.  Panel and
+        # matte are constructed recovery/presentation families and may only
+        # win after the lower tier has no hard-safe option.
+        return 0 if option.metrics.intrusion_rank < 4 else 1
 
-    ranked = sorted(legal, key=rank, reverse=True)
+    def preference_tier(option: ExecutableOptionV2) -> int:
+        return preference_rank.get(
+            option.capability_id,
+            len(preference_rank) + 1,
+        )
+
+    def rank(
+        option: ExecutableOptionV2,
+    ) -> tuple[int, int, int, float, float, float, float, int, str]:
+        metrics = option.metrics
+        return (
+            construction_tier(option),
+            preference_tier(option),
+            metrics.intrusion_rank,
+            -metrics.semantic_fit,
+            -metrics.readability,
+            -metrics.technical_quality,
+            metrics.synthetic_motion_distance,
+            metrics.local_cost_rank,
+            option.option_id,
+        )
+
+    ranked = sorted(legal, key=rank)
     selected = ranked[0]
-    selected_score = rank(selected)[0]
+    selected_score = (
+        selected.metrics.semantic_fit * 0.4
+        + selected.metrics.readability * 0.35
+        + selected.metrics.technical_quality * 0.25
+    )
     runners = tuple(option.option_id for option in ranked[1:3])
-    score_gap = (
-        selected_score - rank(ranked[1])[0]
+    runner_score = (
+        ranked[1].metrics.semantic_fit * 0.4
+        + ranked[1].metrics.readability * 0.35
+        + ranked[1].metrics.technical_quality * 0.25
         if len(ranked) >= 2
+        else None
+    )
+    score_gap = (
+        selected_score - runner_score
+        if runner_score is not None
         else None
     )
     semantically_ambiguous = bool(
         len(ranked) >= 2
         and score_gap is not None
-        and score_gap <= 0.04
+        and construction_tier(selected) == construction_tier(ranked[1])
+        and preference_tier(selected) == preference_tier(ranked[1])
+        and abs(score_gap) <= 0.04
         and selected.capability_id != ranked[1].capability_id
     )
     return ExecutableOptionSelectionV2(
@@ -186,7 +211,8 @@ def select_executable_option(
         ),
         decision_codes=(
             "hard_constraints_passed",
-            "lexicographic_preference_selected",
+            "single_canvas_minimality_applied",
+            "lexicographic_hard_first_selection",
         ),
     )
 

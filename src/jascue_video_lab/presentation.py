@@ -120,6 +120,7 @@ class PresentationTarget(FrozenStrictModel):
     source_asset_id: str
     source_pts: int
     box_2d: NormalizedBox
+    track_boxes_by_pts: tuple[tuple[int, NormalizedBox], ...] = ()
     minimum_visible_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
 
     @model_validator(mode="after")
@@ -129,7 +130,80 @@ class PresentationTarget(FrozenStrictModel):
             raise ValueError("target x coordinates are invalid")
         if not (0 <= y_min < y_max <= 1000):
             raise ValueError("target y coordinates are invalid")
+        pts_values: list[int] = []
+        for source_pts, box in self.track_boxes_by_pts:
+            track_x_min, track_y_min, track_x_max, track_y_max = box
+            if not (0 <= track_x_min < track_x_max <= 1000):
+                raise ValueError("tracked target x coordinates are invalid")
+            if not (0 <= track_y_min < track_y_max <= 1000):
+                raise ValueError("tracked target y coordinates are invalid")
+            pts_values.append(source_pts)
+        if pts_values != sorted(set(pts_values)):
+            raise ValueError("tracked target PTS values must be strictly increasing")
         return self
+
+
+def _aggregate_presentation_group(
+    *,
+    targets: Sequence[PresentationTarget],
+    target_ids: Sequence[str],
+    group_index: int,
+) -> PresentationTarget:
+    """Collapse one semantic pane group without losing member provenance."""
+
+    target_by_id = {target.target_id: target for target in targets}
+    try:
+        members = [target_by_id[target_id] for target_id in target_ids]
+    except KeyError as error:
+        raise ValueError(
+            f"panel group references unknown target: {error.args[0]}"
+        ) from error
+    source_bindings = {
+        (member.source_asset_id, member.source_pts) for member in members
+    }
+    if len(source_bindings) != 1:
+        raise ValueError(
+            "targets inside one panel group must share source and PTS"
+        )
+    source_asset_id, source_pts = next(iter(source_bindings))
+    envelope = (
+        min(member.box_2d[0] for member in members),
+        min(member.box_2d[1] for member in members),
+        max(member.box_2d[2] for member in members),
+        max(member.box_2d[3] for member in members),
+    )
+    samples_by_member = [
+        dict(member.track_boxes_by_pts) for member in members
+    ]
+    common_pts = (
+        set.intersection(
+            *(set(samples) for samples in samples_by_member)
+        )
+        if samples_by_member and all(samples_by_member)
+        else set()
+    )
+    group_samples = tuple(
+        (
+            sample_pts,
+            (
+                min(samples[sample_pts][0] for samples in samples_by_member),
+                min(samples[sample_pts][1] for samples in samples_by_member),
+                max(samples[sample_pts][2] for samples in samples_by_member),
+                max(samples[sample_pts][3] for samples in samples_by_member),
+            ),
+        )
+        for sample_pts in sorted(common_pts)
+    )
+    return PresentationTarget(
+        target_id=f"semantic_panel_group_{group_index + 1}",
+        source_asset_id=source_asset_id,
+        source_pts=source_pts,
+        box_2d=envelope,
+        track_boxes_by_pts=group_samples,
+        minimum_visible_fraction=max(
+            member.minimum_visible_fraction for member in members
+        ),
+    )
 
 
 class PanelRect(FrozenStrictModel):
@@ -208,16 +282,30 @@ class IntentionalFreezeSpec(FrozenStrictModel):
 class SceneFacts(FrozenStrictModel):
     """Continuous local measurements; never a product/person case label."""
 
-    contract_version: Literal["presentation-scene-facts-v1"] = (
-        "presentation-scene-facts-v1"
+    contract_version: Literal[
+        "presentation-scene-facts-v1",
+        "presentation-scene-facts-v2",
+    ] = (
+        "presentation-scene-facts-v2"
     )
     source_width: int = Field(gt=0)
     source_height: int = Field(gt=0)
     target_ids: tuple[str, ...] = Field(min_length=1)
     target_center_x: tuple[float, ...] = Field(min_length=1)
+    target_center_y: tuple[float, ...] = ()
     target_width_fractions: tuple[float, ...] = Field(min_length=1)
+    target_height_fractions: tuple[float, ...] = ()
     normalized_distance_matrix: tuple[tuple[float, ...], ...]
+    normalized_xy_distance_matrix: tuple[tuple[float, ...], ...] = ()
+    intersection_over_union_matrix: tuple[tuple[float, ...], ...] = ()
+    containment_fraction_matrix: tuple[tuple[float, ...], ...] = ()
+    nested_target_pairs: tuple[tuple[str, str], ...] = ()
+    aligned_track_sample_count_matrix: tuple[tuple[int, ...], ...] = ()
+    co_visibility_fraction_matrix: tuple[tuple[float, ...], ...] = ()
+    common_motion_residual_matrix: tuple[tuple[float | None, ...], ...] = ()
+    common_motion_pairs: tuple[tuple[str, str], ...] = ()
     shared_static_crop_feasible: bool
+    shared_tracked_crop_feasible: bool | None = None
     source_camera_motion: SourceCameraMotionEstimate
     source_camera_motion_measured: bool = False
     source_camera_motion_reliable: bool = False
@@ -226,6 +314,10 @@ class SceneFacts(FrozenStrictModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     target_readability_by_canvas: Mapping[str, float]
+    target_short_edge_pixels_by_mode: Mapping[
+        str,
+        tuple[int, ...],
+    ] = Field(default_factory=dict)
     same_source_same_pts: bool
     physical_scale_evidence_available: bool
 
@@ -238,15 +330,64 @@ class SceneFacts(FrozenStrictModel):
             raise ValueError("scene fact target centers are incomplete")
         if len(self.target_width_fractions) != count:
             raise ValueError("scene fact target widths are incomplete")
-        if len(self.normalized_distance_matrix) != count or any(
-            len(row) != count for row in self.normalized_distance_matrix
+        if self.contract_version == "presentation-scene-facts-v1":
+            if len(self.normalized_distance_matrix) != count or any(
+                len(row) != count
+                for row in self.normalized_distance_matrix
+            ):
+                raise ValueError(
+                    "scene fact distance matrix dimensions are invalid"
+                )
+            return self
+        if len(self.target_center_y) != count:
+            raise ValueError("scene fact target vertical centers are incomplete")
+        if len(self.target_height_fractions) != count:
+            raise ValueError("scene fact target heights are incomplete")
+        matrices = (
+            self.normalized_distance_matrix,
+            self.normalized_xy_distance_matrix,
+            self.intersection_over_union_matrix,
+            self.containment_fraction_matrix,
+            self.aligned_track_sample_count_matrix,
+            self.co_visibility_fraction_matrix,
+            self.common_motion_residual_matrix,
+        )
+        if any(
+            len(matrix) != count
+            or any(len(row) != count for row in matrix)
+            for matrix in matrices
         ):
-            raise ValueError("scene fact distance matrix dimensions are invalid")
+            raise ValueError("scene fact matrix dimensions are invalid")
+        if any(
+            len(values) != count
+            for values in self.target_short_edge_pixels_by_mode.values()
+        ):
+            raise ValueError("scene fact pixel measurements are incomplete")
         return self
 
     @property
     def definition_sha256(self) -> str:
-        return _canonical_payload_sha(self.model_dump(mode="json"))
+        payload = self.model_dump(mode="json")
+        if self.contract_version == "presentation-scene-facts-v1":
+            v1_fields = (
+                "contract_version",
+                "source_width",
+                "source_height",
+                "target_ids",
+                "target_center_x",
+                "target_width_fractions",
+                "normalized_distance_matrix",
+                "shared_static_crop_feasible",
+                "source_camera_motion",
+                "source_camera_motion_measured",
+                "source_camera_motion_reliable",
+                "source_camera_motion_evidence_sha256",
+                "target_readability_by_canvas",
+                "same_source_same_pts",
+                "physical_scale_evidence_available",
+            )
+            payload = {field: payload[field] for field in v1_fields}
+        return _canonical_payload_sha(payload)
 
 
 class PresentationOption(FrozenStrictModel):
@@ -471,6 +612,11 @@ def compile_presentation(
     source_camera_motion_evidence: SourceCameraMotionEvidence | None = None,
     movement_motivated: bool = False,
     preferred_capability_ids: Sequence[str] = (),
+    acceptable_capability_ids: Sequence[str] = (),
+    forbidden_capability_ids: Sequence[str] = (),
+    required_readability_by_target: Mapping[str, float] | None = None,
+    panel_semantically_admissible: bool = False,
+    panel_target_groups: Sequence[Sequence[str]] = (),
 ) -> PresentationCompilation:
     """Compatibility wrapper over the v2 option generator and optimizer."""
 
@@ -493,6 +639,11 @@ def compile_presentation(
         source_camera_x_values=source_camera_x_values,
         source_camera_motion_evidence=source_camera_motion_evidence,
         movement_motivated=movement_motivated,
+        acceptable_capability_ids=acceptable_capability_ids,
+        forbidden_capability_ids=forbidden_capability_ids,
+        required_readability_by_target=required_readability_by_target,
+        panel_semantically_admissible=panel_semantically_admissible,
+        panel_target_groups=panel_target_groups,
     )
     selection = select_executable_option(
         [item.option for item in option_set.options],
@@ -548,6 +699,11 @@ def generate_presentation_options(
     source_camera_x_values: Sequence[float] = (),
     source_camera_motion_evidence: SourceCameraMotionEvidence | None = None,
     movement_motivated: bool = False,
+    acceptable_capability_ids: Sequence[str] = (),
+    forbidden_capability_ids: Sequence[str] = (),
+    required_readability_by_target: Mapping[str, float] | None = None,
+    panel_semantically_admissible: bool = False,
+    panel_target_groups: Sequence[Sequence[str]] = (),
 ) -> PresentationOptionSet:
     """Enumerate all locally feasible operations before selecting one.
 
@@ -601,6 +757,86 @@ def generate_presentation_options(
         ),
     )
     options: list[PresentationOption] = []
+    acceptable = frozenset(acceptable_capability_ids)
+    forbidden = frozenset(forbidden_capability_ids)
+    required_readability = required_readability_by_target or {}
+    panel_admissible = (
+        panel_semantically_admissible or physical_scale_comparison
+    )
+    resolved_panel_groups = tuple(
+        tuple(dict.fromkeys(group))
+        for group in panel_target_groups
+        if group
+    )
+    if not resolved_panel_groups and panel_admissible and len(targets) == 2:
+        resolved_panel_groups = tuple(
+            (target.target_id,) for target in targets
+        )
+    flattened_panel_ids = tuple(
+        target_id
+        for group in resolved_panel_groups
+        for target_id in group
+    )
+    panel_groups_valid = (
+        len(resolved_panel_groups) == 2
+        and len(flattened_panel_ids) == len(set(flattened_panel_ids))
+        and set(flattened_panel_ids) == set(scene_facts.target_ids)
+    )
+    grouped_panel_targets = (
+        tuple(
+            _aggregate_presentation_group(
+                targets=targets,
+                target_ids=group,
+                group_index=index,
+            )
+            for index, group in enumerate(resolved_panel_groups)
+        )
+        if panel_groups_valid
+        else ()
+    )
+    panel_group_index_by_target = {
+        target_id: group_index
+        for group_index, group in enumerate(resolved_panel_groups)
+        for target_id in group
+    }
+    split_coupled_pairs = tuple(
+        pair
+        for pair in (
+            *scene_facts.nested_target_pairs,
+            *scene_facts.common_motion_pairs,
+        )
+        if panel_group_index_by_target.get(pair[0])
+        != panel_group_index_by_target.get(pair[1])
+    )
+    full_bleed_readability = min(
+        1.0,
+        min(
+            scene_facts.target_short_edge_pixels_by_mode["full_bleed"]
+        )
+        / 240,
+    )
+
+    def capability_boundary(capability_id: str) -> ConstraintResult:
+        allowed = (
+            capability_id not in forbidden
+            and (not acceptable or capability_id in acceptable)
+        )
+        return _constraint(
+            "semantic_capability_boundary",
+            passed=allowed,
+            reason_code=(
+                "capability_semantically_acceptable"
+                if allowed
+                else "capability_outside_semantic_boundary"
+            ),
+            evidence_refs=(scene_facts.definition_sha256,),
+        )
+
+    def readability_passed(score: float) -> bool:
+        return all(
+            score >= float(required_readability.get(target_id, 0.0))
+            for target_id in scene_facts.target_ids
+        )
 
     if shared_crop is not None:
         options.append(
@@ -612,10 +848,21 @@ def generate_presentation_options(
                     "static_crop_box_2d": shared_crop,
                 },
                 constraints=(
+                    capability_boundary("static_full_bleed_crop"),
                     _constraint(
                         "shared_static_crop",
                         passed=True,
                         reason_code="required_targets_fit_static_full_bleed",
+                        evidence_refs=(scene_facts.definition_sha256,),
+                    ),
+                    _constraint(
+                        "minimum_readability",
+                        passed=readability_passed(full_bleed_readability),
+                        reason_code=(
+                            "minimum_readability_passed"
+                            if readability_passed(full_bleed_readability)
+                            else "minimum_readability_failed"
+                        ),
                         evidence_refs=(scene_facts.definition_sha256,),
                     ),
                 ),
@@ -624,7 +871,7 @@ def generate_presentation_options(
                     if relation_mode != "sequential_focus"
                     else 0.78
                 ),
-                readability=1.0,
+                readability=full_bleed_readability,
                 technical_quality=1.0,
                 intrusion_rank=capability_specs[
                     "static_full_bleed_crop"
@@ -639,6 +886,7 @@ def generate_presentation_options(
 
     if tracking_available:
         tracked_constraint = (
+            capability_boundary("tracked_full_bleed_crop"),
             _constraint(
                 "tracking_available",
                 passed=True,
@@ -651,6 +899,7 @@ def generate_presentation_options(
                     relation_mode
                     not in {"simultaneous_relation", "context_detail"}
                     or shared_crop is not None
+                    or scene_facts.shared_tracked_crop_feasible is True
                 ),
                 reason_code=(
                     "required_relation_preserved"
@@ -658,8 +907,19 @@ def generate_presentation_options(
                         relation_mode
                         not in {"simultaneous_relation", "context_detail"}
                         or shared_crop is not None
+                        or scene_facts.shared_tracked_crop_feasible is True
                     )
                     else "tracked_single_view_cannot_preserve_relation"
+                ),
+                evidence_refs=(scene_facts.definition_sha256,),
+            ),
+            _constraint(
+                "minimum_readability",
+                passed=readability_passed(full_bleed_readability),
+                reason_code=(
+                    "minimum_readability_passed"
+                    if readability_passed(full_bleed_readability)
+                    else "minimum_readability_failed"
                 ),
                 evidence_refs=(scene_facts.definition_sha256,),
             ),
@@ -674,7 +934,7 @@ def generate_presentation_options(
                 semantic_fit=(
                     0.90 if relation_mode == "single_subject" else 0.72
                 ),
-                readability=0.92,
+                readability=full_bleed_readability,
                 technical_quality=0.90,
                 intrusion_rank=capability_specs[
                     "tracked_full_bleed_crop"
@@ -714,6 +974,7 @@ def generate_presentation_options(
                         "camera_motion": camera_motion.model_dump(mode="json"),
                     },
                     constraints=(
+                        capability_boundary(motion_mode),
                         _constraint(
                             "motion_motivated",
                             passed=movement_motivated,
@@ -804,12 +1065,13 @@ def generate_presentation_options(
 
     if (
         relation_mode in {"simultaneous_relation", "context_detail"}
-        and len(targets) == 2
+        and len(grouped_panel_targets) == 2
         and policy.presentation.allow_two_panel_layout
+        and panel_admissible
     ):
         panel = choose_two_panel_layout(
-            targets[0],
-            targets[1],
+            grouped_panel_targets[0],
+            grouped_panel_targets[1],
             source_width=source_width,
             source_height=source_height,
             relation_mode=relation_mode,
@@ -820,6 +1082,38 @@ def generate_presentation_options(
             allowed_modes=policy.presentation.allowed_panel_modes,
         )
         if panel is not None:
+            panel = panel.model_copy(
+                update={
+                    "panels": tuple(
+                        panel_spec.model_copy(
+                            update={
+                                "target_ids": resolved_panel_groups[index]
+                            }
+                        )
+                        for index, panel_spec in enumerate(panel.panels)
+                    )
+                }
+            )
+            target_by_id = {
+                target.target_id: target for target in targets
+            }
+            panel_readability_by_target = {
+                target_id: _panel_readability(
+                    target_by_id[target_id].box_2d,
+                    panel_spec.output_rect,
+                    panel_spec.crop_box_2d,
+                )
+                for panel_spec in panel.panels
+                for target_id in panel_spec.target_ids
+            }
+            panel_readability_passed = all(
+                score
+                >= float(required_readability.get(target_id, 0.0))
+                for target_id, score in panel_readability_by_target.items()
+            )
+            panel_min_readability = min(
+                panel_readability_by_target.values()
+            )
             options.append(
                 _presentation_option(
                     capability_id="two_panel_layout",
@@ -827,10 +1121,36 @@ def generate_presentation_options(
                     scene_facts=scene_facts,
                     payload=panel.model_dump(mode="json"),
                     constraints=(
+                        capability_boundary("two_panel_layout"),
+                        _constraint(
+                            "panel_semantic_admissibility",
+                            passed=panel_admissible,
+                            reason_code="panel_semantically_admissible",
+                            evidence_refs=(scene_facts.definition_sha256,),
+                        ),
+                        _constraint(
+                            "coupled_target_separation",
+                            passed=(
+                                not split_coupled_pairs
+                                or relation_mode == "context_detail"
+                            ),
+                            reason_code=(
+                                "targets_are_independent_panel_groups"
+                                if not split_coupled_pairs
+                                else "context_detail_explicitly_authorizes_coupled_views"
+                                if relation_mode == "context_detail"
+                                else "coupled_targets_must_remain_on_one_canvas"
+                            ),
+                            evidence_refs=(scene_facts.definition_sha256,),
+                        ),
                         _constraint(
                             "two_panel_count",
-                            passed=True,
-                            reason_code="exactly_two_panels",
+                            passed=panel_groups_valid,
+                            reason_code=(
+                                "exactly_two_semantic_panel_groups"
+                                if panel_groups_valid
+                                else "semantic_panel_groups_invalid"
+                            ),
                         ),
                         _constraint(
                             "same_pts_or_conceptual",
@@ -857,11 +1177,21 @@ def generate_presentation_options(
                             ),
                             evidence_refs=(scene_facts.definition_sha256,),
                         ),
+                        _constraint(
+                            "minimum_readability",
+                            passed=panel_readability_passed,
+                            reason_code=(
+                                "minimum_readability_passed"
+                                if panel_readability_passed
+                                else "minimum_readability_failed"
+                            ),
+                            evidence_refs=(scene_facts.definition_sha256,),
+                        ),
                     ),
                     semantic_fit=(
                         0.94 if shared_crop is None else 0.68
                     ),
-                    readability=max(0.5, panel.local_layout_score),
+                    readability=panel_min_readability,
                     technical_quality=0.88,
                     intrusion_rank=capability_specs[
                         "two_panel_layout"
@@ -883,10 +1213,25 @@ def generate_presentation_options(
                 scene_facts=scene_facts,
                 payload={"filter_graph": _vertical_fit_filter()},
                 constraints=(
+                    capability_boundary("solid_matte_fit"),
                     _constraint(
                         "policy_authorized",
                         passed=True,
                         reason_code="solid_matte_fit_policy_authorized",
+                    ),
+                    _constraint(
+                        "minimum_readability",
+                        passed=readability_passed(
+                            scene_facts.target_readability_by_canvas["9:16"]
+                        ),
+                        reason_code=(
+                            "minimum_readability_passed"
+                            if readability_passed(
+                                scene_facts.target_readability_by_canvas["9:16"]
+                            )
+                            else "minimum_readability_failed"
+                        ),
+                        evidence_refs=(scene_facts.definition_sha256,),
                     ),
                 ),
                 semantic_fit=0.58,
@@ -944,32 +1289,259 @@ def _build_scene_facts(
     source_camera_motion_reliable: bool,
     source_camera_motion_evidence_sha256: str | None,
 ) -> SceneFacts:
-    centers = tuple(
+    center_x = tuple(
         ((target.box_2d[0] + target.box_2d[2]) / 2) / 1000
+        for target in targets
+    )
+    center_y = tuple(
+        ((target.box_2d[1] + target.box_2d[3]) / 2) / 1000
         for target in targets
     )
     widths = tuple(
         (target.box_2d[2] - target.box_2d[0]) / 1000
         for target in targets
     )
-    distances = tuple(
-        tuple(abs(first - second) for second in centers)
-        for first in centers
+    heights = tuple(
+        (target.box_2d[3] - target.box_2d[1]) / 1000
+        for target in targets
+    )
+    x_distances = tuple(
+        tuple(abs(first - second) for second in center_x)
+        for first in center_x
+    )
+    xy_distances = tuple(
+        tuple(
+            math.hypot(first_x - second_x, first_y - second_y)
+            for second_x, second_y in zip(center_x, center_y, strict=True)
+        )
+        for first_x, first_y in zip(center_x, center_y, strict=True)
+    )
+
+    def intersection_area(first: NormalizedBox, second: NormalizedBox) -> int:
+        return max(0, min(first[2], second[2]) - max(first[0], second[0])) * max(
+            0,
+            min(first[3], second[3]) - max(first[1], second[1]),
+        )
+
+    areas = tuple(
+        (target.box_2d[2] - target.box_2d[0])
+        * (target.box_2d[3] - target.box_2d[1])
+        for target in targets
+    )
+    intersections = tuple(
+        tuple(
+            intersection_area(first.box_2d, second.box_2d)
+            for second in targets
+        )
+        for first in targets
+    )
+    iou = tuple(
+        tuple(
+            round(
+                intersections[first_index][second_index]
+                / max(
+                    1,
+                    areas[first_index]
+                    + areas[second_index]
+                    - intersections[first_index][second_index],
+                ),
+                6,
+            )
+            for second_index in range(len(targets))
+        )
+        for first_index in range(len(targets))
+    )
+    containment = tuple(
+        tuple(
+            round(
+                intersections[first_index][second_index]
+                / max(1, areas[second_index]),
+                6,
+            )
+            for second_index in range(len(targets))
+        )
+        for first_index in range(len(targets))
+    )
+    nested_pairs = tuple(
+        (
+            targets[outer_index].target_id,
+            targets[inner_index].target_id,
+        )
+        for outer_index in range(len(targets))
+        for inner_index in range(len(targets))
+        if outer_index != inner_index
+        and containment[outer_index][inner_index] >= 0.9
+    )
+    samples_by_target = tuple(
+        {
+            source_pts: box
+            for source_pts, box in target.track_boxes_by_pts
+        }
+        for target in targets
+    )
+    sample_pts_by_target = tuple(
+        set(samples) for samples in samples_by_target
+    )
+    aligned_counts = tuple(
+        tuple(
+            len(first_pts & second_pts)
+            for second_pts in sample_pts_by_target
+        )
+        for first_pts in sample_pts_by_target
+    )
+    co_visibility = tuple(
+        tuple(
+            round(
+                len(first_pts & second_pts)
+                / max(1, len(first_pts | second_pts)),
+                6,
+            )
+            for second_pts in sample_pts_by_target
+        )
+        for first_pts in sample_pts_by_target
+    )
+
+    def center(box: NormalizedBox) -> tuple[float, float]:
+        return (
+            (box[0] + box[2]) / 2000,
+            (box[1] + box[3]) / 2000,
+        )
+
+    def common_motion_residual(
+        first_index: int,
+        second_index: int,
+    ) -> float | None:
+        common_pts = sorted(
+            sample_pts_by_target[first_index]
+            & sample_pts_by_target[second_index]
+        )
+        if len(common_pts) < 2:
+            return None
+        residuals: list[float] = []
+        for before_pts, after_pts in zip(
+            common_pts[:-1],
+            common_pts[1:],
+            strict=True,
+        ):
+            first_before = center(
+                samples_by_target[first_index][before_pts]
+            )
+            first_after = center(
+                samples_by_target[first_index][after_pts]
+            )
+            second_before = center(
+                samples_by_target[second_index][before_pts]
+            )
+            second_after = center(
+                samples_by_target[second_index][after_pts]
+            )
+            residuals.append(
+                math.hypot(
+                    (first_after[0] - first_before[0])
+                    - (second_after[0] - second_before[0]),
+                    (first_after[1] - first_before[1])
+                    - (second_after[1] - second_before[1]),
+                )
+            )
+        return round(sum(residuals) / len(residuals), 6)
+
+    motion_residuals = tuple(
+        tuple(
+            common_motion_residual(first_index, second_index)
+            for second_index in range(len(targets))
+        )
+        for first_index in range(len(targets))
+    )
+    common_motion_pairs = tuple(
+        (targets[first_index].target_id, targets[second_index].target_id)
+        for first_index in range(len(targets))
+        for second_index in range(first_index + 1, len(targets))
+        if motion_residuals[first_index][second_index] is not None
+        and motion_residuals[first_index][second_index] <= 0.03
+        and co_visibility[first_index][second_index] >= 0.8
+    )
+    common_track_pts = (
+        set.intersection(*sample_pts_by_target)
+        if sample_pts_by_target
+        and all(sample_pts_by_target)
+        else set()
+    )
+    shared_tracked_crop_feasible = (
+        all(
+            _largest_shared_vertical_crop(
+                [
+                    target.model_copy(
+                        update={
+                            "box_2d": samples_by_target[target_index][
+                                source_pts
+                            ],
+                            "track_boxes_by_pts": (),
+                        }
+                    )
+                    for target_index, target in enumerate(targets)
+                ],
+                source_width=source_width,
+                source_height=source_height,
+            )
+            is not None
+            for source_pts in sorted(common_track_pts)
+        )
+        if common_track_pts
+        else None
     )
     same_source_same_pts = len(
         {(target.source_asset_id, target.source_pts) for target in targets}
     ) == 1
-    # This is a geometry proxy, not a semantic claim. Exact text/UI
-    # readability remains a separate evidence provider.
-    portrait_readability = min(1.0, max(0.0, min(widths) * 4.0))
+    solid_fit_scale = min(
+        1080 / source_width,
+        1920 / source_height,
+    )
+    full_bleed_scale = max(
+        1080 / source_width,
+        1920 / source_height,
+    )
+
+    def target_short_edges(scale: float) -> tuple[int, ...]:
+        return tuple(
+            round(
+                min(
+                    width * source_width * scale,
+                    height * source_height * scale,
+                )
+            )
+            for width, height in zip(widths, heights, strict=True)
+        )
+
+    solid_fit_short_edges = target_short_edges(solid_fit_scale)
+    full_bleed_short_edges = target_short_edges(full_bleed_scale)
+    # 240 px is the executor's conservative short-edge normalization for a
+    # legible atomic UI/detail target. Final semantic QA remains independent.
+    portrait_readability = min(
+        1.0,
+        max(
+            0.0,
+            min(solid_fit_short_edges) / 240,
+        ),
+    )
     return SceneFacts(
         source_width=source_width,
         source_height=source_height,
         target_ids=tuple(target.target_id for target in targets),
-        target_center_x=centers,
+        target_center_x=center_x,
+        target_center_y=center_y,
         target_width_fractions=widths,
-        normalized_distance_matrix=distances,
+        target_height_fractions=heights,
+        normalized_distance_matrix=x_distances,
+        normalized_xy_distance_matrix=xy_distances,
+        intersection_over_union_matrix=iou,
+        containment_fraction_matrix=containment,
+        nested_target_pairs=nested_pairs,
+        aligned_track_sample_count_matrix=aligned_counts,
+        co_visibility_fraction_matrix=co_visibility,
+        common_motion_residual_matrix=motion_residuals,
+        common_motion_pairs=common_motion_pairs,
         shared_static_crop_feasible=shared_crop is not None,
+        shared_tracked_crop_feasible=shared_tracked_crop_feasible,
         source_camera_motion=source_motion,
         source_camera_motion_measured=source_camera_motion_measured,
         source_camera_motion_reliable=source_camera_motion_reliable,
@@ -977,6 +1549,10 @@ def _build_scene_facts(
             source_camera_motion_evidence_sha256
         ),
         target_readability_by_canvas={"9:16": round(portrait_readability, 6)},
+        target_short_edge_pixels_by_mode={
+            "solid_matte_fit": solid_fit_short_edges,
+            "full_bleed": full_bleed_short_edges,
+        },
         same_source_same_pts=same_source_same_pts,
         physical_scale_evidence_available=same_source_same_pts,
     )
@@ -2045,7 +2621,7 @@ def choose_two_panel_layout(
             )
             if first_crop is None or second_crop is None:
                 continue
-        score = sum(
+        score = min(
             _panel_readability(target.box_2d, rect, crop)
             for target, rect, crop in zip(
                 (first, second),
@@ -2257,16 +2833,35 @@ def _vertical_intentional_freeze_fit_filter(
     freeze_start_seconds: float,
     total_duration_seconds: float,
 ) -> str:
+    return _vertical_intentional_freeze_filter(
+        _vertical_fit_filter(),
+        freeze_start_seconds=freeze_start_seconds,
+        total_duration_seconds=total_duration_seconds,
+    )
+
+
+def _vertical_intentional_freeze_filter(
+    presentation_filter_graph: str,
+    *,
+    freeze_start_seconds: float,
+    total_duration_seconds: float,
+) -> str:
+    """Freeze the already-compiled presentation, not the uncropped source."""
+
     if not 0 < freeze_start_seconds < total_duration_seconds:
         raise ValueError("intentional freeze must start inside the segment")
+    if not presentation_filter_graph.endswith("[base]"):
+        raise ValueError(
+            "intentional freeze requires a presentation graph ending in [base]"
+        )
     freeze_duration = total_duration_seconds - freeze_start_seconds
     return (
-        "[0:v]fps=30,"
-        f"trim=end={freeze_start_seconds:.6f},setpts=PTS-STARTPTS,"
-        f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f},"
-        "scale='max(2,trunc(iw*sar/2)*2)':ih,setsar=1,"
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x0b0e12,setsar=1[base]"
+        presentation_filter_graph[:-6]
+        + "[presented];"
+        + "[presented]"
+        + f"trim=end={freeze_start_seconds:.6f},setpts=PTS-STARTPTS,"
+        + f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}"
+        + "[base]"
     )
 
 
@@ -2507,12 +3102,16 @@ def _panel_readability(
     box_height = box[3] - box[1]
     crop_width = crop[2] - crop[0]
     crop_height = crop[3] - crop[1]
-    target_occupancy = min(
-        1.0,
-        (box_width * box_height) / (crop_width * crop_height),
+    projected_width_pixels = (
+        box_width / crop_width * rect.width / 1000 * 1080
     )
-    area = rect.width * rect.height / 1_000_000
-    return area * target_occupancy**0.5
+    projected_height_pixels = (
+        box_height / crop_height * rect.height / 1000 * 1920
+    )
+    return min(
+        1.0,
+        min(projected_width_pixels, projected_height_pixels) / 240,
+    )
 
 
 def _panel_crop_around(
