@@ -25,7 +25,7 @@ from .storage import read_json, utc_now, write_json
 
 
 FINAL_EDIT_QA_CONTRACT_VERSION = "final-edit-qa-v1"
-FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v2"
+FINAL_EDIT_QA_PROMPT_VERSION = "final-edit-qa-prompt-v3"
 FINAL_EDIT_QA_VALIDATOR_VERSION = "final-edit-qa-validator-v3"
 FINAL_EDIT_QA_GENERATION_CONFIG = {
     "thinking_level": "low",
@@ -514,12 +514,60 @@ def build_final_qa_segment_contract(
                 )
             )
         )
-        required_subjects = _flatten_text(
-            chapter.get("required_subjects")
-            or chapter.get("required_regions")
-            or chapter.get("vertical_regions")
-            or chapter.get("target_description")
+        vertical_regions = chapter.get("vertical_regions")
+        typed_vertical_regions = (
+            [
+                item
+                for item in vertical_regions
+                if isinstance(item, Mapping)
+            ]
+            if isinstance(vertical_regions, list)
+            else []
         )
+        has_typed_roles = any(
+            item.get("role") in {"required", "preferred"}
+            for item in typed_vertical_regions
+        )
+        required_region_contracts = [
+            {
+                "entity_id": item.get("entity_id"),
+                "region_id": item.get("region_id"),
+                "description": item.get("target_description"),
+                "minimum_visible_fraction": item.get(
+                    "minimum_visible_fraction"
+                ),
+            }
+            for item in typed_vertical_regions
+            if item.get("role") == "required"
+        ]
+        preferred_region_contracts = [
+            {
+                "entity_id": item.get("entity_id"),
+                "region_id": item.get("region_id"),
+                "description": item.get("target_description"),
+            }
+            for item in typed_vertical_regions
+            if item.get("role") == "preferred"
+        ]
+        required_subjects = (
+            [
+                str(item["description"])
+                for item in required_region_contracts
+                if item.get("description")
+            ]
+            if has_typed_roles
+            else _flatten_text(
+                chapter.get("required_subjects")
+                or chapter.get("required_regions")
+                or vertical_regions
+                or chapter.get("target_description")
+            )
+        )
+        preferred_subjects = [
+            str(item["description"])
+            for item in preferred_region_contracts
+            if item.get("description")
+        ]
         important_text = _flatten_text(
             chapter.get("important_text")
             or chapter.get("required_text")
@@ -539,6 +587,20 @@ def build_final_qa_segment_contract(
                 "brief_item_id": brief_item_id,
                 "expected_semantics": expected_semantics,
                 "required_subjects": list(dict.fromkeys(required_subjects)),
+                "required_subject_contracts": required_region_contracts,
+                "preferred_context_subjects": list(
+                    dict.fromkeys(preferred_subjects)
+                ),
+                "preferred_context_contracts": preferred_region_contracts,
+                "preferred_context_may_be_clipped": bool(
+                    chapter.get("secondary_context_clipping_allowed")
+                    or chapter.get("controlled_clip_applied")
+                    or chapter.get("auto_bounded_clip_applied")
+                ),
+                "presentation_strategy": (
+                    chapter.get("strategy")
+                    or chapter.get("applied_strategy")
+                ),
                 "important_text": list(dict.fromkeys(important_text)),
                 "tracking_expected": bool(
                     chapter.get("tracking_expected")

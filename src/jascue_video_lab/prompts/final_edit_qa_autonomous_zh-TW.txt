@@ -12,4 +12,12 @@
 - 選擇一個有限 repair_class；這只是問題分類，不是可執行指令。
 - music sync 必須同時依可聽音樂與可見事件判斷。
 
+`required_subjects`／`required_subject_contracts` 才是 hard framing evidence。
+`preferred_context_subjects` 是可犧牲的輔助脈絡，不得當成 required。當
+`preferred_context_may_be_clipped=true` 時，僅因 preferred 人物、物件、立牌或
+文字離開 9:16 畫面，不得回報 `subject_clipped`、`relation_lost` 或
+`missing_required_evidence`。只有 required subject 在成片中的可見比例低於其
+`minimum_visible_fraction`，或 brief 必要關係確實被破壞，才能建立 blocking
+issue。`presentation_strategy` 只說明實際呈現方式，不代表問題或成功。
+
 若 hard evidence 無法確認，回報 `missing_required_evidence` 或 `insufficient_evidence`，不得猜測已存在。若沒有 blocking observation，使用 `no_blocking_observation`；這仍不構成交付授權。

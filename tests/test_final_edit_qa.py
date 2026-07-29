@@ -212,6 +212,57 @@ def _canonical_output(prepared: Any) -> dict[str, Any]:
     }
 
 
+def test_autonomous_segment_contract_separates_required_from_preferred_context() -> None:
+    manifest = {
+        "vertical": {
+            "chapters": [
+                {
+                    "feature_id": "opening",
+                    "applied_strategy": "tracked_crop",
+                    "secondary_context_clipping_allowed": True,
+                    "duration_ms": 6_000,
+                    "vertical_regions": [
+                        {
+                            "region_id": "required.phone",
+                            "entity_id": "phone",
+                            "role": "required",
+                            "target_description": "central required phone",
+                            "minimum_visible_fraction": 1.0,
+                        },
+                        {
+                            "region_id": "preferred.person",
+                            "entity_id": "side_person",
+                            "role": "preferred",
+                            "target_description": "side context person",
+                            "minimum_visible_fraction": None,
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+    contract = final_edit_qa_module.build_final_qa_segment_contract(
+        manifest,
+        mode="autonomous_final_9x16",
+    )
+
+    assert contract[0]["required_subjects"] == ["central required phone"]
+    assert contract[0]["preferred_context_subjects"] == [
+        "side context person"
+    ]
+    assert contract[0]["preferred_context_may_be_clipped"] is True
+    assert contract[0]["required_subject_contracts"] == [
+        {
+            "entity_id": "phone",
+            "region_id": "required.phone",
+            "description": "central required phone",
+            "minimum_visible_fraction": 1.0,
+        }
+    ]
+    assert contract[0]["presentation_strategy"] == "tracked_crop"
+
+
 def _autonomous_policy() -> AutonomousEditPolicy:
     return AutonomousEditPolicy(
         execution_profile="autonomous_strict",
