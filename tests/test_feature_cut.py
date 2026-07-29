@@ -2173,6 +2173,44 @@ from jascue_video_lab.shots import ShotManifest, ShotSegment
 from jascue_video_lab.storage import read_json, write_json
 
 
+def test_grounded_track_alignment_preserves_hard_target_after_preferred_omission() -> None:
+    hard = FramingRegionIntent(
+        region_id="watch.required.smartwatch",
+        entity_id="smartwatch_01",
+        target_description="required smartwatch",
+        role="required",
+        evidence_role="primary_subject",
+        minimum_visible_fraction=1.0,
+    )
+    preferred = FramingRegionIntent(
+        region_id="watch.preferred.hand",
+        entity_id="hand_01",
+        target_description="preferred operating hand",
+        role="preferred",
+        evidence_role="context_reference",
+    )
+    track = SimpleNamespace()
+
+    tracks_by_region, available_soft, failures = (
+        feature_cut_module._align_grounded_region_tracks(
+            proposals=[SimpleNamespace(entity_id="smartwatch_01")],
+            tracks=[track],
+            crop_regions=[hard, preferred],
+            hard_regions=[hard],
+            soft_regions=[preferred],
+        )
+    )
+
+    assert tracks_by_region == {hard.region_id: track}
+    assert available_soft == []
+    assert failures == [
+        {
+            "region_id": preferred.region_id,
+            "reason_code": "preferred_grounding_omitted",
+        }
+    ]
+
+
 def _portrait_presentation_options(
     *,
     single: str = "not_feasible",

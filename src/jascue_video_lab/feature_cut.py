@@ -7859,6 +7859,62 @@ def _build_required_region_tracks(
     )
 
 
+def _align_grounded_region_tracks(
+    *,
+    proposals: Sequence[GroundingProposal],
+    tracks: Sequence[SegmentationTrack],
+    crop_regions: Sequence[FramingRegionIntent],
+    hard_regions: Sequence[FramingRegionIntent],
+    soft_regions: Sequence[FramingRegionIntent],
+) -> tuple[
+    dict[str, SegmentationTrack],
+    list[FramingRegionIntent],
+    list[dict[str, str]],
+]:
+    """Align post-Grounding tracks by identity after preferred omissions."""
+
+    regions_by_grounding_entity = {
+        (
+            region.entity_id
+            or f"reframe_{region.region_id}"
+        ): region
+        for region in crop_regions
+    }
+    tracks_by_region: dict[str, SegmentationTrack] = {}
+    for proposal, track in zip(proposals, tracks, strict=True):
+        region = regions_by_grounding_entity.get(proposal.entity_id)
+        if region is None:
+            raise ValueError(
+                "grounded framing target has no matching region contract: "
+                + proposal.entity_id
+            )
+        tracks_by_region[region.region_id] = track
+    missing_hard_regions = [
+        region.region_id
+        for region in hard_regions
+        if region.region_id not in tracks_by_region
+    ]
+    if missing_hard_regions:
+        raise ValueError(
+            "grouped Grounding omitted hard-core framing targets: "
+            + ", ".join(missing_hard_regions)
+        )
+    available_soft_regions = [
+        region
+        for region in soft_regions
+        if region.region_id in tracks_by_region
+    ]
+    optional_region_failures = [
+        {
+            "region_id": region.region_id,
+            "reason_code": "preferred_grounding_omitted",
+        }
+        for region in soft_regions
+        if region.region_id not in tracks_by_region
+    ]
+    return tracks_by_region, available_soft_regions, optional_region_failures
+
+
 def _identity_seed_reference(
     *,
     track: SegmentationTrack,
@@ -8992,7 +9048,7 @@ def _vertical_candidate_geometry(
     if crop_regions and not hard_regions:
         raise ValueError("candidate region contract has no hard core")
     if crop_regions:
-        _, all_tracks, all_debug_paths = _build_framing_region_tracks(
+        all_proposals, all_tracks, all_debug_paths = _build_framing_region_tracks(
             client=client,
             clip=clip,
             frame=frame,
@@ -9013,21 +9069,25 @@ def _vertical_candidate_geometry(
             query_lock_v2=query_lock_v2,
         )
         debug_paths.extend(all_debug_paths)
-        tracks_by_region = {
-            region.region_id: track
-            for region, track in zip(
-                crop_regions,
-                all_tracks,
-                strict=True,
-            )
-        }
+        (
+            tracks_by_region,
+            available_soft_regions,
+            grounded_optional_failures,
+        ) = _align_grounded_region_tracks(
+            proposals=all_proposals,
+            tracks=all_tracks,
+            crop_regions=crop_regions,
+            hard_regions=hard_regions,
+            soft_regions=soft_regions,
+        )
+        optional_region_failures.extend(grounded_optional_failures)
         hard_tracks = [
             tracks_by_region[region.region_id]
             for region in hard_regions
         ]
         soft_tracks = [
             tracks_by_region[region.region_id]
-            for region in soft_regions
+            for region in available_soft_regions
         ]
         identity_tracks.extend(
             (
@@ -9361,7 +9421,6 @@ def _vertical_candidate_geometry(
                     ),
                     **source_lineage,
                 }
-        available_soft_regions = list(soft_regions)
         available_regions = [*hard_regions, *available_soft_regions]
         available_region_ids = set(tracks_by_region)
         effective_camera_phases: list[VerticalVirtualCameraPhase] = []
