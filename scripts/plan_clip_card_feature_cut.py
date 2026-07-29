@@ -46,7 +46,10 @@ from jascue_video_lab.editing_capabilities import (
     autonomous_production_capability_catalog,
     simple_production_capability_catalog,
 )
-from jascue_video_lab.event_lock import load_editorial_beat_contracts
+from jascue_video_lab.event_lock import (
+    EditorialBeatContract,
+    load_editorial_beat_contracts,
+)
 from jascue_video_lab.gemini import (
     GeminiLabClient,
     MODEL_ID,
@@ -1057,6 +1060,67 @@ class SelectedClipCardEvidence(StrictModel):
 FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v2"
 
 
+def validate_hard_shortlist_provenance(
+    shortlist: FeatureShortlistPlan,
+    *,
+    cards: dict[str, FullClipCard],
+    contracts: tuple[EditorialBeatContract, ...],
+    candidate_depth: int,
+    direct_video_evidence: bool,
+) -> None:
+    """Fail before multimodal planning when hard evidence is absent.
+
+    Retrieval may return visually adjacent candidates whose provenance cannot
+    satisfy a contracted event (for example, a screen playing a prerecorded
+    demo).  Exact-frame analysis cannot upgrade that provenance, so paying to
+    upload and ground those candidates would be wasteful and misleading.
+    """
+
+    chapter_by_id = {
+        chapter.feature_id: chapter for chapter in shortlist.chapters
+    }
+    failures: list[str] = []
+    for contract in contracts:
+        if contract.priority != "hard" or contract.feature_id is None:
+            continue
+        chapter = chapter_by_id.get(contract.feature_id)
+        candidates = (
+            planning_candidate_slice(
+                chapter.candidates,
+                direct_video_evidence=direct_video_evidence,
+                depth=candidate_depth,
+            )
+            if chapter is not None
+            else []
+        )
+        observed: list[str] = []
+        eligible = False
+        for candidate in candidates:
+            card = cards[candidate.source_asset_id]
+            event = next(
+                event
+                for event in card.events
+                if event.event_id == candidate.event_id
+            )
+            observed.append(str(event.evidence_provenance))
+            eligible = eligible or (
+                event.evidence_provenance
+                in contract.allowed_evidence_provenance
+            )
+        if not eligible:
+            failures.append(
+                f"{contract.beat_id}/{contract.feature_id}:"
+                f"observed={sorted(set(observed)) or ['not_found']},"
+                f"allowed={list(contract.allowed_evidence_provenance)}"
+            )
+    if failures:
+        raise ValueError(
+            "hard evidence is absent from the provenance-eligible Top-K; "
+            "blocked before candidate-video upload or paid multimodal planning: "
+            + "; ".join(failures)
+        )
+
+
 def canonicalize_feature_plan_output(
     output_text: str,
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -1155,6 +1219,51 @@ def canonicalize_direct_video_edit_plan_output(
     for chapter_index, chapter in enumerate(chapters):
         if not isinstance(chapter, dict) or chapter.get("evidence_status") == "not_found":
             continue
+        reuse_mode = chapter.get("source_reuse_mode")
+        reuse_justification = chapter.get("source_reuse_justification")
+        if reuse_mode == "distinct_interval" and not (
+            isinstance(reuse_justification, str)
+            and reuse_justification.strip()
+        ):
+            observed = chapter.get("observed_visual_evidence")
+            if isinstance(observed, str) and observed.strip():
+                derived_justification = (
+                    "Distinct-interval authorization remains contingent on the "
+                    "deterministic source-interval audit. Separately observed "
+                    f"beat evidence: {observed.strip()}"
+                )
+                chapter["source_reuse_justification"] = derived_justification
+                changes.append(
+                    {
+                        "json_path": (
+                            f"chapters[{chapter_index}]"
+                            ".source_reuse_justification"
+                        ),
+                        "before": reuse_justification,
+                        "after": derived_justification,
+                        "rule": (
+                            "distinct_interval_reuse_uses_existing_observation_"
+                            "and_remains_deterministically_gated"
+                        ),
+                    }
+                )
+        elif reuse_mode not in {None, "none"} and not (
+            isinstance(reuse_justification, str)
+            and reuse_justification.strip()
+        ):
+            chapter["source_reuse_mode"] = "none"
+            chapter["source_reuse_justification"] = None
+            changes.append(
+                {
+                    "json_path": f"chapters[{chapter_index}].source_reuse_mode",
+                    "before": reuse_mode,
+                    "after": "none",
+                    "rule": (
+                        "unjustified_semantic_reuse_loses_authority_instead_"
+                        "of_inventing_a_reason"
+                    ),
+                }
+            )
         flow = chapter.get("flow_intent")
         if isinstance(flow, dict):
             sync_keys = (
@@ -1260,6 +1369,22 @@ def canonicalize_direct_video_edit_plan_output(
                     "rule": (
                         "fit_with_background_preserves_scope_without_"
                         "controlled_clipping"
+                    ),
+                }
+            )
+        if (
+            vertical.get("presentation_preference") == "two_panel_layout"
+            and vertical.get("coverage_mode") == "sequential"
+        ):
+            vertical["presentation_preference"] = "phase_virtual_camera"
+            changes.append(
+                {
+                    "json_path": f"{base}.vertical.presentation_preference",
+                    "before": "two_panel_layout",
+                    "after": "phase_virtual_camera",
+                    "rule": (
+                        "sequential_attention_uses_declared_phases_instead_"
+                        "of_implying_simultaneity"
                     ),
                 }
             )
@@ -1542,6 +1667,25 @@ def canonicalize_direct_video_edit_plan_output(
                             ),
                         }
                     )
+        if len(preferred) > 4:
+            preferred_overflow = preferred[4:]
+            preferred = preferred[:4]
+            sacrificable = list(
+                dict.fromkeys([*sacrificable, *preferred_overflow])
+            )[:4]
+            changes.append(
+                {
+                    "json_path": (
+                        f"{base}.vertical.preferred_entity_indices"
+                    ),
+                    "before": list(vertical.get("preferred_entity_indices") or []),
+                    "after": preferred,
+                    "rule": (
+                        "preferred_entity_overflow_is_demoted_without_"
+                        "weakening_required_entities"
+                    ),
+                }
+            )
         normalized_roles = {
             "required_entity_indices": required,
             "preferred_entity_indices": preferred,
@@ -4024,6 +4168,13 @@ def main() -> int:
             }
             for chapter in shortlist.chapters
         }
+        validate_hard_shortlist_provenance(
+            shortlist,
+            cards=cards,
+            contracts=tuple(editorial_contracts),
+            candidate_depth=args.candidate_video_depth,
+            direct_video_evidence=args.candidate_video_evidence,
+        )
 
     def validate_shortlist_membership(plan: ClipCardFeaturePlanV3) -> None:
         if shortlist is None:

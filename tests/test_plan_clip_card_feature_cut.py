@@ -51,6 +51,7 @@ from jascue_video_lab.models import (
 from jascue_video_lab.editing_capabilities import (
     simple_production_capability_catalog,
 )
+from jascue_video_lab.event_lock import EditorialBeatContract
 from jascue_video_lab.feature_cut import (
     _current_external_projection_binding,
     write_external_feature_plan_projection,
@@ -103,6 +104,7 @@ from scripts.plan_clip_card_feature_cut import (
     prior_vertical_selections,
     project_direct_video_edit_plan,
     validate_candidate_video_budget,
+    validate_hard_shortlist_provenance,
 )
 
 
@@ -582,6 +584,142 @@ def test_direct_video_canonicalization_disables_clipping_for_fit() -> None:
         == "fit_with_background_preserves_scope_without_controlled_clipping"
         for change in changes
     )
+
+
+def test_direct_video_canonicalization_repairs_bounded_representation_conflicts() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "observed_visual_evidence": "A second, separate action is visible.",
+                "source_reuse_mode": "distinct_interval",
+                "source_reuse_justification": None,
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                },
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "tracked_crop",
+                    "crop_mode": "primary_center",
+                    "coverage_mode": "sequential",
+                    "presentation_preference": "two_panel_layout",
+                    "allow_controlled_clip": True,
+                    "framing_intent": "Observe each subject in sequence.",
+                    "required_entity_indices": [1, 2],
+                    "preferred_entity_indices": [3, 4, 5, 6, 7],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [
+                        {
+                            "start_progress": 0.0,
+                            "end_progress": 0.5,
+                            "anchor_entity_indices": [1],
+                            "camera_behavior": "hold",
+                        },
+                        {
+                            "start_progress": 0.5,
+                            "end_progress": 1.0,
+                            "anchor_entity_indices": [2],
+                            "camera_behavior": "follow_deadband",
+                        },
+                    ],
+                },
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+
+    assert "A second, separate action is visible." in (
+        chapter["source_reuse_justification"]
+    )
+    assert (
+        chapter["vertical"]["presentation_preference"]
+        == "phase_virtual_camera"
+    )
+    assert chapter["vertical"]["preferred_entity_indices"] == [3, 4, 5, 6]
+    assert chapter["vertical"]["sacrificable_entity_indices"] == [7]
+    assert {
+        change["rule"] for change in changes
+    } >= {
+        "distinct_interval_reuse_uses_existing_observation_and_remains_deterministically_gated",
+        "sequential_attention_uses_declared_phases_instead_of_implying_simultaneity",
+        "preferred_entity_overflow_is_demoted_without_weakening_required_entities",
+    }
+
+
+def test_hard_shortlist_provenance_blocks_prerecorded_playback() -> None:
+    card = _card().model_copy(
+        update={
+            "events": [
+                _card().events[0].model_copy(
+                    update={"evidence_provenance": "prerecorded_screen_playback"}
+                )
+            ]
+        }
+    )
+    shortlist = FeatureShortlistPlan(
+        project_id="project-1",
+        catalog_id="catalog-1",
+        chapters=[
+            FeatureChapterShortlist(
+                feature_id="feature-1",
+                evidence_status="partial",
+                candidates=[
+                    FeatureShortlistCandidate(
+                        source_asset_id=ASSET_ID,
+                        event_id="demo",
+                        retrieval_reason="A nested demonstration is visible.",
+                    )
+                ],
+            )
+        ],
+        uncertainties=[],
+        model_provenance=_provenance(),
+    )
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "hard-result",
+            "feature_id": "feature-1",
+            "priority": "hard",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["result"],
+            "allowed_evidence_provenance": ["direct_result"],
+            "narrative_function": "global_energy_peak",
+            "visual_events": [
+                {
+                    "event_type": "result_stable_start",
+                    "cue_relation": "principal_downbeat",
+                    "tolerance_frames": 2,
+                }
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="blocked before candidate-video upload",
+    ):
+        validate_hard_shortlist_provenance(
+            shortlist,
+            cards={ASSET_ID: card},
+            contracts=(contract,),
+            candidate_depth=3,
+            direct_video_evidence=True,
+        )
 
 
 def test_direct_video_canonicalization_fails_safe_for_missing_duration_and_attention() -> None:

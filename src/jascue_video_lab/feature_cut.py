@@ -11156,6 +11156,52 @@ def _load_runtime_candidate_evidence_events(
     return events
 
 
+def _validate_hard_exact_event_candidate_provenance(
+    plan: FeatureEditPlan,
+    contracts: Sequence[EditorialBeatContract],
+    evidence_events: Mapping[
+        tuple[str, str],
+        Mapping[str, Any],
+    ],
+) -> None:
+    """Reject an ineligible hard-event frontier before geometry work."""
+
+    chapters = {chapter.feature_id: chapter for chapter in plan.chapters}
+    failures: list[str] = []
+    for contract in contracts:
+        if contract.priority != "hard" or contract.feature_id is None:
+            continue
+        chapter = chapters.get(contract.feature_id)
+        candidates = chapter.vertical_candidates if chapter is not None else ()
+        observed: list[str] = []
+        eligible = False
+        for candidate in candidates:
+            event = evidence_events.get(
+                (str(candidate.source_asset_id), str(candidate.event_id))
+            )
+            provenance = (
+                str(event.get("evidence_provenance"))
+                if event is not None
+                else "unknown"
+            )
+            observed.append(provenance)
+            eligible = eligible or (
+                provenance in contract.allowed_evidence_provenance
+            )
+        if not eligible:
+            failures.append(
+                f"{contract.beat_id}/{contract.feature_id}:"
+                f"observed={sorted(set(observed)) or ['not_found']},"
+                f"allowed={list(contract.allowed_evidence_provenance)}"
+            )
+    if failures:
+        raise ValueError(
+            "hard exact-event evidence is absent from the provenance-eligible "
+            "Top-K; blocked before quality, geometry, or paid grounding: "
+            + "; ".join(failures)
+        )
+
+
 def _autonomous_exact_event_source_reservations(
     plan: FeatureEditPlan,
     contracts: Sequence[EditorialBeatContract],
@@ -14220,6 +14266,12 @@ def _run_feature_cut_experiment_impl(
             plan_dir,
             require_provenance=autonomous_profile,
         )
+        if autonomous_profile:
+            _validate_hard_exact_event_candidate_provenance(
+                plan,
+                editorial_templates,
+                candidate_evidence_events,
+            )
         shot_cache: dict[str, ShotManifest] = {}
         shots_dir = output_dir / "shots"
         requested_candidate_recall_audit = (
