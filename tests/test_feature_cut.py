@@ -5434,6 +5434,81 @@ def test_controlled_crop_assesses_each_hard_target_independently() -> None:
     assert assessed["phone"].minimum_visible_fraction == 1.0
 
 
+def test_controlled_crop_prioritizes_primary_target_visibility_floor() -> None:
+    def track(target: str, box: list[int]) -> SimpleNamespace:
+        return SimpleNamespace(
+            analysis_start_ms=0,
+            analysis_end_ms=1000,
+            analysis_fps=2.0,
+            seed_time_ms=0,
+            semantic_seed_box=box,
+            seed_source_width=3840,
+            seed_source_height=2160,
+            analysis_width=960,
+            analysis_height=540,
+            target_description=target,
+            state_counts={"tracked": 2},
+            samples=[
+                SimpleNamespace(
+                    analysis_sample_time_ms=index * 500,
+                    tracking_state=TrackingState.TRACKED,
+                    derived_tracking_box=box,
+                )
+                for index in range(2)
+            ],
+        )
+
+    regions = [
+        FramingRegionIntent(
+            region_id="person",
+            entity_id="person",
+            target_description="the central person",
+            role="required",
+            minimum_visible_fraction=0.6,
+        ),
+        FramingRegionIntent(
+            region_id="phone",
+            entity_id="phone",
+            target_description="the primary phone",
+            role="required",
+            minimum_visible_fraction=1.0,
+        ),
+    ]
+    filter_graph, geometry = _vertical_filter_from_track(  # type: ignore[arg-type]
+        [
+            track("the central person", [200, 0, 570, 1000]),
+            track("the primary phone", [468, 170, 630, 459]),
+        ],
+        allow_subject_clipping=True,
+        overflow_policy="controlled_clip",
+        region_ids=["person", "phone"],
+        required_regions=regions,
+    )
+
+    measured = {
+        item["region_id"]: item
+        for item in geometry["hard_core_regions"]
+    }
+    coordinate_space = geometry["crop_coordinate_space"]
+    crop_left = (
+        geometry["crop_keyframes"][0]["crop_x_pixels"]
+        * 1000
+        / coordinate_space["scaled_width"]
+    )
+    legal_left = geometry["crop_keyframes"][0][
+        "per_region_visibility_constraints"
+    ]["crop_left_min_normalized"]
+
+    assert geometry["per_region_visibility_constraints_feasible"] is True
+    assert geometry["per_region_visibility_constraints_applied"] is True
+    assert crop_left >= legal_left - 1e-3
+    assert measured["phone"]["minimum_visible_area_fraction"] == 1.0
+    assert measured["phone"]["passed"] is True
+    assert measured["person"]["minimum_visible_area_fraction"] >= 0.6
+    assert measured["person"]["passed"] is True
+    assert "crop=1080:1920" in filter_graph
+
+
 def test_vertical_multi_region_reframe_rejects_disagreeing_seed_dimensions() -> None:
     def track(
         target: str,

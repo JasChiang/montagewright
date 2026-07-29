@@ -3079,6 +3079,35 @@ def _axis_crop_constraints(
     return aligned, aligned, False, overflow_policy == "controlled_clip"
 
 
+def _axis_minimum_visibility_constraints(
+    *,
+    target_min: float,
+    target_max: float,
+    viewport_normalized: float,
+    minimum_visible_fraction: float,
+) -> tuple[float, float, bool]:
+    """Return crop-origin bounds that retain the requested target fraction.
+
+    With one active cover-crop axis, retaining a fraction of the target area is
+    exactly the same as retaining that fraction of its extent on this axis; the
+    other axis spans the full normalized source.  Aspect-preserving cover has
+    at most one active pan axis when zoom is 1, which is the tracked delivery
+    path used here.
+    """
+
+    if not 0.0 < minimum_visible_fraction <= 1.0:
+        raise ValueError("minimum visible fraction must be within (0, 1]")
+    if not 0.0 <= target_min < target_max <= 1000.0:
+        raise ValueError("target extent is invalid")
+    max_origin = max(0.0, 1000.0 - viewport_normalized)
+    required_extent = (
+        target_max - target_min
+    ) * minimum_visible_fraction
+    lower = max(0.0, target_min + required_extent - viewport_normalized)
+    upper = min(max_origin, target_max - required_extent)
+    return lower, upper, lower <= upper + 1e-6
+
+
 def _tracked_crop_geometry(
     times: Sequence[float],
     centers_x: Sequence[float],
@@ -3093,6 +3122,8 @@ def _tracked_crop_geometry(
     overflow_policy: Literal["preserve_all", "controlled_clip"] = "preserve_all",
     edge_priority: Literal["balanced", "preserve_start", "preserve_end"] = "balanced",
     desired_centers_y: Sequence[float] | None = None,
+    per_region_boxes: Sequence[Sequence[Sequence[int]]] | None = None,
+    per_region_minimum_visible_fractions: Sequence[float] | None = None,
 ) -> tuple[list[float], list[float], dict[str, Any]]:
     """Return a 2D crop path projected into per-sample safety constraints.
 
@@ -3107,6 +3138,23 @@ def _tracked_crop_geometry(
         raise ValueError("tracked crop geometry needs aligned non-empty samples")
     if desired_centers_y is not None and len(desired_centers_y) != len(times):
         raise ValueError("desired y centers must align with tracked crop samples")
+    if (per_region_boxes is None) != (
+        per_region_minimum_visible_fractions is None
+    ):
+        raise ValueError(
+            "per-region boxes and visibility floors must be provided together"
+        )
+    if per_region_boxes is not None:
+        if len(per_region_boxes) != len(times):
+            raise ValueError("per-region boxes must align with crop samples")
+        expected_regions = len(per_region_minimum_visible_fractions or ())
+        if expected_regions == 0 or any(
+            len(sample_boxes) != expected_regions
+            for sample_boxes in per_region_boxes
+        ):
+            raise ValueError(
+                "per-region boxes must align with visibility floors"
+            )
     if safety_multiplier < 1.0:
         raise ValueError("safety_multiplier must be at least 1")
     transform = _cover_transform(
@@ -3168,9 +3216,12 @@ def _tracked_crop_geometry(
     full_containment_x: list[bool] = []
     full_containment_y: list[bool] = []
     controlled_clip_samples: list[bool] = []
+    per_region_constraint_samples: list[dict[str, Any]] = []
     margins_x: list[float] = []
     margins_y: list[float] = []
-    for x_min, y_min, x_max, y_max in validated_boxes:
+    for sample_index, (x_min, y_min, x_max, y_max) in enumerate(
+        validated_boxes
+    ):
         width = x_max - x_min
         height = y_max - y_min
         margin_x = width * (safety_multiplier - 1) / 2
@@ -3193,6 +3244,102 @@ def _tracked_crop_geometry(
             overflow_policy=overflow_policy,
             edge_priority=edge_priority,
         )
+        sample_constraint_audit: dict[str, Any] = {
+            "applied": False,
+            "feasible": True,
+            "region_count": 0,
+        }
+        if (
+            overflow_policy == "controlled_clip"
+            and per_region_boxes is not None
+            and per_region_minimum_visible_fractions is not None
+        ):
+            region_x_lower = 0.0
+            region_x_upper = max(0.0, 1000.0 - crop_width_normalized)
+            region_y_lower = 0.0
+            region_y_upper = max(0.0, 1000.0 - crop_height_normalized)
+            region_constraints_feasible = True
+            region_audit: list[dict[str, Any]] = []
+            for region_index, (region_box, minimum_fraction) in enumerate(
+                zip(
+                    per_region_boxes[sample_index],
+                    per_region_minimum_visible_fractions,
+                    strict=True,
+                )
+            ):
+                if len(region_box) != 4:
+                    raise ValueError(
+                        "per-region crop boxes must contain four coordinates"
+                    )
+                (
+                    region_x_min,
+                    region_y_min,
+                    region_x_max,
+                    region_y_max,
+                ) = (float(value) for value in region_box)
+                x_region_low, x_region_high, x_region_fits = (
+                    _axis_minimum_visibility_constraints(
+                        target_min=region_x_min,
+                        target_max=region_x_max,
+                        viewport_normalized=crop_width_normalized,
+                        minimum_visible_fraction=float(minimum_fraction),
+                    )
+                )
+                y_region_low, y_region_high, y_region_fits = (
+                    _axis_minimum_visibility_constraints(
+                        target_min=region_y_min,
+                        target_max=region_y_max,
+                        viewport_normalized=crop_height_normalized,
+                        minimum_visible_fraction=float(minimum_fraction),
+                    )
+                )
+                region_x_lower = max(region_x_lower, x_region_low)
+                region_x_upper = min(region_x_upper, x_region_high)
+                region_y_lower = max(region_y_lower, y_region_low)
+                region_y_upper = min(region_y_upper, y_region_high)
+                region_constraints_feasible = (
+                    region_constraints_feasible
+                    and x_region_fits
+                    and y_region_fits
+                )
+                region_audit.append(
+                    {
+                        "region_index": region_index,
+                        "minimum_visible_fraction": round(
+                            float(minimum_fraction), 6
+                        ),
+                        "crop_left_min_normalized": round(
+                            x_region_low, 4
+                        ),
+                        "crop_left_max_normalized": round(
+                            x_region_high, 4
+                        ),
+                        "crop_top_min_normalized": round(
+                            y_region_low, 4
+                        ),
+                        "crop_top_max_normalized": round(
+                            y_region_high, 4
+                        ),
+                    }
+                )
+            region_constraints_feasible = (
+                region_constraints_feasible
+                and region_x_lower <= region_x_upper + 1e-6
+                and region_y_lower <= region_y_upper + 1e-6
+            )
+            if region_constraints_feasible:
+                x_lower, x_upper = region_x_lower, region_x_upper
+                y_lower, y_upper = region_y_lower, region_y_upper
+            sample_constraint_audit = {
+                "applied": region_constraints_feasible,
+                "feasible": region_constraints_feasible,
+                "region_count": len(per_region_minimum_visible_fractions),
+                "crop_left_min_normalized": round(region_x_lower, 4),
+                "crop_left_max_normalized": round(region_x_upper, 4),
+                "crop_top_min_normalized": round(region_y_lower, 4),
+                "crop_top_max_normalized": round(region_y_upper, 4),
+                "regions": region_audit,
+            }
         legal_left_lower.append(x_lower)
         legal_left_upper.append(x_upper)
         legal_top_lower.append(y_lower)
@@ -3200,6 +3347,7 @@ def _tracked_crop_geometry(
         full_containment_x.append(x_fits)
         full_containment_y.append(y_fits)
         controlled_clip_samples.append(x_controlled or y_controlled)
+        per_region_constraint_samples.append(sample_constraint_audit)
         margins_x.append(margin_x)
         margins_y.append(margin_y)
 
@@ -3209,7 +3357,13 @@ def _tracked_crop_geometry(
             full_containment_x, full_containment_y, strict=True
         )
     ]
-    geometry_feasible = overflow_policy == "controlled_clip" or all(full_containment)
+    per_region_visibility_constraints_feasible = all(
+        sample["feasible"] for sample in per_region_constraint_samples
+    )
+    geometry_feasible = (
+        (overflow_policy == "controlled_clip" or all(full_containment))
+        and per_region_visibility_constraints_feasible
+    )
     if geometry_feasible:
         crop_left_normalized = _projected_smooth(
             desired_left,
@@ -3262,6 +3416,7 @@ def _tracked_crop_geometry(
         margin_y,
         contained_by_construction,
         controlled,
+        region_constraints,
     ) in zip(
         times,
         centers_x,
@@ -3281,6 +3436,7 @@ def _tracked_crop_geometry(
         margins_y,
         full_containment,
         controlled_clip_samples,
+        per_region_constraint_samples,
         strict=True,
     ):
         x_min, y_min, x_max, y_max = box
@@ -3336,6 +3492,7 @@ def _tracked_crop_geometry(
                 "required_union_contained": contained,
                 "full_containment_feasible": contained_by_construction,
                 "controlled_clip_applied": controlled,
+                "per_region_visibility_constraints": region_constraints,
                 "visible_required_width_fraction": round(
                     visible_width_fraction, 6
                 ),
@@ -3394,6 +3551,12 @@ def _tracked_crop_geometry(
         "overflow_policy": overflow_policy,
         "edge_priority": edge_priority,
         "geometry_feasible": geometry_feasible,
+        "per_region_visibility_constraints_feasible": (
+            per_region_visibility_constraints_feasible
+        ),
+        "per_region_visibility_constraints_applied": any(
+            sample["applied"] for sample in per_region_constraint_samples
+        ),
         "full_containment_feasible": all(full_containment),
         "controlled_clip_applied": any(controlled_clip_samples),
         "containment_failure_count": containment_failures,
@@ -3642,6 +3805,43 @@ def _required_track_union(
         "per_region": per_region,
     }
     return times, centers, boxes, coverage
+
+
+def _aligned_required_region_boxes(
+    tracks: Sequence[SegmentationTrack],
+    times: Sequence[float],
+) -> list[list[list[int]]]:
+    """Return each required target box in the union sample order."""
+
+    if not tracks:
+        raise ValueError("at least one required track is needed")
+    start_ms = tracks[0].analysis_start_ms
+    boxes_by_track = [
+        {
+            sample.analysis_sample_time_ms: [
+                int(value) for value in sample.derived_tracking_box
+            ]
+            for sample in track.samples
+            if sample.tracking_state == TrackingState.TRACKED
+            and sample.derived_tracking_box is not None
+        }
+        for track in tracks
+    ]
+    aligned: list[list[list[int]]] = []
+    for relative_seconds in times:
+        sample_time_ms = start_ms + round(relative_seconds * 1000)
+        try:
+            aligned.append(
+                [
+                    boxes_by_time[sample_time_ms]
+                    for boxes_by_time in boxes_by_track
+                ]
+            )
+        except KeyError as error:
+            raise ValueError(
+                "required region boxes do not align with union samples"
+            ) from error
+    return aligned
 
 
 def _tracking_coverage_recovery_window(
@@ -4689,6 +4889,19 @@ def _vertical_filter_from_track(
         overflow_policy=overflow_policy,
         edge_priority=edge_priority,
         desired_centers_y=desired_centers_y,
+        per_region_boxes=(
+            _aligned_required_region_boxes(tracks, times)
+            if required_regions
+            else None
+        ),
+        per_region_minimum_visible_fractions=(
+            [
+                region.effective_minimum_visible_fraction
+                for region in required_regions
+            ]
+            if required_regions
+            else None
+        ),
     )
     crop_width_normalized = float(crop_audit["crop_width_normalized"])
     crop_height_normalized = float(crop_audit["crop_height_normalized"])
