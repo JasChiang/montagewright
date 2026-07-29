@@ -310,6 +310,8 @@ def _passing_deterministic_report(policy: AutonomousEditPolicy):
             dead_air_count=0,
             concat_padding_audited=True,
             unauthorized_concat_padding_count=0,
+            sequence_optimization_audited=True,
+            sequence_optimization_passed=True,
             readability_passed=True,
             reuse_authorized=True,
             omissions_authorized=True,

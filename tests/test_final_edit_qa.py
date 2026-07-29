@@ -351,6 +351,7 @@ def _autonomous_files(
         "music_map": {"music_id": "sha256:" + "a" * 64},
         "cue_plan": {"cue_id": "principal-downbeat"},
         "exact_event_locks": [{"event_id": "result-stable"}],
+        "sequence_optimization": {"result": {"outcome": "selected"}},
         "reuse_degradation": {
             "records": [],
             "hard_evidence_omitted": False,
@@ -855,6 +856,8 @@ def test_deterministic_qa_measures_cue_delta_and_fails_independently() -> None:
             dead_air_count=0,
             concat_padding_audited=True,
             unauthorized_concat_padding_count=0,
+            sequence_optimization_audited=True,
+            sequence_optimization_passed=True,
             readability_passed=True,
             reuse_authorized=True,
             omissions_authorized=True,
@@ -895,6 +898,8 @@ def test_deterministic_qa_uses_event_specific_cue_tolerance() -> None:
             dead_air_count=0,
             concat_padding_audited=True,
             unauthorized_concat_padding_count=0,
+            sequence_optimization_audited=True,
+            sequence_optimization_passed=True,
             readability_passed=True,
             reuse_authorized=True,
             omissions_authorized=True,
@@ -933,6 +938,8 @@ def test_deterministic_qa_blocks_excessive_panel_runtime() -> None:
             dead_air_count=0,
             concat_padding_audited=True,
             unauthorized_concat_padding_count=0,
+            sequence_optimization_audited=True,
+            sequence_optimization_passed=True,
             readability_passed=True,
             reuse_authorized=True,
             omissions_authorized=True,
@@ -974,6 +981,7 @@ def test_deterministic_qa_fails_closed_when_new_audits_are_unknown() -> None:
     assert report.gate_results["dwell_bounds"] == "failed"
     assert report.gate_results["no_dead_air"] == "failed"
     assert report.gate_results["no_unauthorized_concat_padding"] == "failed"
+    assert report.gate_results["sequence_optimization"] == "failed"
 
 
 @pytest.mark.parametrize(
@@ -1020,6 +1028,8 @@ def test_deterministic_qa_blocks_generic_motion_rhythm_and_padding_defects(
         "dead_air_count": 0,
         "concat_padding_audited": True,
         "unauthorized_concat_padding_count": 0,
+        "sequence_optimization_audited": True,
+        "sequence_optimization_passed": True,
         "readability_passed": True,
         "reuse_authorized": True,
         "omissions_authorized": True,
@@ -1064,6 +1074,8 @@ def test_deterministic_qa_requires_ids_and_deltas_for_required_cues() -> None:
             dead_air_count=0,
             concat_padding_audited=True,
             unauthorized_concat_padding_count=0,
+            sequence_optimization_audited=True,
+            sequence_optimization_passed=True,
             readability_passed=True,
             reuse_authorized=True,
             omissions_authorized=True,

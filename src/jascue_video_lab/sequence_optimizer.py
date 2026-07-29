@@ -397,6 +397,288 @@ class MusicBoundarySolution(FrozenStrictModel):
     cue_aligned_boundary_count: int = Field(ge=0)
 
 
+class SemanticRhythmSpec(FrozenStrictModel):
+    """One beat's semantic dwell envelope before optional music snapping."""
+
+    beat_id: str = Field(min_length=1)
+    minimum_duration_ms: int = Field(gt=0)
+    preferred_duration_ms: int = Field(gt=0)
+    maximum_duration_ms: int = Field(gt=0)
+    cut_pressure: float | None = Field(default=None, ge=0.0, le=1.0)
+    energy_role: Literal[
+        "low_hold",
+        "rise",
+        "peak",
+        "release",
+        "reset",
+    ] | None = None
+    boundary_alignment: Literal[
+        "free",
+        "content_locked",
+        "phrase_preferred",
+        "accent_preferred",
+    ] = "free"
+
+    @model_validator(mode="after")
+    def validate_duration_bounds(self) -> "SemanticRhythmSpec":
+        if not (
+            self.minimum_duration_ms
+            <= self.preferred_duration_ms
+            <= self.maximum_duration_ms
+        ):
+            raise ValueError("semantic rhythm duration bounds must be ordered")
+        return self
+
+
+class SemanticRhythmSelection(FrozenStrictModel):
+    beat_id: str
+    duration_ms: int = Field(gt=0)
+    semantic_target_ms: int = Field(gt=0)
+    preferred_delta_ms: int
+    decision_codes: tuple[str, ...]
+
+
+class SemanticRhythmSolution(FrozenStrictModel):
+    """Globally reconciled visual cadence, independent of soundtrack presence."""
+
+    contract_version: Literal["semantic-rhythm-solution-v1"] = (
+        "semantic-rhythm-solution-v1"
+    )
+    total_duration_ms: int = Field(gt=0)
+    selections: tuple[SemanticRhythmSelection, ...]
+    objective_cost: float = Field(ge=0.0)
+    cadence_source: Literal[
+        "semantic_attention_and_energy",
+        "bounded_legacy_dwell",
+    ]
+
+
+class _RhythmBeamState(FrozenStrictModel):
+    durations_ms: tuple[int, ...] = ()
+    elapsed_ms: int = Field(default=0, ge=0)
+    objective_cost: float = Field(default=0.0, ge=0.0)
+
+
+def _semantic_rhythm_target_ms(spec: SemanticRhythmSpec) -> int:
+    """Translate semantic pressure into a bounded target, never a hard rule."""
+
+    if (
+        spec.boundary_alignment == "content_locked"
+        or spec.minimum_duration_ms == spec.maximum_duration_ms
+    ):
+        return spec.preferred_duration_ms
+    span = spec.maximum_duration_ms - spec.minimum_duration_ms
+    preferred_ratio = (
+        spec.preferred_duration_ms - spec.minimum_duration_ms
+    ) / max(span, 1)
+    pressure_ratio = (
+        1.0 - spec.cut_pressure
+        if spec.cut_pressure is not None
+        else preferred_ratio
+    )
+    # Gemini's preferred dwell remains the main authority. Cut pressure and
+    # semantic energy only resolve flexibility already permitted by the
+    # attention envelope.
+    target_ratio = preferred_ratio * 0.72 + pressure_ratio * 0.28
+    target_ratio += {
+        "low_hold": 0.06,
+        "rise": -0.04,
+        "peak": -0.07,
+        "release": 0.08,
+        "reset": 0.04,
+        None: 0.0,
+    }[spec.energy_role]
+    target_ratio = max(0.0, min(1.0, target_ratio))
+    return round(spec.minimum_duration_ms + span * target_ratio)
+
+
+def _semantic_duration_candidates(
+    spec: SemanticRhythmSpec,
+    *,
+    step_ms: int,
+) -> tuple[int, ...]:
+    if spec.minimum_duration_ms == spec.maximum_duration_ms:
+        return (spec.minimum_duration_ms,)
+    first_grid = (
+        (spec.minimum_duration_ms + step_ms - 1) // step_ms
+    ) * step_ms
+    grid = range(
+        first_grid,
+        spec.maximum_duration_ms + 1,
+        step_ms,
+    )
+    return tuple(
+        sorted(
+            {
+                spec.minimum_duration_ms,
+                spec.preferred_duration_ms,
+                spec.maximum_duration_ms,
+                _semantic_rhythm_target_ms(spec),
+                *grid,
+            }
+        )
+    )
+
+
+def solve_semantic_rhythm_durations(
+    specs: Sequence[SemanticRhythmSpec],
+    *,
+    total_duration_ms: int,
+    step_ms: int = 100,
+    beam_width: int = 512,
+) -> SemanticRhythmSolution:
+    """Choose a globally coherent cadence before optional soundtrack snapping.
+
+    The solver consumes Gemini's semantic attention and energy observations,
+    but all durations stay inside application-measured readability/capacity
+    bounds. With no music this is the production cadence authority; with music
+    its output becomes the preferred timeline for the cue-boundary solver.
+    """
+
+    if not specs:
+        raise ValueError("semantic rhythm solver requires at least one beat")
+    if total_duration_ms <= 0:
+        raise ValueError("semantic rhythm total duration must be positive")
+    if step_ms <= 0:
+        raise ValueError("semantic rhythm step must be positive")
+    if beam_width <= 0:
+        raise ValueError("semantic rhythm beam width must be positive")
+    if (
+        sum(spec.minimum_duration_ms for spec in specs) > total_duration_ms
+        or sum(spec.maximum_duration_ms for spec in specs) < total_duration_ms
+    ):
+        raise ValueError("semantic rhythm bounds cannot satisfy total duration")
+    beat_ids = [spec.beat_id for spec in specs]
+    if len(beat_ids) != len(set(beat_ids)):
+        raise ValueError("semantic rhythm beat IDs must be unique")
+
+    minimum_suffix = [
+        sum(spec.minimum_duration_ms for spec in specs[index:])
+        for index in range(len(specs) + 1)
+    ]
+    maximum_suffix = [
+        sum(spec.maximum_duration_ms for spec in specs[index:])
+        for index in range(len(specs) + 1)
+    ]
+    states: list[_RhythmBeamState] = [_RhythmBeamState()]
+    for index, spec in enumerate(specs):
+        remaining_min = minimum_suffix[index + 1]
+        remaining_max = maximum_suffix[index + 1]
+        target = _semantic_rhythm_target_ms(spec)
+        candidates = _semantic_duration_candidates(spec, step_ms=step_ms)
+        expanded: list[_RhythmBeamState] = []
+        for state in states:
+            if index == len(specs) - 1:
+                durations = (total_duration_ms - state.elapsed_ms,)
+            else:
+                durations = candidates
+            for duration in durations:
+                if not (
+                    spec.minimum_duration_ms
+                    <= duration
+                    <= spec.maximum_duration_ms
+                ):
+                    continue
+                elapsed = state.elapsed_ms + duration
+                remaining = total_duration_ms - elapsed
+                if not remaining_min <= remaining <= remaining_max:
+                    continue
+                span = max(
+                    spec.maximum_duration_ms - spec.minimum_duration_ms,
+                    step_ms,
+                )
+                semantic_cost = abs(duration - target) / span
+                preferred_cost = (
+                    abs(duration - spec.preferred_duration_ms) / span
+                ) * 0.35
+                cadence_cost = 0.0
+                if state.durations_ms:
+                    prior_duration = state.durations_ms[-1]
+                    prior_spec = specs[index - 1]
+                    transition_pressure = max(
+                        float(spec.cut_pressure or 0.0),
+                        float(prior_spec.cut_pressure or 0.0),
+                    )
+                    if (
+                        transition_pressure >= 0.55
+                        and abs(duration - prior_duration) < 150
+                        and spec.boundary_alignment != "content_locked"
+                        and prior_spec.boundary_alignment != "content_locked"
+                    ):
+                        cadence_cost = 0.08
+                expanded.append(
+                    _RhythmBeamState(
+                        durations_ms=state.durations_ms + (duration,),
+                        elapsed_ms=elapsed,
+                        objective_cost=(
+                            state.objective_cost
+                            + semantic_cost
+                            + preferred_cost
+                            + cadence_cost
+                        ),
+                    )
+                )
+        if not expanded:
+            raise ValueError(
+                "no globally feasible semantic rhythm sequence satisfies "
+                f"{spec.beat_id}"
+            )
+        # Retain distinct elapsed/last-duration frontiers. This keeps the
+        # search bounded without collapsing all cadence shapes into one state.
+        best_by_frontier: dict[tuple[int, int], _RhythmBeamState] = {}
+        for state in sorted(
+            expanded,
+            key=lambda item: (
+                item.objective_cost,
+                item.elapsed_ms,
+                item.durations_ms,
+            ),
+        ):
+            frontier = (
+                state.elapsed_ms,
+                state.durations_ms[-1] // step_ms,
+            )
+            best_by_frontier.setdefault(frontier, state)
+        states = list(best_by_frontier.values())[:beam_width]
+
+    completed = [
+        state for state in states if state.elapsed_ms == total_duration_ms
+    ]
+    if not completed:
+        raise ValueError("semantic rhythm solver did not close the total duration")
+    best = min(
+        completed,
+        key=lambda item: (item.objective_cost, item.durations_ms),
+    )
+    selections: list[SemanticRhythmSelection] = []
+    for spec, duration in zip(specs, best.durations_ms, strict=True):
+        target = _semantic_rhythm_target_ms(spec)
+        codes = ["semantic_attention_envelope_respected"]
+        if spec.energy_role is not None:
+            codes.append(f"energy_role_{spec.energy_role}")
+        if spec.boundary_alignment == "content_locked":
+            codes.append("content_locked_dwell_preserved")
+        selections.append(
+            SemanticRhythmSelection(
+                beat_id=spec.beat_id,
+                duration_ms=duration,
+                semantic_target_ms=target,
+                preferred_delta_ms=duration - spec.preferred_duration_ms,
+                decision_codes=tuple(codes),
+            )
+        )
+    return SemanticRhythmSolution(
+        total_duration_ms=total_duration_ms,
+        selections=tuple(selections),
+        objective_cost=round(best.objective_cost, 6),
+        cadence_source=(
+            "semantic_attention_and_energy"
+            if any(spec.cut_pressure is not None for spec in specs)
+            else "bounded_legacy_dwell"
+        ),
+    )
+
+
 def solve_music_aligned_boundaries(
     specs: Sequence[MusicBoundarySpec],
     cues: Sequence[MusicBoundaryCue],

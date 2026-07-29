@@ -65,6 +65,7 @@ AUTONOMOUS_CONTEXT_KEYS = (
     "music_map",
     "cue_plan",
     "exact_event_locks",
+    "sequence_optimization",
     "reuse_degradation",
 )
 
@@ -339,6 +340,8 @@ class DeterministicDeliveryEvidence(StrictModel):
     dead_air_count: int | None = Field(default=None, ge=0)
     concat_padding_audited: bool | None = None
     unauthorized_concat_padding_count: int | None = Field(default=None, ge=0)
+    sequence_optimization_audited: bool | None = None
+    sequence_optimization_passed: bool | None = None
     readability_passed: bool
     reuse_authorized: bool
     omissions_authorized: bool
@@ -1425,6 +1428,11 @@ def run_deterministic_delivery_qa(
         "no_unauthorized_concat_padding",
         evidence.concat_padding_audited is True
         and evidence.unauthorized_concat_padding_count == 0,
+    )
+    gate(
+        "sequence_optimization",
+        evidence.sequence_optimization_audited is True
+        and evidence.sequence_optimization_passed is True,
     )
     gate("readability", evidence.readability_passed)
     gate("reuse_authorized", evidence.reuse_authorized)

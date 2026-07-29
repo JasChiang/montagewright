@@ -472,6 +472,7 @@ def run_feature_delivery_pipeline(
             "music_map",
             "cue_plan",
             "exact_event_locks",
+            "sequence_optimization",
             "reuse_degradation",
         }
         if autonomous_context_paths is not None:

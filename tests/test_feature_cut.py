@@ -42,6 +42,7 @@ from jascue_video_lab.feature_cut import (
     _attempt_trim_shift_operation,
     _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
+    _build_production_sequence_optimization,
     _bounded_cue_shifted_window,
     _bind_regions_to_editorial_relation,
     _candidate_capability_boundaries,
@@ -112,6 +113,7 @@ from jascue_video_lab.feature_cut import (
 )
 from jascue_video_lab.auto_reframe import FailureCode
 from jascue_video_lab.models import FramingRegionIntent
+from jascue_video_lab.final_edit_qa import DeterministicDeliveryEvidence
 
 
 def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
@@ -139,6 +141,152 @@ def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
     )
     assert "two_panel_layout" in forbidden
     assert "solid_matte_fit" in forbidden
+
+
+def test_production_sequence_builder_calls_real_beam_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    source_sha = hashlib.sha256(b"source").hexdigest()
+    selected = FeatureChapterSelect(
+        feature_id="only",
+        evidence_status="supported",
+        horizontal_frame_id="RF000001",
+        vertical_frame_id="RF000001",
+        observed_visual_evidence="One complete observable action.",
+        selection_reason="Only evidence-bound candidate.",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        recommended_duration_seconds=15,
+        duration_rationale="The complete action justifies the dwell.",
+        quality_risks=[],
+        confidence=0.9,
+    )
+    plan = FeatureEditPlan(
+        project_id="production-wiring",
+        catalog_id="catalog",
+        title="Production wiring",
+        chapters=[selected],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    rhythm = SimpleNamespace(
+        chapters=[
+            SimpleNamespace(
+                feature_id="only",
+                minimum_duration_seconds=15,
+                preferred_duration_seconds=60,
+                maximum_duration_seconds=60,
+            )
+        ]
+    )
+    clip = RushClip(
+        clip_id="clip",
+        path=str(source),
+        sha256=source_sha,
+        duration_ms=60_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=source.stat().st_size,
+    )
+    deterministic = DeterministicDeliveryEvidence(
+        media_playable=True,
+        pts_valid=True,
+        unexpected_freeze_count=0,
+        containment_passed=True,
+        identity_passed=True,
+        relation_passed=True,
+        panel_same_pts_passed=True,
+        relative_scale_lock_passed=True,
+        cue_delta_frames={},
+        cue_boundary_coverage_audited=True,
+        music_edit_boundary_coverage_passed=True,
+        synthetic_motion_motivated=True,
+        synthetic_reversal_count=0,
+        settle_passed=True,
+        source_camera_motion_audited=True,
+        unwanted_source_camera_motion_count=0,
+        dwell_bounds_audited=True,
+        excessive_dwell_count=0,
+        dead_air_audited=True,
+        dead_air_count=0,
+        concat_padding_audited=True,
+        unauthorized_concat_padding_count=0,
+        readability_passed=True,
+        reuse_authorized=True,
+        omissions_authorized=True,
+        hard_evidence_passed=True,
+    )
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="visual_demo",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=60_000,
+            max_ms=60_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    real_optimizer = feature_cut_module.optimize_sequence
+    calls = 0
+
+    def observed_optimizer(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return real_optimizer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "optimize_sequence",
+        observed_optimizer,
+    )
+    result, beat_sets = _build_production_sequence_optimization(
+        vertical_chapters=(
+            {
+                "feature_id": "only",
+                "source_clip_id": "clip",
+                "source_in_ms": 0,
+                "source_out_ms": 60_000,
+                "duration_ms": 60_000,
+                "applied_strategy": "static_full_bleed_crop",
+                "segment_render_fingerprint": "a" * 64,
+                "track_geometry_fingerprint": None,
+                "risk_codes": [],
+            },
+        ),
+        plan=plan,
+        rhythm_plan=rhythm,
+        clips={"clip": clip},
+        contracts=(),
+        locks=(),
+        cue_deltas={},
+        cue_tolerances={},
+        cue_ids_by_event={},
+        deterministic=deterministic,
+        policy=policy,
+        music_supplied=False,
+    )
+
+    assert calls == 1
+    assert result.outcome == "complete"
+    assert beat_sets[0].options[0].cue_id == "no-music"
 
 
 def test_primary_with_context_stays_single_canvas_without_panel_intent() -> None:
@@ -1350,6 +1498,103 @@ def test_editorial_dwell_can_snap_to_longer_music_prefix_when_authorized() -> No
         assembled_audit["music_cue_timeline"]
         == "assembled_output_timeline"
     )
+
+
+def test_editorial_dwell_runs_semantic_sequence_optimizer_without_music() -> None:
+    feature_ids = (
+        "hook",
+        "setup",
+        "proof",
+        "payoff",
+        "breath",
+        "closing",
+    )
+    brief = FeatureEditBrief(
+        project_id="visual-cadence",
+        title="Visual cadence",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id=feature_id,
+                title=feature_id,
+                detail_lines=[],
+                target_duration_seconds=10,
+            )
+            for feature_id in feature_ids
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id="generic-catalog",
+        title=brief.title,
+        chapters=[
+            FeatureChapterSelect(
+                feature_id=feature_id,
+                evidence_status="supported",
+                observed_visual_evidence=f"Observable {feature_id}.",
+                selection_reason=f"Selected {feature_id}.",
+                horizontal_frame_id=f"RF{index:06d}",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_frame_id=f"RF{index:06d}",
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                recommended_duration_seconds=10,
+                duration_rationale="Semantic attention recommendation.",
+                quality_risks=[],
+                confidence=0.9,
+            )
+            for index, feature_id in enumerate(feature_ids, start=1)
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    rhythm_plan = SimpleNamespace(
+        attention_profile_sha256="a" * 64,
+        chapters=[
+            SimpleNamespace(
+                feature_id=feature_id,
+                minimum_duration_seconds=5,
+                preferred_duration_seconds=10,
+                maximum_duration_seconds=15,
+                cut_pressure=pressure,
+                boundary_priority="normal",
+                boundary_alignment="free",
+            )
+            for feature_id, pressure in zip(
+                feature_ids,
+                (0.9, 0.2, 0.8, 0.95, 0.1, 0.3),
+                strict=True,
+            )
+        ],
+    )
+
+    durations, audit = _resolve_editorial_chapter_durations(
+        brief,
+        plan,
+        rhythm_plan=rhythm_plan,
+        source_capacity_seconds={
+            feature_id: 15 for feature_id in feature_ids
+        },
+    )
+
+    assert sum(durations.values()) == 60
+    assert len(set(durations.values())) > 1
+    assert audit["semantic_sequence_optimizer_applied"] is True
+    assert (
+        audit["semantic_sequence_optimizer_mode"]
+        == "semantic_visual_cadence"
+    )
+    assert audit["music_boundary_refinements"] == []
 
 
 def test_editorial_dwell_refuses_approved_trim_beyond_safe_capacity() -> None:

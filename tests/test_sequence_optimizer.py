@@ -17,10 +17,12 @@ from jascue_video_lab.sequence_optimizer import (
     MusicBoundarySpec,
     SegmentRenderCacheKey,
     SegmentRenderRequest,
+    SemanticRhythmSpec,
     SequenceOption,
     concat_manifest_lines,
     optimize_sequence,
     render_segments_incrementally,
+    solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
 )
 
@@ -306,6 +308,46 @@ def test_music_boundary_solver_treats_source_capacity_as_a_bound() -> None:
     assert result.chapter_durations_ms == (10_000, 10_000)
     assert result.selections[0].cue_id == "cue-capacity-edge"
     assert result.cue_aligned_boundary_count == 1
+
+
+def test_semantic_rhythm_solver_drives_cadence_without_music() -> None:
+    result = solve_semantic_rhythm_durations(
+        [
+            SemanticRhythmSpec(
+                beat_id="peak",
+                minimum_duration_ms=5_000,
+                preferred_duration_ms=10_000,
+                maximum_duration_ms=15_000,
+                cut_pressure=0.9,
+                energy_role="peak",
+            ),
+            SemanticRhythmSpec(
+                beat_id="hold",
+                minimum_duration_ms=5_000,
+                preferred_duration_ms=10_000,
+                maximum_duration_ms=15_000,
+                cut_pressure=0.2,
+                energy_role="low_hold",
+            ),
+            SemanticRhythmSpec(
+                beat_id="release",
+                minimum_duration_ms=5_000,
+                preferred_duration_ms=10_000,
+                maximum_duration_ms=15_000,
+                cut_pressure=0.3,
+                energy_role="release",
+            ),
+        ],
+        total_duration_ms=30_000,
+    )
+
+    durations = {
+        selection.beat_id: selection.duration_ms
+        for selection in result.selections
+    }
+    assert result.cadence_source == "semantic_attention_and_energy"
+    assert sum(durations.values()) == 30_000
+    assert durations["peak"] < durations["hold"] < durations["release"]
 
 
 def test_music_boundary_solver_preserves_global_readability_bounds() -> None:

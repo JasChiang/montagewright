@@ -197,8 +197,13 @@ from .editorial_planning import (
     reconcile_attention_delivery_floor,
 )
 from .sequence_optimizer import (
+    BeatOptionSet,
     MusicBoundaryCue,
     MusicBoundarySpec,
+    SemanticRhythmSpec,
+    SequenceOption,
+    optimize_sequence,
+    solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
 )
 from .storage import read_json, utc_now, write_json
@@ -13740,6 +13745,46 @@ def _resolve_editorial_chapter_durations(
     if remaining_ms != 0 or sum(allocated_ms.values()) != target_duration_ms:
         raise ValueError("editorial duration capacity reconciliation did not close")
 
+    semantic_rhythm_solution = None
+    if rhythm_plan is not None:
+        semantic_specs: list[SemanticRhythmSpec] = []
+        for selected, _, _ in weighted:
+            feature_id = selected.feature_id
+            fixed = feature_id in fixed_ms
+            rhythm_chapter = rhythm_by_id[feature_id]
+            preferred_ms = allocated_ms[feature_id]
+            semantic_specs.append(
+                SemanticRhythmSpec(
+                    beat_id=feature_id,
+                    minimum_duration_ms=(
+                        preferred_ms
+                        if fixed
+                        else minimum_ms.get(feature_id, 1)
+                    ),
+                    preferred_duration_ms=preferred_ms,
+                    maximum_duration_ms=(
+                        preferred_ms
+                        if fixed
+                        else capacity_ms.get(feature_id, target_duration_ms)
+                    ),
+                    cut_pressure=rhythm_chapter.cut_pressure,
+                    energy_role=(
+                        selected.flow_intent.energy_role
+                        if selected.flow_intent is not None
+                        else None
+                    ),
+                    boundary_alignment=rhythm_chapter.boundary_alignment,
+                )
+            )
+        semantic_rhythm_solution = solve_semantic_rhythm_durations(
+            semantic_specs,
+            total_duration_ms=target_duration_ms,
+        )
+        allocated_ms = {
+            selection.beat_id: selection.duration_ms
+            for selection in semantic_rhythm_solution.selections
+        }
+
     scale = resolved_project_duration_seconds / weight_total
     unsnapped: list[tuple[FeatureChapterSelect, float, str, float]] = []
     for selected, weight, authority in weighted:
@@ -13969,6 +14014,21 @@ def _resolve_editorial_chapter_durations(
         "music_lock_duration_ms": (
             music_lock.duration_ms if music_lock is not None else None
         ),
+        "semantic_sequence_optimizer_applied": (
+            semantic_rhythm_solution is not None
+        ),
+        "semantic_sequence_optimizer_mode": (
+            "semantic_then_music_cues"
+            if semantic_rhythm_solution is not None and music_lock is not None
+            else "semantic_visual_cadence"
+            if semantic_rhythm_solution is not None
+            else "legacy_proportional_reconciliation"
+        ),
+        "semantic_sequence_optimization": (
+            semantic_rhythm_solution.model_dump(mode="json")
+            if semantic_rhythm_solution is not None
+            else None
+        ),
         "music_cue_timeline": (
             "assembled_output_timeline"
             if output_timeline_cues is not None
@@ -13986,6 +14046,335 @@ def _resolve_editorial_chapter_durations(
         "chapters": rows,
     }
     return resolved, audit
+
+
+def _sequence_presentation_mode(applied_strategy: str) -> str:
+    if applied_strategy in {
+        "static_full_bleed_crop",
+        "seed_anchor_crop",
+    }:
+        return "static_full_bleed_crop"
+    if applied_strategy in {
+        "tracked_crop",
+        "tracked_full_bleed_crop",
+    }:
+        return "tracked_full_bleed_crop"
+    if applied_strategy in {
+        "phase_virtual_camera",
+        "virtual_camera",
+    }:
+        return "phase_virtual_camera"
+    if applied_strategy in {
+        "hard_cut_between_views",
+        "hard_cut",
+    }:
+        return "hard_cut_between_views"
+    if applied_strategy in {
+        "controlled_semantic_clip",
+        "controlled_clip",
+    }:
+        return "controlled_semantic_clip"
+    if applied_strategy == "two_panel_layout":
+        return "two_panel_layout"
+    if applied_strategy in {
+        "solid_matte_fit",
+        "required_scope_solid_fit",
+        "fit_with_solid_matte",
+        "scope_preserving_solid_fit",
+    }:
+        return "solid_matte_fit"
+    if applied_strategy == "intentional_freeze":
+        return "intentional_freeze"
+    return "source_hold"
+
+
+def _sequence_entry_exit_x(
+    chapter: Mapping[str, Any],
+) -> tuple[float | None, float | None]:
+    keyframes = chapter.get("crop_keyframes")
+    if not isinstance(keyframes, list) or not keyframes:
+        return None, None
+    centers = [
+        row.get("smoothed_center_x_normalized")
+        for row in keyframes
+        if isinstance(row, Mapping)
+        and isinstance(
+            row.get("smoothed_center_x_normalized"),
+            (int, float),
+        )
+    ]
+    if not centers:
+        return None, None
+    # Historical crop manifests use the 0–1000 normalized coordinate space.
+    return (
+        max(0.0, min(1.0, float(centers[0]) / 1000)),
+        max(0.0, min(1.0, float(centers[-1]) / 1000)),
+    )
+
+
+def _build_production_sequence_optimization(
+    *,
+    vertical_chapters: Sequence[Mapping[str, Any]],
+    plan: FeatureEditPlan,
+    rhythm_plan: RhythmPlan,
+    clips: Mapping[str, RushClip],
+    contracts: Sequence[EditorialBeatContract],
+    locks: Sequence[ExactEventLockV2],
+    cue_deltas: Mapping[str, int],
+    cue_tolerances: Mapping[str, int],
+    cue_ids_by_event: Mapping[str, str],
+    deterministic: DeterministicDeliveryEvidence,
+    policy: AutonomousEditPolicy,
+    music_supplied: bool,
+) -> tuple[Any, tuple[BeatOptionSet, ...]]:
+    """Bind the tested beam search to exact executed production evidence."""
+
+    selected_by_id = {chapter.feature_id: chapter for chapter in plan.chapters}
+    rhythm_by_id = {
+        chapter.feature_id: chapter for chapter in rhythm_plan.chapters
+    }
+    contracts_by_feature: dict[str, list[EditorialBeatContract]] = {}
+    for contract in contracts:
+        contracts_by_feature.setdefault(
+            str(contract.feature_id or contract.beat_id),
+            [],
+        ).append(contract)
+    lock_by_type: dict[str, list[ExactEventLockV2]] = {}
+    for lock in locks:
+        lock_by_type.setdefault(lock.event_type, []).append(lock)
+    beat_sets: list[BeatOptionSet] = []
+    blocked_geometry_codes = {
+        "tracking_or_grounding_failed",
+        "hard_core_not_fully_retained",
+        "relation_lost",
+        "relative_scale_misleading",
+        "unverified_center_crop",
+        "explicit_unverified_geometry_preview",
+    }
+    for chapter in vertical_chapters:
+        feature_id = str(chapter["feature_id"])
+        selected = selected_by_id[feature_id]
+        rhythm = rhythm_by_id[feature_id]
+        feature_contracts = contracts_by_feature.get(feature_id, [])
+        if any(contract.priority == "hard" for contract in feature_contracts):
+            priority = "hard"
+        elif feature_contracts and all(
+            contract.priority == "optional"
+            for contract in feature_contracts
+        ):
+            priority = "optional"
+        else:
+            priority = "preferred"
+        required_event_types = {
+            event.event_type
+            for contract in feature_contracts
+            if contract.priority == "hard"
+            for event in contract.visual_events
+        }
+        source_clip = clips[str(chapter["source_clip_id"])]
+        source_asset_id = f"sha256:{source_clip.sha256}"
+        feature_locks = [
+            lock
+            for event_type in {
+                event.event_type
+                for contract in feature_contracts
+                for event in contract.visual_events
+            }
+            for lock in lock_by_type.get(event_type, [])
+            if lock.source_asset_id == source_asset_id
+        ]
+        cue_event_ids = [
+            lock.event_id
+            for lock in feature_locks
+            if lock.event_id in cue_deltas
+        ]
+        worst_cue_event_id = (
+            max(
+                cue_event_ids,
+                key=lambda event_id: abs(cue_deltas[event_id]),
+            )
+            if cue_event_ids
+            else None
+        )
+        cue_delta = (
+            cue_deltas[worst_cue_event_id]
+            if worst_cue_event_id is not None
+            else 0
+        )
+        cue_tolerance = (
+            cue_tolerances.get(
+                worst_cue_event_id,
+                policy.sync.hard_tolerance_frames,
+            )
+            if worst_cue_event_id is not None
+            else 0
+        )
+        candidate_routing = chapter.get("automatic_candidate_selection")
+        candidate_id = (
+            str(candidate_routing.get("selected_candidate_id"))
+            if isinstance(candidate_routing, Mapping)
+            else "executed"
+        )
+        candidate = next(
+            (
+                item
+                for item in selected.vertical_candidates
+                if item.candidate_id == candidate_id
+            ),
+            None,
+        )
+        confidence = (
+            float(candidate.confidence)
+            if candidate is not None
+            else float(selected.confidence)
+        )
+        risk_codes = set(chapter.get("risk_codes") or [])
+        duration_ms = int(chapter["duration_ms"])
+        presentation_mode = _sequence_presentation_mode(
+            str(chapter.get("applied_strategy") or "source_hold")
+        )
+        entry_x, exit_x = _sequence_entry_exit_x(chapter)
+        segment_fingerprint = str(
+            chapter.get("segment_render_fingerprint") or ""
+        )
+        presentation_sha256 = (
+            segment_fingerprint
+            if re.fullmatch(r"[0-9a-f]{64}", segment_fingerprint)
+            else _stable_fingerprint(
+                {
+                    "feature_id": feature_id,
+                    "presentation": presentation_mode,
+                    "chapter": dict(chapter),
+                }
+            )
+        )
+        tracking_fingerprint = str(
+            chapter.get("track_geometry_fingerprint") or ""
+        )
+        tracking_sha256 = (
+            tracking_fingerprint
+            if re.fullmatch(r"[0-9a-f]{64}", tracking_fingerprint)
+            else _stable_fingerprint(
+                {
+                    "feature_id": feature_id,
+                    "tracking": tracking_fingerprint or "not_required",
+                }
+            )
+        )
+        locked_event_types = {lock.event_type for lock in feature_locks}
+        technical_quality = max(
+            0.0,
+            min(1.0, 1.0 - len(risk_codes) * 0.04),
+        )
+        readability = max(
+            0.0,
+            min(
+                1.0,
+                duration_ms
+                / max(round(rhythm.preferred_duration_seconds * 1000), 1),
+            ),
+        )
+        option = SequenceOption(
+            option_id=f"{feature_id}:{candidate_id}:{presentation_mode}",
+            beat_id=feature_id,
+            candidate_id=candidate_id,
+            source_asset_id=source_asset_id,
+            source_in_pts=int(
+                chapter.get("source_in_pts")
+                or chapter.get("source_in_ms")
+                or 0
+            ),
+            source_out_pts=int(
+                chapter.get("source_out_pts")
+                or chapter.get("source_out_ms")
+                or duration_ms
+            ),
+            duration_ms=duration_ms,
+            minimum_readable_ms=round(
+                rhythm.minimum_duration_seconds * 1000
+            ),
+            preferred_readable_ms=round(
+                rhythm.preferred_duration_seconds * 1000
+            ),
+            maximum_readable_ms=round(
+                rhythm.maximum_duration_seconds * 1000
+            ),
+            cue_id=(
+                cue_ids_by_event.get(worst_cue_event_id, "no-music")
+                if worst_cue_event_id is not None
+                else "no-music"
+            ),
+            cue_delta_frames=cue_delta,
+            cue_tolerance_frames=cue_tolerance,
+            presentation_mode=presentation_mode,
+            presentation_sha256=presentation_sha256,
+            tracking_sha256=tracking_sha256,
+            entry_x=entry_x,
+            exit_x=exit_x,
+            hard_evidence_satisfied=(
+                selected.evidence_status != "not_found"
+                and required_event_types <= locked_event_types
+            ),
+            identity_satisfied=deterministic.identity_passed,
+            action_complete=(
+                "action_incomplete" not in risk_codes
+                and duration_ms
+                >= round(rhythm.minimum_duration_seconds * 1000)
+            ),
+            required_relation_satisfied=deterministic.relation_passed,
+            relative_scale_satisfied=(
+                deterministic.relative_scale_lock_passed
+            ),
+            quality_safe=(
+                deterministic.media_playable
+                and deterministic.pts_valid
+                and deterministic.unexpected_freeze_count == 0
+            ),
+            reuse_authorized=deterministic.reuse_authorized,
+            geometry_executable=(
+                deterministic.containment_passed
+                and not (blocked_geometry_codes & risk_codes)
+            ),
+            legal_musical_exit=(
+                not music_supplied
+                or (
+                    deterministic.cue_boundary_coverage_audited is True
+                    and deterministic.music_edit_boundary_coverage_passed
+                    is True
+                )
+            ),
+            semantic_fit=confidence,
+            readability=readability,
+            technical_quality=technical_quality,
+            music_flow=(
+                0.5
+                if not music_supplied
+                else 1.0
+                if abs(cue_delta) <= cue_tolerance
+                else 0.0
+            ),
+            synthetic_motion_distance=float(
+                chapter.get("synthetic_motion_distance") or 0.0
+            ),
+            authorized_reprise=(
+                selected.source_reuse_mode == "editorial_reprise"
+            ),
+            freeze_event_lock_id=(
+                feature_locks[0].event_id
+                if presentation_mode == "intentional_freeze"
+                and feature_locks
+                else None
+            ),
+        )
+        beat_sets.append(
+            BeatOptionSet(
+                beat_id=feature_id,
+                priority=priority,
+                options=(option,),
+            )
+        )
+    result = optimize_sequence(beat_sets, policy=policy)
+    return result, tuple(beat_sets)
 
 
 def _run_feature_cut_experiment_impl(
@@ -14781,6 +15170,36 @@ def _run_feature_cut_experiment_impl(
             ),
         )
         write_json(output_dir / "editorial-duration-plan.json", duration_audit)
+        sequence_rhythm_path = editorial_dir / "sequence-rhythm-optimization.json"
+        write_json(
+            sequence_rhythm_path,
+            {
+                "contract_version": "production-sequence-rhythm-v1",
+                "project_id": brief.project_id,
+                "music_supplied": music_lock is not None,
+                "mode": duration_audit[
+                    "semantic_sequence_optimizer_mode"
+                ],
+                "semantic_sequence_optimization": duration_audit[
+                    "semantic_sequence_optimization"
+                ],
+                "music_boundary_refinements": duration_audit[
+                    "music_boundary_refinements"
+                ],
+                "resolved_chapter_durations_seconds": chapter_durations,
+                "input_hashes": {
+                    "attention_profile": sha256_file(attention_path),
+                    "rhythm_plan": sha256_file(rhythm_path),
+                    "feature_plan": sha256_file(plan_path),
+                    "music_map_lock": (
+                        sha256_file(resolved_music_lock_path)
+                        if resolved_music_lock_path is not None
+                        else None
+                    ),
+                },
+                "generated_at": utc_now(),
+            },
+        )
         horizontal_segments: list[Path] = []
         vertical_segments: list[Path] = []
         render_config = {
@@ -14789,6 +15208,9 @@ def _run_feature_cut_experiment_impl(
             "brief": brief.model_dump(mode="json"),
             "plan": plan.model_dump(mode="json"),
             "editorial_duration_plan": duration_audit,
+            "sequence_rhythm_optimization_sha256": sha256_file(
+                sequence_rhythm_path
+            ),
             "music_sha256": music_sha256,
             "sam_analysis_fps": sam_analysis_fps,
             "scdet_threshold": scdet_threshold,
@@ -14907,6 +15329,12 @@ def _run_feature_cut_experiment_impl(
                 "rhythm_plan_path": str(rhythm_path.resolve()),
                 "rhythm_plan_sha256": sha256_file(rhythm_path),
                 "rhythm_style": rhythm_style,
+                "sequence_rhythm_optimization_path": str(
+                    sequence_rhythm_path.resolve()
+                ),
+                "sequence_rhythm_optimization_sha256": sha256_file(
+                    sequence_rhythm_path
+                ),
             },
             "horizontal": {
                 "requested": render_horizontal,
@@ -18332,6 +18760,59 @@ def _run_feature_cut_experiment_impl(
                     tuple(autonomous_degradations),
                 ),
                 hard_evidence_passed=hard_event_types <= locked_event_types,
+            )
+            sequence_optimization, executed_beat_sets = (
+                _build_production_sequence_optimization(
+                    vertical_chapters=vertical_chapters,
+                    plan=plan,
+                    rhythm_plan=rhythm_plan,
+                    clips=clips,
+                    contracts=resolved_editorial_contracts,
+                    locks=resolved_exact_event_locks,
+                    cue_deltas=cue_deltas,
+                    cue_tolerances=cue_tolerances,
+                    cue_ids_by_event=cue_ids_by_event,
+                    deterministic=deterministic,
+                    policy=autonomous_policy,
+                    music_supplied=music_lock is not None,
+                )
+            )
+            sequence_optimization_path = (
+                context_dir / "sequence-optimization.json"
+            )
+            write_json(
+                sequence_optimization_path,
+                {
+                    "contract_version": (
+                        "production-sequence-optimization-v1"
+                    ),
+                    "policy_reference": autonomous_policy.policy_reference,
+                    "rhythm_optimization": {
+                        "path": str(sequence_rhythm_path.resolve()),
+                        "sha256": sha256_file(sequence_rhythm_path),
+                    },
+                    "executed_option_sets": [
+                        beat_set.model_dump(mode="json")
+                        for beat_set in executed_beat_sets
+                    ],
+                    "result": sequence_optimization.model_dump(mode="json"),
+                    "frontier_scope": (
+                        "executed_exact_trim_and_presentation_options"
+                    ),
+                    "music_supplied": music_lock is not None,
+                    "generated_at": utc_now(),
+                },
+            )
+            autonomous_context_paths["sequence_optimization"] = (
+                sequence_optimization_path.resolve()
+            )
+            deterministic = deterministic.model_copy(
+                update={
+                    "sequence_optimization_audited": True,
+                    "sequence_optimization_passed": (
+                        sequence_optimization.outcome != "blocked"
+                    ),
+                }
             )
             deterministic_delivery_evidence_path = (
                 context_dir / "deterministic-delivery-evidence.json"

@@ -218,6 +218,7 @@ def test_autonomous_preflight_rejects_hard_gate_before_paid_work(
         "music_map": {},
         "cue_plan": {},
         "exact_event_locks": [],
+        "sequence_optimization": {"result": {"outcome": "selected"}},
         "reuse_degradation": AutonomousDegradationManifest(
             policy_reference=policy.policy_reference,
             generated_at="now",
@@ -246,6 +247,8 @@ def test_autonomous_preflight_rejects_hard_gate_before_paid_work(
             "reuse_authorized": True,
             "omissions_authorized": True,
             "hard_evidence_passed": True,
+            "sequence_optimization_audited": True,
+            "sequence_optimization_passed": True,
         },
     )
     called = False
@@ -294,6 +297,7 @@ def test_autonomous_pipeline_discovers_selected_window_bundle(
         "music_map": {},
         "cue_plan": {},
         "exact_event_locks": {"locks": []},
+        "sequence_optimization": {"result": {"outcome": "selected"}},
         "reuse_degradation": AutonomousDegradationManifest(
             policy_reference=policy.policy_reference,
             generated_at="now",
@@ -318,12 +322,14 @@ def test_autonomous_pipeline_discovers_selected_window_bundle(
             "synthetic_motion_motivated": True,
             "synthetic_reversal_count": 0,
             "settle_passed": True,
-            "readability_passed": True,
-            "reuse_authorized": True,
-            "omissions_authorized": True,
-            "hard_evidence_passed": True,
-        },
-    )
+                "readability_passed": True,
+                "reuse_authorized": True,
+                "omissions_authorized": True,
+                "hard_evidence_passed": True,
+                "sequence_optimization_audited": True,
+                "sequence_optimization_passed": True,
+            },
+        )
     preflight_deterministic = tmp_path / "preflight-deterministic.json"
     write_json(
         preflight_deterministic,
@@ -357,6 +363,8 @@ def test_autonomous_pipeline_discovers_selected_window_bundle(
             "reuse_authorized": True,
             "omissions_authorized": True,
             "hard_evidence_passed": True,
+            "sequence_optimization_audited": True,
+            "sequence_optimization_passed": True,
         },
     )
     received: dict[str, object] = {}
