@@ -37,6 +37,21 @@ from .storage import read_json, write_json
 
 
 NormalizedBox = tuple[int, int, int, int]
+PresentationFeasibilityStatus = Literal[
+    "known_feasible",
+    "known_infeasible",
+    "needs_exact_event",
+    "needs_bbox",
+    "needs_sam",
+]
+PresentationCapability = Literal[
+    "static_full_bleed_crop",
+    "tracked_full_bleed_crop",
+    "phase_virtual_camera",
+    "hard_cut_between_views",
+    "two_panel_layout",
+    "solid_matte_fit",
+]
 
 _SOURCE_MOTION_ESTIMATOR_V1 = "background-gftt-lk-ransac-affine-v1"
 _SOURCE_MOTION_ESTIMATOR_V2 = "background-gftt-lk-ransac-affine-v2"
@@ -55,6 +70,206 @@ class GroundingTargetRequest(FrozenStrictModel):
     )
     target_description: str = Field(min_length=1)
     exclusions: tuple[str, ...] = ()
+
+
+class PresentationModeFeasibility(FrozenStrictModel):
+    """One honest pre-paid feasibility statement.
+
+    Deferred evidence is never represented as success. This lets the global
+    candidate frontier distinguish a known impossible option from one that is
+    still allowed to consume its specifically reserved exact/bbox/SAM node.
+    """
+
+    capability_id: PresentationCapability
+    status: PresentationFeasibilityStatus
+    reason_codes: tuple[str, ...] = Field(min_length=1)
+
+
+class PresentationFeasibilityLatticeV1(FrozenStrictModel):
+    contract_version: Literal["presentation-feasibility-lattice-v1"] = (
+        "presentation-feasibility-lattice-v1"
+    )
+    candidate_id: str = Field(min_length=1)
+    relation_mode: Literal[
+        "single_subject",
+        "sequential_focus",
+        "simultaneous_relation",
+        "context_detail",
+    ]
+    modes: tuple[PresentationModeFeasibility, ...] = Field(min_length=6)
+
+    @model_validator(mode="after")
+    def validate_modes(self) -> "PresentationFeasibilityLatticeV1":
+        ids = [mode.capability_id for mode in self.modes]
+        if len(ids) != len(set(ids)):
+            raise ValueError("presentation feasibility modes must be unique")
+        return self
+
+    def assessment(
+        self,
+        capability_id: PresentationCapability,
+    ) -> PresentationModeFeasibility:
+        return next(
+            mode
+            for mode in self.modes
+            if mode.capability_id == capability_id
+        )
+
+
+def assess_prepaid_presentation_feasibility(
+    *,
+    candidate_id: str,
+    aspect_suitability: Literal[
+        "natural",
+        "reconstructable",
+        "unsuitable",
+    ],
+    relation_mode: Literal[
+        "single_subject",
+        "sequential_focus",
+        "simultaneous_relation",
+        "context_detail",
+    ],
+    hard_region_count: int,
+    has_virtual_camera_proposal: bool,
+    physical_scale_comparison: bool,
+    has_atomic_or_text_region: bool,
+    policy: AutonomousEditPolicy,
+) -> PresentationFeasibilityLatticeV1:
+    """Classify every local presentation family before a paid refinement.
+
+    This is deliberately conservative. Geometry-dependent modes remain
+    ``needs_bbox``/``needs_sam`` instead of being optimistically declared
+    feasible, while policy and topology failures are rejected immediately.
+    """
+
+    if hard_region_count < 0:
+        raise ValueError("hard region count cannot be negative")
+    if aspect_suitability == "unsuitable":
+        return PresentationFeasibilityLatticeV1(
+            candidate_id=candidate_id,
+            relation_mode=relation_mode,
+            modes=tuple(
+                PresentationModeFeasibility(
+                    capability_id=capability_id,
+                    status="known_infeasible",
+                    reason_codes=("aspect_declared_unsuitable",),
+                )
+                for capability_id in (
+                    "static_full_bleed_crop",
+                    "tracked_full_bleed_crop",
+                    "phase_virtual_camera",
+                    "hard_cut_between_views",
+                    "two_panel_layout",
+                    "solid_matte_fit",
+                )
+            ),
+        )
+
+    target_gate: PresentationFeasibilityStatus = (
+        "needs_sam" if hard_region_count else "needs_bbox"
+    )
+    modes: list[PresentationModeFeasibility] = [
+        PresentationModeFeasibility(
+            capability_id="static_full_bleed_crop",
+            status="needs_bbox",
+            reason_codes=("required_scope_geometry_unresolved",),
+        ),
+        PresentationModeFeasibility(
+            capability_id="tracked_full_bleed_crop",
+            status=target_gate,
+            reason_codes=(
+                "whole_window_tracking_unresolved"
+                if hard_region_count
+                else "grounding_seed_unresolved",
+            ),
+        ),
+        PresentationModeFeasibility(
+            capability_id="phase_virtual_camera",
+            status=(
+                target_gate
+                if has_virtual_camera_proposal
+                else "known_infeasible"
+            ),
+            reason_codes=(
+                ("phase_geometry_and_tracking_unresolved",)
+                if has_virtual_camera_proposal
+                else ("no_semantic_phase_proposal",)
+            ),
+        ),
+        PresentationModeFeasibility(
+            capability_id="hard_cut_between_views",
+            status=(
+                "needs_exact_event"
+                if relation_mode == "sequential_focus"
+                else "known_infeasible"
+            ),
+            reason_codes=(
+                ("view_transition_event_unresolved",)
+                if relation_mode == "sequential_focus"
+                else ("relation_does_not_authorize_sequential_reconstruction",)
+            ),
+        ),
+    ]
+
+    panel_relation_allowed = relation_mode in {
+        "simultaneous_relation",
+        "context_detail",
+    }
+    panel_allowed = (
+        policy.presentation.allow_two_panel_layout
+        and panel_relation_allowed
+        and (
+            hard_region_count >= 2
+            or relation_mode == "context_detail"
+        )
+    )
+    panel_reason = (
+        "panel_geometry_and_readability_unresolved"
+        if panel_allowed
+        else "two_panel_not_authorized_for_candidate_topology"
+    )
+    if physical_scale_comparison and panel_allowed:
+        panel_reason = "relative_scale_and_same_pts_unresolved"
+    modes.append(
+        PresentationModeFeasibility(
+            capability_id="two_panel_layout",
+            status=(
+                "needs_exact_event"
+                if panel_allowed and physical_scale_comparison
+                else target_gate
+                if panel_allowed
+                else "known_infeasible"
+            ),
+            reason_codes=(panel_reason,),
+        )
+    )
+
+    fit_allowed = policy.presentation.allow_solid_matte_fit
+    modes.append(
+        PresentationModeFeasibility(
+            capability_id="solid_matte_fit",
+            status=(
+                "needs_bbox"
+                if fit_allowed and has_atomic_or_text_region
+                else "known_feasible"
+                if fit_allowed
+                else "known_infeasible"
+            ),
+            reason_codes=(
+                ("atomic_readability_unresolved",)
+                if fit_allowed and has_atomic_or_text_region
+                else ("whole_source_scope_preserved",)
+                if fit_allowed
+                else ("solid_matte_fit_forbidden_by_policy",)
+            ),
+        )
+    )
+    return PresentationFeasibilityLatticeV1(
+        candidate_id=candidate_id,
+        relation_mode=relation_mode,
+        modes=tuple(modes),
+    )
 
 
 class MultiTargetGroundingCandidate(FrozenStrictModel):

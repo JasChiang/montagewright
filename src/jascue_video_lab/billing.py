@@ -399,6 +399,17 @@ def _canonical_request_sha256(value: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _paid_work_node_id(*, stage: str, request_sha256: str) -> str:
+    return "sha256:" + hashlib.sha256(
+        (
+            "paid-work-node-v1:"
+            + stage
+            + ":"
+            + request_sha256
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _estimate_from_dispatch_journal(payload: Mapping[str, Any]) -> PaidCallEstimate:
     raw = payload.get("estimate")
     if not isinstance(raw, Mapping):
@@ -454,6 +465,10 @@ def dispatch_paid_interaction(
     resolved_dir = journal_dir.expanduser().resolve()
     resolved_dir.mkdir(parents=True, exist_ok=True)
     request_sha256 = _canonical_request_sha256(request_record)
+    work_node_id = _paid_work_node_id(
+        stage=estimate.stage,
+        request_sha256=request_sha256,
+    )
     safe_stage = re.sub(r"[^A-Za-z0-9._-]+", "-", estimate.stage).strip("-")
     journal_path = (
         resolved_dir / f"{safe_stage}.{request_sha256}.paid_dispatch.json"
@@ -462,6 +477,8 @@ def dispatch_paid_interaction(
         payload = read_json(journal_path)
         if str(payload.get("request_sha256") or "") != request_sha256:
             raise ValueError("paid dispatch journal path/hash mismatch")
+        if str(payload.get("work_node_id") or "") != work_node_id:
+            raise ValueError("paid dispatch journal work-node identity mismatch")
         dispatch_id = str(payload.get("dispatch_id") or "")
         if not dispatch_id:
             raise ValueError("paid dispatch journal has no dispatch ID")
@@ -495,7 +512,8 @@ def dispatch_paid_interaction(
         ),
     )
     journal = {
-        "contract_version": "paid-dispatch-journal-v1",
+        "contract_version": "paid-dispatch-journal-v2",
+        "work_node_id": work_node_id,
         "dispatch_id": dispatch_id,
         "request_sha256": request_sha256,
         "stage": estimate.stage,
@@ -613,6 +631,16 @@ def adopt_paid_dispatch_journals(
         if dispatch_id in seen_dispatch_ids:
             continue
         estimate = _estimate_from_dispatch_journal(payload)
+        request_sha256 = str(payload.get("request_sha256") or "")
+        work_node_id = str(payload.get("work_node_id") or "")
+        if work_node_id != _paid_work_node_id(
+            stage=estimate.stage,
+            request_sha256=request_sha256,
+        ):
+            raise ValueError(
+                f"paid dispatch journal work-node identity differs: "
+                f"{journal_path}"
+            )
         budget_ledger.adopt_conservative_dispatch(
             dispatch_id=dispatch_id,
             estimate=estimate,
@@ -621,6 +649,7 @@ def adopt_paid_dispatch_journals(
         adopted.append(
             {
                 "dispatch_id": dispatch_id,
+                "work_node_id": work_node_id,
                 "path": str(relative),
                 "stage": estimate.stage,
                 "model_id": estimate.model_id,
@@ -631,10 +660,128 @@ def adopt_paid_dispatch_journals(
     return adopted
 
 
+def adopt_paid_dispatch_journal_state(
+    *,
+    budget_ledger: "BudgetLedger",
+    root: Path,
+    allowed_top_level: set[str] | frozenset[str] | None = None,
+) -> tuple[list[dict[str, Any]], frozenset[Path]]:
+    """Adopt paid nodes by journal identity, never by artifact path naming."""
+
+    adopted: list[dict[str, Any]] = []
+    journaled_raw_paths: set[Path] = set()
+    seen_dispatch_ids: set[str] = set()
+    resolved_root = root.expanduser().resolve()
+    if not resolved_root.exists():
+        return adopted, frozenset()
+    for journal_path in sorted(
+        resolved_root.rglob("*.paid_dispatch.json")
+    ):
+        relative = journal_path.relative_to(resolved_root)
+        if (
+            allowed_top_level is not None
+            and (
+                not relative.parts
+                or relative.parts[0] not in allowed_top_level
+            )
+        ):
+            continue
+        payload = read_json(journal_path)
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"invalid paid dispatch journal: {journal_path}")
+        dispatch_id = str(payload.get("dispatch_id") or "")
+        if not dispatch_id:
+            raise ValueError(f"paid dispatch journal has no ID: {journal_path}")
+        if dispatch_id in seen_dispatch_ids:
+            continue
+        estimate = _estimate_from_dispatch_journal(payload)
+        request_sha256 = str(payload.get("request_sha256") or "")
+        work_node_id = str(payload.get("work_node_id") or "")
+        if work_node_id != _paid_work_node_id(
+            stage=estimate.stage,
+            request_sha256=request_sha256,
+        ):
+            raise ValueError(
+                f"paid dispatch journal work-node identity differs: "
+                f"{journal_path}"
+            )
+        status = str(payload.get("status") or "")
+        raw_path_value = payload.get("raw_artifact_path")
+        raw_path = (
+            Path(str(raw_path_value)).expanduser().resolve()
+            if isinstance(raw_path_value, str) and raw_path_value
+            else None
+        )
+        if raw_path is not None:
+            try:
+                raw_path.relative_to(resolved_root)
+            except ValueError as error:
+                raise ValueError(
+                    "paid dispatch raw artifact lies outside the run root"
+                ) from error
+            journaled_raw_paths.add(raw_path)
+        if status == "raw_usage_persisted":
+            if raw_path is None or not raw_path.is_file():
+                raise ValueError(
+                    "completed paid dispatch has no durable raw artifact"
+                )
+            raw = read_json(raw_path)
+            if not isinstance(raw, Mapping) or not isinstance(
+                raw.get("usage"),
+                Mapping,
+            ):
+                raise ValueError(
+                    "completed paid dispatch raw artifact has no usage"
+                )
+            journal_interaction_id = str(
+                payload.get("interaction_id") or ""
+            )
+            raw_interaction_id = str(raw.get("id") or "")
+            if (
+                journal_interaction_id
+                and raw_interaction_id
+                and journal_interaction_id != raw_interaction_id
+            ):
+                raise ValueError(
+                    "paid dispatch journal/raw interaction ID mismatch"
+                )
+            budget_ledger.adopt_reconciled_usage(
+                stage=estimate.stage,
+                model_id=estimate.model_id,
+                usage=raw["usage"],
+            )
+            adoption_basis = "actual_usage"
+        elif _dispatch_needs_conservative_adoption(payload):
+            budget_ledger.adopt_conservative_dispatch(
+                dispatch_id=dispatch_id,
+                estimate=estimate,
+            )
+            adoption_basis = "conservative_worst_case"
+        else:
+            raise ValueError(
+                "paid dispatch journal has an unsupported terminal status: "
+                f"{status or '<empty>'}"
+            )
+        seen_dispatch_ids.add(dispatch_id)
+        adopted.append(
+            {
+                "dispatch_id": dispatch_id,
+                "work_node_id": work_node_id,
+                "path": str(relative),
+                "stage": estimate.stage,
+                "model_id": estimate.model_id,
+                "status": status,
+                "adoption_basis": adoption_basis,
+                "worst_case_cost_usd": estimate.worst_case_cost_usd,
+            }
+        )
+    return adopted, frozenset(journaled_raw_paths)
+
+
 class BudgetLedger:
     """Reserve worst-case paid work, then reconcile immutable usage evidence."""
 
-    contract_version = "budget-ledger-v2"
+    contract_version = "budget-ledger-v3"
 
     def __init__(
         self,
@@ -643,9 +790,17 @@ class BudgetLedger:
         max_interactions: int,
         reserved_recovery_fraction: float = 0.20,
         mandatory_stage_minimums: Mapping[str, int] | None = None,
+        mandatory_stage_cost_holds: Mapping[str, float] | None = None,
+        interaction_guard: int = 0,
     ) -> None:
         if max_cost_usd <= 0 or max_interactions <= 0:
             raise ValueError("budget caps must be positive")
+        if (
+            isinstance(interaction_guard, bool)
+            or not isinstance(interaction_guard, int)
+            or interaction_guard < 0
+        ):
+            raise ValueError("interaction guard must be a non-negative integer")
         if not 0.20 <= reserved_recovery_fraction <= 0.50:
             raise ValueError("recovery reserve must be between 20% and 50%")
         resolved_minimums = (
@@ -668,15 +823,52 @@ class BudgetLedger:
                 )
             if raw_minimum:
                 normalized_minimums[stage] = raw_minimum
-        if sum(normalized_minimums.values()) > max_interactions:
+        if (
+            sum(normalized_minimums.values()) + interaction_guard
+            > max_interactions
+        ):
             raise ValueError(
-                "mandatory stage interaction minimums exceed the interaction cap"
+                "mandatory stage interaction minimums and guard exceed the "
+                "interaction cap"
+            )
+        normalized_cost_holds: dict[str, float] = {}
+        for raw_stage, raw_cost in dict(
+            mandatory_stage_cost_holds or {}
+        ).items():
+            stage = str(raw_stage).strip()
+            if not stage:
+                raise ValueError("mandatory cost-hold stage cannot be empty")
+            if isinstance(raw_cost, bool) or not isinstance(
+                raw_cost,
+                (int, float),
+            ):
+                raise ValueError("mandatory stage cost holds must be numeric")
+            cost = float(raw_cost)
+            if cost < 0:
+                raise ValueError("mandatory stage cost holds cannot be negative")
+            if cost:
+                normalized_cost_holds[stage] = cost
+        if sum(normalized_cost_holds.values()) > max_cost_usd + 1e-9:
+            raise ValueError(
+                "mandatory stage cost holds exceed the USD cap"
+            )
+        unknown_cost_hold_stages = (
+            set(normalized_cost_holds) - set(normalized_minimums)
+        )
+        if unknown_cost_hold_stages:
+            raise ValueError(
+                "mandatory cost holds require matching interaction holds: "
+                + ", ".join(sorted(unknown_cost_hold_stages))
             )
         self.max_cost_usd = max_cost_usd
         self.max_interactions = max_interactions
+        self.interaction_guard = interaction_guard
         self.reserved_recovery_fraction = reserved_recovery_fraction
         self.mandatory_stage_minimums = dict(
             sorted(normalized_minimums.items())
+        )
+        self.mandatory_stage_cost_holds = dict(
+            sorted(normalized_cost_holds.items())
         )
         self._reservations: dict[str, BudgetReservation] = {}
         self.created_at = utc_now()
@@ -719,9 +911,13 @@ class BudgetLedger:
         prevents one call from satisfying two overlapping holds.
         """
 
+        hold_stages = (
+            set(self.mandatory_stage_minimums)
+            | set(self.mandatory_stage_cost_holds)
+        )
         matches = [
             hold_stage
-            for hold_stage in self.mandatory_stage_minimums
+            for hold_stage in hold_stages
             if stage == hold_stage or stage.startswith(f"{hold_stage}:")
         ]
         return max(matches, key=len) if matches else None
@@ -749,6 +945,54 @@ class BudgetLedger:
             for stage, minimum in self.mandatory_stage_minimums.items()
         }
 
+    def _committed_mandatory_cost_ceiling(self) -> dict[str, float]:
+        committed = {
+            stage: 0.0 for stage in self.mandatory_stage_cost_holds
+        }
+        for reservation in self._reservations.values():
+            if reservation.state == "cancelled":
+                continue
+            hold_stage = self._mandatory_hold_stage(
+                reservation.estimate.stage
+            )
+            if hold_stage in committed:
+                committed[hold_stage] += (
+                    reservation.estimate.worst_case_cost_usd
+                )
+        return {
+            stage: round(cost, 8)
+            for stage, cost in committed.items()
+        }
+
+    def remaining_mandatory_cost_holds(self) -> dict[str, float]:
+        committed = self._committed_mandatory_cost_ceiling()
+        return {
+            stage: round(max(0.0, minimum - committed[stage]), 8)
+            for stage, minimum in self.mandatory_stage_cost_holds.items()
+        }
+
+    def _remaining_mandatory_cost_after(
+        self,
+        *,
+        stage: str,
+        cost_usd: float,
+    ) -> float:
+        committed = self._committed_mandatory_cost_ceiling()
+        hold_stage = self._mandatory_hold_stage(stage)
+        if hold_stage in committed:
+            committed[hold_stage] = round(
+                committed[hold_stage] + cost_usd,
+                8,
+            )
+        return round(
+            sum(
+                max(0.0, minimum - committed[configured_stage])
+                for configured_stage, minimum
+                in self.mandatory_stage_cost_holds.items()
+            ),
+            8,
+        )
+
     def _interaction_limit_after(
         self,
         *,
@@ -763,7 +1007,7 @@ class BudgetLedger:
             max(0, minimum - committed_by_hold[hold_stage])
             for hold_stage, minimum in self.mandatory_stage_minimums.items()
         )
-        return self.max_interactions - remaining_holds
+        return self.max_interactions - self.interaction_guard - remaining_holds
 
     def reserve(
         self,
@@ -781,10 +1025,18 @@ class BudgetLedger:
         )
         mandatory_hold_stage = self._mandatory_hold_stage(estimate.stage)
         if recovery_call or mandatory_hold_stage is not None:
-            cost_limit = self.max_cost_usd
+            coarse_cost_limit = self.max_cost_usd
         else:
             usable_fraction = 1.0 - self.reserved_recovery_fraction
-            cost_limit = self.max_cost_usd * usable_fraction
+            coarse_cost_limit = self.max_cost_usd * usable_fraction
+        remaining_mandatory_cost = self._remaining_mandatory_cost_after(
+            stage=estimate.stage,
+            cost_usd=estimate.worst_case_cost_usd,
+        )
+        completion_cost_limit = (
+            self.max_cost_usd - remaining_mandatory_cost
+        )
+        cost_limit = min(coarse_cost_limit, completion_cost_limit)
         interaction_limit = self._interaction_limit_after(
             stage=estimate.stage,
             interactions=estimate.worst_case_interactions,
@@ -1046,8 +1298,10 @@ class BudgetLedger:
             "contract_version": self.contract_version,
             "max_cost_usd": self.max_cost_usd,
             "max_interactions": self.max_interactions,
+            "interaction_guard": self.interaction_guard,
             "reserved_recovery_fraction": self.reserved_recovery_fraction,
             "mandatory_stage_minimums": self.mandatory_stage_minimums,
+            "mandatory_stage_cost_holds": self.mandatory_stage_cost_holds,
             "mandatory_interaction_holds": {
                 stage: {
                     "minimum_interactions": minimum,
@@ -1063,10 +1317,28 @@ class BudgetLedger:
             "remaining_held_interactions": sum(
                 self.remaining_mandatory_interaction_holds().values()
             ),
+            "mandatory_cost_holds": {
+                stage: {
+                    "minimum_cost_usd": minimum,
+                    "committed_cost_ceiling_usd": (
+                        self._committed_mandatory_cost_ceiling()[stage]
+                    ),
+                    "remaining_held_cost_usd": (
+                        self.remaining_mandatory_cost_holds()[stage]
+                    ),
+                }
+                for stage, minimum
+                in self.mandatory_stage_cost_holds.items()
+            },
+            "remaining_held_cost_usd": round(
+                sum(self.remaining_mandatory_cost_holds().values()),
+                8,
+            ),
             "available_unheld_interactions": max(
                 0,
                 self.max_interactions
                 - self.committed_interactions
+                - self.interaction_guard
                 - sum(
                     self.remaining_mandatory_interaction_holds().values()
                 ),
@@ -1075,6 +1347,11 @@ class BudgetLedger:
             "active_reserved_cost_usd": self.reserved_cost_usd,
             "committed_interactions": self.committed_interactions,
             "remaining_interactions": (
+                self.max_interactions
+                - self.committed_interactions
+                - self.interaction_guard
+            ),
+            "circuit_breaker_remaining_interactions": (
                 self.max_interactions - self.committed_interactions
             ),
             "remaining_cost_usd": round(

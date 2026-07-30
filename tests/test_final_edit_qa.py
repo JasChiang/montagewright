@@ -357,6 +357,10 @@ def _autonomous_files(
             "records": [],
             "hard_evidence_omitted": False,
         },
+        "resolved_timeline": {
+            "aspect": "9:16" if vertical else "16:9",
+            "definition_sha256": "f" * 64,
+        },
     }.items():
         path = tmp_path / f"{key}.json"
         write_json(path, payload)
@@ -1502,9 +1506,16 @@ def test_semantic_replan_is_scoped_and_limited_to_one(
         }
     )
 
+    semantic_policy = _autonomous_policy().model_copy(
+        update={
+            "budget": _autonomous_policy().budget.model_copy(
+                update={"max_semantic_replans": 1}
+            )
+        }
+    )
     first = plan_autonomous_recovery(
         qa,
-        policy=_autonomous_policy(),
+        policy=semantic_policy,
         qa_passes_completed=1,
         semantic_replans_used=0,
     )
@@ -1513,7 +1524,7 @@ def test_semantic_replan_is_scoped_and_limited_to_one(
 
     blocked = plan_autonomous_recovery(
         qa,
-        policy=_autonomous_policy(),
+        policy=semantic_policy,
         qa_passes_completed=1,
         semantic_replans_used=1,
     )

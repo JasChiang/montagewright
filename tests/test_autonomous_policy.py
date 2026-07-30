@@ -365,8 +365,12 @@ def test_autonomous_preflight_rejects_hard_gate_before_paid_work(
         "music_map": {},
         "cue_plan": {},
         "exact_event_locks": [],
-        "sequence_optimization": {"result": {"outcome": "selected"}},
-        "reuse_degradation": AutonomousDegradationManifest(
+            "sequence_optimization": {"result": {"outcome": "selected"}},
+            "resolved_timeline": {
+                "aspect": "9:16",
+                "definition_sha256": "f" * 64,
+            },
+            "reuse_degradation": AutonomousDegradationManifest(
             policy_reference=policy.policy_reference,
             generated_at="now",
         ).model_dump(mode="json"),
@@ -445,8 +449,12 @@ def test_autonomous_pipeline_discovers_selected_window_bundle(
         "music_map": {},
         "cue_plan": {},
         "exact_event_locks": {"locks": []},
-        "sequence_optimization": {"result": {"outcome": "selected"}},
-        "reuse_degradation": AutonomousDegradationManifest(
+            "sequence_optimization": {"result": {"outcome": "selected"}},
+            "resolved_timeline": {
+                "aspect": "9:16",
+                "definition_sha256": "f" * 64,
+            },
+            "reuse_degradation": AutonomousDegradationManifest(
             policy_reference=policy.policy_reference,
             generated_at="now",
         ).model_dump(mode="json"),

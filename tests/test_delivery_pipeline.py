@@ -139,6 +139,34 @@ def test_mandatory_budget_holds_are_derived_from_contract_graph(
         "exact_event_group:watch9": 1,
         "exact_event_group:watch_ultra2": 1,
     }
+    assert {
+        key: value
+        for key, value in minimums.items()
+        if key.startswith("multi_target_grounding:")
+    } == {
+        "multi_target_grounding:galaxy_ai": 1,
+        "multi_target_grounding:watch9": 1,
+    }
+
+    cost_holds = pipeline._mandatory_paid_stage_cost_holds(
+        policy=policy,
+        editorial_beat_contracts_path=contracts,
+    )
+    assert set(cost_holds) == set(minimums)
+    assert 0 < sum(cost_holds.values()) < policy.budget.max_gemini_cost_usd
+
+
+def test_multi_aspect_qa_reserve_is_per_aspect_and_per_pass() -> None:
+    policy = _autonomous_policy(
+        requested_aspects=("16:9", "9:16"),
+    )
+
+    minimums = pipeline._mandatory_paid_stage_minimums(
+        policy=policy,
+        editorial_beat_contracts_path=None,
+    )
+
+    assert minimums["final_qa"] == 4
 
 
 def test_autonomous_delivery_cli_accepts_explicit_no_music_mode() -> None:
@@ -395,6 +423,7 @@ def test_multi_aspect_preflight_rejects_cross_aspect_context_reuse(
             "exact_event_locks",
             "sequence_optimization",
             "reuse_degradation",
+            "resolved_timeline",
         ):
             path = aspect_dir / f"{key}.json"
             if key == "reuse_degradation":
@@ -925,9 +954,16 @@ def _recovery_fixture_paths(
         "exact_event_locks",
         "sequence_optimization",
         "reuse_degradation",
+        "resolved_timeline",
     ):
         path = tmp_path / f"{key}.json"
-        payload: object = {}
+        payload: object = (
+            []
+            if key == "editorial_beat_contracts"
+            else {"aspect": "9:16"}
+            if key == "resolved_timeline"
+            else {}
+        )
         if key == "reuse_degradation":
             payload = AutonomousDegradationManifest(
                 policy_reference=policy.policy_reference,

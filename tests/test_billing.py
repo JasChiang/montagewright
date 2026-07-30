@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,9 @@ from jascue_video_lab.billing import (
     BudgetExceeded,
     BudgetLedger,
     PaidDispatchAlreadyRecorded,
+    adopt_paid_dispatch_journal_state,
     adopt_paid_dispatch_journals,
+    complete_paid_dispatch,
     dispatch_paid_interaction,
     estimate_paid_call,
     summarize_usage_and_list_price,
@@ -73,6 +76,80 @@ def test_multiple_mandatory_stage_holds_cannot_be_spent_by_other_calls() -> None
 
     ledger.reserve(_cheap_estimate("exact_event_group"))
     assert ledger.report()["remaining_held_interactions"] == 0
+
+
+def test_interaction_guard_is_not_spendable_by_any_stage() -> None:
+    ledger = BudgetLedger(
+        max_cost_usd=10.0,
+        max_interactions=5,
+        mandatory_stage_minimums={"final_qa": 1},
+        interaction_guard=2,
+    )
+
+    ledger.reserve(_cheap_estimate("candidate_reel_plan"))
+    ledger.reserve(_cheap_estimate("exact_event_group"))
+    with pytest.raises(BudgetExceeded, match="interaction reserve"):
+        ledger.reserve(_cheap_estimate("multi_target_grounding"))
+    ledger.reserve(_cheap_estimate("final_qa:autonomous_final_9x16"))
+
+    report = ledger.report()
+    assert report["interaction_guard"] == 2
+    assert report["committed_interactions"] == 3
+
+
+def test_mandatory_usd_escrow_blocks_optional_work_before_starvation() -> None:
+    ledger = BudgetLedger(
+        max_cost_usd=1.0,
+        max_interactions=3,
+        mandatory_stage_minimums={"final_qa": 1},
+        mandatory_stage_cost_holds={"final_qa": 0.40},
+    )
+
+    with pytest.raises(BudgetExceeded, match="cost reserve"):
+        ledger.reserve(
+            replace(
+                _cheap_estimate("candidate_reel_plan"),
+                worst_case_cost_usd=0.65,
+            )
+        )
+
+    ledger.reserve(
+        replace(
+            _cheap_estimate("final_qa:autonomous_final_9x16"),
+            worst_case_cost_usd=0.40,
+        )
+    )
+    report = ledger.report()
+    assert report["remaining_held_cost_usd"] == 0.0
+    assert report["mandatory_cost_holds"]["final_qa"] == {
+        "minimum_cost_usd": 0.4,
+        "committed_cost_ceiling_usd": 0.4,
+        "remaining_held_cost_usd": 0.0,
+    }
+
+
+def test_one_mandatory_stage_cannot_spend_another_stage_usd_hold() -> None:
+    ledger = BudgetLedger(
+        max_cost_usd=1.0,
+        max_interactions=2,
+        mandatory_stage_minimums={
+            "exact_event_group:closing": 1,
+            "final_qa": 1,
+        },
+        mandatory_stage_cost_holds={
+            "exact_event_group:closing": 0.30,
+            "final_qa": 0.40,
+        },
+    )
+
+    with pytest.raises(BudgetExceeded, match="cost reserve"):
+        ledger.reserve(
+            replace(
+                _cheap_estimate("exact_event_group:closing"),
+                worst_case_cost_usd=0.65,
+            )
+        )
+    assert ledger.report()["remaining_held_cost_usd"] == 0.7
 
 
 def test_cancelling_mandatory_reservation_restores_its_stage_hold() -> None:
@@ -472,3 +549,98 @@ def test_ambiguous_dispatch_is_adopted_once_and_exact_request_never_replayed(
 
     assert len(calls) == 1
     assert resumed_ledger.committed_interactions == 1
+
+
+def test_completed_dispatch_resume_uses_journal_stage_not_raw_path(
+    tmp_path,
+) -> None:
+    interaction = SimpleNamespace(
+        id="interaction-1",
+        model_dump=lambda mode="json": {
+            "id": "interaction-1",
+            "model": "gemini-3.6-flash",
+            "usage": {
+                "total_input_tokens": 100,
+                "total_cached_tokens": 0,
+                "total_output_tokens": 10,
+                "total_thought_tokens": 5,
+            },
+        },
+    )
+    client = SimpleNamespace(
+        interactions=SimpleNamespace(
+            create=lambda **_request: interaction
+        )
+    )
+    estimate = estimate_paid_call(
+        stage="exact_event_group:closing",
+        model_id="gemini-3.6-flash",
+        text_input_tokens=100,
+        max_output_tokens=100,
+        thinking_level="minimal",
+    )
+    first_ledger = BudgetLedger(
+        max_cost_usd=1.25,
+        max_interactions=25,
+    )
+    response, handle = dispatch_paid_interaction(
+        client=client,
+        request={"model": "gemini-3.6-flash", "input": []},
+        request_record={"semantic_request": "closing"},
+        journal_dir=tmp_path / "picture" / "opaque-directory",
+        estimate=estimate,
+        budget_ledger=first_ledger,
+    )
+    raw = response.model_dump(mode="json")
+    raw_path = (
+        tmp_path
+        / "picture"
+        / "unrelated-name.raw_interaction.json"
+    )
+    raw_path.write_text(json.dumps(raw), encoding="utf-8")
+    complete_paid_dispatch(
+        handle=handle,
+        raw_interaction=raw,
+        raw_artifact_path=raw_path,
+        budget_ledger=first_ledger,
+        model_id="gemini-3.6-flash",
+    )
+
+    resumed_ledger = BudgetLedger(
+        max_cost_usd=1.25,
+        max_interactions=25,
+        mandatory_stage_minimums={
+            "exact_event_group:closing": 1,
+        },
+    )
+    adopted, raw_paths = adopt_paid_dispatch_journal_state(
+        budget_ledger=resumed_ledger,
+        root=tmp_path,
+        allowed_top_level={"picture"},
+    )
+
+    assert adopted[0]["stage"] == "exact_event_group:closing"
+    assert adopted[0]["adoption_basis"] == "actual_usage"
+    assert raw_path.resolve() in raw_paths
+    first_node_id = adopted[0]["work_node_id"]
+    assert str(first_node_id).startswith("sha256:")
+    assert (
+        resumed_ledger.remaining_mandatory_interaction_holds()[
+            "exact_event_group:closing"
+        ]
+        == 0
+    )
+    assert resumed_ledger.committed_interactions == 1
+
+    _, second_handle = dispatch_paid_interaction(
+        client=client,
+        request={"model": "gemini-3.6-flash", "input": []},
+        request_record={"semantic_request": "different-window"},
+        journal_dir=tmp_path / "picture" / "opaque-directory",
+        estimate=estimate,
+        budget_ledger=first_ledger,
+    )
+    second_journal = json.loads(
+        second_handle.journal_path.read_text(encoding="utf-8")
+    )
+    assert second_journal["work_node_id"] != first_node_id

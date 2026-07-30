@@ -21,7 +21,7 @@ from .autonomous_policy import (
 )
 from .billing import (
     BudgetLedger,
-    adopt_paid_dispatch_journals,
+    adopt_paid_dispatch_journal_state,
     estimate_paid_call,
     summarize_usage_and_list_price,
 )
@@ -96,6 +96,15 @@ class DeliveryPipelineBlocked(RuntimeError):
     """The pipeline preserved review artifacts but cannot continue safely."""
 
 
+def _maximum_full_final_qa_calls(policy: AutonomousEditPolicy) -> int:
+    """Reserve every policy-reachable QA pass independently per aspect."""
+
+    return (
+        len(policy.requested_aspects)
+        * policy.budget.max_final_qa_passes
+    )
+
+
 def _mandatory_paid_stage_minimums(
     *,
     policy: AutonomousEditPolicy,
@@ -106,12 +115,15 @@ def _mandatory_paid_stage_minimums(
     minimums = {
         # Reserve both allowed QA passes. The second remains unused unless a
         # bounded repair is actually necessary.
-        "final_qa": policy.budget.max_final_qa_passes,
+        "final_qa": _maximum_full_final_qa_calls(policy),
     }
     if editorial_beat_contracts_path is None:
         return minimums
     contracts = load_editorial_beat_contracts(
         editorial_beat_contracts_path.expanduser().resolve(strict=True)
+    )
+    hard_contracts = tuple(
+        contract for contract in contracts if contract.priority == "hard"
     )
     exact_event_features = {
         contract.feature_id
@@ -120,7 +132,97 @@ def _mandatory_paid_stage_minimums(
     }
     for feature_id in sorted(exact_event_features):
         minimums[f"exact_event_group:{feature_id}"] = 1
+    hard_grounding_features = {
+        contract.feature_id or contract.beat_id
+        for contract in hard_contracts
+        if contract.required_target_ids
+    }
+    for feature_id in sorted(hard_grounding_features):
+        minimums[f"multi_target_grounding:{feature_id}"] = 1
     return minimums
+
+
+def _mandatory_paid_stage_cost_holds(
+    *,
+    policy: AutonomousEditPolicy,
+    editorial_beat_contracts_path: Path | None,
+) -> dict[str, float]:
+    """Price the mandatory completion path before the first paid dispatch.
+
+    These are conservative admission ceilings, not forecasts.  Provider cache
+    hits are deliberately ignored.  Each configured cost hold has a matching
+    interaction hold so a completed node consumes both forms of escrow.
+    """
+
+    limits = policy.gemini_limits
+    holds: dict[str, float] = {}
+    qa_calls = _maximum_full_final_qa_calls(policy)
+    qa_estimate = estimate_paid_call(
+        stage="final_qa",
+        model_id=MODEL_ID,
+        media_duration_ms=policy.duration.max_ms,
+        media_resolution=policy.media_resolution.final_video_qa,
+        text_input_tokens=8_000,
+        max_output_tokens=limits.final_qa.max_output_tokens,
+        thinking_level=limits.final_qa.thinking_level,
+        retry_allowance=0,
+    )
+    holds["final_qa"] = round(
+        qa_estimate.worst_case_cost_usd * qa_calls,
+        8,
+    )
+    if editorial_beat_contracts_path is None:
+        return holds
+    contracts = load_editorial_beat_contracts(
+        editorial_beat_contracts_path.expanduser().resolve(strict=True)
+    )
+    hard_contracts = tuple(
+        contract for contract in contracts if contract.priority == "hard"
+    )
+    exact_event_features = {
+        contract.feature_id
+        for contract in contracts
+        if contract.visual_events
+    }
+    for feature_id in sorted(exact_event_features):
+        estimate = estimate_paid_call(
+            stage=f"exact_event_group:{feature_id}",
+            model_id=MODEL_ID,
+            media_resolution=policy.media_resolution.exact_event_image,
+            image_count=12,
+            text_input_tokens=4_000,
+            max_output_tokens=limits.exact_event_group.max_output_tokens,
+            thinking_level=limits.exact_event_group.thinking_level,
+            retry_allowance=0,
+        )
+        holds[estimate.stage] = estimate.worst_case_cost_usd
+    hard_grounding_features = {
+        contract.feature_id or contract.beat_id
+        for contract in hard_contracts
+        if contract.required_target_ids
+    }
+    if hard_grounding_features:
+        grounding_estimate = estimate_paid_call(
+            stage="multi_target_grounding",
+            model_id=MODEL_ID,
+            media_resolution=(
+                policy.media_resolution.exact_frame_grounding_image
+            ),
+            image_count=1,
+            text_input_tokens=4_000,
+            max_output_tokens=(
+                limits.multi_target_grounding.max_output_tokens
+            ),
+            thinking_level=(
+                limits.multi_target_grounding.thinking_level
+            ),
+            retry_allowance=0,
+        )
+        for feature_id in sorted(hard_grounding_features):
+            holds[f"multi_target_grounding:{feature_id}"] = (
+                grounding_estimate.worst_case_cost_usd
+            )
+    return holds
 
 
 def _prepared_clip_card_library_root(
@@ -2075,6 +2177,15 @@ def run_feature_delivery_pipeline(
             raise DeliveryPipelineBlocked(
                 "execution profile does not match the autonomous policy"
             )
+        if (
+            policy.budget.max_semantic_replans > 0
+            and autonomous_repair_executor is None
+        ):
+            raise DeliveryPipelineBlocked(
+                "policy authorizes a scoped semantic replan, but this run has "
+                "no bounded semantic-replan executor; disable semantic replan "
+                "or supply the executor before any paid dispatch"
+            )
         requested = set(policy.requested_aspects)
         aspect_argument = str(feature_cut_kwargs.get("aspect", "both"))
         expected_aspects = (
@@ -2100,137 +2211,63 @@ def run_feature_delivery_pipeline(
         budget_ledger = BudgetLedger(
             max_cost_usd=effective_cap,
             max_interactions=policy.budget.max_paid_interactions,
+            # This is a circuit-breaker margin, not callable work. It keeps
+            # the frozen mandatory frontier below the policy's absolute cap
+            # even when a provider dispatch becomes ambiguous.
+            interaction_guard=2,
             reserved_recovery_fraction=(
                 policy.budget.reserved_recovery_fraction
             ),
             mandatory_stage_minimums=_mandatory_paid_stage_minimums(
                 policy=policy,
-                editorial_beat_contracts_path=(
-                    editorial_beat_contracts_path
-                    if (
-                        autonomous_context_paths is None
-                        and autonomous_context_paths_by_aspect is None
-                    )
-                    else None
-                ),
+                editorial_beat_contracts_path=editorial_beat_contracts_path,
+            ),
+            mandatory_stage_cost_holds=_mandatory_paid_stage_cost_holds(
+                policy=policy,
+                editorial_beat_contracts_path=editorial_beat_contracts_path,
             ),
         )
-        prior_usage = summarize_usage_and_list_price(resolved_output)
-        policy_scoped_prior_requests = [
-            request
-            for request in prior_usage["requests"]
-            if str(request["path"]).startswith(
-                (
-                    "cold-ingest/",
-                    "retrieval/",
-                    "picture/",
-                    "aspects/",
-                    "audition/",
-                )
-            )
-        ]
-        for request in policy_scoped_prior_requests:
-            saved_path = str(request["path"])
-            saved_parts = Path(saved_path).parts
-            exact_feature = (
-                saved_parts[saved_parts.index("exact-events") + 1]
-                if (
-                    "exact-events" in saved_parts
-                    and saved_parts.index("exact-events") + 1
-                    < len(saved_parts)
-                )
-                else None
-            )
-            resumed_stage = (
-                f"exact_event_group:{exact_feature}"
-                if (
-                    "exact_event_group" in Path(saved_path).name
-                    and exact_feature is not None
-                )
-                else (
-                    "final_qa"
-                    if "final" in saved_path and "qa" in saved_path
-                    else "resumed_artifact"
-                )
-            )
-            budget_ledger.adopt_reconciled_usage(
-                stage=resumed_stage,
-                model_id=str(request["model"]),
-                usage={
-                    "total_input_tokens": request["input_tokens"],
-                    "total_cached_tokens": request[
-                        "cached_input_tokens"
-                    ],
-                    "total_output_tokens": request["output_tokens"],
-                    "total_thought_tokens": request["thought_tokens"],
-                },
-            )
-        conservative_dispatches: list[dict[str, Any]] = []
-        for orchestration_path in resolved_output.rglob(
-            "orchestration.json"
-        ):
-            relative = orchestration_path.relative_to(resolved_output)
-            if not relative.parts or relative.parts[0] not in {
-                "cold-ingest",
-                "retrieval",
-                "picture",
-                "aspects",
-                "audition",
-            }:
-                continue
-            orchestration = read_json(orchestration_path)
-            usage = (
-                orchestration.get("usage")
-                if isinstance(orchestration, Mapping)
-                else None
-            )
-            if (
-                not isinstance(usage, Mapping)
-                or usage.get("conservative_reconciliation") is not True
-            ):
-                continue
-            conservative_dispatches.append(
-                {
-                    "path": str(relative),
-                    "stage": str(
-                        orchestration.get("stage")
-                        or "resumed_conservative_dispatch"
-                    ),
-                    "usage": dict(usage),
-                }
-            )
-            budget_ledger.adopt_reconciled_usage(
-                stage=str(
-                    orchestration.get("stage")
-                    or "resumed_conservative_dispatch"
-                ),
-                model_id=MODEL_ID,
-                usage={
-                    "total_input_tokens": int(
-                        usage["total_input_tokens"]
-                    ),
-                    "total_cached_tokens": int(
-                        usage.get("total_cached_input_tokens") or 0
-                    ),
-                    "total_output_tokens": int(
-                        usage["total_output_tokens"]
-                    ),
-                    "total_thought_tokens": int(
-                        usage["total_thought_tokens"]
-                    ),
-                },
-            )
-        adopted_dispatch_journals = adopt_paid_dispatch_journals(
+        # Cold Clip Card ingest has its own budget namespace. Warm edit resume
+        # adopts only stable node journals and never infers a stage from a
+        # directory or filename.
+        warm_paid_namespaces = {
+            "retrieval",
+            "picture",
+            "aspects",
+            "audition",
+        }
+        (
+            adopted_dispatch_journals,
+            journaled_raw_paths,
+        ) = adopt_paid_dispatch_journal_state(
             budget_ledger=budget_ledger,
             root=resolved_output,
-            allowed_top_level={
-                "cold-ingest",
-                "retrieval",
-                "picture",
-                "aspects",
-                "audition",
-            },
+            allowed_top_level=warm_paid_namespaces,
         )
+        conservative_dispatches = [
+            node
+            for node in adopted_dispatch_journals
+            if node["adoption_basis"] == "conservative_worst_case"
+        ]
+        unjournaled_warm_paid_artifacts = [
+            path
+            for path in resolved_output.rglob("*raw_interaction.json")
+            if (
+                path.relative_to(resolved_output).parts
+                and path.relative_to(resolved_output).parts[0]
+                in warm_paid_namespaces
+                and path.resolve() not in journaled_raw_paths
+            )
+        ]
+        if unjournaled_warm_paid_artifacts:
+            raise DeliveryPipelineBlocked(
+                "warm-run paid artifacts lack stable dispatch-node journals: "
+                + ", ".join(
+                    str(path.relative_to(resolved_output))
+                    for path in unjournaled_warm_paid_artifacts[:5]
+                )
+            )
+        prior_usage = summarize_usage_and_list_price(resolved_output)
         required_context_keys = {
             "editorial_beat_contracts",
             "music_map",
@@ -2238,7 +2275,9 @@ def run_feature_delivery_pipeline(
             "exact_event_locks",
             "sequence_optimization",
             "reuse_degradation",
+            "resolved_timeline",
         }
+        optional_context_keys: set[str] = set()
         if (
             autonomous_context_paths is not None
             and autonomous_context_paths_by_aspect is not None
@@ -2272,7 +2311,13 @@ def run_feature_delivery_pipeline(
             for aspect_key, supplied_paths in (
                 autonomous_context_paths_by_aspect.items()
             ):
-                if set(supplied_paths) != required_context_keys:
+                supplied_keys = set(supplied_paths)
+                if (
+                    not required_context_keys.issubset(supplied_keys)
+                    or supplied_keys
+                    - required_context_keys
+                    - optional_context_keys
+                ):
                     raise DeliveryPipelineBlocked(
                         f"{aspect_key} autonomous final-QA context keys are "
                         "incomplete or unknown"
@@ -2307,7 +2352,13 @@ def run_feature_delivery_pipeline(
                     resolved_paths
                 )
         elif autonomous_context_paths is not None:
-            if set(autonomous_context_paths) != required_context_keys:
+            supplied_keys = set(autonomous_context_paths)
+            if (
+                not required_context_keys.issubset(supplied_keys)
+                or supplied_keys
+                - required_context_keys
+                - optional_context_keys
+            ):
                 raise DeliveryPipelineBlocked(
                     "autonomous final-QA context keys are incomplete or unknown"
                 )
@@ -2435,9 +2486,9 @@ def run_feature_delivery_pipeline(
                 "policy_reference": policy.policy_reference,
                 "requested_aspects": list(policy.requested_aspects),
                 "budget": budget_ledger.report(),
-                "prior_usage_scope": {
-                    "included_policy_scoped_requests": len(
-                        policy_scoped_prior_requests
+                    "prior_usage_scope": {
+                        "included_policy_scoped_requests": len(
+                            adopted_dispatch_journals
                     ),
                     "included_conservative_dispatches": len(
                         conservative_dispatches
@@ -2445,15 +2496,15 @@ def run_feature_delivery_pipeline(
                     "included_non_subprocess_dispatch_journals": len(
                         adopted_dispatch_journals
                     ),
-                    "excluded_pre_policy_requests": (
-                        prior_usage["request_count"]
-                        - len(policy_scoped_prior_requests)
-                    ),
-                    "interpretation": (
-                        "only cold-ingest calls created before the policy-bound "
-                        "direct edit are reported separately; policy-bound "
-                        "retrieval is included and cannot be reset on resume"
-                    ),
+                        "excluded_pre_policy_requests": (
+                            prior_usage["request_count"]
+                            - len(journaled_raw_paths)
+                        ),
+                        "interpretation": (
+                            "warm edit usage is adopted only from stable dispatch "
+                            "journals; cold ingest remains a separate budget "
+                            "namespace"
+                        ),
                 },
                 "autonomous_context_paths": {
                     key: str(path)
@@ -2704,9 +2755,17 @@ def run_feature_delivery_pipeline(
                 for aspect_key, raw_paths in (
                     generated_context_by_aspect.items()
                 ):
+                    raw_keys = (
+                        set(raw_paths)
+                        if isinstance(raw_paths, Mapping)
+                        else set()
+                    )
                     if (
                         not isinstance(raw_paths, Mapping)
-                        or set(raw_paths) != required_context_keys
+                        or not required_context_keys.issubset(raw_keys)
+                        or raw_keys
+                        - required_context_keys
+                        - optional_context_keys
                     ):
                         raise DeliveryPipelineBlocked(
                             f"generated {aspect_key} autonomous context is "
@@ -2737,7 +2796,13 @@ def run_feature_delivery_pipeline(
                         "multi-aspect feature-cut must persist independently "
                         "bound per-aspect context"
                     )
-                if set(generated_context) != required_context_keys:
+                generated_keys = set(generated_context)
+                if (
+                    not required_context_keys.issubset(generated_keys)
+                    or generated_keys
+                    - required_context_keys
+                    - optional_context_keys
+                ):
                     raise DeliveryPipelineBlocked(
                         "generated autonomous context is incomplete"
                     )
@@ -2915,6 +2980,45 @@ def run_feature_delivery_pipeline(
                 if music_timeline_path.is_file()
                 else None
             )
+            resolved_timeline_path = (
+                resolved_autonomous_context_by_aspect
+                .get(aspect_ratio, {})
+                .get("resolved_timeline")
+            )
+            resolved_timeline_sha256 = (
+                sha256_file(resolved_timeline_path)
+                if resolved_timeline_path is not None
+                and resolved_timeline_path.is_file()
+                else None
+            )
+            if expected_timeline is not None:
+                expected_plan = expected_timeline.get(
+                    "plan_definition",
+                    {},
+                )
+                sample_rate = int(
+                    expected_plan.get("master_sample_rate") or 0
+                )
+                output_samples = int(
+                    expected_plan.get("output_duration_samples") or 0
+                )
+                planned_music_duration_ms = (
+                    round(output_samples * 1000 / sample_rate)
+                    if sample_rate > 0 and output_samples > 0
+                    else -1
+                )
+                if (
+                    planned_music_duration_ms < 0
+                    or abs(
+                        planned_music_duration_ms
+                        - picture_duration_ms
+                    )
+                    > 100
+                ):
+                    # Runtime substitutions changed the authoritative picture
+                    # duration. Re-plan locally from the locked MusicMap rather
+                    # than reusing a stale planned-duration soundtrack.
+                    expected_timeline = None
             aspect_dir = resolved_output / (
                 "audition" if deterministic_failure_codes else "aspects"
             ) / aspect_key
@@ -2936,6 +3040,12 @@ def run_feature_delivery_pipeline(
                         sha256_file(music_timeline_path)
                         if expected_timeline
                         else "unplanned"
+                    )
+                    + ":"
+                    + (
+                        resolved_timeline_sha256
+                        if resolved_timeline_sha256 is not None
+                        else "no-resolved-timeline"
                     )
                 ).encode("utf-8")
             ).hexdigest()
@@ -2962,6 +3072,15 @@ def run_feature_delivery_pipeline(
                             render_manifest_path
                         ),
                         "audio_policy": "explicitly_absent",
+                        **(
+                            {
+                                "resolved_timeline_sha256": (
+                                    resolved_timeline_sha256
+                                )
+                            }
+                            if resolved_timeline_sha256 is not None
+                            else {}
+                        ),
                     },
                 )
             elif expected_timeline is not None:
@@ -3060,6 +3179,15 @@ def run_feature_delivery_pipeline(
                         ),
                         "music_map_lock_sha256": sha256_file(
                             resolved_lock_path
+                        ),
+                        **(
+                            {
+                                "resolved_timeline_sha256": (
+                                    resolved_timeline_sha256
+                                )
+                            }
+                            if resolved_timeline_sha256 is not None
+                            else {}
                         ),
                     },
                 )
@@ -3230,7 +3358,7 @@ def run_feature_delivery_pipeline(
             if (
                 policy is not None
                 and autonomous_final_qa_calls_completed
-                >= policy.budget.max_final_qa_passes
+                >= _maximum_full_final_qa_calls(policy)
             ):
                 raise DeliveryPipelineBlocked(
                     "run-global full final QA pass limit reached before "
@@ -3282,7 +3410,7 @@ def run_feature_delivery_pipeline(
                 remaining_followup_slots = (
                     _remaining_run_global_followup_qa_slots(
                         maximum_full_final_qa_calls=(
-                            policy.budget.max_final_qa_passes
+                            _maximum_full_final_qa_calls(policy)
                         ),
                         completed_full_final_qa_calls=(
                             autonomous_final_qa_calls_completed
@@ -3320,7 +3448,7 @@ def run_feature_delivery_pipeline(
                                 - autonomous_initial_aspects_started
                             ),
                             "maximum_full_final_qa_calls": (
-                                policy.budget.max_final_qa_passes
+                                _maximum_full_final_qa_calls(policy)
                             ),
                             "semantic_replans_used": (
                                 autonomous_semantic_replans_used
@@ -3677,7 +3805,7 @@ def run_feature_delivery_pipeline(
                     )
                     if (
                         autonomous_final_qa_calls_completed
-                        >= policy.budget.max_final_qa_passes
+                        >= _maximum_full_final_qa_calls(policy)
                     ):
                         raise DeliveryPipelineBlocked(
                             "run-global full final QA pass limit reached "
@@ -4052,7 +4180,7 @@ def run_feature_delivery_pipeline(
                         autonomous_final_qa_calls_completed
                     ),
                     "max_full_final_qa_calls": (
-                        policy.budget.max_final_qa_passes
+                        _maximum_full_final_qa_calls(policy)
                     ),
                     "semantic_replans_used": (
                         autonomous_semantic_replans_used

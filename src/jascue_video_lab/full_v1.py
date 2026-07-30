@@ -8,7 +8,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import Any, Mapping
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -408,6 +408,11 @@ def dense_window_for_event(
     return start, end, shot.shot_id
 
 
+FULL_CLIP_CARD_REQUEST_SEMANTIC_VERSION = "base-clip-card-request-v2"
+FULL_CLIP_CARD_PARSER_REVISION = "full-clip-card-pydantic-v2"
+FULL_CLIP_CARD_NORMALIZER_REVISION = "visual-evidence-language-v2"
+
+
 def current_full_clip_card_cache_key(
     *,
     prompt: str,
@@ -429,6 +434,11 @@ def current_full_clip_card_cache_key(
         "media_resolution": "low",
         "thinking_level": "low",
         "max_output_tokens": 4_096,
+        "request_semantic_version": (
+            FULL_CLIP_CARD_REQUEST_SEMANTIC_VERSION
+        ),
+        "parser_revision": FULL_CLIP_CARD_PARSER_REVISION,
+        "normalizer_revision": FULL_CLIP_CARD_NORMALIZER_REVISION,
     }
     if source_asset_id is not None:
         key["source_asset_id"] = source_asset_id
@@ -443,13 +453,49 @@ def _cache_fingerprint(prompt: str) -> dict[str, Any]:
     return current_full_clip_card_cache_key(prompt=prompt)
 
 
-def _saved_request_matches_prompt(run_dir: Path, prompt: str) -> bool:
+def _saved_request_matches_prompt(
+    run_dir: Path,
+    prompt: str,
+    *,
+    source_asset_id: str | None = None,
+    proxy_asset_id: str | None = None,
+    duration_ms: int | None = None,
+) -> bool:
     request_path = run_dir / "clip_card.request.json"
     if not request_path.exists():
         return False
     try:
         request = read_json(request_path)
         request_inputs = request["input"]
+        request_text = str(request_inputs[0].get("text", ""))
+        metadata_prefix = prompt + "\n\n## 本次不可變 metadata\n"
+        expected_metadata = tuple(
+            value
+            for value in (
+                (
+                    f"source_asset_id 必須原樣回傳：{source_asset_id}\n"
+                    if source_asset_id is not None
+                    else None
+                ),
+                (
+                    f"proxy_asset_id 必須原樣回傳：{proxy_asset_id}\n"
+                    if proxy_asset_id is not None
+                    else None
+                ),
+                (
+                    f"duration_ms 必須原樣回傳：{duration_ms}\n"
+                    if duration_ms is not None
+                    else None
+                ),
+            )
+            if value is not None
+        )
+        video_inputs = [
+            item
+            for item in request_inputs
+            if isinstance(item, dict) and item.get("type") == "video"
+        ]
+        expected_schema = gemini_response_schema(FullClipCard)
         return bool(
             request.get("model") == MODEL_ID
             and request.get("system_instruction") == VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
@@ -459,7 +505,16 @@ def _saved_request_matches_prompt(run_dir: Path, prompt: str) -> bool:
                 "max_output_tokens": 4_096,
             }
             and request_inputs
-            and request_inputs[0].get("text", "").startswith(prompt)
+            and request_text.startswith(metadata_prefix)
+            and all(value in request_text for value in expected_metadata)
+            and len(video_inputs) == 1
+            and video_inputs[0].get("media_resolution") == "low"
+            and request.get("response_format")
+            == {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": expected_schema,
+            }
         )
     except (KeyError, TypeError, ValueError):
         return False
@@ -471,9 +526,30 @@ def _revalidate_saved_clip_card(
     proxy_asset_id: str,
     duration_ms: int,
     prompt: str,
+    expected_cache_key: Mapping[str, Any] | None = None,
 ) -> FullClipCard | None:
+    resolved_cache_key = dict(
+        expected_cache_key
+        or current_full_clip_card_cache_key(
+            prompt=prompt,
+            source_asset_id=source_asset_id,
+            proxy_asset_id=proxy_asset_id,
+        )
+    )
     raw_output_path = run_dir / "clip_card.raw_output.json"
-    if not raw_output_path.exists() or not _saved_request_matches_prompt(run_dir, prompt):
+    cache_key_path = run_dir / "cache-key.json"
+    if (
+        not raw_output_path.exists()
+        or not cache_key_path.exists()
+        or read_json(cache_key_path) != resolved_cache_key
+        or not _saved_request_matches_prompt(
+            run_dir,
+            prompt,
+            source_asset_id=source_asset_id,
+            proxy_asset_id=proxy_asset_id,
+            duration_ms=duration_ms,
+        )
+    ):
         return None
     try:
         raw_output = read_json(raw_output_path)
@@ -746,7 +822,13 @@ def run_full_clip(
             card_path.exists()
             and cache_path.exists()
             and read_json(cache_path) == cache_key
-            and _saved_request_matches_prompt(run_dir, clip_card_prompt)
+            and _saved_request_matches_prompt(
+                run_dir,
+                clip_card_prompt,
+                source_asset_id=source_media.asset_id,
+                proxy_asset_id=proxy_media.asset_id,
+                duration_ms=source_media.duration_ms,
+            )
         ):
             card = FullClipCard.model_validate(read_json(card_path))
             card_reused = True
@@ -757,6 +839,7 @@ def run_full_clip(
                 proxy_media.asset_id,
                 source_media.duration_ms,
                 clip_card_prompt,
+                cache_key,
             )
             if card is None:
                 stage = monotonic()

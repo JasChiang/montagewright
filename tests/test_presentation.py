@@ -39,6 +39,7 @@ from jascue_video_lab.presentation import (
     SceneFacts,
     SourceCameraMotionEvidence,
     _vertical_intentional_freeze_filter,
+    assess_prepaid_presentation_feasibility,
     choose_two_panel_layout,
     compile_intentional_freeze,
     compile_minimal_camera_motion,
@@ -64,6 +65,57 @@ def _policy() -> AutonomousEditPolicy:
             max_gemini_cost_usd=1.25,
             max_paid_interactions=25,
         ),
+    )
+
+
+def test_prepaid_feasibility_keeps_geometry_unknown_until_evidence() -> None:
+    lattice = assess_prepaid_presentation_feasibility(
+        candidate_id="candidate-a",
+        aspect_suitability="reconstructable",
+        relation_mode="simultaneous_relation",
+        hard_region_count=2,
+        has_virtual_camera_proposal=True,
+        physical_scale_comparison=True,
+        has_atomic_or_text_region=False,
+        policy=_policy(),
+    )
+
+    assert (
+        lattice.assessment("static_full_bleed_crop").status
+        == "needs_bbox"
+    )
+    assert (
+        lattice.assessment("tracked_full_bleed_crop").status
+        == "needs_sam"
+    )
+    assert (
+        lattice.assessment("two_panel_layout").status
+        == "needs_exact_event"
+    )
+    assert (
+        lattice.assessment("solid_matte_fit").status
+        == "known_feasible"
+    )
+
+
+def test_prepaid_feasibility_rejects_every_mode_for_unsuitable_take() -> None:
+    lattice = assess_prepaid_presentation_feasibility(
+        candidate_id="candidate-b",
+        aspect_suitability="unsuitable",
+        relation_mode="single_subject",
+        hard_region_count=1,
+        has_virtual_camera_proposal=False,
+        physical_scale_comparison=False,
+        has_atomic_or_text_region=False,
+        policy=_policy(),
+    )
+
+    assert {
+        assessment.status for assessment in lattice.modes
+    } == {"known_infeasible"}
+    assert all(
+        assessment.reason_codes == ("aspect_declared_unsuitable",)
+        for assessment in lattice.modes
     )
 
 

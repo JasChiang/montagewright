@@ -56,6 +56,7 @@ class CandidateRouteOption(FrozenStrictModel):
     exit_composition: str = Field(default="unresolved", min_length=1)
     technical_quality: float = Field(default=0.5, ge=0.0, le=1.0)
     preflight_hard_failures: tuple[str, ...] = ()
+    preflight_deferred_gates: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_editorial_bounds(self) -> "CandidateRouteOption":
@@ -296,6 +297,76 @@ class RuntimeSequenceTimingReconciliation(FrozenStrictModel):
         if self.outcome != "blocked" and self.failure_codes:
             raise ValueError("successful runtime reconciliation has failures")
         return self
+
+
+class ResolvedTimelineV1(FrozenStrictModel):
+    """Per-aspect project-time authority after rendered durations are probed."""
+
+    contract_version: Literal["resolved-timeline-v1"] = "resolved-timeline-v1"
+    aspect: Literal["16:9", "9:16"]
+    reconciliation_input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    resolved_total_duration_ms: int = Field(ge=0)
+    segments: tuple[ReconciledRuntimeSegmentTiming, ...]
+    music_output_timeline_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_definition(self) -> "ResolvedTimelineV1":
+        payload = self.model_dump(mode="json", exclude={"definition_sha256"})
+        expected = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if self.definition_sha256 != expected:
+            raise ValueError("resolved timeline definition hash is inconsistent")
+        if (
+            sum(segment.resolved_duration_ms for segment in self.segments)
+            != self.resolved_total_duration_ms
+        ):
+            raise ValueError("resolved timeline total differs from its segments")
+        return self
+
+
+def build_resolved_timeline(
+    *,
+    aspect: Literal["16:9", "9:16"],
+    reconciliation: RuntimeSequenceTimingReconciliation,
+    music_output_timeline_sha256: str | None = None,
+) -> ResolvedTimelineV1:
+    if reconciliation.outcome == "blocked":
+        raise ValueError("blocked reconciliation cannot become time authority")
+    payload = {
+        "contract_version": "resolved-timeline-v1",
+        "aspect": aspect,
+        "reconciliation_input_sha256": reconciliation.input_sha256,
+        "resolved_total_duration_ms": (
+            reconciliation.resolved_total_duration_ms
+        ),
+        "segments": [
+            segment.model_dump(mode="json")
+            for segment in reconciliation.segments
+        ],
+        "music_output_timeline_sha256": music_output_timeline_sha256,
+    }
+    definition_sha256 = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return ResolvedTimelineV1(
+        **payload,
+        definition_sha256=definition_sha256,
+    )
 
 
 def reconcile_runtime_sequence_timing(

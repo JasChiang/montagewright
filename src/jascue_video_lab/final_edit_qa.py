@@ -76,7 +76,9 @@ AUTONOMOUS_CONTEXT_KEYS = (
     "exact_event_locks",
     "sequence_optimization",
     "reuse_degradation",
+    "resolved_timeline",
 )
+AUTONOMOUS_OPTIONAL_CONTEXT_KEYS: tuple[str, ...] = ()
 
 _FIXED_SECONDS_RE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:秒|sec(?:ond)?s?)",
@@ -1217,14 +1219,25 @@ def prepare_final_edit_qa(
         )
         supplied = dict(autonomous_context_paths or {})
         missing = sorted(set(AUTONOMOUS_CONTEXT_KEYS) - set(supplied))
-        extras = sorted(set(supplied) - set(AUTONOMOUS_CONTEXT_KEYS))
+        allowed_context_keys = (
+            set(AUTONOMOUS_CONTEXT_KEYS)
+            | set(AUTONOMOUS_OPTIONAL_CONTEXT_KEYS)
+        )
+        extras = sorted(set(supplied) - allowed_context_keys)
         if missing or extras:
             raise ValueError(
                 "autonomous final QA context mismatch: "
                 f"missing={missing}, extras={extras}"
             )
         autonomous_context = {}
-        for key in AUTONOMOUS_CONTEXT_KEYS:
+        for key in (
+            *AUTONOMOUS_CONTEXT_KEYS,
+            *(
+                optional
+                for optional in AUTONOMOUS_OPTIONAL_CONTEXT_KEYS
+                if optional in supplied
+            ),
+        ):
             resolved = supplied[key].expanduser().resolve(strict=True)
             payload = read_json(resolved)
             if not isinstance(payload, (dict, list)):

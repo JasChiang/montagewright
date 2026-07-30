@@ -52,7 +52,10 @@ class DurationPolicy(FrozenStrictModel):
 class BudgetPolicy(FrozenStrictModel):
     max_gemini_cost_usd: float = Field(gt=0.0, le=100.0)
     max_paid_interactions: int = Field(ge=1, le=100)
-    max_semantic_replans: Literal[0, 1] = 1
+    # V1 production does not yet have a complete bounded semantic-replan
+    # executor. Keep the safe default disabled; a caller may explicitly grant
+    # one only when it also supplies that executor.
+    max_semantic_replans: Literal[0, 1] = 0
     max_final_qa_passes: int = Field(default=2, ge=1, le=2)
     reserved_recovery_fraction: float = Field(default=0.20, ge=0.20, le=0.50)
 

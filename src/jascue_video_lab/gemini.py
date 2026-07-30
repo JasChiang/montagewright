@@ -2351,6 +2351,7 @@ class GeminiLabClient:
         frame_path: Path,
         targets: Sequence[GroundingTargetRequest],
         output_dir: Path,
+        budget_stage: str = "multi_target_grounding",
     ) -> MultiTargetGroundingGroup:
         """Ground at most four targets in one exact original-aspect image call."""
 
@@ -2466,7 +2467,7 @@ class GeminiLabClient:
         )
         budget_ledger = getattr(self, "budget_ledger", None)
         estimate = estimate_paid_call(
-            stage="multi_target_grounding",
+            stage=budget_stage,
             model_id=self.model_id,
             media_resolution=media_resolution,
             image_count=1,

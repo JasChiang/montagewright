@@ -23,6 +23,8 @@ from jascue_video_lab.sequence_optimizer import (
     SegmentRenderRequest,
     SemanticRhythmSpec,
     SequenceOption,
+    ResolvedTimelineV1,
+    build_resolved_timeline,
     concat_manifest_lines,
     optimize_sequence,
     optimize_pre_render_candidate_route,
@@ -349,6 +351,42 @@ def test_runtime_reconciliation_accepts_shorter_sequence_when_gates_pass() -> No
     assert len(result.input_sha256) == 64
 
 
+def test_resolved_timeline_is_hash_bound_per_aspect() -> None:
+    reconciliation = reconcile_runtime_sequence_timing(
+        (
+            _runtime_timing(
+                "setup",
+                planned_duration_ms=7_587,
+                actual_duration_ms=6_973,
+            ),
+            _runtime_timing(
+                "closing",
+                planned_duration_ms=5_000,
+                actual_duration_ms=5_000,
+            ),
+        )
+    )
+
+    vertical = build_resolved_timeline(
+        aspect="9:16",
+        reconciliation=reconciliation,
+        music_output_timeline_sha256="a" * 64,
+    )
+    horizontal = build_resolved_timeline(
+        aspect="16:9",
+        reconciliation=reconciliation,
+        music_output_timeline_sha256="a" * 64,
+    )
+
+    assert vertical.resolved_total_duration_ms == 11_973
+    assert vertical.definition_sha256 != horizontal.definition_sha256
+    with pytest.raises(ValidationError, match="definition hash"):
+        ResolvedTimelineV1.model_validate(
+            {
+                **vertical.model_dump(mode="json"),
+                "definition_sha256": "f" * 64,
+            }
+        )
 def test_runtime_reconciliation_blocks_unreadable_shortfall_without_fill() -> None:
     segment = _runtime_timing(
         "result",

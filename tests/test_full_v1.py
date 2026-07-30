@@ -24,6 +24,7 @@ from jascue_video_lab.full_v1 import (
     create_dense_event_catalog,
     create_dense_window_catalog,
     create_shot_catalog,
+    current_full_clip_card_cache_key,
     dense_window_for_event,
     dense_sampling_fps,
     derive_clip_timeline,
@@ -64,6 +65,7 @@ from jascue_video_lab.query_refinement import (
     ResolvedDenseFrame,
     ResolvedQueryTemporalObservation,
 )
+from jascue_video_lab.schema import gemini_response_schema
 
 
 def _provenance(model_id: str = "gemini-3.5-flash") -> ModelProvenance:
@@ -971,12 +973,48 @@ def test_saved_raw_clip_card_can_be_revalidated_without_another_api_call(
             {
                 "model": MODEL_ID,
                 "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
-                "input": [{"type": "text", "text": prompt + "\nmetadata"}],
+                "input": [
+                    {
+                        "type": "text",
+                        "text": (
+                            prompt
+                            + "\n\n## 本次不可變 metadata\n"
+                            + "source_asset_id 必須原樣回傳："
+                            + card.source_asset_id
+                            + "\nproxy_asset_id 必須原樣回傳："
+                            + card.proxy_asset_id
+                            + "\nduration_ms 必須原樣回傳："
+                            + str(card.duration_ms)
+                            + "\n"
+                        ),
+                    },
+                    {
+                        "type": "video",
+                        "uri": "files/test",
+                        "mime_type": "video/mp4",
+                        "media_resolution": "low",
+                    },
+                ],
                 "generation_config": {
                     "thinking_level": "low",
                     "max_output_tokens": 4_096,
                 },
+                "response_format": {
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": gemini_response_schema(FullClipCard),
+                },
             }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "cache-key.json").write_text(
+        json.dumps(
+            current_full_clip_card_cache_key(
+                prompt=prompt,
+                source_asset_id=card.source_asset_id,
+                proxy_asset_id=card.proxy_asset_id,
+            )
         ),
         encoding="utf-8",
     )

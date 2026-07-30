@@ -174,6 +174,7 @@ from .overlay import draw_grounding_overlay
 from .presentation import (
     GroundingTargetRequest,
     MultiTargetGroundingGroup,
+    PresentationCapability,
     PresentationTarget,
     SourceCameraMotionEvidence,
     _signed_motion_reversal_count,
@@ -184,6 +185,7 @@ from .presentation import (
     _vertical_required_scope_fit_filter,
     compile_intentional_freeze,
     compile_presentation,
+    assess_prepaid_presentation_feasibility,
     measure_source_camera_motion,
     shared_sam_seeds_from_grounding,
     static_full_bleed_crop_filter,
@@ -226,6 +228,7 @@ from .sequence_optimizer import (
     SemanticRhythmSpec,
     SequenceOption,
     RuntimeSegmentTiming,
+    build_resolved_timeline,
     reconcile_runtime_sequence_timing,
     optimize_sequence,
     optimize_pre_render_candidate_route,
@@ -257,6 +260,68 @@ _CONTROLLED_PHASE_MIN_VISIBLE_FRACTION = 2 / 3
 _FEATURE_PLAN_BINDING_VERSION = "feature-plan-binding-v1"
 _EXTERNAL_PROJECTION_SIDECAR_VERSION = "external-feature-plan-projection-v1"
 _EXTERNAL_PROJECTION_POINTER_NAME = "feature-plan.external-projection.json"
+
+
+class CandidateKnownInfeasible(ValueError):
+    """A candidate-specific hard failure that may advance the frontier."""
+
+
+class FeatureCutSystemFailure(RuntimeError):
+    """A wiring, artifact, tool, or invariant failure that stops the run."""
+
+
+def _require_candidate_scoped_failure(error: Exception) -> None:
+    """Reject broad fallback for system/invariant failures.
+
+    Existing candidate solvers use ``ValueError`` for bounded infeasibility.
+    Anything else is treated as a run-level fault instead of silently buying
+    another candidate attempt.
+    """
+
+    if isinstance(error, ValueError):
+        return
+    raise FeatureCutSystemFailure(
+        "candidate execution raised a non-candidate system failure: "
+        f"{type(error).__name__}:{error}"
+    ) from error
+
+
+def _maskless_source_motion_preflight(
+    *,
+    source_path: Path,
+    source_asset_id: str,
+    window_start_ms: int,
+    window_end_ms: int,
+    output_dir: Path,
+) -> SourceCameraMotionEvidence:
+    """Measure high-confidence source defects before any paid geometry work.
+
+    Without foreground masks a large moving subject may make the estimate
+    unreliable.  That state remains unknown and proceeds to the masked
+    post-SAM pass.  Only reliable dirty edges or isolated camera jolts are
+    rejected here.
+    """
+
+    evidence = measure_source_camera_motion(
+        source_path=source_path,
+        source_asset_id=source_asset_id,
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
+        subject_tracks=(),
+        output_dir=output_dir,
+    )
+    if evidence.reliable and (
+        evidence.isolated_jolt_count > 0
+        or evidence.dirty_head
+        or evidence.dirty_tail
+    ):
+        raise CandidateKnownInfeasible(
+            "maskless source-motion preflight found an unresolved dirty "
+            "edge or isolated camera jolt"
+        )
+    return evidence
+
+
 _EXTERNAL_PROJECTION_CONTRACTS = {
     "clip-card-open-edit-v1": {
         "source": "validated open edit plan selected from Clip Card evidence",
@@ -1557,6 +1622,7 @@ def _chapter_bounds_with_approved_trim(
     expected_event_id: str | None = None,
     quality_maps: Sequence[tuple[Path, ShotQualityMap]] = (),
     minimum_duration_seconds: float | None = None,
+    fail_on_quality_human_review: bool = False,
 ) -> tuple[int, int, str, dict[str, Any]]:
     fallback_start, fallback_end, shot_id = _chapter_bounds(
         frame,
@@ -1616,6 +1682,10 @@ def _chapter_bounds_with_approved_trim(
             <= frame.requested_time_ms
             < interval.end_ms
             and interval.end_ms - interval.start_ms >= requested_ms
+            and (
+                not fail_on_quality_human_review
+                or not interval.requires_human_review
+            )
         ]
         if not containing:
             minimum_requested_ms = (
@@ -1632,6 +1702,10 @@ def _chapter_bounds_with_approved_trim(
                 < interval.end_ms
                 and interval.end_ms - interval.start_ms
                 >= minimum_requested_ms
+                and (
+                    not fail_on_quality_human_review
+                    or not interval.requires_human_review
+                )
             ]
             if not minimum_containing:
                 raise ValueError(
@@ -1712,6 +1786,14 @@ def _chapter_bounds_with_approved_trim(
             raise ValueError(
                 "approved trim crosses an unresolved hard/trim quality risk; "
                 "review the risk intent or revise the trim before rendering"
+            )
+        if (
+            fail_on_quality_human_review
+            and quality_interval.requires_human_review
+        ):
+            raise ValueError(
+                "autonomous strict cannot select a QualitySafeInterval whose "
+                "review risk has no deterministic resolution"
             )
     decision_payload = read_json(path) if path.is_file() else None
     auto_authorized = (
@@ -8835,6 +8917,9 @@ def _build_framing_region_tracks(
                             frame_path=Path(exact_frame.path),
                             targets=requests,
                             output_dir=group_dir,
+                            budget_stage=(
+                                f"multi_target_grounding:{feature_id}"
+                            ),
                         )
                     except BudgetExceeded:
                         if any(
@@ -12393,6 +12478,81 @@ def _pre_render_vertical_presentation_mode(
     }[candidate.presentation_preference]
 
 
+def _pre_render_vertical_feasibility(
+    candidate: FeatureVerticalCandidate,
+    *,
+    policy: AutonomousEditPolicy,
+) -> tuple[PresentationCapability, tuple[str, ...], tuple[str, ...]]:
+    """Select a policy-authorized family without laundering unknown geometry."""
+
+    relation_mode = _resolved_autonomous_relation_mode(
+        candidate.coverage_mode,
+        presentation_preference=candidate.presentation_preference,
+        panel_semantically_admissible=(
+            candidate.presentation_preference == "two_panel_layout"
+        ),
+    )
+    lattice = assess_prepaid_presentation_feasibility(
+        candidate_id=candidate.candidate_id,
+        aspect_suitability=candidate.aspect_suitability,
+        relation_mode=relation_mode,
+        hard_region_count=sum(
+            region.execution_role == "hard_core"
+            for region in candidate.regions
+        ),
+        has_virtual_camera_proposal=(
+            candidate.virtual_camera_proposal is not None
+        ),
+        physical_scale_comparison=candidate.physical_scale_comparison,
+        has_atomic_or_text_region=any(
+            region.atomic
+            or region.kind in {"text_region", "ui_region", "graphic"}
+            for region in candidate.regions
+        ),
+        policy=policy,
+    )
+    preferred = _pre_render_vertical_presentation_mode(
+        candidate,
+        policy=policy,
+    )
+    order: tuple[PresentationCapability, ...] = (
+        preferred,  # type: ignore[assignment]
+        "static_full_bleed_crop",
+        "tracked_full_bleed_crop",
+        "phase_virtual_camera",
+        "hard_cut_between_views",
+        "two_panel_layout",
+        "solid_matte_fit",
+    )
+    unique_order = tuple(dict.fromkeys(order))
+    selected = next(
+        (
+            mode
+            for mode in unique_order
+            if lattice.assessment(mode).status != "known_infeasible"
+        ),
+        preferred,
+    )
+    assessment = lattice.assessment(selected)  # type: ignore[arg-type]
+    if assessment.status == "known_infeasible":
+        hard_failures = tuple(
+            dict.fromkeys(
+                reason
+                for mode in lattice.modes
+                for reason in mode.reason_codes
+            )
+        )
+        return selected, hard_failures, ()
+    return (
+        selected,
+        (),
+        tuple(
+            f"{selected}:{assessment.status}:{reason}"
+            for reason in assessment.reason_codes
+        ),
+    )
+
+
 def _build_pre_render_vertical_candidate_route(
     plan: FeatureEditPlan,
     *,
@@ -12431,6 +12591,13 @@ def _build_pre_render_vertical_candidate_route(
         trim_duration_ms = round(
             chapter_durations[chapter.feature_id] * 1000
         )
+        candidate_feasibility = {
+            candidate.candidate_id: _pre_render_vertical_feasibility(
+                candidate,
+                policy=policy,
+            )
+            for candidate in chapter.vertical_candidates
+        }
         beats.append(
             CandidateRouteBeat(
                 beat_id=chapter.feature_id,
@@ -12443,10 +12610,7 @@ def _build_pre_render_vertical_candidate_route(
                         planner_rank=candidate.rank,
                         semantic_confidence=float(candidate.confidence),
                         presentation_intrusion_rank=intrusion_rank[
-                            _pre_render_vertical_presentation_mode(
-                                candidate,
-                                policy=policy,
-                            )
+                            candidate_feasibility[candidate.candidate_id][0]
                         ],
                         trim_duration_ms=trim_duration_ms,
                         minimum_readable_ms=round(
@@ -12463,10 +12627,9 @@ def _build_pre_render_vertical_candidate_route(
                             "cue_aligned"
                         ],
                         presentation_mode=(
-                            _pre_render_vertical_presentation_mode(
-                                candidate,
-                                policy=policy,
-                            )
+                            candidate_feasibility[
+                                candidate.candidate_id
+                            ][0]
                         ),
                         entry_composition=(
                             _vertical_candidate_composition_signature(
@@ -12485,9 +12648,14 @@ def _build_pre_render_vertical_candidate_route(
                             1.0 - len(candidate.quality_risks) * 0.06,
                         ),
                         preflight_hard_failures=(
-                            ("aspect_declared_unsuitable",)
-                            if candidate.aspect_suitability == "unsuitable"
-                            else ()
+                            candidate_feasibility[
+                                candidate.candidate_id
+                            ][1]
+                        ),
+                        preflight_deferred_gates=(
+                            candidate_feasibility[
+                                candidate.candidate_id
+                            ][2]
                         ),
                     )
                     for candidate in chapter.vertical_candidates
@@ -13446,6 +13614,7 @@ def _prepare_horizontal_runtime_candidate(
     sam_analysis_fps: float,
     model_request_block_reason: str | None,
     audit_source_motion: bool = False,
+    fail_on_quality_human_review: bool = False,
     compile_geometry: bool = True,
     immutable_window: Mapping[str, Any] | None = None,
     grounding_frame: RushFrame | None = None,
@@ -13474,6 +13643,9 @@ def _prepare_horizontal_runtime_candidate(
                     str(option["event_id"]) if option.get("event_id") else None
                 ),
                 quality_maps=shot_quality_maps,
+                fail_on_quality_human_review=(
+                    fail_on_quality_human_review
+                ),
             )
         )
     else:
@@ -18547,12 +18719,49 @@ def _run_feature_cut_experiment_impl(
                                         gemini_geometry_block_reason
                                     ),
                                     audit_source_motion=False,
+                                    fail_on_quality_human_review=(
+                                        autonomous_policy is not None
+                                        and str(
+                                            autonomous_policy.execution_profile
+                                        )
+                                        == "autonomous_strict"
+                                    ),
                                     compile_geometry=not autonomous_profile,
                                 )
                             )
                             if autonomous_profile:
                                 assert autonomous_policy is not None
                                 assert editorial_beat_contracts_path is not None
+                                maskless_motion = (
+                                    _maskless_source_motion_preflight(
+                                        source_path=Path(
+                                            candidate_window["clip"].path
+                                        ),
+                                        source_asset_id=(
+                                            candidate_window["media"].asset_id
+                                        ),
+                                        window_start_ms=int(
+                                            candidate_window["start_ms"]
+                                        ),
+                                        window_end_ms=int(
+                                            candidate_window["end_ms"]
+                                        ),
+                                        output_dir=(
+                                            output_dir
+                                            / "candidate-preflight"
+                                            / selected.feature_id
+                                            / str(
+                                                horizontal_option[
+                                                    "candidate_id"
+                                                ]
+                                            )
+                                            / "source-camera-motion"
+                                        ),
+                                    )
+                                )
+                                candidate_window[
+                                    "maskless_source_camera_motion"
+                                ] = maskless_motion.model_dump(mode="json")
                                 candidate_exact_resolution = (
                                     _resolve_horizontal_grouped_exact_event_locks(
                                         client=client,
@@ -18708,6 +18917,12 @@ def _run_feature_cut_experiment_impl(
                                             gemini_geometry_block_reason
                                         ),
                                         audit_source_motion=True,
+                                        fail_on_quality_human_review=(
+                                            str(
+                                                autonomous_policy.execution_profile
+                                            )
+                                            == "autonomous_strict"
+                                        ),
                                         immutable_window={
                                             "start_ms": candidate_window[
                                                 "start_ms"
@@ -18730,6 +18945,7 @@ def _run_feature_cut_experiment_impl(
                                 prepared_horizontal = candidate_window
                         except Exception as error:
                             abort_for_geometry_quota(error)
+                            _require_candidate_scoped_failure(error)
                             horizontal_candidate_attempts.append(
                                 {
                                     "candidate_id": horizontal_option.get(
@@ -19204,6 +19420,13 @@ def _run_feature_cut_experiment_impl(
                                 )
                                 else None
                             ),
+                            fail_on_quality_human_review=(
+                                autonomous_policy is not None
+                                and str(
+                                    autonomous_policy.execution_profile
+                                )
+                                == "autonomous_strict"
+                            ),
                         )
                         reuse_violation = _runtime_candidate_reuse_violation(
                             selected,
@@ -19247,8 +19470,23 @@ def _run_feature_cut_experiment_impl(
                                 }
                             )
                             continue
+                        if autonomous_profile:
+                            _maskless_source_motion_preflight(
+                                source_path=Path(candidate_clip.path),
+                                source_asset_id=candidate_media.asset_id,
+                                window_start_ms=candidate_start,
+                                window_end_ms=candidate_end,
+                                output_dir=(
+                                    output_dir
+                                    / "candidate-preflight"
+                                    / selected.feature_id
+                                    / candidate_id
+                                    / "source-camera-motion"
+                                ),
+                            )
                     except Exception as error:
                         abort_for_geometry_quota(error)
+                        _require_candidate_scoped_failure(error)
                         candidate_attempts.append(
                             {
                                 "candidate_id": candidate_id,
@@ -19308,6 +19546,7 @@ def _run_feature_cut_experiment_impl(
                             )
                         except Exception as error:
                             abort_for_geometry_quota(error)
+                            _require_candidate_scoped_failure(error)
                             failure_codes = _failure_codes_from_geometry_error(
                                 error
                             )
@@ -20510,6 +20749,7 @@ def _run_feature_cut_experiment_impl(
                             break
                     except Exception as error:
                         abort_for_geometry_quota(error)
+                        _require_candidate_scoped_failure(error)
                         failure_codes = _failure_codes_from_geometry_error(error)
                         (
                             candidate_acceptable_capability_ids,
@@ -22198,7 +22438,16 @@ def _run_feature_cut_experiment_impl(
                             if planned_timing is not None
                             else actual_duration_ms
                         ),
-                        actual_source_capacity_ms=actual_duration_ms,
+                        actual_source_capacity_ms=max(
+                            actual_duration_ms,
+                            round(
+                                source_capacity_seconds.get(
+                                    feature_id,
+                                    actual_duration_ms / 1000,
+                                )
+                                * 1000
+                            ),
+                        ),
                         actual_duration_ms=actual_duration_ms,
                         minimum_readable_ms=round(
                             rhythm_timing.minimum_duration_seconds * 1000
@@ -22249,6 +22498,20 @@ def _run_feature_cut_experiment_impl(
                         runtime_timing_reconciliation.failure_codes
                     )
                 )
+            resolved_timeline = build_resolved_timeline(
+                aspect=audit_aspect.replace("x", ":"),  # type: ignore[arg-type]
+                reconciliation=runtime_timing_reconciliation,
+                music_output_timeline_sha256=(
+                    music_output_timeline_definition_sha256
+                ),
+            )
+            resolved_timeline_path = (
+                context_dir / "resolved-timeline.json"
+            )
+            write_json(resolved_timeline_path, resolved_timeline)
+            autonomous_context_paths["resolved_timeline"] = (
+                resolved_timeline_path.resolve()
+            )
             runtime_timing_by_feature = {
                 segment.beat_id: segment
                 for segment in runtime_timing_reconciliation.segments
@@ -22383,6 +22646,9 @@ def _run_feature_cut_experiment_impl(
                         if output_timeline_cues is not None
                         else None
                     ),
+                    "resolved_timeline_sha256": (
+                        resolved_timeline.definition_sha256
+                    ),
                     "alignments": cue_rows,
                 },
                 authority_inputs={
@@ -22393,6 +22659,7 @@ def _run_feature_cut_experiment_impl(
                     "exact_event_locks": autonomous_context_paths[
                         "exact_event_locks"
                     ],
+                    "resolved_timeline": resolved_timeline_path,
                 },
                 policy=autonomous_policy,
             )
@@ -22900,6 +23167,13 @@ def _run_feature_cut_experiment_impl(
                         "sha256": sha256_file(runtime_timing_path),
                         "outcome": runtime_timing_reconciliation.outcome,
                     },
+                    "resolved_timeline": {
+                        "path": str(resolved_timeline_path.resolve()),
+                        "sha256": sha256_file(resolved_timeline_path),
+                        "definition_sha256": (
+                            resolved_timeline.definition_sha256
+                        ),
+                    },
                     "frontier_scope": (
                         "pre_render_sequence_frontier_with_bounded_"
                         "runtime_fallback_and_post_render_validation"
@@ -23002,6 +23276,164 @@ def _run_feature_cut_experiment_impl(
                     selected_windows=horizontal_windows,
                     aspect=horizontal_aspect,
                 )
+                horizontal_chapters = manifest["horizontal"]["chapters"]
+                horizontal_planned_by_feature = (
+                    {
+                        selection.beat_id: selection
+                        for selection in (
+                            pre_render_horizontal_candidate_route.selections
+                        )
+                    }
+                    if pre_render_horizontal_candidate_route is not None
+                    else {}
+                )
+                horizontal_runtime_segments: list[
+                    RuntimeSegmentTiming
+                ] = []
+                for chapter in horizontal_chapters:
+                    feature_id = str(chapter["feature_id"])
+                    actual_duration_ms = int(
+                        chapter.get("duration_ms") or 0
+                    )
+                    planned_timing = horizontal_planned_by_feature.get(
+                        feature_id
+                    )
+                    routing = chapter.get("automatic_candidate_selection")
+                    runtime_candidate_id = (
+                        str(routing.get("selected_candidate_id"))
+                        if isinstance(routing, Mapping)
+                        and routing.get("selected_candidate_id")
+                        else (
+                            planned_timing.candidate_id
+                            if planned_timing is not None
+                            else "executed"
+                        )
+                    )
+                    source_clip = clips[str(chapter["source_clip_id"])]
+                    rhythm_timing = rhythm_timing_by_feature[feature_id]
+                    horizontal_runtime_segments.append(
+                        RuntimeSegmentTiming(
+                            beat_id=feature_id,
+                            planned_candidate_id=(
+                                planned_timing.candidate_id
+                                if planned_timing is not None
+                                else runtime_candidate_id
+                            ),
+                            runtime_candidate_id=runtime_candidate_id,
+                            source_asset_id=(
+                                f"sha256:{source_clip.sha256}"
+                            ),
+                            planned_duration_ms=(
+                                planned_timing.trim_duration_ms
+                                if planned_timing is not None
+                                else actual_duration_ms
+                            ),
+                            actual_source_capacity_ms=max(
+                                actual_duration_ms,
+                                round(
+                                    source_capacity_seconds.get(
+                                        feature_id,
+                                        actual_duration_ms / 1000,
+                                    )
+                                    * 1000
+                                ),
+                            ),
+                            actual_duration_ms=actual_duration_ms,
+                            minimum_readable_ms=round(
+                                rhythm_timing.minimum_duration_seconds
+                                * 1000
+                            ),
+                            input_artifact_hashes=tuple(
+                                value
+                                for value in (
+                                    str(
+                                        chapter.get(
+                                            "segment_render_fingerprint"
+                                        )
+                                        or ""
+                                    ),
+                                    str(
+                                        chapter.get(
+                                            "track_geometry_fingerprint"
+                                        )
+                                        or ""
+                                    ),
+                                )
+                                if value
+                            ),
+                        )
+                    )
+                horizontal_runtime_reconciliation = (
+                    reconcile_runtime_sequence_timing(
+                        horizontal_runtime_segments,
+                        minimum_total_duration_ms=(
+                            autonomous_policy.duration.min_ms
+                        ),
+                        maximum_total_duration_ms=(
+                            autonomous_policy.duration.max_ms
+                        ),
+                    )
+                )
+                if horizontal_runtime_reconciliation.outcome == "blocked":
+                    raise ValueError(
+                        "16:9 runtime-selected sequence timing failed closed: "
+                        + ",".join(
+                            horizontal_runtime_reconciliation.failure_codes
+                        )
+                    )
+                horizontal_runtime_path = (
+                    horizontal_context_dir
+                    / "runtime-sequence-timing-reconciliation.json"
+                )
+                write_json(
+                    horizontal_runtime_path,
+                    horizontal_runtime_reconciliation,
+                )
+                horizontal_resolved_timeline = build_resolved_timeline(
+                    aspect="16:9",
+                    reconciliation=horizontal_runtime_reconciliation,
+                    music_output_timeline_sha256=(
+                        music_output_timeline_definition_sha256
+                    ),
+                )
+                horizontal_resolved_timeline_path = (
+                    horizontal_context_dir / "resolved-timeline.json"
+                )
+                write_json(
+                    horizontal_resolved_timeline_path,
+                    horizontal_resolved_timeline,
+                )
+                horizontal_context["resolved_timeline"] = (
+                    horizontal_resolved_timeline_path.resolve()
+                )
+                horizontal_runtime_by_feature = {
+                    segment.beat_id: segment
+                    for segment
+                    in horizontal_runtime_reconciliation.segments
+                }
+                horizontal_event_feature_by_id = {
+                    f"{contract.beat_id}:{event.event_type}": str(
+                        contract.feature_id or contract.beat_id
+                    )
+                    for contract in horizontal_contracts
+                    for event in contract.visual_events
+                }
+                for event_id, original_project_time_ms in tuple(
+                    horizontal_project_times.items()
+                ):
+                    feature_id = horizontal_event_feature_by_id.get(event_id)
+                    timing = horizontal_runtime_by_feature.get(
+                        feature_id or ""
+                    )
+                    if timing is not None:
+                        horizontal_project_times[event_id] = (
+                            original_project_time_ms
+                            + timing.project_shift_before_ms
+                        )
+                horizontal_project_duration_ms = (
+                    horizontal_runtime_reconciliation
+                    .resolved_total_duration_ms
+                )
                 horizontal_music_map_path = (
                     horizontal_context_dir / "music-map.json"
                 )
@@ -23053,7 +23485,9 @@ def _run_feature_cut_experiment_impl(
                             project_event_time_ms=horizontal_project_times[
                                 lock.event_id
                             ],
-                            project_duration_ms=project_duration_ms,
+                            project_duration_ms=(
+                                horizontal_project_duration_ms
+                            ),
                         )
                         if not candidates:
                             raise ValueError(
@@ -23110,6 +23544,9 @@ def _run_feature_cut_experiment_impl(
                             if output_timeline_cues is not None
                             else None
                         ),
+                        "resolved_timeline_sha256": (
+                            horizontal_resolved_timeline.definition_sha256
+                        ),
                         "alignments": horizontal_cue_rows,
                     },
                     authority_inputs={
@@ -23120,6 +23557,9 @@ def _run_feature_cut_experiment_impl(
                         "exact_event_locks": horizontal_context[
                             "exact_event_locks"
                         ],
+                        "resolved_timeline": (
+                            horizontal_resolved_timeline_path
+                        ),
                     },
                     policy=autonomous_policy,
                 )
@@ -23528,6 +23968,11 @@ def _run_feature_cut_experiment_impl(
                     pre_render_route=(
                         pre_render_horizontal_candidate_route
                     ),
+                    reconciled_duration_ms_by_beat={
+                        beat_id: timing.resolved_duration_ms
+                        for beat_id, timing
+                        in horizontal_runtime_by_feature.items()
+                    },
                 )
                 horizontal_sequence_path = (
                     horizontal_context_dir
@@ -23556,6 +24001,27 @@ def _run_feature_cut_experiment_impl(
                                 mode="json"
                             )
                         ),
+                        "runtime_sequence_timing_reconciliation": {
+                            "path": str(horizontal_runtime_path.resolve()),
+                            "sha256": sha256_file(
+                                horizontal_runtime_path
+                            ),
+                            "outcome": (
+                                horizontal_runtime_reconciliation.outcome
+                            ),
+                        },
+                        "resolved_timeline": {
+                            "path": str(
+                                horizontal_resolved_timeline_path.resolve()
+                            ),
+                            "sha256": sha256_file(
+                                horizontal_resolved_timeline_path
+                            ),
+                            "definition_sha256": (
+                                horizontal_resolved_timeline
+                                .definition_sha256
+                            ),
+                        },
                         "frontier_scope": (
                             "pre_render_sequence_frontier_with_bounded_"
                             "runtime_fallback_and_post_render_validation"
