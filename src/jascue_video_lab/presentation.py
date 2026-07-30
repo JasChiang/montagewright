@@ -63,6 +63,26 @@ _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS = 100
 _SOURCE_MOTION_EDGE_SETTLE_PADDING_MS = 200
 
 
+def source_motion_estimator_binding_sha256() -> str:
+    """Fingerprint every implementation constant that changes motion evidence."""
+
+    payload = {
+        "estimator": _SOURCE_MOTION_ESTIMATOR_V2,
+        "sampling": _SOURCE_MOTION_SAMPLING_V2,
+        "maximum_sample_gap_ms": _SOURCE_MOTION_MAX_SAMPLE_GAP_MS,
+        "edge_dense_window_ms": _SOURCE_MOTION_EDGE_DENSE_WINDOW_MS,
+        "edge_sample_step_ms": _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS,
+        "edge_settle_padding_ms": _SOURCE_MOTION_EDGE_SETTLE_PADDING_MS,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 class GroundingTargetRequest(FrozenStrictModel):
     target_id: str = Field(
         min_length=1,
@@ -1214,24 +1234,57 @@ def generate_presentation_options(
             for target_id in scene_facts.target_ids
         )
 
-    def source_motion_acceptance() -> ConstraintResult:
-        strict = str(policy.execution_profile) == "autonomous_strict"
+    def source_motion_acceptance(
+        *,
+        motion_dependent: bool,
+    ) -> ConstraintResult:
+        """Apply estimator reliability only where an operation depends on it."""
+
         if not scene_facts.source_camera_motion_measured:
-            return _preference_constraint(
+            return (
+                _constraint(
+                    "source_camera_motion_quality",
+                    passed=False,
+                    reason_code=(
+                        "source_camera_motion_not_measured_"
+                        "motion_dependent_presentation_forbidden"
+                    ),
+                    evidence_refs=(scene_facts.definition_sha256,),
+                )
+                if motion_dependent
+                else _preference_constraint(
+                    "source_camera_motion_quality",
+                    status="unknown",
+                    reason_code="source_camera_motion_not_measured",
+                    evidence_refs=(scene_facts.definition_sha256,),
+                )
+            )
+        if (
+            source_camera_motion_evidence is not None
+            and source_camera_motion_evidence.reliable
+            and source_camera_motion_evidence.isolated_jolt_count > 0
+        ):
+            return _constraint(
                 "source_camera_motion_quality",
-                status="unknown",
-                reason_code="source_camera_motion_not_measured",
-                evidence_refs=(scene_facts.definition_sha256,),
+                passed=False,
+                reason_code="unresolved_source_camera_jolt",
+                evidence_refs=(
+                    scene_facts.definition_sha256,
+                    source_camera_motion_evidence.definition_sha256,
+                ),
             )
         if not scene_facts.source_camera_motion_reliable:
             return (
                 _constraint(
                     "source_camera_motion_quality",
                     passed=False,
-                    reason_code="source_camera_motion_unreliable",
+                    reason_code=(
+                        "source_camera_motion_unreliable_"
+                        "motion_dependent_presentation_forbidden"
+                    ),
                     evidence_refs=(scene_facts.definition_sha256,),
                 )
-                if strict
+                if motion_dependent
                 else _preference_constraint(
                     "source_camera_motion_quality",
                     status="unknown",
@@ -1245,27 +1298,29 @@ def generate_presentation_options(
             == "source-camera-motion-evidence-v2"
             and not source_camera_motion_evidence.sampling_complete
         ):
-            return _constraint(
-                "source_camera_motion_quality",
-                passed=False,
-                reason_code="source_camera_motion_sampling_incomplete",
-                evidence_refs=(
-                    scene_facts.definition_sha256,
-                    source_camera_motion_evidence.definition_sha256,
-                ),
-            )
-        if (
-            source_camera_motion_evidence is not None
-            and source_camera_motion_evidence.isolated_jolt_count > 0
-        ):
-            return _constraint(
-                "source_camera_motion_quality",
-                passed=False,
-                reason_code="unresolved_source_camera_jolt",
-                evidence_refs=(
-                    scene_facts.definition_sha256,
-                    source_camera_motion_evidence.definition_sha256,
-                ),
+            return (
+                _constraint(
+                    "source_camera_motion_quality",
+                    passed=False,
+                    reason_code=(
+                        "source_camera_motion_sampling_incomplete_"
+                        "motion_dependent_presentation_forbidden"
+                    ),
+                    evidence_refs=(
+                        scene_facts.definition_sha256,
+                        source_camera_motion_evidence.definition_sha256,
+                    ),
+                )
+                if motion_dependent
+                else _preference_constraint(
+                    "source_camera_motion_quality",
+                    status="unknown",
+                    reason_code="source_camera_motion_sampling_incomplete",
+                    evidence_refs=(
+                        scene_facts.definition_sha256,
+                        source_camera_motion_evidence.definition_sha256,
+                    ),
+                )
             )
         accepted = (
             scene_facts.source_camera_motion.direction == "static"
@@ -1306,7 +1361,7 @@ def generate_presentation_options(
                 },
                 constraints=(
                     capability_boundary("static_full_bleed_crop"),
-                    source_motion_acceptance(),
+                    source_motion_acceptance(motion_dependent=False),
                     _constraint(
                         "shared_static_crop",
                         passed=True,
@@ -1345,7 +1400,7 @@ def generate_presentation_options(
     if tracking_available:
         tracked_constraint = (
             capability_boundary("tracked_full_bleed_crop"),
-            source_motion_acceptance(),
+            source_motion_acceptance(motion_dependent=True),
             _constraint(
                 "tracking_available",
                 passed=True,
@@ -1434,6 +1489,11 @@ def generate_presentation_options(
                     },
                     constraints=(
                         capability_boundary(motion_mode),
+                        source_motion_acceptance(
+                            motion_dependent=(
+                                motion_mode == "phase_virtual_camera"
+                            )
+                        ),
                         _constraint(
                             "motion_motivated",
                             passed=movement_motivated,
@@ -1469,39 +1529,33 @@ def generate_presentation_options(
                                 scene_facts.source_camera_motion_measured
                                 and scene_facts.source_camera_motion_reliable
                             )
-                            else (
-                                _constraint(
-                                    "source_motion_compatible",
-                                    passed=(
+                            else _constraint(
+                                "source_motion_compatible",
+                                passed=(
+                                    motion_mode
+                                    == "hard_cut_between_views"
+                                ),
+                                reason_code=(
+                                    "hard_cut_does_not_require_source_"
+                                    "motion_measurement"
+                                    if (
                                         motion_mode
                                         == "hard_cut_between_views"
-                                    ),
-                                    reason_code=(
-                                        "hard_cut_does_not_require_source_"
-                                        "motion_measurement"
-                                        if (
-                                            motion_mode
-                                            == "hard_cut_between_views"
-                                        )
-                                        else
-                                        "source_camera_motion_unreliable_"
-                                        "synthetic_motion_forbidden"
-                                    ),
-                                    evidence_refs=(
-                                        scene_facts.definition_sha256,
-                                    ),
-                                )
-                                if scene_facts.source_camera_motion_measured
-                                else _preference_constraint(
-                                    "source_motion_measurement",
-                                    status="unknown",
-                                    reason_code=(
-                                        "source_camera_motion_not_measured"
-                                    ),
-                                    evidence_refs=(
-                                        scene_facts.definition_sha256,
-                                    ),
-                                )
+                                    )
+                                    else
+                                    "source_camera_motion_unreliable_"
+                                    "synthetic_motion_forbidden"
+                                    if (
+                                        scene_facts
+                                        .source_camera_motion_measured
+                                    )
+                                    else
+                                    "source_camera_motion_not_measured_"
+                                    "synthetic_motion_forbidden"
+                                ),
+                                evidence_refs=(
+                                    scene_facts.definition_sha256,
+                                ),
                             )
                         ),
                     ),
@@ -1581,7 +1635,7 @@ def generate_presentation_options(
                     payload=panel.model_dump(mode="json"),
                     constraints=(
                         capability_boundary("two_panel_layout"),
-                        source_motion_acceptance(),
+                        source_motion_acceptance(motion_dependent=False),
                         _constraint(
                             "panel_semantic_admissibility",
                             passed=panel_admissible,
@@ -1674,7 +1728,7 @@ def generate_presentation_options(
                 payload={"filter_graph": _vertical_fit_filter()},
                 constraints=(
                     capability_boundary("solid_matte_fit"),
-                    source_motion_acceptance(),
+                    source_motion_acceptance(motion_dependent=False),
                     _constraint(
                         "policy_authorized",
                         passed=True,

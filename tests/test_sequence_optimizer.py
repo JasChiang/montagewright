@@ -45,10 +45,12 @@ def _frontier_beat(
     beat_id: str,
     story_order: int,
     *candidates: tuple[str, bool],
+    priority: str = "preferred",
 ) -> RoundRobinFrontierBeat:
     return RoundRobinFrontierBeat(
         beat_id=beat_id,
         story_order=story_order,
+        priority=priority,
         candidates=tuple(
             RoundRobinFrontierCandidate(
                 beat_id=beat_id,
@@ -163,6 +165,37 @@ def test_round_robin_frontier_order_uses_explicit_story_order() -> None:
     assert reversed_order == forward_order
 
 
+def test_round_robin_frontier_resolves_hard_before_earlier_preferred() -> None:
+    state = _run_frontier_with_candidate_outcomes(
+        (
+            _frontier_beat(
+                "preferred-opening",
+                0,
+                ("preferred-1", False),
+                priority="preferred",
+            ),
+            _frontier_beat(
+                "hard-payoff",
+                1,
+                ("hard-1", True),
+                priority="hard",
+            ),
+        )
+    )
+
+    paid_attempts = [
+        (row.attempt.beat_id, row.attempt.stage, row.attempt.priority)
+        for row in state.attempt_history
+        if row.attempt.paid
+    ]
+
+    assert paid_attempts == [
+        ("hard-payoff", "exact_event", "hard"),
+        ("hard-payoff", "grounding", "hard"),
+        ("preferred-opening", "grounding", "preferred"),
+    ]
+
+
 def test_round_robin_frontier_local_failure_is_zero_paid() -> None:
     state = initialize_round_robin_frontier(
         (
@@ -222,6 +255,48 @@ def test_round_robin_frontier_requires_exact_before_grounding() -> None:
     assert grounding_attempt is not None
     assert grounding_attempt.stage == "grounding"
     assert grounding_attempt.candidate_id == "candidate"
+
+
+def test_round_robin_frontier_exact_failure_can_accept_earlier_deferred() -> None:
+    state = initialize_round_robin_frontier(
+        (
+            _frontier_beat(
+                "hard",
+                0,
+                ("deferred-panel", False),
+                ("last-exact", True),
+                priority="hard",
+            ),
+            _frontier_beat(
+                "preferred",
+                1,
+                ("preferred-candidate", False),
+                priority="preferred",
+            ),
+        )
+    )
+    state = _record_frontier_outcome(state, "local_preflight_passed")
+    state = _record_frontier_outcome(state, "grounding_failed")
+    state = _record_frontier_outcome(state, "local_preflight_passed")
+    exact_attempt = next_round_robin_frontier_attempt(state)
+    assert exact_attempt is not None
+    assert exact_attempt.stage == "exact_event"
+
+    state = record_round_robin_frontier_attempt(
+        state,
+        RoundRobinFrontierAttemptResult(
+            attempt=exact_attempt,
+            outcome="exact_event_failed",
+            accepted_candidate_id="deferred-panel",
+            decision_codes=("deferred_fallback_accepted",),
+        ),
+    )
+
+    assert state.beats[0].status == "accepted"
+    assert state.beats[0].accepted_candidate_id == "deferred-panel"
+    next_attempt = next_round_robin_frontier_attempt(state)
+    assert next_attempt is not None
+    assert next_attempt.beat_id == "preferred"
 
 
 def _route_option(

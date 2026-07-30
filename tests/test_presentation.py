@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from PIL import Image, ImageDraw
 
+import jascue_video_lab.presentation as presentation_module
 from jascue_video_lab.autonomous_policy import (
     AutonomousEditPolicy,
     BudgetPolicy,
@@ -44,8 +45,10 @@ from jascue_video_lab.presentation import (
     compile_intentional_freeze,
     compile_minimal_camera_motion,
     compile_presentation,
+    generate_presentation_options,
     measure_source_camera_motion,
     shared_sam_seeds_from_grounding,
+    source_motion_estimator_binding_sha256,
     static_full_bleed_crop_filter,
     two_panel_ffmpeg_filter,
 )
@@ -66,6 +69,50 @@ def _policy() -> AutonomousEditPolicy:
             max_paid_interactions=25,
         ),
     )
+
+
+def test_source_motion_binding_changes_with_sampling_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = source_motion_estimator_binding_sha256()
+    monkeypatch.setattr(
+        presentation_module,
+        "_SOURCE_MOTION_MAX_SAMPLE_GAP_MS",
+        presentation_module._SOURCE_MOTION_MAX_SAMPLE_GAP_MS + 1,
+    )
+
+    assert source_motion_estimator_binding_sha256() != original
+
+
+def test_paid_stage_request_bindings_include_model_and_policy() -> None:
+    first = GeminiLabClient(
+        api_key="test-only",
+        model_id="model-a",
+        autonomous_policy=_policy(),
+    )
+    second = GeminiLabClient(
+        api_key="test-only",
+        model_id="model-b",
+        autonomous_policy=_policy(),
+    )
+    try:
+        assert (
+            first.exact_event_request_contract_sha256()
+            != second.exact_event_request_contract_sha256()
+        )
+        assert (
+            first.multi_target_grounding_request_contract_sha256()
+            != second.multi_target_grounding_request_contract_sha256()
+        )
+        assert (
+            first.semantic_negotiation_request_contract_sha256(_policy())
+            != second.semantic_negotiation_request_contract_sha256(
+                _policy()
+            )
+        )
+    finally:
+        first.close()
+        second.close()
 
 
 def test_prepaid_feasibility_keeps_geometry_unknown_until_evidence() -> None:
@@ -633,6 +680,27 @@ def test_edge_dense_sampling_preserves_short_opening_jolt(
         "unresolved_source_camera_jolt" in failures
         for failures in compilation.selection.rejected_options.values()
     )
+    motion_options = generate_presentation_options(
+        targets=[
+            _target("first", (100, 250, 300, 750)),
+            _target("second", (700, 250, 900, 750)),
+        ],
+        source_width=WIDTH,
+        source_height=HEIGHT,
+        relation_mode="sequential_focus",
+        policy=_policy(),
+        required_x_values=(0.2, 0.8),
+        source_camera_motion_evidence=evidence,
+        movement_motivated=True,
+    )
+    for option in motion_options.options:
+        if option.mode in {
+            "phase_virtual_camera",
+            "hard_cut_between_views",
+        }:
+            assert "unresolved_source_camera_jolt" in (
+                option.option.hard_failure_codes
+            )
 
 
 def test_edge_dense_sampling_reports_clean_tail_before_closing_jolt(
@@ -772,6 +840,81 @@ def test_impossible_two_device_crop_uses_scale_locked_two_panel() -> None:
     assert ",pad=" not in filter_graph
 
 
+def test_static_two_panel_survives_unreliable_source_motion_estimate() -> None:
+    evidence = SourceCameraMotionEvidence(
+        source_asset_id="sha256:" + "a" * 64,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        sample_times_ms=(),
+        sample_frame_pts=(),
+        sample_frame_hashes=(),
+        subject_exclusion_mode="none",
+        mean_excluded_area_fraction=0.0,
+        pairs=(),
+        classification="unreliable",
+        reliable=False,
+        confidence=0.0,
+        normalized_translation_x_per_second=0.0,
+        normalized_translation_y_per_second=0.0,
+        scale_rate_per_second=0.0,
+        rotation_degrees_per_second=0.0,
+        normalized_travel=0.0,
+        reversal_count=0,
+        reason_codes=("insufficient_background_features",),
+        cache_key_sha256="b" * 64,
+    )
+
+    compilation = compile_presentation(
+        targets=[
+            _target("device-a", (20, 250, 270, 750)),
+            _target("device-b", (730, 250, 980, 750)),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="simultaneous_relation",
+        policy=_policy(),
+        physical_scale_comparison=True,
+        source_camera_motion_evidence=evidence,
+    )
+
+    assert compilation.mode == "two_panel_layout"
+    assert compilation.panel_layout is not None
+    assert compilation.panel_layout.relative_scale_policy == "locked"
+    assert compilation.scene_facts is not None
+    assert compilation.scene_facts.source_camera_motion_reliable is False
+    assert compilation.selection is not None
+    selected_id = compilation.selection.selected_option_id
+    selected = next(
+        option
+        for option in compilation.option_set.options
+        if option.option.option_id == selected_id
+    )
+    motion_constraint = next(
+        constraint
+        for constraint in selected.option.constraints
+        if constraint.constraint_id == "source_camera_motion_quality"
+    )
+    assert motion_constraint.level == "preference"
+    assert motion_constraint.status == "unknown"
+
+    tentative_jolt = evidence.model_copy(
+        update={"isolated_jolt_count": 1}
+    )
+    tentative_compilation = compile_presentation(
+        targets=[
+            _target("device-a", (20, 250, 270, 750)),
+            _target("device-b", (730, 250, 980, 750)),
+        ],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="simultaneous_relation",
+        policy=_policy(),
+        physical_scale_comparison=True,
+        source_camera_motion_evidence=tentative_jolt,
+    )
+    assert tentative_compilation.mode == "two_panel_layout"
+
+
 def test_nested_context_targets_do_not_create_panels_from_target_count() -> None:
     compilation = compile_presentation(
         targets=[
@@ -906,6 +1049,28 @@ def test_common_motion_and_tracked_relation_are_measured_per_pts() -> None:
         (30, (300, 300, 400, 700)),
         (60, (320, 300, 420, 700)),
     )
+    static_source_motion = SourceCameraMotionEvidence(
+        source_asset_id="sha256:" + "a" * 64,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        sample_times_ms=(0, 2_000),
+        sample_frame_pts=(0, 60),
+        sample_frame_hashes=("c" * 64, "d" * 64),
+        subject_exclusion_mode="none",
+        mean_excluded_area_fraction=0.0,
+        pairs=(),
+        classification="static",
+        reliable=True,
+        confidence=0.95,
+        normalized_translation_x_per_second=0.0,
+        normalized_translation_y_per_second=0.0,
+        scale_rate_per_second=0.0,
+        rotation_degrees_per_second=0.0,
+        normalized_travel=0.0,
+        reversal_count=0,
+        reason_codes=("source_camera_static",),
+        cache_key_sha256="e" * 64,
+    )
     compilation = compile_presentation(
         targets=[
             _target(
@@ -925,6 +1090,7 @@ def test_common_motion_and_tracked_relation_are_measured_per_pts() -> None:
         policy=_policy(),
         allow_static_full_bleed=False,
         acceptable_capability_ids=("tracked_full_bleed_crop",),
+        source_camera_motion_evidence=static_source_motion,
     )
 
     assert compilation.mode == "tracked_full_bleed_crop"

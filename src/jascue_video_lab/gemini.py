@@ -182,6 +182,15 @@ _SEMANTIC_MUSIC_RAW_REUSE_BINDING_VERSION = (
 _SEMANTIC_MUSIC_RAW_REUSE_BINDING_FILENAME = (
     "semantic_music_pairing.raw_output_binding.json"
 )
+EXACT_EVENT_SELECTION_REQUEST_VERSION = (
+    "exact-event-frame-id-request-v1"
+)
+MULTI_TARGET_GROUNDING_REQUEST_VERSION = (
+    "multi-target-exact-frame-grounding-request-v2"
+)
+SEMANTIC_NEGOTIATION_REQUEST_VERSION = (
+    "bounded-semantic-negotiation-request-v1"
+)
 
 
 def _canonical_json_sha256(value: Any) -> str:
@@ -2341,6 +2350,109 @@ class GeminiLabClient:
             append_error(output_dir, "identity_checkpoint", error)
             raise
 
+    def exact_event_request_contract_sha256(self) -> str:
+        """Bind caches to the complete static exact-event request contract."""
+
+        autonomous_policy = getattr(self, "autonomous_policy", None)
+        operation_limit = (
+            autonomous_policy.gemini_limits.exact_event_group
+            if autonomous_policy is not None
+            else None
+        )
+        return _canonical_json_sha256(
+            {
+                "request_version": EXACT_EVENT_SELECTION_REQUEST_VERSION,
+                "model_id": self.model_id,
+                "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+                "response_schema": gemini_response_schema(
+                    ExactEventSelectionGroup
+                ),
+                "media_resolution": (
+                    autonomous_policy.media_resolution.exact_event_image
+                    if autonomous_policy is not None
+                    else "high"
+                ),
+                "thinking_level": (
+                    operation_limit.thinking_level
+                    if operation_limit is not None
+                    else "low"
+                ),
+                "max_output_tokens": (
+                    operation_limit.max_output_tokens
+                    if operation_limit is not None
+                    else 2_048
+                ),
+            }
+        )
+
+    def multi_target_grounding_request_contract_sha256(self) -> str:
+        """Bind nested grounding caches to the real provider request."""
+
+        autonomous_policy = getattr(self, "autonomous_policy", None)
+        operation_limit = (
+            autonomous_policy.gemini_limits.multi_target_grounding
+            if autonomous_policy is not None
+            else None
+        )
+        return _canonical_json_sha256(
+            {
+                "request_version": MULTI_TARGET_GROUNDING_REQUEST_VERSION,
+                "model_id": self.model_id,
+                "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+                "response_schema": gemini_response_schema(
+                    MultiTargetGroundingGroup
+                ),
+                "media_resolution": (
+                    autonomous_policy.media_resolution
+                    .exact_frame_grounding_image
+                    if autonomous_policy is not None
+                    else "high"
+                ),
+                "thinking_level": (
+                    operation_limit.thinking_level
+                    if operation_limit is not None
+                    else "low"
+                ),
+                "max_output_tokens": (
+                    operation_limit.max_output_tokens
+                    if operation_limit is not None
+                    else 2_048
+                ),
+            }
+        )
+
+    def semantic_negotiation_request_contract_sha256(
+        self,
+        policy: AutonomousEditPolicy,
+    ) -> str:
+        """Bind geometry caches to the bounded function-call protocol."""
+
+        return _canonical_json_sha256(
+            {
+                "request_version": SEMANTIC_NEGOTIATION_REQUEST_VERSION,
+                "model_id": self.model_id,
+                "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+                "decision_tool_schema": gemini_response_schema(
+                    EditDecisionProposal
+                ),
+                "thinking_level": (
+                    policy.gemini_limits.semantic_negotiation.thinking_level
+                ),
+                "max_output_tokens": (
+                    policy.gemini_limits.semantic_negotiation
+                    .max_output_tokens
+                ),
+                "max_tool_result_rounds": (
+                    policy.semantic_negotiation.max_tool_result_rounds
+                ),
+                "allowed_tools": list(
+                    policy.semantic_negotiation.allowed_tools
+                ),
+                "automatic_function_calling": False,
+                "store": True,
+            }
+        )
+
     def ground_multi_target_exact_frame(
         self,
         *,
@@ -2383,7 +2495,7 @@ class GeminiLabClient:
             width, height = image.size
         mime_type = mimetypes.guess_type(resolved_frame.name)[0] or "image/jpeg"
         prompt = (
-            "## MULTI_TARGET_EXACT_FRAME_GROUNDING\n"
+            f"## {MULTI_TARGET_GROUNDING_REQUEST_VERSION}\n"
             "只處理這一張原比例 exact frame。依 target_id 順序回傳每個"
             "目標的候選 box_2d_yxyx=[ymin,xmin,ymax,xmax]，座標 0..1000。"
             "不得輸出 timestamp、PTS、crop、panel 或相機方向。找不到時"
@@ -3532,7 +3644,7 @@ model_provenance (return it unchanged with interaction_id=null):
         )
         allowed_ids = [frame.frame_id for frame in bracket]
         prompt = (
-            "## Exact event frame-ID selection\n"
+            f"## {EXACT_EVENT_SELECTION_REQUEST_VERSION}\n"
             "只能從本次提供的原比例影格選擇既有 frame ID。不得輸出、"
             "推算或改寫 timestamp、PTS、秒數、bbox 或 crop。"
             "每個 event 必須回傳 selected/support start/support end IDs；"
@@ -3700,6 +3812,12 @@ model_provenance (return it unchanged with interaction_id=null):
                     {
                         "contract_version": "exact-event-lock-group-v2",
                         "locks": [],
+                        "input_artifact_hashes": list(
+                            input_artifact_hashes
+                        ),
+                        "request_contract_sha256": (
+                            self.exact_event_request_contract_sha256()
+                        ),
                         "unresolved_events": unresolved,
                         "fail_closed": True,
                     },
@@ -3735,6 +3853,10 @@ model_provenance (return it unchanged with interaction_id=null):
                     "locks": [
                         lock.model_dump(mode="json") for lock in locks
                     ],
+                    "input_artifact_hashes": list(input_artifact_hashes),
+                    "request_contract_sha256": (
+                        self.exact_event_request_contract_sha256()
+                    ),
                 },
             )
             write_json(

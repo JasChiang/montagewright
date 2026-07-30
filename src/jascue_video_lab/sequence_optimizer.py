@@ -40,7 +40,12 @@ FrontierAttemptOutcome = Literal[
     "grounding_accepted",
     "grounding_failed",
 ]
-FrontierBeatStatus = Literal["pending", "accepted", "exhausted"]
+FrontierBeatStatus = Literal[
+    "pending",
+    "accepted",
+    "omitted",
+    "exhausted",
+]
 
 
 class RoundRobinFrontierCandidate(FrozenStrictModel):
@@ -61,6 +66,7 @@ class RoundRobinFrontierBeat(FrozenStrictModel):
 
     beat_id: str = Field(min_length=1)
     story_order: int = Field(ge=0)
+    priority: BeatPriority = "preferred"
     candidates: tuple[RoundRobinFrontierCandidate, ...] = Field(
         min_length=1
     )
@@ -94,6 +100,7 @@ class RoundRobinFrontierAttempt(FrozenStrictModel):
     beat_id: str = Field(min_length=1)
     candidate_id: str = Field(min_length=1)
     story_order: int = Field(ge=0)
+    priority: BeatPriority = "preferred"
     candidate_order: int = Field(ge=0)
     round_index: int = Field(ge=1)
     stage: FrontierAttemptStage
@@ -112,6 +119,8 @@ class RoundRobinFrontierAttempt(FrozenStrictModel):
 class RoundRobinFrontierAttemptResult(FrozenStrictModel):
     attempt: RoundRobinFrontierAttempt
     outcome: FrontierAttemptOutcome
+    accepted_candidate_id: str | None = None
+    beat_omitted: bool = False
     decision_codes: tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -133,6 +142,29 @@ class RoundRobinFrontierAttemptResult(FrozenStrictModel):
         if self.outcome not in allowed_by_stage[self.attempt.stage]:
             raise ValueError(
                 "frontier attempt outcome does not match its stage"
+            )
+        if (
+            self.accepted_candidate_id is not None
+            and self.outcome
+            not in {
+                "local_preflight_failed",
+                "exact_event_failed",
+                "grounding_failed",
+                "grounding_accepted",
+            }
+        ):
+            raise ValueError(
+                "candidate override requires a grounding acceptance or a "
+                "terminal-stage failure that activates an earlier deferred "
+                "fallback"
+            )
+        if self.beat_omitted and (
+            not self.outcome.endswith("_failed")
+            or self.accepted_candidate_id is not None
+        ):
+            raise ValueError(
+                "beat omission requires a terminal candidate failure and "
+                "cannot also accept a candidate"
             )
         return self
 
@@ -186,8 +218,8 @@ class RoundRobinFrontierBeatState(FrozenStrictModel):
 class RoundRobinFrontierState(FrozenStrictModel):
     """Immutable state for fair, candidate-round paid execution."""
 
-    contract_version: Literal["round-robin-paid-frontier-v1"] = (
-        "round-robin-paid-frontier-v1"
+    contract_version: Literal["round-robin-paid-frontier-v2"] = (
+        "round-robin-paid-frontier-v2"
     )
     revision: int = Field(default=0, ge=0)
     beats: tuple[RoundRobinFrontierBeatState, ...] = Field(min_length=1)
@@ -249,19 +281,30 @@ def next_round_robin_frontier_attempt(
 ) -> RoundRobinFrontierAttempt | None:
     """Return one deterministic operation without mutating frontier state.
 
-    Beats in the lowest unfinished paid round always win.  Consequently no
-    round-N+1 candidate may start before every still-runnable beat has either
-    completed, accepted, exhausted, or failed its round-N candidate.
+    Hard beats are completely resolved before preferred beats, and preferred
+    beats before optional beats.  Inside one priority class, beats in the
+    lowest unfinished paid round always win.  Consequently a flexible earlier
+    beat cannot consume source capacity needed by a later hard beat, while
+    candidate retry fairness remains deterministic inside each class.
     """
 
     pending = [row for row in state.beats if row.status == "pending"]
     if not pending:
         return None
-    minimum_round = min(row.round_index for row in pending)
+    priority_rank = {"hard": 0, "preferred": 1, "optional": 2}
+    minimum_priority_rank = min(
+        priority_rank[row.beat.priority] for row in pending
+    )
+    priority_pending = [
+        row
+        for row in pending
+        if priority_rank[row.beat.priority] == minimum_priority_rank
+    ]
+    minimum_round = min(row.round_index for row in priority_pending)
     selected = min(
         (
             row
-            for row in pending
+            for row in priority_pending
             if row.round_index == minimum_round
         ),
         key=lambda row: (row.beat.story_order, row.beat.beat_id),
@@ -272,6 +315,7 @@ def next_round_robin_frontier_attempt(
         beat_id=selected.beat.beat_id,
         candidate_id=candidate.candidate_id,
         story_order=selected.beat.story_order,
+        priority=selected.beat.priority,
         candidate_order=candidate.candidate_order,
         round_index=selected.round_index,
         stage=selected.next_stage,
@@ -318,10 +362,42 @@ def record_round_robin_frontier_attempt(
             update={"next_stage": "grounding"}
         )
     elif result.outcome == "grounding_accepted":
+        accepted_candidate_id = (
+            result.accepted_candidate_id or candidate.candidate_id
+        )
+        if accepted_candidate_id not in {
+            row.candidate_id for row in beat_state.beat.candidates
+        }:
+            raise ValueError(
+                "accepted frontier candidate override is outside the beat"
+            )
         beat_state = beat_state.model_copy(
             update={
                 "status": "accepted",
-                "accepted_candidate_id": candidate.candidate_id,
+                "active_candidate_id": None,
+                "accepted_candidate_id": accepted_candidate_id,
+            }
+        )
+    elif result.beat_omitted:
+        beat_state = beat_state.model_copy(
+            update={
+                "status": "omitted",
+                "active_candidate_id": None,
+                "accepted_candidate_id": None,
+            }
+        )
+    elif result.accepted_candidate_id is not None:
+        if result.accepted_candidate_id not in {
+            row.candidate_id for row in beat_state.beat.candidates
+        }:
+            raise ValueError(
+                "accepted frontier candidate override is outside the beat"
+            )
+        beat_state = beat_state.model_copy(
+            update={
+                "status": "accepted",
+                "active_candidate_id": None,
+                "accepted_candidate_id": result.accepted_candidate_id,
             }
         )
     else:

@@ -58,6 +58,9 @@ from jascue_video_lab.feature_cut import (
     _bind_runtime_candidate_coverage,
     _audit_render_source_reuse,
     _runtime_candidate_reuse_violation,
+    _source_reservation_precedes_candidate,
+    _source_motion_delivery_failure,
+    _source_motion_requirement_audited,
     _whole_source_fit_recovery_allowed,
     _candidate_asset_reference_matches,
     _feature_vertical_candidate_from_runtime_option,
@@ -90,6 +93,7 @@ from jascue_video_lab.feature_cut import (
     _requested_render_aspects,
     _runtime_panel_budget_allows,
     _load_or_create_frontier_stage_artifact,
+    _load_existing_frontier_stage_artifact,
     _compile_autonomous_vertical_candidate_geometry,
     _run_persisted_production_frontier,
     _validate_all_vertical_finalizers_ready,
@@ -302,6 +306,25 @@ def test_frozen_vertical_render_selection_rejects_candidate_mismatch(
         )
 
 
+def test_frozen_vertical_render_selection_rejects_state_tamper(
+    tmp_path: Path,
+) -> None:
+    frontier_root, feature_id, candidate_id = (
+        _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
+    )
+    state_path = frontier_root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["revision"] += 1
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(FeatureCutSystemFailure, match="completely frozen"):
+        _validate_frozen_vertical_render_selection(
+            frontier_root=frontier_root,
+            feature_id=feature_id,
+            candidate_id=candidate_id,
+        )
+
+
 @pytest.mark.parametrize("stage", ("local", "exact", "geometry"))
 def test_frozen_vertical_render_selection_rejects_stage_artifact_tamper(
     tmp_path: Path,
@@ -498,7 +521,6 @@ def test_frontier_stage_artifact_produces_once_and_resumes(
             ("sha256:" + "f" * 64,),
         ),
         ("policy_reference", "sha256:" + "e" * 64),
-        ("route_sha256", "sha256:" + "9" * 64),
     ),
 )
 def test_frontier_stage_artifact_rejects_binding_mismatch(
@@ -520,6 +542,261 @@ def test_frontier_stage_artifact_rejects_binding_mismatch(
                 "binding mismatch invoked stage producer"
             ),
         )
+
+
+def test_frontier_stage_artifact_reuses_paid_result_after_route_change(
+    tmp_path: Path,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    first = _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: {"event_lock_ids": ["lock-1"]},
+    )
+
+    rerouted = {
+        **kwargs,
+        "route_sha256": "sha256:" + "9" * 64,
+    }
+    resumed = _load_or_create_frontier_stage_artifact(
+        **rerouted,
+        producer=lambda: pytest.fail(
+            "route-only retry dispatched a new paid operation"
+        ),
+    )
+
+    assert resumed == first
+
+
+def test_frontier_stage_load_only_missing_artifact_never_dispatches(
+    tmp_path: Path,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="missing after the scheduler advanced",
+    ):
+        _load_existing_frontier_stage_artifact(
+            artifact_path=kwargs["artifact_path"],
+            beat_id=str(kwargs["beat_id"]),
+            candidate_id=str(kwargs["candidate_id"]),
+            stage=str(kwargs["stage"]),
+            dependency_hashes=kwargs["dependency_hashes"],
+            policy_reference=str(kwargs["policy_reference"]),
+            route_sha256=str(kwargs["route_sha256"]),
+        )
+
+
+def test_frontier_stage_non_regular_path_never_dispatches_producer(
+    tmp_path: Path,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    artifact_path = kwargs["artifact_path"]
+    assert isinstance(artifact_path, Path)
+    artifact_path.mkdir(parents=True)
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="not a regular file",
+    ):
+        _load_or_create_frontier_stage_artifact(
+            **kwargs,
+            producer=lambda: pytest.fail(
+                "non-regular artifact path dispatched paid producer"
+            ),
+        )
+
+
+def test_frontier_stage_legacy_dependency_schema_is_not_migrated(
+    tmp_path: Path,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: {"event_lock_ids": ["paid-once"]},
+    )
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="stale or tampered bindings",
+    ):
+        _load_or_create_frontier_stage_artifact(
+            **{
+                **kwargs,
+                "dependency_hashes": (
+                    *kwargs["dependency_hashes"],
+                    "sha256:" + "f" * 64,
+                ),
+            },
+            producer=lambda: pytest.fail(
+                "dependency-schema mismatch dispatched producer"
+            ),
+        )
+
+
+def test_frontier_stage_artifact_migrates_legacy_paid_result_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    artifact_path = kwargs["artifact_path"]
+    assert isinstance(artifact_path, Path)
+    payload = {"event_lock_ids": ["legacy-lock"]}
+    legacy = {
+        "contract_version": "vertical-frontier-stage-artifact-v1",
+        "beat_id": kwargs["beat_id"],
+        "candidate_id": kwargs["candidate_id"],
+        "stage": kwargs["stage"],
+        "binding_sha256": (
+            feature_cut_module._legacy_frontier_stage_binding_sha256(
+                beat_id=str(kwargs["beat_id"]),
+                candidate_id=str(kwargs["candidate_id"]),
+                stage=str(kwargs["stage"]),
+                dependency_hashes=kwargs["dependency_hashes"],
+                policy_reference=str(kwargs["policy_reference"]),
+                route_sha256=str(kwargs["route_sha256"]),
+            )
+        ),
+        "dependency_hashes": list(kwargs["dependency_hashes"]),
+        "policy_reference": kwargs["policy_reference"],
+        "route_sha256": kwargs["route_sha256"],
+        "payload": payload,
+    }
+    legacy["definition_sha256"] = hashlib.sha256(
+        json.dumps(
+            legacy,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    artifact_path.write_text(
+        json.dumps(legacy),
+        encoding="utf-8",
+    )
+    legacy_bytes = artifact_path.read_bytes()
+
+    resumed = _load_or_create_frontier_stage_artifact(
+        **{
+            **kwargs,
+            "route_sha256": "sha256:" + "9" * 64,
+        },
+        producer=lambda: pytest.fail(
+            "legacy artifact migration dispatched a paid operation"
+        ),
+    )
+    compatibility_path = artifact_path.with_name(
+        artifact_path.name + ".binding-v2-compat.json"
+    )
+    compatibility = json.loads(
+        compatibility_path.read_text(encoding="utf-8")
+    )
+
+    assert resumed == payload
+    assert artifact_path.read_bytes() == legacy_bytes
+    assert compatibility["contract_version"] == (
+        "vertical-frontier-stage-binding-compat-v1"
+    )
+    assert compatibility["migrated_from_route_sha256"] == (
+        kwargs["route_sha256"]
+    )
+    assert compatibility["current_route_sha256"] == "sha256:" + "9" * 64
+    assert compatibility["paid_provider_dispatch_added"] is False
+
+
+def test_legacy_frontier_stage_chain_reuses_byte_identical_paid_artifacts(
+    tmp_path: Path,
+) -> None:
+    policy_reference = "sha256:" + "c" * 64
+    original_route = "sha256:" + "d" * 64
+    current_route = "sha256:" + "9" * 64
+
+    def write_legacy(
+        path: Path,
+        *,
+        stage: str,
+        dependencies: tuple[str, ...],
+        payload: dict[str, object],
+    ) -> None:
+        artifact = {
+            "contract_version": "vertical-frontier-stage-artifact-v1",
+            "beat_id": "beat-a",
+            "candidate_id": "candidate-a1",
+            "stage": stage,
+            "binding_sha256": (
+                feature_cut_module._legacy_frontier_stage_binding_sha256(
+                    beat_id="beat-a",
+                    candidate_id="candidate-a1",
+                    stage=stage,
+                    dependency_hashes=dependencies,
+                    policy_reference=policy_reference,
+                    route_sha256=original_route,
+                )
+            ),
+            "dependency_hashes": list(dependencies),
+            "policy_reference": policy_reference,
+            "route_sha256": original_route,
+            "payload": payload,
+        }
+        artifact["definition_sha256"] = hashlib.sha256(
+            json.dumps(
+                artifact,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    local_path = tmp_path / "local.json"
+    exact_path = tmp_path / "exact.json"
+    geometry_path = tmp_path / "geometry.json"
+    local_dependencies = ("sha256:" + "a" * 64,)
+    write_legacy(
+        local_path,
+        stage="local_preflight",
+        dependencies=local_dependencies,
+        payload={"local": "saved"},
+    )
+    exact_dependencies = (sha256_file(local_path),)
+    write_legacy(
+        exact_path,
+        stage="exact_event",
+        dependencies=exact_dependencies,
+        payload={"exact": "saved"},
+    )
+    geometry_dependencies = (sha256_file(exact_path),)
+    write_legacy(
+        geometry_path,
+        stage="grounding",
+        dependencies=geometry_dependencies,
+        payload={"geometry": "saved"},
+    )
+    original_hashes = {
+        path: sha256_file(path)
+        for path in (local_path, exact_path, geometry_path)
+    }
+
+    for path, stage, dependencies in (
+        (local_path, "local_preflight", local_dependencies),
+        (exact_path, "exact_event", exact_dependencies),
+        (geometry_path, "grounding", geometry_dependencies),
+    ):
+        _load_or_create_frontier_stage_artifact(
+            artifact_path=path,
+            beat_id="beat-a",
+            candidate_id="candidate-a1",
+            stage=stage,
+            dependency_hashes=dependencies,
+            policy_reference=policy_reference,
+            route_sha256=current_route,
+            producer=lambda: pytest.fail(
+                f"legacy {stage} retry dispatched a provider operation"
+            ),
+        )
+
+    assert {
+        path: sha256_file(path)
+        for path in (local_path, exact_path, geometry_path)
+    } == original_hashes
 
 
 @pytest.mark.parametrize("tamper_target", ("payload", "definition"))
@@ -557,10 +834,12 @@ def _production_frontier_beat(
     beat_id: str,
     story_order: int,
     *candidates: tuple[str, bool],
+    priority: str = "preferred",
 ) -> RoundRobinFrontierBeat:
     return RoundRobinFrontierBeat(
         beat_id=beat_id,
         story_order=story_order,
+        priority=priority,
         candidates=tuple(
             RoundRobinFrontierCandidate(
                 beat_id=beat_id,
@@ -657,6 +936,313 @@ def test_production_frontier_accepted_beat_exits(
 
     assert accepted == {"accepted": "a1", "later": "l2"}
     assert ("accepted", "a2-must-not-run") not in seen
+
+
+def test_production_frontier_hard_beat_reserves_source_before_preferred(
+    tmp_path: Path,
+) -> None:
+    accepted_sources: set[str] = set()
+    source_by_candidate = {
+        "preferred-shared": "shared",
+        "preferred-alternate": "alternate",
+        "hard-shared": "shared",
+    }
+    paid_order: list[str] = []
+
+    def grounding(attempt) -> None:
+        paid_order.append(attempt.candidate_id)
+        source_id = source_by_candidate[attempt.candidate_id]
+        if source_id in accepted_sources:
+            raise CandidateKnownInfeasible("source reuse blocked")
+        accepted_sources.add(source_id)
+
+    accepted = _run_persisted_production_frontier(
+        state_path=tmp_path / "frontier.json",
+        beats=(
+            _production_frontier_beat(
+                "preferred-opening",
+                0,
+                ("preferred-shared", False),
+                ("preferred-alternate", False),
+                priority="preferred",
+            ),
+            _production_frontier_beat(
+                "hard-comparison",
+                1,
+                ("hard-shared", False),
+                priority="hard",
+            ),
+        ),
+        local_preflight=lambda _attempt: None,
+        exact_event=lambda _attempt: None,
+        grounding=grounding,
+    )
+
+    assert paid_order == [
+        "hard-shared",
+        "preferred-shared",
+        "preferred-alternate",
+    ]
+    assert accepted == {
+        "preferred-opening": "preferred-alternate",
+        "hard-comparison": "hard-shared",
+    }
+
+
+def test_production_frontier_may_accept_earlier_constructed_fallback(
+    tmp_path: Path,
+) -> None:
+    seen: list[str] = []
+
+    def grounding(attempt) -> str | None:
+        seen.append(attempt.candidate_id)
+        if attempt.candidate_id == "natural-failed-panel-valid":
+            raise CandidateKnownInfeasible("deferred_panel")
+        return "natural-failed-panel-valid"
+
+    accepted = _run_persisted_production_frontier(
+        state_path=tmp_path / "frontier.json",
+        beats=(
+            _production_frontier_beat(
+                "hard-comparison",
+                0,
+                ("natural-failed-panel-valid", False),
+                ("last-natural-failed", False),
+                priority="hard",
+            ),
+        ),
+        local_preflight=lambda _attempt: None,
+        exact_event=lambda _attempt: None,
+        grounding=grounding,
+    )
+    state = RoundRobinFrontierState.model_validate_json(
+        (tmp_path / "frontier.json").read_text(encoding="utf-8")
+    )
+
+    assert seen == [
+        "natural-failed-panel-valid",
+        "last-natural-failed",
+    ]
+    assert accepted == {
+        "hard-comparison": "natural-failed-panel-valid"
+    }
+    assert state.beats[0].status == "accepted"
+    assert state.beats[0].active_candidate_id is None
+
+
+def test_production_frontier_accepts_deferred_before_lower_priority_when_last_exact_fails(
+    tmp_path: Path,
+) -> None:
+    paid_order: list[tuple[str, str]] = []
+
+    def exact_event(attempt) -> None:
+        paid_order.append((attempt.beat_id, attempt.stage))
+        if attempt.candidate_id == "last-hard":
+            raise CandidateKnownInfeasible("exact event absent")
+
+    def grounding(attempt) -> None:
+        paid_order.append((attempt.beat_id, attempt.stage))
+        if attempt.candidate_id == "deferred-panel":
+            raise CandidateKnownInfeasible("deferred_panel")
+
+    accepted = _run_persisted_production_frontier(
+        state_path=tmp_path / "frontier.json",
+        beats=(
+            _production_frontier_beat(
+                "hard",
+                0,
+                ("deferred-panel", False),
+                ("last-hard", True),
+                priority="hard",
+            ),
+            _production_frontier_beat(
+                "preferred",
+                1,
+                ("preferred-1", False),
+                priority="preferred",
+            ),
+        ),
+        local_preflight=lambda _attempt: None,
+        exact_event=exact_event,
+        grounding=grounding,
+        resolve_deferred_on_exhaustion=lambda beat_id: (
+            "deferred-panel" if beat_id == "hard" else None
+        ),
+    )
+    state = RoundRobinFrontierState.model_validate_json(
+        (tmp_path / "frontier.json").read_text(encoding="utf-8")
+    )
+
+    assert accepted == {
+        "hard": "deferred-panel",
+        "preferred": "preferred-1",
+    }
+    assert state.beats[0].status == "accepted"
+    hard_exact_index = paid_order.index(("hard", "exact_event"))
+    preferred_index = paid_order.index(("preferred", "grounding"))
+    assert hard_exact_index < preferred_index
+
+
+def test_production_frontier_exhaustion_fails_before_frozen_callback(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="before any lower-priority callback",
+    ):
+        _run_persisted_production_frontier(
+            state_path=tmp_path / "frontier.json",
+            beats=(
+                _production_frontier_beat(
+                    "hard",
+                    0,
+                    ("bad", False),
+                    priority="hard",
+                ),
+            ),
+            local_preflight=lambda _attempt: None,
+            exact_event=lambda _attempt: None,
+            grounding=lambda _attempt: (
+                (_ for _ in ()).throw(
+                    CandidateKnownInfeasible("no geometry")
+                )
+            ),
+            resolve_deferred_on_exhaustion=lambda _beat_id: None,
+            on_frontier_frozen=lambda _state, _accepted: pytest.fail(
+                "unresolved frontier reached render freeze"
+            ),
+        )
+
+
+def test_production_frontier_can_omit_policy_authorized_optional_beat(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "frontier.json"
+
+    accepted = _run_persisted_production_frontier(
+        state_path=state_path,
+        beats=(
+            _production_frontier_beat(
+                "optional",
+                0,
+                ("bad", False),
+                priority="optional",
+            ),
+        ),
+        local_preflight=lambda _attempt: None,
+        exact_event=lambda _attempt: None,
+        grounding=lambda _attempt: (
+            (_ for _ in ()).throw(
+                CandidateKnownInfeasible("no optional geometry")
+            )
+        ),
+        resolve_deferred_on_exhaustion=lambda _beat_id: None,
+        allow_beat_omission=lambda beat_id: beat_id == "optional",
+    )
+    state = RoundRobinFrontierState.model_validate_json(
+        state_path.read_text(encoding="utf-8")
+    )
+
+    assert accepted == {}
+    assert state.beats[0].status == "omitted"
+    assert state.attempt_history[-1].beat_omitted is True
+    assert (
+        "policy_authorized_optional_beat_omission"
+        in state.attempt_history[-1].decision_codes
+    )
+
+
+def test_production_frontier_preexisting_exhaustion_blocks_before_callbacks(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "frontier.json"
+    beats = (
+        _production_frontier_beat(
+            "hard",
+            0,
+            ("bad", False),
+            priority="hard",
+        ),
+        _production_frontier_beat(
+            "preferred",
+            1,
+            ("must-not-run", False),
+            priority="preferred",
+        ),
+    )
+
+    stale_state = initialize_round_robin_frontier(beats)
+    write_json(
+        state_path,
+        stale_state.model_copy(
+            update={
+                "beats": (
+                    stale_state.beats[0].model_copy(
+                        update={
+                            "candidate_cursor": 1,
+                            "status": "exhausted",
+                        }
+                    ),
+                    stale_state.beats[1],
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="before any lower-priority or paid callback",
+    ):
+        _run_persisted_production_frontier(
+            state_path=state_path,
+            beats=beats,
+            local_preflight=lambda _attempt: pytest.fail(
+                "stale exhausted state ran local callback"
+            ),
+            exact_event=lambda _attempt: pytest.fail(
+                "stale exhausted state ran exact callback"
+            ),
+            grounding=lambda _attempt: pytest.fail(
+                "stale exhausted state ran grounding callback"
+            ),
+            resolve_deferred_on_exhaustion=lambda _beat_id: None,
+        )
+
+
+def test_production_frontier_refuses_legacy_state_before_callbacks(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "frontier.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "contract_version": "round-robin-paid-frontier-v1",
+                "revision": 0,
+                "beats": [],
+                "attempt_history": [],
+                "paid_calls_consumed": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="No paid callback was dispatched",
+    ):
+        _run_persisted_production_frontier(
+            state_path=state_path,
+            beats=None,
+            local_preflight=lambda _attempt: pytest.fail(
+                "legacy state ran local callback"
+            ),
+            exact_event=lambda _attempt: pytest.fail(
+                "legacy state ran exact callback"
+            ),
+            grounding=lambda _attempt: pytest.fail(
+                "legacy state ran grounding callback"
+            ),
+        )
 
 
 def test_production_frontier_local_failure_uses_no_paid_callback(
@@ -1947,6 +2533,7 @@ def test_exact_event_source_is_reserved_from_earlier_flexible_beat() -> None:
     contracts = [
         SimpleNamespace(
             feature_id="closing",
+            priority="hard",
             visual_events=[SimpleNamespace(event_type="freeze_start")],
         )
     ]
@@ -1956,7 +2543,57 @@ def test_exact_event_source_is_reserved_from_earlier_flexible_beat() -> None:
         contracts,
     )
 
-    assert reservations == {source_sha256: (1, "closing")}
+    assert reservations == {source_sha256: ("hard", 1, "closing")}
+
+
+def test_lower_priority_exact_reservation_cannot_displace_hard_beat() -> None:
+    reservation = ("preferred", 2, "later-exact")
+
+    assert not _source_reservation_precedes_candidate(
+        reservation,
+        candidate_priority="hard",
+        candidate_story_order=0,
+        candidate_feature_id="hard-opening",
+    )
+    assert _source_reservation_precedes_candidate(
+        ("hard", 2, "later-hard-exact"),
+        candidate_priority="preferred",
+        candidate_story_order=0,
+        candidate_feature_id="preferred-opening",
+    )
+
+
+def test_static_presentation_does_not_require_reliable_source_motion() -> None:
+    unreliable = SimpleNamespace(reliable=False, isolated_jolt_count=1)
+    static_chapter = {
+        "applied_strategy": "two_panel_layout",
+        "risk_codes": [],
+    }
+    virtual_chapter = {
+        "applied_strategy": "phase_virtual_camera",
+        "risk_codes": [],
+    }
+
+    assert _source_motion_requirement_audited(
+        static_chapter,
+        unreliable,
+    )
+    assert not _source_motion_delivery_failure(
+        static_chapter,
+        unreliable,
+    )
+    assert not _source_motion_requirement_audited(
+        virtual_chapter,
+        unreliable,
+    )
+    assert _source_motion_delivery_failure(
+        virtual_chapter,
+        unreliable,
+    )
+    assert _source_motion_delivery_failure(
+        static_chapter,
+        SimpleNamespace(reliable=True, isolated_jolt_count=1),
+    )
 from jascue_video_lab.cli import build_parser
 from jascue_video_lab.models import (
     FeatureCutExecutionProfile,
@@ -2076,6 +2713,11 @@ def test_horizontal_only_resolves_grouped_exact_event_locks(
     )
 
     class FakeClient:
+        model_id = MODEL_ID
+
+        def exact_event_request_contract_sha256(self) -> str:
+            return "3" * 64
+
         def select_exact_event_locks(
             self,
             *,

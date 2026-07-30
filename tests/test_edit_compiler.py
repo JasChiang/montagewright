@@ -31,6 +31,7 @@ from jascue_video_lab.gemini import (
 from jascue_video_lab.feature_cut import _late_cue_shift_disposition
 from jascue_video_lab.presentation import (
     PresentationTarget,
+    SourceCameraMotionEvidence,
     compile_presentation,
     generate_presentation_options,
 )
@@ -74,6 +75,31 @@ def _target(
         source_asset_id="sha256:" + "a" * 64,
         source_pts=30,
         box_2d=box,
+    )
+
+
+def _static_source_motion() -> SourceCameraMotionEvidence:
+    return SourceCameraMotionEvidence(
+        source_asset_id="sha256:" + "a" * 64,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        sample_times_ms=(0, 2_000),
+        sample_frame_pts=(0, 60),
+        sample_frame_hashes=("b" * 64, "c" * 64),
+        subject_exclusion_mode="none",
+        mean_excluded_area_fraction=0.0,
+        pairs=(),
+        classification="static",
+        reliable=True,
+        confidence=0.95,
+        normalized_translation_x_per_second=0.0,
+        normalized_translation_y_per_second=0.0,
+        scale_rate_per_second=0.0,
+        rotation_degrees_per_second=0.0,
+        normalized_travel=0.0,
+        reversal_count=0,
+        reason_codes=("source_camera_static",),
+        cache_key_sha256="d" * 64,
     )
 
 
@@ -157,6 +183,7 @@ def test_option_generator_exposes_static_and_motivated_virtual_camera() -> None:
         policy=_policy(),
         required_x_values=(0.2, 0.75),
         movement_motivated=True,
+        source_camera_motion_evidence=_static_source_motion(),
     )
     modes = {option.mode for option in options.options}
 
@@ -174,6 +201,7 @@ def test_option_generator_exposes_static_and_motivated_virtual_camera() -> None:
         required_x_values=(0.2, 0.75),
         movement_motivated=True,
         preferred_capability_ids=("phase_virtual_camera",),
+        source_camera_motion_evidence=_static_source_motion(),
     )
     assert compilation.mode == "phase_virtual_camera"
     assert compilation.camera_motion is not None
@@ -192,6 +220,7 @@ def test_semantic_capability_boundary_is_hard_not_a_saved_annotation() -> None:
         policy=_policy(),
         preferred_capability_ids=("solid_matte_fit",),
         acceptable_capability_ids=("static_full_bleed_crop",),
+        source_camera_motion_evidence=_static_source_motion(),
     )
 
     assert compilation.mode == "static_full_bleed_crop"
