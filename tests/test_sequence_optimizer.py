@@ -17,6 +17,8 @@ from jascue_video_lab.sequence_optimizer import (
     CandidateRouteOption,
     MusicBoundaryCue,
     MusicBoundarySpec,
+    RuntimeCueTimingBinding,
+    RuntimeSegmentTiming,
     SegmentRenderCacheKey,
     SegmentRenderRequest,
     SemanticRhythmSpec,
@@ -24,6 +26,7 @@ from jascue_video_lab.sequence_optimizer import (
     concat_manifest_lines,
     optimize_sequence,
     optimize_pre_render_candidate_route,
+    reconcile_runtime_sequence_timing,
     render_segments_incrementally,
     solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
@@ -224,6 +227,158 @@ def test_pre_render_frontier_applies_panel_runtime_policy_before_render() -> Non
     assert route.fallback_candidate_ids_by_beat["comparison"] == (
         "full-bleed",
     )
+
+
+def _runtime_timing(
+    beat_id: str,
+    *,
+    planned_duration_ms: int,
+    actual_duration_ms: int,
+    planned_candidate_id: str | None = None,
+    runtime_candidate_id: str | None = None,
+    cue_bindings: tuple[RuntimeCueTimingBinding, ...] = (),
+) -> RuntimeSegmentTiming:
+    return RuntimeSegmentTiming(
+        beat_id=beat_id,
+        planned_candidate_id=planned_candidate_id or f"{beat_id}-primary",
+        runtime_candidate_id=runtime_candidate_id or f"{beat_id}-primary",
+        source_asset_id="sha256:" + "d" * 64,
+        planned_duration_ms=planned_duration_ms,
+        actual_source_capacity_ms=actual_duration_ms,
+        actual_duration_ms=actual_duration_ms,
+        minimum_readable_ms=min(actual_duration_ms, 5_000),
+        cue_bindings=cue_bindings,
+        input_artifact_hashes=("sha256:" + "e" * 64,),
+    )
+
+
+def test_runtime_substitute_rebases_downstream_boundaries_and_cues() -> None:
+    result = reconcile_runtime_sequence_timing(
+        (
+            _runtime_timing(
+                "opening",
+                planned_duration_ms=6_000,
+                actual_duration_ms=6_000,
+            ),
+            _runtime_timing(
+                "comparison",
+                planned_duration_ms=7_587,
+                actual_duration_ms=6_973,
+                planned_candidate_id="comparison-primary",
+                runtime_candidate_id="comparison-substitute",
+            ),
+            _runtime_timing(
+                "payoff",
+                planned_duration_ms=7_000,
+                actual_duration_ms=7_000,
+                cue_bindings=(
+                    RuntimeCueTimingBinding(
+                        event_id="payoff:stable-result",
+                        cue_id="downbeat-04",
+                        event_offset_ms=1_000,
+                        cue_time_ms=14_587,
+                        tolerance_frames=2,
+                    ),
+                ),
+            ),
+        ),
+        minimum_total_duration_ms=19_000,
+        maximum_total_duration_ms=22_000,
+    )
+
+    substitute = result.segments[1]
+    downstream = result.segments[2]
+    cue = downstream.cue_timings[0]
+    assert result.planned_total_duration_ms == 20_587
+    assert result.resolved_total_duration_ms == 19_973
+    assert result.total_duration_delta_ms == -614
+    assert substitute.duration_delta_ms == -614
+    assert substitute.runtime_substitute_selected is True
+    assert substitute.source_capacity_limited is True
+    assert downstream.planned_project_start_ms == 13_587
+    assert downstream.resolved_project_start_ms == 12_973
+    assert downstream.project_shift_before_ms == -614
+    assert cue.planned_delta_frames == 0
+    assert cue.resolved_delta_frames == -19
+    assert cue.delta_change_frames == -19
+    assert result.outcome == "blocked"
+    assert result.failure_codes == (
+        "payoff:stable-result:runtime_cue_alignment_failed",
+    )
+    assert result.freeze_inserted is False
+    assert result.time_stretch_applied is False
+    assert all(segment.synthetic_fill_ms == 0 for segment in result.segments)
+    assert all(
+        segment.time_stretch_ratio == 1.0 for segment in result.segments
+    )
+
+
+def test_runtime_reconciliation_accepts_shorter_sequence_when_gates_pass() -> None:
+    result = reconcile_runtime_sequence_timing(
+        (
+            _runtime_timing(
+                "setup",
+                planned_duration_ms=5_000,
+                actual_duration_ms=4_500,
+                planned_candidate_id="setup-primary",
+                runtime_candidate_id="setup-substitute",
+            ),
+            _runtime_timing(
+                "result",
+                planned_duration_ms=5_000,
+                actual_duration_ms=5_000,
+                cue_bindings=(
+                    RuntimeCueTimingBinding(
+                        event_id="result:visible",
+                        cue_id="accent-02",
+                        event_offset_ms=500,
+                        cue_time_ms=5_000,
+                        tolerance_frames=0,
+                    ),
+                ),
+            ),
+        ),
+        minimum_total_duration_ms=9_000,
+        maximum_total_duration_ms=11_000,
+    )
+
+    assert result.outcome == "reconciled"
+    assert result.resolved_total_duration_ms == 9_500
+    assert result.segments[1].cue_timings[0].resolved_delta_frames == 0
+    assert result.failure_codes == ()
+    assert len(result.input_sha256) == 64
+
+
+def test_runtime_reconciliation_blocks_unreadable_shortfall_without_fill() -> None:
+    segment = _runtime_timing(
+        "result",
+        planned_duration_ms=7_000,
+        actual_duration_ms=3_000,
+    ).model_copy(update={"minimum_readable_ms": 4_000})
+
+    result = reconcile_runtime_sequence_timing((segment,))
+
+    assert result.outcome == "blocked"
+    assert result.failure_codes == (
+        "result:runtime_duration_below_minimum_readable",
+    )
+    assert result.segments[0].resolved_duration_ms == 3_000
+    assert result.segments[0].synthetic_fill_ms == 0
+    assert result.freeze_inserted is False
+
+
+def test_runtime_timing_rejects_duration_beyond_source_capacity() -> None:
+    with pytest.raises(ValidationError, match="measured source capacity"):
+        RuntimeSegmentTiming(
+            beat_id="comparison",
+            planned_candidate_id="primary",
+            runtime_candidate_id="substitute",
+            source_asset_id="sha256:" + "d" * 64,
+            planned_duration_ms=7_000,
+            actual_source_capacity_ms=6_000,
+            actual_duration_ms=6_500,
+            minimum_readable_ms=5_000,
+        )
 
 
 def _policy(

@@ -42,6 +42,7 @@ from .feature_cut import (
     validate_authorized_selected_window_cue_plan,
     validate_policy_decision_artifact,
 )
+from .event_lock import load_editorial_beat_contracts
 from .final_delivery import (
     assemble_music_only_delivery,
     assemble_picture_only_delivery,
@@ -59,6 +60,7 @@ from .final_edit_qa import (
     run_deterministic_delivery_qa,
     validate_deterministic_evidence_causal_binding,
 )
+from .full_v1 import current_full_clip_card_cache_key
 from .gemini import (
     GeminiLabClient,
     MODEL_ID,
@@ -92,6 +94,33 @@ from .storage import read_json, utc_now, write_json
 
 class DeliveryPipelineBlocked(RuntimeError):
     """The pipeline preserved review artifacts but cannot continue safely."""
+
+
+def _mandatory_paid_stage_minimums(
+    *,
+    policy: AutonomousEditPolicy,
+    editorial_beat_contracts_path: Path | None,
+) -> dict[str, int]:
+    """Reserve graph-derived hard work instead of a guessed call count."""
+
+    minimums = {
+        # Reserve both allowed QA passes. The second remains unused unless a
+        # bounded repair is actually necessary.
+        "final_qa": policy.budget.max_final_qa_passes,
+    }
+    if editorial_beat_contracts_path is None:
+        return minimums
+    contracts = load_editorial_beat_contracts(
+        editorial_beat_contracts_path.expanduser().resolve(strict=True)
+    )
+    exact_event_features = {
+        contract.feature_id
+        for contract in contracts
+        if contract.visual_events
+    }
+    for feature_id in sorted(exact_event_features):
+        minimums[f"exact_event_group:{feature_id}"] = 1
+    return minimums
 
 
 def _prepared_clip_card_library_root(
@@ -137,29 +166,11 @@ def _expected_clip_card_cache_key(
         / "prompts"
         / "full_clip_card_mmss_zh-TW.txt"
     ).read_text(encoding="utf-8")
-    schema_payload = json.dumps(
-        gemini_response_schema(FullClipCard),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    return current_full_clip_card_cache_key(
+        prompt=card_prompt,
+        source_asset_id=source_asset_id,
+        proxy_asset_id=proxy_asset_id,
     )
-    return {
-        "model": MODEL_ID,
-        "prompt_sha256": hashlib.sha256(
-            card_prompt.encode("utf-8")
-        ).hexdigest(),
-        "schema_sha256": hashlib.sha256(
-            schema_payload.encode("utf-8")
-        ).hexdigest(),
-        "system_instruction_sha256": hashlib.sha256(
-            VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
-        ).hexdigest(),
-        "media_resolution": "low",
-        "thinking_level": "low",
-        "max_output_tokens": 4_096,
-        "source_asset_id": source_asset_id,
-        "proxy_asset_id": proxy_asset_id,
-    }
 
 
 def _clip_card_entry_stale_reason(
@@ -421,6 +432,17 @@ def _run_budgeted_planning_stage(
             capture_output=True,
             text=True,
         )
+    except subprocess.CalledProcessError as caught:
+        # ``subprocess.run(check=True)`` raises with the captured process
+        # result attached. Preserve it in the immutable orchestration artifact
+        # instead of replacing the most useful failure evidence with nulls.
+        completed = subprocess.CompletedProcess(
+            args=caught.cmd,
+            returncode=caught.returncode,
+            stdout=caught.stdout,
+            stderr=caught.stderr,
+        )
+        error = caught
     except BaseException as caught:
         error = caught
     finally:
@@ -2081,6 +2103,17 @@ def run_feature_delivery_pipeline(
             reserved_recovery_fraction=(
                 policy.budget.reserved_recovery_fraction
             ),
+            mandatory_stage_minimums=_mandatory_paid_stage_minimums(
+                policy=policy,
+                editorial_beat_contracts_path=(
+                    editorial_beat_contracts_path
+                    if (
+                        autonomous_context_paths is None
+                        and autonomous_context_paths_by_aspect is None
+                    )
+                    else None
+                ),
+            ),
         )
         prior_usage = summarize_usage_and_list_price(resolved_output)
         policy_scoped_prior_requests = [
@@ -2097,8 +2130,31 @@ def run_feature_delivery_pipeline(
             )
         ]
         for request in policy_scoped_prior_requests:
+            saved_path = str(request["path"])
+            saved_parts = Path(saved_path).parts
+            exact_feature = (
+                saved_parts[saved_parts.index("exact-events") + 1]
+                if (
+                    "exact-events" in saved_parts
+                    and saved_parts.index("exact-events") + 1
+                    < len(saved_parts)
+                )
+                else None
+            )
+            resumed_stage = (
+                f"exact_event_group:{exact_feature}"
+                if (
+                    "exact_event_group" in Path(saved_path).name
+                    and exact_feature is not None
+                )
+                else (
+                    "final_qa"
+                    if "final" in saved_path and "qa" in saved_path
+                    else "resumed_artifact"
+                )
+            )
             budget_ledger.adopt_reconciled_usage(
-                stage="resumed_artifact",
+                stage=resumed_stage,
                 model_id=str(request["model"]),
                 usage={
                     "total_input_tokens": request["input_tokens"],

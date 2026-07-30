@@ -92,6 +92,7 @@ from scripts.plan_clip_card_feature_cut import (
     canonicalize_feature_plan_output,
     compact_card,
     compact_card_v3,
+    fit_candidate_video_windows_to_budget,
     project_feature_contracts,
     project_feature_contracts_v3,
     reproject_external_feature_plan,
@@ -279,6 +280,27 @@ def test_candidate_video_budget_fails_before_upload_or_paid_planning() -> None:
             total_duration_ms=360_001,
             maximum_duration_ms=360_000,
         )
+
+
+def test_candidate_video_budget_reduces_context_before_omitting_evidence() -> None:
+    card = _card()
+    event = card.events[0].model_copy(
+        update={"start_mmss": "00:02", "end_mmss": "00:08"}
+    )
+    card = card.model_copy(update={"events": [event]})
+    rows = [{"source_asset_id": ASSET_ID, "event_id": event.event_id}]
+
+    context_ms, total_ms = fit_candidate_video_windows_to_budget(
+        rows=rows,
+        cards={ASSET_ID: card},
+        requested_context_ms=1_000,
+        maximum_total_ms=7_000,
+    )
+
+    assert context_ms == 500
+    assert total_ms == 7_000
+    assert rows[0]["start_ms"] == 1_500
+    assert rows[0]["end_ms"] == 8_500
 
 
 def test_alternate_edit_freshness_changes_only_substitutable_events() -> None:

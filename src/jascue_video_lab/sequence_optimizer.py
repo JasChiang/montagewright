@@ -128,6 +128,387 @@ class CandidateRouteResult(FrozenStrictModel):
     )
 
 
+class RuntimeCueTimingBinding(FrozenStrictModel):
+    """One exact event projected against an immutable output-music cue.
+
+    ``event_offset_ms`` is measured inside the runtime-selected source window,
+    not copied from the pre-render candidate.  The reconciler owns only
+    project-timeline arithmetic; it never moves the source event or the cue.
+    """
+
+    event_id: str = Field(min_length=1)
+    cue_id: str = Field(min_length=1)
+    event_offset_ms: int = Field(ge=0)
+    cue_time_ms: int = Field(ge=0)
+    fps_numerator: int = Field(default=30, gt=0)
+    fps_denominator: int = Field(default=1, gt=0)
+    tolerance_frames: int = Field(default=0, ge=0, le=24)
+    hard_sync: bool = True
+
+
+class RuntimeSegmentTiming(FrozenStrictModel):
+    """Measured timing for one runtime-selected candidate.
+
+    The pre-render duration remains the editorial request.  Source capacity
+    and actual duration are measured runtime facts.  An actual duration may
+    be shorter, but may never be padded beyond the plan, exceed source
+    capacity, or fall back to freeze/time-stretch inside this contract.
+    """
+
+    beat_id: str = Field(min_length=1)
+    planned_candidate_id: str = Field(min_length=1)
+    runtime_candidate_id: str = Field(min_length=1)
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    planned_duration_ms: int = Field(gt=0)
+    actual_source_capacity_ms: int = Field(gt=0)
+    actual_duration_ms: int = Field(gt=0)
+    minimum_readable_ms: int = Field(gt=0)
+    cue_bindings: tuple[RuntimeCueTimingBinding, ...] = ()
+    input_artifact_hashes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_runtime_duration(self) -> "RuntimeSegmentTiming":
+        if self.actual_duration_ms > self.actual_source_capacity_ms:
+            raise ValueError(
+                "runtime duration cannot exceed measured source capacity"
+            )
+        if self.actual_duration_ms > self.planned_duration_ms:
+            raise ValueError(
+                "runtime reconciliation cannot extend a pre-render duration"
+            )
+        if any(
+            binding.event_offset_ms >= self.actual_duration_ms
+            for binding in self.cue_bindings
+        ):
+            raise ValueError(
+                "runtime cue event must lie inside the selected duration"
+            )
+        return self
+
+
+class ReconciledRuntimeCueTiming(FrozenStrictModel):
+    event_id: str
+    cue_id: str
+    planned_project_event_time_ms: int = Field(ge=0)
+    resolved_project_event_time_ms: int = Field(ge=0)
+    cue_time_ms: int = Field(ge=0)
+    planned_delta_frames: int
+    resolved_delta_frames: int
+    delta_change_frames: int
+    tolerance_frames: int = Field(ge=0, le=24)
+    hard_sync: bool
+    passed: bool
+
+    @model_validator(mode="after")
+    def validate_cue_result(self) -> "ReconciledRuntimeCueTiming":
+        if (
+            self.delta_change_frames
+            != self.resolved_delta_frames - self.planned_delta_frames
+        ):
+            raise ValueError("runtime cue delta change is inconsistent")
+        if self.passed != (
+            abs(self.resolved_delta_frames) <= self.tolerance_frames
+        ):
+            raise ValueError("runtime cue pass flag is inconsistent")
+        return self
+
+
+class ReconciledRuntimeSegmentTiming(FrozenStrictModel):
+    beat_id: str
+    planned_candidate_id: str
+    runtime_candidate_id: str
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    planned_project_start_ms: int = Field(ge=0)
+    planned_project_end_ms: int = Field(gt=0)
+    resolved_project_start_ms: int = Field(ge=0)
+    resolved_project_end_ms: int = Field(gt=0)
+    planned_duration_ms: int = Field(gt=0)
+    actual_source_capacity_ms: int = Field(gt=0)
+    resolved_duration_ms: int = Field(gt=0)
+    duration_delta_ms: int
+    project_shift_before_ms: int
+    project_shift_after_ms: int
+    runtime_substitute_selected: bool
+    source_capacity_limited: bool
+    synthetic_fill_ms: Literal[0] = 0
+    time_stretch_ratio: Literal[1.0] = 1.0
+    cue_timings: tuple[ReconciledRuntimeCueTiming, ...] = ()
+    decision_codes: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def validate_boundaries(self) -> "ReconciledRuntimeSegmentTiming":
+        if (
+            self.planned_project_end_ms - self.planned_project_start_ms
+            != self.planned_duration_ms
+        ):
+            raise ValueError("planned project boundaries are inconsistent")
+        if (
+            self.resolved_project_end_ms - self.resolved_project_start_ms
+            != self.resolved_duration_ms
+        ):
+            raise ValueError("resolved project boundaries are inconsistent")
+        if (
+            self.duration_delta_ms
+            != self.resolved_duration_ms - self.planned_duration_ms
+        ):
+            raise ValueError("runtime duration delta is inconsistent")
+        if (
+            self.project_shift_before_ms
+            != self.resolved_project_start_ms
+            - self.planned_project_start_ms
+        ):
+            raise ValueError("runtime project start shift is inconsistent")
+        if (
+            self.project_shift_after_ms
+            != self.resolved_project_end_ms - self.planned_project_end_ms
+        ):
+            raise ValueError("runtime project end shift is inconsistent")
+        return self
+
+
+class RuntimeSequenceTimingReconciliation(FrozenStrictModel):
+    """Auditable replacement of planned timing with measured runtime timing."""
+
+    contract_version: Literal["runtime-sequence-timing-reconciliation-v1"] = (
+        "runtime-sequence-timing-reconciliation-v1"
+    )
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    segments: tuple[ReconciledRuntimeSegmentTiming, ...]
+    planned_total_duration_ms: int = Field(ge=0)
+    resolved_total_duration_ms: int = Field(ge=0)
+    total_duration_delta_ms: int
+    outcome: Literal["unchanged", "reconciled", "blocked"]
+    freeze_inserted: Literal[False] = False
+    time_stretch_applied: Literal[False] = False
+    decision_codes: tuple[str, ...]
+    failure_codes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_totals(self) -> "RuntimeSequenceTimingReconciliation":
+        if (
+            self.total_duration_delta_ms
+            != self.resolved_total_duration_ms
+            - self.planned_total_duration_ms
+        ):
+            raise ValueError("runtime total duration delta is inconsistent")
+        if self.outcome == "blocked" and not self.failure_codes:
+            raise ValueError("blocked runtime reconciliation needs failures")
+        if self.outcome != "blocked" and self.failure_codes:
+            raise ValueError("successful runtime reconciliation has failures")
+        return self
+
+
+def reconcile_runtime_sequence_timing(
+    segments: Sequence[RuntimeSegmentTiming],
+    *,
+    minimum_total_duration_ms: int | None = None,
+    maximum_total_duration_ms: int | None = None,
+) -> RuntimeSequenceTimingReconciliation:
+    """Rebase a pre-render sequence onto measured runtime source durations.
+
+    This is intentionally deterministic and conservative.  It accepts a
+    shorter, already-selected Top-K substitute only at its measured duration,
+    shifts every downstream project boundary, and recomputes exact-event cue
+    deltas.  It never fills the shortfall with a freeze, time-stretch, or an
+    unplanned extension of another segment.
+    """
+
+    if (minimum_total_duration_ms is None) != (
+        maximum_total_duration_ms is None
+    ):
+        raise ValueError("runtime total duration bounds must be supplied together")
+    if (
+        minimum_total_duration_ms is not None
+        and maximum_total_duration_ms is not None
+        and (
+            minimum_total_duration_ms < 1
+            or maximum_total_duration_ms < minimum_total_duration_ms
+        )
+    ):
+        raise ValueError("runtime total duration bounds are invalid")
+    beat_ids = [segment.beat_id for segment in segments]
+    if len(beat_ids) != len(set(beat_ids)):
+        raise ValueError("runtime sequence beat IDs must be unique")
+    event_ids = [
+        binding.event_id
+        for segment in segments
+        for binding in segment.cue_bindings
+    ]
+    if len(event_ids) != len(set(event_ids)):
+        raise ValueError("runtime sequence cue event IDs must be unique")
+
+    input_payload = {
+        "segments": [
+            segment.model_dump(mode="json") for segment in segments
+        ],
+        "minimum_total_duration_ms": minimum_total_duration_ms,
+        "maximum_total_duration_ms": maximum_total_duration_ms,
+    }
+    input_sha256 = hashlib.sha256(
+        json.dumps(
+            input_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    planned_cursor_ms = 0
+    resolved_cursor_ms = 0
+    reconciled: list[ReconciledRuntimeSegmentTiming] = []
+    failures: list[str] = []
+    for segment in segments:
+        planned_start_ms = planned_cursor_ms
+        resolved_start_ms = resolved_cursor_ms
+        planned_end_ms = planned_start_ms + segment.planned_duration_ms
+        resolved_end_ms = resolved_start_ms + segment.actual_duration_ms
+        cue_timings: list[ReconciledRuntimeCueTiming] = []
+        for binding in segment.cue_bindings:
+            planned_event_ms = planned_start_ms + binding.event_offset_ms
+            resolved_event_ms = resolved_start_ms + binding.event_offset_ms
+            planned_delta = _project_cue_delta_frames(
+                project_event_time_ms=planned_event_ms,
+                cue_time_ms=binding.cue_time_ms,
+                fps_numerator=binding.fps_numerator,
+                fps_denominator=binding.fps_denominator,
+            )
+            resolved_delta = _project_cue_delta_frames(
+                project_event_time_ms=resolved_event_ms,
+                cue_time_ms=binding.cue_time_ms,
+                fps_numerator=binding.fps_numerator,
+                fps_denominator=binding.fps_denominator,
+            )
+            passed = abs(resolved_delta) <= binding.tolerance_frames
+            cue_timings.append(
+                ReconciledRuntimeCueTiming(
+                    event_id=binding.event_id,
+                    cue_id=binding.cue_id,
+                    planned_project_event_time_ms=planned_event_ms,
+                    resolved_project_event_time_ms=resolved_event_ms,
+                    cue_time_ms=binding.cue_time_ms,
+                    planned_delta_frames=planned_delta,
+                    resolved_delta_frames=resolved_delta,
+                    delta_change_frames=resolved_delta - planned_delta,
+                    tolerance_frames=binding.tolerance_frames,
+                    hard_sync=binding.hard_sync,
+                    passed=passed,
+                )
+            )
+            if binding.hard_sync and not passed:
+                failures.append(
+                    f"{binding.event_id}:runtime_cue_alignment_failed"
+                )
+        if segment.actual_duration_ms < segment.minimum_readable_ms:
+            failures.append(
+                f"{segment.beat_id}:runtime_duration_below_minimum_readable"
+            )
+        decision_codes = ["measured_runtime_duration_applied"]
+        if (
+            segment.runtime_candidate_id
+            != segment.planned_candidate_id
+        ):
+            decision_codes.append("runtime_substitute_candidate_bound")
+        if segment.actual_duration_ms < segment.planned_duration_ms:
+            decision_codes.append("shortfall_preserved_without_synthetic_fill")
+        else:
+            decision_codes.append("pre_render_duration_preserved")
+        if resolved_start_ms != planned_start_ms:
+            decision_codes.append("downstream_project_boundary_rebased")
+        if cue_timings:
+            decision_codes.append("cue_deltas_recomputed_from_resolved_boundary")
+        reconciled.append(
+            ReconciledRuntimeSegmentTiming(
+                beat_id=segment.beat_id,
+                planned_candidate_id=segment.planned_candidate_id,
+                runtime_candidate_id=segment.runtime_candidate_id,
+                source_asset_id=segment.source_asset_id,
+                planned_project_start_ms=planned_start_ms,
+                planned_project_end_ms=planned_end_ms,
+                resolved_project_start_ms=resolved_start_ms,
+                resolved_project_end_ms=resolved_end_ms,
+                planned_duration_ms=segment.planned_duration_ms,
+                actual_source_capacity_ms=(
+                    segment.actual_source_capacity_ms
+                ),
+                resolved_duration_ms=segment.actual_duration_ms,
+                duration_delta_ms=(
+                    segment.actual_duration_ms - segment.planned_duration_ms
+                ),
+                project_shift_before_ms=(
+                    resolved_start_ms - planned_start_ms
+                ),
+                project_shift_after_ms=resolved_end_ms - planned_end_ms,
+                runtime_substitute_selected=(
+                    segment.runtime_candidate_id
+                    != segment.planned_candidate_id
+                ),
+                source_capacity_limited=(
+                    segment.actual_source_capacity_ms
+                    < segment.planned_duration_ms
+                ),
+                cue_timings=tuple(cue_timings),
+                decision_codes=tuple(decision_codes),
+            )
+        )
+        planned_cursor_ms = planned_end_ms
+        resolved_cursor_ms = resolved_end_ms
+
+    if (
+        minimum_total_duration_ms is not None
+        and resolved_cursor_ms < minimum_total_duration_ms
+    ):
+        failures.append("resolved_total_duration_below_minimum")
+    if (
+        maximum_total_duration_ms is not None
+        and resolved_cursor_ms > maximum_total_duration_ms
+    ):
+        failures.append("resolved_total_duration_above_maximum")
+    changed = resolved_cursor_ms != planned_cursor_ms or any(
+        segment.runtime_substitute_selected for segment in reconciled
+    )
+    outcome: Literal["unchanged", "reconciled", "blocked"]
+    if failures:
+        outcome = "blocked"
+    elif changed:
+        outcome = "reconciled"
+    else:
+        outcome = "unchanged"
+    return RuntimeSequenceTimingReconciliation(
+        input_sha256=input_sha256,
+        segments=tuple(reconciled),
+        planned_total_duration_ms=planned_cursor_ms,
+        resolved_total_duration_ms=resolved_cursor_ms,
+        total_duration_delta_ms=resolved_cursor_ms - planned_cursor_ms,
+        outcome=outcome,
+        decision_codes=(
+            "runtime_source_capacity_audited",
+            "all_project_boundaries_recomputed",
+            "all_bound_cue_deltas_recomputed",
+            "no_freeze_inserted",
+            "no_time_stretch_applied",
+        ),
+        failure_codes=tuple(dict.fromkeys(failures)),
+    )
+
+
+def _project_cue_delta_frames(
+    *,
+    project_event_time_ms: int,
+    cue_time_ms: int,
+    fps_numerator: int,
+    fps_denominator: int,
+) -> int:
+    event_frame = round(
+        project_event_time_ms
+        * fps_numerator
+        / (1_000 * fps_denominator)
+    )
+    cue_frame = round(
+        cue_time_ms * fps_numerator / (1_000 * fps_denominator)
+    )
+    return event_frame - cue_frame
+
+
 class _CandidateRouteState(FrozenStrictModel):
     selections: tuple[CandidateRouteSelection, ...] = ()
     source_asset_ids: tuple[str, ...] = ()

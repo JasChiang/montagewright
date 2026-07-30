@@ -408,11 +408,18 @@ def dense_window_for_event(
     return start, end, shot.shot_id
 
 
-def _cache_fingerprint(prompt: str) -> dict[str, Any]:
+def current_full_clip_card_cache_key(
+    *,
+    prompt: str,
+    source_asset_id: str | None = None,
+    proxy_asset_id: str | None = None,
+) -> dict[str, Any]:
+    """Return the one canonical cache binding for Base Clip Card consumers."""
+
     schema_json = json.dumps(
         gemini_response_schema(FullClipCard), sort_keys=True, separators=(",", ":")
     )
-    return {
+    key: dict[str, Any] = {
         "model": MODEL_ID,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "schema_sha256": hashlib.sha256(schema_json.encode()).hexdigest(),
@@ -423,6 +430,17 @@ def _cache_fingerprint(prompt: str) -> dict[str, Any]:
         "thinking_level": "low",
         "max_output_tokens": 4_096,
     }
+    if source_asset_id is not None:
+        key["source_asset_id"] = source_asset_id
+    if proxy_asset_id is not None:
+        key["proxy_asset_id"] = proxy_asset_id
+    return key
+
+
+def _cache_fingerprint(prompt: str) -> dict[str, Any]:
+    """Backward-compatible internal alias for historical full-clip callers."""
+
+    return current_full_clip_card_cache_key(prompt=prompt)
 
 
 def _saved_request_matches_prompt(run_dir: Path, prompt: str) -> bool:

@@ -48,6 +48,7 @@ from jascue_video_lab.clip_card_supplement_runner import (
     render_bounded_event_proxy,
 )
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
+from jascue_video_lab.full_v1 import current_full_clip_card_cache_key
 from jascue_video_lab.editing_capabilities import (
     EditingCapabilityCatalog,
     autonomous_production_capability_catalog,
@@ -98,27 +99,11 @@ def _expected_clip_card_cache_key(
     card: FullClipCard,
     prompt: str,
 ) -> dict[str, str]:
-    schema = json.dumps(
-        gemini_response_schema(FullClipCard),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    return current_full_clip_card_cache_key(
+        prompt=prompt,
+        source_asset_id=card.source_asset_id,
+        proxy_asset_id=card.proxy_asset_id,
     )
-    return {
-        "model": MODEL_ID,
-        "prompt_sha256": hashlib.sha256(
-            prompt.encode("utf-8")
-        ).hexdigest(),
-        "schema_sha256": hashlib.sha256(
-            schema.encode("utf-8")
-        ).hexdigest(),
-        "system_instruction_sha256": hashlib.sha256(
-            VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
-        ).hexdigest(),
-        "media_resolution": "low",
-        "source_asset_id": card.source_asset_id,
-        "proxy_asset_id": card.proxy_asset_id,
-    }
 
 
 # Keep these two v1 models byte-for-byte schema compatible with the historical
@@ -2231,6 +2216,68 @@ def validate_candidate_video_budget(
             f"planning: {total_duration_ms / 1000:.1f}s > "
             f"{maximum_duration_ms / 1000:.1f}s"
         )
+
+
+def fit_candidate_video_windows_to_budget(
+    *,
+    rows: list[dict[str, Any]],
+    cards: dict[str, FullClipCard],
+    requested_context_ms: int,
+    maximum_total_ms: int,
+) -> tuple[int, int]:
+    """Shrink uniform context handles before omitting selectable evidence.
+
+    The candidate ranks exposed to Gemini must exactly match the videos
+    attached to the request. When bounded windows barely exceed the signed
+    media budget, preserve every event and reduce only symmetric context.
+    """
+
+    if requested_context_ms < 0:
+        raise ValueError("requested_context_ms must be non-negative")
+
+    def apply_context(context_ms: int) -> int:
+        total_ms = 0
+        for row in rows:
+            card = cards[str(row["source_asset_id"])]
+            event = next(
+                item
+                for item in card.events
+                if item.event_id == row["event_id"]
+            )
+            start_ms, end_ms = bounded_event_window_ms(
+                card,
+                event,
+                context_ms=context_ms,
+            )
+            row["start_ms"] = start_ms
+            row["end_ms"] = end_ms
+            row["duration_ms"] = end_ms - start_ms
+            total_ms += end_ms - start_ms
+        return total_ms
+
+    requested_total_ms = apply_context(requested_context_ms)
+    if requested_total_ms <= maximum_total_ms:
+        return requested_context_ms, requested_total_ms
+
+    minimum_total_ms = apply_context(0)
+    validate_candidate_video_budget(
+        total_duration_ms=minimum_total_ms,
+        maximum_duration_ms=maximum_total_ms,
+    )
+    low = 0
+    high = requested_context_ms
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if apply_context(candidate) <= maximum_total_ms:
+            low = candidate
+        else:
+            high = candidate - 1
+    fitted_total_ms = apply_context(low)
+    validate_candidate_video_budget(
+        total_duration_ms=fitted_total_ms,
+        maximum_duration_ms=maximum_total_ms,
+    )
+    return low, fitted_total_ms
 
 
 def project_direct_video_edit_plan(
@@ -4939,29 +4986,15 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                         "retrieval_reason": candidate.retrieval_reason,
                     }
                 )
-        total_evidence_ms = 0
-        for row in selected_direct_evidence.values():
-            card = cards[row["source_asset_id"]]
-            event = next(
-                item
-                for item in card.events
-                if item.event_id == row["event_id"]
-            )
-            start_ms, end_ms = bounded_event_window_ms(
-                card,
-                event,
-                context_ms=context_ms,
-            )
-            row["start_ms"] = start_ms
-            row["end_ms"] = end_ms
-            row["duration_ms"] = end_ms - start_ms
-            total_evidence_ms += end_ms - start_ms
         maximum_evidence_ms = round(
             args.maximum_candidate_video_seconds * 1000
         )
-        validate_candidate_video_budget(
-            total_duration_ms=total_evidence_ms,
-            maximum_duration_ms=maximum_evidence_ms,
+        requested_context_ms = context_ms
+        context_ms, total_evidence_ms = fit_candidate_video_windows_to_budget(
+            rows=list(selected_direct_evidence.values()),
+            cards=cards,
+            requested_context_ms=requested_context_ms,
+            maximum_total_ms=maximum_evidence_ms,
         )
         file_cache_root = (
             args.file_cache_root.expanduser().resolve()
@@ -5047,6 +5080,10 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                 "selection_policy": {
                     "rank_depth_per_chapter": args.candidate_video_depth,
                     "context_ms": context_ms,
+                    "requested_context_ms": requested_context_ms,
+                    "context_reduced_to_fit_budget": (
+                        context_ms < requested_context_ms
+                    ),
                     "maximum_total_ms": maximum_evidence_ms,
                     "editorial_run_mode": args.editorial_run_mode,
                     "prior_edit_plan_sha256": (

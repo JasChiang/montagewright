@@ -67,6 +67,28 @@ def evidence_relation_from_legacy(
     return _LEGACY_EVIDENCE_RELATIONS[provenance]
 
 
+def legacy_evidence_mirror_is_compatible(
+    relation: EvidenceRelation,
+    provenance: FeatureEvidenceProvenance,
+) -> bool:
+    """Accept only exact mirrors or one conservative legacy demotion.
+
+    The legacy enum has no value for a directly observed static state or
+    spatial relation.  Older readers can safely receive ``context_only`` for
+    that case while the generic origin remains authoritative.  The reverse
+    promotion, mediated content marked direct, and every other disagreement
+    remain invalid.
+    """
+
+    if provenance == "unknown":
+        return True
+    projected = evidence_relation_from_legacy(provenance)
+    return projected == relation or (
+        relation == "direct_source_event"
+        and provenance == "context_only"
+    )
+
+
 def _mmss_to_ms(value: str) -> int:
     minutes, seconds = (int(part) for part in value.split(":"))
     return (minutes * 60 + seconds) * 1000
@@ -1248,9 +1270,10 @@ class FullClipEvent(StrictModel):
                 raise ValueError("recommended MM:SS keyframe must be inside [start, end)")
         if (
             self.evidence_origin is not None
-            and self.evidence_provenance != "unknown"
-            and self.evidence_origin.relation
-            != evidence_relation_from_legacy(self.evidence_provenance)
+            and not legacy_evidence_mirror_is_compatible(
+                self.evidence_origin.relation,
+                self.evidence_provenance,
+            )
         ):
             raise ValueError(
                 "legacy evidence_provenance conflicts with generic evidence_origin"

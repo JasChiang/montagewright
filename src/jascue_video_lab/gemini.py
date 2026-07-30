@@ -3505,6 +3505,7 @@ model_provenance (return it unchanged with interaction_id=null):
         input_artifact_hashes: tuple[str, ...],
         evidence_provenance: FeatureEvidenceProvenance | None = None,
         max_bracket_frames: int = 12,
+        budget_stage: str = "exact_event_group",
     ) -> tuple[ExactEventLockV2, ...]:
         """Resolve grouped event locks from supplied IDs without model timecodes."""
 
@@ -3640,7 +3641,7 @@ model_provenance (return it unchanged with interaction_id=null):
         write_json(run_dir / "exact_event.request.json", request_record)
         budget_ledger = getattr(self, "budget_ledger", None)
         estimate = estimate_paid_call(
-            stage="exact_event_group",
+            stage=budget_stage,
             model_id=self.model_id,
             media_resolution=media_resolution,
             image_count=len(bracket),

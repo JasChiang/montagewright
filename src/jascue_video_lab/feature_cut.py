@@ -168,6 +168,7 @@ from .models import (
     VirtualCameraPlan,
     approve_evidence_query_proposal_v2,
     evidence_relation_from_legacy,
+    legacy_evidence_mirror_is_compatible,
 )
 from .overlay import draw_grounding_overlay
 from .presentation import (
@@ -224,6 +225,8 @@ from .sequence_optimizer import (
     MusicBoundarySpec,
     SemanticRhythmSpec,
     SequenceOption,
+    RuntimeSegmentTiming,
+    reconcile_runtime_sequence_timing,
     optimize_sequence,
     optimize_pre_render_candidate_route,
     solve_semantic_rhythm_durations,
@@ -9197,6 +9200,34 @@ def _align_grounded_region_tracks(
     return tracks_by_region, available_soft_regions, optional_region_failures
 
 
+def _grounding_regions_without_preferred_only_batch(
+    *,
+    hard_regions: Sequence[FramingRegionIntent],
+    soft_regions: Sequence[FramingRegionIntent],
+    maximum_targets_per_call: int = 4,
+) -> list[FramingRegionIntent]:
+    """Fill hard-target batches with preferred context without buying another.
+
+    Preferred context may use spare capacity in the final hard-target request,
+    but it must never create a paid request of its own.  This keeps the
+    interaction count proportional to immutable evidence requirements rather
+    than to optional framing decoration.
+    """
+
+    if maximum_targets_per_call < 1:
+        raise ValueError("maximum_targets_per_call must be positive")
+    if not hard_regions:
+        raise ValueError("grounding requires at least one hard-core region")
+    remainder = len(hard_regions) % maximum_targets_per_call
+    spare_slots = (
+        0 if remainder == 0 else maximum_targets_per_call - remainder
+    )
+    return [
+        *hard_regions,
+        *soft_regions[:spare_slots],
+    ]
+
+
 def _identity_seed_reference(
     *,
     track: SegmentationTrack,
@@ -10482,6 +10513,12 @@ def _vertical_candidate_geometry(
     if crop_regions and not hard_regions:
         raise ValueError("candidate region contract has no hard core")
     if crop_regions:
+        paid_grounding_regions = (
+            _grounding_regions_without_preferred_only_batch(
+                hard_regions=hard_regions,
+                soft_regions=soft_regions,
+            )
+        )
         all_proposals, all_tracks, all_debug_paths = _build_framing_region_tracks(
             client=client,
             clip=clip,
@@ -10490,7 +10527,7 @@ def _vertical_candidate_geometry(
             end_ms=end_ms,
             feature_id=feature_id,
             event_description=event_description,
-            regions=crop_regions,
+            regions=paid_grounding_regions,
             checkpoint_path=checkpoint_path,
             grounding_prompt=grounding_prompt,
             output_dir=output_dir,
@@ -10510,7 +10547,7 @@ def _vertical_candidate_geometry(
         ) = _align_grounded_region_tracks(
             proposals=all_proposals,
             tracks=all_tracks,
-            crop_regions=crop_regions,
+            crop_regions=paid_grounding_regions,
             hard_regions=hard_regions,
             soft_regions=soft_regions,
         )
@@ -12720,6 +12757,23 @@ def _runtime_panel_budget_allows(
     ) / planned_total_ms <= maximum_fraction + 1e-9
 
 
+def _select_deferred_vertical_fallback(
+    *,
+    autonomous_profile: bool,
+    panel: dict[str, Any] | None,
+    panel_allowed: bool,
+    review_full_bleed: dict[str, Any] | None,
+    required_scope_fit: dict[str, Any] | None,
+    fit: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Keep review-only center crops out of autonomous delivery."""
+
+    available_panel = panel if panel_allowed else None
+    if autonomous_profile:
+        return available_panel or required_scope_fit or fit
+    return available_panel or review_full_bleed or required_scope_fit or fit
+
+
 def _bind_regions_to_editorial_relation(
     regions: Sequence[FramingRegionIntent],
     contracts: Sequence[EditorialBeatContract],
@@ -13055,9 +13109,9 @@ def _validate_runtime_selected_evidence_v3_event(
             "selected evidence v3 top-level/effective legacy provenance mismatch: "
             f"{event_ref}"
         )
-    if (
-        evidence_relation_from_legacy(effective.evidence_provenance)
-        != top_level_origin.relation
+    if not legacy_evidence_mirror_is_compatible(
+        top_level_origin.relation,
+        effective.evidence_provenance,
     ):
         raise ValueError(
             "selected evidence v3 legacy provenance/evidence origin mismatch: "
@@ -13714,6 +13768,7 @@ def _resolve_selected_window_grouped_exact_event_locks(
             run_dir=dense_root / "resolve",
             input_artifact_hashes=exact_input_hashes,
             evidence_provenance=evidence_provenance,
+            budget_stage=f"exact_event_group:{feature_id}",
         )
     if not locks and exact_event_required:
         fulfillment_selections = _select_runtime_candidate_fulfillments(
@@ -16759,6 +16814,7 @@ def _build_production_sequence_optimization(
     music_supplied: bool,
     candidate_aspect: Literal["16:9", "9:16"] = "9:16",
     pre_render_route: Any | None = None,
+    reconciled_duration_ms_by_beat: Mapping[str, int] | None = None,
 ) -> tuple[Any, tuple[BeatOptionSet, ...]]:
     """Validate the executed frontier against exact production evidence.
 
@@ -16868,12 +16924,18 @@ def _build_production_sequence_optimization(
                 for selection in pre_render_route.selections
                 if selection.beat_id == feature_id
             )
-            if int(chapter["duration_ms"]) != (
-                planned_selection.trim_duration_ms
-            ):
+            expected_duration_ms = (
+                reconciled_duration_ms_by_beat.get(
+                    feature_id,
+                    planned_selection.trim_duration_ms,
+                )
+                if reconciled_duration_ms_by_beat is not None
+                else planned_selection.trim_duration_ms
+            )
+            if int(chapter["duration_ms"]) != expected_duration_ms:
                 raise ValueError(
-                    "executed trim duration differs from the pre-render "
-                    f"sequence frontier for {feature_id}"
+                    "executed trim duration differs from the reconciled "
+                    f"runtime sequence timing for {feature_id}"
                 )
         planned_candidates = (
             selected.horizontal_candidates
@@ -20700,15 +20762,13 @@ def _run_feature_cut_experiment_impl(
                                     "paid_model_calls_added": 0,
                                 }
                             )
-                    selected_vertical = (
-                        (
-                            deferred_panel
-                            if deferred_panel_allowed
-                            else None
-                        )
-                        or deferred_full_bleed
-                        or deferred_required_scope_fit
-                        or deferred_fit
+                    selected_vertical = _select_deferred_vertical_fallback(
+                        autonomous_profile=autonomous_profile,
+                        panel=deferred_panel,
+                        panel_allowed=deferred_panel_allowed,
+                        review_full_bleed=deferred_full_bleed,
+                        required_scope_fit=deferred_required_scope_fit,
+                        fit=deferred_fit,
                     )
                 if selected_vertical is None:
                     # Do not retry the first candidate outside the audited
@@ -21147,6 +21207,10 @@ def _run_feature_cut_experiment_impl(
                                         "evidence_provenance",
                                         "unknown",
                                     )
+                                ),
+                                budget_stage=(
+                                    "exact_event_group:"
+                                    + selected.feature_id
                                 ),
                             )
                         if not locks and exact_event_required:
@@ -22084,6 +22148,136 @@ def _run_feature_cut_experiment_impl(
             if render_horizontal and render_vertical:
                 context_dir = context_dir / audit_aspect
             audit_chapters = manifest[audit_section]["chapters"]
+            active_pre_render_route = (
+                pre_render_candidate_route
+                if render_vertical
+                else pre_render_horizontal_candidate_route
+            )
+            planned_timing_by_feature = (
+                {
+                    selection.beat_id: selection
+                    for selection in active_pre_render_route.selections
+                }
+                if active_pre_render_route is not None
+                else {}
+            )
+            rhythm_timing_by_feature = {
+                chapter.feature_id: chapter
+                for chapter in rhythm_plan.chapters
+            }
+            runtime_timing_segments: list[RuntimeSegmentTiming] = []
+            for chapter in audit_chapters:
+                feature_id = str(chapter["feature_id"])
+                actual_duration_ms = int(chapter.get("duration_ms") or 0)
+                planned_timing = planned_timing_by_feature.get(feature_id)
+                routing = chapter.get("automatic_candidate_selection")
+                runtime_candidate_id = (
+                    str(routing.get("selected_candidate_id"))
+                    if isinstance(routing, Mapping)
+                    and routing.get("selected_candidate_id")
+                    else (
+                        planned_timing.candidate_id
+                        if planned_timing is not None
+                        else "executed"
+                    )
+                )
+                source_clip = clips[str(chapter["source_clip_id"])]
+                rhythm_timing = rhythm_timing_by_feature[feature_id]
+                runtime_timing_segments.append(
+                    RuntimeSegmentTiming(
+                        beat_id=feature_id,
+                        planned_candidate_id=(
+                            planned_timing.candidate_id
+                            if planned_timing is not None
+                            else runtime_candidate_id
+                        ),
+                        runtime_candidate_id=runtime_candidate_id,
+                        source_asset_id=f"sha256:{source_clip.sha256}",
+                        planned_duration_ms=(
+                            planned_timing.trim_duration_ms
+                            if planned_timing is not None
+                            else actual_duration_ms
+                        ),
+                        actual_source_capacity_ms=actual_duration_ms,
+                        actual_duration_ms=actual_duration_ms,
+                        minimum_readable_ms=round(
+                            rhythm_timing.minimum_duration_seconds * 1000
+                        ),
+                        input_artifact_hashes=tuple(
+                            value
+                            for value in (
+                                str(
+                                    chapter.get(
+                                        "segment_render_fingerprint"
+                                    )
+                                    or ""
+                                ),
+                                str(
+                                    chapter.get(
+                                        "track_geometry_fingerprint"
+                                    )
+                                    or ""
+                                ),
+                            )
+                            if value
+                        ),
+                    )
+                )
+            runtime_timing_reconciliation = (
+                reconcile_runtime_sequence_timing(
+                    runtime_timing_segments,
+                    minimum_total_duration_ms=(
+                        autonomous_policy.duration.min_ms
+                    ),
+                    maximum_total_duration_ms=(
+                        autonomous_policy.duration.max_ms
+                    ),
+                )
+            )
+            runtime_timing_path = (
+                context_dir
+                / "runtime-sequence-timing-reconciliation.json"
+            )
+            write_json(
+                runtime_timing_path,
+                runtime_timing_reconciliation,
+            )
+            if runtime_timing_reconciliation.outcome == "blocked":
+                raise ValueError(
+                    "runtime-selected sequence timing failed closed: "
+                    + ",".join(
+                        runtime_timing_reconciliation.failure_codes
+                    )
+                )
+            runtime_timing_by_feature = {
+                segment.beat_id: segment
+                for segment in runtime_timing_reconciliation.segments
+            }
+            event_feature_by_id = {
+                f"{contract.beat_id}:{event.event_type}": str(
+                    contract.feature_id or contract.beat_id
+                )
+                for contract in resolved_editorial_contracts
+                for event in contract.visual_events
+            }
+            for event_id, project_time_ms in tuple(
+                exact_event_project_times_ms.items()
+            ):
+                event_feature = event_feature_by_id.get(event_id)
+                timing = runtime_timing_by_feature.get(
+                    event_feature or ""
+                )
+                if timing is None:
+                    continue
+                resolved_project_time_ms = (
+                    project_time_ms + timing.project_shift_before_ms
+                )
+                exact_event_project_times_ms[event_id] = (
+                    resolved_project_time_ms
+                )
+                exact_event_project_times_ms_by_aspect[
+                    audit_aspect.replace("x", ":")
+                ][event_id] = resolved_project_time_ms
             autonomous_context_paths.update(
                 write_exact_event_bundle(
                     context_dir,
@@ -22125,8 +22319,8 @@ def _run_feature_cut_experiment_impl(
             cue_deltas: dict[str, int] = {}
             cue_tolerances: dict[str, int] = {}
             cue_ids_by_event: dict[str, str] = {}
-            project_duration_ms = round(
-                sum(chapter_durations.values()) * 1000
+            project_duration_ms = (
+                runtime_timing_reconciliation.resolved_total_duration_ms
             )
             if music_lock is not None:
                 for lock in resolved_exact_event_locks:
@@ -22647,6 +22841,12 @@ def _run_feature_cut_experiment_impl(
                         if render_vertical
                         else pre_render_horizontal_candidate_route
                     ),
+                    reconciled_duration_ms_by_beat={
+                        beat_id: timing.resolved_duration_ms
+                        for beat_id, timing in (
+                            runtime_timing_by_feature.items()
+                        )
+                    },
                 )
             )
             sequence_optimization_path = (
@@ -22695,6 +22895,11 @@ def _run_feature_cut_experiment_impl(
                     "runtime_hard_gate_validation": (
                         sequence_optimization.model_dump(mode="json")
                     ),
+                    "runtime_sequence_timing_reconciliation": {
+                        "path": str(runtime_timing_path.resolve()),
+                        "sha256": sha256_file(runtime_timing_path),
+                        "outcome": runtime_timing_reconciliation.outcome,
+                    },
                     "frontier_scope": (
                         "pre_render_sequence_frontier_with_bounded_"
                         "runtime_fallback_and_post_render_validation"

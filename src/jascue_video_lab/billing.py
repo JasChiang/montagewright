@@ -634,7 +634,7 @@ def adopt_paid_dispatch_journals(
 class BudgetLedger:
     """Reserve worst-case paid work, then reconcile immutable usage evidence."""
 
-    contract_version = "budget-ledger-v1"
+    contract_version = "budget-ledger-v2"
 
     def __init__(
         self,
@@ -642,14 +642,42 @@ class BudgetLedger:
         max_cost_usd: float,
         max_interactions: int,
         reserved_recovery_fraction: float = 0.20,
+        mandatory_stage_minimums: Mapping[str, int] | None = None,
     ) -> None:
         if max_cost_usd <= 0 or max_interactions <= 0:
             raise ValueError("budget caps must be positive")
         if not 0.20 <= reserved_recovery_fraction <= 0.50:
             raise ValueError("recovery reserve must be between 20% and 50%")
+        resolved_minimums = (
+            {"final_qa": 1}
+            if mandatory_stage_minimums is None
+            else dict(mandatory_stage_minimums)
+        )
+        normalized_minimums: dict[str, int] = {}
+        for raw_stage, raw_minimum in resolved_minimums.items():
+            stage = str(raw_stage).strip()
+            if not stage:
+                raise ValueError("mandatory budget stage cannot be empty")
+            if isinstance(raw_minimum, bool) or not isinstance(raw_minimum, int):
+                raise ValueError(
+                    "mandatory stage interaction minimums must be integers"
+                )
+            if raw_minimum < 0:
+                raise ValueError(
+                    "mandatory stage interaction minimums cannot be negative"
+                )
+            if raw_minimum:
+                normalized_minimums[stage] = raw_minimum
+        if sum(normalized_minimums.values()) > max_interactions:
+            raise ValueError(
+                "mandatory stage interaction minimums exceed the interaction cap"
+            )
         self.max_cost_usd = max_cost_usd
         self.max_interactions = max_interactions
         self.reserved_recovery_fraction = reserved_recovery_fraction
+        self.mandatory_stage_minimums = dict(
+            sorted(normalized_minimums.items())
+        )
         self._reservations: dict[str, BudgetReservation] = {}
         self.created_at = utc_now()
 
@@ -683,6 +711,60 @@ class BudgetLedger:
             if item.state != "cancelled"
         )
 
+    def _mandatory_hold_stage(self, stage: str) -> str | None:
+        """Resolve a concrete call stage to its most-specific configured hold.
+
+        A hold named ``final_qa`` intentionally covers typed sub-stages such as
+        ``final_qa:autonomous_final_9x16``. Choosing the longest matching name
+        prevents one call from satisfying two overlapping holds.
+        """
+
+        matches = [
+            hold_stage
+            for hold_stage in self.mandatory_stage_minimums
+            if stage == hold_stage or stage.startswith(f"{hold_stage}:")
+        ]
+        return max(matches, key=len) if matches else None
+
+    def _committed_mandatory_interactions(self) -> dict[str, int]:
+        committed = {
+            stage: 0 for stage in self.mandatory_stage_minimums
+        }
+        for reservation in self._reservations.values():
+            if reservation.state == "cancelled":
+                continue
+            hold_stage = self._mandatory_hold_stage(
+                reservation.estimate.stage
+            )
+            if hold_stage is not None:
+                committed[hold_stage] += (
+                    reservation.estimate.worst_case_interactions
+                )
+        return committed
+
+    def remaining_mandatory_interaction_holds(self) -> dict[str, int]:
+        committed = self._committed_mandatory_interactions()
+        return {
+            stage: max(0, minimum - committed[stage])
+            for stage, minimum in self.mandatory_stage_minimums.items()
+        }
+
+    def _interaction_limit_after(
+        self,
+        *,
+        stage: str,
+        interactions: int,
+    ) -> int:
+        committed_by_hold = self._committed_mandatory_interactions()
+        mandatory_hold_stage = self._mandatory_hold_stage(stage)
+        if mandatory_hold_stage is not None:
+            committed_by_hold[mandatory_hold_stage] += interactions
+        remaining_holds = sum(
+            max(0, minimum - committed_by_hold[hold_stage])
+            for hold_stage, minimum in self.mandatory_stage_minimums.items()
+        )
+        return self.max_interactions - remaining_holds
+
     def reserve(
         self,
         estimate: PaidCallEstimate,
@@ -697,18 +779,16 @@ class BudgetLedger:
         projected_interactions = (
             self.committed_interactions + estimate.worst_case_interactions
         )
-        if recovery_call:
+        mandatory_hold_stage = self._mandatory_hold_stage(estimate.stage)
+        if recovery_call or mandatory_hold_stage is not None:
             cost_limit = self.max_cost_usd
-            interaction_limit = self.max_interactions
         else:
             usable_fraction = 1.0 - self.reserved_recovery_fraction
             cost_limit = self.max_cost_usd * usable_fraction
-            # The fraction is a monetary reserve. Interaction cardinality
-            # separately preserves the mandatory first final-QA call. A second
-            # QA/replan remains bounded by the absolute cap and is available
-            # only when earlier stages consume fewer calls.
-            recovery_slots = min(1, max(1, self.max_interactions - 1))
-            interaction_limit = self.max_interactions - recovery_slots
+        interaction_limit = self._interaction_limit_after(
+            stage=estimate.stage,
+            interactions=estimate.worst_case_interactions,
+        )
         failures: list[str] = []
         if projected_cost > cost_limit + 1e-9:
             failures.append(
@@ -784,9 +864,14 @@ class BudgetLedger:
         )
         projected_interactions = self.committed_interactions + 1
         projected_cost = self.actual_cost_usd + cost
-        if projected_interactions > self.max_interactions:
+        interaction_limit = self._interaction_limit_after(
+            stage=stage,
+            interactions=1,
+        )
+        if projected_interactions > interaction_limit:
             raise BudgetExceeded(
-                "persisted paid interactions already exceed the configured cap"
+                "persisted paid interactions consume mandatory future "
+                "interaction holds or exceed the configured cap"
             )
         if projected_cost > self.max_cost_usd + 1e-9:
             raise BudgetExceeded(
@@ -832,10 +917,14 @@ class BudgetLedger:
         )
         projected_interactions = self.committed_interactions + 1
         projected_cost = self.actual_cost_usd + estimate.worst_case_cost_usd
-        if projected_interactions > self.max_interactions:
+        interaction_limit = self._interaction_limit_after(
+            stage=estimate.stage,
+            interactions=1,
+        )
+        if projected_interactions > interaction_limit:
             raise BudgetExceeded(
                 "persisted ambiguous dispatches already exceed the configured "
-                "interaction cap"
+                "interaction headroom"
             )
         if projected_cost > self.max_cost_usd + 1e-9:
             raise BudgetExceeded(
@@ -958,9 +1047,36 @@ class BudgetLedger:
             "max_cost_usd": self.max_cost_usd,
             "max_interactions": self.max_interactions,
             "reserved_recovery_fraction": self.reserved_recovery_fraction,
+            "mandatory_stage_minimums": self.mandatory_stage_minimums,
+            "mandatory_interaction_holds": {
+                stage: {
+                    "minimum_interactions": minimum,
+                    "committed_interactions": (
+                        self._committed_mandatory_interactions()[stage]
+                    ),
+                    "remaining_held_interactions": (
+                        self.remaining_mandatory_interaction_holds()[stage]
+                    ),
+                }
+                for stage, minimum in self.mandatory_stage_minimums.items()
+            },
+            "remaining_held_interactions": sum(
+                self.remaining_mandatory_interaction_holds().values()
+            ),
+            "available_unheld_interactions": max(
+                0,
+                self.max_interactions
+                - self.committed_interactions
+                - sum(
+                    self.remaining_mandatory_interaction_holds().values()
+                ),
+            ),
             "actual_cost_usd": self.actual_cost_usd,
             "active_reserved_cost_usd": self.reserved_cost_usd,
             "committed_interactions": self.committed_interactions,
+            "remaining_interactions": (
+                self.max_interactions - self.committed_interactions
+            ),
             "remaining_cost_usd": round(
                 self.max_cost_usd
                 - self.actual_cost_usd

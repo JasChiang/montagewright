@@ -66,6 +66,7 @@ from jascue_video_lab.feature_cut import (
     _current_external_projection_binding,
     _has_complete_cached_primary_track,
     _horizontal_filter_from_track,
+    _grounding_regions_without_preferred_only_batch,
     _is_exhausted_model_quota_error,
     _is_non_retryable_spending_cap_error,
     _load_trim_decisions,
@@ -87,6 +88,7 @@ from jascue_video_lab.feature_cut import (
     _render_text_layer,
     _requested_render_aspects,
     _runtime_panel_budget_allows,
+    _select_deferred_vertical_fallback,
     _required_track_union,
     _resolve_editorial_chapter_durations,
     _resolve_horizontal_grouped_exact_event_locks,
@@ -3322,6 +3324,97 @@ def test_grounded_track_alignment_preserves_hard_target_after_preferred_omission
             "reason_code": "preferred_grounding_omitted",
         }
     ]
+
+
+def test_preferred_regions_never_open_a_paid_grounding_batch() -> None:
+    hard = [
+        FramingRegionIntent(
+            region_id=f"hard-{index}",
+            target_description=f"required target {index}",
+            role="required",
+            evidence_role="primary_subject",
+        )
+        for index in range(5)
+    ]
+    preferred = [
+        FramingRegionIntent(
+            region_id=f"preferred-{index}",
+            target_description=f"preferred context {index}",
+            role="preferred",
+            evidence_role="context_reference",
+        )
+        for index in range(5)
+    ]
+
+    selected = _grounding_regions_without_preferred_only_batch(
+        hard_regions=hard,
+        soft_regions=preferred,
+    )
+
+    # Five hard targets already require two calls (4 + 1). Only the three
+    # unused slots in that second call may carry preferred context.
+    assert selected == [*hard, *preferred[:3]]
+
+
+def test_full_hard_grounding_batch_omits_all_preferred_regions() -> None:
+    hard = [
+        FramingRegionIntent(
+            region_id=f"hard-{index}",
+            target_description=f"required target {index}",
+            role="required",
+            evidence_role="primary_subject",
+        )
+        for index in range(4)
+    ]
+    preferred = [
+        FramingRegionIntent(
+            region_id="preferred",
+            target_description="preferred context",
+            role="preferred",
+            evidence_role="context_reference",
+        )
+    ]
+
+    assert _grounding_regions_without_preferred_only_batch(
+        hard_regions=hard,
+        soft_regions=preferred,
+    ) == hard
+
+
+def test_autonomous_fallback_never_promotes_review_only_center_crop() -> None:
+    review = {"geometry": {"applied_strategy": "full_bleed_center_crop_review"}}
+    fit = {"geometry": {"applied_strategy": "solid_matte_fit"}}
+
+    assert _select_deferred_vertical_fallback(
+        autonomous_profile=True,
+        panel=None,
+        panel_allowed=True,
+        review_full_bleed=review,
+        required_scope_fit=None,
+        fit=fit,
+    ) is fit
+    assert _select_deferred_vertical_fallback(
+        autonomous_profile=True,
+        panel=None,
+        panel_allowed=True,
+        review_full_bleed=review,
+        required_scope_fit=None,
+        fit=None,
+    ) is None
+
+
+def test_review_profile_preserves_center_crop_fallback_precedence() -> None:
+    review = {"geometry": {"applied_strategy": "full_bleed_center_crop_review"}}
+    fit = {"geometry": {"applied_strategy": "solid_matte_fit"}}
+
+    assert _select_deferred_vertical_fallback(
+        autonomous_profile=False,
+        panel=None,
+        panel_allowed=True,
+        review_full_bleed=review,
+        required_scope_fit=None,
+        fit=fit,
+    ) is review
 
 
 def _portrait_presentation_options(

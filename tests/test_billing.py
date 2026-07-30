@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from jascue_video_lab.billing import (
+    BudgetExceeded,
     BudgetLedger,
     PaidDispatchAlreadyRecorded,
     adopt_paid_dispatch_journals,
@@ -13,6 +14,144 @@ from jascue_video_lab.billing import (
     estimate_paid_call,
     summarize_usage_and_list_price,
 )
+
+
+def _cheap_estimate(stage: str):
+    return estimate_paid_call(
+        stage=stage,
+        model_id="gemini-3.6-flash",
+        text_input_tokens=1,
+        max_output_tokens=1,
+        thinking_level="minimal",
+    )
+
+
+def test_default_budget_hold_preserves_and_automatically_consumes_final_qa_slot(
+) -> None:
+    ledger = BudgetLedger(max_cost_usd=10.0, max_interactions=3)
+
+    ledger.reserve(_cheap_estimate("candidate_reel_plan"))
+    ledger.reserve(_cheap_estimate("exact_event_group"))
+    with pytest.raises(BudgetExceeded, match="interaction reserve"):
+        ledger.reserve(_cheap_estimate("multi_target_grounding"))
+
+    # The typed QA stage consumes the default final_qa hold even when the
+    # caller does not opt into the legacy recovery_call escape hatch.
+    ledger.reserve(_cheap_estimate("final_qa:autonomous_final_9x16"))
+
+    report = ledger.report()
+    assert report["mandatory_stage_minimums"] == {"final_qa": 1}
+    assert report["remaining_held_interactions"] == 0
+    assert report["available_unheld_interactions"] == 0
+    assert report["committed_interactions"] == 3
+
+
+def test_multiple_mandatory_stage_holds_cannot_be_spent_by_other_calls() -> None:
+    ledger = BudgetLedger(
+        max_cost_usd=10.0,
+        max_interactions=6,
+        mandatory_stage_minimums={
+            "exact_event_group": 2,
+            "final_qa": 1,
+        },
+    )
+
+    for _ in range(3):
+        ledger.reserve(_cheap_estimate("candidate_reel_plan"))
+    with pytest.raises(BudgetExceeded, match="interaction reserve"):
+        ledger.reserve(_cheap_estimate("multi_target_grounding"))
+
+    ledger.reserve(_cheap_estimate("exact_event_group"))
+    ledger.reserve(_cheap_estimate("final_qa:autonomous_final_9x16"))
+    report = ledger.report()
+    assert report["remaining_held_interactions"] == 1
+    assert report["mandatory_interaction_holds"]["exact_event_group"] == {
+        "minimum_interactions": 2,
+        "committed_interactions": 1,
+        "remaining_held_interactions": 1,
+    }
+
+    ledger.reserve(_cheap_estimate("exact_event_group"))
+    assert ledger.report()["remaining_held_interactions"] == 0
+
+
+def test_cancelling_mandatory_reservation_restores_its_stage_hold() -> None:
+    ledger = BudgetLedger(
+        max_cost_usd=10.0,
+        max_interactions=2,
+        mandatory_stage_minimums={"exact_event_group": 1},
+    )
+    mandatory = ledger.reserve(_cheap_estimate("exact_event_group"))
+    ledger.cancel_before_dispatch(mandatory.reservation_id)
+
+    report = ledger.report()
+    assert report["committed_interactions"] == 0
+    assert report["remaining_held_interactions"] == 1
+    ledger.reserve(_cheap_estimate("candidate_reel_plan"))
+    with pytest.raises(BudgetExceeded, match="interaction reserve"):
+        ledger.reserve(_cheap_estimate("multi_target_grounding"))
+
+
+def test_resumed_and_conservatively_adopted_calls_consume_stage_holds() -> None:
+    ledger = BudgetLedger(
+        max_cost_usd=10.0,
+        max_interactions=3,
+        mandatory_stage_minimums={
+            "exact_event_group": 1,
+            "final_qa": 1,
+        },
+    )
+    ledger.adopt_reconciled_usage(
+        stage="final_qa:autonomous_final_9x16",
+        model_id="gemini-3.6-flash",
+        usage={
+            "total_input_tokens": 10,
+            "total_cached_tokens": 0,
+            "total_output_tokens": 1,
+            "total_thought_tokens": 0,
+        },
+    )
+    adopted = ledger.adopt_conservative_dispatch(
+        dispatch_id="dispatch-exact-event",
+        estimate=_cheap_estimate("exact_event_group"),
+    )
+    assert (
+        ledger.adopt_conservative_dispatch(
+            dispatch_id="dispatch-exact-event",
+            estimate=_cheap_estimate("exact_event_group"),
+        )
+        is adopted
+    )
+
+    report = ledger.report()
+    assert report["committed_interactions"] == 2
+    assert report["remaining_held_interactions"] == 0
+    assert report["available_unheld_interactions"] == 1
+
+
+def test_resume_cannot_adopt_nonmandatory_work_into_a_mandatory_hold() -> None:
+    ledger = BudgetLedger(max_cost_usd=10.0, max_interactions=2)
+    usage = {
+        "total_input_tokens": 10,
+        "total_cached_tokens": 0,
+        "total_output_tokens": 1,
+        "total_thought_tokens": 0,
+    }
+    ledger.adopt_reconciled_usage(
+        stage="candidate_reel_plan",
+        model_id="gemini-3.6-flash",
+        usage=usage,
+    )
+
+    with pytest.raises(BudgetExceeded, match="mandatory future"):
+        ledger.adopt_reconciled_usage(
+            stage="multi_target_grounding",
+            model_id="gemini-3.6-flash",
+            usage=usage,
+        )
+
+    assert ledger.committed_interactions == 1
+    assert ledger.report()["remaining_held_interactions"] == 1
 
 
 def test_usage_summary_prices_input_output_and_thought_tokens(tmp_path) -> None:

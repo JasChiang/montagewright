@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +27,118 @@ from jascue_video_lab.billing import BudgetLedger
 from jascue_video_lab.cli import build_parser
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.storage import read_json, write_json
+
+
+def test_planner_and_delivery_share_full_clip_card_cache_contract() -> None:
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "plan_clip_card_feature_cut.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "plan_clip_card_feature_cut_contract_test",
+        script_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    card = SimpleNamespace(
+        source_asset_id="sha256:source",
+        proxy_asset_id="sha256:proxy",
+    )
+    prompt = "canonical prompt"
+
+    planner_key = module._expected_clip_card_cache_key(card, prompt)
+    shared_key = module.current_full_clip_card_cache_key(
+        prompt=prompt,
+        source_asset_id=card.source_asset_id,
+        proxy_asset_id=card.proxy_asset_id,
+    )
+
+    assert planner_key == shared_key
+    assert planner_key["thinking_level"] == "low"
+    assert planner_key["max_output_tokens"] == 4_096
+
+
+def test_budgeted_planning_failure_preserves_subprocess_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stage_dir = tmp_path / "planner"
+
+    def fail(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            17,
+            ["planner"],
+            output="planner stdout",
+            stderr="planner stderr",
+        )
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fail)
+    ledger = BudgetLedger(max_cost_usd=1.0, max_interactions=3)
+
+    with pytest.raises(
+        pipeline.DeliveryPipelineBlocked,
+        match="immutable subprocess artifacts",
+    ):
+        pipeline._run_budgeted_planning_stage(
+            command=["planner"],
+            stage="candidate_reel_plan",
+            stage_dir=stage_dir,
+            budget_ledger=ledger,
+            estimated_text_tokens=10,
+        )
+
+    orchestration = read_json(stage_dir / "orchestration.json")
+    assert orchestration["returncode"] == 17
+    assert orchestration["stdout"] == "planner stdout"
+    assert orchestration["stderr"] == "planner stderr"
+    assert ledger.committed_interactions == 0
+
+
+def test_mandatory_budget_holds_are_derived_from_contract_graph(
+    tmp_path: Path,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=50_000,
+            max_ms=70_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+    contracts = tmp_path / "contracts.json"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "autonomous"
+        / "samsung-editorial-beats.json"
+    )
+    contracts.write_bytes(source.read_bytes())
+
+    minimums = pipeline._mandatory_paid_stage_minimums(
+        policy=policy,
+        editorial_beat_contracts_path=contracts,
+    )
+
+    assert minimums["final_qa"] == 2
+    assert {
+        key: value
+        for key, value in minimums.items()
+        if key.startswith("exact_event_group:")
+    } == {
+        "exact_event_group:closing": 1,
+        "exact_event_group:fold8_camera": 1,
+        "exact_event_group:galaxy_ai": 1,
+        "exact_event_group:watch9": 1,
+        "exact_event_group:watch_ultra2": 1,
+    }
 
 
 def test_autonomous_delivery_cli_accepts_explicit_no_music_mode() -> None:

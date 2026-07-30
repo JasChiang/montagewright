@@ -18,6 +18,7 @@ from .models import (
     FullClipEvent,
     ModelProvenance,
     evidence_relation_from_legacy,
+    legacy_evidence_mirror_is_compatible,
 )
 
 
@@ -213,9 +214,10 @@ class EventObservationSupplement(FrozenStrictModel):
                 raise ValueError(f"{capability} payload conflicts with status {status}")
         if (
             self.evidence_origin is not None
-            and self.evidence_provenance != "unknown"
-            and self.evidence_origin.relation
-            != evidence_relation_from_legacy(self.evidence_provenance)
+            and not legacy_evidence_mirror_is_compatible(
+                self.evidence_origin.relation,
+                self.evidence_provenance,
+            )
         ):
             raise ValueError(
                 "legacy evidence_provenance conflicts with generic evidence_origin"

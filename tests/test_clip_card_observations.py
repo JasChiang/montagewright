@@ -250,6 +250,23 @@ def test_base_clip_event_rejects_conflicting_legacy_and_generic_origin() -> None
         raise AssertionError("conflicting base evidence origins were accepted")
 
 
+def test_base_clip_event_allows_conservative_legacy_context_mirror() -> None:
+    payload = _card().events[0].model_dump(mode="json")
+    payload["evidence_provenance"] = "context_only"
+    payload["evidence_origin"] = {
+        "relation": "direct_source_event",
+        "observable_reason": (
+            "A static object state is directly visible in the source scene."
+        ),
+    }
+
+    event = FullClipEvent.model_validate(payload)
+
+    assert event.evidence_origin is not None
+    assert event.evidence_origin.relation == "direct_source_event"
+    assert event.evidence_provenance == "context_only"
+
+
 def test_legacy_v1_supplement_remains_readable() -> None:
     card = _card()
     payload = _supplement(card).model_dump(mode="json")
