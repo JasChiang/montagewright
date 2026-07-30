@@ -147,6 +147,7 @@ from jascue_video_lab.models import (
 from jascue_video_lab.final_edit_qa import DeterministicDeliveryEvidence
 from jascue_video_lab.sequence_optimizer import CandidateRouteOption
 from jascue_video_lab.sequence_optimizer import (
+    CandidateCompleteRoute,
     CandidateRouteBeat,
     CandidateRouteSelection,
     RoundRobinFrontierBeat,
@@ -155,21 +156,149 @@ from jascue_video_lab.sequence_optimizer import (
     initialize_round_robin_frontier,
     next_round_robin_frontier_attempt,
     optimize_pre_render_candidate_route,
+    select_next_compatible_route,
 )
+
+
+def _complete_route_for_execution_compatibility(
+    route_marker: str,
+    execution_sha256_by_beat: dict[str, str],
+) -> CandidateCompleteRoute:
+    selections = tuple(
+        CandidateRouteSelection(
+            beat_id=beat_id,
+            candidate_id=f"candidate-{beat_id}",
+            source_asset_id="sha256:" + route_marker * 64,
+            event_id=f"event-{beat_id}",
+            trim_duration_ms=1_000,
+            cue_id=f"cue-{beat_id}",
+            cue_aligned=True,
+            presentation_mode="static_full_bleed_crop",
+            entry_composition="center",
+            exit_composition="center",
+            decision_codes=("test_execution_binding",),
+            source_in_ms=0,
+            source_out_ms=1_000,
+            candidate_execution_sha256=execution_sha256,
+        )
+        for beat_id, execution_sha256 in execution_sha256_by_beat.items()
+    )
+    return CandidateCompleteRoute(
+        route_id=route_marker * 64,
+        selections=selections,
+        objective_score=1.0,
+        total_duration_ms=len(selections) * 1_000,
+        panel_duration_ms=0,
+    )
+
+
+def test_deferred_execution_requires_one_compatible_complete_route() -> None:
+    accepted_execution = "a" * 64
+    compatible_deferred = "b" * 64
+    incompatible_accepted = "c" * 64
+    incompatible_deferred = "d" * 64
+    routes = (
+        _complete_route_for_execution_compatibility(
+            "1",
+            {
+                "accepted-beat": accepted_execution,
+                "deferred-beat": compatible_deferred,
+            },
+        ),
+        _complete_route_for_execution_compatibility(
+            "2",
+            {
+                "accepted-beat": incompatible_accepted,
+                "deferred-beat": incompatible_deferred,
+            },
+        ),
+    )
+
+    compatible = select_next_compatible_route(
+        routes,
+        accepted_execution_sha256_by_beat={
+            "accepted-beat": accepted_execution,
+            "deferred-beat": compatible_deferred,
+        },
+    )
+    incompatible = select_next_compatible_route(
+        routes,
+        accepted_execution_sha256_by_beat={
+            "accepted-beat": accepted_execution,
+            "deferred-beat": incompatible_deferred,
+        },
+    )
+
+    assert compatible is routes[0]
+    assert incompatible is None
+
+
+def test_resume_never_reselects_consumed_inactive_execution() -> None:
+    accepted_execution = "a" * 64
+    consumed_execution = "b" * 64
+    available_execution = "c" * 64
+    routes = (
+        _complete_route_for_execution_compatibility(
+            "1",
+            {
+                "accepted-beat": accepted_execution,
+                "pending-beat": consumed_execution,
+            },
+        ),
+        _complete_route_for_execution_compatibility(
+            "2",
+            {
+                "accepted-beat": accepted_execution,
+                "pending-beat": available_execution,
+            },
+        ),
+    )
+
+    resumed = select_next_compatible_route(
+        routes,
+        accepted_execution_sha256_by_beat={
+            "accepted-beat": accepted_execution,
+        },
+        unavailable_execution_sha256s=(consumed_execution,),
+    )
+    exhausted = select_next_compatible_route(
+        routes,
+        accepted_execution_sha256_by_beat={
+            "accepted-beat": accepted_execution,
+        },
+        unavailable_execution_sha256s=(
+            consumed_execution,
+            available_execution,
+        ),
+    )
+
+    assert resumed is routes[1]
+    assert exhausted is None
 
 
 def _write_frozen_vertical_render_fixture(
     tmp_path: Path,
     *,
     accepted: bool,
-) -> tuple[Path, str, str]:
+) -> tuple[Path, str, str, str]:
     frontier_root = tmp_path / "vertical-frontier"
     feature_id = "beat-a"
     candidate_id = "candidate-a1"
-    beat = _production_frontier_beat(
-        feature_id,
-        0,
-        (candidate_id, True),
+    candidate_execution_sha256 = "d" * 64
+    beat = RoundRobinFrontierBeat(
+        beat_id=feature_id,
+        story_order=0,
+        candidates=(
+            RoundRobinFrontierCandidate(
+                beat_id=feature_id,
+                candidate_id=candidate_id,
+                candidate_execution_sha256=(
+                    candidate_execution_sha256
+                ),
+                candidate_order=0,
+                requires_exact_event=True,
+            ),
+        ),
     )
     state_path = frontier_root / "state.json"
     if accepted:
@@ -186,7 +315,12 @@ def _write_frozen_vertical_render_fixture(
             initialize_round_robin_frontier((beat,)),
         )
 
-    candidate_root = frontier_root / feature_id / candidate_id
+    candidate_root = (
+        frontier_root
+        / feature_id
+        / candidate_id
+        / f"execution-{candidate_execution_sha256}"
+    )
     stage_paths = {
         stage: candidate_root / f"{stage}.json"
         for stage in ("local", "exact", "geometry")
@@ -199,9 +333,15 @@ def _write_frozen_vertical_render_fixture(
         "route_sha256": "sha256:" + "b" * 64,
         "state_sha256": sha256_file(state_path),
         "selected_candidate_ids": {feature_id: candidate_id},
+        "selected_candidate_execution_sha256s": {
+            feature_id: candidate_execution_sha256
+        },
         "selected_candidates": {
             feature_id: {
                 "candidate_id": candidate_id,
+                "candidate_execution_sha256": (
+                    candidate_execution_sha256
+                ),
                 "local_artifact_sha256": sha256_file(
                     stage_paths["local"]
                 ),
@@ -225,6 +365,7 @@ def _write_frozen_vertical_render_fixture(
         artifact_path=candidate_root / "finalized.json",
         beat_id=feature_id,
         candidate_id=candidate_id,
+        candidate_execution_sha256=candidate_execution_sha256,
         stage="finalize",
         dependency_hashes=(
             sha256_file(frontier_root / "selection.json"),
@@ -235,13 +376,18 @@ def _write_frozen_vertical_render_fixture(
         route_sha256="sha256:" + "b" * 64,
         producer=lambda: {"runtime_selection": "frozen"},
     )
-    return frontier_root, feature_id, candidate_id
+    return (
+        frontier_root,
+        feature_id,
+        candidate_id,
+        candidate_execution_sha256,
+    )
 
 
 def test_frozen_vertical_render_selection_accepts_complete_lineage(
     tmp_path: Path,
 ) -> None:
-    frontier_root, feature_id, candidate_id = (
+    frontier_root, feature_id, candidate_id, execution_sha256 = (
         _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
     )
 
@@ -249,6 +395,7 @@ def test_frozen_vertical_render_selection_accepts_complete_lineage(
         frontier_root=frontier_root,
         feature_id=feature_id,
         candidate_id=candidate_id,
+        candidate_execution_sha256=execution_sha256,
     )
 
     assert selection["selected_candidate_ids"] == {
@@ -259,7 +406,7 @@ def test_frozen_vertical_render_selection_accepts_complete_lineage(
 def test_vertical_render_batch_waits_for_every_finalizer(
     tmp_path: Path,
 ) -> None:
-    frontier_root, feature_id, candidate_id = (
+    frontier_root, feature_id, candidate_id, execution_sha256 = (
         _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
     )
 
@@ -268,6 +415,7 @@ def test_vertical_render_batch_waits_for_every_finalizer(
         frontier_root
         / feature_id
         / candidate_id
+        / f"execution-{execution_sha256}"
         / "finalized.json"
     ).unlink()
 
@@ -281,7 +429,7 @@ def test_vertical_render_batch_waits_for_every_finalizer(
 def test_frozen_vertical_render_selection_rejects_pending_state(
     tmp_path: Path,
 ) -> None:
-    frontier_root, feature_id, candidate_id = (
+    frontier_root, feature_id, candidate_id, execution_sha256 = (
         _write_frozen_vertical_render_fixture(tmp_path, accepted=False)
     )
 
@@ -290,13 +438,14 @@ def test_frozen_vertical_render_selection_rejects_pending_state(
             frontier_root=frontier_root,
             feature_id=feature_id,
             candidate_id=candidate_id,
+            candidate_execution_sha256=execution_sha256,
         )
 
 
 def test_frozen_vertical_render_selection_rejects_candidate_mismatch(
     tmp_path: Path,
 ) -> None:
-    frontier_root, feature_id, _candidate_id = (
+    frontier_root, feature_id, _candidate_id, execution_sha256 = (
         _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
     )
 
@@ -305,13 +454,14 @@ def test_frozen_vertical_render_selection_rejects_candidate_mismatch(
             frontier_root=frontier_root,
             feature_id=feature_id,
             candidate_id="different-candidate",
+            candidate_execution_sha256=execution_sha256,
         )
 
 
 def test_frozen_vertical_render_selection_rejects_state_tamper(
     tmp_path: Path,
 ) -> None:
-    frontier_root, feature_id, candidate_id = (
+    frontier_root, feature_id, candidate_id, execution_sha256 = (
         _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
     )
     state_path = frontier_root / "state.json"
@@ -324,6 +474,7 @@ def test_frozen_vertical_render_selection_rejects_state_tamper(
             frontier_root=frontier_root,
             feature_id=feature_id,
             candidate_id=candidate_id,
+            candidate_execution_sha256=execution_sha256,
         )
 
 
@@ -332,13 +483,14 @@ def test_frozen_vertical_render_selection_rejects_stage_artifact_tamper(
     tmp_path: Path,
     stage: str,
 ) -> None:
-    frontier_root, feature_id, candidate_id = (
+    frontier_root, feature_id, candidate_id, execution_sha256 = (
         _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
     )
     (
         frontier_root
         / feature_id
         / candidate_id
+        / f"execution-{execution_sha256}"
         / f"{stage}.json"
     ).write_text('{"tampered":true}', encoding="utf-8")
 
@@ -347,6 +499,7 @@ def test_frozen_vertical_render_selection_rejects_stage_artifact_tamper(
             frontier_root=frontier_root,
             feature_id=feature_id,
             candidate_id=candidate_id,
+            candidate_execution_sha256=execution_sha256,
         )
 
 
@@ -478,6 +631,7 @@ def _frontier_stage_artifact_kwargs(
         "artifact_path": tmp_path / "frontier-stage.json",
         "beat_id": "beat-a",
         "candidate_id": "candidate-a1",
+        "candidate_execution_sha256": "e" * 64,
         "stage": "exact_event",
         "dependency_hashes": (
             "sha256:" + "a" * 64,
@@ -523,6 +677,7 @@ def test_frontier_stage_artifact_produces_once_and_resumes(
             ("sha256:" + "f" * 64,),
         ),
         ("policy_reference", "sha256:" + "e" * 64),
+        ("candidate_execution_sha256", "f" * 64),
     ),
 )
 def test_frontier_stage_artifact_rejects_binding_mismatch(
@@ -581,6 +736,9 @@ def test_frontier_stage_load_only_missing_artifact_never_dispatches(
             artifact_path=kwargs["artifact_path"],
             beat_id=str(kwargs["beat_id"]),
             candidate_id=str(kwargs["candidate_id"]),
+            candidate_execution_sha256=str(
+                kwargs["candidate_execution_sha256"]
+            ),
             stage=str(kwargs["stage"]),
             dependency_hashes=kwargs["dependency_hashes"],
             policy_reference=str(kwargs["policy_reference"]),

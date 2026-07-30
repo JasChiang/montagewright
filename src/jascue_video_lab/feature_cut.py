@@ -242,6 +242,7 @@ from .sequence_optimizer import (
     next_round_robin_frontier_attempt,
     record_round_robin_frontier_attempt,
     reconcile_runtime_sequence_timing,
+    select_next_compatible_route,
     optimize_sequence,
     optimize_pre_render_candidate_route,
     solve_semantic_rhythm_durations,
@@ -294,19 +295,58 @@ class FeatureCutSystemFailure(RuntimeError):
     """A wiring, artifact, tool, or invariant failure that stops the run."""
 
 
+def _frontier_execution_key(
+    beat_id: str,
+    candidate_id: str,
+    candidate_execution_sha256: str | None,
+) -> tuple[str, str, str]:
+    return (
+        beat_id,
+        candidate_id,
+        candidate_execution_sha256 or "legacy",
+    )
+
+
+def _frontier_execution_dir(
+    frontier_root: Path,
+    *,
+    beat_id: str,
+    candidate_id: str,
+    candidate_execution_sha256: str | None,
+) -> Path:
+    execution_component = (
+        candidate_execution_sha256
+        if candidate_execution_sha256 is not None
+        else "legacy"
+    )
+    return (
+        frontier_root
+        / beat_id
+        / candidate_id
+        / f"execution-{execution_component}"
+    )
+
+
 def _run_persisted_production_frontier(
     *,
     state_path: Path,
     beats: Sequence[RoundRobinFrontierBeat] | None,
     local_preflight: Callable[[RoundRobinFrontierAttempt], None],
     exact_event: Callable[[RoundRobinFrontierAttempt], None],
-    grounding: Callable[[RoundRobinFrontierAttempt], str | None],
+    grounding: Callable[
+        [RoundRobinFrontierAttempt],
+        str | tuple[str, str] | None,
+    ],
     resolve_deferred_on_exhaustion: (
-        Callable[[str], str | None] | None
+        Callable[[str], str | tuple[str, str] | None] | None
     ) = None,
     allow_beat_omission: Callable[[str], bool] | None = None,
     on_frontier_frozen: (
         Callable[[RoundRobinFrontierState, Mapping[str, str]], None] | None
+    ) = None,
+    on_candidate_infeasible: (
+        Callable[[RoundRobinFrontierAttempt, CandidateKnownInfeasible], None]
+        | None
     ) = None,
     paid_interaction_counter: Callable[[], int] | None = None,
 ) -> Mapping[str, str]:
@@ -383,6 +423,7 @@ def _run_persisted_production_frontier(
         attempt := next_round_robin_frontier_attempt(state)
     ) is not None:
         accepted_candidate_id: str | None = None
+        accepted_candidate_execution_sha256: str | None = None
         beat_omitted = False
         paid_count_before = (
             paid_interaction_counter()
@@ -390,7 +431,14 @@ def _run_persisted_production_frontier(
             else None
         )
         try:
-            accepted_candidate_id = callbacks[attempt.stage](attempt)
+            callback_result = callbacks[attempt.stage](attempt)
+            if isinstance(callback_result, tuple):
+                (
+                    accepted_candidate_id,
+                    accepted_candidate_execution_sha256,
+                ) = callback_result
+            else:
+                accepted_candidate_id = callback_result
             if (
                 accepted_candidate_id is not None
                 and attempt.stage != "grounding"
@@ -401,6 +449,8 @@ def _run_persisted_production_frontier(
             outcome = pass_outcomes[attempt.stage]
             decision_codes = (f"{attempt.stage}_passed",)
         except CandidateKnownInfeasible as error:
+            if on_candidate_infeasible is not None:
+                on_candidate_infeasible(attempt, error)
             outcome = failure_outcomes[attempt.stage]
             decision_codes = (
                 f"{attempt.stage}_candidate_known_infeasible",
@@ -416,9 +466,16 @@ def _run_persisted_production_frontier(
                 and beat_state.candidate_cursor + 1
                 >= len(beat_state.beat.candidates)
             ):
-                accepted_candidate_id = (
+                deferred_result = (
                     resolve_deferred_on_exhaustion(attempt.beat_id)
                 )
+                if isinstance(deferred_result, tuple):
+                    (
+                        accepted_candidate_id,
+                        accepted_candidate_execution_sha256,
+                    ) = deferred_result
+                else:
+                    accepted_candidate_id = deferred_result
                 if accepted_candidate_id is not None:
                     decision_codes = (
                         *decision_codes,
@@ -452,6 +509,9 @@ def _run_persisted_production_frontier(
                 attempt=attempt,
                 outcome=outcome,
                 accepted_candidate_id=accepted_candidate_id,
+                accepted_candidate_execution_sha256=(
+                    accepted_candidate_execution_sha256
+                ),
                 beat_omitted=beat_omitted,
                 decision_codes=decision_codes,
                 paid_calls_added=paid_calls_added,
@@ -499,6 +559,7 @@ def _frontier_stage_binding_sha256(
     *,
     beat_id: str,
     candidate_id: str,
+    candidate_execution_sha256: str | None = None,
     stage: str,
     dependency_hashes: Sequence[str],
     policy_reference: str,
@@ -512,16 +573,25 @@ def _frontier_stage_binding_sha256(
     the artifact as audit metadata and is bound by the frozen selection.
     """
 
+    binding = {
+        "contract_version": (
+            "vertical-frontier-stage-binding-v3"
+            if candidate_execution_sha256 is not None
+            else "vertical-frontier-stage-binding-v2"
+        ),
+        "beat_id": beat_id,
+        "candidate_id": candidate_id,
+        "stage": stage,
+        "dependency_hashes": list(dependency_hashes),
+        "policy_reference": policy_reference,
+    }
+    if candidate_execution_sha256 is not None:
+        binding["candidate_execution_sha256"] = (
+            candidate_execution_sha256
+        )
     return hashlib.sha256(
         json.dumps(
-            {
-                "contract_version": "vertical-frontier-stage-binding-v2",
-                "beat_id": beat_id,
-                "candidate_id": candidate_id,
-                "stage": stage,
-                "dependency_hashes": list(dependency_hashes),
-                "policy_reference": policy_reference,
-            },
+            binding,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -563,6 +633,7 @@ def _load_or_create_frontier_stage_artifact(
     artifact_path: Path,
     beat_id: str,
     candidate_id: str,
+    candidate_execution_sha256: str | None = None,
     stage: str,
     dependency_hashes: Sequence[str],
     policy_reference: str,
@@ -580,6 +651,7 @@ def _load_or_create_frontier_stage_artifact(
     binding_sha256 = _frontier_stage_binding_sha256(
         beat_id=beat_id,
         candidate_id=candidate_id,
+        candidate_execution_sha256=candidate_execution_sha256,
         stage=stage,
         dependency_hashes=dependency_hashes,
         policy_reference=policy_reference,
@@ -616,6 +688,11 @@ def _load_or_create_frontier_stage_artifact(
             or saved.get("beat_id") != beat_id
             or saved.get("candidate_id") != candidate_id
             or saved.get("stage") != stage
+            or (
+                saved.get("candidate_execution_sha256") is not None
+                and saved.get("candidate_execution_sha256")
+                != candidate_execution_sha256
+            )
         ):
             raise FeatureCutSystemFailure(
                 "persisted vertical frontier stage artifact has stale or "
@@ -645,6 +722,9 @@ def _load_or_create_frontier_stage_artifact(
         saved_v2_binding = _frontier_stage_binding_sha256(
             beat_id=beat_id,
             candidate_id=candidate_id,
+            candidate_execution_sha256=(
+                saved.get("candidate_execution_sha256")
+            ),
             stage=stage,
             dependency_hashes=saved_dependency_hashes,
             policy_reference=saved_policy_reference,
@@ -670,6 +750,11 @@ def _load_or_create_frontier_stage_artifact(
         bindings_are_stale = (
             saved_dependency_hashes != list(dependency_hashes)
             or saved_policy_reference != policy_reference
+            or (
+                saved.get("candidate_execution_sha256") is not None
+                and saved.get("candidate_execution_sha256")
+                != candidate_execution_sha256
+            )
         )
         if bindings_are_stale:
             if stage != "local_preflight":
@@ -726,6 +811,9 @@ def _load_or_create_frontier_stage_artifact(
                         "artifact_sha256": sha256_file(artifact_path),
                         "beat_id": beat_id,
                         "candidate_id": candidate_id,
+                        "candidate_execution_sha256": (
+                            candidate_execution_sha256
+                        ),
                         "stage": stage,
                         "verified_legacy_binding_sha256": legacy_binding,
                         "current_binding_sha256": binding_sha256,
@@ -751,9 +839,14 @@ def _load_or_create_frontier_stage_artifact(
         "contract_version": "vertical-frontier-stage-artifact-v1",
         "beat_id": beat_id,
         "candidate_id": candidate_id,
+        "candidate_execution_sha256": candidate_execution_sha256,
         "stage": stage,
         "binding_sha256": binding_sha256,
-        "binding_contract_version": "vertical-frontier-stage-binding-v2",
+        "binding_contract_version": (
+            "vertical-frontier-stage-binding-v3"
+            if candidate_execution_sha256 is not None
+            else "vertical-frontier-stage-binding-v2"
+        ),
         "dependency_hashes": list(dependency_hashes),
         "policy_reference": policy_reference,
         "route_sha256": route_sha256,
@@ -777,6 +870,7 @@ def _load_existing_frontier_stage_artifact(
     artifact_path: Path,
     beat_id: str,
     candidate_id: str,
+    candidate_execution_sha256: str | None = None,
     stage: str,
     dependency_hashes: Sequence[str],
     policy_reference: str,
@@ -799,6 +893,7 @@ def _load_existing_frontier_stage_artifact(
         artifact_path=artifact_path,
         beat_id=beat_id,
         candidate_id=candidate_id,
+        candidate_execution_sha256=candidate_execution_sha256,
         stage=stage,
         dependency_hashes=dependency_hashes,
         policy_reference=policy_reference,
@@ -812,6 +907,7 @@ def _validate_frozen_vertical_render_selection(
     frontier_root: Path,
     feature_id: str,
     candidate_id: str,
+    candidate_execution_sha256: str,
 ) -> Mapping[str, Any]:
     """Prove that rendering consumes the exact frozen stage artifacts."""
 
@@ -827,12 +923,21 @@ def _validate_frozen_vertical_render_selection(
     selected_candidate_ids = dict(
         selection.get("selected_candidate_ids", {})
     )
+    selected_candidate_execution_sha256s = dict(
+        selection.get("selected_candidate_execution_sha256s", {})
+    )
     omitted_feature_ids = set(selection.get("omitted_feature_ids", ()))
     state_selected_candidate_ids = {
         row.beat.beat_id: row.accepted_candidate_id
         for row in state.beats
         if row.status == "accepted"
         and row.accepted_candidate_id is not None
+    }
+    state_selected_candidate_execution_sha256s = {
+        row.beat.beat_id: row.accepted_candidate_execution_sha256
+        for row in state.beats
+        if row.status == "accepted"
+        and row.accepted_candidate_execution_sha256 is not None
     }
     state_omitted_feature_ids = {
         row.beat.beat_id
@@ -845,6 +950,8 @@ def _validate_frozen_vertical_render_selection(
             for row in state.beats
         )
         or state_selected_candidate_ids != selected_candidate_ids
+        or state_selected_candidate_execution_sha256s
+        != selected_candidate_execution_sha256s
         or state_omitted_feature_ids != omitted_feature_ids
     )
     omission_reconciliation_path = (
@@ -900,7 +1007,12 @@ def _validate_frozen_vertical_render_selection(
         "selected_candidates",
         {},
     ).get(feature_id, {})
-    candidate_root = frontier_root / feature_id / candidate_id
+    candidate_root = _frontier_execution_dir(
+        frontier_root,
+        beat_id=feature_id,
+        candidate_id=candidate_id,
+        candidate_execution_sha256=candidate_execution_sha256,
+    )
     finalized_path = candidate_root / "finalized.json"
     finalized = (
         read_json(finalized_path)
@@ -924,6 +1036,10 @@ def _validate_frozen_vertical_render_selection(
         or not selection.get("render_permitted")
         or selected_candidate_ids.get(feature_id)
         != candidate_id
+        or selected_candidate_execution_sha256s.get(feature_id)
+        != candidate_execution_sha256
+        or candidate_binding.get("candidate_execution_sha256")
+        != candidate_execution_sha256
         or candidate_binding.get("local_artifact_sha256")
         != sha256_file(candidate_root / "local.json")
         or candidate_binding.get("exact_artifact_sha256")
@@ -954,18 +1070,26 @@ def _validate_all_vertical_finalizers_ready(
     """Block the first segment render until every selected beat finalized."""
 
     selection = read_json(frontier_root / "selection.json")
-    missing = [
-        feature_id
-        for feature_id, candidate_id in dict(
-            selection.get("selected_candidate_ids", {})
-        ).items()
-        if not (
-            frontier_root
-            / feature_id
-            / candidate_id
+    selected_execution_sha256s = dict(
+        selection.get("selected_candidate_execution_sha256s", {})
+    )
+    missing = []
+    for feature_id, candidate_id in dict(
+        selection.get("selected_candidate_ids", {})
+    ).items():
+        candidate_execution_sha256 = selected_execution_sha256s.get(
+            feature_id
+        )
+        if not isinstance(candidate_execution_sha256, str) or not (
+            _frontier_execution_dir(
+                frontier_root,
+                beat_id=feature_id,
+                candidate_id=candidate_id,
+                candidate_execution_sha256=candidate_execution_sha256,
+            )
             / "finalized.json"
-        ).is_file()
-    ]
+        ).is_file():
+            missing.append(feature_id)
     if missing:
         raise FeatureCutSystemFailure(
             "autonomous vertical render batch started before all selected "
@@ -13661,6 +13785,61 @@ def _apply_pre_render_candidate_route(
     return applied
 
 
+def _apply_pre_render_complete_route_executions(
+    options: Sequence[dict[str, Any]],
+    *,
+    beat_id: str,
+    route: Any,
+    sequence_bindings: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Expand semantic candidates into immutable complete-route executions."""
+
+    by_id = {
+        str(option.get("candidate_id")): option for option in options
+    }
+    executions: list[dict[str, Any]] = []
+    seen_execution_sha256s: set[str] = set()
+    for complete_route in route.ranked_routes:
+        selection = next(
+            (
+                item
+                for item in complete_route.selections
+                if item.beat_id == beat_id
+            ),
+            None,
+        )
+        if selection is None:
+            raise FeatureCutSystemFailure(
+                "complete route omits a requested production beat"
+            )
+        execution_sha256 = (
+            selection.candidate_execution_sha256
+        )
+        if execution_sha256 is None:
+            raise FeatureCutSystemFailure(
+                "complete route selection has no execution SHA"
+            )
+        if execution_sha256 in seen_execution_sha256s:
+            continue
+        seen_execution_sha256s.add(execution_sha256)
+        base = by_id.get(selection.candidate_id)
+        if base is None:
+            raise FeatureCutSystemFailure(
+                "complete route selected an unknown semantic candidate"
+            )
+        applied = _apply_pre_render_candidate_route(
+            [dict(base)],
+            selected_candidate_id=selection.candidate_id,
+            ordered_candidate_ids=(selection.candidate_id,),
+            sequence_bindings=sequence_bindings,
+            execution_bindings={
+                selection.candidate_id: selection,
+            },
+        )
+        executions.append(applied[0])
+    return executions
+
+
 def _semantic_replan_frontier_projection(
     route: Any,
     *,
@@ -14772,6 +14951,7 @@ def _resolve_selected_window_grouped_exact_event_locks(
     client: GeminiLabClient,
     feature_id: str,
     candidate_id: str,
+    candidate_execution_sha256: str | None,
     source_path: Path,
     source_sha256: str,
     source_asset_id: str,
@@ -14816,7 +14996,13 @@ def _resolve_selected_window_grouped_exact_event_locks(
             strict=True,
         )
     )
-    dense_root = output_dir / "exact-events" / feature_id / candidate_id
+    dense_root = (
+        output_dir / "exact-events" / feature_id / candidate_id
+    )
+    if candidate_execution_sha256 is not None:
+        dense_root = (
+            dense_root / f"execution-{candidate_execution_sha256}"
+        )
     dense_catalog_path = dense_root / "dense-catalog.json"
     if dense_catalog_path.is_file():
         dense_catalog = DenseFrameCatalog.model_validate(
@@ -15040,11 +15226,40 @@ def _prepare_autonomous_vertical_candidate(
                 "pre-render candidate execution binding is incomplete or "
                 "differs from the frozen chapter duration"
             )
-        if (start_ms, end_ms) != (bound_start, bound_end):
+        sequence_binding = option_data.get(
+            "_pre_render_sequence_binding"
+        )
+        if not isinstance(sequence_binding, Mapping):
             raise FeatureCutSystemFailure(
-                "local candidate preparation recomputed a source interval "
-                "different from the frozen complete route"
+                "pre-render execution has no candidate timing binding"
             )
+        safe_start = sequence_binding.get("safe_window_start_ms")
+        safe_end = sequence_binding.get("safe_window_end_ms")
+        source_anchor = sequence_binding.get("source_anchor_ms")
+        if not (
+            isinstance(safe_start, int)
+            and isinstance(safe_end, int)
+            and isinstance(source_anchor, int)
+            and safe_start <= bound_start < bound_end <= safe_end
+            and bound_start <= source_anchor < bound_end
+        ):
+            raise FeatureCutSystemFailure(
+                "pre-render execution interval escaped its candidate-local "
+                "quality-safe timing fact"
+            )
+        trim = {
+            **dict(trim),
+            "trim_method": "pre_render_complete_route_source_interval",
+            "locally_centered_source_in_ms": start_ms,
+            "locally_centered_source_out_ms": end_ms,
+            "resolved_duration_ms": bound_duration,
+            "candidate_timing_sha256": sequence_binding.get(
+                "candidate_timing_sha256"
+            ),
+            "candidate_execution_sha256": (
+                candidate_execution_sha256
+            ),
+        }
         start_ms, end_ms = bound_start, bound_end
 
     source_motion = _maskless_source_motion_preflight(
@@ -15093,6 +15308,13 @@ def _prepare_autonomous_vertical_candidate(
         / selected.feature_id
         / "vertical"
         / f"candidate-{int(option_data['rank']):02d}-{candidate_id}"
+        / (
+            "execution-"
+            + (
+                candidate_execution_sha256
+                or "legacy"
+            )
+        )
     )
     query_lock = _load_or_create_feature_candidate_query_lock_v2(
         _feature_vertical_candidate_from_runtime_option(option_data),
@@ -15144,6 +15366,10 @@ def _resolve_autonomous_vertical_candidate_exact(
 
     option = dict(local_artifact["option"])
     candidate_id = str(option["candidate_id"])
+    candidate_execution_sha256 = (
+        str(local_artifact.get("candidate_execution_sha256") or "")
+        or None
+    )
     frame = RushFrame.model_validate(local_artifact["frame"])
     clip = RushClip.model_validate(local_artifact["clip"])
     regions = tuple(
@@ -15183,6 +15409,9 @@ def _resolve_autonomous_vertical_candidate_exact(
             client=client,
             feature_id=feature_id,
             candidate_id=candidate_id,
+            candidate_execution_sha256=(
+                candidate_execution_sha256
+            ),
             source_path=Path(clip.path),
             source_sha256=clip.sha256,
             source_asset_id=str(local_artifact["media_asset_id"]),
@@ -15199,7 +15428,13 @@ def _resolve_autonomous_vertical_candidate_exact(
             output_dir=output_dir,
         )
     else:
-        dense_root = output_dir / "exact-events" / feature_id / candidate_id
+        dense_root = (
+            output_dir / "exact-events" / feature_id / candidate_id
+        )
+        if candidate_execution_sha256 is not None:
+            dense_root = (
+                dense_root / f"execution-{candidate_execution_sha256}"
+            )
         dense_catalog_path = dense_root / "dense-catalog.json"
         if dense_catalog_path.is_file():
             dense_catalog = DenseFrameCatalog.model_validate(
@@ -15218,13 +15453,14 @@ def _resolve_autonomous_vertical_candidate_exact(
         bound_contracts = ()
         locks = ()
         fulfillments = ()
-    dense_catalog_path = (
-        output_dir
-        / "exact-events"
-        / feature_id
-        / candidate_id
-        / "dense-catalog.json"
+    dense_root = (
+        output_dir / "exact-events" / feature_id / candidate_id
     )
+    if candidate_execution_sha256 is not None:
+        dense_root = (
+            dense_root / f"execution-{candidate_execution_sha256}"
+        )
+    dense_catalog_path = dense_root / "dense-catalog.json"
     trim, authority = _authorize_runtime_selected_window_trim(
         policy=policy,
         feature_id=feature_id,
@@ -15692,6 +15928,7 @@ def _resolve_horizontal_grouped_exact_event_locks(
         client=client,
         feature_id=selected.feature_id,
         candidate_id=candidate_id,
+        candidate_execution_sha256=None,
         source_path=Path(clip.path),
         source_sha256=clip.sha256,
         source_asset_id=media.asset_id,
@@ -20401,6 +20638,10 @@ def _run_feature_cut_experiment_impl(
             else {}
         )
         autonomous_vertical_frontier_selected_ids: dict[str, str] = {}
+        autonomous_vertical_frontier_selected_execution_sha256s: dict[
+            str,
+            str,
+        ] = {}
         autonomous_vertical_frontier_omitted_feature_ids: set[str] = set()
         if (
             autonomous_profile
@@ -20513,14 +20754,21 @@ def _run_feature_cut_experiment_impl(
                     "render_pipeline_version": _RENDER_PIPELINE_VERSION,
                 }
             )
-            local_payloads: dict[tuple[str, str], Mapping[str, Any]] = {}
-            exact_payloads: dict[tuple[str, str], Mapping[str, Any]] = {}
+            local_payloads: dict[
+                tuple[str, str, str],
+                Mapping[str, Any],
+            ] = {}
+            exact_payloads: dict[
+                tuple[str, str, str],
+                Mapping[str, Any],
+            ] = {}
             geometry_payloads: dict[
-                tuple[str, str], Mapping[str, Any]
+                tuple[str, str, str], Mapping[str, Any]
             ] = {}
             frontier_accepted_source_uses: list[dict[str, Any]] = []
             deferred_payloads: dict[
-                str, list[tuple[int, str, Mapping[str, Any]]]
+                str,
+                list[tuple[int, str, str, Mapping[str, Any]]],
             ] = {}
             frontier_beats: list[RoundRobinFrontierBeat] = []
 
@@ -20558,31 +20806,18 @@ def _run_feature_cut_experiment_impl(
                         .max_candidate_attempts_per_beat
                     ),
                 )
-                frontier_options = _apply_pre_render_candidate_route(
+                frontier_options = (
+                    _apply_pre_render_complete_route_executions(
                     frontier_options,
-                    selected_candidate_id=(
-                        pre_render_candidate_id_by_feature.get(
-                            frontier_feature_id
-                        )
-                    ),
-                    ordered_candidate_ids=(
-                        pre_render_candidate_order_by_feature.get(
-                            frontier_feature_id,
-                            (),
-                        )
-                    ),
+                    beat_id=frontier_feature_id,
+                    route=pre_render_candidate_route,
                     sequence_bindings=(
                         pre_render_candidate_bindings_by_feature.get(
                             frontier_feature_id,
                             {},
                         )
                     ),
-                    execution_bindings=(
-                        pre_render_execution_bindings_by_feature.get(
-                            frontier_feature_id,
-                            {},
-                        )
-                    ),
+                    )
                 )
                 viable_candidates = []
                 local_failures = []
@@ -20650,10 +20885,36 @@ def _run_feature_cut_experiment_impl(
                     frontier_candidate_id = str(
                         frontier_option["candidate_id"]
                     )
+                    frontier_execution_binding = frontier_option.get(
+                        "_pre_render_execution_binding"
+                    )
+                    if not isinstance(
+                        frontier_execution_binding,
+                        Mapping,
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "runtime candidate has no complete-route "
+                            "execution binding"
+                        )
+                    frontier_execution_sha256 = str(
+                        frontier_execution_binding.get(
+                            "candidate_execution_sha256"
+                        )
+                        or ""
+                    )
+                    if not frontier_execution_sha256:
+                        raise FeatureCutSystemFailure(
+                            "runtime candidate execution binding has no SHA"
+                        )
                     local_path = (
-                        frontier_root
-                        / frontier_feature_id
-                        / frontier_candidate_id
+                        _frontier_execution_dir(
+                            frontier_root,
+                            beat_id=frontier_feature_id,
+                            candidate_id=frontier_candidate_id,
+                            candidate_execution_sha256=(
+                                frontier_execution_sha256
+                            ),
+                        )
                         / "local.json"
                     )
                     option_sha256 = _stable_fingerprint(
@@ -20676,6 +20937,9 @@ def _run_feature_cut_experiment_impl(
                                 artifact_path=local_path,
                                 beat_id=frontier_feature_id,
                                 candidate_id=frontier_candidate_id,
+                                candidate_execution_sha256=(
+                                    frontier_execution_sha256
+                                ),
                                 stage="local_preflight",
                                 dependency_hashes=(
                                     frontier_plan_sha256,
@@ -20728,6 +20992,9 @@ def _run_feature_cut_experiment_impl(
                         local_failures.append(
                             {
                                 "candidate_id": frontier_candidate_id,
+                                "candidate_execution_sha256": (
+                                    frontier_execution_sha256
+                                ),
                                 "candidate_order": candidate_order,
                                 "reason": str(error),
                                 "paid_calls_added": 0,
@@ -20735,7 +21002,11 @@ def _run_feature_cut_experiment_impl(
                         )
                         continue
                     local_payloads[
-                        (frontier_feature_id, frontier_candidate_id)
+                        _frontier_execution_key(
+                            frontier_feature_id,
+                            frontier_candidate_id,
+                            frontier_execution_sha256,
+                        )
                     ] = local_payload
                     viable_candidates.append(
                         RoundRobinFrontierCandidate(
@@ -20743,6 +21014,9 @@ def _run_feature_cut_experiment_impl(
                             candidate_id=frontier_candidate_id,
                             candidate_order=candidate_order,
                             requires_exact_event=requires_paid_exact,
+                            candidate_execution_sha256=(
+                                frontier_execution_sha256
+                            ),
                         )
                     )
                 write_json(
@@ -20756,6 +21030,16 @@ def _run_feature_cut_experiment_impl(
                         "feature_id": frontier_feature_id,
                         "viable_candidate_ids": [
                             candidate.candidate_id
+                            for candidate in viable_candidates
+                        ],
+                        "viable_candidate_executions": [
+                            {
+                                "candidate_id": candidate.candidate_id,
+                                "candidate_execution_sha256": (
+                                    candidate
+                                    .candidate_execution_sha256
+                                ),
+                            }
                             for candidate in viable_candidates
                         ],
                         "failures": local_failures,
@@ -20782,6 +21066,140 @@ def _run_feature_cut_experiment_impl(
                     )
                 )
 
+            locally_viable_complete_routes = tuple(
+                complete_route
+                for complete_route in pre_render_candidate_route.ranked_routes
+                if all(
+                    _frontier_execution_key(
+                        selection.beat_id,
+                        selection.candidate_id,
+                        selection.candidate_execution_sha256,
+                    )
+                    in local_payloads
+                    for selection in complete_route.selections
+                )
+            )
+            if not locally_viable_complete_routes:
+                raise CandidateKnownInfeasible(
+                    "no complete autonomous 9:16 route survived the "
+                    "all-candidate zero-paid preflight"
+                )
+            active_local_route = locally_viable_complete_routes[0]
+            active_local_selection_by_beat = {
+                selection.beat_id: selection
+                for selection in active_local_route.selections
+            }
+            locally_viable_execution_order_by_beat: dict[
+                str,
+                list[tuple[str, str]],
+            ] = {}
+            for complete_route in locally_viable_complete_routes:
+                for selection in complete_route.selections:
+                    ordered_ids = (
+                        locally_viable_execution_order_by_beat.setdefault(
+                            selection.beat_id,
+                            [],
+                        )
+                    )
+                    assert (
+                        selection.candidate_execution_sha256 is not None
+                    )
+                    execution_id = (
+                        selection.candidate_id,
+                        selection.candidate_execution_sha256,
+                    )
+                    if execution_id not in ordered_ids:
+                        ordered_ids.append(execution_id)
+            rerouted_frontier_beats: list[RoundRobinFrontierBeat] = []
+            for beat in frontier_beats:
+                candidates_by_execution = {
+                    (
+                        candidate.candidate_id,
+                        candidate.candidate_execution_sha256 or "legacy",
+                    ): candidate
+                    for candidate in beat.candidates
+                }
+                active_selection = active_local_selection_by_beat[
+                    beat.beat_id
+                ]
+                assert (
+                    active_selection.candidate_execution_sha256 is not None
+                )
+                active_execution_id = (
+                    active_selection.candidate_id,
+                    active_selection.candidate_execution_sha256,
+                )
+                ordered_executions = [
+                    active_execution_id,
+                    *(
+                        execution_id
+                        for execution_id in (
+                            locally_viable_execution_order_by_beat[
+                                beat.beat_id
+                            ]
+                        )
+                        if execution_id != active_execution_id
+                    ),
+                ]
+                rerouted_frontier_beats.append(
+                    beat.model_copy(
+                        update={
+                            "candidates": tuple(
+                                candidates_by_execution[
+                                    execution_id
+                                ].model_copy(
+                                    update={
+                                        "candidate_order": candidate_order
+                                    }
+                                )
+                                for candidate_order, execution_id in enumerate(
+                                    ordered_executions
+                                )
+                            )
+                        }
+                    )
+                )
+            frontier_beats = rerouted_frontier_beats
+            pre_render_candidate_route = (
+                pre_render_candidate_route.model_copy(
+                    update={
+                        "selections": active_local_route.selections,
+                        "objective_score": (
+                            active_local_route.objective_score
+                        ),
+                        "total_duration_ms": (
+                            active_local_route.total_duration_ms
+                        ),
+                        "ranked_routes": (
+                            locally_viable_complete_routes
+                        ),
+                    }
+                )
+            )
+            pre_render_candidate_id_by_feature = {
+                selection.beat_id: selection.candidate_id
+                for selection in active_local_route.selections
+            }
+            write_json(
+                frontier_root / "active-local-route.json",
+                {
+                    "contract_version": (
+                        "production-frontier-active-local-route-v1"
+                    ),
+                    "pre_render_route_sha256": route_sha256,
+                    "active_route": active_local_route.model_dump(
+                        mode="json"
+                    ),
+                    "locally_viable_route_ids": [
+                        route.route_id
+                        for route in locally_viable_complete_routes
+                    ],
+                    "all_candidate_local_preflight_completed": True,
+                    "paid_provider_dispatch_added": False,
+                    "generated_at": utc_now(),
+                },
+            )
+
             frontier_priority_rank = {
                 "hard": 0,
                 "preferred": 1,
@@ -20795,20 +21213,27 @@ def _run_feature_cut_experiment_impl(
                         beat.beat_id,
                         candidate.candidate_order,
                         candidate.candidate_id,
+                        candidate.candidate_execution_sha256
+                        or "legacy",
                     )
                     for beat in frontier_beats
                     for candidate in beat.candidates
                 ),
-            )[2:]
+            )
             semantic_negotiation_owner_key = (
-                semantic_negotiation_owner[0],
                 semantic_negotiation_owner[2],
+                semantic_negotiation_owner[4],
+                semantic_negotiation_owner[5],
             )
             frontier_beat_by_id = {
                 beat.beat_id: beat for beat in frontier_beats
             }
             frontier_candidate_by_id = {
-                (beat.beat_id, candidate.candidate_id): candidate
+                _frontier_execution_key(
+                    beat.beat_id,
+                    candidate.candidate_id,
+                    candidate.candidate_execution_sha256,
+                ): candidate
                 for beat in frontier_beats
                 for candidate in beat.candidates
             }
@@ -20817,15 +21242,113 @@ def _run_feature_cut_experiment_impl(
                 round(sum(chapter_durations.values()) * 1000),
             )
             frontier_constructed_runtime = {"panel_ms": 0}
-            frontier_constructed_acceptances: dict[str, str] = {}
+            frontier_constructed_acceptances: dict[
+                str,
+                tuple[str, str],
+            ] = {}
+            active_runtime_route = {"route": active_local_route}
+            accepted_runtime_execution_by_beat: dict[str, str] = {}
+            failed_runtime_execution_sha256s: set[str] = set()
+            unavailable_runtime_execution_sha256s: set[str] = set()
+
+            def active_execution_sha256(beat_id: str) -> str:
+                selection = next(
+                    item
+                    for item in active_runtime_route["route"].selections
+                    if item.beat_id == beat_id
+                )
+                if selection.candidate_execution_sha256 is None:
+                    raise FeatureCutSystemFailure(
+                        "active complete route has no candidate execution SHA"
+                    )
+                return selection.candidate_execution_sha256
+
+            def require_active_frontier_execution(
+                frontier_attempt: RoundRobinFrontierAttempt,
+            ) -> None:
+                if (
+                    frontier_attempt.candidate_execution_sha256
+                    != active_execution_sha256(frontier_attempt.beat_id)
+                ):
+                    raise CandidateKnownInfeasible(
+                        "inactive_complete_route_execution"
+                    )
+
+            def advance_complete_route_after_failure(
+                frontier_attempt: RoundRobinFrontierAttempt,
+                error: CandidateKnownInfeasible,
+            ) -> None:
+                if str(error) == "inactive_complete_route_execution":
+                    if (
+                        frontier_attempt.candidate_execution_sha256
+                        is not None
+                    ):
+                        unavailable_runtime_execution_sha256s.add(
+                            frontier_attempt.candidate_execution_sha256
+                        )
+                    return
+                failed_execution_sha256 = (
+                    frontier_attempt.candidate_execution_sha256
+                )
+                if failed_execution_sha256 is not None:
+                    failed_runtime_execution_sha256s.add(
+                        failed_execution_sha256
+                    )
+                    unavailable_runtime_execution_sha256s.add(
+                        failed_execution_sha256
+                    )
+                next_route = select_next_compatible_route(
+                    locally_viable_complete_routes,
+                    accepted_execution_sha256_by_beat=(
+                        accepted_runtime_execution_by_beat
+                    ),
+                    failed_execution_sha256s=tuple(
+                        sorted(failed_runtime_execution_sha256s)
+                    ),
+                    unavailable_execution_sha256s=tuple(
+                        sorted(
+                            unavailable_runtime_execution_sha256s
+                        )
+                    ),
+                    after_route_id=(
+                        active_runtime_route["route"].route_id
+                    ),
+                )
+                if next_route is None:
+                    return
+                active_runtime_route["route"] = next_route
+                write_json(
+                    frontier_root / "active-runtime-route.json",
+                    {
+                        "contract_version": (
+                            "production-frontier-active-runtime-route-v1"
+                        ),
+                        "active_route": next_route.model_dump(mode="json"),
+                        "accepted_execution_sha256_by_beat": dict(
+                            sorted(
+                                accepted_runtime_execution_by_beat.items()
+                            )
+                        ),
+                        "failed_execution_sha256s": sorted(
+                            failed_runtime_execution_sha256s
+                        ),
+                        "paid_provider_dispatch_added": False,
+                        "generated_at": utc_now(),
+                    },
+                )
 
             def frontier_local_callback(
                 frontier_attempt: RoundRobinFrontierAttempt,
             ) -> None:
+                require_active_frontier_execution(frontier_attempt)
                 if (
-                    frontier_attempt.beat_id,
-                    frontier_attempt.candidate_id,
-                ) not in local_payloads:
+                    _frontier_execution_key(
+                        frontier_attempt.beat_id,
+                        frontier_attempt.candidate_id,
+                        frontier_attempt.candidate_execution_sha256,
+                    )
+                    not in local_payloads
+                ):
                     raise FeatureCutSystemFailure(
                         "frontier admitted a candidate without local artifact"
                     )
@@ -20833,14 +21356,22 @@ def _run_feature_cut_experiment_impl(
             def frontier_exact_callback(
                 frontier_attempt: RoundRobinFrontierAttempt,
             ) -> None:
-                key = (
+                require_active_frontier_execution(frontier_attempt)
+                key = _frontier_execution_key(
                     frontier_attempt.beat_id,
                     frontier_attempt.candidate_id,
+                    frontier_attempt.candidate_execution_sha256,
                 )
                 local_path = (
-                    frontier_root
-                    / frontier_attempt.beat_id
-                    / frontier_attempt.candidate_id
+                    _frontier_execution_dir(
+                        frontier_root,
+                        beat_id=frontier_attempt.beat_id,
+                        candidate_id=frontier_attempt.candidate_id,
+                        candidate_execution_sha256=(
+                            frontier_attempt
+                            .candidate_execution_sha256
+                        ),
+                    )
                     / "local.json"
                 )
                 exact_path = local_path.with_name("exact.json")
@@ -20849,6 +21380,10 @@ def _run_feature_cut_experiment_impl(
                         artifact_path=exact_path,
                         beat_id=frontier_attempt.beat_id,
                         candidate_id=frontier_attempt.candidate_id,
+                        candidate_execution_sha256=(
+                            frontier_attempt
+                            .candidate_execution_sha256
+                        ),
                         stage="exact_event",
                         dependency_hashes=(
                             sha256_file(local_path),
@@ -20877,7 +21412,7 @@ def _run_feature_cut_experiment_impl(
 
             def accept_deferred_for_beat(
                 feature_id: str,
-            ) -> str | None:
+            ) -> tuple[str, str] | None:
                 already_selected = frontier_constructed_acceptances.get(
                     feature_id
                 )
@@ -20898,13 +21433,31 @@ def _run_feature_cut_experiment_impl(
                         selected_chapter_for_fallback,
                         frontier_accepted_source_uses,
                         source_clip_id=RushClip.model_validate(
-                            local_payloads[(feature_id, row[1])]["clip"]
+                            local_payloads[
+                                _frontier_execution_key(
+                                    feature_id,
+                                    row[1],
+                                    row[2],
+                                )
+                            ]["clip"]
                         ).clip_id,
                         source_in_ms=int(
-                            local_payloads[(feature_id, row[1])]["start_ms"]
+                            local_payloads[
+                                _frontier_execution_key(
+                                    feature_id,
+                                    row[1],
+                                    row[2],
+                                )
+                            ]["start_ms"]
                         ),
                         source_out_ms=int(
-                            local_payloads[(feature_id, row[1])]["end_ms"]
+                            local_payloads[
+                                _frontier_execution_key(
+                                    feature_id,
+                                    row[1],
+                                    row[2],
+                                )
+                            ]["end_ms"]
                         ),
                         max_editorial_reprise_overlap_fraction=0.5,
                         allowed_reuse_modes=(
@@ -20912,6 +21465,30 @@ def _run_feature_cut_experiment_impl(
                         ),
                     )
                     is None
+                ]
+                compatible_deferred_routes = {
+                    row[2]: select_next_compatible_route(
+                        locally_viable_complete_routes,
+                        accepted_execution_sha256_by_beat={
+                            **accepted_runtime_execution_by_beat,
+                            feature_id: row[2],
+                        },
+                        failed_execution_sha256s=tuple(
+                            sorted(failed_runtime_execution_sha256s)
+                        ),
+                        unavailable_execution_sha256s=tuple(
+                            sorted(
+                                unavailable_runtime_execution_sha256s
+                                - {row[2]}
+                            )
+                        ),
+                    )
+                    for row in reusable_deferred
+                }
+                reusable_deferred = [
+                    row
+                    for row in reusable_deferred
+                    if compatible_deferred_routes[row[2]] is not None
                 ]
                 feature_runtime_ms = round(
                     chapter_durations[feature_id] * 1000
@@ -20921,7 +21498,7 @@ def _run_feature_cut_experiment_impl(
                         row
                         for row in reusable_deferred
                         if (
-                            row[2].get("classification")
+                            row[3].get("classification")
                             == "deferred_panel"
                             and autonomous_policy.presentation
                             .allow_two_panel_layout
@@ -20944,7 +21521,7 @@ def _run_feature_cut_experiment_impl(
                         row
                         for row in reusable_deferred
                         if (
-                            row[2].get("classification")
+                            row[3].get("classification")
                             in {
                                 "deferred_fit",
                                 "deferred_scope_fit",
@@ -20957,8 +21534,20 @@ def _run_feature_cut_experiment_impl(
                 )
                 if selected_deferred is None:
                     return None
+                compatible_route = compatible_deferred_routes[
+                    selected_deferred[2]
+                ]
+                if compatible_route is None:
+                    raise FeatureCutSystemFailure(
+                        "deferred frontier acceptance lost its complete-route "
+                        "proof"
+                    )
                 selected_local = local_payloads[
-                    (feature_id, selected_deferred[1])
+                    _frontier_execution_key(
+                        feature_id,
+                        selected_deferred[1],
+                        selected_deferred[2],
+                    )
                 ]
                 selected_clip = RushClip.model_validate(
                     selected_local["clip"]
@@ -20972,28 +21561,44 @@ def _run_feature_cut_experiment_impl(
                     }
                 )
                 if (
-                    selected_deferred[2].get("classification")
+                    selected_deferred[3].get("classification")
                     == "deferred_panel"
                 ):
                     frontier_constructed_runtime[
                         "panel_ms"
                     ] += feature_runtime_ms
                 frontier_constructed_acceptances[feature_id] = (
-                    selected_deferred[1]
+                    selected_deferred[1],
+                    selected_deferred[2],
                 )
-                return selected_deferred[1]
+                accepted_runtime_execution_by_beat[feature_id] = (
+                    selected_deferred[2]
+                )
+                active_runtime_route["route"] = compatible_route
+                return (
+                    selected_deferred[1],
+                    selected_deferred[2],
+                )
 
             def frontier_grounding_callback(
                 frontier_attempt: RoundRobinFrontierAttempt,
-            ) -> str | None:
-                key = (
+            ) -> str | tuple[str, str] | None:
+                require_active_frontier_execution(frontier_attempt)
+                key = _frontier_execution_key(
                     frontier_attempt.beat_id,
                     frontier_attempt.candidate_id,
+                    frontier_attempt.candidate_execution_sha256,
                 )
                 exact_path = (
-                    frontier_root
-                    / frontier_attempt.beat_id
-                    / frontier_attempt.candidate_id
+                    _frontier_execution_dir(
+                        frontier_root,
+                        beat_id=frontier_attempt.beat_id,
+                        candidate_id=frontier_attempt.candidate_id,
+                        candidate_execution_sha256=(
+                            frontier_attempt
+                            .candidate_execution_sha256
+                        ),
+                    )
                     / "exact.json"
                 )
                 if key not in exact_payloads:
@@ -21013,6 +21618,10 @@ def _run_feature_cut_experiment_impl(
                                 beat_id=frontier_attempt.beat_id,
                                 candidate_id=(
                                     frontier_attempt.candidate_id
+                                ),
+                                candidate_execution_sha256=(
+                                    frontier_attempt
+                                    .candidate_execution_sha256
                                 ),
                                 stage="exact_event",
                                 dependency_hashes=exact_dependencies,
@@ -21124,6 +21733,10 @@ def _run_feature_cut_experiment_impl(
                         artifact_path=geometry_path,
                         beat_id=frontier_attempt.beat_id,
                         candidate_id=frontier_attempt.candidate_id,
+                        candidate_execution_sha256=(
+                            frontier_attempt
+                            .candidate_execution_sha256
+                        ),
                         stage="grounding",
                         dependency_hashes=(
                             sha256_file(exact_path),
@@ -21173,6 +21786,18 @@ def _run_feature_cut_experiment_impl(
                     geometry_payload.get("classification")
                 )
                 if classification == "natural_accepted":
+                    if (
+                        frontier_attempt.candidate_execution_sha256
+                        is None
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "accepted runtime candidate has no execution SHA"
+                        )
+                    accepted_runtime_execution_by_beat[
+                        frontier_attempt.beat_id
+                    ] = (
+                        frontier_attempt.candidate_execution_sha256
+                    )
                     frontier_accepted_source_uses.append(
                         {
                             "feature_id": frontier_attempt.beat_id,
@@ -21198,20 +21823,17 @@ def _run_feature_cut_experiment_impl(
                         (
                             frontier_attempt.candidate_order,
                             frontier_attempt.candidate_id,
+                            frontier_attempt
+                            .candidate_execution_sha256
+                            or "legacy",
                             geometry_payload,
                         )
                     )
-                    beat_spec = frontier_beat_by_id[
+                    accepted_deferred = accept_deferred_for_beat(
                         frontier_attempt.beat_id
-                    ]
-                    is_last_candidate = (
-                        frontier_attempt.candidate_id
-                        == beat_spec.candidates[-1].candidate_id
                     )
-                    if is_last_candidate:
-                        return accept_deferred_for_beat(
-                            frontier_attempt.beat_id
-                        )
+                    if accepted_deferred is not None:
+                        return accepted_deferred
                 raise CandidateKnownInfeasible(
                     str(
                         geometry_payload.get("reason")
@@ -21223,6 +21845,7 @@ def _run_feature_cut_experiment_impl(
             def load_existing_candidate_stage_chain(
                 feature_id: str,
                 candidate_id: str,
+                candidate_execution_sha256: str | None,
             ) -> tuple[
                 Mapping[str, Any],
                 Mapping[str, Any],
@@ -21230,8 +21853,19 @@ def _run_feature_cut_experiment_impl(
             ]:
                 """Validate the immutable local→exact→geometry chain."""
 
-                key = (feature_id, candidate_id)
-                candidate_root = frontier_root / feature_id / candidate_id
+                key = _frontier_execution_key(
+                    feature_id,
+                    candidate_id,
+                    candidate_execution_sha256,
+                )
+                candidate_root = _frontier_execution_dir(
+                    frontier_root,
+                    beat_id=feature_id,
+                    candidate_id=candidate_id,
+                    candidate_execution_sha256=(
+                        candidate_execution_sha256
+                    ),
+                )
                 local_path = candidate_root / "local.json"
                 exact_path = candidate_root / "exact.json"
                 geometry_path = candidate_root / "geometry.json"
@@ -21239,6 +21873,9 @@ def _run_feature_cut_experiment_impl(
                     artifact_path=local_path,
                     beat_id=feature_id,
                     candidate_id=candidate_id,
+                    candidate_execution_sha256=(
+                        candidate_execution_sha256
+                    ),
                     stage="local_preflight",
                     dependency_hashes=(
                         frontier_plan_sha256,
@@ -21261,6 +21898,9 @@ def _run_feature_cut_experiment_impl(
                     artifact_path=exact_path,
                     beat_id=feature_id,
                     candidate_id=candidate_id,
+                    candidate_execution_sha256=(
+                        candidate_execution_sha256
+                    ),
                     stage="exact_event",
                     dependency_hashes=(
                         sha256_file(local_path),
@@ -21300,6 +21940,9 @@ def _run_feature_cut_experiment_impl(
                     artifact_path=geometry_path,
                     beat_id=feature_id,
                     candidate_id=candidate_id,
+                    candidate_execution_sha256=(
+                        candidate_execution_sha256
+                    ),
                     stage="grounding",
                     dependency_hashes=(
                         sha256_file(exact_path),
@@ -21315,9 +21958,17 @@ def _run_feature_cut_experiment_impl(
             for persisted_beat in frontier_beats:
                 for persisted_candidate in persisted_beat.candidates:
                     persisted_geometry_path = (
-                        frontier_root
-                        / persisted_beat.beat_id
-                        / persisted_candidate.candidate_id
+                        _frontier_execution_dir(
+                            frontier_root,
+                            beat_id=persisted_beat.beat_id,
+                            candidate_id=(
+                                persisted_candidate.candidate_id
+                            ),
+                            candidate_execution_sha256=(
+                                persisted_candidate
+                                .candidate_execution_sha256
+                            ),
+                        )
                         / "geometry.json"
                     )
                     if not persisted_geometry_path.is_file():
@@ -21326,6 +21977,8 @@ def _run_feature_cut_experiment_impl(
                         load_existing_candidate_stage_chain(
                             persisted_beat.beat_id,
                             persisted_candidate.candidate_id,
+                            persisted_candidate
+                            .candidate_execution_sha256,
                         )
                     )
                     persisted_semantic_count = max(
@@ -21351,6 +22004,9 @@ def _run_feature_cut_experiment_impl(
                             (
                                 persisted_candidate.candidate_order,
                                 persisted_candidate.candidate_id,
+                                persisted_candidate
+                                .candidate_execution_sha256
+                                or "legacy",
                                 persisted_geometry_payload,
                             )
                         )
@@ -21368,10 +22024,23 @@ def _run_feature_cut_experiment_impl(
                     )
                     if resumed_candidate_id is None:
                         continue
+                    resumed_execution_sha256 = (
+                        resumed_beat
+                        .accepted_candidate_execution_sha256
+                    )
+                    if resumed_execution_sha256 is None:
+                        raise FeatureCutSystemFailure(
+                            "resumed accepted frontier candidate has no "
+                            "execution SHA"
+                        )
+                    accepted_runtime_execution_by_beat[
+                        resumed_beat.beat.beat_id
+                    ] = resumed_execution_sha256
                     resumed_local = local_payloads[
-                        (
+                        _frontier_execution_key(
                             resumed_beat.beat.beat_id,
                             resumed_candidate_id,
+                            resumed_execution_sha256,
                         )
                     ]
                     resumed_clip = RushClip.model_validate(
@@ -21390,9 +22059,14 @@ def _run_feature_cut_experiment_impl(
                         }
                     )
                     resumed_geometry_path = (
-                        frontier_root
-                        / resumed_beat.beat.beat_id
-                        / resumed_candidate_id
+                        _frontier_execution_dir(
+                            frontier_root,
+                            beat_id=resumed_beat.beat.beat_id,
+                            candidate_id=resumed_candidate_id,
+                            candidate_execution_sha256=(
+                                resumed_execution_sha256
+                            ),
+                        )
                         / "geometry.json"
                     )
                     if resumed_geometry_path.is_file():
@@ -21400,6 +22074,7 @@ def _run_feature_cut_experiment_impl(
                             load_existing_candidate_stage_chain(
                                 resumed_beat.beat.beat_id,
                                 resumed_candidate_id,
+                                resumed_execution_sha256,
                             )
                         )
                         if (
@@ -21425,13 +22100,61 @@ def _run_feature_cut_experiment_impl(
                         }:
                             frontier_constructed_acceptances[
                                 resumed_beat.beat.beat_id
-                            ] = resumed_candidate_id
+                            ] = (
+                                resumed_candidate_id,
+                                resumed_execution_sha256,
+                            )
+                persisted_unavailable_executions = {
+                    result.attempt.candidate_execution_sha256
+                    for result in resumed_state.attempt_history
+                    if result.outcome.endswith("_failed")
+                    and result.attempt.candidate_execution_sha256
+                    is not None
+                }
+                persisted_failed_executions = {
+                    result.attempt.candidate_execution_sha256
+                    for result in resumed_state.attempt_history
+                    if result.outcome.endswith("_failed")
+                    and result.attempt.candidate_execution_sha256
+                    is not None
+                    and "inactive_complete_route_execution"
+                    not in result.decision_codes
+                }
+                failed_runtime_execution_sha256s.update(
+                    persisted_failed_executions
+                )
+                unavailable_runtime_execution_sha256s.update(
+                    persisted_unavailable_executions
+                )
+                resumed_route = select_next_compatible_route(
+                    locally_viable_complete_routes,
+                    accepted_execution_sha256_by_beat=(
+                        accepted_runtime_execution_by_beat
+                    ),
+                    failed_execution_sha256s=tuple(
+                        sorted(failed_runtime_execution_sha256s)
+                    ),
+                    unavailable_execution_sha256s=tuple(
+                        sorted(
+                            unavailable_runtime_execution_sha256s
+                        )
+                    ),
+                )
+                if resumed_route is None:
+                    raise FeatureCutSystemFailure(
+                        "persisted frontier state has no compatible complete "
+                        "route"
+                    )
+                active_runtime_route["route"] = resumed_route
             naturally_accepted = _run_persisted_production_frontier(
                 state_path=frontier_state_path,
                 beats=tuple(frontier_beats),
                 local_preflight=frontier_local_callback,
                 exact_event=frontier_exact_callback,
                 grounding=frontier_grounding_callback,
+                on_candidate_infeasible=(
+                    advance_complete_route_after_failure
+                ),
                 resolve_deferred_on_exhaustion=(
                     accept_deferred_for_beat
                 ),
@@ -21454,26 +22177,49 @@ def _run_feature_cut_experiment_impl(
             frontier_state = RoundRobinFrontierState.model_validate(
                 read_json(frontier_state_path)
             )
+            for beat_state in frontier_state.beats:
+                if beat_state.status != "accepted":
+                    continue
+                if (
+                    beat_state.accepted_candidate_execution_sha256
+                    is None
+                ):
+                    raise FeatureCutSystemFailure(
+                        "accepted frontier beat has no execution SHA"
+                    )
+                autonomous_vertical_frontier_selected_execution_sha256s[
+                    beat_state.beat.beat_id
+                ] = (
+                    beat_state.accepted_candidate_execution_sha256
+                )
             autonomous_vertical_frontier_omitted_feature_ids.update(
                 beat_state.beat.beat_id
                 for beat_state in frontier_state.beats
                 if beat_state.status == "omitted"
             )
             for beat_state in frontier_state.beats:
-                known_deferred_ids = {
-                    row[1]
+                known_deferred_executions = {
+                    (row[1], row[2])
                     for row in deferred_payloads.get(
                         beat_state.beat.beat_id,
                         [],
                     )
                 }
                 for candidate in beat_state.beat.candidates:
-                    if candidate.candidate_id in known_deferred_ids:
+                    if (
+                        candidate.candidate_id,
+                        candidate.candidate_execution_sha256 or "legacy",
+                    ) in known_deferred_executions:
                         continue
                     geometry_path = (
-                        frontier_root
-                        / beat_state.beat.beat_id
-                        / candidate.candidate_id
+                        _frontier_execution_dir(
+                            frontier_root,
+                            beat_id=beat_state.beat.beat_id,
+                            candidate_id=candidate.candidate_id,
+                            candidate_execution_sha256=(
+                                candidate.candidate_execution_sha256
+                            ),
+                        )
                         / "geometry.json"
                     )
                     if not geometry_path.is_file():
@@ -21482,12 +22228,14 @@ def _run_feature_cut_experiment_impl(
                         load_existing_candidate_stage_chain(
                             beat_state.beat.beat_id,
                             candidate.candidate_id,
+                            candidate.candidate_execution_sha256,
                         )
                     )
                     exact_payloads[
-                        (
+                        _frontier_execution_key(
                             beat_state.beat.beat_id,
                             candidate.candidate_id,
+                            candidate.candidate_execution_sha256,
                         )
                     ] = exact_payload
                     if (
@@ -21505,6 +22253,8 @@ def _run_feature_cut_experiment_impl(
                             (
                                 candidate.candidate_order,
                                 candidate.candidate_id,
+                                candidate.candidate_execution_sha256
+                                or "legacy",
                                 dict(geometry_payload),
                             )
                         )
@@ -21528,20 +22278,26 @@ def _run_feature_cut_experiment_impl(
                     "autonomous vertical frontier did not resolve every beat"
                 )
             validated_selected_payloads: dict[
-                tuple[str, str], Mapping[str, Any]
+                tuple[str, str, str], Mapping[str, Any]
             ] = {}
             for feature_id, candidate_id in (
                 autonomous_vertical_frontier_selected_ids.items()
             ):
-                key = (feature_id, candidate_id)
-                candidate_root = frontier_root / feature_id / candidate_id
-                local_path = candidate_root / "local.json"
-                exact_path = candidate_root / "exact.json"
-                geometry_path = candidate_root / "geometry.json"
+                candidate_execution_sha256 = (
+                    autonomous_vertical_frontier_selected_execution_sha256s[
+                        feature_id
+                    ]
+                )
+                key = _frontier_execution_key(
+                    feature_id,
+                    candidate_id,
+                    candidate_execution_sha256,
+                )
                 _, _, validated_selected_payloads[key] = (
                     load_existing_candidate_stage_chain(
                         feature_id,
                         candidate_id,
+                        candidate_execution_sha256,
                     )
                 )
             omission_reconciliation_path: Path | None = None
@@ -21564,7 +22320,13 @@ def _run_feature_cut_experiment_impl(
                         autonomous_vertical_frontier_selected_ids.items()
                     )
                     if validated_selected_payloads[
-                        (feature_id, candidate_id)
+                        _frontier_execution_key(
+                            feature_id,
+                            candidate_id,
+                            autonomous_vertical_frontier_selected_execution_sha256s[
+                                feature_id
+                            ],
+                        )
                     ].get("classification")
                     == "deferred_panel"
                 )
@@ -21645,6 +22407,9 @@ def _run_feature_cut_experiment_impl(
                 "selected_candidate_ids": (
                     autonomous_vertical_frontier_selected_ids
                 ),
+                "selected_candidate_execution_sha256s": (
+                    autonomous_vertical_frontier_selected_execution_sha256s
+                ),
                 "omitted_feature_ids": sorted(
                     autonomous_vertical_frontier_omitted_feature_ids
                 ),
@@ -21656,27 +22421,59 @@ def _run_feature_cut_experiment_impl(
                 "selected_candidates": {
                     feature_id: {
                         "candidate_id": candidate_id,
+                        "candidate_execution_sha256": (
+                            autonomous_vertical_frontier_selected_execution_sha256s[
+                                feature_id
+                            ]
+                        ),
                         "local_artifact_sha256": sha256_file(
-                            frontier_root
-                            / feature_id
-                            / candidate_id
+                            _frontier_execution_dir(
+                                frontier_root,
+                                beat_id=feature_id,
+                                candidate_id=candidate_id,
+                                candidate_execution_sha256=(
+                                    autonomous_vertical_frontier_selected_execution_sha256s[
+                                        feature_id
+                                    ]
+                                ),
+                            )
                             / "local.json"
                         ),
                         "exact_artifact_sha256": sha256_file(
-                            frontier_root
-                            / feature_id
-                            / candidate_id
+                            _frontier_execution_dir(
+                                frontier_root,
+                                beat_id=feature_id,
+                                candidate_id=candidate_id,
+                                candidate_execution_sha256=(
+                                    autonomous_vertical_frontier_selected_execution_sha256s[
+                                        feature_id
+                                    ]
+                                ),
+                            )
                             / "exact.json"
                         ),
                         "geometry_artifact_sha256": sha256_file(
-                            frontier_root
-                            / feature_id
-                            / candidate_id
+                            _frontier_execution_dir(
+                                frontier_root,
+                                beat_id=feature_id,
+                                candidate_id=candidate_id,
+                                candidate_execution_sha256=(
+                                    autonomous_vertical_frontier_selected_execution_sha256s[
+                                        feature_id
+                                    ]
+                                ),
+                            )
                             / "geometry.json"
                         ),
                         "presentation_classification": (
                             validated_selected_payloads[
-                                (feature_id, candidate_id)
+                                _frontier_execution_key(
+                                    feature_id,
+                                    candidate_id,
+                                    autonomous_vertical_frontier_selected_execution_sha256s[
+                                        feature_id
+                                    ],
+                                )
                             ]["classification"]
                         ),
                     }
@@ -22500,6 +23297,11 @@ def _run_feature_cut_experiment_impl(
                         selected.feature_id
                     )
                 )
+                frozen_frontier_execution_sha256 = (
+                    autonomous_vertical_frontier_selected_execution_sha256s.get(
+                        selected.feature_id
+                    )
+                )
                 if frozen_frontier_candidate_id is not None:
                     vertical_options = [
                         option
@@ -22524,12 +23326,18 @@ def _run_feature_cut_experiment_impl(
                     candidate_rank = int(option_data["rank"])
                     frame_id = str(option_data["frame_id"])
                     if frozen_frontier_candidate_id is not None:
-                        frozen_candidate_root = (
-                            output_dir
-                            / "production-frontier"
-                            / "9x16"
-                            / selected.feature_id
-                            / candidate_id
+                        if frozen_frontier_execution_sha256 is None:
+                            raise FeatureCutSystemFailure(
+                                "frozen autonomous frontier candidate has no "
+                                "execution SHA"
+                            )
+                        frozen_candidate_root = _frontier_execution_dir(
+                            output_dir / "production-frontier" / "9x16",
+                            beat_id=selected.feature_id,
+                            candidate_id=candidate_id,
+                            candidate_execution_sha256=(
+                                frozen_frontier_execution_sha256
+                            ),
                         )
                         local_stage = read_json(
                             frozen_candidate_root / "local.json"
@@ -22737,6 +23545,9 @@ def _run_feature_cut_experiment_impl(
                         candidate_attempts.append(
                             {
                                 "candidate_id": candidate_id,
+                                "candidate_execution_sha256": (
+                                    frozen_frontier_execution_sha256
+                                ),
                                 "rank": candidate_rank,
                                 "decision": "accepted_from_frozen_frontier",
                                 "reason_code": (
@@ -23311,6 +24122,7 @@ def _run_feature_cut_experiment_impl(
                                         client=client,
                                         feature_id=selected.feature_id,
                                         candidate_id=candidate_id,
+                                        candidate_execution_sha256=None,
                                         source_path=Path(
                                             candidate_clip.path
                                         ),
@@ -25550,14 +26362,24 @@ def _run_feature_cut_experiment_impl(
                     frozen_frontier_root = (
                         output_dir / "production-frontier" / "9x16"
                     )
-                    frozen_candidate_root = (
-                        frozen_frontier_root
-                        / selected.feature_id
-                        / selected_candidate_id
+                    if frozen_frontier_execution_sha256 is None:
+                        raise FeatureCutSystemFailure(
+                            "frozen vertical finalizer has no execution SHA"
+                        )
+                    frozen_candidate_root = _frontier_execution_dir(
+                        frozen_frontier_root,
+                        beat_id=selected.feature_id,
+                        candidate_id=selected_candidate_id,
+                        candidate_execution_sha256=(
+                            frozen_frontier_execution_sha256
+                        ),
                     )
                     finalized_runtime_sha256 = _stable_fingerprint(
                         {
                             "candidate_id": selected_candidate_id,
+                            "candidate_execution_sha256": (
+                                frozen_frontier_execution_sha256
+                            ),
                             "source_in_ms": v_start,
                             "source_out_ms": v_end,
                             "trim": vertical_trim,
@@ -25574,6 +26396,9 @@ def _run_feature_cut_experiment_impl(
                         ),
                         beat_id=selected.feature_id,
                         candidate_id=selected_candidate_id,
+                        candidate_execution_sha256=(
+                            frozen_frontier_execution_sha256
+                        ),
                         stage="finalize",
                         dependency_hashes=(
                             sha256_file(
@@ -25612,6 +26437,9 @@ def _run_feature_cut_experiment_impl(
                         frontier_root=frozen_frontier_root,
                         feature_id=selected.feature_id,
                         candidate_id=selected_candidate_id,
+                        candidate_execution_sha256=(
+                            frozen_frontier_execution_sha256
+                        ),
                     )
                 vertical_source_interval = _exact_render_source_interval(
                     source_path=Path(vertical_clip.path),

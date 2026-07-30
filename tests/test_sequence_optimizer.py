@@ -301,6 +301,93 @@ def test_round_robin_frontier_exact_failure_can_accept_earlier_deferred() -> Non
     assert next_attempt.beat_id == "preferred"
 
 
+def test_frontier_distinguishes_same_candidate_across_execution_hashes() -> None:
+    first_execution_sha256 = "a" * 64
+    second_execution_sha256 = "b" * 64
+    state = initialize_round_robin_frontier(
+        (
+            RoundRobinFrontierBeat(
+                beat_id="fold_hero",
+                story_order=0,
+                candidates=(
+                    RoundRobinFrontierCandidate(
+                        beat_id="fold_hero",
+                        candidate_id="c8361",
+                        candidate_execution_sha256=(
+                            first_execution_sha256
+                        ),
+                        candidate_order=0,
+                    ),
+                    RoundRobinFrontierCandidate(
+                        beat_id="fold_hero",
+                        candidate_id="c8361",
+                        candidate_execution_sha256=(
+                            second_execution_sha256
+                        ),
+                        candidate_order=1,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    first_local = next_round_robin_frontier_attempt(state)
+    assert first_local is not None
+    assert (
+        first_local.candidate_execution_sha256
+        == first_execution_sha256
+    )
+    state = record_round_robin_frontier_attempt(
+        state,
+        RoundRobinFrontierAttemptResult(
+            attempt=first_local,
+            outcome="local_preflight_passed",
+        ),
+    )
+    first_grounding = next_round_robin_frontier_attempt(state)
+    assert first_grounding is not None
+    assert (
+        first_grounding.candidate_execution_sha256
+        == first_execution_sha256
+    )
+    state = record_round_robin_frontier_attempt(
+        state,
+        RoundRobinFrontierAttemptResult(
+            attempt=first_grounding,
+            outcome="grounding_failed",
+        ),
+    )
+    second_local = next_round_robin_frontier_attempt(state)
+    assert second_local is not None
+    assert second_local.candidate_id == "c8361"
+    assert (
+        second_local.candidate_execution_sha256
+        == second_execution_sha256
+    )
+    state = record_round_robin_frontier_attempt(
+        state,
+        RoundRobinFrontierAttemptResult(
+            attempt=second_local,
+            outcome="local_preflight_passed",
+        ),
+    )
+    second_grounding = next_round_robin_frontier_attempt(state)
+    assert second_grounding is not None
+    state = record_round_robin_frontier_attempt(
+        state,
+        RoundRobinFrontierAttemptResult(
+            attempt=second_grounding,
+            outcome="grounding_accepted",
+        ),
+    )
+
+    assert state.beats[0].accepted_candidate_id == "c8361"
+    assert (
+        state.beats[0].accepted_candidate_execution_sha256
+        == second_execution_sha256
+    )
+
+
 def _route_option(
     beat_id: str,
     candidate_id: str,
@@ -345,6 +432,43 @@ def _timed_route_option(
         maximum_readable_ms=duration_ms,
         fixed_source_in_ms=source_in_ms,
         fixed_source_out_ms=source_out_ms,
+        reuse_mode=reuse_mode,
+        reuse_justification=(
+            "explicit test reuse authority"
+            if reuse_mode != "none"
+            else None
+        ),
+        candidate_timing_sha256=source_marker * 64,
+    )
+
+
+def _movable_route_option(
+    beat_id: str,
+    candidate_id: str,
+    source_marker: str,
+    *,
+    duration_ms: int,
+    safe_window_start_ms: int,
+    safe_window_end_ms: int,
+    source_anchor_ms: int,
+    reuse_mode: str = "none",
+) -> CandidateRouteOption:
+    return CandidateRouteOption(
+        beat_id=beat_id,
+        candidate_id=candidate_id,
+        source_asset_id="sha256:" + source_marker * 64,
+        source_clip_id=f"clip-{source_marker}",
+        event_id=f"event-{candidate_id}",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=duration_ms,
+        minimum_readable_ms=duration_ms,
+        preferred_readable_ms=duration_ms,
+        maximum_readable_ms=duration_ms,
+        safe_capacity_ms=safe_window_end_ms - safe_window_start_ms,
+        safe_window_start_ms=safe_window_start_ms,
+        safe_window_end_ms=safe_window_end_ms,
+        source_anchor_ms=source_anchor_ms,
         reuse_mode=reuse_mode,
         reuse_justification=(
             "explicit test reuse authority"
@@ -616,6 +740,94 @@ def test_non_overlapping_distinct_interval_reuse_is_hard_safe() -> None:
         "closing-a",
     ]
     assert result.selections[1].reuse_mode == "distinct_interval"
+
+
+def test_center_overlap_repositions_safe_window_for_distinct_interval() -> None:
+    fold_hero = _movable_route_option(
+        "fold_hero",
+        "fold-c8361",
+        "a",
+        duration_ms=5_500,
+        safe_window_start_ms=0,
+        safe_window_end_ms=9_009,
+        source_anchor_ms=6_000,
+    )
+    closing = _timed_route_option(
+        "closing",
+        "closing-c8361",
+        "a",
+        source_in_ms=0,
+        source_out_ms=3_500,
+        reuse_mode="distinct_interval",
+    )
+
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="fold_hero",
+                options=(fold_hero,),
+            ),
+            CandidateRouteBeat(
+                beat_id="closing",
+                options=(closing,),
+            ),
+        )
+    )
+
+    assert (
+        result.selections[0].source_in_ms,
+        result.selections[0].source_out_ms,
+    ) == (3_500, 9_000)
+    assert (
+        result.selections[1].source_in_ms,
+        result.selections[1].source_out_ms,
+    ) == (0, 3_500)
+    assert result.selections[0].source_in_ms != 3_250
+    assert "source_interval_jointly_repositioned" in (
+        result.selections[0].decision_codes
+    )
+    assert result.selections[0].candidate_execution_sha256 == (
+        candidate_route_execution_sha256(
+            fold_hero,
+            duration_ms=5_500,
+            source_in_ms=3_500,
+            source_out_ms=9_000,
+        )
+    )
+
+
+def test_center_overlap_still_rejects_when_safe_window_cannot_move() -> None:
+    immovable_fold = _movable_route_option(
+        "fold_hero",
+        "fold-c8361",
+        "a",
+        duration_ms=5_500,
+        safe_window_start_ms=0,
+        safe_window_end_ms=8_750,
+        source_anchor_ms=6_000,
+    )
+    closing = _timed_route_option(
+        "closing",
+        "closing-c8361",
+        "a",
+        source_in_ms=0,
+        source_out_ms=3_500,
+        reuse_mode="distinct_interval",
+    )
+
+    with pytest.raises(ValueError, match="no options for beat closing"):
+        optimize_pre_render_candidate_route(
+            (
+                CandidateRouteBeat(
+                    beat_id="fold_hero",
+                    options=(immovable_fold,),
+                ),
+                CandidateRouteBeat(
+                    beat_id="closing",
+                    options=(closing,),
+                ),
+            )
+        )
 
 
 def test_independent_fallback_conflict_never_becomes_complete_route() -> None:

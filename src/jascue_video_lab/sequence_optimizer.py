@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -63,6 +64,10 @@ class RoundRobinFrontierCandidate(FrozenStrictModel):
 
     beat_id: str = Field(min_length=1)
     candidate_id: str = Field(min_length=1)
+    candidate_execution_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     candidate_order: int = Field(ge=0)
     requires_exact_event: bool = False
 
@@ -84,11 +89,17 @@ class RoundRobinFrontierBeat(FrozenStrictModel):
             for candidate in self.candidates
         ):
             raise ValueError("frontier candidates must match their beat")
-        candidate_ids = [
-            candidate.candidate_id for candidate in self.candidates
+        candidate_keys = [
+            (
+                candidate.candidate_id,
+                candidate.candidate_execution_sha256,
+            )
+            for candidate in self.candidates
         ]
-        if len(candidate_ids) != len(set(candidate_ids)):
-            raise ValueError("frontier candidate IDs must be unique per beat")
+        if len(candidate_keys) != len(set(candidate_keys)):
+            raise ValueError(
+                "frontier candidate executions must be unique per beat"
+            )
         candidate_orders = [
             candidate.candidate_order for candidate in self.candidates
         ]
@@ -105,6 +116,10 @@ class RoundRobinFrontierAttempt(FrozenStrictModel):
     revision: int = Field(ge=0)
     beat_id: str = Field(min_length=1)
     candidate_id: str = Field(min_length=1)
+    candidate_execution_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     story_order: int = Field(ge=0)
     priority: BeatPriority = "preferred"
     candidate_order: int = Field(ge=0)
@@ -126,6 +141,10 @@ class RoundRobinFrontierAttemptResult(FrozenStrictModel):
     attempt: RoundRobinFrontierAttempt
     outcome: FrontierAttemptOutcome
     accepted_candidate_id: str | None = None
+    accepted_candidate_execution_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     beat_omitted: bool = False
     decision_codes: tuple[str, ...] = ()
     paid_calls_added: int | None = Field(default=None, ge=0)
@@ -165,9 +184,17 @@ class RoundRobinFrontierAttemptResult(FrozenStrictModel):
                 "terminal-stage failure that activates an earlier deferred "
                 "fallback"
             )
+        if (
+            self.accepted_candidate_execution_sha256 is not None
+            and self.accepted_candidate_id is None
+        ):
+            raise ValueError(
+                "accepted candidate execution requires its candidate ID"
+            )
         if self.beat_omitted and (
             not self.outcome.endswith("_failed")
             or self.accepted_candidate_id is not None
+            or self.accepted_candidate_execution_sha256 is not None
         ):
             raise ValueError(
                 "beat omission requires a terminal candidate failure and "
@@ -187,8 +214,16 @@ class RoundRobinFrontierBeatState(FrozenStrictModel):
     round_index: int = Field(default=1, ge=1)
     status: FrontierBeatStatus = "pending"
     active_candidate_id: str | None = None
+    active_candidate_execution_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     next_stage: FrontierAttemptStage = "local_preflight"
     accepted_candidate_id: str | None = None
+    accepted_candidate_execution_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @model_validator(mode="after")
     def validate_runtime_state(self) -> "RoundRobinFrontierBeatState":
@@ -209,18 +244,51 @@ class RoundRobinFrontierBeatState(FrozenStrictModel):
                     "active frontier candidate must match the cursor"
                 )
             if (
+                self.active_candidate_execution_sha256 is not None
+                and self.active_candidate_execution_sha256
+                != current.candidate_execution_sha256
+            ):
+                raise ValueError(
+                    "active frontier execution must match the cursor"
+                )
+            if (
                 self.next_stage != "local_preflight"
                 and self.active_candidate_id is None
             ):
                 raise ValueError(
                     "paid frontier stages require an active candidate"
                 )
+            if (
+                self.next_stage != "local_preflight"
+                and self.active_candidate_execution_sha256
+                != current.candidate_execution_sha256
+            ):
+                raise ValueError(
+                    "paid frontier stage must bind the active execution"
+                )
         elif self.status == "accepted":
             if self.accepted_candidate_id is None:
                 raise ValueError(
                     "accepted frontier beat must bind its candidate"
                 )
-        elif self.accepted_candidate_id is not None:
+            matching = [
+                candidate
+                for candidate in self.beat.candidates
+                if candidate.candidate_id == self.accepted_candidate_id
+                and (
+                    self.accepted_candidate_execution_sha256 is None
+                    or candidate.candidate_execution_sha256
+                    == self.accepted_candidate_execution_sha256
+                )
+            ]
+            if len(matching) != 1:
+                raise ValueError(
+                    "accepted frontier beat must bind one candidate execution"
+                )
+        elif (
+            self.accepted_candidate_id is not None
+            or self.accepted_candidate_execution_sha256 is not None
+        ):
             raise ValueError(
                 "only an accepted frontier beat may bind a candidate"
             )
@@ -271,6 +339,7 @@ def initialize_round_robin_frontier(
                             key=lambda candidate: (
                                 candidate.candidate_order,
                                 candidate.candidate_id,
+                                candidate.candidate_execution_sha256 or "",
                             ),
                         )
                     )
@@ -326,6 +395,9 @@ def next_round_robin_frontier_attempt(
         revision=state.revision,
         beat_id=selected.beat.beat_id,
         candidate_id=candidate.candidate_id,
+        candidate_execution_sha256=(
+            candidate.candidate_execution_sha256
+        ),
         story_order=selected.beat.story_order,
         priority=selected.beat.priority,
         candidate_order=candidate.candidate_order,
@@ -333,6 +405,30 @@ def next_round_robin_frontier_attempt(
         stage=selected.next_stage,
         paid=selected.next_stage != "local_preflight",
     )
+
+
+def _resolve_accepted_frontier_candidate(
+    beat: RoundRobinFrontierBeat,
+    current: RoundRobinFrontierCandidate,
+    result: RoundRobinFrontierAttemptResult,
+) -> RoundRobinFrontierCandidate:
+    if result.accepted_candidate_id is None:
+        return current
+    matching = [
+        candidate
+        for candidate in beat.candidates
+        if candidate.candidate_id == result.accepted_candidate_id
+        and (
+            result.accepted_candidate_execution_sha256 is None
+            or candidate.candidate_execution_sha256
+            == result.accepted_candidate_execution_sha256
+        )
+    ]
+    if len(matching) != 1:
+        raise ValueError(
+            "accepted frontier override must identify one candidate execution"
+        )
+    return matching[0]
 
 
 def record_round_robin_frontier_attempt(
@@ -362,6 +458,9 @@ def record_round_robin_frontier_attempt(
         beat_state = beat_state.model_copy(
             update={
                 "active_candidate_id": candidate.candidate_id,
+                "active_candidate_execution_sha256": (
+                    candidate.candidate_execution_sha256
+                ),
                 "next_stage": (
                     "exact_event"
                     if candidate.requires_exact_event
@@ -374,20 +473,20 @@ def record_round_robin_frontier_attempt(
             update={"next_stage": "grounding"}
         )
     elif result.outcome == "grounding_accepted":
-        accepted_candidate_id = (
-            result.accepted_candidate_id or candidate.candidate_id
+        accepted_candidate = _resolve_accepted_frontier_candidate(
+            beat_state.beat,
+            candidate,
+            result,
         )
-        if accepted_candidate_id not in {
-            row.candidate_id for row in beat_state.beat.candidates
-        }:
-            raise ValueError(
-                "accepted frontier candidate override is outside the beat"
-            )
         beat_state = beat_state.model_copy(
             update={
                 "status": "accepted",
                 "active_candidate_id": None,
-                "accepted_candidate_id": accepted_candidate_id,
+                "active_candidate_execution_sha256": None,
+                "accepted_candidate_id": accepted_candidate.candidate_id,
+                "accepted_candidate_execution_sha256": (
+                    accepted_candidate.candidate_execution_sha256
+                ),
             }
         )
     elif result.beat_omitted:
@@ -395,21 +494,26 @@ def record_round_robin_frontier_attempt(
             update={
                 "status": "omitted",
                 "active_candidate_id": None,
+                "active_candidate_execution_sha256": None,
                 "accepted_candidate_id": None,
+                "accepted_candidate_execution_sha256": None,
             }
         )
     elif result.accepted_candidate_id is not None:
-        if result.accepted_candidate_id not in {
-            row.candidate_id for row in beat_state.beat.candidates
-        }:
-            raise ValueError(
-                "accepted frontier candidate override is outside the beat"
-            )
+        accepted_candidate = _resolve_accepted_frontier_candidate(
+            beat_state.beat,
+            candidate,
+            result,
+        )
         beat_state = beat_state.model_copy(
             update={
                 "status": "accepted",
                 "active_candidate_id": None,
-                "accepted_candidate_id": result.accepted_candidate_id,
+                "active_candidate_execution_sha256": None,
+                "accepted_candidate_id": accepted_candidate.candidate_id,
+                "accepted_candidate_execution_sha256": (
+                    accepted_candidate.candidate_execution_sha256
+                ),
             }
         )
     else:
@@ -429,6 +533,7 @@ def record_round_robin_frontier_attempt(
                     else "pending"
                 ),
                 "active_candidate_id": None,
+                "active_candidate_execution_sha256": None,
                 "next_stage": "local_preflight",
             }
         )
@@ -1255,29 +1360,236 @@ def _candidate_source_interval(
     *,
     duration_ms: int,
 ) -> tuple[int | None, int | None]:
+    feasible = _candidate_source_start_range(
+        option,
+        duration_ms=duration_ms,
+    )
+    if feasible is None:
+        return None, None
+    _, _, centered_start_ms = feasible
+    return centered_start_ms, centered_start_ms + duration_ms
+
+
+def _candidate_source_start_range(
+    option: CandidateRouteOption,
+    *,
+    duration_ms: int,
+) -> tuple[int, int, int] | None:
+    """Return inclusive start bounds and the anchor-centered preferred start."""
+
     if (
         option.fixed_source_in_ms is not None
         and option.fixed_source_out_ms is not None
     ):
         if option.fixed_source_out_ms - option.fixed_source_in_ms != duration_ms:
-            return None, None
-        return option.fixed_source_in_ms, option.fixed_source_out_ms
+            return None
+        return (
+            option.fixed_source_in_ms,
+            option.fixed_source_in_ms,
+            option.fixed_source_in_ms,
+        )
     if (
         option.safe_window_start_ms is None
         or option.safe_window_end_ms is None
         or option.source_anchor_ms is None
     ):
-        return None, None
+        return None
     if duration_ms > option.safe_window_end_ms - option.safe_window_start_ms:
-        return None, None
-    source_in_ms = min(
-        max(
-            option.safe_window_start_ms,
-            option.source_anchor_ms - duration_ms // 2,
-        ),
+        return None
+    # Every movable interval must retain the semantic/event anchor.  The
+    # interval may slide anywhere inside the safe window; centering is merely
+    # the preferred position, never an immutable trim.
+    minimum_start_ms = max(
+        option.safe_window_start_ms,
+        option.source_anchor_ms - duration_ms,
+    )
+    maximum_start_ms = min(
+        option.source_anchor_ms,
         option.safe_window_end_ms - duration_ms,
     )
-    return source_in_ms, source_in_ms + duration_ms
+    if minimum_start_ms > maximum_start_ms:
+        return None
+    centered_start_ms = min(
+        max(
+            minimum_start_ms,
+            option.source_anchor_ms - duration_ms // 2,
+        ),
+        maximum_start_ms,
+    )
+    return minimum_start_ms, maximum_start_ms, centered_start_ms
+
+
+def _ordered_interval_placement(
+    *,
+    left_range: tuple[int, int, int],
+    left_duration_ms: int,
+    right_range: tuple[int, int, int],
+    permitted_overlap_ms: float,
+) -> tuple[int, int] | None:
+    """Minimally move centers so left overlap with right stays under a cap."""
+
+    left_min, left_max, left_center = left_range
+    right_min, right_max, right_center = right_range
+    required_start_delta_ms = math.ceil(
+        left_duration_ms - permitted_overlap_ms
+    )
+    if left_min + required_start_delta_ms > right_max:
+        return None
+    if left_center + required_start_delta_ms <= right_center:
+        return left_center, right_center
+    movement_needed_ms = (
+        left_center + required_start_delta_ms - right_center
+    )
+    left_capacity_ms = left_center - left_min
+    right_capacity_ms = right_max - right_center
+    left_move_ms = min(
+        left_capacity_ms,
+        movement_needed_ms // 2,
+    )
+    right_move_ms = min(
+        right_capacity_ms,
+        movement_needed_ms - left_move_ms,
+    )
+    remaining_ms = (
+        movement_needed_ms - left_move_ms - right_move_ms
+    )
+    if remaining_ms:
+        extra_left_ms = min(
+            left_capacity_ms - left_move_ms,
+            remaining_ms,
+        )
+        left_move_ms += extra_left_ms
+        remaining_ms -= extra_left_ms
+    if remaining_ms:
+        extra_right_ms = min(
+            right_capacity_ms - right_move_ms,
+            remaining_ms,
+        )
+        right_move_ms += extra_right_ms
+        remaining_ms -= extra_right_ms
+    if remaining_ms:
+        return None
+    left_start_ms = left_center - left_move_ms
+    right_start_ms = right_center + right_move_ms
+    if left_start_ms + required_start_delta_ms > right_start_ms:
+        return None
+    return left_start_ms, right_start_ms
+
+
+def _joint_pair_interval_placement(
+    *,
+    first_range: tuple[int, int, int],
+    first_duration_ms: int,
+    second_range: tuple[int, int, int],
+    second_duration_ms: int,
+    permitted_overlap_ms: float,
+) -> tuple[int, int] | None:
+    candidates: list[tuple[int, int]] = []
+    first_then_second = _ordered_interval_placement(
+        left_range=first_range,
+        left_duration_ms=first_duration_ms,
+        right_range=second_range,
+        permitted_overlap_ms=permitted_overlap_ms,
+    )
+    if first_then_second is not None:
+        candidates.append(first_then_second)
+    second_then_first = _ordered_interval_placement(
+        left_range=second_range,
+        left_duration_ms=second_duration_ms,
+        right_range=first_range,
+        permitted_overlap_ms=permitted_overlap_ms,
+    )
+    if second_then_first is not None:
+        second_start_ms, first_start_ms = second_then_first
+        candidates.append((first_start_ms, second_start_ms))
+    if not candidates:
+        return None
+    first_center = first_range[2]
+    second_center = second_range[2]
+    return min(
+        candidates,
+        key=lambda starts: (
+            abs(starts[0] - first_center)
+            + abs(starts[1] - second_center),
+            max(
+                abs(starts[0] - first_center),
+                abs(starts[1] - second_center),
+            ),
+            starts,
+        ),
+    )
+
+
+def _candidate_route_intervals(
+    options: Sequence[CandidateRouteOption],
+    durations_ms: Sequence[int],
+    *,
+    max_editorial_reprise_overlap_fraction: float,
+) -> tuple[tuple[int | None, int | None], ...] | None:
+    """Jointly place up to two timed uses of each source."""
+
+    ranges = [
+        _candidate_source_start_range(option, duration_ms=duration_ms)
+        for option, duration_ms in zip(options, durations_ms, strict=True)
+    ]
+    intervals: list[tuple[int | None, int | None]] = [
+        (
+            (start_range[2], start_range[2] + duration_ms)
+            if start_range is not None
+            else (None, None)
+        )
+        for start_range, duration_ms in zip(
+            ranges,
+            durations_ms,
+            strict=True,
+        )
+    ]
+    source_indices: dict[str, list[int]] = {}
+    for index, option in enumerate(options):
+        source_indices.setdefault(_source_identity(option), []).append(index)
+    for indices in source_indices.values():
+        timed_indices = [
+            index for index in indices if ranges[index] is not None
+        ]
+        # Missing legacy timing retains the old soft-repeat behavior.  Exact
+        # interval authority starts only once both uses are measurable.
+        if len(timed_indices) < 2:
+            continue
+        if len(timed_indices) > 2:
+            return None
+        first_index, second_index = timed_indices
+        second_option = options[second_index]
+        if second_option.reuse_mode == "none":
+            return None
+        if second_option.reuse_mode == "alternate_presentation":
+            continue
+        permitted_overlap_ms = 0.0
+        if second_option.reuse_mode == "editorial_reprise":
+            permitted_overlap_ms = (
+                durations_ms[second_index]
+                * max_editorial_reprise_overlap_fraction
+            )
+        assert ranges[first_index] is not None
+        assert ranges[second_index] is not None
+        placed = _joint_pair_interval_placement(
+            first_range=ranges[first_index],
+            first_duration_ms=durations_ms[first_index],
+            second_range=ranges[second_index],
+            second_duration_ms=durations_ms[second_index],
+            permitted_overlap_ms=permitted_overlap_ms,
+        )
+        if placed is None:
+            return None
+        first_start_ms, second_start_ms = placed
+        intervals[first_index] = (
+            first_start_ms,
+            first_start_ms + durations_ms[first_index],
+        )
+        intervals[second_index] = (
+            second_start_ms,
+            second_start_ms + durations_ms[second_index],
+        )
+    return tuple(intervals)
 
 
 def candidate_route_execution_sha256(
@@ -1320,11 +1632,15 @@ def _candidate_route_selection(
     *,
     duration_ms: int,
     decision_codes: tuple[str, ...],
+    source_interval: tuple[int | None, int | None] | None = None,
 ) -> CandidateRouteSelection:
-    source_in_ms, source_out_ms = _candidate_source_interval(
-        option,
-        duration_ms=duration_ms,
-    )
+    if source_interval is None:
+        source_in_ms, source_out_ms = _candidate_source_interval(
+            option,
+            duration_ms=duration_ms,
+        )
+    else:
+        source_in_ms, source_out_ms = source_interval
     return CandidateRouteSelection(
         beat_id=option.beat_id,
         candidate_id=option.candidate_id,
@@ -1409,19 +1725,42 @@ def _candidate_complete_route(
     )
     if durations is None:
         return None
+    source_intervals = _candidate_route_intervals(
+        state.options,
+        durations,
+        max_editorial_reprise_overlap_fraction=(
+            max_editorial_reprise_overlap_fraction
+        ),
+    )
+    if source_intervals is None:
+        return None
     selections: list[CandidateRouteSelection] = []
     prior: list[tuple[CandidateRouteOption, CandidateRouteSelection]] = []
     panel_duration_ms = 0
-    for option, duration_ms, provisional in zip(
+    repositioned = False
+    for option, duration_ms, source_interval, provisional in zip(
         state.options,
         durations,
+        source_intervals,
         state.selections,
         strict=True,
     ):
+        centered_interval = _candidate_source_interval(
+            option,
+            duration_ms=duration_ms,
+        )
+        selection_codes = provisional.decision_codes
+        if source_interval != centered_interval:
+            repositioned = True
+            selection_codes = (
+                *selection_codes,
+                "source_interval_jointly_repositioned",
+            )
         selection = _candidate_route_selection(
             option,
             duration_ms=duration_ms,
-            decision_codes=provisional.decision_codes,
+            decision_codes=selection_codes,
+            source_interval=source_interval,
         )
         if _candidate_reuse_failure(
             prior,
@@ -1468,6 +1807,11 @@ def _candidate_complete_route(
             "complete_route_ranked_before_runtime",
             "candidate_local_timing_bound",
             "source_reuse_hard_checked",
+            *(
+                ("source_intervals_jointly_placed",)
+                if repositioned
+                else ()
+            ),
         ),
     )
 
@@ -1552,32 +1896,26 @@ def optimize_pre_render_candidate_route(
         expanded: list[_CandidateRouteState] = []
         for state in states:
             for option in feasible_options:
-                provisional_duration = (
-                    _candidate_duration_bounds(option) or (0, 0, 0)
-                )[0]
-                if provisional_duration < 1:
-                    continue
-                provisional_selection = _candidate_route_selection(
-                    option,
-                    duration_ms=provisional_duration,
-                    decision_codes=(),
+                provisional_options = state.options + (option,)
+                provisional_durations = tuple(
+                    (
+                        _candidate_duration_bounds(candidate)
+                        or (0, 0, 0)
+                    )[0]
+                    for candidate in provisional_options
                 )
-                prior = [
-                    (prior_option, prior_selection)
-                    for prior_option, prior_selection in zip(
-                        state.options,
-                        state.selections,
-                        strict=True,
-                    )
-                ]
-                if _candidate_reuse_failure(
-                    prior,
-                    option,
-                    provisional_selection,
+                if any(duration < 1 for duration in provisional_durations):
+                    continue
+                # Centered trims are preferences.  The early hard gate solves
+                # the full feasible start ranges, so a movable distinct
+                # interval is not discarded merely because centers overlap.
+                if _candidate_route_intervals(
+                    provisional_options,
+                    provisional_durations,
                     max_editorial_reprise_overlap_fraction=(
                         max_editorial_reprise_overlap_fraction
                     ),
-                ):
+                ) is None:
                     continue
                 exact_repeat = (
                     option.source_asset_id,
@@ -1726,25 +2064,12 @@ def optimize_pre_render_candidate_route(
     ] = {}
     for beat in beats:
         selected_candidate_id = selected_by_beat[beat.beat_id]
-        best_execution_by_beat = {
-            selection.beat_id: selection.candidate_execution_sha256
-            for selection in best_route.selections
-        }
         route_compatible_candidate_ids: list[str] = []
         for complete_route, _state in ranked_route_states:
             route_by_beat = {
                 selection.beat_id: selection
                 for selection in complete_route.selections
             }
-            if any(
-                route_by_beat[other_beat_id]
-                .candidate_execution_sha256
-                != execution_sha256
-                for other_beat_id, execution_sha256
-                in best_execution_by_beat.items()
-                if other_beat_id != beat.beat_id
-            ):
-                continue
             candidate_id = route_by_beat[beat.beat_id].candidate_id
             if candidate_id not in route_compatible_candidate_ids:
                 route_compatible_candidate_ids.append(candidate_id)
@@ -1854,11 +2179,15 @@ def select_next_compatible_route(
     *,
     accepted_execution_sha256_by_beat: Mapping[str, str],
     failed_execution_sha256s: Sequence[str] = (),
+    unavailable_execution_sha256s: Sequence[str] = (),
     after_route_id: str | None = None,
 ) -> CandidateCompleteRoute | None:
     """Advance only to a complete route compatible with accepted executions."""
 
-    failed = set(failed_execution_sha256s)
+    unavailable = {
+        *failed_execution_sha256s,
+        *unavailable_execution_sha256s,
+    }
     after_seen = after_route_id is None
     for route in ranked_routes:
         if not after_seen:
@@ -1870,7 +2199,7 @@ def select_next_compatible_route(
             for selection in route.selections
         }
         if any(
-            selection.candidate_execution_sha256 in failed
+            selection.candidate_execution_sha256 in unavailable
             for selection in route.selections
         ):
             continue
