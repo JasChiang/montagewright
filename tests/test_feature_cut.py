@@ -883,11 +883,60 @@ def test_zero_paid_local_stage_archives_stale_binding_and_recomputes(
         .read_text(encoding="utf-8")
     )
     assert archive_record["contract_version"] == (
-        "zero-paid-frontier-local-stale-archive-v1"
+        "zero-paid-frontier-stale-archive-v2"
     )
     assert archive_record["paid_provider_dispatch_added"] is False
     assert archive_record["previous_dependency_hashes"] == list(
         kwargs["dependency_hashes"]
+    )
+
+
+def test_grounding_stage_recompiles_locally_from_saved_provider_evidence(
+    tmp_path: Path,
+) -> None:
+    kwargs = {
+        **_frontier_stage_artifact_kwargs(tmp_path),
+        "stage": "grounding",
+    }
+    artifact_path = kwargs["artifact_path"]
+    assert isinstance(artifact_path, Path)
+    _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: {"classification": "old_local_compile"},
+    )
+    local_recompile_calls: list[str] = []
+
+    refreshed = _load_or_create_frontier_stage_artifact(
+        **{
+            **kwargs,
+            "dependency_hashes": (
+                kwargs["dependency_hashes"][0],
+                "sha256:" + "f" * 64,
+            ),
+        },
+        producer=lambda: pytest.fail(
+            "stale grounding wrapper used paid-capable producer"
+        ),
+        stale_local_recompile_producer=lambda: (
+            local_recompile_calls.append("saved-provider-evidence")
+            or {"classification": "current_local_compile"}
+        ),
+    )
+
+    archive_records = list(
+        (artifact_path.parent / "archive").glob(
+            "*.archive-record.json"
+        )
+    )
+    assert refreshed == {"classification": "current_local_compile"}
+    assert local_recompile_calls == ["saved-provider-evidence"]
+    assert len(archive_records) == 1
+    archive_record = json.loads(
+        archive_records[0].read_text(encoding="utf-8")
+    )
+    assert archive_record["paid_provider_dispatch_added"] is False
+    assert archive_record["recompile_mode"] == (
+        "saved_provider_evidence_local_recompile"
     )
 
 

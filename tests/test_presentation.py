@@ -810,6 +810,58 @@ def test_unreliable_source_motion_forbids_virtual_pan_but_allows_hard_cut() -> N
     assert compilation.scene_facts.source_camera_motion_reliable is False
 
 
+def test_one_measured_source_reversal_is_allowed_only_when_motivated() -> None:
+    evidence = SourceCameraMotionEvidence(
+        source_asset_id="sha256:" + "a" * 64,
+        window_start_ms=0,
+        window_end_ms=5_500,
+        sample_times_ms=(0, 2_750, 5_500),
+        sample_frame_pts=(0, 83, 165),
+        sample_frame_hashes=("b" * 64, "c" * 64, "d" * 64),
+        subject_exclusion_mode="sam_track_boxes",
+        mean_excluded_area_fraction=0.06,
+        pairs=(),
+        classification="mixed",
+        reliable=True,
+        confidence=0.49,
+        normalized_translation_x_per_second=-0.01,
+        normalized_translation_y_per_second=0.0,
+        scale_rate_per_second=0.0,
+        rotation_degrees_per_second=0.0,
+        normalized_travel=0.18,
+        reversal_count=1,
+        reason_codes=("mixed_motion_one_reversal",),
+        cache_key_sha256="e" * 64,
+    )
+
+    motivated = compile_presentation(
+        targets=[_target("device", (400, 250, 600, 750))],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="single_subject",
+        policy=_policy(),
+        source_camera_motion_evidence=evidence,
+        movement_motivated=True,
+    )
+    unmotivated = compile_presentation(
+        targets=[_target("device", (400, 250, 600, 750))],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="single_subject",
+        policy=_policy(),
+        source_camera_motion_evidence=evidence,
+        movement_motivated=False,
+    )
+
+    assert motivated.mode == "static_full_bleed_crop"
+    assert unmotivated.mode == "blocked"
+    assert unmotivated.selection is not None
+    assert any(
+        "unmotivated_source_camera_motion" in failures
+        for failures in unmotivated.selection.rejected_options.values()
+    )
+
+
 def test_impossible_two_device_crop_uses_scale_locked_two_panel() -> None:
     compilation = compile_presentation(
         targets=[

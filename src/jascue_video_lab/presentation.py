@@ -1326,7 +1326,6 @@ def generate_presentation_options(
             scene_facts.source_camera_motion.direction == "static"
             or (
                 movement_motivated
-                and scene_facts.source_camera_motion.direction != "mixed"
                 and scene_facts.source_camera_motion.reversal_count <= 1
             )
         )
@@ -1337,6 +1336,8 @@ def generate_presentation_options(
                 "source_camera_static"
                 if scene_facts.source_camera_motion.direction == "static"
                 else "source_camera_motion_semantically_motivated"
+                if accepted and movement_motivated
+                else "source_camera_motion_reversal_exceeds_policy"
                 if movement_motivated
                 else "unmotivated_source_camera_motion"
             ),

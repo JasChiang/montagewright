@@ -275,7 +275,7 @@ _EXTERNAL_PROJECTION_SIDECAR_VERSION = "external-feature-plan-projection-v1"
 _EXTERNAL_PROJECTION_POINTER_NAME = "feature-plan.external-projection.json"
 _FRONTIER_LOCAL_BINDING_VERSION = "vertical-frontier-local-input-v3"
 _FRONTIER_EXACT_BINDING_VERSION = "vertical-frontier-exact-input-v2"
-_FRONTIER_GEOMETRY_BINDING_VERSION = "vertical-frontier-geometry-input-v2"
+_FRONTIER_GEOMETRY_BINDING_VERSION = "vertical-frontier-geometry-input-v3"
 _FRONTIER_FULFILLMENT_COMPILER_VERSION = (
     "runtime-candidate-fulfillment-compiler-v2"
 )
@@ -639,6 +639,9 @@ def _load_or_create_frontier_stage_artifact(
     policy_reference: str,
     route_sha256: str,
     producer: Callable[[], Mapping[str, Any]],
+    stale_local_recompile_producer: (
+        Callable[[], Mapping[str, Any]] | None
+    ) = None,
 ) -> Mapping[str, Any]:
     """Persist a callback result before advancing scheduler state.
 
@@ -757,7 +760,14 @@ def _load_or_create_frontier_stage_artifact(
             )
         )
         if bindings_are_stale:
-            if stage != "local_preflight":
+            locally_recompilable = (
+                stage == "local_preflight"
+                or (
+                    stage == "grounding"
+                    and stale_local_recompile_producer is not None
+                )
+            )
+            if not locally_recompilable:
                 raise FeatureCutSystemFailure(
                     "persisted vertical frontier stage artifact has stale or "
                     "tampered bindings"
@@ -778,7 +788,7 @@ def _load_or_create_frontier_stage_artifact(
                 ),
                 {
                     "contract_version": (
-                        "zero-paid-frontier-local-stale-archive-v1"
+                        "zero-paid-frontier-stale-archive-v2"
                     ),
                     "stage": stage,
                     "beat_id": beat_id,
@@ -790,9 +800,16 @@ def _load_or_create_frontier_stage_artifact(
                     "previous_policy_reference": saved_policy_reference,
                     "current_policy_reference": policy_reference,
                     "paid_provider_dispatch_added": False,
+                    "recompile_mode": (
+                        "local_preflight"
+                        if stage == "local_preflight"
+                        else "saved_provider_evidence_local_recompile"
+                    ),
                     "generated_at": utc_now(),
                 },
             )
+            if stale_local_recompile_producer is not None:
+                producer = stale_local_recompile_producer
         else:
             if saved_binding_sha256 == saved_legacy_binding:
                 legacy_binding = saved_legacy_binding
@@ -15521,6 +15538,7 @@ def _compile_autonomous_vertical_candidate_geometry(
     semantic_beat: SemanticBeat | None,
     titles_rendered: bool,
     semantic_negotiation_state: dict[str, int],
+    model_request_block_reason: str | None = None,
 ) -> Mapping[str, Any]:
     """Compile and audit one candidate without rendering any segment."""
 
@@ -15583,6 +15601,7 @@ def _compile_autonomous_vertical_candidate_geometry(
             query_lock_v2=query_lock,
             allow_review_sequential_fallback=False,
             max_identity_model_checks=0,
+            model_request_block_reason=model_request_block_reason,
             autonomous_policy=policy,
             presentation_preference=str(
                 option.get(
@@ -21767,6 +21786,35 @@ def _run_feature_cut_experiment_impl(
                                 ),
                                 semantic_negotiation_state=(
                                     candidate_negotiation_state
+                                ),
+                            )
+                        ),
+                        stale_local_recompile_producer=lambda: (
+                            _compile_autonomous_vertical_candidate_geometry(
+                                client=client,
+                                feature_id=frontier_attempt.beat_id,
+                                local_artifact=local_payloads[key],
+                                exact_artifact=exact_payloads[key],
+                                brief_chapter=brief_by_id[
+                                    frontier_attempt.beat_id
+                                ],
+                                checkpoint_path=checkpoint_path,
+                                grounding_prompt=grounding_prompt,
+                                analysis_fps=sam_analysis_fps,
+                                scdet_threshold=scdet_threshold,
+                                track_cache=track_cache,
+                                policy=autonomous_policy,
+                                semantic_beat=runtime_semantic_beat,
+                                titles_rendered=(
+                                    brief.render_title_overlays
+                                ),
+                                semantic_negotiation_state={
+                                    "global": 1,
+                                    "repair": 0,
+                                },
+                                model_request_block_reason=(
+                                    "frontier_saved_provider_evidence_"
+                                    "local_geometry_recompile"
                                 ),
                             )
                         ),
