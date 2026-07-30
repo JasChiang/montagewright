@@ -699,7 +699,8 @@ def _load_or_create_frontier_stage_artifact(
         ):
             raise FeatureCutSystemFailure(
                 "persisted vertical frontier stage artifact has stale or "
-                "tampered bindings"
+                "tampered bindings: "
+                f"{beat_id}/{candidate_id}/{stage}@{artifact_path}"
             )
         payload = saved.get("payload")
         if not isinstance(payload, Mapping):
@@ -720,7 +721,8 @@ def _load_or_create_frontier_stage_artifact(
         ):
             raise FeatureCutSystemFailure(
                 "persisted vertical frontier stage artifact has stale or "
-                "tampered bindings"
+                "tampered bindings: "
+                f"{beat_id}/{candidate_id}/{stage}@{artifact_path}"
             )
         saved_v2_binding = _frontier_stage_binding_sha256(
             beat_id=beat_id,
@@ -748,7 +750,8 @@ def _load_or_create_frontier_stage_artifact(
         }:
             raise FeatureCutSystemFailure(
                 "persisted vertical frontier stage artifact has stale or "
-                "tampered bindings"
+                "tampered bindings: "
+                f"{beat_id}/{candidate_id}/{stage}@{artifact_path}"
             )
         bindings_are_stale = (
             saved_dependency_hashes != list(dependency_hashes)
@@ -770,7 +773,8 @@ def _load_or_create_frontier_stage_artifact(
             if not locally_recompilable:
                 raise FeatureCutSystemFailure(
                     "persisted vertical frontier stage artifact has stale or "
-                    "tampered bindings"
+                    "tampered bindings: "
+                    f"{beat_id}/{candidate_id}/{stage}@{artifact_path}"
                 )
             archive_dir = artifact_path.parent / "archive"
             archive_dir.mkdir(parents=True, exist_ok=True)
@@ -917,6 +921,45 @@ def _load_existing_frontier_stage_artifact(
         route_sha256=route_sha256,
         producer=reject_producer,
     )
+
+
+def _read_frontier_stage_payload_integrity_only(
+    artifact_path: Path,
+    *,
+    beat_id: str,
+    candidate_id: str,
+    stage: str,
+) -> Mapping[str, Any]:
+    """Read prior audit facts without accepting a stale execution binding."""
+
+    saved = read_json(artifact_path)
+    expected_definition = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in saved.items()
+                if key not in {"definition_sha256", "generated_at"}
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload = saved.get("payload")
+    if (
+        saved.get("definition_sha256") != expected_definition
+        or saved.get("contract_version")
+        != "vertical-frontier-stage-artifact-v1"
+        or saved.get("beat_id") != beat_id
+        or saved.get("candidate_id") != candidate_id
+        or saved.get("stage") != stage
+        or not isinstance(payload, Mapping)
+    ):
+        raise FeatureCutSystemFailure(
+            "persisted vertical frontier stage artifact failed integrity-only "
+            f"audit: {beat_id}/{candidate_id}/{stage}@{artifact_path}"
+        )
+    return dict(payload)
 
 
 def _validate_frozen_vertical_render_selection(
@@ -9764,6 +9807,7 @@ def _build_framing_region_tracks(
                             "run-level circuit breaker: "
                             + model_request_block_reason
                         )
+                    persisted_geometry_stale = False
                     try:
                         group = client.ground_multi_target_exact_frame(
                             source_asset_id=media.asset_id,
@@ -22021,14 +22065,37 @@ def _run_feature_cut_experiment_impl(
                     )
                     if not persisted_geometry_path.is_file():
                         continue
-                    _, _, persisted_geometry_payload = (
-                        load_existing_candidate_stage_chain(
-                            persisted_beat.beat_id,
-                            persisted_candidate.candidate_id,
-                            persisted_candidate
-                            .candidate_execution_sha256,
+                    try:
+                        _, _, persisted_geometry_payload = (
+                            load_existing_candidate_stage_chain(
+                                persisted_beat.beat_id,
+                                persisted_candidate.candidate_id,
+                                persisted_candidate
+                                .candidate_execution_sha256,
+                            )
                         )
-                    )
+                    except FeatureCutSystemFailure as error:
+                        if (
+                            "stale or tampered bindings" not in str(error)
+                            or "/grounding@" not in str(error)
+                        ):
+                            raise
+                        persisted_geometry_stale = True
+                        # A local compiler revision may stale the geometry
+                        # wrapper while its paid grounding response remains
+                        # intact. Read only the prior negotiation count here;
+                        # the scheduler will recompile through its explicitly
+                        # no-provider stale-local producer.
+                        persisted_geometry_payload = (
+                            _read_frontier_stage_payload_integrity_only(
+                                persisted_geometry_path,
+                                beat_id=persisted_beat.beat_id,
+                                candidate_id=(
+                                    persisted_candidate.candidate_id
+                                ),
+                                stage="grounding",
+                            )
+                        )
                     persisted_semantic_count = max(
                         persisted_semantic_count,
                         int(
@@ -22038,13 +22105,15 @@ def _run_feature_cut_experiment_impl(
                             )
                         ),
                     )
-                    if persisted_geometry_payload.get(
-                        "classification"
-                    ) in {
-                        "deferred_panel",
-                        "deferred_fit",
-                        "deferred_scope_fit",
-                    }:
+                    if (
+                        not persisted_geometry_stale
+                        and persisted_geometry_payload.get("classification")
+                        in {
+                            "deferred_panel",
+                            "deferred_fit",
+                            "deferred_scope_fit",
+                        }
+                    ):
                         deferred_payloads.setdefault(
                             persisted_beat.beat_id,
                             [],
