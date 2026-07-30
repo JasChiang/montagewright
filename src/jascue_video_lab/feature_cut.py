@@ -560,6 +560,32 @@ def _validate_frozen_vertical_render_selection(
     return selection
 
 
+def _validate_all_vertical_finalizers_ready(
+    frontier_root: Path,
+) -> Mapping[str, Any]:
+    """Block the first segment render until every selected beat finalized."""
+
+    selection = read_json(frontier_root / "selection.json")
+    missing = [
+        feature_id
+        for feature_id, candidate_id in dict(
+            selection.get("selected_candidate_ids", {})
+        ).items()
+        if not (
+            frontier_root
+            / feature_id
+            / candidate_id
+            / "finalized.json"
+        ).is_file()
+    ]
+    if missing:
+        raise FeatureCutSystemFailure(
+            "autonomous vertical render batch started before all selected "
+            "beats finalized: " + ", ".join(sorted(missing))
+        )
+    return selection
+
+
 def _require_candidate_scoped_failure(error: Exception) -> None:
     """Reject broad fallback for system/invariant failures.
 
@@ -19051,6 +19077,7 @@ def _run_feature_cut_experiment_impl(
         )
         horizontal_segments: list[Path] = []
         vertical_segments: list[Path] = []
+        deferred_vertical_render_tasks: list[dict[str, Any]] = []
         render_config = {
             "pipeline_version": _RENDER_PIPELINE_VERSION,
             "aspect": aspect,
@@ -23937,6 +23964,7 @@ def _run_feature_cut_experiment_impl(
                     dimensions=(1080, 1920),
                 )
                 vertical_cache_hit = cached_vertical_segment is not None
+                vertical_render_deferred = False
                 if cached_vertical_segment is not None:
                     vertical_segment = cached_vertical_segment
                 elif not _segment_is_valid(
@@ -23944,11 +23972,11 @@ def _run_feature_cut_experiment_impl(
                     expected_duration=(v_end - v_start) / 1000,
                     dimensions=(1080, 1920),
                 ):
-                    _render_source_segment(
-                        source_path=Path(vertical_clip.path),
-                        start_ms=v_start,
-                        end_ms=v_end,
-                        overlay_path=(
+                    render_task = {
+                        "source_path": Path(vertical_clip.path),
+                        "start_ms": v_start,
+                        "end_ms": v_end,
+                        "overlay_path": (
                             vertical_overlay
                             if (
                                 brief.render_title_overlays
@@ -23956,28 +23984,89 @@ def _run_feature_cut_experiment_impl(
                             )
                             else None
                         ),
-                        base_filter=vertical_filter,
-                        output_path=vertical_segment,
-                        source_has_audio=vertical_source_has_audio,
-                        source_interval=vertical_source_interval,
-                    )
+                        "base_filter": vertical_filter,
+                        "output_path": vertical_segment,
+                        "source_has_audio": vertical_source_has_audio,
+                        "source_interval": vertical_source_interval,
+                    }
+                    if frozen_frontier_candidate_id is not None:
+                        deferred_vertical_render_tasks.append(
+                            {
+                                "feature_id": selected.feature_id,
+                                "segment_id": f"segment-{index + 1:03d}",
+                                "render_kwargs": render_task,
+                                "boundary_lineage_output_path": (
+                                    output_dir
+                                    / "render-boundary-lineage"
+                                    / selected.feature_id
+                                    / "9x16.json"
+                                ),
+                                "repair_catalog_kwargs": {
+                                    "output_dir": output_dir,
+                                    "segment_id": (
+                                        f"segment-{index + 1:03d}"
+                                    ),
+                                    "feature_id": selected.feature_id,
+                                    "source_path": Path(
+                                        vertical_clip.path
+                                    ),
+                                    "source_sha256": (
+                                        vertical_clip.sha256
+                                    ),
+                                    "source_has_audio": (
+                                        vertical_source_has_audio
+                                    ),
+                                    "start_ms": v_start,
+                                    "end_ms": v_end,
+                                    "source_interval": (
+                                        vertical_source_interval
+                                    ),
+                                    "overlay_path": render_task[
+                                        "overlay_path"
+                                    ],
+                                    "selected_filter_graph": (
+                                        vertical_filter
+                                    ),
+                                    "selected_geometry": (
+                                        vertical_geometry
+                                    ),
+                                    "selected_track_fingerprint": (
+                                        vertical_track_fingerprint
+                                    ),
+                                },
+                            }
+                        )
+                        vertical_render_deferred = True
+                    else:
+                        _render_source_segment(**render_task)
                 vertical_geometry["segment_cache"] = {
                     "content_addressed_hit": vertical_cache_hit,
                     "fingerprint": vertical_segment_fingerprint,
                     "cache_hit_validated_once": vertical_cache_hit,
                 }
-                vertical_boundary_lineage = _write_render_boundary_lineage(
-                    segment_path=vertical_segment,
-                    source_interval=vertical_source_interval,
-                    output_path=(
-                        output_dir
-                        / "render-boundary-lineage"
-                        / selected.feature_id
-                        / "9x16.json"
-                    ),
+                vertical_boundary_lineage = (
+                    {
+                        "contract_version": (
+                            "render-boundary-lineage-v1"
+                        ),
+                        "status": "deferred_until_global_finalize",
+                    }
+                    if vertical_render_deferred
+                    else _write_render_boundary_lineage(
+                        segment_path=vertical_segment,
+                        source_interval=vertical_source_interval,
+                        output_path=(
+                            output_dir
+                            / "render-boundary-lineage"
+                            / selected.feature_id
+                            / "9x16.json"
+                        ),
+                    )
                 )
                 vertical_repair_catalog = (
-                    _persist_vertical_segment_repair_catalog(
+                    None
+                    if vertical_render_deferred
+                    else _persist_vertical_segment_repair_catalog(
                         output_dir=output_dir,
                         segment_id=f"segment-{index + 1:03d}",
                         feature_id=selected.feature_id,
@@ -24083,6 +24172,35 @@ def _run_feature_cut_experiment_impl(
             if render_vertical:
                 vertical_segments.append(vertical_segment)
                 manifest["vertical"]["chapters"].append(vertical_entry)
+        if deferred_vertical_render_tasks:
+            frontier_root = (
+                output_dir / "production-frontier" / "9x16"
+            )
+            _validate_all_vertical_finalizers_ready(frontier_root)
+            chapters_by_feature = {
+                str(chapter["feature_id"]): chapter
+                for chapter in manifest["vertical"]["chapters"]
+            }
+            for task in deferred_vertical_render_tasks:
+                _render_source_segment(**task["render_kwargs"])
+                render_kwargs = task["render_kwargs"]
+                boundary_lineage = _write_render_boundary_lineage(
+                    segment_path=Path(render_kwargs["output_path"]),
+                    source_interval=render_kwargs["source_interval"],
+                    output_path=task[
+                        "boundary_lineage_output_path"
+                    ],
+                )
+                repair_catalog = (
+                    _persist_vertical_segment_repair_catalog(
+                        **task["repair_catalog_kwargs"]
+                    )
+                    if autonomous_policy is not None
+                    else None
+                )
+                chapter = chapters_by_feature[str(task["feature_id"])]
+                chapter["render_boundary_lineage"] = boundary_lineage
+                chapter["repair_option_catalog"] = repair_catalog
         source_reuse_audits: dict[str, Any] = {}
         if render_horizontal:
             source_reuse_audits["16x9"] = _audit_render_source_reuse(

@@ -92,6 +92,7 @@ from jascue_video_lab.feature_cut import (
     _load_or_create_frontier_stage_artifact,
     _compile_autonomous_vertical_candidate_geometry,
     _run_persisted_production_frontier,
+    _validate_all_vertical_finalizers_ready,
     _validate_frozen_vertical_render_selection,
     _select_deferred_vertical_fallback,
     _required_track_union,
@@ -247,6 +248,28 @@ def test_frozen_vertical_render_selection_accepts_complete_lineage(
     assert selection["selected_candidate_ids"] == {
         feature_id: candidate_id
     }
+
+
+def test_vertical_render_batch_waits_for_every_finalizer(
+    tmp_path: Path,
+) -> None:
+    frontier_root, feature_id, candidate_id = (
+        _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
+    )
+
+    _validate_all_vertical_finalizers_ready(frontier_root)
+    (
+        frontier_root
+        / feature_id
+        / candidate_id
+        / "finalized.json"
+    ).unlink()
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="before all selected beats finalized",
+    ):
+        _validate_all_vertical_finalizers_ready(frontier_root)
 
 
 def test_frozen_vertical_render_selection_rejects_pending_state(
