@@ -14,6 +14,12 @@ from .models import FrozenStrictModel
 
 
 BeatPriority = Literal["hard", "preferred", "optional"]
+SourceReuseMode = Literal[
+    "none",
+    "distinct_interval",
+    "alternate_presentation",
+    "editorial_reprise",
+]
 PresentationMode = Literal[
     "source_hold",
     "static_full_bleed_crop",
@@ -478,6 +484,19 @@ class CandidateRouteOption(FrozenStrictModel):
     technical_quality: float = Field(default=0.5, ge=0.0, le=1.0)
     preflight_hard_failures: tuple[str, ...] = ()
     preflight_deferred_gates: tuple[str, ...] = ()
+    source_clip_id: str | None = Field(default=None, min_length=1)
+    safe_capacity_ms: int | None = Field(default=None, gt=0)
+    safe_window_start_ms: int | None = Field(default=None, ge=0)
+    safe_window_end_ms: int | None = Field(default=None, ge=0)
+    source_anchor_ms: int | None = Field(default=None, ge=0)
+    fixed_source_in_ms: int | None = Field(default=None, ge=0)
+    fixed_source_out_ms: int | None = Field(default=None, ge=0)
+    reuse_mode: SourceReuseMode = "none"
+    reuse_justification: str | None = None
+    candidate_timing_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @model_validator(mode="after")
     def validate_editorial_bounds(self) -> "CandidateRouteOption":
@@ -494,6 +513,59 @@ class CandidateRouteOption(FrozenStrictModel):
         ):
             raise ValueError(
                 "pre-render trim duration must remain inside readability bounds"
+            )
+        safe_fields = (
+            self.safe_window_start_ms,
+            self.safe_window_end_ms,
+            self.source_anchor_ms,
+        )
+        if any(value is not None for value in safe_fields):
+            if any(value is None for value in safe_fields):
+                raise ValueError(
+                    "candidate safe window requires start, end, and anchor"
+                )
+            assert self.safe_window_start_ms is not None
+            assert self.safe_window_end_ms is not None
+            assert self.source_anchor_ms is not None
+            if not (
+                self.safe_window_start_ms
+                <= self.source_anchor_ms
+                < self.safe_window_end_ms
+            ):
+                raise ValueError(
+                    "candidate source anchor must lie inside its safe window"
+                )
+            measured_capacity = (
+                self.safe_window_end_ms - self.safe_window_start_ms
+            )
+            if measured_capacity < 1:
+                raise ValueError("candidate safe window must be positive")
+            if (
+                self.safe_capacity_ms is not None
+                and self.safe_capacity_ms != measured_capacity
+            ):
+                raise ValueError(
+                    "candidate safe capacity must match its safe window"
+                )
+        fixed_fields = (
+            self.fixed_source_in_ms,
+            self.fixed_source_out_ms,
+        )
+        if any(value is not None for value in fixed_fields):
+            if any(value is None for value in fixed_fields):
+                raise ValueError(
+                    "fixed candidate trim requires both source boundaries"
+                )
+            assert self.fixed_source_in_ms is not None
+            assert self.fixed_source_out_ms is not None
+            if self.fixed_source_out_ms <= self.fixed_source_in_ms:
+                raise ValueError("fixed candidate trim must be positive")
+        if (
+            self.reuse_mode != "none"
+            and not (self.reuse_justification or "").strip()
+        ):
+            raise ValueError(
+                "candidate source reuse authority requires a justification"
             )
         return self
 
@@ -524,6 +596,63 @@ class CandidateRouteSelection(FrozenStrictModel):
     entry_composition: str
     exit_composition: str
     decision_codes: tuple[str, ...]
+    source_clip_id: str | None = Field(default=None, min_length=1)
+    source_in_ms: int | None = Field(default=None, ge=0)
+    source_out_ms: int | None = Field(default=None, ge=0)
+    candidate_execution_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    reuse_mode: SourceReuseMode = "none"
+
+    @model_validator(mode="after")
+    def validate_source_interval(self) -> "CandidateRouteSelection":
+        boundaries = (self.source_in_ms, self.source_out_ms)
+        if any(value is not None for value in boundaries):
+            if any(value is None for value in boundaries):
+                raise ValueError(
+                    "candidate execution needs both source boundaries"
+                )
+            assert self.source_in_ms is not None
+            assert self.source_out_ms is not None
+            if self.source_out_ms - self.source_in_ms != self.trim_duration_ms:
+                raise ValueError(
+                    "candidate source interval must match trim duration"
+                )
+        return self
+
+
+class CandidateCompleteRoute(FrozenStrictModel):
+    """One complete, globally feasible candidate/duration/source route."""
+
+    route_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    selections: tuple[CandidateRouteSelection, ...] = Field(min_length=1)
+    objective_score: float
+    total_duration_ms: int = Field(gt=0)
+    panel_duration_ms: int = Field(ge=0)
+    decision_codes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_complete_route(self) -> "CandidateCompleteRoute":
+        beat_ids = [selection.beat_id for selection in self.selections]
+        if len(beat_ids) != len(set(beat_ids)):
+            raise ValueError("complete route may select each beat only once")
+        if (
+            sum(
+                selection.trim_duration_ms
+                for selection in self.selections
+            )
+            != self.total_duration_ms
+        ):
+            raise ValueError("complete route duration is inconsistent")
+        measured_panel_duration_ms = sum(
+            selection.trim_duration_ms
+            for selection in self.selections
+            if selection.presentation_mode == "two_panel_layout"
+        )
+        if measured_panel_duration_ms != self.panel_duration_ms:
+            raise ValueError("complete route panel duration is inconsistent")
+        return self
 
 
 class CandidateRouteResult(FrozenStrictModel):
@@ -539,6 +668,7 @@ class CandidateRouteResult(FrozenStrictModel):
     objective_score: float
     beam_width: int = Field(gt=0)
     total_duration_ms: int = Field(gt=0)
+    ranked_routes: tuple[CandidateCompleteRoute, ...] = ()
     unresolved_runtime_hard_gates: tuple[str, ...] = (
         "exact_event_evidence",
         "identity",
@@ -1003,12 +1133,343 @@ def _project_cue_delta_frames(
 
 class _CandidateRouteState(FrozenStrictModel):
     selections: tuple[CandidateRouteSelection, ...] = ()
+    options: tuple[CandidateRouteOption, ...] = ()
     source_asset_ids: tuple[str, ...] = ()
     source_events: tuple[tuple[str, str], ...] = ()
     exit_composition: str | None = None
     duration_ms: int = Field(default=0, ge=0)
     panel_duration_ms: int = Field(default=0, ge=0)
     score: float = 0.0
+
+
+def _candidate_duration_bounds(
+    option: CandidateRouteOption,
+) -> tuple[int, int, int] | None:
+    maximum_ms = option.maximum_readable_ms
+    if option.safe_capacity_ms is not None:
+        maximum_ms = min(maximum_ms, option.safe_capacity_ms)
+    if (
+        option.fixed_source_in_ms is not None
+        and option.fixed_source_out_ms is not None
+    ):
+        fixed_ms = option.fixed_source_out_ms - option.fixed_source_in_ms
+        if not option.minimum_readable_ms <= fixed_ms <= maximum_ms:
+            return None
+        return fixed_ms, fixed_ms, fixed_ms
+    minimum_ms = option.minimum_readable_ms
+    if minimum_ms > maximum_ms:
+        return None
+    preferred_ms = min(
+        maximum_ms,
+        max(minimum_ms, option.preferred_readable_ms),
+    )
+    return minimum_ms, preferred_ms, maximum_ms
+
+
+def _distribute_duration_headroom(
+    durations_ms: list[int],
+    ceilings_ms: Sequence[int],
+    amount_ms: int,
+) -> int:
+    """Distribute integer duration deterministically without exceeding caps."""
+
+    if amount_ms <= 0:
+        return 0
+    headroom = [
+        max(0, ceiling - duration)
+        for duration, ceiling in zip(durations_ms, ceilings_ms, strict=True)
+    ]
+    total_headroom = sum(headroom)
+    if total_headroom <= 0:
+        return amount_ms
+    awarded = [
+        min(
+            room,
+            amount_ms * room // total_headroom,
+        )
+        for room in headroom
+    ]
+    for index, value in enumerate(awarded):
+        durations_ms[index] += value
+    remaining = amount_ms - sum(awarded)
+    for index, ceiling in enumerate(ceilings_ms):
+        if remaining <= 0:
+            break
+        available = ceiling - durations_ms[index]
+        if available <= 0:
+            continue
+        value = min(available, remaining)
+        durations_ms[index] += value
+        remaining -= value
+    return remaining
+
+
+def _allocate_candidate_route_durations(
+    options: Sequence[CandidateRouteOption],
+    *,
+    target_duration_ms: int | None,
+) -> tuple[int, ...] | None:
+    bounds = [_candidate_duration_bounds(option) for option in options]
+    if any(item is None for item in bounds):
+        return None
+    resolved_bounds = [
+        item for item in bounds if item is not None
+    ]
+    if target_duration_ms is None:
+        durations = tuple(option.trim_duration_ms for option in options)
+        if any(
+            not minimum <= duration <= maximum
+            for duration, (minimum, _, maximum) in zip(
+                durations,
+                resolved_bounds,
+                strict=True,
+            )
+        ):
+            return None
+        return durations
+    minimum_total = sum(item[0] for item in resolved_bounds)
+    maximum_total = sum(item[2] for item in resolved_bounds)
+    if not minimum_total <= target_duration_ms <= maximum_total:
+        return None
+    durations = [item[0] for item in resolved_bounds]
+    preferred = [item[1] for item in resolved_bounds]
+    maximum = [item[2] for item in resolved_bounds]
+    remaining = target_duration_ms - minimum_total
+    remaining = _distribute_duration_headroom(
+        durations,
+        preferred,
+        remaining,
+    )
+    remaining = _distribute_duration_headroom(
+        durations,
+        maximum,
+        remaining,
+    )
+    if remaining:
+        return None
+    return tuple(durations)
+
+
+def _candidate_source_interval(
+    option: CandidateRouteOption,
+    *,
+    duration_ms: int,
+) -> tuple[int | None, int | None]:
+    if (
+        option.fixed_source_in_ms is not None
+        and option.fixed_source_out_ms is not None
+    ):
+        if option.fixed_source_out_ms - option.fixed_source_in_ms != duration_ms:
+            return None, None
+        return option.fixed_source_in_ms, option.fixed_source_out_ms
+    if (
+        option.safe_window_start_ms is None
+        or option.safe_window_end_ms is None
+        or option.source_anchor_ms is None
+    ):
+        return None, None
+    if duration_ms > option.safe_window_end_ms - option.safe_window_start_ms:
+        return None, None
+    source_in_ms = min(
+        max(
+            option.safe_window_start_ms,
+            option.source_anchor_ms - duration_ms // 2,
+        ),
+        option.safe_window_end_ms - duration_ms,
+    )
+    return source_in_ms, source_in_ms + duration_ms
+
+
+def candidate_route_execution_sha256(
+    option: CandidateRouteOption,
+    *,
+    duration_ms: int,
+    source_in_ms: int | None,
+    source_out_ms: int | None,
+) -> str:
+    """Hash the exact candidate execution, not just its semantic identity."""
+
+    payload = {
+        "contract_version": "candidate-route-execution-v1",
+        "beat_id": option.beat_id,
+        "candidate_id": option.candidate_id,
+        "source_asset_id": option.source_asset_id,
+        "source_clip_id": option.source_clip_id,
+        "event_id": option.event_id,
+        "candidate_timing_sha256": option.candidate_timing_sha256,
+        "duration_ms": duration_ms,
+        "source_in_ms": source_in_ms,
+        "source_out_ms": source_out_ms,
+        "cue_id": option.cue_id,
+        "presentation_mode": option.presentation_mode,
+        "entry_composition": option.entry_composition,
+        "exit_composition": option.exit_composition,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _candidate_route_selection(
+    option: CandidateRouteOption,
+    *,
+    duration_ms: int,
+    decision_codes: tuple[str, ...],
+) -> CandidateRouteSelection:
+    source_in_ms, source_out_ms = _candidate_source_interval(
+        option,
+        duration_ms=duration_ms,
+    )
+    return CandidateRouteSelection(
+        beat_id=option.beat_id,
+        candidate_id=option.candidate_id,
+        source_asset_id=option.source_asset_id,
+        event_id=option.event_id,
+        trim_duration_ms=duration_ms,
+        cue_id=option.cue_id,
+        cue_aligned=option.cue_aligned,
+        presentation_mode=option.presentation_mode,
+        entry_composition=option.entry_composition,
+        exit_composition=option.exit_composition,
+        decision_codes=decision_codes,
+        source_clip_id=option.source_clip_id,
+        source_in_ms=source_in_ms,
+        source_out_ms=source_out_ms,
+        candidate_execution_sha256=candidate_route_execution_sha256(
+            option,
+            duration_ms=duration_ms,
+            source_in_ms=source_in_ms,
+            source_out_ms=source_out_ms,
+        ),
+        reuse_mode=option.reuse_mode,
+    )
+
+
+def _source_identity(option: CandidateRouteOption) -> str:
+    return option.source_clip_id or option.source_asset_id
+
+
+def _candidate_reuse_failure(
+    prior: Sequence[tuple[CandidateRouteOption, CandidateRouteSelection]],
+    option: CandidateRouteOption,
+    selection: CandidateRouteSelection,
+    *,
+    max_editorial_reprise_overlap_fraction: float,
+) -> str | None:
+    for prior_option, prior_selection in prior:
+        if _source_identity(prior_option) != _source_identity(option):
+            continue
+        # Legacy options did not persist candidate-local timing.  Preserve
+        # their old soft-repeat behavior instead of manufacturing intervals.
+        if (
+            prior_selection.source_in_ms is None
+            or prior_selection.source_out_ms is None
+            or selection.source_in_ms is None
+            or selection.source_out_ms is None
+        ):
+            continue
+        overlap_ms = max(
+            0,
+            min(prior_selection.source_out_ms, selection.source_out_ms)
+            - max(prior_selection.source_in_ms, selection.source_in_ms),
+        )
+        if option.reuse_mode == "none":
+            return "source_reuse_authority_missing"
+        if option.reuse_mode == "distinct_interval" and overlap_ms:
+            return "distinct_interval_reuse_overlaps"
+        if option.reuse_mode == "editorial_reprise":
+            overlap_fraction = overlap_ms / max(
+                selection.trim_duration_ms,
+                1,
+            )
+            if (
+                overlap_fraction
+                > max_editorial_reprise_overlap_fraction + 1e-9
+            ):
+                return "editorial_reprise_overlap_exceeded"
+        # alternate_presentation is explicit authority for the same interval.
+    return None
+
+
+def _candidate_complete_route(
+    state: _CandidateRouteState,
+    *,
+    target_duration_ms: int | None,
+    max_panel_runtime_fraction: float | None,
+    max_editorial_reprise_overlap_fraction: float,
+) -> CandidateCompleteRoute | None:
+    durations = _allocate_candidate_route_durations(
+        state.options,
+        target_duration_ms=target_duration_ms,
+    )
+    if durations is None:
+        return None
+    selections: list[CandidateRouteSelection] = []
+    prior: list[tuple[CandidateRouteOption, CandidateRouteSelection]] = []
+    panel_duration_ms = 0
+    for option, duration_ms, provisional in zip(
+        state.options,
+        durations,
+        state.selections,
+        strict=True,
+    ):
+        selection = _candidate_route_selection(
+            option,
+            duration_ms=duration_ms,
+            decision_codes=provisional.decision_codes,
+        )
+        if _candidate_reuse_failure(
+            prior,
+            option,
+            selection,
+            max_editorial_reprise_overlap_fraction=(
+                max_editorial_reprise_overlap_fraction
+            ),
+        ):
+            return None
+        selections.append(selection)
+        prior.append((option, selection))
+        if option.presentation_mode == "two_panel_layout":
+            panel_duration_ms += duration_ms
+    total_duration_ms = sum(durations)
+    if (
+        max_panel_runtime_fraction is not None
+        and panel_duration_ms / max(total_duration_ms, 1)
+        > max_panel_runtime_fraction + 1e-9
+    ):
+        return None
+    route_payload = {
+        "contract_version": "candidate-complete-route-v1",
+        "candidate_execution_sha256s": [
+            selection.candidate_execution_sha256
+            for selection in selections
+        ],
+    }
+    route_id = hashlib.sha256(
+        json.dumps(
+            route_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return CandidateCompleteRoute(
+        route_id=route_id,
+        selections=tuple(selections),
+        objective_score=round(state.score, 6),
+        total_duration_ms=total_duration_ms,
+        panel_duration_ms=panel_duration_ms,
+        decision_codes=(
+            "complete_route_ranked_before_runtime",
+            "candidate_local_timing_bound",
+            "source_reuse_hard_checked",
+        ),
+    )
 
 
 def optimize_pre_render_candidate_route(
@@ -1018,6 +1479,9 @@ def optimize_pre_render_candidate_route(
     minimum_duration_ms: int | None = None,
     maximum_duration_ms: int | None = None,
     max_panel_runtime_fraction: float | None = None,
+    target_duration_ms: int | None = None,
+    max_editorial_reprise_overlap_fraction: float = 0.5,
+    max_ranked_routes: int | None = None,
 ) -> CandidateRouteResult:
     """Choose the executable pre-render frontier without inventing geometry.
 
@@ -1048,6 +1512,23 @@ def optimize_pre_render_candidate_route(
         raise ValueError(
             "pre-render panel runtime fraction must be between 0 and 1"
         )
+    if target_duration_ms is not None and target_duration_ms < 1:
+        raise ValueError("pre-render target duration must be positive")
+    if (
+        target_duration_ms is not None
+        and minimum_duration_ms is not None
+        and maximum_duration_ms is not None
+        and not minimum_duration_ms
+        <= target_duration_ms
+        <= maximum_duration_ms
+    ):
+        raise ValueError("pre-render target duration is outside policy bounds")
+    if not 0 <= max_editorial_reprise_overlap_fraction <= 1:
+        raise ValueError(
+            "editorial reprise overlap fraction must be between 0 and 1"
+        )
+    if max_ranked_routes is not None and max_ranked_routes < 1:
+        raise ValueError("max ranked routes must be positive")
     states = [_CandidateRouteState()]
     for beat in beats:
         feasible_options = [
@@ -1071,6 +1552,33 @@ def optimize_pre_render_candidate_route(
         expanded: list[_CandidateRouteState] = []
         for state in states:
             for option in feasible_options:
+                provisional_duration = (
+                    _candidate_duration_bounds(option) or (0, 0, 0)
+                )[0]
+                if provisional_duration < 1:
+                    continue
+                provisional_selection = _candidate_route_selection(
+                    option,
+                    duration_ms=provisional_duration,
+                    decision_codes=(),
+                )
+                prior = [
+                    (prior_option, prior_selection)
+                    for prior_option, prior_selection in zip(
+                        state.options,
+                        state.selections,
+                        strict=True,
+                    )
+                ]
+                if _candidate_reuse_failure(
+                    prior,
+                    option,
+                    provisional_selection,
+                    max_editorial_reprise_overlap_fraction=(
+                        max_editorial_reprise_overlap_fraction
+                    ),
+                ):
+                    continue
                 exact_repeat = (
                     option.source_asset_id,
                     option.event_id,
@@ -1126,20 +1634,13 @@ def optimize_pre_render_candidate_route(
                     _CandidateRouteState(
                         selections=state.selections
                         + (
-                            CandidateRouteSelection(
-                                beat_id=beat.beat_id,
-                                candidate_id=option.candidate_id,
-                                source_asset_id=option.source_asset_id,
-                                event_id=option.event_id,
-                                trim_duration_ms=option.trim_duration_ms,
-                                cue_id=option.cue_id,
-                                cue_aligned=option.cue_aligned,
-                                presentation_mode=option.presentation_mode,
-                                entry_composition=option.entry_composition,
-                                exit_composition=option.exit_composition,
+                            _candidate_route_selection(
+                                option,
+                                duration_ms=option.trim_duration_ms,
                                 decision_codes=tuple(codes),
                             ),
                         ),
+                        options=state.options + (option,),
                         source_asset_ids=state.source_asset_ids
                         + (option.source_asset_id,),
                         source_events=state.source_events
@@ -1173,42 +1674,50 @@ def optimize_pre_render_candidate_route(
             ),
             reverse=True,
         )[:beam_width]
-    eligible_states = [
-        state
-        for state in states
-        if (
-            (
-                minimum_duration_ms is None
-                or maximum_duration_ms is None
-                or minimum_duration_ms
-                <= state.duration_ms
-                <= maximum_duration_ms
-            )
-            and (
-                max_panel_runtime_fraction is None
-                or state.duration_ms == 0
-                or state.panel_duration_ms / state.duration_ms
-                <= max_panel_runtime_fraction + 1e-9
-            )
+    ranked_route_states: list[
+        tuple[CandidateCompleteRoute, _CandidateRouteState]
+    ] = []
+    for state in states:
+        route = _candidate_complete_route(
+            state,
+            target_duration_ms=target_duration_ms,
+            max_panel_runtime_fraction=max_panel_runtime_fraction,
+            max_editorial_reprise_overlap_fraction=(
+                max_editorial_reprise_overlap_fraction
+            ),
         )
-    ]
-    if not eligible_states:
+        if route is None:
+            continue
+        if (
+            minimum_duration_ms is not None
+            and maximum_duration_ms is not None
+            and not minimum_duration_ms
+            <= route.total_duration_ms
+            <= maximum_duration_ms
+        ):
+            continue
+        ranked_route_states.append((route, state))
+    ranked_route_states.sort(
+        key=lambda item: (
+            item[0].objective_score,
+            tuple(
+                selection.candidate_id
+                for selection in item[0].selections
+            ),
+        ),
+        reverse=True,
+    )
+    if max_ranked_routes is not None:
+        ranked_route_states = ranked_route_states[:max_ranked_routes]
+    if not ranked_route_states:
         raise ValueError(
             "pre-render sequence frontier has no route inside duration and "
             "panel-runtime policy bounds"
         )
-    best = max(
-        eligible_states,
-        key=lambda state: (
-            state.score,
-            tuple(
-                selection.candidate_id for selection in state.selections
-            ),
-        ),
-    )
+    best_route, best_state = ranked_route_states[0]
     selected_by_beat = {
         selection.beat_id: selection.candidate_id
-        for selection in best.selections
+        for selection in best_route.selections
     }
     fallback_candidate_ids_by_beat: dict[str, tuple[str, ...]] = {}
     option_bindings_by_beat: dict[
@@ -1217,10 +1726,33 @@ def optimize_pre_render_candidate_route(
     ] = {}
     for beat in beats:
         selected_candidate_id = selected_by_beat[beat.beat_id]
+        best_execution_by_beat = {
+            selection.beat_id: selection.candidate_execution_sha256
+            for selection in best_route.selections
+        }
+        route_compatible_candidate_ids: list[str] = []
+        for complete_route, _state in ranked_route_states:
+            route_by_beat = {
+                selection.beat_id: selection
+                for selection in complete_route.selections
+            }
+            if any(
+                route_by_beat[other_beat_id]
+                .candidate_execution_sha256
+                != execution_sha256
+                for other_beat_id, execution_sha256
+                in best_execution_by_beat.items()
+                if other_beat_id != beat.beat_id
+            ):
+                continue
+            candidate_id = route_by_beat[beat.beat_id].candidate_id
+            if candidate_id not in route_compatible_candidate_ids:
+                route_compatible_candidate_ids.append(candidate_id)
         legal = [
             option
             for option in beat.options
             if not option.preflight_hard_failures
+            and option.candidate_id in route_compatible_candidate_ids
         ]
         primary = next(
             option
@@ -1230,15 +1762,24 @@ def optimize_pre_render_candidate_route(
         contextual_legal: list[CandidateRouteOption] = []
         for option in legal:
             substituted_duration_ms = (
-                best.duration_ms
-                - primary.trim_duration_ms
+                best_route.total_duration_ms
+                - next(
+                    selection.trim_duration_ms
+                    for selection in best_route.selections
+                    if selection.beat_id == beat.beat_id
+                )
                 + option.trim_duration_ms
             )
             substituted_panel_duration_ms = (
-                best.panel_duration_ms
+                best_route.panel_duration_ms
                 - (
-                    primary.trim_duration_ms
-                    if primary.presentation_mode == "two_panel_layout"
+                    next(
+                        selection.trim_duration_ms
+                        for selection in best_route.selections
+                        if selection.beat_id == beat.beat_id
+                    )
+                    if primary.presentation_mode
+                    == "two_panel_layout"
                     else 0
                 )
                 + (
@@ -1296,13 +1837,51 @@ def optimize_pre_render_candidate_route(
             option.candidate_id: option for option in contextual_legal
         }
     return CandidateRouteResult(
-        selections=best.selections,
+        selections=best_route.selections,
         fallback_candidate_ids_by_beat=fallback_candidate_ids_by_beat,
         option_bindings_by_beat=option_bindings_by_beat,
-        objective_score=round(best.score, 6),
+        objective_score=best_route.objective_score,
         beam_width=beam_width,
-        total_duration_ms=best.duration_ms,
+        total_duration_ms=best_route.total_duration_ms,
+        ranked_routes=tuple(
+            route for route, _ in ranked_route_states
+        ),
     )
+
+
+def select_next_compatible_route(
+    ranked_routes: Sequence[CandidateCompleteRoute],
+    *,
+    accepted_execution_sha256_by_beat: Mapping[str, str],
+    failed_execution_sha256s: Sequence[str] = (),
+    after_route_id: str | None = None,
+) -> CandidateCompleteRoute | None:
+    """Advance only to a complete route compatible with accepted executions."""
+
+    failed = set(failed_execution_sha256s)
+    after_seen = after_route_id is None
+    for route in ranked_routes:
+        if not after_seen:
+            if route.route_id == after_route_id:
+                after_seen = True
+            continue
+        by_beat = {
+            selection.beat_id: selection.candidate_execution_sha256
+            for selection in route.selections
+        }
+        if any(
+            selection.candidate_execution_sha256 in failed
+            for selection in route.selections
+        ):
+            continue
+        if any(
+            by_beat.get(beat_id) != execution_sha256
+            for beat_id, execution_sha256
+            in accepted_execution_sha256_by_beat.items()
+        ):
+            continue
+        return route
+    return None
 
 
 class ConstraintResult(FrozenStrictModel):

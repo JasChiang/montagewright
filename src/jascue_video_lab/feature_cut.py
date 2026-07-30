@@ -215,6 +215,7 @@ from .shot_quality import (
     build_quality_safe_intervals,
     build_render_quality_report,
     load_shot_quality_map,
+    resolve_strict_quality_clean_subinterval,
     scan_shot_quality,
 )
 from .editorial_planning import (
@@ -271,9 +272,12 @@ _CONTROLLED_PHASE_MIN_VISIBLE_FRACTION = 2 / 3
 _FEATURE_PLAN_BINDING_VERSION = "feature-plan-binding-v1"
 _EXTERNAL_PROJECTION_SIDECAR_VERSION = "external-feature-plan-projection-v1"
 _EXTERNAL_PROJECTION_POINTER_NAME = "feature-plan.external-projection.json"
-_FRONTIER_LOCAL_BINDING_VERSION = "vertical-frontier-local-input-v2"
+_FRONTIER_LOCAL_BINDING_VERSION = "vertical-frontier-local-input-v3"
 _FRONTIER_EXACT_BINDING_VERSION = "vertical-frontier-exact-input-v2"
 _FRONTIER_GEOMETRY_BINDING_VERSION = "vertical-frontier-geometry-input-v2"
+_FRONTIER_FULFILLMENT_COMPILER_VERSION = (
+    "runtime-candidate-fulfillment-compiler-v2"
+)
 _PRESENTATION_NEGOTIATION_PROMPT_VERSION = (
     "presentation-option-negotiation-prompt-v1"
 )
@@ -612,9 +616,6 @@ def _load_or_create_frontier_stage_artifact(
             or saved.get("beat_id") != beat_id
             or saved.get("candidate_id") != candidate_id
             or saved.get("stage") != stage
-            or saved.get("dependency_hashes")
-            != list(dependency_hashes)
-            or saved.get("policy_reference") != policy_reference
         ):
             raise FeatureCutSystemFailure(
                 "persisted vertical frontier stage artifact has stale or "
@@ -625,57 +626,120 @@ def _load_or_create_frontier_stage_artifact(
             raise FeatureCutSystemFailure(
                 "persisted vertical frontier stage artifact has no payload"
             )
-        if saved.get("binding_sha256") != binding_sha256:
-            saved_route_sha256 = saved.get("route_sha256")
-            legacy_binding = (
-                _legacy_frontier_stage_binding_sha256(
-                    beat_id=beat_id,
-                    candidate_id=candidate_id,
-                    stage=stage,
-                    dependency_hashes=dependency_hashes,
-                    policy_reference=policy_reference,
-                    route_sha256=saved_route_sha256,
-                )
-                if isinstance(saved_route_sha256, str)
-                else None
+        saved_dependency_hashes = saved.get("dependency_hashes")
+        saved_policy_reference = saved.get("policy_reference")
+        saved_route_sha256 = saved.get("route_sha256")
+        if (
+            not isinstance(saved_dependency_hashes, list)
+            or not all(
+                isinstance(value, str)
+                for value in saved_dependency_hashes
             )
-            if saved.get("binding_sha256") != legacy_binding:
+            or not isinstance(saved_policy_reference, str)
+            or not isinstance(saved_route_sha256, str)
+        ):
+            raise FeatureCutSystemFailure(
+                "persisted vertical frontier stage artifact has stale or "
+                "tampered bindings"
+            )
+        saved_v2_binding = _frontier_stage_binding_sha256(
+            beat_id=beat_id,
+            candidate_id=candidate_id,
+            stage=stage,
+            dependency_hashes=saved_dependency_hashes,
+            policy_reference=saved_policy_reference,
+            route_sha256=saved_route_sha256,
+        )
+        saved_legacy_binding = _legacy_frontier_stage_binding_sha256(
+            beat_id=beat_id,
+            candidate_id=candidate_id,
+            stage=stage,
+            dependency_hashes=saved_dependency_hashes,
+            policy_reference=saved_policy_reference,
+            route_sha256=saved_route_sha256,
+        )
+        saved_binding_sha256 = saved.get("binding_sha256")
+        if saved_binding_sha256 not in {
+            saved_v2_binding,
+            saved_legacy_binding,
+        }:
+            raise FeatureCutSystemFailure(
+                "persisted vertical frontier stage artifact has stale or "
+                "tampered bindings"
+            )
+        bindings_are_stale = (
+            saved_dependency_hashes != list(dependency_hashes)
+            or saved_policy_reference != policy_reference
+        )
+        if bindings_are_stale:
+            if stage != "local_preflight":
                 raise FeatureCutSystemFailure(
                     "persisted vertical frontier stage artifact has stale or "
                     "tampered bindings"
                 )
-            # Keep the paid artifact byte-identical: downstream stages bind
-            # its complete file SHA. This migration is deliberately limited
-            # to route-only binding drift after exact dependency equality was
-            # proven above. Older dependency schemas are non-migratable and
-            # fail before this branch. Compatibility metadata belongs beside
-            # the artifact, never inside it.
+            archive_dir = artifact_path.parent / "archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archived_path = archive_dir / (
+                artifact_path.stem
+                + ".stale-"
+                + uuid.uuid4().hex
+                + artifact_path.suffix
+            )
+            archived_sha256 = sha256_file(artifact_path)
+            artifact_path.replace(archived_path)
             write_json(
-                artifact_path.with_name(
-                    artifact_path.name + ".binding-v2-compat.json"
+                archived_path.with_name(
+                    archived_path.name + ".archive-record.json"
                 ),
                 {
                     "contract_version": (
-                        "vertical-frontier-stage-binding-compat-v1"
+                        "zero-paid-frontier-local-stale-archive-v1"
                     ),
-                    "artifact_path": str(artifact_path.resolve()),
-                    "artifact_sha256": sha256_file(artifact_path),
+                    "stage": stage,
                     "beat_id": beat_id,
                     "candidate_id": candidate_id,
-                    "stage": stage,
-                    "verified_legacy_binding_sha256": legacy_binding,
-                    "current_binding_sha256": binding_sha256,
-                    "migrated_from_route_sha256": saved_route_sha256,
-                    "current_route_sha256": route_sha256,
-                    "policy_reference": policy_reference,
-                    "dependency_hashes": list(dependency_hashes),
-                    "migration_scope": (
-                        "route_only_with_identical_dependency_schema"
-                    ),
+                    "archived_path": str(archived_path.resolve()),
+                    "archived_sha256": archived_sha256,
+                    "previous_dependency_hashes": saved_dependency_hashes,
+                    "current_dependency_hashes": list(dependency_hashes),
+                    "previous_policy_reference": saved_policy_reference,
+                    "current_policy_reference": policy_reference,
                     "paid_provider_dispatch_added": False,
+                    "generated_at": utc_now(),
                 },
             )
-        return dict(payload)
+        else:
+            if saved_binding_sha256 == saved_legacy_binding:
+                legacy_binding = saved_legacy_binding
+                # Keep the paid artifact byte-identical: downstream stages
+                # bind its complete file SHA. Compatibility metadata belongs
+                # beside the artifact, never inside it.
+                write_json(
+                    artifact_path.with_name(
+                        artifact_path.name + ".binding-v2-compat.json"
+                    ),
+                    {
+                        "contract_version": (
+                            "vertical-frontier-stage-binding-compat-v1"
+                        ),
+                        "artifact_path": str(artifact_path.resolve()),
+                        "artifact_sha256": sha256_file(artifact_path),
+                        "beat_id": beat_id,
+                        "candidate_id": candidate_id,
+                        "stage": stage,
+                        "verified_legacy_binding_sha256": legacy_binding,
+                        "current_binding_sha256": binding_sha256,
+                        "migrated_from_route_sha256": saved_route_sha256,
+                        "current_route_sha256": route_sha256,
+                        "policy_reference": policy_reference,
+                        "dependency_hashes": list(dependency_hashes),
+                        "migration_scope": (
+                            "route_only_with_identical_dependency_schema"
+                        ),
+                        "paid_provider_dispatch_added": False,
+                    },
+                )
+            return dict(payload)
 
     produced = producer()
     if not isinstance(produced, Mapping):
@@ -2315,38 +2379,47 @@ def _chapter_bounds_with_approved_trim(
             }
         preferred_requested_ms = max(1, round(duration_seconds * 1000))
         requested_ms = preferred_requested_ms
-        containing = [
-            interval
-            for interval in safe_intervals
-            if interval.start_ms
-            <= frame.requested_time_ms
-            < interval.end_ms
-            and interval.end_ms - interval.start_ms >= requested_ms
-            and (
-                not fail_on_quality_human_review
-                or not interval.requires_human_review
+        minimum_requested_ms = (
+            max(1, round(minimum_duration_seconds * 1000))
+            if minimum_duration_seconds is not None
+            else requested_ms
+        )
+        if fail_on_quality_human_review:
+            assert quality_path is not None
+            strict_interval = resolve_strict_quality_clean_subinterval(
+                quality_map,
+                anchor_ms=frame.requested_time_ms,
+                minimum_duration_ms=minimum_requested_ms,
+                quality_map_sha256=sha256_file(quality_path),
             )
-        ]
-        if not containing:
-            minimum_requested_ms = (
-                max(1, round(minimum_duration_seconds * 1000))
-                if minimum_duration_seconds is not None
-                else None
+            containing = (
+                [strict_interval]
+                if (
+                    strict_interval.end_ms - strict_interval.start_ms
+                    >= requested_ms
+                )
+                else []
             )
+            minimum_containing = [strict_interval]
+        else:
+            containing = [
+                interval
+                for interval in safe_intervals
+                if interval.start_ms
+                <= frame.requested_time_ms
+                < interval.end_ms
+                and interval.end_ms - interval.start_ms >= requested_ms
+            ]
             minimum_containing = [
                 interval
                 for interval in safe_intervals
-                if minimum_requested_ms is not None
-                and interval.start_ms
+                if interval.start_ms
                 <= frame.requested_time_ms
                 < interval.end_ms
                 and interval.end_ms - interval.start_ms
                 >= minimum_requested_ms
-                and (
-                    not fail_on_quality_human_review
-                    or not interval.requires_human_review
-                )
             ]
+        if not containing:
             if not minimum_containing:
                 raise ValueError(
                     "selected evidence frame has no continuous QualitySafeInterval "
@@ -13212,6 +13285,10 @@ def _build_pre_render_vertical_candidate_route(
     rhythm_plan: RhythmPlan,
     duration_audit: Mapping[str, Any],
     policy: AutonomousEditPolicy,
+    candidate_timing_facts: Mapping[
+        tuple[str, str],
+        Mapping[str, Any],
+    ] | None = None,
 ) -> Any | None:
     """Resolve the 9:16 candidate/trim/cue/presentation frontier.
 
@@ -13250,66 +13327,141 @@ def _build_pre_render_vertical_candidate_route(
             )
             for candidate in chapter.vertical_candidates
         }
+
+        def route_option(
+            candidate: FeatureVerticalCandidate,
+        ) -> CandidateRouteOption:
+            timing = (
+                candidate_timing_facts or {}
+            ).get((chapter.feature_id, candidate.candidate_id), {})
+            hard_failures = list(
+                candidate_feasibility[candidate.candidate_id][1]
+            )
+            timing_failure = timing.get("hard_failure")
+            if timing_failure is not None:
+                hard_failures.append(str(timing_failure))
+            safe_capacity_ms = (
+                int(timing["safe_capacity_ms"])
+                if timing.get("safe_capacity_ms") is not None
+                else None
+            )
+            if (
+                safe_capacity_ms is not None
+                and trim_duration_ms > safe_capacity_ms
+            ):
+                hard_failures.append(
+                    "candidate_capacity_below_resolved:"
+                    f"{safe_capacity_ms}<{trim_duration_ms}"
+                )
+            planned_reuse_mode = chapter.source_reuse_mode
+            planned_reuse_justification = (
+                chapter.source_reuse_justification
+            )
+            if (
+                planned_reuse_mode == "none"
+                and "distinct_interval"
+                in policy.editorial.allow_source_reuse
+            ):
+                planned_reuse_mode = "distinct_interval"
+                planned_reuse_justification = (
+                    "AUTO_POLICY permits only measured non-overlapping "
+                    "candidate intervals; runtime reuse remains fail-closed."
+                )
+            return CandidateRouteOption(
+                beat_id=chapter.feature_id,
+                candidate_id=candidate.candidate_id,
+                source_asset_id=candidate.source_asset_id,
+                event_id=candidate.event_id,
+                planner_rank=candidate.rank,
+                semantic_confidence=float(candidate.confidence),
+                presentation_intrusion_rank=intrusion_rank[
+                    candidate_feasibility[candidate.candidate_id][0]
+                ],
+                trim_duration_ms=trim_duration_ms,
+                minimum_readable_ms=round(
+                    rhythm.minimum_duration_seconds * 1000
+                ),
+                # The joint semantic/music solver already froze this beat's
+                # project boundary.  Candidate routing may choose another
+                # take, but production must not silently move that cue.
+                preferred_readable_ms=trim_duration_ms,
+                maximum_readable_ms=round(
+                    rhythm.maximum_duration_seconds * 1000
+                ),
+                cue_id=cue_by_id[chapter.feature_id]["cue_id"],
+                cue_aligned=cue_by_id[chapter.feature_id][
+                    "cue_aligned"
+                ],
+                presentation_mode=(
+                    candidate_feasibility[candidate.candidate_id][0]
+                ),
+                entry_composition=(
+                    _vertical_candidate_composition_signature(
+                        candidate,
+                        edge="entry",
+                    )
+                ),
+                exit_composition=(
+                    _vertical_candidate_composition_signature(
+                        candidate,
+                        edge="exit",
+                    )
+                ),
+                technical_quality=max(
+                    0.0,
+                    1.0 - len(candidate.quality_risks) * 0.06,
+                ),
+                preflight_hard_failures=tuple(
+                    dict.fromkeys(hard_failures)
+                ),
+                preflight_deferred_gates=(
+                    candidate_feasibility[candidate.candidate_id][2]
+                ),
+                source_clip_id=(
+                    str(timing["source_clip_id"])
+                    if timing.get("source_clip_id") is not None
+                    else None
+                ),
+                safe_capacity_ms=safe_capacity_ms,
+                safe_window_start_ms=(
+                    int(timing["safe_window_start_ms"])
+                    if timing.get("safe_window_start_ms") is not None
+                    else None
+                ),
+                safe_window_end_ms=(
+                    int(timing["safe_window_end_ms"])
+                    if timing.get("safe_window_end_ms") is not None
+                    else None
+                ),
+                source_anchor_ms=(
+                    int(timing["source_anchor_ms"])
+                    if timing.get("source_anchor_ms") is not None
+                    else None
+                ),
+                fixed_source_in_ms=(
+                    int(timing["fixed_source_in_ms"])
+                    if timing.get("fixed_source_in_ms") is not None
+                    else None
+                ),
+                fixed_source_out_ms=(
+                    int(timing["fixed_source_out_ms"])
+                    if timing.get("fixed_source_out_ms") is not None
+                    else None
+                ),
+                reuse_mode=planned_reuse_mode,
+                reuse_justification=planned_reuse_justification,
+                candidate_timing_sha256=(
+                    str(timing["candidate_timing_sha256"])
+                    if timing.get("candidate_timing_sha256") is not None
+                    else None
+                ),
+            )
+
         beats.append(
             CandidateRouteBeat(
                 beat_id=chapter.feature_id,
                 options=tuple(
-                    CandidateRouteOption(
-                        beat_id=chapter.feature_id,
-                        candidate_id=candidate.candidate_id,
-                        source_asset_id=candidate.source_asset_id,
-                        event_id=candidate.event_id,
-                        planner_rank=candidate.rank,
-                        semantic_confidence=float(candidate.confidence),
-                        presentation_intrusion_rank=intrusion_rank[
-                            candidate_feasibility[candidate.candidate_id][0]
-                        ],
-                        trim_duration_ms=trim_duration_ms,
-                        minimum_readable_ms=round(
-                            rhythm.minimum_duration_seconds * 1000
-                        ),
-                        preferred_readable_ms=round(
-                            rhythm.preferred_duration_seconds * 1000
-                        ),
-                        maximum_readable_ms=round(
-                            rhythm.maximum_duration_seconds * 1000
-                        ),
-                        cue_id=cue_by_id[chapter.feature_id]["cue_id"],
-                        cue_aligned=cue_by_id[chapter.feature_id][
-                            "cue_aligned"
-                        ],
-                        presentation_mode=(
-                            candidate_feasibility[
-                                candidate.candidate_id
-                            ][0]
-                        ),
-                        entry_composition=(
-                            _vertical_candidate_composition_signature(
-                                candidate,
-                                edge="entry",
-                            )
-                        ),
-                        exit_composition=(
-                            _vertical_candidate_composition_signature(
-                                candidate,
-                                edge="exit",
-                            )
-                        ),
-                        technical_quality=max(
-                            0.0,
-                            1.0 - len(candidate.quality_risks) * 0.06,
-                        ),
-                        preflight_hard_failures=(
-                            candidate_feasibility[
-                                candidate.candidate_id
-                            ][1]
-                        ),
-                        preflight_deferred_gates=(
-                            candidate_feasibility[
-                                candidate.candidate_id
-                            ][2]
-                        ),
-                    )
+                    route_option(candidate)
                     for candidate in chapter.vertical_candidates
                 ),
             )
@@ -13328,6 +13480,7 @@ def _build_pre_render_vertical_candidate_route(
         max_panel_runtime_fraction=(
             policy.presentation.max_panel_runtime_fraction
         ),
+        target_duration_ms=round(sum(chapter_durations.values()) * 1000),
     )
 
 
@@ -13436,6 +13589,7 @@ def _apply_pre_render_candidate_route(
     selected_candidate_id: str | None,
     ordered_candidate_ids: Sequence[str] = (),
     sequence_bindings: Mapping[str, Any] | None = None,
+    execution_bindings: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply the globally ranked frontier without reviving rejected options."""
 
@@ -13496,6 +13650,13 @@ def _apply_pre_render_candidate_route(
                 option["presentation_preference"] = (
                     preference_by_mode[presentation_mode]
                 )
+        execution_binding = (execution_bindings or {}).get(candidate_id)
+        if execution_binding is not None:
+            option["_pre_render_execution_binding"] = (
+                execution_binding.model_dump(mode="json")
+                if hasattr(execution_binding, "model_dump")
+                else dict(execution_binding)
+            )
         applied.append(option)
     return applied
 
@@ -14153,6 +14314,59 @@ def _require_runtime_candidate_fulfillments(
         ) from error
 
 
+def _frontier_local_semantic_input_sha256(
+    *,
+    feature_id: str,
+    option: Mapping[str, Any],
+    editorial_contracts: Sequence[EditorialBeatContract],
+    editorial_contracts_file_sha256: str,
+    evidence_events: Mapping[
+        tuple[str, str],
+        Mapping[str, Any],
+    ],
+) -> str:
+    """Bind zero-paid candidate preparation to its semantic contracts.
+
+    Local preparation evaluates fulfillment and compiles candidate-specific
+    coverage/query intent. Those inputs must invalidate a saved local artifact
+    before exact-event or grounding work can observe it.
+    """
+
+    source_asset_id = str(option.get("source_asset_id") or "")
+    event_id = str(option.get("event_id") or "")
+    selected_evidence = evidence_events.get(
+        (source_asset_id, event_id)
+    )
+    return _stable_fingerprint(
+        {
+            "contract_version": (
+                "vertical-frontier-local-semantic-input-v1"
+            ),
+            "fulfillment_compiler_version": (
+                _FRONTIER_FULFILLMENT_COMPILER_VERSION
+            ),
+            "feature_id": feature_id,
+            "editorial_contracts_file_sha256": (
+                editorial_contracts_file_sha256
+            ),
+            "editorial_contracts": [
+                contract.model_dump(mode="json")
+                for contract in editorial_contracts
+                if contract.feature_id == feature_id
+            ],
+            "selected_evidence_key": {
+                "source_asset_id": source_asset_id,
+                "event_id": event_id,
+            },
+            "selected_evidence_payload": (
+                dict(selected_evidence)
+                if selected_evidence is not None
+                else None
+            ),
+        }
+    )
+
+
 def _autonomous_exact_event_source_reservations(
     plan: FeatureEditPlan,
     contracts: Sequence[EditorialBeatContract],
@@ -14802,6 +15016,36 @@ def _prepare_autonomous_vertical_candidate(
         )
     except ValueError as error:
         raise CandidateKnownInfeasible(str(error)) from error
+    execution_binding = option_data.get(
+        "_pre_render_execution_binding"
+    )
+    candidate_execution_sha256: str | None = None
+    if isinstance(execution_binding, Mapping):
+        bound_start = execution_binding.get("source_in_ms")
+        bound_end = execution_binding.get("source_out_ms")
+        bound_duration = execution_binding.get("trim_duration_ms")
+        candidate_execution_sha256 = str(
+            execution_binding.get("candidate_execution_sha256") or ""
+        ) or None
+        if not (
+            isinstance(bound_start, int)
+            and isinstance(bound_end, int)
+            and isinstance(bound_duration, int)
+            and bound_start < bound_end
+            and bound_end - bound_start == bound_duration
+            and bound_duration
+            == round(chapter_duration_seconds * 1000)
+        ):
+            raise FeatureCutSystemFailure(
+                "pre-render candidate execution binding is incomplete or "
+                "differs from the frozen chapter duration"
+            )
+        if (start_ms, end_ms) != (bound_start, bound_end):
+            raise FeatureCutSystemFailure(
+                "local candidate preparation recomputed a source interval "
+                "different from the frozen complete route"
+            )
+        start_ms, end_ms = bound_start, bound_end
 
     source_motion = _maskless_source_motion_preflight(
         source_path=Path(clip.path),
@@ -14881,6 +15125,7 @@ def _prepare_autonomous_vertical_candidate(
         "source_motion_definition_sha256": (
             source_motion.definition_sha256
         ),
+        "candidate_execution_sha256": candidate_execution_sha256,
     }
 
 
@@ -17149,6 +17394,223 @@ def _selected_source_capacity_seconds(
     return capacities
 
 
+def _vertical_candidate_timing_facts(
+    plan: FeatureEditPlan,
+    *,
+    frames: Mapping[str, RushFrame],
+    clips: Mapping[str, RushClip],
+    shot_cache: dict[str, ShotManifest],
+    shots_dir: Path,
+    scdet_threshold: float,
+    approved_decisions: Sequence[tuple[Path, TrimIntentDecision]],
+    quality_maps: Sequence[tuple[Path, ShotQualityMap]],
+    strict_quality: bool,
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    """Measure every vertical Top-K candidate before paid execution.
+
+    The result is candidate-local: unlike the legacy beat-capacity projection,
+    no fallback inherits another take's duration.  Source interval and reuse
+    facts are therefore available to the complete-route optimizer before exact
+    event or grounding dispatch.
+    """
+
+    facts: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for selected in plan.chapters:
+        minimum_duration_ms = max(
+            1,
+            round(
+                (
+                    selected.attention_observation.minimum_dwell_seconds
+                    if selected.attention_observation is not None
+                    else 0.5
+                )
+                * 1000
+            ),
+        )
+        for candidate in selected.vertical_candidates:
+            key = (selected.feature_id, candidate.candidate_id)
+            try:
+                frame = frames[candidate.frame_id]
+                clip = clips[frame.clip_id]
+            except KeyError as error:
+                facts[key] = {
+                    "hard_failure": (
+                        "candidate_references_unknown_rush_object:"
+                        f"{error}"
+                    )
+                }
+                continue
+            if not _candidate_asset_reference_matches(
+                candidate.source_asset_id,
+                clip,
+            ):
+                facts[key] = {
+                    "hard_failure": "candidate_source_asset_frame_mismatch"
+                }
+                continue
+            if clip.clip_id not in shot_cache:
+                shot_cache[clip.clip_id] = detect_shots_ffmpeg(
+                    Path(clip.path),
+                    threshold=scdet_threshold,
+                    output_path=shots_dir / f"{clip.clip_id}.json",
+                )
+            shot = next(
+                (
+                    item
+                    for item in shot_cache[clip.clip_id].shots
+                    if item.start_time_ms
+                    <= frame.requested_time_ms
+                    < item.end_time_ms
+                ),
+                None,
+            )
+            if shot is None:
+                facts[key] = {
+                    "hard_failure": "candidate_anchor_has_no_source_shot"
+                }
+                continue
+            source_asset_id = f"sha256:{clip.sha256}"
+            allowed_start_ms = max(0, shot.start_time_ms)
+            allowed_end_ms = min(clip.duration_ms, shot.end_time_ms)
+            fixed_source_in_ms: int | None = None
+            fixed_source_out_ms: int | None = None
+            trim_match = _matching_trim_decision(
+                approved_decisions,
+                source_asset_id=source_asset_id,
+                shot_id=shot.shot_id,
+                event_id=candidate.event_id,
+            )
+            if trim_match is not None:
+                _trim_path, trim_decision = trim_match
+                assert trim_decision.source_in_ms is not None
+                assert trim_decision.source_out_ms is not None
+                allowed_start_ms = trim_decision.source_in_ms
+                allowed_end_ms = trim_decision.source_out_ms
+                fixed_source_in_ms = allowed_start_ms
+                fixed_source_out_ms = allowed_end_ms
+            if not (
+                allowed_start_ms
+                <= frame.requested_time_ms
+                < allowed_end_ms
+            ):
+                facts[key] = {
+                    "hard_failure": (
+                        "candidate_anchor_outside_authorized_source_interval"
+                    )
+                }
+                continue
+            quality_match = _quality_map_for_shot(
+                quality_maps,
+                source_asset_id=source_asset_id,
+                shot_id=shot.shot_id,
+            )
+            if quality_maps and quality_match is None:
+                facts[key] = {
+                    "hard_failure": "candidate_quality_map_coverage_missing"
+                }
+                continue
+            quality_map_path: Path | None = None
+            quality_interval_id: str | None = None
+            if quality_match is not None:
+                quality_map_path, quality_map = quality_match
+                if sha256_file(Path(quality_map.source_path)) != clip.sha256:
+                    facts[key] = {
+                        "hard_failure": "candidate_quality_source_hash_mismatch"
+                    }
+                    continue
+                try:
+                    if strict_quality:
+                        safe_interval = (
+                            resolve_strict_quality_clean_subinterval(
+                                quality_map,
+                                anchor_ms=frame.requested_time_ms,
+                                minimum_duration_ms=minimum_duration_ms,
+                                quality_map_sha256=sha256_file(
+                                    quality_map_path
+                                ),
+                                allowed_start_ms=allowed_start_ms,
+                                allowed_end_ms=allowed_end_ms,
+                            )
+                        )
+                    else:
+                        safe_interval = max(
+                            (
+                                interval
+                                for interval in build_quality_safe_intervals(
+                                    quality_map,
+                                    quality_map_sha256=sha256_file(
+                                        quality_map_path
+                                    ),
+                                    allowed_start_ms=allowed_start_ms,
+                                    allowed_end_ms=allowed_end_ms,
+                                )
+                                if interval.start_ms
+                                <= frame.requested_time_ms
+                                < interval.end_ms
+                            ),
+                            key=lambda interval: (
+                                interval.end_ms - interval.start_ms,
+                                -interval.start_ms,
+                            ),
+                        )
+                except (ValueError, StopIteration) as error:
+                    facts[key] = {
+                        "hard_failure": f"candidate_quality_interval:{error}"
+                    }
+                    continue
+                allowed_start_ms = safe_interval.start_ms
+                allowed_end_ms = safe_interval.end_ms
+                quality_interval_id = safe_interval.interval_id
+                if fixed_source_in_ms is not None:
+                    assert fixed_source_out_ms is not None
+                    if (
+                        allowed_start_ms != fixed_source_in_ms
+                        or allowed_end_ms != fixed_source_out_ms
+                    ):
+                        facts[key] = {
+                            "hard_failure": (
+                                "candidate_fixed_trim_overlaps_quality_risk"
+                            )
+                        }
+                        continue
+            capacity_ms = allowed_end_ms - allowed_start_ms
+            if capacity_ms < minimum_duration_ms:
+                facts[key] = {
+                    "hard_failure": (
+                        "candidate_capacity_below_minimum:"
+                        f"{capacity_ms}<{minimum_duration_ms}"
+                    )
+                }
+                continue
+            definition = {
+                "contract_version": "candidate-local-timing-fact-v1",
+                "beat_id": selected.feature_id,
+                "candidate_id": candidate.candidate_id,
+                "source_asset_id": source_asset_id,
+                "source_clip_id": clip.clip_id,
+                "event_id": candidate.event_id,
+                "source_anchor_ms": frame.requested_time_ms,
+                "safe_window_start_ms": allowed_start_ms,
+                "safe_window_end_ms": allowed_end_ms,
+                "safe_capacity_ms": capacity_ms,
+                "fixed_source_in_ms": fixed_source_in_ms,
+                "fixed_source_out_ms": fixed_source_out_ms,
+                "minimum_readable_ms": minimum_duration_ms,
+                "quality_map_sha256": (
+                    sha256_file(quality_map_path)
+                    if quality_map_path is not None
+                    else None
+                ),
+                "quality_safe_interval_id": quality_interval_id,
+                "strict_quality": strict_quality,
+            }
+            facts[key] = {
+                **definition,
+                "candidate_timing_sha256": _stable_fingerprint(definition),
+            }
+    return facts
+
+
 def _selected_fixed_trim_durations_seconds(
     plan: FeatureEditPlan,
     *,
@@ -19245,6 +19707,51 @@ def _run_feature_cut_experiment_impl(
                     + "; use review_preview only when an auditable preview is "
                     "intended"
                 )
+        vertical_candidate_timing_facts_path = (
+            output_dir / "vertical-candidate-timing-facts.json"
+        )
+        vertical_candidate_timing_facts = (
+            _vertical_candidate_timing_facts(
+                plan,
+                frames=frames,
+                clips=clips,
+                shot_cache=shot_cache,
+                shots_dir=shots_dir,
+                scdet_threshold=scdet_threshold,
+                approved_decisions=trim_decisions,
+                quality_maps=shot_quality_maps,
+                strict_quality=(
+                    autonomous_policy is not None
+                    and autonomous_policy.execution_profile
+                    == "autonomous_strict"
+                ),
+            )
+            if autonomous_profile and render_vertical
+            else {}
+        )
+        if vertical_candidate_timing_facts:
+            write_json(
+                vertical_candidate_timing_facts_path,
+                {
+                    "contract_version": (
+                        "vertical-candidate-timing-facts-v1"
+                    ),
+                    "candidates": [
+                        {
+                            "feature_id": feature_id,
+                            "candidate_id": candidate_id,
+                            **dict(fact),
+                        }
+                        for (
+                            feature_id,
+                            candidate_id,
+                        ), fact in sorted(
+                            vertical_candidate_timing_facts.items()
+                        )
+                    ],
+                    "generated_at": utc_now(),
+                },
+            )
         source_capacity_seconds = _selected_source_capacity_seconds(
             plan,
             aspect=aspect,
@@ -19256,6 +19763,30 @@ def _run_feature_cut_experiment_impl(
             approved_decisions=trim_decisions,
             quality_maps=shot_quality_maps,
         )
+        if vertical_candidate_timing_facts:
+            vertical_capacity_by_feature: dict[str, float] = {}
+            for (feature_id, _candidate_id), fact in (
+                vertical_candidate_timing_facts.items()
+            ):
+                if fact.get("hard_failure") is not None:
+                    continue
+                capacity_ms = fact.get("safe_capacity_ms")
+                if capacity_ms is None:
+                    continue
+                vertical_capacity_by_feature[feature_id] = max(
+                    vertical_capacity_by_feature.get(feature_id, 0.0),
+                    int(capacity_ms) / 1000,
+                )
+            for feature_id, vertical_capacity in (
+                vertical_capacity_by_feature.items()
+            ):
+                source_capacity_seconds[feature_id] = min(
+                    source_capacity_seconds.get(
+                        feature_id,
+                        vertical_capacity,
+                    ),
+                    vertical_capacity,
+                )
         fixed_duration_seconds = _selected_fixed_trim_durations_seconds(
             plan,
             aspect=aspect,
@@ -19510,6 +20041,9 @@ def _run_feature_cut_experiment_impl(
                 rhythm_plan=rhythm_plan,
                 duration_audit=duration_audit,
                 policy=autonomous_policy,
+                candidate_timing_facts=(
+                    vertical_candidate_timing_facts
+                ),
             )
             if autonomous_profile and render_vertical
             else None
@@ -19528,14 +20062,19 @@ def _run_feature_cut_experiment_impl(
                         )
                     ),
                     "feature_plan_sha256": sha256_file(plan_path),
+                    "candidate_timing_facts_sha256": (
+                        sha256_file(vertical_candidate_timing_facts_path)
+                        if vertical_candidate_timing_facts_path.is_file()
+                        else None
+                    ),
                     "interpretation": (
-                        "Candidate, resolved trim duration, music exit, "
+                        "Candidate-local quality-safe source interval, resolved "
+                        "trim duration, source-reuse authority, music exit, "
                         "presentation family, and symbolic entry/exit "
-                        "composition were jointly bound before render. Exact "
-                        "evidence, identity, relation, quality, reuse, and "
-                        "pixel geometry remain downstream hard gates; a "
-                        "failed primary advances through the saved global "
-                        "fallback order."
+                        "composition were jointly bound before paid execution. "
+                        "Exact evidence, identity, relation, tracking, and "
+                        "pixel geometry remain downstream fail-closed gates; "
+                        "fallbacks are projections of saved complete routes."
                     ),
                     "generated_at": utc_now(),
                 },
@@ -19561,6 +20100,24 @@ def _run_feature_cut_experiment_impl(
             if pre_render_candidate_route is not None
             else {}
         )
+        pre_render_execution_bindings_by_feature: dict[
+            str,
+            dict[str, Any],
+        ] = {}
+        if pre_render_candidate_route is not None:
+            ranked_routes = (
+                pre_render_candidate_route.ranked_routes
+                or ()
+            )
+            for complete_route in ranked_routes:
+                for selection in complete_route.selections:
+                    pre_render_execution_bindings_by_feature.setdefault(
+                        selection.beat_id,
+                        {},
+                    ).setdefault(
+                        selection.candidate_id,
+                        selection,
+                    )
         pre_render_horizontal_candidate_route = (
             _build_pre_render_horizontal_candidate_route(
                 plan,
@@ -19858,6 +20415,9 @@ def _run_feature_cut_experiment_impl(
                 pre_render_candidate_route_path
             )
             frontier_plan_sha256 = sha256_file(plan_path)
+            frontier_editorial_contracts_sha256 = sha256_file(
+                editorial_beat_contracts_path
+            )
             frontier_shared_local_input_sha256 = _stable_fingerprint(
                 {
                     "contract_version": _FRONTIER_LOCAL_BINDING_VERSION,
@@ -20017,6 +20577,12 @@ def _run_feature_cut_experiment_impl(
                             {},
                         )
                     ),
+                    execution_bindings=(
+                        pre_render_execution_bindings_by_feature.get(
+                            frontier_feature_id,
+                            {},
+                        )
+                    ),
                 )
                 viable_candidates = []
                 local_failures = []
@@ -20093,6 +20659,17 @@ def _run_feature_cut_experiment_impl(
                     option_sha256 = _stable_fingerprint(
                         dict(frontier_option)
                     )
+                    local_semantic_input_sha256 = (
+                        _frontier_local_semantic_input_sha256(
+                            feature_id=frontier_feature_id,
+                            option=frontier_option,
+                            editorial_contracts=editorial_templates,
+                            editorial_contracts_file_sha256=(
+                                frontier_editorial_contracts_sha256
+                            ),
+                            evidence_events=candidate_evidence_events,
+                        )
+                    )
                     try:
                         local_payload = (
                             _load_or_create_frontier_stage_artifact(
@@ -20104,6 +20681,7 @@ def _run_feature_cut_experiment_impl(
                                     frontier_plan_sha256,
                                     option_sha256,
                                     frontier_shared_local_input_sha256,
+                                    local_semantic_input_sha256,
                                 ),
                                 policy_reference=(
                                     autonomous_policy.policy_reference
@@ -20666,6 +21244,15 @@ def _run_feature_cut_experiment_impl(
                         frontier_plan_sha256,
                         _stable_fingerprint(local_payloads[key]["option"]),
                         frontier_shared_local_input_sha256,
+                        _frontier_local_semantic_input_sha256(
+                            feature_id=feature_id,
+                            option=local_payloads[key]["option"],
+                            editorial_contracts=editorial_templates,
+                            editorial_contracts_file_sha256=(
+                                frontier_editorial_contracts_sha256
+                            ),
+                            evidence_events=candidate_evidence_events,
+                        ),
                     ),
                     policy_reference=autonomous_policy.policy_reference,
                     route_sha256=route_sha256,

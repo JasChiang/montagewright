@@ -28,6 +28,7 @@ from jascue_video_lab.sequence_optimizer import (
     SequenceOption,
     ResolvedTimelineV1,
     build_resolved_timeline,
+    candidate_route_execution_sha256,
     concat_manifest_lines,
     initialize_round_robin_frontier,
     next_round_robin_frontier_attempt,
@@ -36,6 +37,7 @@ from jascue_video_lab.sequence_optimizer import (
     record_round_robin_frontier_attempt,
     reconcile_runtime_sequence_timing,
     render_segments_incrementally,
+    select_next_compatible_route,
     solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
 )
@@ -317,6 +319,42 @@ def _route_option(
     )
 
 
+def _timed_route_option(
+    beat_id: str,
+    candidate_id: str,
+    source_marker: str,
+    *,
+    source_in_ms: int,
+    source_out_ms: int,
+    rank: int = 1,
+    confidence: float = 0.9,
+    reuse_mode: str = "none",
+) -> CandidateRouteOption:
+    duration_ms = source_out_ms - source_in_ms
+    return CandidateRouteOption(
+        beat_id=beat_id,
+        candidate_id=candidate_id,
+        source_asset_id="sha256:" + source_marker * 64,
+        source_clip_id=f"clip-{source_marker}",
+        event_id=f"event-{candidate_id}",
+        planner_rank=rank,
+        semantic_confidence=confidence,
+        trim_duration_ms=duration_ms,
+        minimum_readable_ms=duration_ms,
+        preferred_readable_ms=duration_ms,
+        maximum_readable_ms=duration_ms,
+        fixed_source_in_ms=source_in_ms,
+        fixed_source_out_ms=source_out_ms,
+        reuse_mode=reuse_mode,
+        reuse_justification=(
+            "explicit test reuse authority"
+            if reuse_mode != "none"
+            else None
+        ),
+        candidate_timing_sha256=source_marker * 64,
+    )
+
+
 def test_pre_render_route_uses_global_variety_without_discarding_semantics() -> None:
     route = optimize_pre_render_candidate_route(
         (
@@ -493,6 +531,255 @@ def test_pre_render_frontier_applies_panel_runtime_policy_before_render() -> Non
     assert route.fallback_candidate_ids_by_beat["comparison"] == (
         "full-bleed",
     )
+
+
+def test_overlapping_source_without_authority_is_excluded_before_route() -> None:
+    first = _timed_route_option(
+        "opening",
+        "opening-primary",
+        "a",
+        source_in_ms=0,
+        source_out_ms=3_000,
+    )
+    unauthorized_overlap = _timed_route_option(
+        "payoff",
+        "payoff-overlap",
+        "a",
+        source_in_ms=1_000,
+        source_out_ms=4_000,
+        confidence=1.0,
+    )
+    alternate = _timed_route_option(
+        "payoff",
+        "payoff-alternate",
+        "b",
+        source_in_ms=0,
+        source_out_ms=3_000,
+        rank=2,
+        confidence=0.2,
+    )
+
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(first,)),
+            CandidateRouteBeat(
+                beat_id="payoff",
+                options=(unauthorized_overlap, alternate),
+            ),
+        )
+    )
+
+    assert [row.candidate_id for row in result.selections] == [
+        "opening-primary",
+        "payoff-alternate",
+    ]
+    assert all(
+        "payoff-overlap"
+        not in {selection.candidate_id for selection in route.selections}
+        for route in result.ranked_routes
+    )
+
+
+def test_non_overlapping_distinct_interval_reuse_is_hard_safe() -> None:
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(
+                    _timed_route_option(
+                        "opening",
+                        "opening-a",
+                        "a",
+                        source_in_ms=0,
+                        source_out_ms=3_000,
+                    ),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="closing",
+                options=(
+                    _timed_route_option(
+                        "closing",
+                        "closing-a",
+                        "a",
+                        source_in_ms=5_000,
+                        source_out_ms=8_000,
+                        reuse_mode="distinct_interval",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert [row.candidate_id for row in result.selections] == [
+        "opening-a",
+        "closing-a",
+    ]
+    assert result.selections[1].reuse_mode == "distinct_interval"
+
+
+def test_independent_fallback_conflict_never_becomes_complete_route() -> None:
+    beats = (
+        CandidateRouteBeat(
+            beat_id="a",
+            options=(
+                _timed_route_option(
+                    "a",
+                    "a-primary",
+                    "a",
+                    source_in_ms=0,
+                    source_out_ms=3_000,
+                    confidence=0.95,
+                ),
+                _timed_route_option(
+                    "a",
+                    "a-fallback",
+                    "c",
+                    source_in_ms=0,
+                    source_out_ms=3_000,
+                    rank=2,
+                    confidence=0.8,
+                ),
+            ),
+        ),
+        CandidateRouteBeat(
+            beat_id="b",
+            options=(
+                _timed_route_option(
+                    "b",
+                    "b-primary",
+                    "b",
+                    source_in_ms=0,
+                    source_out_ms=3_000,
+                    confidence=0.95,
+                ),
+                _timed_route_option(
+                    "b",
+                    "b-fallback",
+                    "c",
+                    source_in_ms=1_000,
+                    source_out_ms=4_000,
+                    rank=2,
+                    confidence=0.8,
+                ),
+            ),
+        ),
+    )
+
+    result = optimize_pre_render_candidate_route(beats)
+
+    assert "a-fallback" in result.fallback_candidate_ids_by_beat["a"]
+    assert "b-fallback" in result.fallback_candidate_ids_by_beat["b"]
+    assert all(
+        {
+            "a-fallback",
+            "b-fallback",
+        }
+        - {selection.candidate_id for selection in route.selections}
+        for route in result.ranked_routes
+    )
+
+
+def test_allocated_duration_changes_candidate_execution_hash() -> None:
+    option = CandidateRouteOption(
+        beat_id="detail",
+        candidate_id="detail-a",
+        source_asset_id="sha256:" + "a" * 64,
+        source_clip_id="clip-a",
+        event_id="detail-event",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=4_000,
+        minimum_readable_ms=2_000,
+        preferred_readable_ms=4_000,
+        maximum_readable_ms=8_000,
+        safe_capacity_ms=10_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=10_000,
+        source_anchor_ms=5_000,
+        candidate_timing_sha256="a" * 64,
+    )
+    beat = CandidateRouteBeat(beat_id="detail", options=(option,))
+
+    short = optimize_pre_render_candidate_route(
+        (beat,),
+        target_duration_ms=4_000,
+    )
+    long = optimize_pre_render_candidate_route(
+        (beat,),
+        target_duration_ms=6_000,
+    )
+
+    assert short.total_duration_ms == 4_000
+    assert long.total_duration_ms == 6_000
+    assert (
+        short.selections[0].candidate_execution_sha256
+        != long.selections[0].candidate_execution_sha256
+    )
+    assert short.selections[0].candidate_execution_sha256 == (
+        candidate_route_execution_sha256(
+            option,
+            duration_ms=4_000,
+            source_in_ms=3_000,
+            source_out_ms=7_000,
+        )
+    )
+
+
+def test_next_route_preserves_accepted_execution_and_skips_failed_one() -> None:
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="a",
+                options=(
+                    _timed_route_option(
+                        "a",
+                        "a-primary",
+                        "a",
+                        source_in_ms=0,
+                        source_out_ms=3_000,
+                    ),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="b",
+                options=(
+                    _timed_route_option(
+                        "b",
+                        "b-primary",
+                        "b",
+                        source_in_ms=0,
+                        source_out_ms=3_000,
+                    ),
+                    _timed_route_option(
+                        "b",
+                        "b-fallback",
+                        "c",
+                        source_in_ms=0,
+                        source_out_ms=3_000,
+                        rank=2,
+                        confidence=0.7,
+                    ),
+                ),
+            ),
+        )
+    )
+    first = result.ranked_routes[0]
+    accepted_a = first.selections[0].candidate_execution_sha256
+    failed_b = first.selections[1].candidate_execution_sha256
+    assert accepted_a is not None
+    assert failed_b is not None
+
+    next_route = select_next_compatible_route(
+        result.ranked_routes,
+        accepted_execution_sha256_by_beat={"a": accepted_a},
+        failed_execution_sha256s=(failed_b,),
+        after_route_id=first.route_id,
+    )
+
+    assert next_route is not None
+    assert next_route.selections[0].candidate_execution_sha256 == accepted_a
+    assert next_route.selections[1].candidate_id == "b-fallback"
 
 
 def _runtime_timing(

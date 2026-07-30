@@ -148,6 +148,7 @@ from jascue_video_lab.final_edit_qa import DeterministicDeliveryEvidence
 from jascue_video_lab.sequence_optimizer import CandidateRouteOption
 from jascue_video_lab.sequence_optimizer import (
     CandidateRouteBeat,
+    CandidateRouteSelection,
     RoundRobinFrontierBeat,
     RoundRobinFrontierCandidate,
     RoundRobinFrontierState,
@@ -674,6 +675,96 @@ def test_frontier_stage_legacy_dependency_schema_is_not_migrated(
                 "dependency-schema mismatch dispatched producer"
             ),
         )
+
+
+def test_zero_paid_local_stage_archives_stale_binding_and_recomputes(
+    tmp_path: Path,
+) -> None:
+    kwargs = {
+        **_frontier_stage_artifact_kwargs(tmp_path),
+        "stage": "local_preflight",
+    }
+    artifact_path = kwargs["artifact_path"]
+    assert isinstance(artifact_path, Path)
+    first = _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: {"semantic_contract": "old"},
+    )
+    original_sha256 = sha256_file(artifact_path)
+    producer_calls: list[str] = []
+
+    refreshed = _load_or_create_frontier_stage_artifact(
+        **{
+            **kwargs,
+            "dependency_hashes": (
+                *kwargs["dependency_hashes"],
+                "sha256:" + "f" * 64,
+            ),
+        },
+        producer=lambda: (
+            producer_calls.append("zero-paid-local-recomputed")
+            or {"semantic_contract": "current"}
+        ),
+    )
+
+    archived = [
+        path
+        for path in (artifact_path.parent / "archive").glob(
+            "frontier-stage.stale-*.json"
+        )
+        if not path.name.endswith(".archive-record.json")
+    ]
+    assert first == {"semantic_contract": "old"}
+    assert refreshed == {"semantic_contract": "current"}
+    assert producer_calls == ["zero-paid-local-recomputed"]
+    assert len(archived) == 1
+    assert sha256_file(archived[0]) == original_sha256
+    archive_record = json.loads(
+        archived[0]
+        .with_name(archived[0].name + ".archive-record.json")
+        .read_text(encoding="utf-8")
+    )
+    assert archive_record["contract_version"] == (
+        "zero-paid-frontier-local-stale-archive-v1"
+    )
+    assert archive_record["paid_provider_dispatch_added"] is False
+    assert archive_record["previous_dependency_hashes"] == list(
+        kwargs["dependency_hashes"]
+    )
+
+
+@pytest.mark.parametrize("stage", ("exact_event", "grounding"))
+def test_paid_frontier_stage_stale_binding_remains_fail_closed(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    kwargs = {
+        **_frontier_stage_artifact_kwargs(tmp_path),
+        "stage": stage,
+    }
+    _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: {"paid_result": "saved"},
+    )
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="stale or tampered bindings",
+    ):
+        _load_or_create_frontier_stage_artifact(
+            **{
+                **kwargs,
+                "dependency_hashes": (
+                    *kwargs["dependency_hashes"],
+                    "sha256:" + "f" * 64,
+                ),
+            },
+            producer=lambda: pytest.fail(
+                "stale paid stage dispatched its producer"
+            ),
+        )
+
+    assert not (tmp_path / "archive").exists()
 
 
 def test_frontier_stage_artifact_migrates_legacy_paid_result_without_dispatch(
@@ -1562,12 +1653,31 @@ def test_pre_render_frontier_order_drives_runtime_fallback_sequence() -> None:
         semantic_confidence=0.8,
         presentation_mode="phase_virtual_camera",
     )
+    execution = CandidateRouteSelection(
+        beat_id="beat",
+        candidate_id="rank-2",
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="event",
+        trim_duration_ms=4_000,
+        cue_id="cue",
+        cue_aligned=True,
+        presentation_mode="phase_virtual_camera",
+        entry_composition="left",
+        exit_composition="right",
+        decision_codes=("complete_route_ranked_before_runtime",),
+        source_clip_id="clip-a",
+        source_in_ms=1_000,
+        source_out_ms=5_000,
+        candidate_execution_sha256="b" * 64,
+        reuse_mode="distinct_interval",
+    )
     runtime_options[1]["presentation_preference"] = "two_panel_layout"
     ordered = _apply_pre_render_candidate_route(
         runtime_options,
         selected_candidate_id="rank-2",
         ordered_candidate_ids=("rank-2", "rank-3", "rank-1"),
         sequence_bindings={"rank-2": binding},
+        execution_bindings={"rank-2": execution},
     )
 
     assert [option["candidate_id"] for option in ordered] == [
@@ -1580,6 +1690,12 @@ def test_pre_render_frontier_order_drives_runtime_fallback_sequence() -> None:
         ordered[0]["_pre_render_sequence_binding"]["candidate_id"]
         == "rank-2"
     )
+    assert ordered[0]["_pre_render_execution_binding"][
+        "candidate_execution_sha256"
+    ] == "b" * 64
+    assert ordered[0]["_pre_render_execution_binding"][
+        "source_in_ms"
+    ] == 1_000
 
 
 def test_semantic_replan_frontier_is_bounded_and_carries_adjacent_context() -> None:
@@ -7382,6 +7498,104 @@ def test_preferred_candidate_below_fulfillment_minimum_is_candidate_failure() ->
         )
 
 
+def test_frontier_local_semantic_fingerprint_binds_contract_evidence_and_compiler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = EditorialBeatContract(
+        beat_id="closing",
+        feature_id="closing",
+        priority="preferred",
+        evidence_query_lock_sha256="a" * 64,
+        required_target_ids=("closing-subject",),
+        allowed_evidence_provenance=("direct_physical_action",),
+        narrative_function="closing",
+        minimum_fulfillment_level="visible_state",
+        fulfillment_alternatives=(
+            {
+                "fulfillment_level": "visible_state",
+                "accepted_evidence_provenance": (
+                    "direct_physical_action",
+                ),
+                "claim_support_level": "observable_state",
+                "exact_event_requirement": "none",
+            },
+        ),
+        duration={
+            "minimum_readable_frames": 18,
+            "preferred_frames": 36,
+            "maximum_frames": 72,
+        },
+        relation_mode="single_subject",
+        allowed_reconstruction=("continuous", "solid_fit"),
+    )
+    option = {
+        "candidate_id": "rank-01",
+        "source_asset_id": "sha256:" + "b" * 64,
+        "event_id": "closing-event",
+    }
+    evidence_key = (
+        option["source_asset_id"],
+        option["event_id"],
+    )
+    evidence = {
+        evidence_key: {
+            "evidence_provenance": "direct_physical_action",
+            "effective_observation": None,
+        }
+    }
+
+    def fingerprint(
+        *,
+        contracts: tuple[EditorialBeatContract, ...] = (contract,),
+        file_sha256: str = "c" * 64,
+        events: dict[
+            tuple[str, str],
+            dict[str, object],
+        ] = evidence,
+    ) -> str:
+        return feature_cut_module._frontier_local_semantic_input_sha256(
+            feature_id="closing",
+            option=option,
+            editorial_contracts=contracts,
+            editorial_contracts_file_sha256=file_sha256,
+            evidence_events=events,
+        )
+
+    baseline = fingerprint()
+    file_changed = fingerprint(file_sha256="d" * 64)
+    contract_changed = fingerprint(
+        contracts=(
+            contract.model_copy(
+                update={"priority": "optional"}
+            ),
+        )
+    )
+    evidence_changed = fingerprint(
+        events={
+            evidence_key: {
+                "evidence_provenance": "direct_result",
+                "effective_observation": None,
+            }
+        }
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_FRONTIER_FULFILLMENT_COMPILER_VERSION",
+        "runtime-candidate-fulfillment-compiler-test-next",
+    )
+    compiler_changed = fingerprint()
+
+    assert len(
+        {
+            baseline,
+            file_changed,
+            contract_changed,
+            evidence_changed,
+            compiler_changed,
+        }
+    ) == 5
+
+
 def test_grouped_grounding_cache_key_ignores_only_target_order() -> None:
     first = {
         "source_frame_hash": "a" * 64,
@@ -8165,6 +8379,16 @@ def test_autonomous_strict_rejects_unresolved_quality_review_before_paid_work(
                 requires_human_review=True,
             )
         ],
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "resolve_strict_quality_clean_subinterval",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError(
+                "selected evidence frame has no continuous "
+                "QualitySafeInterval after strict review-risk exclusion"
+            )
+        ),
     )
 
     with pytest.raises(ValueError, match="QualitySafeInterval"):

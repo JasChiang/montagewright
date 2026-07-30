@@ -17,6 +17,7 @@ from jascue_video_lab.shot_quality import (
     _decode_analysis_frames,
     build_candidate_capacity,
     build_quality_safe_intervals,
+    resolve_strict_quality_clean_subinterval,
     scan_shot_quality,
 )
 from jascue_video_lab.shots import detect_shots_ffmpeg
@@ -285,6 +286,113 @@ def test_quality_safe_intervals_exclude_unknown_trim_candidate_only(
     assert intervals[0].requires_human_review is False
     assert intervals[1].requires_human_review is True
     assert intervals[1].review_risk_window_ids == ["QRW-0002"]
+
+
+def _localized_review_risk(
+    quality_map: ShotQualityMap,
+    *,
+    start_ms: int,
+    end_ms: int,
+) -> QualityRiskWindow:
+    return QualityRiskWindow(
+        risk_window_id="QRW-0009",
+        source_asset_id=quality_map.source_asset_id,
+        shot_id=quality_map.shot_id,
+        start_pts=round(start_ms * 30 / 1000),
+        end_pts=round(end_ms * 30 / 1000),
+        start_ms=start_ms,
+        end_ms=end_ms,
+        reason_code="focus_loss",
+        severity="review",
+        intent="unknown",
+        confidence=0.8,
+        evidence_frame_ids=[quality_map.evidence_frames[0].frame_id],
+        metric_summary={"focus_score_mean": 0.001},
+    )
+
+
+def test_strict_quality_excludes_review_risk_before_anchor_and_keeps_5s(
+    tmp_path: Path,
+) -> None:
+    _, quality_map = _quality_map(tmp_path)
+    quality_map = quality_map.model_copy(
+        update={
+            "risk_windows": [
+                _localized_review_risk(
+                    quality_map,
+                    start_ms=0,
+                    end_ms=5_000,
+                )
+            ]
+        }
+    )
+
+    review_intervals = build_quality_safe_intervals(quality_map)
+    strict = resolve_strict_quality_clean_subinterval(
+        quality_map,
+        anchor_ms=7_500,
+        minimum_duration_ms=5_000,
+    )
+
+    assert review_intervals[0].requires_human_review is True
+    assert strict.start_ms == 5_000
+    assert strict.end_ms == 10_000
+    assert strict.end_ms - strict.start_ms == 5_000
+    assert strict.requires_human_review is False
+    assert strict.review_risk_window_ids == []
+    assert strict.excluded_risk_window_ids == ["QRW-0009"]
+
+
+def test_strict_quality_rejects_risk_covering_anchor(tmp_path: Path) -> None:
+    _, quality_map = _quality_map(tmp_path)
+    quality_map = quality_map.model_copy(
+        update={
+            "risk_windows": [
+                _localized_review_risk(
+                    quality_map,
+                    start_ms=5_000,
+                    end_ms=7_000,
+                )
+            ]
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="strict_quality_anchor_covered_by_risk:QRW-0009",
+    ):
+        resolve_strict_quality_clean_subinterval(
+            quality_map,
+            anchor_ms=6_000,
+            minimum_duration_ms=2_000,
+        )
+
+
+def test_strict_quality_rejects_clean_capacity_below_minimum(
+    tmp_path: Path,
+) -> None:
+    _, quality_map = _quality_map(tmp_path)
+    quality_map = quality_map.model_copy(
+        update={
+            "risk_windows": [
+                _localized_review_risk(
+                    quality_map,
+                    start_ms=0,
+                    end_ms=6_000,
+                )
+            ]
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="strict_quality_clean_capacity_below_minimum:4000<5000",
+    ):
+        resolve_strict_quality_clean_subinterval(
+            quality_map,
+            anchor_ms=8_000,
+            minimum_duration_ms=5_000,
+        )
 
 
 def test_intentional_trim_candidate_is_retained(tmp_path: Path) -> None:

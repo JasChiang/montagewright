@@ -995,6 +995,165 @@ def build_quality_safe_intervals(
     return intervals
 
 
+def resolve_strict_quality_clean_subinterval(
+    quality_map: ShotQualityMap,
+    *,
+    anchor_ms: int,
+    minimum_duration_ms: int,
+    quality_map_sha256: str | None = None,
+    allowed_start_ms: int | None = None,
+    allowed_end_ms: int | None = None,
+) -> QualitySafeInterval:
+    """Resolve one anchor-containing interval for strict production.
+
+    Review profiles intentionally keep unresolved ``review`` windows inside a
+    ``QualitySafeInterval`` and mark it ``requires_human_review``.  Strict
+    production may instead treat those already-measured local windows as
+    exclusions, but may not reinterpret or delete their evidence.  The
+    resulting clean interval must still contain the immutable editorial/event
+    anchor and provide the requested minimum continuous capacity.
+
+    This helper does not change :func:`build_quality_safe_intervals`; callers
+    must opt into the stricter projection explicitly.
+    """
+
+    if minimum_duration_ms <= 0:
+        raise ValueError("strict quality minimum duration must be positive")
+    start_ms = (
+        quality_map.shot_start_ms
+        if allowed_start_ms is None
+        else allowed_start_ms
+    )
+    end_ms = (
+        quality_map.shot_end_ms
+        if allowed_end_ms is None
+        else allowed_end_ms
+    )
+    if not (
+        quality_map.shot_start_ms
+        <= start_ms
+        < end_ms
+        <= quality_map.shot_end_ms
+    ):
+        raise ValueError(
+            "strict quality bounds must stay inside the scanned shot"
+        )
+    if not start_ms <= anchor_ms < end_ms:
+        raise ValueError(
+            "strict_quality_anchor_outside_allowed_interval"
+        )
+    map_sha256 = quality_map_sha256 or _canonical_sha256(quality_map)
+    review_intervals = build_quality_safe_intervals(
+        quality_map,
+        quality_map_sha256=map_sha256,
+        allowed_start_ms=start_ms,
+        allowed_end_ms=end_ms,
+    )
+    anchor_interval = next(
+        (
+            interval
+            for interval in review_intervals
+            if interval.start_ms <= anchor_ms < interval.end_ms
+        ),
+        None,
+    )
+    if anchor_interval is None:
+        covering_ids = sorted(
+            window.risk_window_id
+            for window in quality_map.risk_windows
+            if window.start_ms <= anchor_ms < window.end_ms
+        )
+        suffix = f":{','.join(covering_ids)}" if covering_ids else ""
+        raise ValueError(
+            "strict_quality_anchor_covered_by_risk" + suffix
+        )
+
+    review_ids = set(anchor_interval.review_risk_window_ids)
+    review_exclusions = sorted(
+        (
+            (
+                max(anchor_interval.start_ms, window.start_ms),
+                min(anchor_interval.end_ms, window.end_ms),
+                window.risk_window_id,
+            )
+            for window in quality_map.risk_windows
+            if (
+                window.risk_window_id in review_ids
+                and window.start_ms < anchor_interval.end_ms
+                and anchor_interval.start_ms < window.end_ms
+            )
+        ),
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    merged: list[tuple[int, int, list[str]]] = []
+    for risk_start, risk_end, risk_id in review_exclusions:
+        if not merged or risk_start > merged[-1][1]:
+            merged.append((risk_start, risk_end, [risk_id]))
+            continue
+        prior_start, prior_end, prior_ids = merged[-1]
+        merged[-1] = (
+            prior_start,
+            max(prior_end, risk_end),
+            [*prior_ids, risk_id],
+        )
+
+    clean_gaps: list[tuple[int, int]] = []
+    cursor_ms = anchor_interval.start_ms
+    for risk_start, risk_end, _risk_ids in merged:
+        if cursor_ms < risk_start:
+            clean_gaps.append((cursor_ms, risk_start))
+        cursor_ms = max(cursor_ms, risk_end)
+    if cursor_ms < anchor_interval.end_ms:
+        clean_gaps.append((cursor_ms, anchor_interval.end_ms))
+    clean_interval = next(
+        (
+            (clean_start, clean_end, index)
+            for index, (clean_start, clean_end) in enumerate(
+                clean_gaps,
+                start=1,
+            )
+            if clean_start <= anchor_ms < clean_end
+        ),
+        None,
+    )
+    if clean_interval is None:
+        covering_ids = sorted(
+            risk_id
+            for risk_start, risk_end, risk_ids in merged
+            if risk_start <= anchor_ms < risk_end
+            for risk_id in risk_ids
+        )
+        suffix = f":{','.join(covering_ids)}" if covering_ids else ""
+        raise ValueError(
+            "strict_quality_anchor_covered_by_risk" + suffix
+        )
+    clean_start, clean_end, clean_index = clean_interval
+    clean_capacity_ms = clean_end - clean_start
+    if clean_capacity_ms < minimum_duration_ms:
+        raise ValueError(
+            "strict_quality_clean_capacity_below_minimum:"
+            f"{clean_capacity_ms}<{minimum_duration_ms}"
+        )
+    return QualitySafeInterval(
+        interval_id=f"QSI-{clean_index:04d}",
+        source_asset_id=quality_map.source_asset_id,
+        shot_id=quality_map.shot_id,
+        start_pts=_pts_for_local_ms(quality_map, clean_start),
+        end_pts=_pts_for_local_ms(quality_map, clean_end),
+        start_ms=clean_start,
+        end_ms=clean_end,
+        excluded_risk_window_ids=sorted(
+            {
+                *anchor_interval.excluded_risk_window_ids,
+                *anchor_interval.review_risk_window_ids,
+            }
+        ),
+        review_risk_window_ids=[],
+        requires_human_review=False,
+        quality_map_sha256=map_sha256,
+    )
+
+
 def build_candidate_capacity(
     *,
     candidate_id: str,
