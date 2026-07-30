@@ -12,6 +12,7 @@ import shutil
 import statistics
 import subprocess
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
 from typing import Any, Collection, Literal, Mapping, Sequence
@@ -228,7 +229,15 @@ from .sequence_optimizer import (
     SemanticRhythmSpec,
     SequenceOption,
     RuntimeSegmentTiming,
+    RoundRobinFrontierAttempt,
+    RoundRobinFrontierAttemptResult,
+    RoundRobinFrontierBeat,
+    RoundRobinFrontierCandidate,
+    RoundRobinFrontierState,
     build_resolved_timeline,
+    initialize_round_robin_frontier,
+    next_round_robin_frontier_attempt,
+    record_round_robin_frontier_attempt,
     reconcile_runtime_sequence_timing,
     optimize_sequence,
     optimize_pre_render_candidate_route,
@@ -268,6 +277,287 @@ class CandidateKnownInfeasible(ValueError):
 
 class FeatureCutSystemFailure(RuntimeError):
     """A wiring, artifact, tool, or invariant failure that stops the run."""
+
+
+def _run_persisted_production_frontier(
+    *,
+    state_path: Path,
+    beats: Sequence[RoundRobinFrontierBeat] | None,
+    local_preflight: Callable[[RoundRobinFrontierAttempt], None],
+    exact_event: Callable[[RoundRobinFrontierAttempt], None],
+    grounding: Callable[[RoundRobinFrontierAttempt], None],
+    on_frontier_frozen: (
+        Callable[[RoundRobinFrontierState, Mapping[str, str]], None] | None
+    ) = None,
+) -> Mapping[str, str]:
+    """Drive one persisted production frontier without doing media work.
+
+    The callbacks deliberately receive only the scheduler's admitted attempt.
+    Candidate-specific infeasibility advances that candidate; every other
+    exception stops immediately with the last completed state still durable.
+    Rendering belongs in ``on_frontier_frozen`` so it cannot run while any
+    beat still has frontier work.
+    """
+
+    if state_path.is_file():
+        state = RoundRobinFrontierState.model_validate(read_json(state_path))
+        if beats is not None:
+            requested = initialize_round_robin_frontier(beats)
+            persisted_specs = tuple(row.beat for row in state.beats)
+            requested_specs = tuple(row.beat for row in requested.beats)
+            if persisted_specs != requested_specs:
+                raise FeatureCutSystemFailure(
+                    "persisted production frontier does not match requested "
+                    "beat and candidate bindings"
+                )
+    else:
+        if beats is None:
+            raise FeatureCutSystemFailure(
+                "production frontier cannot start without beat bindings"
+            )
+        state = initialize_round_robin_frontier(beats)
+        write_json(state_path, state)
+
+    callbacks = {
+        "local_preflight": local_preflight,
+        "exact_event": exact_event,
+        "grounding": grounding,
+    }
+    pass_outcomes = {
+        "local_preflight": "local_preflight_passed",
+        "exact_event": "exact_event_passed",
+        "grounding": "grounding_accepted",
+    }
+    failure_outcomes = {
+        "local_preflight": "local_preflight_failed",
+        "exact_event": "exact_event_failed",
+        "grounding": "grounding_failed",
+    }
+
+    while (
+        attempt := next_round_robin_frontier_attempt(state)
+    ) is not None:
+        try:
+            callbacks[attempt.stage](attempt)
+            outcome = pass_outcomes[attempt.stage]
+            decision_codes = (f"{attempt.stage}_passed",)
+        except CandidateKnownInfeasible as error:
+            outcome = failure_outcomes[attempt.stage]
+            decision_codes = (
+                f"{attempt.stage}_candidate_known_infeasible",
+                str(error),
+            )
+        except Exception as error:
+            raise FeatureCutSystemFailure(
+                "production frontier stopped on a non-candidate system "
+                f"failure at {attempt.beat_id}/{attempt.candidate_id}/"
+                f"{attempt.stage}: {type(error).__name__}:{error}"
+            ) from error
+
+        state = record_round_robin_frontier_attempt(
+            state,
+            RoundRobinFrontierAttemptResult(
+                attempt=attempt,
+                outcome=outcome,
+                decision_codes=decision_codes,
+            ),
+        )
+        write_json(state_path, state)
+
+    accepted = {
+        row.beat.beat_id: row.accepted_candidate_id
+        for row in state.beats
+        if (
+            row.status == "accepted"
+            and row.accepted_candidate_id is not None
+        )
+    }
+    if on_frontier_frozen is not None:
+        on_frontier_frozen(state, accepted)
+    return accepted
+
+
+def _frontier_stage_binding_sha256(
+    *,
+    beat_id: str,
+    candidate_id: str,
+    stage: str,
+    dependency_hashes: Sequence[str],
+    policy_reference: str,
+    route_sha256: str,
+) -> str:
+    """Bind one resumable frontier stage to immutable production inputs."""
+
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "contract_version": "vertical-frontier-stage-binding-v1",
+                "beat_id": beat_id,
+                "candidate_id": candidate_id,
+                "stage": stage,
+                "dependency_hashes": list(dependency_hashes),
+                "policy_reference": policy_reference,
+                "route_sha256": route_sha256,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _load_or_create_frontier_stage_artifact(
+    *,
+    artifact_path: Path,
+    beat_id: str,
+    candidate_id: str,
+    stage: str,
+    dependency_hashes: Sequence[str],
+    policy_reference: str,
+    route_sha256: str,
+    producer: Callable[[], Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Persist a callback result before advancing scheduler state.
+
+    A process may die after a paid provider response but before the frontier
+    cursor advances.  The stage artifact is therefore the callback's durable
+    commit point.  Resume validates every immutable dependency and returns the
+    saved payload without invoking ``producer`` again.
+    """
+
+    binding_sha256 = _frontier_stage_binding_sha256(
+        beat_id=beat_id,
+        candidate_id=candidate_id,
+        stage=stage,
+        dependency_hashes=dependency_hashes,
+        policy_reference=policy_reference,
+        route_sha256=route_sha256,
+    )
+    if artifact_path.is_file():
+        saved = read_json(artifact_path)
+        if (
+            saved.get("contract_version")
+            != "vertical-frontier-stage-artifact-v1"
+            or saved.get("beat_id") != beat_id
+            or saved.get("candidate_id") != candidate_id
+            or saved.get("stage") != stage
+            or saved.get("binding_sha256") != binding_sha256
+        ):
+            raise FeatureCutSystemFailure(
+                "persisted vertical frontier stage artifact has stale or "
+                "tampered bindings"
+            )
+        payload = saved.get("payload")
+        if not isinstance(payload, Mapping):
+            raise FeatureCutSystemFailure(
+                "persisted vertical frontier stage artifact has no payload"
+            )
+        expected_definition = hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in saved.items()
+                    if key not in {"definition_sha256", "generated_at"}
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if saved.get("definition_sha256") != expected_definition:
+            raise FeatureCutSystemFailure(
+                "persisted vertical frontier stage artifact hash changed"
+            )
+        return dict(payload)
+
+    payload = dict(producer())
+    artifact = {
+        "contract_version": "vertical-frontier-stage-artifact-v1",
+        "beat_id": beat_id,
+        "candidate_id": candidate_id,
+        "stage": stage,
+        "binding_sha256": binding_sha256,
+        "dependency_hashes": list(dependency_hashes),
+        "policy_reference": policy_reference,
+        "route_sha256": route_sha256,
+        "payload": payload,
+    }
+    artifact["definition_sha256"] = hashlib.sha256(
+        json.dumps(
+            artifact,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    artifact["generated_at"] = utc_now()
+    write_json(artifact_path, artifact)
+    return payload
+
+
+def _validate_frozen_vertical_render_selection(
+    *,
+    frontier_root: Path,
+    feature_id: str,
+    candidate_id: str,
+) -> Mapping[str, Any]:
+    """Prove that rendering consumes the exact frozen stage artifacts."""
+
+    selection = read_json(frontier_root / "selection.json")
+    definition = dict(selection)
+    saved_definition_sha256 = definition.pop(
+        "definition_sha256",
+        None,
+    )
+    state = RoundRobinFrontierState.model_validate(
+        read_json(frontier_root / "state.json")
+    )
+    candidate_binding = selection.get(
+        "selected_candidates",
+        {},
+    ).get(feature_id, {})
+    candidate_root = frontier_root / feature_id / candidate_id
+    finalized_path = candidate_root / "finalized.json"
+    finalized = (
+        read_json(finalized_path)
+        if finalized_path.is_file()
+        else {}
+    )
+    finalized_definition = dict(finalized)
+    finalized_saved_sha256 = finalized_definition.pop(
+        "definition_sha256",
+        None,
+    )
+    finalized_definition.pop("generated_at", None)
+    finalized_dependencies = finalized.get("dependency_hashes", ())
+    invalid = (
+        saved_definition_sha256 != _stable_fingerprint(definition)
+        or not selection.get("all_beats_resolved")
+        or not selection.get("render_permitted")
+        or selection.get("selected_candidate_ids", {}).get(feature_id)
+        != candidate_id
+        or candidate_binding.get("local_artifact_sha256")
+        != sha256_file(candidate_root / "local.json")
+        or candidate_binding.get("exact_artifact_sha256")
+        != sha256_file(candidate_root / "exact.json")
+        or candidate_binding.get("geometry_artifact_sha256")
+        != sha256_file(candidate_root / "geometry.json")
+        or finalized.get("stage") != "finalize"
+        or finalized_saved_sha256
+        != _stable_fingerprint(finalized_definition)
+        or len(finalized_dependencies) != 3
+        or finalized_dependencies[0]
+        != sha256_file(frontier_root / "selection.json")
+        or finalized_dependencies[1]
+        != sha256_file(candidate_root / "geometry.json")
+        or next_round_robin_frontier_attempt(state) is not None
+    )
+    if invalid:
+        raise FeatureCutSystemFailure(
+            "vertical render attempted before the production frontier "
+            "selection was completely frozen"
+        )
+    return selection
 
 
 def _require_candidate_scoped_failure(error: Exception) -> None:
@@ -13972,6 +14262,491 @@ def _resolve_selected_window_grouped_exact_event_locks(
     )
 
 
+def _prepare_autonomous_vertical_candidate(
+    *,
+    selected: FeatureChapterSelect,
+    brief_chapter: FeatureChapterBrief,
+    option_data: Mapping[str, Any],
+    frames: Mapping[str, RushFrame],
+    clips: Mapping[str, RushClip],
+    chapter_duration_seconds: float,
+    shot_cache: dict[str, list[tuple[int, int, str]]],
+    shots_dir: Path,
+    scdet_threshold: float,
+    trim_decisions: Sequence[tuple[Path, TrimIntentDecision]],
+    quality_maps: Sequence[tuple[Path, ShotQualityMap]],
+    editorial_contracts: Sequence[EditorialBeatContract],
+    evidence_events: Mapping[tuple[str, str], Mapping[str, Any]],
+    source_audio_cache: dict[str, bool],
+    source_media_cache: dict[str, MediaInfo],
+    output_dir: Path,
+    policy: AutonomousEditPolicy,
+) -> Mapping[str, Any]:
+    """Complete every zero-paid vertical gate and persistable intent binding."""
+
+    candidate_id = str(option_data["candidate_id"])
+    frame_id = str(option_data["frame_id"])
+    try:
+        frame = frames[frame_id]
+        clip = clips[frame.clip_id]
+    except KeyError as error:
+        raise CandidateKnownInfeasible(
+            f"candidate references unknown rush object: {error}"
+        ) from error
+    if not _candidate_asset_reference_matches(
+        option_data.get("source_asset_id"),
+        clip,
+    ):
+        raise CandidateKnownInfeasible(
+            "vertical candidate source asset differs from its frame"
+        )
+    hard_contracts = tuple(
+        contract
+        for contract in editorial_contracts
+        if contract.feature_id == selected.feature_id
+        and contract.priority == "hard"
+    )
+    try:
+        _select_runtime_candidate_fulfillments(
+            hard_contracts,
+            option=option_data,
+            evidence_events=evidence_events,
+        )
+    except ValueError as error:
+        raise CandidateKnownInfeasible(
+            "candidate is below the hard fulfillment minimum"
+        ) from error
+
+    if clip.sha256 not in source_audio_cache:
+        source_audio_cache[clip.sha256] = has_audio_stream(Path(clip.path))
+    if clip.sha256 not in source_media_cache:
+        source_media_cache[clip.sha256] = probe_video(Path(clip.path))
+    media = source_media_cache[clip.sha256]
+    display_sar = (
+        media.video.display_sample_aspect_ratio.numerator
+        / media.video.display_sample_aspect_ratio.denominator
+    )
+    try:
+        start_ms, end_ms, shot_id, trim = (
+            _chapter_bounds_with_approved_trim(
+                frame,
+                clip,
+                chapter_duration_seconds,
+                shot_cache,
+                shots_dir,
+                scdet_threshold,
+                trim_decisions,
+                expected_event_id=option_data.get("event_id"),
+                quality_maps=quality_maps,
+                minimum_duration_seconds=(
+                    selected.attention_observation.minimum_dwell_seconds
+                    if selected.attention_observation is not None
+                    else None
+                ),
+                fail_on_quality_human_review=(
+                    policy.execution_profile == "autonomous_strict"
+                ),
+            )
+        )
+    except ValueError as error:
+        raise CandidateKnownInfeasible(str(error)) from error
+
+    source_motion = _maskless_source_motion_preflight(
+        source_path=Path(clip.path),
+        source_asset_id=media.asset_id,
+        window_start_ms=start_ms,
+        window_end_ms=end_ms,
+        output_dir=(
+            output_dir
+            / "candidate-preflight"
+            / selected.feature_id
+            / candidate_id
+            / "source-camera-motion"
+        ),
+    )
+    regions, target = _resolve_vertical_candidate_intent(
+        option_regions=option_data.get("regions", []),
+        option_target_description=option_data.get("target_description"),
+        selected_target_description=selected.vertical_target_description,
+        brief_primary_target_description=(
+            brief_chapter.vertical_primary_target_description
+        ),
+        brief_regions=brief_chapter.vertical_regions,
+        inherit_reviewed_brief_intent=False,
+    )
+    regions = _bind_regions_to_editorial_relation(
+        regions,
+        [
+            contract
+            for contract in editorial_contracts
+            if contract.feature_id == selected.feature_id
+        ],
+    )
+    crop_mode = str(
+        option_data.get("crop_mode", brief_chapter.vertical_crop_mode)
+    )
+    camera_phases, camera_phase_origin = _resolve_vertical_camera_phases(
+        option_data=dict(option_data),
+        reviewed_phases=brief_chapter.vertical_camera_phases,
+        regions=regions,
+        allow_controlled_clip=False,
+    )
+    candidate_root = (
+        output_dir
+        / "geometry"
+        / selected.feature_id
+        / "vertical"
+        / f"candidate-{int(option_data['rank']):02d}-{candidate_id}"
+    )
+    query_lock = _load_or_create_feature_candidate_query_lock_v2(
+        _feature_vertical_candidate_from_runtime_option(option_data),
+        feature_id=selected.feature_id,
+        output_dir=candidate_root,
+    )
+    return {
+        "option": dict(option_data),
+        "frame": frame.model_dump(mode="json"),
+        "clip": clip.model_dump(mode="json"),
+        "source_has_audio": source_audio_cache[clip.sha256],
+        "media_asset_id": media.asset_id,
+        "display_sample_aspect_ratio": display_sar,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "shot_id": shot_id,
+        "trim": dict(trim),
+        "regions": [
+            region.model_dump(mode="json") for region in regions
+        ],
+        "target": target,
+        "crop_mode": crop_mode,
+        "camera_phases": [
+            phase.model_dump(mode="json") for phase in camera_phases
+        ],
+        "camera_phase_origin": camera_phase_origin,
+        "query_lock": query_lock.model_dump(mode="json"),
+        "query_lock_definition_sha256": query_lock.definition_sha256(),
+        "candidate_root": str(candidate_root.resolve()),
+        "source_motion_definition_sha256": (
+            source_motion.definition_sha256
+        ),
+    }
+
+
+def _resolve_autonomous_vertical_candidate_exact(
+    *,
+    client: GeminiLabClient,
+    feature_id: str,
+    local_artifact: Mapping[str, Any],
+    editorial_contracts: Sequence[EditorialBeatContract],
+    evidence_events: Mapping[tuple[str, str], Mapping[str, Any]],
+    editorial_beat_contracts_path: Path,
+    output_dir: Path,
+    policy: AutonomousEditPolicy,
+) -> Mapping[str, Any]:
+    """Resolve grouped events and AUTO_POLICY trim exactly once per window."""
+
+    option = dict(local_artifact["option"])
+    candidate_id = str(option["candidate_id"])
+    frame = RushFrame.model_validate(local_artifact["frame"])
+    clip = RushClip.model_validate(local_artifact["clip"])
+    regions = tuple(
+        FramingRegionIntent.model_validate(row)
+        for row in local_artifact["regions"]
+    )
+    contracts = tuple(
+        contract
+        for contract in editorial_contracts
+        if contract.feature_id == feature_id
+    )
+    query_lock = EvidenceQueryLockV2.model_validate(
+        local_artifact["query_lock"]
+    )
+    required_target_ids = tuple(
+        dict.fromkeys(
+            str(region.entity_id or region.region_id)
+            for region in regions
+            if region.role == "required"
+        )
+    ) or tuple(
+        dict.fromkeys(
+            target_id
+            for contract in contracts
+            for target_id in contract.required_target_ids
+        )
+    )
+    start_ms = int(local_artifact["start_ms"])
+    end_ms = int(local_artifact["end_ms"])
+    if contracts:
+        (
+            bound_contracts,
+            locks,
+            dense_catalog,
+            fulfillments,
+        ) = _resolve_selected_window_grouped_exact_event_locks(
+            client=client,
+            feature_id=feature_id,
+            candidate_id=candidate_id,
+            source_path=Path(clip.path),
+            source_sha256=clip.sha256,
+            source_asset_id=str(local_artifact["media_asset_id"]),
+            start_ms=start_ms,
+            end_ms=end_ms,
+            selected_option=option,
+            contracts=contracts,
+            evidence_events=evidence_events,
+            evidence_query_lock_sha256=(
+                query_lock.definition_sha256()
+            ),
+            required_target_ids=required_target_ids,
+            editorial_beat_contracts_path=editorial_beat_contracts_path,
+            output_dir=output_dir,
+        )
+    else:
+        dense_root = output_dir / "exact-events" / feature_id / candidate_id
+        dense_catalog_path = dense_root / "dense-catalog.json"
+        if dense_catalog_path.is_file():
+            dense_catalog = DenseFrameCatalog.model_validate(
+                read_json(dense_catalog_path)
+            )
+        else:
+            dense_catalog = create_dense_window_catalog(
+                Path(clip.path),
+                str(local_artifact["media_asset_id"]),
+                feature_id,
+                dense_root,
+                sampling_fps=8.0,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+        bound_contracts = ()
+        locks = ()
+        fulfillments = ()
+    dense_catalog_path = (
+        output_dir
+        / "exact-events"
+        / feature_id
+        / candidate_id
+        / "dense-catalog.json"
+    )
+    trim, authority = _authorize_runtime_selected_window_trim(
+        policy=policy,
+        feature_id=feature_id,
+        shot_id=str(local_artifact["shot_id"]),
+        source_path=Path(clip.path),
+        source_sha256=clip.sha256,
+        source_asset_id=str(local_artifact["media_asset_id"]),
+        start_ms=start_ms,
+        end_ms=end_ms,
+        trim=dict(local_artifact["trim"]),
+        locks=locks,
+        dense_catalog=dense_catalog,
+        dense_catalog_path=dense_catalog_path,
+        output_dir=output_dir,
+    )
+    grounding_frame = _grounding_anchor_from_exact_event_locks(
+        frame,
+        locks=locks,
+        dense_catalog=dense_catalog,
+    )
+    return {
+        "local_artifact_definition_sha256": str(
+            local_artifact.get("definition_sha256", "")
+        ),
+        "bound_contracts": [
+            contract.model_dump(mode="json")
+            for contract in bound_contracts
+        ],
+        "locks": [lock.model_dump(mode="json") for lock in locks],
+        "fulfillments": [
+            fulfillment.model_dump(mode="json")
+            for fulfillment in fulfillments
+        ],
+        "dense_catalog_path": str(dense_catalog_path.resolve()),
+        "dense_catalog_sha256": sha256_file(dense_catalog_path),
+        "trim": dict(trim),
+        "authorized_trim": authority.model_dump(mode="json"),
+        "grounding_frame": grounding_frame.model_dump(mode="json"),
+    }
+
+
+def _compile_autonomous_vertical_candidate_geometry(
+    *,
+    client: GeminiLabClient,
+    feature_id: str,
+    local_artifact: Mapping[str, Any],
+    exact_artifact: Mapping[str, Any],
+    brief_chapter: FeatureChapterBrief,
+    checkpoint_path: Path,
+    grounding_prompt: str,
+    analysis_fps: float,
+    scdet_threshold: float,
+    track_cache: dict[
+        tuple[str, str, int, int],
+        tuple[GroundingProposal, SegmentationTrack, Path],
+    ],
+    policy: AutonomousEditPolicy,
+    semantic_beat: SemanticBeat | None,
+    titles_rendered: bool,
+    semantic_negotiation_state: dict[str, int],
+) -> Mapping[str, Any]:
+    """Compile and audit one candidate without rendering any segment."""
+
+    option = dict(local_artifact["option"])
+    clip = RushClip.model_validate(local_artifact["clip"])
+    frame = RushFrame.model_validate(exact_artifact["grounding_frame"])
+    regions = tuple(
+        FramingRegionIntent.model_validate(row)
+        for row in local_artifact["regions"]
+    )
+    phases = tuple(
+        VerticalVirtualCameraPhase.model_validate(row)
+        for row in local_artifact["camera_phases"]
+    )
+    query_lock = EvidenceQueryLockV2.model_validate(
+        local_artifact["query_lock"]
+    )
+    candidate_root = Path(str(local_artifact["candidate_root"]))
+    try:
+        (
+            filter_graph,
+            geometry,
+            debug_paths,
+            track_fingerprint,
+        ) = _vertical_candidate_geometry(
+            client=client,
+            clip=clip,
+            frame=frame,
+            start_ms=int(local_artifact["start_ms"]),
+            end_ms=int(local_artifact["end_ms"]),
+            feature_id=feature_id,
+            event_description=(
+                brief_chapter.title
+                + "；"
+                + str(option["observed_visual_evidence"])
+            ),
+            target_description=(
+                str(local_artifact["target"])
+                if local_artifact.get("target")
+                else None
+            ),
+            regions=regions,
+            camera_phases=phases,
+            camera_phase_origin=str(
+                local_artifact["camera_phase_origin"]
+            ),
+            crop_mode=str(local_artifact["crop_mode"]),
+            overflow_policy="preserve_all",
+            edge_priority="balanced",
+            fallback_strategy="center_crop",
+            checkpoint_path=checkpoint_path,
+            grounding_prompt=grounding_prompt,
+            output_dir=candidate_root,
+            analysis_fps=analysis_fps,
+            scdet_threshold=scdet_threshold,
+            display_sample_aspect_ratio=float(
+                local_artifact["display_sample_aspect_ratio"]
+            ),
+            track_cache=track_cache,
+            query_lock_v2=query_lock,
+            allow_review_sequential_fallback=False,
+            max_identity_model_checks=0,
+            autonomous_policy=policy,
+            presentation_preference=str(
+                option.get(
+                    "presentation_preference",
+                    "tracked_full_bleed",
+                )
+            ),
+            relation_mode=str(
+                option.get("coverage_mode", "simultaneous")
+            ),
+            physical_scale_comparison=bool(
+                option.get("physical_scale_comparison", False)
+            ),
+            semantic_negotiation_state=semantic_negotiation_state,
+            semantic_beat=semantic_beat,
+        )
+    except CandidateKnownInfeasible as error:
+        return {
+            "classification": "rejected",
+            "reason": str(error),
+            "failure_codes": [
+                failure.value
+                for failure in _failure_codes_from_geometry_error(error)
+            ],
+            "semantic_negotiation_global_count": (
+                semantic_negotiation_state.get("global", 0)
+            ),
+        }
+    except ValueError as error:
+        raise FeatureCutSystemFailure(
+            "untyped vertical geometry failure cannot authorize a paid "
+            "Top-K retry: " + str(error)
+        ) from error
+
+    preflight, expected_fingerprint = _vertical_candidate_preflight(
+        candidate_id=str(option["candidate_id"]),
+        rank=int(option["rank"]),
+        confidence=float(option["confidence"]),
+        source_sha256=clip.sha256,
+        filter_graph=filter_graph,
+        geometry=geometry,
+        regions=regions,
+        track_fingerprint=track_fingerprint,
+        titles_rendered=titles_rendered,
+    )
+    audit = audit_auto_bounded_clip(
+        preflight,
+        AutoReframePolicy(
+            max_candidates=policy.recovery.max_candidate_attempts_per_beat,
+            require_semantic_checkpoints_for_tracked_crop=False,
+            soft_extent_below_minimum_is_failure=False,
+        ),
+        expected_geometry_fingerprint=expected_fingerprint,
+    )
+    geometry["auto_bounded_clip_audit"] = audit.model_dump(mode="json")
+    if not audit.approved:
+        return {
+            "classification": "rejected",
+            "reason": "geometry_hard_gate_failed",
+            "failure_codes": [
+                failure.value for failure in audit.failure_codes
+            ],
+            "geometry": geometry,
+            "semantic_negotiation_global_count": (
+                semantic_negotiation_state.get("global", 0)
+            ),
+        }
+    applied = str(
+        geometry.get("applied_strategy")
+        or geometry.get("base_presentation_strategy")
+        or ""
+    )
+    classification = (
+        "deferred_panel"
+        if applied == "two_panel_layout"
+        else "deferred_fit"
+        if applied
+        in {
+            "solid_matte_fit",
+            "required_scope_solid_fit",
+            "fit_with_solid_matte",
+        }
+        else "natural_accepted"
+    )
+    return {
+        "classification": classification,
+        "filter_graph": filter_graph,
+        "geometry": geometry,
+        "debug_paths": [str(path.resolve()) for path in debug_paths],
+        "track_fingerprint": track_fingerprint,
+        "failure_codes": [],
+        "semantic_negotiation_global_count": (
+            semantic_negotiation_state.get("global", 0)
+        ),
+    }
+
+
 def _grounding_anchor_from_exact_event_locks(
     frame: RushFrame,
     *,
@@ -18500,6 +19275,769 @@ def _run_feature_cut_experiment_impl(
             if autonomous_profile
             else {}
         )
+        autonomous_vertical_frontier_selected_ids: dict[str, str] = {}
+        if (
+            autonomous_profile
+            and render_vertical
+            and not human_reframe_policy_requested
+            and pre_render_candidate_route is not None
+            and autonomous_policy is not None
+            and editorial_beat_contracts_path is not None
+        ):
+            frontier_root = output_dir / "production-frontier" / "9x16"
+            route_sha256 = sha256_file(
+                pre_render_candidate_route_path
+            )
+            local_payloads: dict[tuple[str, str], Mapping[str, Any]] = {}
+            exact_payloads: dict[tuple[str, str], Mapping[str, Any]] = {}
+            geometry_payloads: dict[
+                tuple[str, str], Mapping[str, Any]
+            ] = {}
+            frontier_accepted_source_uses: list[dict[str, Any]] = []
+            deferred_payloads: dict[
+                str, list[tuple[int, str, Mapping[str, Any]]]
+            ] = {}
+            frontier_beats: list[RoundRobinFrontierBeat] = []
+
+            # Round zero is deliberately complete before the scheduler may
+            # admit a single paid exact-event or grounding operation.
+            for story_order, frontier_selected in enumerate(plan.chapters):
+                frontier_feature_id = frontier_selected.feature_id
+                if frontier_selected.evidence_status == "not_found":
+                    missing_contracts = tuple(
+                        contract
+                        for contract in editorial_templates
+                        if contract.feature_id == frontier_feature_id
+                    )
+                    if (
+                        not missing_contracts
+                        or any(
+                            contract.priority in {"hard", "preferred"}
+                            for contract in missing_contracts
+                        )
+                        or not autonomous_policy.editorial
+                        .allow_optional_beat_omission
+                    ):
+                        raise CandidateKnownInfeasible(
+                            "not-found autonomous beat is not eligible for "
+                            f"optional omission: {frontier_feature_id}"
+                        )
+                    continue
+                frontier_brief_chapter = brief_by_id[frontier_feature_id]
+                frontier_options = _vertical_runtime_candidate_options(
+                    frontier_selected,
+                    human_policy_binding_present=False,
+                    candidate_evidence_events=candidate_evidence_events,
+                    max_candidates=(
+                        autonomous_policy.recovery
+                        .max_candidate_attempts_per_beat
+                    ),
+                )
+                frontier_options = _apply_pre_render_candidate_route(
+                    frontier_options,
+                    selected_candidate_id=(
+                        pre_render_candidate_id_by_feature.get(
+                            frontier_feature_id
+                        )
+                    ),
+                    ordered_candidate_ids=(
+                        pre_render_candidate_order_by_feature.get(
+                            frontier_feature_id,
+                            (),
+                        )
+                    ),
+                    sequence_bindings=(
+                        pre_render_candidate_bindings_by_feature.get(
+                            frontier_feature_id,
+                            {},
+                        )
+                    ),
+                )
+                viable_candidates = []
+                local_failures = []
+                contracts_for_feature = tuple(
+                    contract
+                    for contract in editorial_templates
+                    if contract.feature_id == frontier_feature_id
+                )
+                requires_paid_exact = any(
+                    contract.visual_events
+                    for contract in contracts_for_feature
+                )
+                for candidate_order, frontier_option in enumerate(
+                    frontier_options
+                ):
+                    frontier_candidate_id = str(
+                        frontier_option["candidate_id"]
+                    )
+                    frontier_frame = frames[
+                        str(frontier_option["frame_id"])
+                    ]
+                    frontier_clip = clips[frontier_frame.clip_id]
+                    future_reservation = (
+                        exact_event_source_reservations.get(
+                            frontier_clip.sha256
+                        )
+                    )
+                    if (
+                        future_reservation is not None
+                        and future_reservation[0] > story_order
+                        and candidate_order + 1 < len(frontier_options)
+                    ):
+                        local_failures.append(
+                            {
+                                "candidate_id": frontier_candidate_id,
+                                "candidate_order": candidate_order,
+                                "reason": (
+                                    "source_reserved_for_future_exact_event:"
+                                    + future_reservation[1]
+                                ),
+                                "paid_calls_added": 0,
+                            }
+                        )
+                        continue
+                    local_path = (
+                        frontier_root
+                        / frontier_feature_id
+                        / frontier_candidate_id
+                        / "local.json"
+                    )
+                    option_sha256 = _stable_fingerprint(
+                        dict(frontier_option)
+                    )
+                    try:
+                        local_payload = (
+                            _load_or_create_frontier_stage_artifact(
+                                artifact_path=local_path,
+                                beat_id=frontier_feature_id,
+                                candidate_id=frontier_candidate_id,
+                                stage="local_preflight",
+                                dependency_hashes=(
+                                    sha256_file(plan_path),
+                                    option_sha256,
+                                ),
+                                policy_reference=(
+                                    autonomous_policy.policy_reference
+                                ),
+                                route_sha256=route_sha256,
+                                producer=lambda selected=frontier_selected,
+                                chapter=frontier_brief_chapter,
+                                option=dict(frontier_option): (
+                                    _prepare_autonomous_vertical_candidate(
+                                        selected=selected,
+                                        brief_chapter=chapter,
+                                        option_data=option,
+                                        frames=frames,
+                                        clips=clips,
+                                        chapter_duration_seconds=(
+                                            chapter_durations[
+                                                selected.feature_id
+                                            ]
+                                        ),
+                                        shot_cache=shot_cache,
+                                        shots_dir=shots_dir,
+                                        scdet_threshold=scdet_threshold,
+                                        trim_decisions=trim_decisions,
+                                        quality_maps=shot_quality_maps,
+                                        editorial_contracts=(
+                                            editorial_templates
+                                        ),
+                                        evidence_events=(
+                                            candidate_evidence_events
+                                        ),
+                                        source_audio_cache=(
+                                            source_audio_cache
+                                        ),
+                                        source_media_cache=(
+                                            source_media_cache
+                                        ),
+                                        output_dir=output_dir,
+                                        policy=autonomous_policy,
+                                    )
+                                ),
+                            )
+                        )
+                    except CandidateKnownInfeasible as error:
+                        local_failures.append(
+                            {
+                                "candidate_id": frontier_candidate_id,
+                                "candidate_order": candidate_order,
+                                "reason": str(error),
+                                "paid_calls_added": 0,
+                            }
+                        )
+                        continue
+                    local_payloads[
+                        (frontier_feature_id, frontier_candidate_id)
+                    ] = local_payload
+                    viable_candidates.append(
+                        RoundRobinFrontierCandidate(
+                            beat_id=frontier_feature_id,
+                            candidate_id=frontier_candidate_id,
+                            candidate_order=candidate_order,
+                            requires_exact_event=requires_paid_exact,
+                        )
+                    )
+                write_json(
+                    frontier_root
+                    / frontier_feature_id
+                    / "local-preflight-summary.json",
+                    {
+                        "contract_version": (
+                            "vertical-frontier-local-summary-v1"
+                        ),
+                        "feature_id": frontier_feature_id,
+                        "viable_candidate_ids": [
+                            candidate.candidate_id
+                            for candidate in viable_candidates
+                        ],
+                        "failures": local_failures,
+                        "all_candidates_checked_before_paid_work": True,
+                    },
+                )
+                if not viable_candidates:
+                    raise CandidateKnownInfeasible(
+                        "all autonomous 9:16 candidates failed zero-paid "
+                        f"preflight for {frontier_feature_id}"
+                    )
+                frontier_beats.append(
+                    RoundRobinFrontierBeat(
+                        beat_id=frontier_feature_id,
+                        story_order=story_order,
+                        candidates=tuple(viable_candidates),
+                    )
+                )
+
+            def frontier_local_callback(
+                frontier_attempt: RoundRobinFrontierAttempt,
+            ) -> None:
+                if (
+                    frontier_attempt.beat_id,
+                    frontier_attempt.candidate_id,
+                ) not in local_payloads:
+                    raise FeatureCutSystemFailure(
+                        "frontier admitted a candidate without local artifact"
+                    )
+
+            def frontier_exact_callback(
+                frontier_attempt: RoundRobinFrontierAttempt,
+            ) -> None:
+                key = (
+                    frontier_attempt.beat_id,
+                    frontier_attempt.candidate_id,
+                )
+                local_path = (
+                    frontier_root
+                    / frontier_attempt.beat_id
+                    / frontier_attempt.candidate_id
+                    / "local.json"
+                )
+                exact_path = local_path.with_name("exact.json")
+                exact_payloads[key] = (
+                    _load_or_create_frontier_stage_artifact(
+                        artifact_path=exact_path,
+                        beat_id=frontier_attempt.beat_id,
+                        candidate_id=frontier_attempt.candidate_id,
+                        stage="exact_event",
+                        dependency_hashes=(sha256_file(local_path),),
+                        policy_reference=(
+                            autonomous_policy.policy_reference
+                        ),
+                        route_sha256=route_sha256,
+                        producer=lambda: (
+                            _resolve_autonomous_vertical_candidate_exact(
+                                client=client,
+                                feature_id=frontier_attempt.beat_id,
+                                local_artifact=local_payloads[key],
+                                editorial_contracts=editorial_templates,
+                                evidence_events=candidate_evidence_events,
+                                editorial_beat_contracts_path=(
+                                    editorial_beat_contracts_path
+                                ),
+                                output_dir=output_dir,
+                                policy=autonomous_policy,
+                            )
+                        ),
+                    )
+                )
+
+            def frontier_grounding_callback(
+                frontier_attempt: RoundRobinFrontierAttempt,
+            ) -> None:
+                key = (
+                    frontier_attempt.beat_id,
+                    frontier_attempt.candidate_id,
+                )
+                exact_path = (
+                    frontier_root
+                    / frontier_attempt.beat_id
+                    / frontier_attempt.candidate_id
+                    / "exact.json"
+                )
+                if key not in exact_payloads:
+                    if exact_path.is_file():
+                        exact_payloads[key] = read_json(
+                            exact_path
+                        )["payload"]
+                    else:
+                        local_path = exact_path.with_name("local.json")
+                        exact_payloads[key] = (
+                            _load_or_create_frontier_stage_artifact(
+                                artifact_path=exact_path,
+                                beat_id=frontier_attempt.beat_id,
+                                candidate_id=(
+                                    frontier_attempt.candidate_id
+                                ),
+                                stage="exact_event",
+                                dependency_hashes=(
+                                    sha256_file(local_path),
+                                ),
+                                policy_reference=(
+                                    autonomous_policy.policy_reference
+                                ),
+                                route_sha256=route_sha256,
+                                producer=lambda: (
+                                    _resolve_autonomous_vertical_candidate_exact(
+                                        client=client,
+                                        feature_id=(
+                                            frontier_attempt.beat_id
+                                        ),
+                                        local_artifact=(
+                                            local_payloads[key]
+                                        ),
+                                        editorial_contracts=(
+                                            editorial_templates
+                                        ),
+                                        evidence_events=(
+                                            candidate_evidence_events
+                                        ),
+                                        editorial_beat_contracts_path=(
+                                            editorial_beat_contracts_path
+                                        ),
+                                        output_dir=output_dir,
+                                        policy=autonomous_policy,
+                                    )
+                                ),
+                            )
+                        )
+                selected_chapter = next(
+                    chapter
+                    for chapter in plan.chapters
+                    if chapter.feature_id == frontier_attempt.beat_id
+                )
+                local_for_attempt = local_payloads[key]
+                local_clip = RushClip.model_validate(
+                    local_for_attempt["clip"]
+                )
+                reuse_violation = _runtime_candidate_reuse_violation(
+                    selected_chapter,
+                    frontier_accepted_source_uses,
+                    source_clip_id=local_clip.clip_id,
+                    source_in_ms=int(local_for_attempt["start_ms"]),
+                    source_out_ms=int(local_for_attempt["end_ms"]),
+                    max_editorial_reprise_overlap_fraction=0.5,
+                    allowed_reuse_modes=(
+                        autonomous_policy.editorial.allow_source_reuse
+                    ),
+                )
+                if reuse_violation is not None:
+                    raise CandidateKnownInfeasible(
+                        "global source reuse preflight failed: "
+                        + str(reuse_violation["reason_code"])
+                    )
+                geometry_path = exact_path.with_name("geometry.json")
+                geometry_payload = (
+                    _load_or_create_frontier_stage_artifact(
+                        artifact_path=geometry_path,
+                        beat_id=frontier_attempt.beat_id,
+                        candidate_id=frontier_attempt.candidate_id,
+                        stage="grounding",
+                        dependency_hashes=(sha256_file(exact_path),),
+                        policy_reference=(
+                            autonomous_policy.policy_reference
+                        ),
+                        route_sha256=route_sha256,
+                        producer=lambda: (
+                            _compile_autonomous_vertical_candidate_geometry(
+                                client=client,
+                                feature_id=frontier_attempt.beat_id,
+                                local_artifact=local_payloads[key],
+                                exact_artifact=exact_payloads[key],
+                                brief_chapter=brief_by_id[
+                                    frontier_attempt.beat_id
+                                ],
+                                checkpoint_path=checkpoint_path,
+                                grounding_prompt=grounding_prompt,
+                                analysis_fps=sam_analysis_fps,
+                                scdet_threshold=scdet_threshold,
+                                track_cache=track_cache,
+                                policy=autonomous_policy,
+                                semantic_beat=(
+                                    _semantic_beat_for_runtime_candidate(
+                                        semantic_beat_by_id.get(
+                                            frontier_attempt.beat_id
+                                        ),
+                                        local_payloads[key]["option"],
+                                    )
+                                ),
+                                titles_rendered=(
+                                    brief.render_title_overlays
+                                ),
+                                semantic_negotiation_state=(
+                                    semantic_negotiation_state
+                                ),
+                            )
+                        ),
+                    )
+                )
+                geometry_payloads[key] = geometry_payload
+                classification = str(
+                    geometry_payload.get("classification")
+                )
+                if classification == "natural_accepted":
+                    frontier_accepted_source_uses.append(
+                        {
+                            "feature_id": frontier_attempt.beat_id,
+                            "source_clip_id": local_clip.clip_id,
+                            "source_in_ms": int(
+                                local_for_attempt["start_ms"]
+                            ),
+                            "source_out_ms": int(
+                                local_for_attempt["end_ms"]
+                            ),
+                        }
+                    )
+                    return
+                if classification in {
+                    "deferred_panel",
+                    "deferred_fit",
+                    "deferred_scope_fit",
+                }:
+                    deferred_payloads.setdefault(
+                        frontier_attempt.beat_id,
+                        [],
+                    ).append(
+                        (
+                            frontier_attempt.candidate_order,
+                            frontier_attempt.candidate_id,
+                            geometry_payload,
+                        )
+                    )
+                raise CandidateKnownInfeasible(
+                    str(
+                        geometry_payload.get("reason")
+                        or classification
+                        or "geometry rejected"
+                    )
+                )
+
+            frontier_state_path = frontier_root / "state.json"
+            persisted_semantic_count = 0
+            for persisted_beat in frontier_beats:
+                for persisted_candidate in persisted_beat.candidates:
+                    persisted_geometry_path = (
+                        frontier_root
+                        / persisted_beat.beat_id
+                        / persisted_candidate.candidate_id
+                        / "geometry.json"
+                    )
+                    if not persisted_geometry_path.is_file():
+                        continue
+                    persisted_geometry_payload = read_json(
+                        persisted_geometry_path
+                    ).get("payload", {})
+                    if isinstance(
+                        persisted_geometry_payload,
+                        Mapping,
+                    ):
+                        persisted_semantic_count = max(
+                            persisted_semantic_count,
+                            int(
+                                persisted_geometry_payload.get(
+                                    "semantic_negotiation_global_count",
+                                    0,
+                                )
+                            ),
+                        )
+            semantic_negotiation_state["global"] = max(
+                semantic_negotiation_state.get("global", 0),
+                persisted_semantic_count,
+            )
+            if frontier_state_path.is_file():
+                resumed_state = RoundRobinFrontierState.model_validate(
+                    read_json(frontier_state_path)
+                )
+                for resumed_beat in resumed_state.beats:
+                    resumed_candidate_id = (
+                        resumed_beat.accepted_candidate_id
+                    )
+                    if resumed_candidate_id is None:
+                        continue
+                    resumed_local = local_payloads[
+                        (
+                            resumed_beat.beat.beat_id,
+                            resumed_candidate_id,
+                        )
+                    ]
+                    resumed_clip = RushClip.model_validate(
+                        resumed_local["clip"]
+                    )
+                    frontier_accepted_source_uses.append(
+                        {
+                            "feature_id": resumed_beat.beat.beat_id,
+                            "source_clip_id": resumed_clip.clip_id,
+                            "source_in_ms": int(
+                                resumed_local["start_ms"]
+                            ),
+                            "source_out_ms": int(
+                                resumed_local["end_ms"]
+                            ),
+                        }
+                    )
+            naturally_accepted = _run_persisted_production_frontier(
+                state_path=frontier_state_path,
+                beats=tuple(frontier_beats),
+                local_preflight=frontier_local_callback,
+                exact_event=frontier_exact_callback,
+                grounding=frontier_grounding_callback,
+            )
+            autonomous_vertical_frontier_selected_ids.update(
+                naturally_accepted
+            )
+            frontier_state = RoundRobinFrontierState.model_validate(
+                read_json(frontier_state_path)
+            )
+            for beat_state in frontier_state.beats:
+                known_deferred_ids = {
+                    row[1]
+                    for row in deferred_payloads.get(
+                        beat_state.beat.beat_id,
+                        [],
+                    )
+                }
+                for candidate in beat_state.beat.candidates:
+                    if candidate.candidate_id in known_deferred_ids:
+                        continue
+                    geometry_path = (
+                        frontier_root
+                        / beat_state.beat.beat_id
+                        / candidate.candidate_id
+                        / "geometry.json"
+                    )
+                    if not geometry_path.is_file():
+                        continue
+                    saved_geometry = read_json(geometry_path)
+                    geometry_payload = saved_geometry.get("payload")
+                    if (
+                        isinstance(geometry_payload, Mapping)
+                        and geometry_payload.get("classification")
+                        in {
+                            "deferred_panel",
+                            "deferred_fit",
+                            "deferred_scope_fit",
+                        }
+                    ):
+                        deferred_payloads.setdefault(
+                            beat_state.beat.beat_id,
+                            [],
+                        ).append(
+                            (
+                                candidate.candidate_order,
+                                candidate.candidate_id,
+                                dict(geometry_payload),
+                            )
+                        )
+            planned_vertical_runtime_ms = max(
+                1,
+                round(sum(chapter_durations.values()) * 1000),
+            )
+            selected_panel_runtime_ms = 0
+            for beat_state in frontier_state.beats:
+                if beat_state.status == "accepted":
+                    continue
+                deferred = sorted(
+                    deferred_payloads.get(beat_state.beat.beat_id, []),
+                    key=lambda row: row[0],
+                )
+                deferred = [
+                    row
+                    for row in deferred
+                    if _runtime_candidate_reuse_violation(
+                        next(
+                            chapter
+                            for chapter in plan.chapters
+                            if chapter.feature_id
+                            == beat_state.beat.beat_id
+                        ),
+                        frontier_accepted_source_uses,
+                        source_clip_id=RushClip.model_validate(
+                            local_payloads[
+                                (
+                                    beat_state.beat.beat_id,
+                                    row[1],
+                                )
+                            ]["clip"]
+                        ).clip_id,
+                        source_in_ms=int(
+                            local_payloads[
+                                (
+                                    beat_state.beat.beat_id,
+                                    row[1],
+                                )
+                            ]["start_ms"]
+                        ),
+                        source_out_ms=int(
+                            local_payloads[
+                                (
+                                    beat_state.beat.beat_id,
+                                    row[1],
+                                )
+                            ]["end_ms"]
+                        ),
+                        max_editorial_reprise_overlap_fraction=0.5,
+                        allowed_reuse_modes=(
+                            autonomous_policy.editorial.allow_source_reuse
+                        ),
+                    )
+                    is None
+                ]
+                panel_candidate = next(
+                    (
+                        row
+                        for row in deferred
+                        if row[2].get("classification")
+                        == "deferred_panel"
+                        and autonomous_policy.presentation
+                        .allow_two_panel_layout
+                    ),
+                    None,
+                )
+                feature_runtime_ms = round(
+                    chapter_durations[beat_state.beat.beat_id] * 1000
+                )
+                panel_fraction_allowed = (
+                    selected_panel_runtime_ms + feature_runtime_ms
+                ) / planned_vertical_runtime_ms <= (
+                    autonomous_policy.presentation
+                    .max_panel_runtime_fraction
+                )
+                selected_deferred = (
+                    panel_candidate
+                    if panel_candidate is not None
+                    and panel_fraction_allowed
+                    else None
+                ) or next(
+                    (
+                        row
+                        for row in deferred
+                        if row[2].get("classification")
+                        in {"deferred_fit", "deferred_scope_fit"}
+                        and autonomous_policy.presentation
+                        .allow_solid_matte_fit
+                    ),
+                    None,
+                )
+                if selected_deferred is None:
+                    raise CandidateKnownInfeasible(
+                        "autonomous 9:16 frontier exhausted natural and "
+                        f"policy-authorized constructed options for "
+                        f"{beat_state.beat.beat_id}"
+                    )
+                autonomous_vertical_frontier_selected_ids[
+                    beat_state.beat.beat_id
+                ] = selected_deferred[1]
+                if (
+                    selected_deferred[2].get("classification")
+                    == "deferred_panel"
+                ):
+                    selected_panel_runtime_ms += feature_runtime_ms
+                selected_deferred_local = local_payloads[
+                    (
+                        beat_state.beat.beat_id,
+                        selected_deferred[1],
+                    )
+                ]
+                selected_deferred_clip = RushClip.model_validate(
+                    selected_deferred_local["clip"]
+                )
+                frontier_accepted_source_uses.append(
+                    {
+                        "feature_id": beat_state.beat.beat_id,
+                        "source_clip_id": selected_deferred_clip.clip_id,
+                        "source_in_ms": int(
+                            selected_deferred_local["start_ms"]
+                        ),
+                        "source_out_ms": int(
+                            selected_deferred_local["end_ms"]
+                        ),
+                    }
+                )
+            if set(autonomous_vertical_frontier_selected_ids) != {
+                chapter.feature_id
+                for chapter in plan.chapters
+                if chapter.evidence_status != "not_found"
+            }:
+                raise FeatureCutSystemFailure(
+                    "autonomous vertical frontier did not resolve every beat"
+                )
+            selection_payload = {
+                "contract_version": (
+                    "autonomous-vertical-frontier-selection-v1"
+                ),
+                "policy_reference": autonomous_policy.policy_reference,
+                "route_sha256": route_sha256,
+                "state_sha256": sha256_file(frontier_root / "state.json"),
+                "selected_candidate_ids": (
+                    autonomous_vertical_frontier_selected_ids
+                ),
+                "selected_candidates": {
+                    feature_id: {
+                        "candidate_id": candidate_id,
+                        "local_artifact_sha256": sha256_file(
+                            frontier_root
+                            / feature_id
+                            / candidate_id
+                            / "local.json"
+                        ),
+                        "exact_artifact_sha256": sha256_file(
+                            frontier_root
+                            / feature_id
+                            / candidate_id
+                            / "exact.json"
+                        ),
+                        "geometry_artifact_sha256": sha256_file(
+                            frontier_root
+                            / feature_id
+                            / candidate_id
+                            / "geometry.json"
+                        ),
+                        "presentation_classification": read_json(
+                            frontier_root
+                            / feature_id
+                            / candidate_id
+                            / "geometry.json"
+                        )["payload"]["classification"],
+                    }
+                    for feature_id, candidate_id in (
+                        autonomous_vertical_frontier_selected_ids.items()
+                    )
+                },
+                "all_beats_resolved": True,
+                "render_permitted": True,
+            }
+            selection_payload["definition_sha256"] = _stable_fingerprint(
+                selection_payload
+            )
+            write_json(
+                frontier_root / "selection.json",
+                selection_payload,
+            )
+            manifest["editorial_planning"][
+                "production_vertical_frontier_selection_path"
+            ] = str((frontier_root / "selection.json").resolve())
+            manifest["editorial_planning"][
+                "production_vertical_frontier_selection_sha256"
+            ] = sha256_file(frontier_root / "selection.json")
         stage = monotonic()
         for index, selected in enumerate(plan.chapters):
             brief_chapter = brief_by_id[selected.feature_id]
@@ -19283,6 +20821,23 @@ def _run_feature_cut_experiment_impl(
                         )
                     ),
                 )
+                frozen_frontier_candidate_id = (
+                    autonomous_vertical_frontier_selected_ids.get(
+                        selected.feature_id
+                    )
+                )
+                if frozen_frontier_candidate_id is not None:
+                    vertical_options = [
+                        option
+                        for option in vertical_options
+                        if str(option["candidate_id"])
+                        == frozen_frontier_candidate_id
+                    ]
+                    if len(vertical_options) != 1:
+                        raise FeatureCutSystemFailure(
+                            "frozen autonomous frontier candidate is absent "
+                            "or duplicated in the runtime plan"
+                        )
                 candidate_attempts: list[dict[str, Any]] = []
                 deferred_fit: dict[str, Any] | None = None
                 deferred_panel: dict[str, Any] | None = None
@@ -19294,6 +20849,238 @@ def _run_feature_cut_experiment_impl(
                     candidate_id = str(option_data["candidate_id"])
                     candidate_rank = int(option_data["rank"])
                     frame_id = str(option_data["frame_id"])
+                    if frozen_frontier_candidate_id is not None:
+                        frozen_candidate_root = (
+                            output_dir
+                            / "production-frontier"
+                            / "9x16"
+                            / selected.feature_id
+                            / candidate_id
+                        )
+                        local_stage = read_json(
+                            frozen_candidate_root / "local.json"
+                        )
+                        exact_stage = read_json(
+                            frozen_candidate_root / "exact.json"
+                        )
+                        geometry_stage = read_json(
+                            frozen_candidate_root / "geometry.json"
+                        )
+                        local_payload = local_stage["payload"]
+                        exact_payload = exact_stage["payload"]
+                        geometry_payload = geometry_stage["payload"]
+                        if geometry_payload.get("classification") not in {
+                            "natural_accepted",
+                            "deferred_panel",
+                            "deferred_fit",
+                            "deferred_scope_fit",
+                        }:
+                            raise FeatureCutSystemFailure(
+                                "frozen frontier selected a rejected geometry"
+                            )
+                        candidate_frame = RushFrame.model_validate(
+                            local_payload["frame"]
+                        )
+                        candidate_grounding_frame = RushFrame.model_validate(
+                            exact_payload["grounding_frame"]
+                        )
+                        candidate_clip = RushClip.model_validate(
+                            local_payload["clip"]
+                        )
+                        if candidate_clip.sha256 not in source_media_cache:
+                            source_media_cache[candidate_clip.sha256] = (
+                                probe_video(Path(candidate_clip.path))
+                            )
+                        candidate_media = source_media_cache[
+                            candidate_clip.sha256
+                        ]
+                        candidate_regions = [
+                            FramingRegionIntent.model_validate(row)
+                            for row in local_payload["regions"]
+                        ]
+                        candidate_query_lock = (
+                            EvidenceQueryLockV2.model_validate(
+                                local_payload["query_lock"]
+                            )
+                        )
+                        candidate_camera_phases = [
+                            VerticalVirtualCameraPhase.model_validate(row)
+                            for row in local_payload["camera_phases"]
+                        ]
+                        dense_catalog = DenseFrameCatalog.model_validate(
+                            read_json(
+                                Path(
+                                    exact_payload[
+                                        "dense_catalog_path"
+                                    ]
+                                )
+                            )
+                        )
+                        candidate_exact_resolution = (
+                            tuple(
+                                EditorialBeatContract.model_validate(row)
+                                for row in exact_payload[
+                                    "bound_contracts"
+                                ]
+                            ),
+                            tuple(
+                                ExactEventLockV2.model_validate(row)
+                                for row in exact_payload["locks"]
+                            ),
+                            dense_catalog,
+                            tuple(
+                                EditorialBeatFulfillmentSelection
+                                .model_validate(row)
+                                for row in exact_payload[
+                                    "fulfillments"
+                                ]
+                            ),
+                        )
+                        candidate_authorized_trim = (
+                            AuthorizedTrimIntentDecisionV2.model_validate(
+                                exact_payload["authorized_trim"]
+                            )
+                        )
+                        geometry_recompile_request = {
+                            "event_description": (
+                                brief_chapter.title
+                                + "；"
+                                + str(
+                                    option_data[
+                                        "observed_visual_evidence"
+                                    ]
+                                )
+                            ),
+                            "camera_phases": candidate_camera_phases,
+                            "camera_phase_origin": str(
+                                local_payload["camera_phase_origin"]
+                            ),
+                            "crop_mode": str(local_payload["crop_mode"]),
+                            "overflow_policy": "preserve_all",
+                            "edge_priority": "balanced",
+                            "fallback_strategy": "center_crop",
+                            "checkpoint_path": checkpoint_path,
+                            "grounding_prompt": grounding_prompt,
+                            "output_dir": Path(
+                                str(local_payload["candidate_root"])
+                            ),
+                            "analysis_fps": sam_analysis_fps,
+                            "scdet_threshold": scdet_threshold,
+                            "display_sample_aspect_ratio": float(
+                                local_payload[
+                                    "display_sample_aspect_ratio"
+                                ]
+                            ),
+                            "model_request_block_reason": (
+                                "production_frontier_frozen_grounding_"
+                                "cache_miss_forbidden"
+                            ),
+                            "query_lock_v2": candidate_query_lock,
+                            "allow_review_sequential_fallback": False,
+                            "max_identity_model_checks": 0,
+                            "presentation_preference": str(
+                                option_data.get(
+                                    "presentation_preference",
+                                    "tracked_full_bleed",
+                                )
+                            ),
+                            "relation_mode": str(
+                                option_data.get(
+                                    "coverage_mode",
+                                    "simultaneous",
+                                )
+                            ),
+                            "physical_scale_comparison": bool(
+                                option_data.get(
+                                    "physical_scale_comparison",
+                                    False,
+                                )
+                            ),
+                            "semantic_beat": (
+                                _semantic_beat_for_runtime_candidate(
+                                    semantic_beat_by_id.get(
+                                        selected.feature_id
+                                    ),
+                                    option_data,
+                                )
+                            ),
+                        }
+                        selected_vertical = {
+                            "option": option_data,
+                            "frame": candidate_frame,
+                            "clip": candidate_clip,
+                            "media": candidate_media,
+                            "start_ms": int(local_payload["start_ms"]),
+                            "end_ms": int(local_payload["end_ms"]),
+                            "shot_id": str(local_payload["shot_id"]),
+                            "trim": dict(exact_payload["trim"]),
+                            "regions": candidate_regions,
+                            "target": local_payload.get("target"),
+                            "filter": str(
+                                geometry_payload["filter_graph"]
+                            ),
+                            "geometry": dict(
+                                geometry_payload["geometry"]
+                            ),
+                            "debugs": [
+                                Path(path)
+                                for path in geometry_payload.get(
+                                    "debug_paths",
+                                    [],
+                                )
+                            ],
+                            "track_fingerprint": geometry_payload.get(
+                                "track_fingerprint"
+                            ),
+                            "evidence_query_v2": {
+                                "query_id": candidate_query_lock.query_id,
+                                "definition_sha256": (
+                                    candidate_query_lock.definition_sha256()
+                                ),
+                                "component_hashes": (
+                                    candidate_query_lock.component_hashes()
+                                ),
+                                "approval_source": (
+                                    candidate_query_lock.approval
+                                    .approval_source.value
+                                ),
+                                "policy_reference": (
+                                    candidate_query_lock.approval
+                                    .policy_reference
+                                ),
+                            },
+                            "_geometry_recompile_request": (
+                                geometry_recompile_request
+                            ),
+                            "_exact_event_resolution": (
+                                candidate_exact_resolution
+                            ),
+                            "_authorized_trim": (
+                                candidate_authorized_trim
+                            ),
+                            "_grounding_frame": candidate_grounding_frame,
+                        }
+                        candidate_attempts.append(
+                            {
+                                "candidate_id": candidate_id,
+                                "rank": candidate_rank,
+                                "decision": "accepted_from_frozen_frontier",
+                                "reason_code": (
+                                    geometry_payload["classification"]
+                                ),
+                                "paid_model_calls_added_after_freeze": 0,
+                                "local_artifact_sha256": sha256_file(
+                                    frozen_candidate_root / "local.json"
+                                ),
+                                "exact_artifact_sha256": sha256_file(
+                                    frozen_candidate_root / "exact.json"
+                                ),
+                                "geometry_artifact_sha256": sha256_file(
+                                    frozen_candidate_root / "geometry.json"
+                                ),
+                            }
+                        )
+                        break
                     candidate_semantic_beat = _semantic_beat_for_runtime_candidate(
                         semantic_beat_by_id.get(selected.feature_id),
                         option_data,
@@ -19989,7 +21776,10 @@ def _run_feature_cut_experiment_impl(
                                 candidate_display_sar
                             ),
                             "model_request_block_reason": (
-                                gemini_geometry_block_reason
+                                "production_frontier_frozen_grounding_"
+                                "cache_miss_forbidden"
+                                if frozen_frontier_candidate_id is not None
+                                else gemini_geometry_block_reason
                             ),
                             "query_lock_v2": candidate_query_lock,
                             "allow_review_sequential_fallback": False,
@@ -20103,7 +21893,10 @@ def _run_feature_cut_experiment_impl(
                                 ),
                                 track_cache=track_cache,
                                 model_request_block_reason=(
-                                    gemini_geometry_block_reason
+                                    "production_frontier_frozen_grounding_"
+                                    "cache_miss_forbidden"
+                                    if frozen_frontier_candidate_id is not None
+                                    else gemini_geometry_block_reason
                                 ),
                                 query_lock_v2=candidate_query_lock,
                                 allow_review_sequential_fallback=any(
@@ -21437,6 +23230,12 @@ def _run_feature_cut_experiment_impl(
                                     "selected-window inputs"
                                 )
                         else:
+                            if frozen_frontier_candidate_id is not None:
+                                raise FeatureCutSystemFailure(
+                                    "frozen production frontier is missing its "
+                                    "pre-resolved ExactEventLocks; paid exact "
+                                    "dispatch after freeze is forbidden"
+                                )
                             locks = client.select_exact_event_locks(
                                 catalog=dense_catalog,
                                 beat_contracts=bound_contracts,
@@ -22029,6 +23828,73 @@ def _run_feature_cut_experiment_impl(
                         }
                     ),
                 }
+                if frozen_frontier_candidate_id is not None:
+                    frozen_frontier_root = (
+                        output_dir / "production-frontier" / "9x16"
+                    )
+                    frozen_candidate_root = (
+                        frozen_frontier_root
+                        / selected.feature_id
+                        / selected_candidate_id
+                    )
+                    finalized_runtime_sha256 = _stable_fingerprint(
+                        {
+                            "candidate_id": selected_candidate_id,
+                            "source_in_ms": v_start,
+                            "source_out_ms": v_end,
+                            "trim": vertical_trim,
+                            "filter_graph": vertical_filter,
+                            "geometry": vertical_geometry,
+                            "track_fingerprint": (
+                                vertical_track_fingerprint
+                            ),
+                        }
+                    )
+                    _load_or_create_frontier_stage_artifact(
+                        artifact_path=(
+                            frozen_candidate_root / "finalized.json"
+                        ),
+                        beat_id=selected.feature_id,
+                        candidate_id=selected_candidate_id,
+                        stage="finalize",
+                        dependency_hashes=(
+                            sha256_file(
+                                frozen_frontier_root / "selection.json"
+                            ),
+                            sha256_file(
+                                frozen_candidate_root / "geometry.json"
+                            ),
+                            finalized_runtime_sha256,
+                        ),
+                        policy_reference=(
+                            autonomous_policy.policy_reference
+                            if autonomous_policy is not None
+                            else ""
+                        ),
+                        route_sha256=sha256_file(
+                            pre_render_candidate_route_path
+                        ),
+                        producer=lambda: {
+                            "source_in_ms": v_start,
+                            "source_out_ms": v_end,
+                            "trim": vertical_trim,
+                            "filter_graph_sha256": hashlib.sha256(
+                                vertical_filter.encode("utf-8")
+                            ).hexdigest(),
+                            "geometry_sha256": _stable_fingerprint(
+                                vertical_geometry
+                            ),
+                            "track_fingerprint": (
+                                vertical_track_fingerprint
+                            ),
+                            "paid_model_calls_added_after_frontier": 0,
+                        },
+                    )
+                    _validate_frozen_vertical_render_selection(
+                        frontier_root=frozen_frontier_root,
+                        feature_id=selected.feature_id,
+                        candidate_id=selected_candidate_id,
+                    )
                 vertical_source_interval = _exact_render_source_interval(
                     source_path=Path(vertical_clip.path),
                     source_sha256=vertical_clip.sha256,

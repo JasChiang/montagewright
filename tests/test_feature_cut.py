@@ -89,6 +89,10 @@ from jascue_video_lab.feature_cut import (
     _render_text_layer,
     _requested_render_aspects,
     _runtime_panel_budget_allows,
+    _load_or_create_frontier_stage_artifact,
+    _compile_autonomous_vertical_candidate_geometry,
+    _run_persisted_production_frontier,
+    _validate_frozen_vertical_render_selection,
     _select_deferred_vertical_fallback,
     _required_track_union,
     _resolve_editorial_chapter_durations,
@@ -127,6 +131,7 @@ from jascue_video_lab.feature_cut import (
     run_feature_cut_experiment,
     write_external_feature_plan_projection,
     CandidateKnownInfeasible,
+    FeatureCutSystemFailure,
 )
 from jascue_video_lab.auto_reframe import FailureCode
 from jascue_video_lab.models import (
@@ -137,8 +142,692 @@ from jascue_video_lab.final_edit_qa import DeterministicDeliveryEvidence
 from jascue_video_lab.sequence_optimizer import CandidateRouteOption
 from jascue_video_lab.sequence_optimizer import (
     CandidateRouteBeat,
+    RoundRobinFrontierBeat,
+    RoundRobinFrontierCandidate,
+    RoundRobinFrontierState,
+    initialize_round_robin_frontier,
+    next_round_robin_frontier_attempt,
     optimize_pre_render_candidate_route,
 )
+
+
+def _write_frozen_vertical_render_fixture(
+    tmp_path: Path,
+    *,
+    accepted: bool,
+) -> tuple[Path, str, str]:
+    frontier_root = tmp_path / "vertical-frontier"
+    feature_id = "beat-a"
+    candidate_id = "candidate-a1"
+    beat = _production_frontier_beat(
+        feature_id,
+        0,
+        (candidate_id, True),
+    )
+    state_path = frontier_root / "state.json"
+    if accepted:
+        _run_persisted_production_frontier(
+            state_path=state_path,
+            beats=(beat,),
+            local_preflight=lambda _attempt: None,
+            exact_event=lambda _attempt: None,
+            grounding=lambda _attempt: None,
+        )
+    else:
+        write_json(
+            state_path,
+            initialize_round_robin_frontier((beat,)),
+        )
+
+    candidate_root = frontier_root / feature_id / candidate_id
+    stage_paths = {
+        stage: candidate_root / f"{stage}.json"
+        for stage in ("local", "exact", "geometry")
+    }
+    for stage, path in stage_paths.items():
+        write_json(path, {"stage": stage, "candidate_id": candidate_id})
+    selection = {
+        "contract_version": "autonomous-vertical-frontier-selection-v1",
+        "policy_reference": "sha256:" + "a" * 64,
+        "route_sha256": "sha256:" + "b" * 64,
+        "state_sha256": sha256_file(state_path),
+        "selected_candidate_ids": {feature_id: candidate_id},
+        "selected_candidates": {
+            feature_id: {
+                "candidate_id": candidate_id,
+                "local_artifact_sha256": sha256_file(
+                    stage_paths["local"]
+                ),
+                "exact_artifact_sha256": sha256_file(
+                    stage_paths["exact"]
+                ),
+                "geometry_artifact_sha256": sha256_file(
+                    stage_paths["geometry"]
+                ),
+                "presentation_classification": "accepted",
+            }
+        },
+        "all_beats_resolved": True,
+        "render_permitted": True,
+    }
+    selection["definition_sha256"] = (
+        feature_cut_module._stable_fingerprint(selection)
+    )
+    write_json(frontier_root / "selection.json", selection)
+    _load_or_create_frontier_stage_artifact(
+        artifact_path=candidate_root / "finalized.json",
+        beat_id=feature_id,
+        candidate_id=candidate_id,
+        stage="finalize",
+        dependency_hashes=(
+            sha256_file(frontier_root / "selection.json"),
+            sha256_file(stage_paths["geometry"]),
+            "sha256:" + "c" * 64,
+        ),
+        policy_reference="sha256:" + "a" * 64,
+        route_sha256="sha256:" + "b" * 64,
+        producer=lambda: {"runtime_selection": "frozen"},
+    )
+    return frontier_root, feature_id, candidate_id
+
+
+def test_frozen_vertical_render_selection_accepts_complete_lineage(
+    tmp_path: Path,
+) -> None:
+    frontier_root, feature_id, candidate_id = (
+        _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
+    )
+
+    selection = _validate_frozen_vertical_render_selection(
+        frontier_root=frontier_root,
+        feature_id=feature_id,
+        candidate_id=candidate_id,
+    )
+
+    assert selection["selected_candidate_ids"] == {
+        feature_id: candidate_id
+    }
+
+
+def test_frozen_vertical_render_selection_rejects_pending_state(
+    tmp_path: Path,
+) -> None:
+    frontier_root, feature_id, candidate_id = (
+        _write_frozen_vertical_render_fixture(tmp_path, accepted=False)
+    )
+
+    with pytest.raises(FeatureCutSystemFailure, match="completely frozen"):
+        _validate_frozen_vertical_render_selection(
+            frontier_root=frontier_root,
+            feature_id=feature_id,
+            candidate_id=candidate_id,
+        )
+
+
+def test_frozen_vertical_render_selection_rejects_candidate_mismatch(
+    tmp_path: Path,
+) -> None:
+    frontier_root, feature_id, _candidate_id = (
+        _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
+    )
+
+    with pytest.raises(FeatureCutSystemFailure, match="completely frozen"):
+        _validate_frozen_vertical_render_selection(
+            frontier_root=frontier_root,
+            feature_id=feature_id,
+            candidate_id="different-candidate",
+        )
+
+
+@pytest.mark.parametrize("stage", ("local", "exact", "geometry"))
+def test_frozen_vertical_render_selection_rejects_stage_artifact_tamper(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    frontier_root, feature_id, candidate_id = (
+        _write_frozen_vertical_render_fixture(tmp_path, accepted=True)
+    )
+    (
+        frontier_root
+        / feature_id
+        / candidate_id
+        / f"{stage}.json"
+    ).write_text('{"tampered":true}', encoding="utf-8")
+
+    with pytest.raises(FeatureCutSystemFailure, match="completely frozen"):
+        _validate_frozen_vertical_render_selection(
+            frontier_root=frontier_root,
+            feature_id=feature_id,
+            candidate_id=candidate_id,
+        )
+
+
+def test_autonomous_vertical_geometry_plain_value_error_is_system_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clip = RushClip(
+        clip_id="clip-a",
+        path=str(tmp_path / "source.mp4"),
+        sha256="1" * 64,
+        duration_ms=5_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=1,
+    )
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id=clip.clip_id,
+        requested_time_ms=1_000,
+        image_path=str(tmp_path / "frame.jpg"),
+    )
+    local_artifact = {
+        "option": {
+            "candidate_id": "candidate-a1",
+            "rank": 1,
+            "confidence": 0.9,
+            "observed_visual_evidence": "One visible subject.",
+            "presentation_preference": "tracked_full_bleed",
+            "coverage_mode": "simultaneous",
+        },
+        "clip": clip.model_dump(mode="json"),
+        "regions": [],
+        "camera_phases": [],
+        "query_lock": {
+            "query_id": "query-a",
+            "revision": 1,
+            "editorial_goal": "Keep the visible subject.",
+            "identity": {
+                "targets": [
+                        {
+                            "target_id": "subject-a",
+                            "target_description": "the visible subject",
+                            "identity_cues": ["one visible subject"],
+                        }
+                ]
+            },
+            "framing": {
+                "required_target_ids": ["subject-a"],
+                "framing_intent": "keep the subject visible",
+            },
+            "claim_source": "user_brief",
+            "provenance": {
+                "created_at": "now",
+                "created_by": "test",
+            },
+            "approval": {
+                "approved_at": "now",
+                "approved_by": "test",
+                "approval_source": "user_brief",
+            },
+        },
+        "candidate_root": str(tmp_path / "candidate"),
+        "start_ms": 0,
+        "end_ms": 5_000,
+        "target": "the visible subject",
+        "camera_phase_origin": "gemini_proposed",
+        "crop_mode": "strict",
+        "display_sample_aspect_ratio": 1.0,
+    }
+    exact_artifact = {
+        "grounding_frame": frame.model_dump(mode="json")
+    }
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="visual_demo",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=50_000,
+            max_ms=70_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_vertical_candidate_geometry",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ValueError("unexpected geometry invariant")
+        ),
+    )
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="cannot authorize a paid Top-K retry",
+    ):
+        _compile_autonomous_vertical_candidate_geometry(
+            client=SimpleNamespace(),
+            feature_id="beat-a",
+            local_artifact=local_artifact,
+            exact_artifact=exact_artifact,
+            brief_chapter=FeatureChapterBrief(
+                feature_id="beat-a",
+                title="Visible subject",
+                detail_lines=[],
+                target_duration_seconds=5,
+            ),
+            checkpoint_path=tmp_path / "checkpoint.pth",
+            grounding_prompt="ground",
+            analysis_fps=2.0,
+            scdet_threshold=4.0,
+            track_cache={},
+            policy=policy,
+            semantic_beat=None,
+            titles_rendered=False,
+            semantic_negotiation_state={},
+        )
+
+
+def _frontier_stage_artifact_kwargs(
+    tmp_path: Path,
+) -> dict[str, object]:
+    return {
+        "artifact_path": tmp_path / "frontier-stage.json",
+        "beat_id": "beat-a",
+        "candidate_id": "candidate-a1",
+        "stage": "exact_event",
+        "dependency_hashes": (
+            "sha256:" + "a" * 64,
+            "sha256:" + "b" * 64,
+        ),
+        "policy_reference": "sha256:" + "c" * 64,
+        "route_sha256": "sha256:" + "d" * 64,
+    }
+
+
+def test_frontier_stage_artifact_produces_once_and_resumes(
+    tmp_path: Path,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    producer_calls: list[str] = []
+
+    def producer() -> dict[str, object]:
+        producer_calls.append("called")
+        return {"event_lock_ids": ["lock-1"], "confidence": 0.91}
+
+    first = _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=producer,
+    )
+    resumed = _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: pytest.fail("resume invoked stage producer"),
+    )
+
+    assert first == {
+        "event_lock_ids": ["lock-1"],
+        "confidence": 0.91,
+    }
+    assert resumed == first
+    assert producer_calls == ["called"]
+
+
+@pytest.mark.parametrize(
+    ("binding_key", "replacement"),
+    (
+        (
+            "dependency_hashes",
+            ("sha256:" + "f" * 64,),
+        ),
+        ("policy_reference", "sha256:" + "e" * 64),
+        ("route_sha256", "sha256:" + "9" * 64),
+    ),
+)
+def test_frontier_stage_artifact_rejects_binding_mismatch(
+    tmp_path: Path,
+    binding_key: str,
+    replacement: object,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: {"value": "original"},
+    )
+    mismatched = {**kwargs, binding_key: replacement}
+
+    with pytest.raises(FeatureCutSystemFailure, match="bindings"):
+        _load_or_create_frontier_stage_artifact(
+            **mismatched,
+            producer=lambda: pytest.fail(
+                "binding mismatch invoked stage producer"
+            ),
+        )
+
+
+@pytest.mark.parametrize("tamper_target", ("payload", "definition"))
+def test_frontier_stage_artifact_rejects_hash_tamper(
+    tmp_path: Path,
+    tamper_target: str,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    artifact_path = kwargs["artifact_path"]
+    assert isinstance(artifact_path, Path)
+    _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: {"value": "original"},
+    )
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if tamper_target == "payload":
+        artifact["payload"]["value"] = "tampered"
+    else:
+        artifact["definition_sha256"] = "0" * 64
+    artifact_path.write_text(
+        json.dumps(artifact),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FeatureCutSystemFailure, match="hash changed"):
+        _load_or_create_frontier_stage_artifact(
+            **kwargs,
+            producer=lambda: pytest.fail(
+                "tampered artifact invoked stage producer"
+            ),
+        )
+
+
+def _production_frontier_beat(
+    beat_id: str,
+    story_order: int,
+    *candidates: tuple[str, bool],
+) -> RoundRobinFrontierBeat:
+    return RoundRobinFrontierBeat(
+        beat_id=beat_id,
+        story_order=story_order,
+        candidates=tuple(
+            RoundRobinFrontierCandidate(
+                beat_id=beat_id,
+                candidate_id=candidate_id,
+                candidate_order=index,
+                requires_exact_event=requires_exact,
+            )
+            for index, (candidate_id, requires_exact) in enumerate(
+                candidates
+            )
+        ),
+    )
+
+
+def test_production_frontier_runs_all_primaries_before_retry(
+    tmp_path: Path,
+) -> None:
+    paid_order: list[tuple[str, str, str, int]] = []
+
+    def grounding(attempt) -> None:
+        paid_order.append(
+            (
+                attempt.beat_id,
+                attempt.candidate_id,
+                attempt.stage,
+                attempt.round_index,
+            )
+        )
+        if attempt.candidate_id in {"a1", "c1"}:
+            raise CandidateKnownInfeasible("candidate geometry failed")
+
+    accepted = _run_persisted_production_frontier(
+        state_path=tmp_path / "frontier.json",
+        beats=(
+            _production_frontier_beat(
+                "c",
+                2,
+                ("c1", False),
+                ("c2", False),
+            ),
+            _production_frontier_beat(
+                "a",
+                0,
+                ("a1", False),
+                ("a2", False),
+            ),
+            _production_frontier_beat("b", 1, ("b1", False)),
+        ),
+        local_preflight=lambda _attempt: None,
+        exact_event=lambda _attempt: None,
+        grounding=grounding,
+    )
+
+    assert paid_order == [
+        ("a", "a1", "grounding", 1),
+        ("b", "b1", "grounding", 1),
+        ("c", "c1", "grounding", 1),
+        ("a", "a2", "grounding", 2),
+        ("c", "c2", "grounding", 2),
+    ]
+    assert accepted == {"a": "a2", "b": "b1", "c": "c2"}
+
+
+def test_production_frontier_accepted_beat_exits(
+    tmp_path: Path,
+) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def grounding(attempt) -> None:
+        seen.append((attempt.beat_id, attempt.candidate_id))
+        if attempt.beat_id == "later" and attempt.candidate_id == "l1":
+            raise CandidateKnownInfeasible("try alternate")
+
+    accepted = _run_persisted_production_frontier(
+        state_path=tmp_path / "frontier.json",
+        beats=(
+            _production_frontier_beat(
+                "accepted",
+                0,
+                ("a1", False),
+                ("a2-must-not-run", False),
+            ),
+            _production_frontier_beat(
+                "later",
+                1,
+                ("l1", False),
+                ("l2", False),
+            ),
+        ),
+        local_preflight=lambda _attempt: None,
+        exact_event=lambda _attempt: None,
+        grounding=grounding,
+    )
+
+    assert accepted == {"accepted": "a1", "later": "l2"}
+    assert ("accepted", "a2-must-not-run") not in seen
+
+
+def test_production_frontier_local_failure_uses_no_paid_callback(
+    tmp_path: Path,
+) -> None:
+    local_ids: list[str] = []
+    exact_ids: list[str] = []
+    grounding_ids: list[str] = []
+
+    def local_preflight(attempt) -> None:
+        local_ids.append(attempt.candidate_id)
+        if attempt.candidate_id == "bad":
+            raise CandidateKnownInfeasible("known local failure")
+
+    accepted = _run_persisted_production_frontier(
+        state_path=tmp_path / "frontier.json",
+        beats=(
+            _production_frontier_beat(
+                "beat",
+                0,
+                ("bad", True),
+                ("good", False),
+            ),
+        ),
+        local_preflight=local_preflight,
+        exact_event=lambda attempt: exact_ids.append(attempt.candidate_id),
+        grounding=lambda attempt: grounding_ids.append(
+            attempt.candidate_id
+        ),
+    )
+    state = RoundRobinFrontierState.model_validate_json(
+        (tmp_path / "frontier.json").read_text(encoding="utf-8")
+    )
+
+    assert accepted == {"beat": "good"}
+    assert local_ids == ["bad", "good"]
+    assert exact_ids == []
+    assert grounding_ids == ["good"]
+    assert state.paid_calls_consumed == 1
+    assert state.attempt_history[0].attempt.paid is False
+    assert state.attempt_history[1].attempt.round_index == 1
+
+
+def test_production_frontier_exact_precedes_grounding(
+    tmp_path: Path,
+) -> None:
+    stages: list[str] = []
+
+    _run_persisted_production_frontier(
+        state_path=tmp_path / "frontier.json",
+        beats=(
+            _production_frontier_beat(
+                "beat",
+                0,
+                ("candidate", True),
+            ),
+        ),
+        local_preflight=lambda attempt: stages.append(attempt.stage),
+        exact_event=lambda attempt: stages.append(attempt.stage),
+        grounding=lambda attempt: stages.append(attempt.stage),
+    )
+
+    assert stages == ["local_preflight", "exact_event", "grounding"]
+
+
+def test_production_frontier_system_error_stops_and_resumes_exact_state(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "frontier.json"
+    first_events: list[str] = []
+
+    def broken_exact(attempt) -> None:
+        first_events.append(attempt.stage)
+        raise RuntimeError("tool transport failed")
+
+    with pytest.raises(FeatureCutSystemFailure, match="RuntimeError"):
+        _run_persisted_production_frontier(
+            state_path=state_path,
+            beats=(
+                _production_frontier_beat(
+                    "beat",
+                    0,
+                    ("candidate", True),
+                ),
+            ),
+            local_preflight=lambda attempt: first_events.append(
+                attempt.stage
+            ),
+            exact_event=broken_exact,
+            grounding=lambda attempt: first_events.append(attempt.stage),
+        )
+
+    stopped = RoundRobinFrontierState.model_validate_json(
+        state_path.read_text(encoding="utf-8")
+    )
+    next_attempt = next_round_robin_frontier_attempt(stopped)
+    assert first_events == ["local_preflight", "exact_event"]
+    assert stopped.revision == 1
+    assert next_attempt is not None
+    assert next_attempt.stage == "exact_event"
+
+    resumed_events: list[str] = []
+    accepted = _run_persisted_production_frontier(
+        state_path=state_path,
+        beats=None,
+        local_preflight=lambda _attempt: pytest.fail(
+            "resume repeated completed local preflight"
+        ),
+        exact_event=lambda attempt: resumed_events.append(attempt.stage),
+        grounding=lambda attempt: resumed_events.append(attempt.stage),
+    )
+
+    assert resumed_events == ["exact_event", "grounding"]
+    assert accepted == {"beat": "candidate"}
+
+
+def test_production_frontier_frozen_callback_runs_after_all_attempts(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "frontier.json"
+    events: list[str] = []
+
+    def frozen(state, accepted) -> None:
+        events.append("render")
+        persisted = RoundRobinFrontierState.model_validate_json(
+            state_path.read_text(encoding="utf-8")
+        )
+        assert next_round_robin_frontier_attempt(state) is None
+        assert next_round_robin_frontier_attempt(persisted) is None
+        assert accepted == {"a": "a1", "b": "b1"}
+
+    accepted = _run_persisted_production_frontier(
+        state_path=state_path,
+        beats=(
+            _production_frontier_beat("a", 0, ("a1", False)),
+            _production_frontier_beat("b", 1, ("b1", False)),
+        ),
+        local_preflight=lambda attempt: events.append(
+            f"{attempt.beat_id}:local"
+        ),
+        exact_event=lambda attempt: events.append(
+            f"{attempt.beat_id}:exact"
+        ),
+        grounding=lambda attempt: events.append(
+            f"{attempt.beat_id}:grounding"
+        ),
+        on_frontier_frozen=frozen,
+    )
+
+    assert accepted == {"a": "a1", "b": "b1"}
+    assert events == [
+        "a:local",
+        "a:grounding",
+        "b:local",
+        "b:grounding",
+        "render",
+    ]
+
+
+def test_production_frontier_rejects_persisted_binding_mismatch(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "frontier.json"
+    original = (
+        _production_frontier_beat("beat", 0, ("candidate-a", False)),
+    )
+    _run_persisted_production_frontier(
+        state_path=state_path,
+        beats=original,
+        local_preflight=lambda _attempt: None,
+        exact_event=lambda _attempt: None,
+        grounding=lambda _attempt: None,
+    )
+
+    with pytest.raises(FeatureCutSystemFailure, match="does not match"):
+        _run_persisted_production_frontier(
+            state_path=state_path,
+            beats=(
+                _production_frontier_beat(
+                    "beat",
+                    0,
+                    ("candidate-b", False),
+                ),
+            ),
+            local_preflight=lambda _attempt: pytest.fail(
+                "mismatch dispatched local callback"
+            ),
+            exact_event=lambda _attempt: pytest.fail(
+                "mismatch dispatched exact callback"
+            ),
+            grounding=lambda _attempt: pytest.fail(
+                "mismatch dispatched grounding callback"
+            ),
+        )
 
 
 def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
