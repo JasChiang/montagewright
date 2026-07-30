@@ -27,6 +27,340 @@ PresentationMode = Literal[
 ]
 
 
+FrontierAttemptStage = Literal[
+    "local_preflight",
+    "exact_event",
+    "grounding",
+]
+FrontierAttemptOutcome = Literal[
+    "local_preflight_passed",
+    "local_preflight_failed",
+    "exact_event_passed",
+    "exact_event_failed",
+    "grounding_accepted",
+    "grounding_failed",
+]
+FrontierBeatStatus = Literal["pending", "accepted", "exhausted"]
+
+
+class RoundRobinFrontierCandidate(FrozenStrictModel):
+    """One candidate in a beat-local fallback order.
+
+    ``candidate_order`` is explicit so the pure scheduler never derives
+    execution order from caller container order or semantic scores.
+    """
+
+    beat_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    candidate_order: int = Field(ge=0)
+    requires_exact_event: bool = False
+
+
+class RoundRobinFrontierBeat(FrozenStrictModel):
+    """One story beat participating in the paid candidate frontier."""
+
+    beat_id: str = Field(min_length=1)
+    story_order: int = Field(ge=0)
+    candidates: tuple[RoundRobinFrontierCandidate, ...] = Field(
+        min_length=1
+    )
+
+    @model_validator(mode="after")
+    def validate_candidates(self) -> "RoundRobinFrontierBeat":
+        if any(
+            candidate.beat_id != self.beat_id
+            for candidate in self.candidates
+        ):
+            raise ValueError("frontier candidates must match their beat")
+        candidate_ids = [
+            candidate.candidate_id for candidate in self.candidates
+        ]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("frontier candidate IDs must be unique per beat")
+        candidate_orders = [
+            candidate.candidate_order for candidate in self.candidates
+        ]
+        if len(candidate_orders) != len(set(candidate_orders)):
+            raise ValueError(
+                "frontier candidate order must be unique per beat"
+            )
+        return self
+
+
+class RoundRobinFrontierAttempt(FrozenStrictModel):
+    """The only next operation currently admitted by the frontier."""
+
+    revision: int = Field(ge=0)
+    beat_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    story_order: int = Field(ge=0)
+    candidate_order: int = Field(ge=0)
+    round_index: int = Field(ge=1)
+    stage: FrontierAttemptStage
+    paid: bool
+
+    @model_validator(mode="after")
+    def validate_paid_stage(self) -> "RoundRobinFrontierAttempt":
+        expected_paid = self.stage != "local_preflight"
+        if self.paid != expected_paid:
+            raise ValueError(
+                "only exact-event and grounding frontier stages are paid"
+            )
+        return self
+
+
+class RoundRobinFrontierAttemptResult(FrozenStrictModel):
+    attempt: RoundRobinFrontierAttempt
+    outcome: FrontierAttemptOutcome
+    decision_codes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_stage_outcome(self) -> "RoundRobinFrontierAttemptResult":
+        allowed_by_stage = {
+            "local_preflight": {
+                "local_preflight_passed",
+                "local_preflight_failed",
+            },
+            "exact_event": {
+                "exact_event_passed",
+                "exact_event_failed",
+            },
+            "grounding": {
+                "grounding_accepted",
+                "grounding_failed",
+            },
+        }
+        if self.outcome not in allowed_by_stage[self.attempt.stage]:
+            raise ValueError(
+                "frontier attempt outcome does not match its stage"
+            )
+        return self
+
+
+class RoundRobinFrontierBeatState(FrozenStrictModel):
+    beat: RoundRobinFrontierBeat
+    candidate_cursor: int = Field(default=0, ge=0)
+    round_index: int = Field(default=1, ge=1)
+    status: FrontierBeatStatus = "pending"
+    active_candidate_id: str | None = None
+    next_stage: FrontierAttemptStage = "local_preflight"
+    accepted_candidate_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_runtime_state(self) -> "RoundRobinFrontierBeatState":
+        candidate_count = len(self.beat.candidates)
+        if self.candidate_cursor > candidate_count:
+            raise ValueError("frontier candidate cursor is out of range")
+        if self.status == "pending":
+            if self.candidate_cursor >= candidate_count:
+                raise ValueError(
+                    "pending frontier beat must have a remaining candidate"
+                )
+            current = self.beat.candidates[self.candidate_cursor]
+            if (
+                self.active_candidate_id is not None
+                and self.active_candidate_id != current.candidate_id
+            ):
+                raise ValueError(
+                    "active frontier candidate must match the cursor"
+                )
+            if (
+                self.next_stage != "local_preflight"
+                and self.active_candidate_id is None
+            ):
+                raise ValueError(
+                    "paid frontier stages require an active candidate"
+                )
+        elif self.status == "accepted":
+            if self.accepted_candidate_id is None:
+                raise ValueError(
+                    "accepted frontier beat must bind its candidate"
+                )
+        elif self.accepted_candidate_id is not None:
+            raise ValueError(
+                "only an accepted frontier beat may bind a candidate"
+            )
+        return self
+
+
+class RoundRobinFrontierState(FrozenStrictModel):
+    """Immutable state for fair, candidate-round paid execution."""
+
+    contract_version: Literal["round-robin-paid-frontier-v1"] = (
+        "round-robin-paid-frontier-v1"
+    )
+    revision: int = Field(default=0, ge=0)
+    beats: tuple[RoundRobinFrontierBeatState, ...] = Field(min_length=1)
+    attempt_history: tuple[RoundRobinFrontierAttemptResult, ...] = ()
+    paid_calls_consumed: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_beats(self) -> "RoundRobinFrontierState":
+        beat_ids = [state.beat.beat_id for state in self.beats]
+        if len(beat_ids) != len(set(beat_ids)):
+            raise ValueError("frontier beat IDs must be unique")
+        story_orders = [state.beat.story_order for state in self.beats]
+        if len(story_orders) != len(set(story_orders)):
+            raise ValueError("frontier story order must be unique")
+        if story_orders != sorted(story_orders):
+            raise ValueError(
+                "frontier state beats must remain in explicit story order"
+            )
+        return self
+
+
+def initialize_round_robin_frontier(
+    beats: Sequence[RoundRobinFrontierBeat],
+) -> RoundRobinFrontierState:
+    """Canonicalize caller input into deterministic story/candidate order."""
+
+    if not beats:
+        raise ValueError("round-robin frontier requires at least one beat")
+    canonical_beats = []
+    for beat in beats:
+        canonical_beats.append(
+            beat.model_copy(
+                update={
+                    "candidates": tuple(
+                        sorted(
+                            beat.candidates,
+                            key=lambda candidate: (
+                                candidate.candidate_order,
+                                candidate.candidate_id,
+                            ),
+                        )
+                    )
+                }
+            )
+        )
+    canonical_beats.sort(
+        key=lambda beat: (beat.story_order, beat.beat_id)
+    )
+    return RoundRobinFrontierState(
+        beats=tuple(
+            RoundRobinFrontierBeatState(beat=beat)
+            for beat in canonical_beats
+        )
+    )
+
+
+def next_round_robin_frontier_attempt(
+    state: RoundRobinFrontierState,
+) -> RoundRobinFrontierAttempt | None:
+    """Return one deterministic operation without mutating frontier state.
+
+    Beats in the lowest unfinished paid round always win.  Consequently no
+    round-N+1 candidate may start before every still-runnable beat has either
+    completed, accepted, exhausted, or failed its round-N candidate.
+    """
+
+    pending = [row for row in state.beats if row.status == "pending"]
+    if not pending:
+        return None
+    minimum_round = min(row.round_index for row in pending)
+    selected = min(
+        (
+            row
+            for row in pending
+            if row.round_index == minimum_round
+        ),
+        key=lambda row: (row.beat.story_order, row.beat.beat_id),
+    )
+    candidate = selected.beat.candidates[selected.candidate_cursor]
+    return RoundRobinFrontierAttempt(
+        revision=state.revision,
+        beat_id=selected.beat.beat_id,
+        candidate_id=candidate.candidate_id,
+        story_order=selected.beat.story_order,
+        candidate_order=candidate.candidate_order,
+        round_index=selected.round_index,
+        stage=selected.next_stage,
+        paid=selected.next_stage != "local_preflight",
+    )
+
+
+def record_round_robin_frontier_attempt(
+    state: RoundRobinFrontierState,
+    result: RoundRobinFrontierAttemptResult,
+) -> RoundRobinFrontierState:
+    """Apply exactly the currently admitted operation to immutable state."""
+
+    expected = next_round_robin_frontier_attempt(state)
+    if expected is None:
+        raise ValueError("round-robin frontier is already complete")
+    if result.attempt != expected:
+        raise ValueError("stale or out-of-order frontier attempt result")
+
+    updated_beats = list(state.beats)
+    beat_index = next(
+        index
+        for index, row in enumerate(updated_beats)
+        if row.beat.beat_id == expected.beat_id
+    )
+    beat_state = updated_beats[beat_index]
+    candidate = beat_state.beat.candidates[
+        beat_state.candidate_cursor
+    ]
+
+    if result.outcome == "local_preflight_passed":
+        beat_state = beat_state.model_copy(
+            update={
+                "active_candidate_id": candidate.candidate_id,
+                "next_stage": (
+                    "exact_event"
+                    if candidate.requires_exact_event
+                    else "grounding"
+                ),
+            }
+        )
+    elif result.outcome == "exact_event_passed":
+        beat_state = beat_state.model_copy(
+            update={"next_stage": "grounding"}
+        )
+    elif result.outcome == "grounding_accepted":
+        beat_state = beat_state.model_copy(
+            update={
+                "status": "accepted",
+                "accepted_candidate_id": candidate.candidate_id,
+            }
+        )
+    else:
+        next_cursor = beat_state.candidate_cursor + 1
+        candidate_failure_was_paid = expected.paid
+        beat_state = beat_state.model_copy(
+            update={
+                "candidate_cursor": next_cursor,
+                "round_index": (
+                    beat_state.round_index + 1
+                    if candidate_failure_was_paid
+                    else beat_state.round_index
+                ),
+                "status": (
+                    "exhausted"
+                    if next_cursor >= len(beat_state.beat.candidates)
+                    else "pending"
+                ),
+                "active_candidate_id": None,
+                "next_stage": "local_preflight",
+            }
+        )
+
+    updated_beats[beat_index] = beat_state
+    return state.model_copy(
+        update={
+            "revision": state.revision + 1,
+            "beats": tuple(updated_beats),
+            "attempt_history": (
+                *state.attempt_history,
+                result,
+            ),
+            "paid_calls_consumed": (
+                state.paid_calls_consumed + int(expected.paid)
+            ),
+        }
+    )
+
+
 class CandidateRouteOption(FrozenStrictModel):
     """One bounded pre-render sequence choice.
 

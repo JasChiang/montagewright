@@ -17,6 +17,9 @@ from jascue_video_lab.sequence_optimizer import (
     CandidateRouteOption,
     MusicBoundaryCue,
     MusicBoundarySpec,
+    RoundRobinFrontierAttemptResult,
+    RoundRobinFrontierBeat,
+    RoundRobinFrontierCandidate,
     RuntimeCueTimingBinding,
     RuntimeSegmentTiming,
     SegmentRenderCacheKey,
@@ -26,13 +29,199 @@ from jascue_video_lab.sequence_optimizer import (
     ResolvedTimelineV1,
     build_resolved_timeline,
     concat_manifest_lines,
+    initialize_round_robin_frontier,
+    next_round_robin_frontier_attempt,
     optimize_sequence,
     optimize_pre_render_candidate_route,
+    record_round_robin_frontier_attempt,
     reconcile_runtime_sequence_timing,
     render_segments_incrementally,
     solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
 )
+
+
+def _frontier_beat(
+    beat_id: str,
+    story_order: int,
+    *candidates: tuple[str, bool],
+) -> RoundRobinFrontierBeat:
+    return RoundRobinFrontierBeat(
+        beat_id=beat_id,
+        story_order=story_order,
+        candidates=tuple(
+            RoundRobinFrontierCandidate(
+                beat_id=beat_id,
+                candidate_id=candidate_id,
+                candidate_order=index,
+                requires_exact_event=requires_exact_event,
+            )
+            for index, (candidate_id, requires_exact_event) in enumerate(
+                candidates
+            )
+        ),
+    )
+
+
+def _record_frontier_outcome(state, outcome: str):
+    attempt = next_round_robin_frontier_attempt(state)
+    assert attempt is not None
+    return record_round_robin_frontier_attempt(
+        state,
+        RoundRobinFrontierAttemptResult(
+            attempt=attempt,
+            outcome=outcome,
+        ),
+    )
+
+
+def _run_frontier_with_candidate_outcomes(beats):
+    state = initialize_round_robin_frontier(beats)
+    while (attempt := next_round_robin_frontier_attempt(state)) is not None:
+        if attempt.stage == "local_preflight":
+            outcome = "local_preflight_passed"
+        elif attempt.stage == "exact_event":
+            outcome = "exact_event_passed"
+        elif attempt.candidate_id in {"a1", "c1"}:
+            outcome = "grounding_failed"
+        else:
+            outcome = "grounding_accepted"
+        state = record_round_robin_frontier_attempt(
+            state,
+            RoundRobinFrontierAttemptResult(
+                attempt=attempt,
+                outcome=outcome,
+            ),
+        )
+    return state
+
+
+def test_round_robin_frontier_finishes_round_one_before_round_two() -> None:
+    beats = (
+        _frontier_beat("c", 2, ("c1", False), ("c2", False)),
+        _frontier_beat("a", 0, ("a1", False), ("a2", False)),
+        _frontier_beat("b", 1, ("b1", True)),
+    )
+
+    state = _run_frontier_with_candidate_outcomes(beats)
+    paid_attempts = [
+        (
+            row.attempt.beat_id,
+            row.attempt.candidate_id,
+            row.attempt.round_index,
+            row.attempt.stage,
+        )
+        for row in state.attempt_history
+        if row.attempt.paid
+    ]
+
+    assert paid_attempts == [
+        ("a", "a1", 1, "grounding"),
+        ("b", "b1", 1, "exact_event"),
+        ("b", "b1", 1, "grounding"),
+        ("c", "c1", 1, "grounding"),
+        ("a", "a2", 2, "grounding"),
+        ("c", "c2", 2, "grounding"),
+    ]
+    assert [row.status for row in state.beats] == [
+        "accepted",
+        "accepted",
+        "accepted",
+    ]
+
+
+def test_round_robin_frontier_order_uses_explicit_story_order() -> None:
+    beats = (
+        _frontier_beat("a", 0, ("a1", False), ("a2", False)),
+        _frontier_beat("b", 1, ("b1", True)),
+        _frontier_beat("c", 2, ("c1", False), ("c2", False)),
+    )
+
+    forward = _run_frontier_with_candidate_outcomes(beats)
+    reversed_input = _run_frontier_with_candidate_outcomes(
+        tuple(reversed(beats))
+    )
+
+    forward_order = [
+        (
+            row.attempt.beat_id,
+            row.attempt.candidate_id,
+            row.attempt.stage,
+            row.outcome,
+        )
+        for row in forward.attempt_history
+    ]
+    reversed_order = [
+        (
+            row.attempt.beat_id,
+            row.attempt.candidate_id,
+            row.attempt.stage,
+            row.outcome,
+        )
+        for row in reversed_input.attempt_history
+    ]
+    assert reversed_order == forward_order
+
+
+def test_round_robin_frontier_local_failure_is_zero_paid() -> None:
+    state = initialize_round_robin_frontier(
+        (
+            _frontier_beat(
+                "beat",
+                0,
+                ("locally-bad", False),
+                ("usable", False),
+            ),
+        )
+    )
+
+    state = _record_frontier_outcome(
+        state,
+        "local_preflight_failed",
+    )
+    next_attempt = next_round_robin_frontier_attempt(state)
+
+    assert state.paid_calls_consumed == 0
+    assert next_attempt is not None
+    assert next_attempt.candidate_id == "usable"
+    assert next_attempt.round_index == 1
+    assert next_attempt.stage == "local_preflight"
+    assert not next_attempt.paid
+
+
+def test_round_robin_frontier_requires_exact_before_grounding() -> None:
+    state = initialize_round_robin_frontier(
+        (_frontier_beat("beat", 0, ("candidate", True)),)
+    )
+    state = _record_frontier_outcome(
+        state,
+        "local_preflight_passed",
+    )
+    exact_attempt = next_round_robin_frontier_attempt(state)
+    assert exact_attempt is not None
+    assert exact_attempt.stage == "exact_event"
+
+    out_of_order = exact_attempt.model_copy(update={"stage": "grounding"})
+    with pytest.raises(ValueError, match="stale or out-of-order"):
+        record_round_robin_frontier_attempt(
+            state,
+            RoundRobinFrontierAttemptResult(
+                attempt=out_of_order,
+                outcome="grounding_accepted",
+            ),
+        )
+
+    state = record_round_robin_frontier_attempt(
+        state,
+        RoundRobinFrontierAttemptResult(
+            attempt=exact_attempt,
+            outcome="exact_event_passed",
+        ),
+    )
+    grounding_attempt = next_round_robin_frontier_attempt(state)
+    assert grounding_attempt is not None
+    assert grounding_attempt.stage == "grounding"
+    assert grounding_attempt.candidate_id == "candidate"
 
 
 def _route_option(
