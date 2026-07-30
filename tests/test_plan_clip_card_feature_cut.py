@@ -16,6 +16,7 @@ from jascue_video_lab.clip_card_retrieval import (
     FeatureChapterShortlist,
     FeatureShortlistCandidate,
     FeatureShortlistPlan,
+    normalize_shortlist_event_ids,
 )
 from jascue_video_lab.clip_card_observations import (
     AssessmentStatus,
@@ -118,6 +119,75 @@ from scripts.shortlist_clip_card_feature_candidates import (
 
 
 ASSET_ID = "sha256:" + "a" * 64
+
+
+def test_shortlist_event_id_normalization_repairs_only_unique_zero_padding() -> None:
+    card = _card()
+    card = card.model_copy(
+        update={
+            "events": [
+                card.events[0].model_copy(update={"event_id": "evt_001"})
+            ]
+        }
+    )
+    payload = {
+        "chapters": [
+            {
+                "feature_id": "feature-1",
+                "candidates": [
+                    {
+                        "source_asset_id": ASSET_ID,
+                        "event_id": "evt_01",
+                    }
+                ],
+            }
+        ]
+    }
+
+    changes = normalize_shortlist_event_ids(
+        payload,
+        cards={ASSET_ID: card},
+    )
+
+    assert payload["chapters"][0]["candidates"][0]["event_id"] == "evt_001"
+    assert changes == [
+        {
+            "feature_id": "feature-1",
+            "source_asset_id": ASSET_ID,
+            "field": "event_id",
+            "from": "evt_01",
+            "to": "evt_001",
+            "reason": "unique_numeric_padding_equivalence",
+        }
+    ]
+
+
+def test_shortlist_event_id_normalization_leaves_ambiguous_ids_to_fail() -> None:
+    card = _card()
+    first = card.events[0].model_copy(update={"event_id": "evt_001"})
+    second = card.events[0].model_copy(update={"event_id": "evt_0001"})
+    card = card.model_copy(update={"events": [first, second]})
+    payload = {
+        "chapters": [
+            {
+                "feature_id": "feature-1",
+                "candidates": [
+                    {
+                        "source_asset_id": ASSET_ID,
+                        "event_id": "evt_01",
+                    }
+                ],
+            }
+        ]
+    }
+
+    changes = normalize_shortlist_event_ids(
+        payload,
+        cards={ASSET_ID: card},
+    )
+
+    assert changes == []
+    assert payload["chapters"][0]["candidates"][0]["event_id"] == "evt_01"
 
 
 def test_shortlist_reuse_binding_changes_with_effective_evidence() -> None:

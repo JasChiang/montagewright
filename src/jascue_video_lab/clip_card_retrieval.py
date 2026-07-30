@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Iterable, Literal
 
 from pydantic import Field, model_validator
@@ -19,6 +20,82 @@ from .clip_card_observations import (
 
 
 SHORTLIST_CONTRACT_VERSION = "clip-card-feature-shortlist-v1"
+
+
+def _numeric_padding_key(identifier: str) -> tuple[tuple[str, object], ...]:
+    """Preserve text exactly while making decimal zero padding comparable."""
+
+    return tuple(
+        ("number", int(part)) if part.isdigit() else ("text", part)
+        for part in re.split(r"(\d+)", identifier)
+        if part
+    )
+
+
+def normalize_shortlist_event_ids(
+    payload: object,
+    *,
+    cards: dict[str, FullClipCard],
+) -> list[dict[str, object]]:
+    """Repair only a unique zero-padding variant inside the referenced asset.
+
+    Gemini sometimes copies ``evt_001`` as ``evt_01`` even though the prompt
+    requires verbatim immutable IDs.  Treating arbitrary near-matches as
+    equivalent would weaken evidence binding, so this normalizer is narrower:
+    the source asset must already be exact, the textual ID components must be
+    byte-for-byte equal, and numeric-padding equivalence must identify exactly
+    one event in that card.  Ambiguous or otherwise unknown IDs remain
+    unchanged and fail the existing validator.
+    """
+
+    if not isinstance(payload, dict):
+        return []
+    chapters = payload.get("chapters")
+    if not isinstance(chapters, list):
+        return []
+    changes: list[dict[str, object]] = []
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        candidates = chapter.get("candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            source_asset_id = candidate.get("source_asset_id")
+            event_id = candidate.get("event_id")
+            if not isinstance(source_asset_id, str) or not isinstance(
+                event_id, str
+            ):
+                continue
+            card = cards.get(source_asset_id)
+            if card is None:
+                continue
+            canonical_ids = {event.event_id for event in card.events}
+            if event_id in canonical_ids:
+                continue
+            key = _numeric_padding_key(event_id)
+            matches = sorted(
+                canonical_id
+                for canonical_id in canonical_ids
+                if _numeric_padding_key(canonical_id) == key
+            )
+            if len(matches) != 1:
+                continue
+            canonical_id = matches[0]
+            candidate["event_id"] = canonical_id
+            changes.append(
+                {
+                    "feature_id": chapter.get("feature_id"),
+                    "source_asset_id": source_asset_id,
+                    "field": "event_id",
+                    "from": event_id,
+                    "to": canonical_id,
+                    "reason": "unique_numeric_padding_equivalence",
+                }
+            )
+    return changes
 
 
 class FeatureShortlistCandidate(FrozenStrictModel):

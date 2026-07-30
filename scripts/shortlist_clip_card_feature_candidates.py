@@ -18,6 +18,7 @@ from jascue_video_lab.billing import summarize_usage_files
 from jascue_video_lab.clip_card_retrieval import (
     FeatureShortlistPlan,
     compact_retrieval_card,
+    normalize_shortlist_event_ids,
     validate_feature_shortlist,
 )
 from jascue_video_lab.clip_card_observations import (
@@ -347,7 +348,10 @@ model_provenance 必須原樣回傳：
         write_json(raw_path, raw_interaction)
         write_json(raw_output_path, {"output_text": output_text})
     payload = json.loads(output_text)
-    normalization_changes: list[dict[str, object]] = []
+    normalization_changes = normalize_shortlist_event_ids(
+        payload,
+        cards=cards,
+    )
     for chapter in payload.get("chapters", []):
         candidates = chapter.get("candidates")
         if (
