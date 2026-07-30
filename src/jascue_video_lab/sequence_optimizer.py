@@ -122,6 +122,7 @@ class RoundRobinFrontierAttemptResult(FrozenStrictModel):
     accepted_candidate_id: str | None = None
     beat_omitted: bool = False
     decision_codes: tuple[str, ...] = ()
+    paid_calls_added: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_stage_outcome(self) -> "RoundRobinFrontierAttemptResult":
@@ -166,6 +167,11 @@ class RoundRobinFrontierAttemptResult(FrozenStrictModel):
                 "beat omission requires a terminal candidate failure and "
                 "cannot also accept a candidate"
             )
+        if self.attempt.stage == "local_preflight" and self.paid_calls_added not in {
+            None,
+            0,
+        }:
+            raise ValueError("local preflight cannot add a paid call")
         return self
 
 
@@ -431,7 +437,12 @@ def record_round_robin_frontier_attempt(
                 result,
             ),
             "paid_calls_consumed": (
-                state.paid_calls_consumed + int(expected.paid)
+                state.paid_calls_consumed
+                + (
+                    int(expected.paid)
+                    if result.paid_calls_added is None
+                    else result.paid_calls_added
+                )
             ),
         }
     )

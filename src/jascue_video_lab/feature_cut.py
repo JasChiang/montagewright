@@ -304,6 +304,7 @@ def _run_persisted_production_frontier(
     on_frontier_frozen: (
         Callable[[RoundRobinFrontierState, Mapping[str, str]], None] | None
     ) = None,
+    paid_interaction_counter: Callable[[], int] | None = None,
 ) -> Mapping[str, str]:
     """Drive one persisted production frontier without doing media work.
 
@@ -379,6 +380,11 @@ def _run_persisted_production_frontier(
     ) is not None:
         accepted_candidate_id: str | None = None
         beat_omitted = False
+        paid_count_before = (
+            paid_interaction_counter()
+            if paid_interaction_counter is not None
+            else None
+        )
         try:
             accepted_candidate_id = callbacks[attempt.stage](attempt)
             if (
@@ -430,6 +436,11 @@ def _run_persisted_production_frontier(
                 f"failure at {attempt.beat_id}/{attempt.candidate_id}/"
                 f"{attempt.stage}: {type(error).__name__}:{error}"
             ) from error
+        paid_calls_added = (
+            None
+            if paid_count_before is None
+            else max(0, paid_interaction_counter() - paid_count_before)
+        )
 
         state = record_round_robin_frontier_attempt(
             state,
@@ -439,6 +450,7 @@ def _run_persisted_production_frontier(
                 accepted_candidate_id=accepted_candidate_id,
                 beat_omitted=beat_omitted,
                 decision_codes=decision_codes,
+                paid_calls_added=paid_calls_added,
             ),
         )
         write_json(state_path, state)
@@ -449,7 +461,7 @@ def _run_persisted_production_frontier(
         )
         if just_updated.status == "exhausted":
             raise FeatureCutSystemFailure(
-                "production frontier exhausted a required beat before any "
+                "production frontier exhausted a non-omittable beat before any "
                 "lower-priority callback could run: "
                 + attempt.beat_id
             )
@@ -15688,6 +15700,46 @@ def _audit_feature_plan_candidate_recall(
     return {**body, "audit_sha256": _stable_fingerprint(body)}
 
 
+def _effective_runtime_source_reuse_authority(
+    selected: FeatureChapterSelect,
+    *,
+    prior_feature_id: str,
+    overlap_ms: int,
+    allowed_reuse_modes: Collection[str] | None,
+) -> tuple[str, str | None, str]:
+    """Resolve candidate-specific reuse after immutable intervals are known.
+
+    A fallback candidate can change the selected source after Gemini planning,
+    so chapter-level intent cannot authorize every runtime combination.
+    AUTO_POLICY may authorize a measured, zero-overlap distinct interval
+    without inventing semantic evidence. Overlap and presentation reprises
+    continue to require the planner's explicit typed authority.
+    """
+
+    if selected.source_reuse_mode != "none":
+        return (
+            selected.source_reuse_mode,
+            selected.source_reuse_justification,
+            "gemini_chapter_intent",
+        )
+    if (
+        overlap_ms == 0
+        and allowed_reuse_modes is not None
+        and "distinct_interval" in allowed_reuse_modes
+        and selected.selection_reason.strip()
+    ):
+        return (
+            "distinct_interval",
+            (
+                "AUTO_POLICY measured a non-overlapping runtime interval after "
+                f"{prior_feature_id}; existing chapter selection reason: "
+                f"{selected.selection_reason.strip()}"
+            ),
+            "auto_policy_runtime_interval",
+        )
+    return "none", None, "none"
+
+
 def _audit_render_source_reuse(
     plan: FeatureEditPlan,
     chapters: Sequence[Mapping[str, Any]],
@@ -15752,6 +15804,16 @@ def _audit_render_source_reuse(
                 and current_fingerprint
                 == prior.get("segment_render_fingerprint")
             )
+            (
+                effective_reuse_mode,
+                effective_justification,
+                reuse_authority_source,
+            ) = _effective_runtime_source_reuse_authority(
+                selected,
+                prior_feature_id=str(prior["feature_id"]),
+                overlap_ms=overlap_ms,
+                allowed_reuse_modes=allowed_reuse_modes,
+            )
             row = {
                 "aspect": aspect,
                 "feature_id": feature_id,
@@ -15768,38 +15830,37 @@ def _audit_render_source_reuse(
                 ),
                 "exact_interval_repeat": exact_interval,
                 "same_presentation": same_presentation,
-                "reuse_mode": selected.source_reuse_mode,
-                "justification": selected.source_reuse_justification,
+                "reuse_mode": effective_reuse_mode,
+                "justification": effective_justification,
+                "planned_reuse_mode": selected.source_reuse_mode,
+                "reuse_authority_source": reuse_authority_source,
                 "source_use_index": source_use_index,
                 "maximum_source_uses": 2,
                 "requires_human_review": (
-                    selected.source_reuse_mode
+                    effective_reuse_mode
                     in {"alternate_presentation", "editorial_reprise"}
                     or overlap_ms > 0
                 ),
             }
             row_violates = (
                 source_use_index > 2
-                or selected.source_reuse_mode == "none"
+                or effective_reuse_mode == "none"
                 or (
                     allowed_reuse_modes is not None
-                    and selected.source_reuse_mode
+                    and effective_reuse_mode
                     not in allowed_reuse_modes
                 )
-                or not (
-                    selected.source_reuse_justification
-                    and selected.source_reuse_justification.strip()
-                )
+                or not (effective_justification and effective_justification.strip())
                 or (
-                    selected.source_reuse_mode == "distinct_interval"
+                    effective_reuse_mode == "distinct_interval"
                     and overlap_ms > 0
                 )
                 or (
-                    selected.source_reuse_mode == "alternate_presentation"
+                    effective_reuse_mode == "alternate_presentation"
                     and same_presentation
                 )
                 or (
-                    selected.source_reuse_mode == "editorial_reprise"
+                    effective_reuse_mode == "editorial_reprise"
                     and max_editorial_reprise_overlap_fraction is not None
                     and reprise_overlap_fraction
                     > max_editorial_reprise_overlap_fraction
@@ -15897,20 +15958,32 @@ def _runtime_candidate_reuse_violation(
             if current_duration_ms > 0
             else 1.0
         )
-        justification = selected.source_reuse_justification
+        (
+            effective_reuse_mode,
+            effective_justification,
+            reuse_authority_source,
+        ) = _effective_runtime_source_reuse_authority(
+            selected,
+            prior_feature_id=str(prior["feature_id"]),
+            overlap_ms=overlap_ms,
+            allowed_reuse_modes=allowed_reuse_modes,
+        )
         violates = (
-            selected.source_reuse_mode == "none"
+            effective_reuse_mode == "none"
             or (
                 allowed_reuse_modes is not None
-                and selected.source_reuse_mode not in allowed_reuse_modes
+                and effective_reuse_mode not in allowed_reuse_modes
             )
-            or not (justification and justification.strip())
+            or not (
+                effective_justification
+                and effective_justification.strip()
+            )
             or (
-                selected.source_reuse_mode == "distinct_interval"
+                effective_reuse_mode == "distinct_interval"
                 and overlap_ms > 0
             )
             or (
-                selected.source_reuse_mode == "editorial_reprise"
+                effective_reuse_mode == "editorial_reprise"
                 and max_editorial_reprise_overlap_fraction is not None
                 and reprise_overlap_fraction
                 > max_editorial_reprise_overlap_fraction
@@ -15929,12 +16002,14 @@ def _runtime_candidate_reuse_violation(
                     reprise_overlap_fraction,
                     6,
                 ),
-                "reuse_mode": selected.source_reuse_mode,
-                "justification": justification,
+                "reuse_mode": effective_reuse_mode,
+                "justification": effective_justification,
+                "planned_reuse_mode": selected.source_reuse_mode,
+                "reuse_authority_source": reuse_authority_source,
                 "reason_code": (
                     "editorial_reprise_overlap_exceeds_autonomous_limit"
                     if (
-                        selected.source_reuse_mode == "editorial_reprise"
+                        effective_reuse_mode == "editorial_reprise"
                         and max_editorial_reprise_overlap_fraction is not None
                         and reprise_overlap_fraction
                         > max_editorial_reprise_overlap_fraction
@@ -20761,6 +20836,11 @@ def _run_feature_cut_experiment_impl(
                     .allow_optional_beat_omission
                     and music_lock is None
                     and not render_horizontal
+                ),
+                paid_interaction_counter=(
+                    (lambda: budget_ledger.committed_interactions)
+                    if budget_ledger is not None
+                    else None
                 ),
             )
             autonomous_vertical_frontier_selected_ids.update(

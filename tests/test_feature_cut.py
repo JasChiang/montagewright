@@ -1303,6 +1303,43 @@ def test_production_frontier_local_failure_uses_no_paid_callback(
     assert state.attempt_history[1].attempt.round_index == 1
 
 
+def test_production_frontier_counts_actual_dispatch_delta_not_paid_capability(
+    tmp_path: Path,
+) -> None:
+    committed = 0
+
+    def reject_before_dispatch(_attempt) -> None:
+        raise CandidateKnownInfeasible(
+            "rejected before provider dispatch"
+        )
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="non-omittable beat",
+    ):
+        _run_persisted_production_frontier(
+            state_path=tmp_path / "frontier.json",
+            beats=(
+                _production_frontier_beat(
+                    "beat",
+                    0,
+                    ("candidate", False),
+                ),
+            ),
+            local_preflight=lambda _attempt: None,
+            exact_event=lambda _attempt: None,
+            grounding=reject_before_dispatch,
+            paid_interaction_counter=lambda: committed,
+        )
+
+    state = RoundRobinFrontierState.model_validate_json(
+        (tmp_path / "frontier.json").read_text(encoding="utf-8")
+    )
+    assert state.paid_calls_consumed == 0
+    assert state.attempt_history[-1].attempt.paid is True
+    assert state.attempt_history[-1].paid_calls_added == 0
+
+
 def test_production_frontier_exact_precedes_grounding(
     tmp_path: Path,
 ) -> None:
@@ -11466,6 +11503,124 @@ def test_runtime_candidate_reuse_allows_authorized_distinct_interval() -> None:
     )
     assert policy_block is not None
     assert policy_block["reuse_mode"] == "distinct_interval"
+
+
+def test_runtime_candidate_reuse_auto_policy_authorizes_measured_distinct_interval(
+) -> None:
+    selected = FeatureChapterSelect(
+        feature_id="second",
+        evidence_status="supported",
+        observed_visual_evidence="A later, distinct action.",
+        selection_reason="Shows a visibly different later action.",
+        horizontal_frame_id="RF000002",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000002",
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+    )
+    prior = [
+        {
+            "feature_id": "first",
+            "source_clip_id": "clip-a",
+            "source_in_ms": 1000,
+            "source_out_ms": 3000,
+        }
+    ]
+
+    assert (
+        _runtime_candidate_reuse_violation(
+            selected,
+            prior,
+            source_clip_id="clip-a",
+            source_in_ms=4000,
+            source_out_ms=6000,
+            allowed_reuse_modes={"distinct_interval"},
+        )
+        is None
+    )
+    overlap = _runtime_candidate_reuse_violation(
+        selected,
+        prior,
+        source_clip_id="clip-a",
+        source_in_ms=2500,
+        source_out_ms=4500,
+        allowed_reuse_modes={"distinct_interval"},
+    )
+    assert overlap is not None
+    assert overlap["reuse_authority_source"] == "none"
+
+
+def test_render_reuse_audit_records_runtime_auto_policy_authority() -> None:
+    first = FeatureChapterSelect(
+        feature_id="first",
+        evidence_status="supported",
+        observed_visual_evidence="First action.",
+        selection_reason="Introduces the action.",
+        horizontal_frame_id="RF000001",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000001",
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+    )
+    second = first.model_copy(
+        update={
+            "feature_id": "second",
+            "horizontal_frame_id": "RF000002",
+            "vertical_frame_id": "RF000002",
+            "selection_reason": "Shows a different later state.",
+        }
+    )
+    plan = FeatureEditPlan(
+        project_id="generic-project",
+        catalog_id="generic-catalog",
+        title="Generic",
+        chapters=[first, second],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    audit = _audit_render_source_reuse(
+        plan,
+        [
+            {
+                "feature_id": "first",
+                "source_clip_id": "clip-a",
+                "source_in_ms": 1000,
+                "source_out_ms": 3000,
+                "segment_render_fingerprint": "first",
+            },
+            {
+                "feature_id": "second",
+                "source_clip_id": "clip-a",
+                "source_in_ms": 4000,
+                "source_out_ms": 6000,
+                "segment_render_fingerprint": "second",
+            },
+        ],
+        aspect="9x16",
+        allowed_reuse_modes={"distinct_interval"},
+    )
+    assert audit["status"] == "passed"
+    assert audit["rows"][0]["reuse_mode"] == "distinct_interval"
+    assert (
+        audit["rows"][0]["reuse_authority_source"]
+        == "auto_policy_runtime_interval"
+    )
+    assert audit["rows"][0]["planned_reuse_mode"] == "none"
 
 
 def test_autonomous_editorial_reprise_rejects_major_interval_overlap() -> None:
