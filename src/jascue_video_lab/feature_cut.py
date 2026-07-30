@@ -581,7 +581,9 @@ def _load_or_create_frontier_stage_artifact(
         policy_reference=policy_reference,
         route_sha256=route_sha256,
     )
-    if os.path.lexists(artifact_path) and not artifact_path.is_file():
+    if os.path.lexists(artifact_path) and (
+        artifact_path.is_symlink() or not artifact_path.is_file()
+    ):
         raise FeatureCutSystemFailure(
             "persisted vertical frontier stage artifact path exists but is "
             "not a regular file"

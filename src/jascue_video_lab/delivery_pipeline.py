@@ -605,9 +605,14 @@ def _refresh_stale_clip_cards(
     catalog_path: Path,
     prepared_library_path: Path | None,
     output_dir: Path,
-    budget_ledger: BudgetLedger,
+    max_cold_ingest_cost_usd: float | None,
 ) -> tuple[dict[str, Any], ...]:
-    """Refresh only stale/missing Base Clip Cards and archive prior lineage."""
+    """Refresh stale cards under a graph-sized, cold-only budget ledger.
+
+    Discovery completes before the first paid dispatch. Completed refresh
+    records from the same output namespace are adopted into the cold ledger,
+    so a process restart cannot regain already-spent money.
+    """
 
     resolved_catalog = catalog_path.expanduser().resolve(strict=True)
     catalog = RushesCatalog.model_validate(read_json(resolved_catalog))
@@ -616,6 +621,114 @@ def _refresh_stale_clip_cards(
         prepared_library_path=prepared_library_path,
         create_explicit=prepared_library_path is not None,
     )
+    planned_refreshes: list[tuple[Any, Path, str]] = []
+    for clip in catalog.clips:
+        clip_root = library / "clips" / clip.sha256[:16]
+        stale_reason = _clip_card_entry_stale_reason(
+            clip=clip,
+            clip_root=clip_root,
+        )
+        if stale_reason is not None:
+            planned_refreshes.append((clip, clip_root, stale_reason))
+
+    cold_root = output_dir / "cold-ingest"
+    prior_records: list[Mapping[str, Any]] = []
+    for record_path in sorted(cold_root.glob("*/refresh-record.json")):
+        payload = read_json(record_path)
+        if not isinstance(payload, Mapping):
+            raise DeliveryPipelineBlocked(
+                f"cold-ingest refresh record is not an object: {record_path}"
+            )
+        usage = payload.get("usage")
+        source_asset_id = str(payload.get("source_asset_id") or "")
+        if (
+            not isinstance(usage, Mapping)
+            or int(usage.get("request_count") or 0) != 1
+            or not source_asset_id.startswith("sha256:")
+        ):
+            raise DeliveryPipelineBlocked(
+                "cold-ingest refresh record lacks one immutable paid usage "
+                f"claim: {record_path}"
+            )
+        prior_records.append(payload)
+    prior_failed_dispatches: list[Mapping[str, Any]] = []
+    for record_path in sorted(
+        cold_root.glob("*/failed-dispatch-record.json")
+    ):
+        payload = read_json(record_path)
+        if not isinstance(payload, Mapping):
+            raise DeliveryPipelineBlocked(
+                f"cold-ingest failure record is not an object: {record_path}"
+            )
+        if payload.get("charged_interaction") is not True:
+            continue
+        usage = payload.get("usage")
+        if not isinstance(usage, Mapping):
+            raise DeliveryPipelineBlocked(
+                "charged cold-ingest failure has no immutable usage reserve: "
+                f"{record_path}"
+            )
+        prior_failed_dispatches.append(payload)
+
+    total_cold_interactions = len(prior_records) + max(
+        len(planned_refreshes),
+        len(prior_failed_dispatches),
+    )
+    if total_cold_interactions == 0:
+        write_json(
+            cold_root / "budget-report.json",
+            {
+                "contract_version": "cold-ingest-budget-report-v1",
+                "namespace": "cold_ingest",
+                "planned_refresh_count": 0,
+                "adopted_refresh_count": 0,
+                "budget": None,
+                "generated_at": utc_now(),
+            },
+        )
+        return ()
+    if max_cold_ingest_cost_usd is None:
+        raise DeliveryPipelineBlocked(
+            f"{len(planned_refreshes)} stale or missing Clip Cards require "
+            "paid refresh, but policy budget.max_cold_ingest_cost_usd is "
+            "not authorized"
+        )
+
+    cold_ledger = BudgetLedger(
+        max_cost_usd=max_cold_ingest_cost_usd,
+        max_interactions=total_cold_interactions,
+        reserved_recovery_fraction=0.20,
+        mandatory_stage_minimums={
+            "autonomous_base_clip_card_refresh": total_cold_interactions,
+        },
+    )
+    for record in prior_records:
+        cold_ledger.adopt_reconciled_usage(
+            stage="autonomous_base_clip_card_refresh",
+            model_id=MODEL_ID,
+            usage=record["usage"],
+        )
+    for record in prior_failed_dispatches:
+        cold_ledger.adopt_reconciled_usage(
+            stage="autonomous_base_clip_card_refresh",
+            model_id=MODEL_ID,
+            usage=record["usage"],
+        )
+    write_json(
+        cold_root / "budget-report.json",
+        {
+            "contract_version": "cold-ingest-budget-report-v1",
+            "namespace": "cold_ingest",
+            "planned_refresh_count": len(planned_refreshes),
+            "adopted_refresh_count": len(prior_records),
+            "adopted_failed_dispatch_count": len(
+                prior_failed_dispatches
+            ),
+            "budget": cold_ledger.report(),
+            "generated_at": utc_now(),
+        },
+    )
+
     refresh_records: list[dict[str, Any]] = []
     entrypoint = Path(sys.executable).with_name("jascue-video-lab")
     if not entrypoint.is_file():
@@ -623,14 +736,7 @@ def _refresh_stale_clip_cards(
             "cannot refresh Clip Cards because the installed CLI entrypoint "
             "is unavailable"
         )
-    for clip in catalog.clips:
-        clip_root = library / "clips" / clip.sha256[:16]
-        stale_reason = _clip_card_entry_stale_reason(
-            clip=clip,
-            clip_root=clip_root,
-        )
-        if stale_reason is None:
-            continue
+    for clip, clip_root, stale_reason in planned_refreshes:
         refresh_root = (
             library
             / ".refresh"
@@ -655,14 +761,14 @@ def _refresh_stale_clip_cards(
                 command=command,
                 stage="autonomous_base_clip_card_refresh",
                 stage_dir=refresh_root,
-                budget_ledger=budget_ledger,
+                budget_ledger=cold_ledger,
                 estimated_text_tokens=12_000,
                 media_duration_ms=int(clip.duration_ms),
                 media_resolution="low",
                 max_output_tokens=4_096,
                 thinking_level="low",
             )
-        except BaseException:
+        except BaseException as error:
             for raw_path in refresh_root.rglob("*raw_interaction.json"):
                 relative = raw_path.relative_to(refresh_root)
                 destination = run_record_dir / relative
@@ -674,6 +780,54 @@ def _refresh_stale_clip_cards(
                     failed_orchestration,
                     run_record_dir / "orchestration.json",
                 )
+            failed_payload = (
+                read_json(failed_orchestration)
+                if failed_orchestration.is_file()
+                else {}
+            )
+            failed_usage = (
+                failed_payload.get("usage")
+                if isinstance(failed_payload, Mapping)
+                and isinstance(failed_payload.get("usage"), Mapping)
+                else {}
+            )
+            charged_interaction = bool(
+                int(failed_usage.get("request_count") or 0)
+                or failed_usage.get("usage_status")
+                == "dispatch_recorded_usage_unavailable"
+            )
+            write_json(
+                run_record_dir / "failed-dispatch-record.json",
+                {
+                    "contract_version": (
+                        "base-clip-card-refresh-failure-v1"
+                    ),
+                    "source_asset_id": f"sha256:{clip.sha256}",
+                    "reason_code": stale_reason,
+                    "charged_interaction": charged_interaction,
+                    "usage": failed_usage,
+                    "error": {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                    },
+                    "generated_at": utc_now(),
+                },
+            )
+            write_json(
+                cold_root / "budget-report.json",
+                {
+                    "contract_version": "cold-ingest-budget-report-v1",
+                    "namespace": "cold_ingest",
+                    "planned_refresh_count": len(planned_refreshes),
+                    "adopted_refresh_count": len(prior_records),
+                    "adopted_failed_dispatch_count": len(
+                        prior_failed_dispatches
+                    ),
+                    "completed_refresh_count": len(refresh_records),
+                    "budget": cold_ledger.report(),
+                    "generated_at": utc_now(),
+                },
+            )
             raise
         refreshed_reason = _clip_card_entry_stale_reason(
             clip=clip,
@@ -706,6 +860,41 @@ def _refresh_stale_clip_cards(
             clip_root.rename(archived_path)
         clip_root.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(refresh_root), str(clip_root))
+        # Planning journals are created while the artifact lives under the
+        # temporary refresh root. Rebind their local provenance after the
+        # atomic move so the durable journal never points at a vanished path.
+        for journal_path in clip_root.rglob("*.paid_dispatch.json"):
+            journal = read_json(journal_path)
+            if not isinstance(journal, Mapping):
+                raise DeliveryPipelineBlocked(
+                    f"invalid cold-ingest dispatch journal: {journal_path}"
+                )
+            rebound = dict(journal)
+            for key in ("raw_artifact_path",):
+                raw_value = rebound.get(key)
+                if isinstance(raw_value, str):
+                    try:
+                        relative = Path(raw_value).relative_to(refresh_root)
+                    except ValueError:
+                        continue
+                    rebound[key] = str((clip_root / relative).resolve())
+            migration = rebound.get("migration")
+            if isinstance(migration, Mapping):
+                rebound_migration = dict(migration)
+                request_value = rebound_migration.get("request_path")
+                if isinstance(request_value, str):
+                    try:
+                        relative = Path(request_value).relative_to(
+                            refresh_root
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        rebound_migration["request_path"] = str(
+                            (clip_root / relative).resolve()
+                        )
+                rebound["migration"] = rebound_migration
+            write_json(journal_path, rebound)
         record = {
             "contract_version": "base-clip-card-refresh-v1",
             "source_asset_id": f"sha256:{clip.sha256}",
@@ -721,6 +910,21 @@ def _refresh_stale_clip_cards(
         }
         write_json(run_record_dir / "refresh-record.json", record)
         refresh_records.append(record)
+        write_json(
+            cold_root / "budget-report.json",
+            {
+                "contract_version": "cold-ingest-budget-report-v1",
+                "namespace": "cold_ingest",
+                "planned_refresh_count": len(planned_refreshes),
+                "adopted_refresh_count": len(prior_records),
+                "adopted_failed_dispatch_count": len(
+                    prior_failed_dispatches
+                ),
+                "completed_refresh_count": len(refresh_records),
+                "budget": cold_ledger.report(),
+                "generated_at": utc_now(),
+            },
+        )
     return tuple(refresh_records)
 
 
@@ -931,7 +1135,9 @@ def _prepare_fresh_autonomous_direct_plan(
         catalog_path=catalog_path,
         prepared_library_path=prepared_library_path,
         output_dir=output_dir,
-        budget_ledger=budget_ledger,
+        max_cold_ingest_cost_usd=(
+            policy.budget.max_cold_ingest_cost_usd
+        ),
     )
     archived_supplements = _archive_stale_clip_card_supplements(
         catalog_path=catalog_path,
@@ -1114,6 +1320,9 @@ def _prepare_fresh_autonomous_direct_plan(
         "contract_version": "fresh-autonomous-direct-plan-orchestration-v1",
         "prepared_library": str(library),
         "clip_card_refreshes": list(clip_card_refreshes),
+        "cold_ingest_budget_report": str(
+            (output_dir / "cold-ingest" / "budget-report.json").resolve()
+        ),
         "archived_stale_supplements": list(archived_supplements),
         "supplements": [str(path) for path in supplements],
         "shortlist_path": str(shortlist_path.resolve()),

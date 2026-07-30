@@ -23,7 +23,11 @@ from jascue_video_lab.final_edit_qa import (
     DeterministicDeliveryEvidence,
     run_deterministic_delivery_qa,
 )
-from jascue_video_lab.billing import BudgetLedger
+from jascue_video_lab.billing import (
+    BudgetExceeded,
+    BudgetLedger,
+    estimate_paid_call,
+)
 from jascue_video_lab.cli import build_parser
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.storage import read_json, write_json
@@ -2050,10 +2054,7 @@ def test_stale_clip_card_refresh_archives_prior_lineage(
         catalog_path=catalog_path,
         prepared_library_path=library,
         output_dir=tmp_path / "delivery",
-        budget_ledger=BudgetLedger(
-            max_cost_usd=1.25,
-            max_interactions=25,
-        ),
+        max_cold_ingest_cost_usd=1.25,
     )
     assert records[0]["reason_code"] == "stale_prompt"
     assert (old_root / "orchestration.json").is_file()
@@ -2066,6 +2067,137 @@ def test_stale_clip_card_refresh_archives_prior_lineage(
         / digest[:16]
         / "refresh-record.json"
     ).is_file()
+
+
+def test_stale_clip_card_refresh_requires_explicit_cold_budget_before_paid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    digest = "c" * 64
+    clip = SimpleNamespace(
+        sha256=digest,
+        duration_ms=10_000,
+        path=str(source),
+    )
+    catalog_path = tmp_path / "catalog.json"
+    write_json(catalog_path, {})
+    library = tmp_path / "clip-cards"
+    calls: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "RushesCatalog",
+        SimpleNamespace(
+            model_validate=lambda _payload: SimpleNamespace(clips=(clip,))
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_prepared_clip_card_library_root",
+        lambda **_kwargs: library,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_clip_card_entry_stale_reason",
+        lambda **_kwargs: "missing",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_run_budgeted_planning_stage",
+        lambda **_kwargs: calls.append("paid"),
+    )
+
+    with pytest.raises(
+        pipeline.DeliveryPipelineBlocked,
+        match="max_cold_ingest_cost_usd",
+    ):
+        pipeline._refresh_stale_clip_cards(
+            catalog_path=catalog_path,
+            prepared_library_path=library,
+            output_dir=tmp_path / "delivery",
+            max_cold_ingest_cost_usd=None,
+        )
+
+    assert calls == []
+
+
+def test_cold_refresh_resume_adopts_failed_dispatch_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    digest = "d" * 64
+    clip = SimpleNamespace(
+        sha256=digest,
+        duration_ms=10_000,
+        path=str(source),
+    )
+    catalog_path = tmp_path / "catalog.json"
+    write_json(catalog_path, {})
+    library = tmp_path / "clip-cards"
+    output_dir = tmp_path / "delivery"
+    write_json(
+        output_dir
+        / "cold-ingest"
+        / digest[:16]
+        / "failed-dispatch-record.json",
+        {
+            "charged_interaction": True,
+            "usage": {
+                "request_count": 0,
+                "usage_status": "dispatch_recorded_usage_unavailable",
+                "total_input_tokens": 10_000,
+                "total_cached_input_tokens": 0,
+                "total_output_tokens": 4_096,
+                "total_thought_tokens": 1_024,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "RushesCatalog",
+        SimpleNamespace(
+            model_validate=lambda _payload: SimpleNamespace(clips=(clip,))
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_prepared_clip_card_library_root",
+        lambda **_kwargs: library,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_clip_card_entry_stale_reason",
+        lambda **_kwargs: "missing",
+    )
+
+    def assert_no_regained_dispatch(**kwargs):
+        estimate = estimate_paid_call(
+            stage="autonomous_base_clip_card_refresh",
+            model_id=pipeline.MODEL_ID,
+            media_duration_ms=10_000,
+            media_resolution="low",
+            text_input_tokens=1_000,
+            max_output_tokens=256,
+            thinking_level="minimal",
+        )
+        kwargs["budget_ledger"].reserve(estimate)
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_budgeted_planning_stage",
+        assert_no_regained_dispatch,
+    )
+
+    with pytest.raises(BudgetExceeded, match="interaction reserve"):
+        pipeline._refresh_stale_clip_cards(
+            catalog_path=catalog_path,
+            prepared_library_path=library,
+            output_dir=output_dir,
+            max_cold_ingest_cost_usd=1.25,
+        )
 
 
 def test_direct_plan_reuse_requires_exact_current_shortlist_binding(

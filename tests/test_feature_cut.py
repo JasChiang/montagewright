@@ -606,6 +606,31 @@ def test_frontier_stage_non_regular_path_never_dispatches_producer(
         )
 
 
+@pytest.mark.parametrize("target_exists", (False, True))
+def test_frontier_stage_symlink_never_dispatches_producer(
+    tmp_path: Path,
+    target_exists: bool,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+    artifact_path = kwargs["artifact_path"]
+    assert isinstance(artifact_path, Path)
+    symlink_target = tmp_path / "untrusted-stage-target.json"
+    if target_exists:
+        symlink_target.write_text("{}", encoding="utf-8")
+    artifact_path.symlink_to(symlink_target)
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="not a regular file",
+    ):
+        _load_or_create_frontier_stage_artifact(
+            **kwargs,
+            producer=lambda: pytest.fail(
+                "symlink artifact path dispatched paid producer"
+            ),
+        )
+
+
 def test_frontier_stage_rejects_tuple_wrapped_mapping_payload(
     tmp_path: Path,
 ) -> None:

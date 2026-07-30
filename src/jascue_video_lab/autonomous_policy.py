@@ -51,6 +51,14 @@ class DurationPolicy(FrozenStrictModel):
 
 class BudgetPolicy(FrozenStrictModel):
     max_gemini_cost_usd: float = Field(gt=0.0, le=100.0)
+    # Cold Base Clip Card ingest is deliberately separate from the warm-edit
+    # allowance. ``None`` is fail-closed: a warm run may reuse current cards,
+    # but it may not silently spend money refreshing stale or missing cards.
+    max_cold_ingest_cost_usd: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=100.0,
+    )
     max_paid_interactions: int = Field(ge=1, le=100)
     # V1 production does not yet have a complete bounded semantic-replan
     # executor. Keep the safe default disabled; a caller may explicitly grant
