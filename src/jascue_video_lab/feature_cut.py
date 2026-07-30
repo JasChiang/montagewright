@@ -663,7 +663,12 @@ def _load_or_create_frontier_stage_artifact(
             )
         return dict(payload)
 
-    payload = dict(producer())
+    produced = producer()
+    if not isinstance(produced, Mapping):
+        raise FeatureCutSystemFailure(
+            "frontier stage producer returned a non-mapping payload"
+        )
+    payload = dict(produced)
     artifact = {
         "contract_version": "vertical-frontier-stage-artifact-v1",
         "beat_id": beat_id,
@@ -20380,7 +20385,7 @@ def _run_feature_cut_experiment_impl(
                                         ),
                                         output_dir=output_dir,
                                         policy=autonomous_policy,
-                                    ),
+                                    )
                                 ),
                             )
                         )

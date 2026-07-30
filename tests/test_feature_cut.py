@@ -606,6 +606,23 @@ def test_frontier_stage_non_regular_path_never_dispatches_producer(
         )
 
 
+def test_frontier_stage_rejects_tuple_wrapped_mapping_payload(
+    tmp_path: Path,
+) -> None:
+    kwargs = _frontier_stage_artifact_kwargs(tmp_path)
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="non-mapping payload",
+    ):
+        _load_or_create_frontier_stage_artifact(
+            **kwargs,
+            producer=lambda: ({"looks_like": "mapping"},),
+        )
+
+    assert not kwargs["artifact_path"].exists()
+
+
 def test_frontier_stage_legacy_dependency_schema_is_not_migrated(
     tmp_path: Path,
 ) -> None:
