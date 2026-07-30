@@ -1401,7 +1401,9 @@ def _candidate_source_start_range(
     # the preferred position, never an immutable trim.
     minimum_start_ms = max(
         option.safe_window_start_ms,
-        option.source_anchor_ms - duration_ms,
+        # Source intervals are half-open.  An anchor exactly at source_out_ms
+        # is not part of the execution and cannot satisfy semantic evidence.
+        option.source_anchor_ms - duration_ms + 1,
     )
     maximum_start_ms = min(
         option.source_anchor_ms,

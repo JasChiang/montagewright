@@ -830,6 +830,42 @@ def test_center_overlap_still_rejects_when_safe_window_cannot_move() -> None:
         )
 
 
+def test_source_anchor_at_half_open_out_boundary_is_not_a_valid_execution() -> None:
+    first = _movable_route_option(
+        "watch_lineup",
+        "lineup",
+        "a",
+        duration_ms=4_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=23_524,
+        source_anchor_ms=6_000,
+    )
+    second = _movable_route_option(
+        "watch_ui",
+        "ui",
+        "a",
+        duration_ms=5_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=23_524,
+        source_anchor_ms=6_000,
+        reuse_mode="distinct_interval",
+    )
+
+    with pytest.raises(ValueError, match="no options for beat watch_ui"):
+        optimize_pre_render_candidate_route(
+            (
+                CandidateRouteBeat(
+                    beat_id="watch_lineup",
+                    options=(first,),
+                ),
+                CandidateRouteBeat(
+                    beat_id="watch_ui",
+                    options=(second,),
+                ),
+            )
+        )
+
+
 def test_independent_fallback_conflict_never_becomes_complete_route() -> None:
     beats = (
         CandidateRouteBeat(
