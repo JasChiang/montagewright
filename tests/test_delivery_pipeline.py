@@ -96,6 +96,83 @@ def test_budgeted_planning_failure_preserves_subprocess_output(
     assert ledger.committed_interactions == 0
 
 
+def test_warm_dispatch_migration_counts_attempt_and_alias_once(
+    tmp_path: Path,
+) -> None:
+    stage_dir = tmp_path / "picture" / "gemini-plan"
+    write_json(
+        stage_dir / "orchestration.json",
+        {
+            "contract_version": "autonomous-planning-orchestration-v1",
+            "stage": "autonomous_direct_video_edit_plan",
+        },
+    )
+    request = {
+        "model": "gemini-3.6-flash",
+        "input": [{"type": "text", "text": "plan"}],
+        "generation_config": {
+            "max_output_tokens": 512,
+            "thinking_level": "low",
+        },
+    }
+    raw = {
+        "id": "interaction-plan-1",
+        "model": "gemini-3.6-flash",
+        "usage": {
+            "total_input_tokens": 100,
+            "total_cached_tokens": 0,
+            "total_output_tokens": 20,
+            "total_thought_tokens": 4,
+        },
+    }
+    for stem in (
+        "clip-card-feature-plan.attempt-01",
+        "clip-card-feature-plan",
+    ):
+        write_json(stage_dir / f"{stem}.request.json", request)
+        write_json(stage_dir / f"{stem}.raw_interaction.json", raw)
+
+    migrated = pipeline._migrate_completed_warm_dispatches(
+        root=tmp_path,
+        allowed_top_level={"picture"},
+    )
+    assert len(migrated) == 1
+
+    ledger = BudgetLedger(max_cost_usd=1.25, max_interactions=25)
+    adopted, raw_paths = (
+        pipeline.adopt_paid_dispatch_journal_state(
+            budget_ledger=ledger,
+            root=tmp_path,
+            allowed_top_level={"picture"},
+        )
+    )
+    assert len(adopted) == 1
+    assert ledger.committed_interactions == 1
+    assert not pipeline._find_unjournaled_warm_paid_artifacts(
+        root=tmp_path,
+        allowed_top_level={"picture"},
+        journaled_raw_paths=raw_paths,
+    )
+
+    orphan = stage_dir / "other.raw_interaction.json"
+    write_json(
+        orphan,
+        {
+            **raw,
+            "id": "interaction-plan-2",
+            "usage": {
+                **raw["usage"],
+                "total_input_tokens": 101,
+            },
+        },
+    )
+    assert pipeline._find_unjournaled_warm_paid_artifacts(
+        root=tmp_path,
+        allowed_top_level={"picture"},
+        journaled_raw_paths=raw_paths,
+    ) == (orphan,)
+
+
 def test_mandatory_budget_holds_are_derived_from_contract_graph(
     tmp_path: Path,
 ) -> None:

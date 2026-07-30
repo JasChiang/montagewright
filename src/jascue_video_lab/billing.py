@@ -410,6 +410,124 @@ def _paid_work_node_id(*, stage: str, request_sha256: str) -> str:
     ).hexdigest()
 
 
+def migrate_completed_legacy_paid_dispatch(
+    *,
+    stage: str,
+    request_path: Path,
+    raw_artifact_path: Path,
+) -> Path:
+    """Create a zero-dispatch journal for one proven legacy paid response.
+
+    This is accounting/resume lineage only. Semantic reuse remains governed
+    by the caller's independent input/schema bindings. Both immutable request
+    and raw usage artifacts must already exist; this function never calls a
+    provider and never invents missing usage.
+    """
+
+    request = read_json(request_path)
+    raw = read_json(raw_artifact_path)
+    if not isinstance(request, Mapping) or not isinstance(raw, Mapping):
+        raise ValueError("legacy paid migration requires object artifacts")
+    usage = raw.get("usage")
+    if not isinstance(usage, Mapping) or not usage:
+        raise ValueError(
+            "legacy paid migration requires durable raw usage"
+        )
+    model_id = str(request.get("model") or raw.get("model") or "")
+    if not model_id:
+        raise ValueError("legacy paid migration has no model ID")
+    generation_config = request.get("generation_config")
+    generation = (
+        generation_config
+        if isinstance(generation_config, Mapping)
+        else {}
+    )
+    estimate = estimate_paid_call(
+        stage=stage,
+        model_id=model_id,
+        text_input_tokens=max(
+            1,
+            int(usage.get("total_input_tokens") or 0),
+        ),
+        max_output_tokens=max(
+            1,
+            int(
+                generation.get("max_output_tokens")
+                or usage.get("total_output_tokens")
+                or 1
+            ),
+        ),
+        thinking_level=str(
+            generation.get("thinking_level") or "low"
+        ),
+        retry_allowance=0,
+    )
+    request_sha256 = _canonical_request_sha256(request)
+    work_node_id = _paid_work_node_id(
+        stage=stage,
+        request_sha256=request_sha256,
+    )
+    safe_stage = re.sub(r"[^A-Za-z0-9._-]+", "-", stage).strip("-")
+    journal_path = request_path.parent / (
+        f"{safe_stage}.{request_sha256}.paid_dispatch.json"
+    )
+    request_file_sha256 = hashlib.sha256(
+        request_path.read_bytes()
+    ).hexdigest()
+    raw_file_sha256 = hashlib.sha256(
+        raw_artifact_path.read_bytes()
+    ).hexdigest()
+    dispatch_id = hashlib.sha256(
+        (
+            "legacy-completed-paid-dispatch-v1:"
+            + stage
+            + ":"
+            + request_sha256
+            + ":"
+            + raw_file_sha256
+        ).encode("utf-8")
+    ).hexdigest()
+    journal = {
+        "contract_version": "paid-dispatch-journal-v2",
+        "work_node_id": work_node_id,
+        "dispatch_id": dispatch_id,
+        "request_sha256": request_sha256,
+        "stage": stage,
+        "model_id": model_id,
+        "estimate": asdict(estimate),
+        "status": "raw_usage_persisted",
+        "request_artifact_persisted": True,
+        "raw_usage_persisted": True,
+        "raw_artifact_path": str(raw_artifact_path.resolve()),
+        "interaction_id": str(raw.get("id") or ""),
+        "migration": {
+            "contract_version": (
+                "completed-legacy-paid-dispatch-migration-v1"
+            ),
+            "request_path": str(request_path.resolve()),
+            "request_file_sha256": request_file_sha256,
+            "raw_file_sha256": raw_file_sha256,
+            "provider_dispatch_added": False,
+        },
+        "completed_at": utc_now(),
+    }
+    if journal_path.is_file():
+        saved = read_json(journal_path)
+        if saved != journal:
+            # completed_at is intentionally stable after first migration.
+            saved_without_time = dict(saved)
+            journal_without_time = dict(journal)
+            saved_without_time.pop("completed_at", None)
+            journal_without_time.pop("completed_at", None)
+            if saved_without_time != journal_without_time:
+                raise ValueError(
+                    "legacy paid dispatch migration journal changed"
+                )
+        return journal_path
+    write_json(journal_path, journal)
+    return journal_path
+
+
 def _estimate_from_dispatch_journal(payload: Mapping[str, Any]) -> PaidCallEstimate:
     raw = payload.get("estimate")
     if not isinstance(raw, Mapping):

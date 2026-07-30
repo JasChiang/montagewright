@@ -23,6 +23,7 @@ from .billing import (
     BudgetLedger,
     adopt_paid_dispatch_journal_state,
     estimate_paid_call,
+    migrate_completed_legacy_paid_dispatch,
     summarize_usage_and_list_price,
 )
 from .clip_card_observations import (
@@ -584,6 +585,14 @@ def _run_budgeted_planning_stage(
                 "generated_at": utc_now(),
             },
         )
+    try:
+        _migrate_completed_planning_dispatches(
+            stage_dir=stage_dir,
+            stage=stage,
+        )
+    except BaseException as caught:
+        if error is None:
+            error = caught
     if error is not None:
         raise DeliveryPipelineBlocked(
             f"{stage} failed; immutable subprocess artifacts were preserved"
@@ -2088,6 +2097,102 @@ def _load_reusable_picture_result(
     return result
 
 
+def _migrate_completed_planning_dispatches(
+    *,
+    stage_dir: Path,
+    stage: str,
+) -> tuple[Path, ...]:
+    """Journal completed child-process calls without dispatching again."""
+
+    if not stage_dir.is_dir():
+        return ()
+    request_paths = sorted(
+        stage_dir.rglob("*.request.json"),
+        key=lambda path: (
+            0 if ".attempt-" in path.name else 1,
+            str(path),
+        ),
+    )
+    migrated: list[Path] = []
+    seen_raw_sha256: set[str] = set()
+    for request_path in request_paths:
+        raw_path = request_path.with_name(
+            request_path.name.removesuffix(".request.json")
+            + ".raw_interaction.json"
+        )
+        if not raw_path.is_file():
+            continue
+        raw_sha256 = sha256_file(raw_path)
+        if raw_sha256 in seen_raw_sha256:
+            continue
+        migrated.append(
+            migrate_completed_legacy_paid_dispatch(
+                stage=stage,
+                request_path=request_path,
+                raw_artifact_path=raw_path,
+            )
+        )
+        seen_raw_sha256.add(raw_sha256)
+    return tuple(migrated)
+
+
+def _migrate_completed_warm_dispatches(
+    *,
+    root: Path,
+    allowed_top_level: Collection[str],
+) -> tuple[Path, ...]:
+    """Migrate only explicitly orchestrated warm-run planning stages."""
+
+    migrated: list[Path] = []
+    for orchestration_path in sorted(root.rglob("orchestration.json")):
+        relative = orchestration_path.relative_to(root)
+        if not relative.parts or relative.parts[0] not in allowed_top_level:
+            continue
+        payload = read_json(orchestration_path)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("contract_version")
+            != "autonomous-planning-orchestration-v1"
+            or not isinstance(payload.get("stage"), str)
+        ):
+            continue
+        migrated.extend(
+            _migrate_completed_planning_dispatches(
+                stage_dir=orchestration_path.parent,
+                stage=str(payload["stage"]),
+            )
+        )
+    return tuple(migrated)
+
+
+def _find_unjournaled_warm_paid_artifacts(
+    *,
+    root: Path,
+    allowed_top_level: Collection[str],
+    journaled_raw_paths: Collection[Path],
+) -> tuple[Path, ...]:
+    """Find raw evidence not covered by a journal or exact byte alias."""
+
+    resolved_journaled = {
+        path.resolve() for path in journaled_raw_paths
+    }
+    journaled_sha256 = {
+        sha256_file(path)
+        for path in resolved_journaled
+        if path.is_file()
+    }
+    return tuple(
+        path
+        for path in root.rglob("*raw_interaction.json")
+        if (
+            path.relative_to(root).parts
+            and path.relative_to(root).parts[0] in allowed_top_level
+            and path.resolve() not in resolved_journaled
+            and sha256_file(path) not in journaled_sha256
+        )
+    )
+
+
 def run_feature_delivery_pipeline(
     *,
     feature_cut_kwargs: Mapping[str, Any],
@@ -2236,6 +2341,10 @@ def run_feature_delivery_pipeline(
             "aspects",
             "audition",
         }
+        _migrate_completed_warm_dispatches(
+            root=resolved_output,
+            allowed_top_level=warm_paid_namespaces,
+        )
         (
             adopted_dispatch_journals,
             journaled_raw_paths,
@@ -2249,16 +2358,13 @@ def run_feature_delivery_pipeline(
             for node in adopted_dispatch_journals
             if node["adoption_basis"] == "conservative_worst_case"
         ]
-        unjournaled_warm_paid_artifacts = [
-            path
-            for path in resolved_output.rglob("*raw_interaction.json")
-            if (
-                path.relative_to(resolved_output).parts
-                and path.relative_to(resolved_output).parts[0]
-                in warm_paid_namespaces
-                and path.resolve() not in journaled_raw_paths
+        unjournaled_warm_paid_artifacts = (
+            _find_unjournaled_warm_paid_artifacts(
+                root=resolved_output,
+                allowed_top_level=warm_paid_namespaces,
+                journaled_raw_paths=journaled_raw_paths,
             )
-        ]
+        )
         if unjournaled_warm_paid_artifacts:
             raise DeliveryPipelineBlocked(
                 "warm-run paid artifacts lack stable dispatch-node journals: "

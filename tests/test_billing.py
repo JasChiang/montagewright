@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from jascue_video_lab.billing import (
     complete_paid_dispatch,
     dispatch_paid_interaction,
     estimate_paid_call,
+    migrate_completed_legacy_paid_dispatch,
     summarize_usage_and_list_price,
 )
 
@@ -27,6 +29,71 @@ def _cheap_estimate(stage: str):
         max_output_tokens=1,
         thinking_level="minimal",
     )
+
+
+def test_migrate_completed_legacy_paid_dispatch_is_zero_dispatch_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    request_path = tmp_path / "feature-shortlist.request.json"
+    raw_path = tmp_path / "feature-shortlist.raw_interaction.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "model": "gemini-3.6-flash",
+                "input": [{"type": "text", "text": "shortlist"}],
+                "generation_config": {
+                    "max_output_tokens": 256,
+                    "thinking_level": "low",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    raw_path.write_text(
+        json.dumps(
+            {
+                "id": "legacy-interaction-1",
+                "model": "gemini-3.6-flash",
+                "usage": {
+                    "total_input_tokens": 100,
+                    "total_cached_tokens": 10,
+                    "total_output_tokens": 20,
+                    "total_thought_tokens": 5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    journal_path = migrate_completed_legacy_paid_dispatch(
+        stage="autonomous_clip_card_shortlist",
+        request_path=request_path,
+        raw_artifact_path=raw_path,
+    )
+    first_bytes = journal_path.read_bytes()
+    assert (
+        migrate_completed_legacy_paid_dispatch(
+            stage="autonomous_clip_card_shortlist",
+            request_path=request_path,
+            raw_artifact_path=raw_path,
+        )
+        == journal_path
+    )
+    assert journal_path.read_bytes() == first_bytes
+    journal = json.loads(first_bytes)
+    assert journal["status"] == "raw_usage_persisted"
+    assert journal["migration"]["provider_dispatch_added"] is False
+    assert journal["migration"]["raw_file_sha256"]
+
+    ledger = BudgetLedger(max_cost_usd=1.25, max_interactions=25)
+    adopted, raw_paths = adopt_paid_dispatch_journal_state(
+        budget_ledger=ledger,
+        root=tmp_path,
+        allowed_top_level=None,
+    )
+    assert len(adopted) == 1
+    assert ledger.committed_interactions == 1
+    assert raw_paths == {raw_path.resolve()}
 
 
 def test_default_budget_hold_preserves_and_automatically_consumes_final_qa_slot(
