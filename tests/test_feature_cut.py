@@ -75,6 +75,7 @@ from jascue_video_lab.feature_cut import (
     _load_trim_decisions,
     _load_runtime_candidate_evidence_events,
     _maskless_source_motion_preflight,
+    _require_runtime_candidate_fulfillments,
     _select_runtime_candidate_fulfillments,
     _order_insensitive_grounding_group_key,
     _migrate_legacy_feature_plan_binding,
@@ -7326,6 +7327,59 @@ def test_hard_target_cardinality_keeps_extra_planner_context_soft() -> None:
 
     assert [region.role for region in bound] == ["required", "preferred"]
     assert bound[1].evidence_role == "context_reference"
+
+
+def test_preferred_candidate_below_fulfillment_minimum_is_candidate_failure() -> None:
+    contract = EditorialBeatContract(
+        beat_id="closing",
+        feature_id="closing",
+        priority="preferred",
+        evidence_query_lock_sha256="a" * 64,
+        required_target_ids=("closing-subject",),
+        allowed_evidence_provenance=(
+            "direct_physical_action",
+            "context_only",
+        ),
+        narrative_function="closing",
+        minimum_fulfillment_level="visible_state",
+        fulfillment_alternatives=(
+            {
+                "fulfillment_level": "visible_state",
+                "accepted_evidence_provenance": (
+                    "direct_physical_action",
+                    "context_only",
+                ),
+                "claim_support_level": "observable_state",
+                "exact_event_requirement": "none",
+            },
+        ),
+        duration={
+            "minimum_readable_frames": 18,
+            "preferred_frames": 36,
+            "maximum_frames": 72,
+        },
+        relation_mode="single_subject",
+        allowed_reconstruction=("continuous", "solid_fit"),
+    )
+    option = {
+        "candidate_id": "rank-03",
+        "source_asset_id": "sha256:source",
+        "event_id": "result",
+    }
+
+    with pytest.raises(
+        CandidateKnownInfeasible,
+        match="editorial fulfillment minimum",
+    ):
+        _require_runtime_candidate_fulfillments(
+            (contract,),
+            option=option,
+            evidence_events={
+                ("sha256:source", "result"): {
+                    "evidence_provenance": "direct_result",
+                },
+            },
+        )
 
 
 def test_grouped_grounding_cache_key_ignores_only_target_order() -> None:

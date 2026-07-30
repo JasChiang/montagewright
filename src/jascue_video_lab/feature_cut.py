@@ -14131,6 +14131,28 @@ def _select_runtime_candidate_fulfillments(
     )
 
 
+def _require_runtime_candidate_fulfillments(
+    contracts: Sequence[EditorialBeatContract],
+    *,
+    option: Mapping[str, Any],
+    evidence_events: Mapping[tuple[str, str], Mapping[str, Any]],
+    available_visual_event_types: tuple[str, ...] | None = None,
+) -> tuple[EditorialBeatFulfillmentSelection, ...]:
+    """Classify a contract-ineligible candidate without weakening the gate."""
+
+    try:
+        return _select_runtime_candidate_fulfillments(
+            contracts,
+            option=option,
+            evidence_events=evidence_events,
+            available_visual_event_types=available_visual_event_types,
+        )
+    except ValueError as error:
+        raise CandidateKnownInfeasible(
+            "candidate is below the editorial fulfillment minimum"
+        ) from error
+
+
 def _autonomous_exact_event_source_reservations(
     plan: FeatureEditPlan,
     contracts: Sequence[EditorialBeatContract],
@@ -14562,7 +14584,7 @@ def _resolve_selected_window_grouped_exact_event_locks(
     cannot drift into separate temporal pipelines.
     """
 
-    fulfillment_selections = _select_runtime_candidate_fulfillments(
+    fulfillment_selections = _require_runtime_candidate_fulfillments(
         contracts,
         option=selected_option,
         evidence_events=evidence_events,
@@ -14669,7 +14691,7 @@ def _resolve_selected_window_grouped_exact_event_locks(
             budget_stage=f"exact_event_group:{feature_id}",
         )
     if not locks and exact_event_required:
-        fulfillment_selections = _select_runtime_candidate_fulfillments(
+        fulfillment_selections = _require_runtime_candidate_fulfillments(
             contracts,
             option=selected_option,
             evidence_events=evidence_events,
@@ -14736,22 +14758,16 @@ def _prepare_autonomous_vertical_candidate(
         raise CandidateKnownInfeasible(
             "vertical candidate source asset differs from its frame"
         )
-    hard_contracts = tuple(
+    feature_contracts = tuple(
         contract
         for contract in editorial_contracts
         if contract.feature_id == selected.feature_id
-        and contract.priority == "hard"
     )
-    try:
-        _select_runtime_candidate_fulfillments(
-            hard_contracts,
-            option=option_data,
-            evidence_events=evidence_events,
-        )
-    except ValueError as error:
-        raise CandidateKnownInfeasible(
-            "candidate is below the hard fulfillment minimum"
-        ) from error
+    _require_runtime_candidate_fulfillments(
+        feature_contracts,
+        option=option_data,
+        evidence_events=evidence_events,
+    )
 
     if clip.sha256 not in source_audio_cache:
         source_audio_cache[clip.sha256] = has_audio_stream(Path(clip.path))
