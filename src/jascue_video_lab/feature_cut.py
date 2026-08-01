@@ -22005,6 +22005,14 @@ def _run_feature_cut_experiment_impl(
                             autonomous_policy.policy_reference
                         ),
                         route_sha256=route_sha256,
+                        stale_paid_payload_validator=(
+                            lambda payload: (
+                                _exact_payload_matches_local_input_projection(
+                                    payload,
+                                    local_payloads[key],
+                                )
+                            )
+                        ),
                         producer=lambda: (
                             _resolve_autonomous_vertical_candidate_exact(
                                 client=client,
