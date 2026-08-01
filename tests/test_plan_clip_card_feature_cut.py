@@ -2350,6 +2350,18 @@ def test_v2_rejects_single_candidate() -> None:
         ClipCardFeaturePlanV2.model_validate(payload)
 
 
+def test_v3_allows_a_unique_supported_candidate() -> None:
+    payload = _v3_plan().model_dump(mode="json")
+    chapter = payload["chapters"][0]
+    chapter["candidates"] = chapter["candidates"][:1]
+    chapter["horizontal_candidate_id"] = "candidate-a"
+    chapter["vertical_candidate_id"] = "candidate-a"
+
+    plan = ClipCardFeaturePlanV3.model_validate(payload)
+
+    assert len(plan.chapters[0].candidates) == 1
+
+
 def test_selected_tracked_crop_can_use_resolved_hard_core_without_fuzzy_target() -> None:
     payload = _v2_plan().model_dump(mode="json")
     chapter = payload["chapters"][0]

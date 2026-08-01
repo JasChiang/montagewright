@@ -698,11 +698,15 @@ class ClipCardFeatureSelectV3(StrictModel):
             if self.candidates or self.horizontal_candidate_id or self.vertical_candidate_id:
                 raise ValueError("not_found chapters cannot reference candidates")
             return self
-        minimum = 2 if self.evidence_status == "supported" else 1
+        # Retrieval normally preserves a Top-K frontier.  A unique direct
+        # event is still usable evidence, however: reject it later only if its
+        # single executable route fails, rather than fabricating a second take
+        # or downgrading a supported claim without cause.
+        minimum = 1
         if not minimum <= len(self.candidates) <= 4:
             raise ValueError(
                 f"v3 {self.evidence_status} chapters must preserve "
-                f"Top-K {minimum}-4 candidates"
+                f"one-or-more Top-K candidates (1-4)"
             )
         candidate_ids = [candidate.candidate_id for candidate in self.candidates]
         if len(candidate_ids) != len(set(candidate_ids)):
