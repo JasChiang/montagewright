@@ -1820,12 +1820,36 @@ def canonicalize_direct_video_edit_plan_output(
                         "planner_contract_phase_requires_sequential_attention"
                     ),
                 )
-        # Reuse authority is an editorial decision.  Do not silently erase an
-        # incomplete Gemini proposal here: the typed model validator must
-        # reject it so the single text-only contract-repair path can ask Gemini
-        # to supply the missing observable rationale.  Clearing the mode would
-        # turn an explicit creative choice into an unexplained local route
-        # rejection much later in the renderer.
+        reuse_mode = chapter.get("source_reuse_mode")
+        reuse_justification = chapter.get("source_reuse_justification")
+        if reuse_mode not in {None, "none"} and not (
+            isinstance(reuse_justification, str)
+            and reuse_justification.strip()
+        ):
+            # ``selection_reason`` is Gemini's per-chapter editorial reason,
+            # not a local inference.  When the model explicitly selected a
+            # typed reuse mode but omitted the duplicated audit field, project
+            # that already-observed reason into the required field and retain
+            # an audit record.  With no model-authored reason we fail closed
+            # in the typed validator, which invokes the single text-only
+            # contract-repair path rather than erasing the creative choice.
+            selection_reason = chapter.get("selection_reason")
+            if isinstance(selection_reason, str) and selection_reason.strip():
+                chapter["source_reuse_justification"] = selection_reason
+                changes.append(
+                    {
+                        "json_path": (
+                            f"chapters[{chapter_index}]."
+                            "source_reuse_justification"
+                        ),
+                        "before": reuse_justification,
+                        "after": selection_reason,
+                        "rule": (
+                            "model_selection_reason_projects_to_missing_"
+                            "reuse_audit_field"
+                        ),
+                    }
+                )
         flow = chapter.get("flow_intent")
         if isinstance(flow, dict):
             sync_keys = (

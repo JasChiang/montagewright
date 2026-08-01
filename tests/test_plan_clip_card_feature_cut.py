@@ -1062,6 +1062,7 @@ def test_direct_video_canonicalization_repairs_bounded_representation_conflicts(
             {
                 "evidence_status": "supported",
                 "observed_visual_evidence": "A second, separate action is visible.",
+                "selection_reason": "A second, separate action is visible.",
                 "source_reuse_mode": "distinct_interval",
                 "source_reuse_justification": None,
                 "horizontal": {
@@ -1107,13 +1108,14 @@ def test_direct_video_canonicalization_repairs_bounded_representation_conflicts(
     chapter = json.loads(canonical)["chapters"][0]
 
     assert chapter["source_reuse_mode"] == "distinct_interval"
-    assert chapter["source_reuse_justification"] is None
+    assert chapter["source_reuse_justification"] == "A second, separate action is visible."
     assert chapter["vertical"]["presentation_preference"] == "two_panel_layout"
     assert chapter["vertical"]["preferred_entity_indices"] == [3, 4, 5, 6]
     assert chapter["vertical"]["aspect_suitability"] == "unsuitable"
     assert {
         change["rule"] for change in changes
     } >= {
+        "model_selection_reason_projects_to_missing_reuse_audit_field",
         "planner_contract_candidate_marked_unsuitable",
     }
 
