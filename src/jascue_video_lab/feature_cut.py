@@ -23085,14 +23085,44 @@ def _run_feature_cut_experiment_impl(
                 decision_path = grouped_dir / "decision.json"
                 if decision_path.is_file() and context_path.is_file():
                     saved = read_json(decision_path)
-                    if (
-                        read_json(context_path) != scoped_context
-                        or saved.get("context_sha256") != sha256_file(context_path)
-                    ):
+                    saved_context_sha256 = sha256_file(context_path)
+                    if saved.get("context_sha256") != saved_context_sha256:
                         raise FeatureCutSystemFailure(
                             "saved grouped scoped semantic replan does not bind "
-                            "the current complete route context"
+                            "its persisted context"
                         )
+                    # A grouped decision may have completed after the
+                    # frontier state was written but before its acceptance
+                    # commit.  Resume reconstructs a compatible route from
+                    # accepted executions, which can change the *current*
+                    # context ordering.  Preserve the already paid decision
+                    # when its own immutable context and authority validate;
+                    # selected option IDs are still checked against the
+                    # freshly loaded local/exact/geometry artifacts below.
+                    if read_json(context_path) != scoped_context:
+                        authority_payload = saved.get("authority")
+                        if not isinstance(authority_payload, Mapping):
+                            raise FeatureCutSystemFailure(
+                                "saved grouped scoped semantic replan lacks authority"
+                            )
+                        saved_authority = DecisionAuthorityV2.model_validate(
+                            authority_payload
+                        )
+                        validate_authority_binding(
+                            saved_authority,
+                            autonomous_policy,
+                        )
+                        if (
+                            saved_authority.decision_scope
+                            != "scoped_semantic_replan"
+                            or f"sha256:{saved_context_sha256}"
+                            not in saved_authority.input_artifact_hashes
+                            or f"sha256:{frontier_plan_sha256}"
+                            not in saved_authority.input_artifact_hashes
+                        ):
+                            raise FeatureCutSystemFailure(
+                                "saved grouped scoped semantic replan authority is incomplete"
+                            )
                     decisions = saved.get("decisions")
                     if not isinstance(decisions, list):
                         raise FeatureCutSystemFailure(
