@@ -1674,6 +1674,31 @@ def canonicalize_direct_video_edit_plan_output(
                         ),
                     }
                 )
+            reuse_mode = decision.get("source_reuse_mode")
+            reuse_reason = decision.get("source_reuse_justification")
+            if reuse_mode not in {None, "none"} and not (
+                isinstance(reuse_reason, str) and reuse_reason.strip()
+            ):
+                # Reuse is an execution authority, not a creative default.
+                # Gemini has still selected this take and its presentation,
+                # but an unexplained authority cannot be carried to the route
+                # solver.  Removing the unsupported claim is fail-closed: if
+                # the selected source actually conflicts with another beat,
+                # the later bounded semantic-replan path reports that fact to
+                # Gemini instead of locally accepting the reuse.
+                decision["source_reuse_mode"] = "none"
+                decision["source_reuse_justification"] = None
+                changes.append(
+                    {
+                        "json_path": f"{decision_base}.source_reuse_mode",
+                        "before": reuse_mode,
+                        "after": "none",
+                        "rule": (
+                            "unexplained_candidate_reuse_authority_"
+                            "removed_fail_closed"
+                        ),
+                    }
+                )
             if (
                 decision.get("strategy") == "tracked_crop"
                 and decision.get("allow_controlled_clip") is True

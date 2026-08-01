@@ -1212,8 +1212,8 @@ def test_direct_video_canonicalization_repairs_bounded_representation_conflicts(
     }
 
 
-def test_direct_video_reuse_without_reason_reaches_typed_contract_repair() -> None:
-    """A normalizer must not turn Gemini's reuse decision into local fallback."""
+def test_direct_video_reuse_without_reason_removes_unproven_authority() -> None:
+    """A normalizer preserves a take but cannot invent reuse authority."""
 
     with pytest.raises(ValidationError, match="observable justification"):
         DirectVideoChapterDecision.model_validate(
@@ -1243,6 +1243,29 @@ def test_direct_video_reuse_without_reason_reaches_typed_contract_repair() -> No
                 "confidence": 0.9,
             }
         )
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "vertical": {
+                            "candidate_rank": 1,
+                            "source_reuse_mode": "editorial_reprise",
+                            "source_reuse_justification": None,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+    vertical = json.loads(canonical)["chapters"][0]["vertical"]
+    assert vertical["source_reuse_mode"] == "none"
+    assert vertical["source_reuse_justification"] is None
+    assert "unexplained_candidate_reuse_authority_removed_fail_closed" in {
+        change["rule"] for change in changes
+    }
 
 
 def test_hard_shortlist_provenance_blocks_prerecorded_playback() -> None:
