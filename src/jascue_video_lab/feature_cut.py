@@ -13609,6 +13609,57 @@ def _presentation_requires_scoped_semantic_replan(
     )
 
 
+def _scoped_semantic_replan_reuse_binding(
+    context: Mapping[str, Any],
+    *,
+    selected_candidate_id: str,
+    selected_execution_sha256: str,
+    selected_measured_presentation_mode: str,
+) -> dict[str, Any] | None:
+    """Project the immutable creative inputs for a persisted scoped replan.
+
+    A scoped decision is allowed to survive a resume which discovers extra
+    *unselected* feasible routes.  Those rows are not creative inputs to the
+    choice Gemini already made.  The full sequence, music grid, affected beat,
+    rules, and the selected measured execution must still match byte-for-byte.
+    Returning ``None`` makes reuse fail closed when the selected option is no
+    longer uniquely present.
+    """
+
+    immutable_options = context.get("immutable_options")
+    if not isinstance(immutable_options, Sequence) or isinstance(
+        immutable_options, (str, bytes)
+    ):
+        return None
+    selected_options = [
+        option
+        for option in immutable_options
+        if isinstance(option, Mapping)
+        and option.get("candidate_id") == selected_candidate_id
+        and option.get("candidate_execution_sha256")
+        == selected_execution_sha256
+        and isinstance(option.get("measured_execution"), Mapping)
+        and option["measured_execution"].get("presentation_mode")
+        == selected_measured_presentation_mode
+    ]
+    if len(selected_options) != 1:
+        return None
+    selected_option = dict(selected_options[0])
+    # Wrapper IDs enumerate the current frontier.  They are not identities of
+    # a source interval and can legitimately change if unrelated options are
+    # added during a resume.
+    selected_option.pop("option_id", None)
+    return {
+        "contract_version": "scoped-semantic-replan-reuse-binding-v1",
+        "policy_reference": context.get("policy_reference"),
+        "affected_beat": context.get("affected_beat"),
+        "adjacent_sequence": context.get("adjacent_sequence"),
+        "music_context": context.get("music_context"),
+        "selected_immutable_option": selected_option,
+        "rules": context.get("rules"),
+    }
+
+
 def _pre_render_vertical_presentation_mode(
     candidate: FeatureVerticalCandidate,
     *,
@@ -22350,14 +22401,72 @@ def _run_feature_cut_experiment_impl(
                     else None
                 )
                 if saved_decision is not None:
+                    selected_candidate_id = str(
+                        saved_decision.get("selected_candidate_id") or ""
+                    )
+                    selected_execution = str(
+                        saved_decision.get(
+                            "selected_candidate_execution_sha256"
+                        )
+                        or ""
+                    )
+                    selected_mode = str(
+                        saved_decision.get(
+                            "selected_measured_presentation_mode"
+                        )
+                        or ""
+                    )
+                    saved_context = read_json(context_path)
+                    saved_reuse_binding = _scoped_semantic_replan_reuse_binding(
+                        saved_context,
+                        selected_candidate_id=selected_candidate_id,
+                        selected_execution_sha256=selected_execution,
+                        selected_measured_presentation_mode=selected_mode,
+                    )
+                    current_reuse_binding = _scoped_semantic_replan_reuse_binding(
+                        scoped_context,
+                        selected_candidate_id=selected_candidate_id,
+                        selected_execution_sha256=selected_execution,
+                        selected_measured_presentation_mode=selected_mode,
+                    )
                     if (
-                        read_json(context_path) != scoped_context
+                        saved_reuse_binding is None
+                        or current_reuse_binding is None
+                        or saved_reuse_binding != current_reuse_binding
                         or saved_decision.get("context_sha256")
                         != sha256_file(context_path)
                     ):
                         raise FeatureCutSystemFailure(
                             "saved scoped semantic replan does not bind the "
                             "current complete route context"
+                        )
+                    if saved_context != scoped_context:
+                        write_json(
+                            context_path.with_name(
+                                f"{feature_id}.reuse-binding.json"
+                            ),
+                            {
+                                "contract_version": (
+                                    "scoped-semantic-replan-reuse-audit-v1"
+                                ),
+                                "reason_code": (
+                                    "unselected_immutable_options_changed"
+                                ),
+                                "saved_context_sha256": sha256_file(
+                                    context_path
+                                ),
+                                "current_context_sha256": _sha256_json(
+                                    scoped_context
+                                ),
+                                "reuse_binding_sha256": _sha256_json(
+                                    current_reuse_binding
+                                ),
+                                "selected_candidate_id": selected_candidate_id,
+                                "selected_candidate_execution_sha256": (
+                                    selected_execution
+                                ),
+                                "generated_at": utc_now(),
+                            },
                         )
                     replan_authority = DecisionAuthorityV2.model_validate(
                         saved_decision.get("authority")
@@ -22380,18 +22489,12 @@ def _run_feature_cut_experiment_impl(
                         raise FeatureCutSystemFailure(
                             "saved scoped semantic replan authority is incomplete"
                         )
-                    selected_execution = str(
-                        saved_decision.get(
-                            "selected_candidate_execution_sha256"
-                        )
-                        or ""
-                    )
                     selected_deferred = next(
                         (
                             row
                             for row in executable_deferred
                             if row[1]
-                            == saved_decision.get("selected_candidate_id")
+                            == selected_candidate_id
                             and row[2] == selected_execution
                         ),
                         None,

@@ -54,6 +54,7 @@ from jascue_video_lab.feature_cut import (
     _pre_render_execution_duration_seconds,
     _pre_render_vertical_feasibility,
     _presentation_requires_scoped_semantic_replan,
+    _scoped_semantic_replan_reuse_binding,
     _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
     _build_production_sequence_optimization,
@@ -2281,6 +2282,61 @@ def test_local_presentation_change_requires_scoped_semantic_replan() -> None:
             "static_full_bleed_crop",
             "tracked_full_bleed_crop",
         ),
+    )
+
+
+def test_scoped_replan_reuse_keeps_creative_context_and_selected_execution() -> None:
+    """Extra unselected frontier rows cannot invalidate a bound decision."""
+
+    selected = {
+        "option_id": "replan-01-rank-01-solid_matte_fit",
+        "candidate_id": "rank-01",
+        "candidate_execution_sha256": "selected-execution",
+        "measured_execution": {"presentation_mode": "solid_matte_fit"},
+        "source_window_ms": {"start": 1000, "end": 4000},
+    }
+    context = {
+        "policy_reference": "sha256:policy",
+        "affected_beat": {"feature_id": "opening"},
+        "adjacent_sequence": {"whole_resolved_timeline": ["opening"]},
+        "music_context": {"output_cues": ["cue-01"]},
+        "immutable_options": [selected],
+        "rules": {"must_preserve": ["resolved_music_cue_grid"]},
+    }
+    resumed_context = {
+        **context,
+        "immutable_options": [
+            {**selected, "option_id": "replan-02-rank-01-solid_matte_fit"},
+            {
+                "option_id": "replan-01-rank-02-static_full_bleed_crop",
+                "candidate_id": "rank-02",
+                "candidate_execution_sha256": "unselected-execution",
+                "measured_execution": {
+                    "presentation_mode": "static_full_bleed_crop"
+                },
+            },
+        ],
+    }
+    selected_kwargs = {
+        "selected_candidate_id": "rank-01",
+        "selected_execution_sha256": "selected-execution",
+        "selected_measured_presentation_mode": "solid_matte_fit",
+    }
+
+    assert _scoped_semantic_replan_reuse_binding(
+        context, **selected_kwargs
+    ) == _scoped_semantic_replan_reuse_binding(
+        resumed_context, **selected_kwargs
+    )
+
+    changed_context = {
+        **resumed_context,
+        "music_context": {"output_cues": ["cue-02"]},
+    }
+    assert _scoped_semantic_replan_reuse_binding(
+        context, **selected_kwargs
+    ) != _scoped_semantic_replan_reuse_binding(
+        changed_context, **selected_kwargs
     )
 
 
