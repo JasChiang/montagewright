@@ -4492,17 +4492,11 @@ class FeatureVerticalCandidate(StrictModel):
                     "overlay keepout regions cannot be virtual-camera anchors: "
                     + ", ".join(invalid_keepouts)
                 )
-            required_ids = {
-                region.region_id
-                for region in self.regions
-                if region.execution_role == "hard_core"
-            }
-            missing_required = sorted(required_ids - referenced_region_ids)
-            if missing_required:
-                raise ValueError(
-                    "every hard-core region must appear in the virtual-camera "
-                    "proposal: " + ", ".join(missing_required)
-                )
+            # ``hard_core`` expresses what must remain visible; an anchor
+            # expresses what the camera attends to.  They intentionally need
+            # not be identical: a phone may be the anchored subject while the
+            # person holding it remains required context.  Geometry/QA checks
+            # containment for every hard-core region downstream.
         if (
             self.aspect_suitability != "unsuitable"
             and self.presentation_preference == "phase_virtual_camera"
