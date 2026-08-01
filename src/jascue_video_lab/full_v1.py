@@ -541,8 +541,6 @@ def _revalidate_saved_clip_card(
     cache_key_path = run_dir / "cache-key.json"
     if (
         not raw_output_path.exists()
-        or not cache_key_path.exists()
-        or read_json(cache_key_path) != resolved_cache_key
         or not _saved_request_matches_prompt(
             run_dir,
             prompt,
@@ -551,6 +549,8 @@ def _revalidate_saved_clip_card(
             duration_ms=duration_ms,
         )
     ):
+        return None
+    if cache_key_path.exists() and read_json(cache_key_path) != resolved_cache_key:
         return None
     try:
         raw_output = read_json(raw_output_path)

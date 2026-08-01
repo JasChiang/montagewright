@@ -62,7 +62,11 @@ from .final_edit_qa import (
     run_deterministic_delivery_qa,
     validate_deterministic_evidence_causal_binding,
 )
-from .full_v1 import current_full_clip_card_cache_key
+from .full_v1 import (
+    _revalidate_saved_clip_card,
+    current_full_clip_card_cache_key,
+)
+from .gemini import normalize_full_clip_card_output_text
 from .gemini import (
     GeminiLabClient,
     MODEL_ID,
@@ -350,6 +354,65 @@ def _clip_card_entry_stale_reason(
     )
     if read_json(cache_key_path) != expected:
         return "prompt_schema_or_request_binding_changed"
+    return None
+
+
+def _recover_refresh_from_saved_raw_output(
+    *,
+    clip: Any,
+    library: Path,
+) -> Path | None:
+    """Recover a charged Clip Card response after a representation-only fix.
+
+    A failed child can already contain the immutable request and raw Gemini
+    output. When the current parser can validate that same response, recover
+    it in place rather than paying to upload and inspect the source again.
+    The normal atomic move and source validation still run afterwards.
+    """
+
+    prompt_path = Path(__file__).resolve().parents[2] / "prompts" / (
+        "full_clip_card_mmss_zh-TW.txt"
+    )
+    prompt = prompt_path.read_text(encoding="utf-8")
+    expected_source_asset_id = f"sha256:{clip.sha256}"
+    refresh_parent = library / ".refresh"
+    if not refresh_parent.is_dir():
+        return None
+    for refresh_root in reversed(
+        sorted(refresh_parent.glob(f"{clip.sha256[:16]}-*"))
+    ):
+        run_dir = refresh_root / "gemini" / "clip-card"
+        raw_output_path = run_dir / "clip_card.raw_output.json"
+        if not raw_output_path.is_file():
+            continue
+        try:
+            raw_output = read_json(raw_output_path)
+            output_text = raw_output["output_text"]
+            canonical_text, _changes = normalize_full_clip_card_output_text(
+                output_text
+            )
+            provisional = FullClipCard.model_validate_json(canonical_text)
+            if provisional.source_asset_id != expected_source_asset_id:
+                continue
+            expected_cache_key = current_full_clip_card_cache_key(
+                prompt=prompt,
+                source_asset_id=provisional.source_asset_id,
+                proxy_asset_id=provisional.proxy_asset_id,
+            )
+            recovered = _revalidate_saved_clip_card(
+                run_dir,
+                provisional.source_asset_id,
+                provisional.proxy_asset_id,
+                provisional.duration_ms,
+                prompt,
+                expected_cache_key,
+            )
+            if recovered is None:
+                continue
+            write_json(run_dir / "cache-key.json", expected_cache_key)
+            return refresh_root
+        except (KeyError, TypeError, ValueError):
+            continue
     return None
 
 
@@ -694,6 +757,9 @@ def _refresh_stale_clip_cards(
             )
         prior_records.append(payload)
     prior_failed_dispatches: list[Mapping[str, Any]] = []
+    prior_success_source_asset_ids = {
+        str(record.get("source_asset_id") or "") for record in prior_records
+    }
     for record_path in sorted(
         cold_root.glob("*/failed-dispatch-record.json")
     ):
@@ -703,6 +769,11 @@ def _refresh_stale_clip_cards(
                 f"cold-ingest failure record is not an object: {record_path}"
             )
         if payload.get("charged_interaction") is not True:
+            continue
+        if str(payload.get("source_asset_id") or "") in prior_success_source_asset_ids:
+            # The original paid raw response was subsequently normalized and
+            # promoted into a refresh record. Count it once, not as both a
+            # failure and a successful card.
             continue
         usage = payload.get("usage")
         if not isinstance(usage, Mapping):
@@ -779,98 +850,119 @@ def _refresh_stale_clip_cards(
             "is unavailable"
         )
     for clip, clip_root, stale_reason in planned_refreshes:
-        refresh_root = (
-            library
-            / ".refresh"
-            / f"{clip.sha256[:16]}-{uuid.uuid4().hex}"
+        refresh_root = _recover_refresh_from_saved_raw_output(
+            clip=clip,
+            library=library,
         )
         source_path = Path(clip.path).expanduser().resolve(strict=True)
-        command = [
-            str(entrypoint),
-            "full-clip",
-            str(source_path),
-            "--output-dir",
-            str(refresh_root),
-            "--dense-mode",
-            "none",
-        ]
         run_record_dir = (
             output_dir / "cold-ingest" / clip.sha256[:16]
         )
         run_record_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            usage = _run_budgeted_planning_stage(
-                command=command,
-                stage="autonomous_base_clip_card_refresh",
-                stage_dir=refresh_root,
-                budget_ledger=cold_ledger,
-                estimated_text_tokens=12_000,
-                media_duration_ms=int(clip.duration_ms),
-                media_resolution="low",
-                max_output_tokens=4_096,
-                thinking_level="low",
+        recovered_from_saved_raw = refresh_root is not None
+        if refresh_root is None:
+            refresh_root = (
+                library
+                / ".refresh"
+                / f"{clip.sha256[:16]}-{uuid.uuid4().hex}"
             )
-        except BaseException as error:
-            for raw_path in refresh_root.rglob("*raw_interaction.json"):
-                relative = raw_path.relative_to(refresh_root)
-                destination = run_record_dir / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(raw_path, destination)
-            failed_orchestration = refresh_root / "orchestration.json"
-            if failed_orchestration.is_file():
-                shutil.copy2(
-                    failed_orchestration,
-                    run_record_dir / "orchestration.json",
+            command = [
+                str(entrypoint),
+                "full-clip",
+                str(source_path),
+                "--output-dir",
+                str(refresh_root),
+                "--dense-mode",
+                "none",
+            ]
+            try:
+                usage = _run_budgeted_planning_stage(
+                    command=command,
+                    stage="autonomous_base_clip_card_refresh",
+                    stage_dir=refresh_root,
+                    budget_ledger=cold_ledger,
+                    estimated_text_tokens=12_000,
+                    media_duration_ms=int(clip.duration_ms),
+                    media_resolution="low",
+                    max_output_tokens=4_096,
+                    thinking_level="low",
                 )
-            failed_payload = (
-                read_json(failed_orchestration)
-                if failed_orchestration.is_file()
-                else {}
-            )
-            failed_usage = (
-                failed_payload.get("usage")
-                if isinstance(failed_payload, Mapping)
-                and isinstance(failed_payload.get("usage"), Mapping)
-                else {}
-            )
-            charged_interaction = bool(
-                int(failed_usage.get("request_count") or 0)
-                or failed_usage.get("usage_status")
-                == "dispatch_recorded_usage_unavailable"
-            )
-            write_json(
-                run_record_dir / "failed-dispatch-record.json",
-                {
-                    "contract_version": (
-                        "base-clip-card-refresh-failure-v1"
-                    ),
-                    "source_asset_id": f"sha256:{clip.sha256}",
-                    "reason_code": stale_reason,
-                    "charged_interaction": charged_interaction,
-                    "usage": failed_usage,
-                    "error": {
-                        "type": type(error).__name__,
-                        "message": str(error),
+            except BaseException as error:
+                for raw_path in refresh_root.rglob("*raw_interaction.json"):
+                    relative = raw_path.relative_to(refresh_root)
+                    destination = run_record_dir / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(raw_path, destination)
+                failed_orchestration = refresh_root / "orchestration.json"
+                if failed_orchestration.is_file():
+                    shutil.copy2(
+                        failed_orchestration,
+                        run_record_dir / "orchestration.json",
+                    )
+                failed_payload = (
+                    read_json(failed_orchestration)
+                    if failed_orchestration.is_file()
+                    else {}
+                )
+                failed_usage = (
+                    failed_payload.get("usage")
+                    if isinstance(failed_payload, Mapping)
+                    and isinstance(failed_payload.get("usage"), Mapping)
+                    else {}
+                )
+                charged_interaction = bool(
+                    int(failed_usage.get("request_count") or 0)
+                    or failed_usage.get("usage_status")
+                    == "dispatch_recorded_usage_unavailable"
+                )
+                write_json(
+                    run_record_dir / "failed-dispatch-record.json",
+                    {
+                        "contract_version": (
+                            "base-clip-card-refresh-failure-v1"
+                        ),
+                        "source_asset_id": f"sha256:{clip.sha256}",
+                        "reason_code": stale_reason,
+                        "charged_interaction": charged_interaction,
+                        "usage": failed_usage,
+                        "error": {
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        },
+                        "generated_at": utc_now(),
                     },
-                    "generated_at": utc_now(),
-                },
+                )
+                write_json(
+                    cold_root / "budget-report.json",
+                    {
+                        "contract_version": "cold-ingest-budget-report-v1",
+                        "namespace": "cold_ingest",
+                        "planned_refresh_count": len(planned_refreshes),
+                        "adopted_refresh_count": len(prior_records),
+                        "adopted_failed_dispatch_count": len(
+                            prior_failed_dispatches
+                        ),
+                        "completed_refresh_count": len(refresh_records),
+                        "budget": cold_ledger.report(),
+                        "generated_at": utc_now(),
+                    },
+                )
+                raise
+        else:
+            failed_record = run_record_dir / "failed-dispatch-record.json"
+            failed_payload = read_json(failed_record)
+            usage = failed_payload.get("usage")
+            if not isinstance(usage, Mapping):
+                raise DeliveryPipelineBlocked(
+                    "saved raw Clip Card recovery has no charged usage record"
+                )
+            usage = dict(usage)
+        if recovered_from_saved_raw and not (
+            refresh_root / "gemini" / "clip-card" / "clip_card.json"
+        ).is_file():
+            raise DeliveryPipelineBlocked(
+                "saved raw Clip Card recovery did not materialize a card"
             )
-            write_json(
-                cold_root / "budget-report.json",
-                {
-                    "contract_version": "cold-ingest-budget-report-v1",
-                    "namespace": "cold_ingest",
-                    "planned_refresh_count": len(planned_refreshes),
-                    "adopted_refresh_count": len(prior_records),
-                    "adopted_failed_dispatch_count": len(
-                        prior_failed_dispatches
-                    ),
-                    "completed_refresh_count": len(refresh_records),
-                    "budget": cold_ledger.report(),
-                    "generated_at": utc_now(),
-                },
-            )
-            raise
         refreshed_reason = _clip_card_entry_stale_reason(
             clip=clip,
             clip_root=refresh_root,
@@ -947,6 +1039,7 @@ def _refresh_stale_clip_cards(
                 else None
             ),
             "refreshed_path": str(clip_root.resolve()),
+            "recovered_from_saved_raw_output": recovered_from_saved_raw,
             "usage": usage,
             "generated_at": utc_now(),
         }
