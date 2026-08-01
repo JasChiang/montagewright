@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -95,6 +96,44 @@ from .storage import read_json, utc_now, write_json
 
 class DeliveryPipelineBlocked(RuntimeError):
     """The pipeline preserved review artifacts but cannot continue safely."""
+
+
+def _planning_subprocess_environment(*, project_root: Path) -> dict[str, str]:
+    """Pass a locally configured Gemini credential to owned CLI children.
+
+    ``uv run`` can load a workspace ``.env`` for its direct command without
+    exporting that value into this process.  Cold Clip Card refreshes are
+    deliberately isolated child CLI invocations, so relying on inheritance
+    alone turns a legitimate stale-card refresh into a misleading blocked
+    delivery before its first paid request.  Copy only the two supported
+    credential names from the workspace file when the parent has neither;
+    never persist or log the resulting environment.
+    """
+
+    environment = os.environ.copy()
+    if environment.get("GEMINI_API_KEY") or environment.get("GOOGLE_API_KEY"):
+        return environment
+    env_path = project_root / ".env"
+    if not env_path.is_file():
+        return environment
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        key, separator, raw_value = line.partition("=")
+        if (
+            not separator
+            or key not in {"GEMINI_API_KEY", "GOOGLE_API_KEY"}
+            or not raw_value.strip()
+        ):
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        environment.setdefault(key, value)
+    return environment
 
 
 def _maximum_full_final_qa_calls(policy: AutonomousEditPolicy) -> int:
@@ -531,6 +570,9 @@ def _run_budgeted_planning_stage(
         completed = subprocess.run(
             command,
             cwd=Path(__file__).resolve().parents[2],
+            env=_planning_subprocess_environment(
+                project_root=Path(__file__).resolve().parents[2]
+            ),
             check=True,
             capture_output=True,
             text=True,

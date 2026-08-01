@@ -2122,6 +2122,25 @@ def test_stale_clip_card_refresh_requires_explicit_cold_budget_before_paid(
     assert calls == []
 
 
+def test_planning_subprocess_environment_forwards_workspace_gemini_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refresh children receive configuration without exposing it in artifacts."""
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "OTHER=value\nGEMINI_API_KEY='test-only-key'\n",
+        encoding="utf-8",
+    )
+
+    environment = pipeline._planning_subprocess_environment(project_root=tmp_path)
+
+    assert environment["GEMINI_API_KEY"] == "test-only-key"
+    assert "OTHER" not in environment
+
+
 def test_cold_refresh_resume_adopts_failed_dispatch_before_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
