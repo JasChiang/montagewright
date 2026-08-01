@@ -227,6 +227,7 @@ from .sequence_optimizer import (
     BeatOptionSet,
     CandidateRouteBeat,
     CandidateRouteOption,
+    CandidateRouteSelection,
     MusicBoundaryCue,
     MusicBoundarySpec,
     SemanticRhythmSpec,
@@ -23203,6 +23204,10 @@ def _run_feature_cut_experiment_impl(
                         "affected beat"
                     )
                 selected: dict[str, tuple[str, str]] = {}
+                post_replan_selections = {
+                    item.beat_id: item
+                    for item in active_runtime_route["route"].selections
+                }
                 for feature_id, option_id in selected_option_ids.items():
                     row = option_rows.get(option_id)
                     if row is None or row[0] != feature_id:
@@ -23220,6 +23225,33 @@ def _run_feature_cut_experiment_impl(
                         )
                     ]
                     selected_clip = RushClip.model_validate(selected_local["clip"])
+                    previous = post_replan_selections[feature_id]
+                    measured_mode = str(
+                        geometry_payload.get("measured_presentation_mode")
+                        or previous.presentation_mode
+                    )
+                    post_replan_selection = CandidateRouteSelection(
+                        beat_id=feature_id,
+                        candidate_id=candidate_id,
+                        source_asset_id=str(selected_local["option"]["source_asset_id"]),
+                        event_id=str(selected_local["option"]["event_id"]),
+                        trim_duration_ms=int(selected_local["end_ms"]) - int(selected_local["start_ms"]),
+                        cue_id=previous.cue_id,
+                        cue_aligned=previous.cue_aligned,
+                        presentation_mode=measured_mode,
+                        entry_composition=previous.entry_composition,
+                        exit_composition=previous.exit_composition,
+                        decision_codes=("grouped_scoped_semantic_replan",),
+                        source_clip_id=selected_clip.clip_id,
+                        source_in_ms=int(selected_local["start_ms"]),
+                        source_out_ms=int(selected_local["end_ms"]),
+                        candidate_execution_sha256=execution_sha256,
+                        reuse_mode=str(selected_local["option"].get("source_reuse_mode") or "none"),
+                    )
+                    post_replan_selections[feature_id] = post_replan_selection
+                    pre_render_execution_bindings_by_feature_and_sha.setdefault(
+                        feature_id, {}
+                    )[execution_sha256] = post_replan_selection
                     frontier_accepted_source_uses.append(
                         {
                             "feature_id": feature_id,
@@ -23237,6 +23269,21 @@ def _run_feature_cut_experiment_impl(
                 scoped_semantic_replan_state["used"] += 1
                 scoped_semantic_replan_state["interaction_ids"].extend(
                     interaction_ids
+                )
+                post_replan_route = tuple(
+                    post_replan_selections[item.beat_id]
+                    for item in active_runtime_route["route"].selections
+                )
+                write_json(
+                    grouped_dir / "post-replan-route.json",
+                    {
+                        "contract_version": "post-replan-route-v1",
+                        "policy_reference": autonomous_policy.policy_reference,
+                        "base_route_id": active_runtime_route["route"].route_id,
+                        "context_sha256": sha256_file(context_path),
+                        "selections": [item.model_dump(mode="json") for item in post_replan_route],
+                        "generated_at": utc_now(),
+                    },
                 )
                 return selected
 
