@@ -11593,6 +11593,7 @@ def _vertical_candidate_geometry(
     semantic_negotiation_state: dict[str, int] | None = None,
     semantic_beat: SemanticBeat | None = None,
     editorial_reconstruction_capability_ids: Sequence[str] = (),
+    allow_inline_semantic_negotiation: Literal[False] = False,
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
     """Evaluate one immutable vertical candidate without rendering a segment."""
 
@@ -11792,9 +11793,13 @@ def _vertical_candidate_geometry(
                 and negotiation_policy.max_global_negotiations == 1
                 and semantic_negotiation_state is not None
                 and semantic_negotiation_state.get("global", 0) < 1
+                and allow_inline_semantic_negotiation
             ):
-                # Claim the single global slot before dispatch. A failed
-                # optional negotiation must never fan out to the next shot.
+                # Production leaves this false. A single-candidate compiler
+                # lacks adjacent rhythm and whole-sequence context, so it may
+                # not spend the scoped-replan authority to select a creative
+                # alternative. The only production path is the deferred
+                # frontier replan below, after local facts are complete.
                 semantic_negotiation_state["global"] = 1
                 negotiation_dir = (
                     output_dir / "semantic-negotiation"
@@ -13511,6 +13516,39 @@ def _vertical_candidate_composition_signature(
     )
 
 
+def _normalized_vertical_presentation_mode(
+    strategy: str,
+) -> str:
+    """Normalize executor labels before comparing them to Gemini intent."""
+
+    return {
+        "static_full_bleed": "static_full_bleed_crop",
+        "static_full_bleed_crop": "static_full_bleed_crop",
+        "tracked_full_bleed": "tracked_full_bleed_crop",
+        "tracked_crop": "tracked_full_bleed_crop",
+        "tracked_full_bleed_crop": "tracked_full_bleed_crop",
+        "phase_virtual_camera": "phase_virtual_camera",
+        "hard_cut_between_views": "hard_cut_between_views",
+        "two_panel_layout": "two_panel_layout",
+        "solid_matte_fit": "solid_matte_fit",
+        "required_scope_solid_fit": "solid_matte_fit",
+        "fit_with_solid_matte": "solid_matte_fit",
+    }.get(strategy, strategy)
+
+
+def _presentation_requires_scoped_semantic_replan(
+    *,
+    requested_mode: str,
+    measured_mode: str,
+) -> bool:
+    """Keep a numeric presentation recovery from becoming an edit decision."""
+
+    return (
+        _normalized_vertical_presentation_mode(requested_mode)
+        != _normalized_vertical_presentation_mode(measured_mode)
+    )
+
+
 def _pre_render_vertical_presentation_mode(
     candidate: FeatureVerticalCandidate,
     *,
@@ -13537,7 +13575,15 @@ def _pre_render_vertical_feasibility(
     *,
     policy: AutonomousEditPolicy,
 ) -> tuple[PresentationCapability, tuple[str, ...], tuple[str, ...]]:
-    """Select a policy-authorized family without laundering unknown geometry."""
+    """Check Gemini's selected family without locally choosing an alternate.
+
+    The pre-render route is a feasibility ledger, not an editorial fallback
+    chooser.  A candidate may list several capabilities that Gemini considers
+    semantically acceptable, but only its explicit ``presentation_preference``
+    is creative authority for the first execution.  If it is known infeasible,
+    the beat must reach the bounded semantic replan path; selecting the next
+    locally convenient capability would silently change the edit.
+    """
 
     relation_mode = _resolved_autonomous_relation_mode(
         candidate.coverage_mode,
@@ -13572,33 +13618,11 @@ def _pre_render_vertical_feasibility(
     authorized = set(
         _normal_acceptable_capability_ids(candidate.presentation_preference)
     )
-    order: tuple[PresentationCapability, ...] = tuple(
-        mode
-        for mode in (
-            preferred,
-            "static_full_bleed_crop",
-            "tracked_full_bleed_crop",
-            "phase_virtual_camera",
-            "hard_cut_between_views",
-            "two_panel_layout",
-            "solid_matte_fit",
-        )
-        if mode in authorized
-    )
-    if not order:
+    if preferred not in authorized:
         raise ValueError(
-            "candidate has no Gemini-authorized presentation capability"
+            "candidate's Gemini-selected presentation is not authorized"
         )
-    unique_order = tuple(dict.fromkeys(order))
-    selected = next(
-        (
-            mode
-            for mode in unique_order
-            if lattice.assessment(mode).status != "known_infeasible"
-        ),
-        preferred,
-    )
-    assessment = lattice.assessment(selected)  # type: ignore[arg-type]
+    assessment = lattice.assessment(preferred)
     if assessment.status == "known_infeasible":
         hard_failures = tuple(
             dict.fromkeys(
@@ -13607,12 +13631,12 @@ def _pre_render_vertical_feasibility(
                 for reason in mode.reason_codes
             )
         )
-        return selected, hard_failures, ()
+        return preferred, hard_failures, ()
     return (
-        selected,
+        preferred,
         (),
         tuple(
-            f"{selected}:{assessment.status}:{reason}"
+            f"{preferred}:{assessment.status}:{reason}"
             for reason in assessment.reason_codes
         ),
     )
@@ -15991,20 +16015,23 @@ def _compile_autonomous_vertical_candidate_geometry(
         or geometry.get("base_presentation_strategy")
         or ""
     )
+    requested_mode = _normalized_vertical_presentation_mode(
+        str(option.get("presentation_preference", "tracked_full_bleed"))
+    )
+    applied_mode = _normalized_vertical_presentation_mode(applied)
     classification = (
-        "deferred_panel"
-        if applied == "two_panel_layout"
-        else "deferred_fit"
-        if applied
-        in {
-            "solid_matte_fit",
-            "required_scope_solid_fit",
-            "fit_with_solid_matte",
-        }
-        else "natural_accepted"
+        "natural_accepted"
+        if not _presentation_requires_scoped_semantic_replan(
+            requested_mode=requested_mode,
+            measured_mode=applied_mode,
+        )
+        else "deferred_semantic_replan"
     )
     return {
         "classification": classification,
+        "requested_presentation_mode": requested_mode,
+        "measured_presentation_mode": applied_mode,
+        "semantic_replan_required": classification != "natural_accepted",
         "filter_graph": filter_graph,
         "geometry": geometry,
         "debug_paths": [str(path.resolve()) for path in debug_paths],
@@ -20694,8 +20721,10 @@ def _run_feature_cut_experiment_impl(
                         "presentation family, and symbolic entry/exit "
                         "composition were jointly bound before paid execution. "
                         "Exact evidence, identity, relation, tracking, and "
-                        "pixel geometry remain downstream fail-closed gates; "
-                        "fallbacks are projections of saved complete routes."
+                        "pixel geometry remain downstream fail-closed gates. "
+                        "A measured presentation change is not a local "
+                        "fallback: it requires the single bounded Gemini "
+                        "replan with the saved sequence and music context."
                     ),
                     "generated_at": utc_now(),
                 },
@@ -21642,6 +21671,10 @@ def _run_feature_cut_experiment_impl(
                 str,
                 tuple[str, str],
             ] = {}
+            scoped_semantic_replan_state: dict[str, Any] = {
+                "used": 0,
+                "interaction_ids": [],
+            }
             active_runtime_route = {"route": active_local_route}
             accepted_runtime_execution_by_beat: dict[str, str] = {}
             failed_runtime_execution_sha256s: set[str] = set()
@@ -21682,6 +21715,16 @@ def _run_feature_cut_experiment_impl(
                         unavailable_runtime_execution_sha256s.add(
                             frontier_attempt.candidate_execution_sha256
                         )
+                    return
+                if str(error) == (
+                    "primary_presentation_requires_scoped_semantic_replan"
+                ):
+                    # This candidate is technically viable and remains in
+                    # the immutable complete-route frontier. It is not a
+                    # local failure merely because its measured presentation
+                    # differs from Gemini's first creative instruction.
+                    # Continue measuring the other bounded options, then let
+                    # the scoped replan choose among the complete set.
                     return
                 failed_execution_sha256 = (
                     frontier_attempt.candidate_execution_sha256
@@ -21809,6 +21852,14 @@ def _run_feature_cut_experiment_impl(
             def accept_deferred_for_beat(
                 feature_id: str,
             ) -> tuple[str, str] | None:
+                """Ask Gemini to resolve a measured presentation conflict.
+
+                Every row here has already completed the same local/exact/SAM
+                stages. Local code filters only hard technical constraints and
+                then gives Gemini the complete affected-beat, neighbouring
+                timeline and music-boundary context. It never ranks a panel,
+                matte, camera move, or candidate by itself.
+                """
                 already_selected = frontier_constructed_acceptances.get(
                     feature_id
                 )
@@ -21886,50 +21937,287 @@ def _run_feature_cut_experiment_impl(
                     for row in reusable_deferred
                     if compatible_deferred_routes[row[2]] is not None
                 ]
-                feature_runtime_ms = round(
-                    chapter_durations[feature_id] * 1000
-                )
-                panel_candidate = next(
-                    (
-                        row
-                        for row in reusable_deferred
-                        if (
-                            row[3].get("classification")
-                            == "deferred_panel"
-                            and autonomous_policy.presentation
-                            .allow_two_panel_layout
-                            and (
-                                frontier_constructed_runtime["panel_ms"]
-                                + feature_runtime_ms
-                            )
-                            / planned_vertical_runtime_ms
-                            <= (
-                                autonomous_policy.presentation
-                                .max_panel_runtime_fraction
-                            )
-                            + 1e-9
+                feature_runtime_ms = round(chapter_durations[feature_id] * 1000)
+                executable_deferred: list[
+                    tuple[int, str, str, Mapping[str, Any]]
+                ] = []
+                for row in reusable_deferred:
+                    measured_mode = str(
+                        row[3].get("measured_presentation_mode")
+                        or row[3].get("geometry", {}).get("applied_strategy")
+                        or ""
+                    )
+                    if measured_mode == "two_panel_layout" and (
+                        not autonomous_policy.presentation.allow_two_panel_layout
+                        or (
+                            frontier_constructed_runtime["panel_ms"]
+                            + feature_runtime_ms
                         )
-                    ),
-                    None,
-                )
-                selected_deferred = panel_candidate or next(
-                    (
-                        row
-                        for row in reusable_deferred
-                        if (
-                            row[3].get("classification")
-                            in {
-                                "deferred_fit",
-                                "deferred_scope_fit",
-                            }
-                            and autonomous_policy.presentation
-                            .allow_solid_matte_fit
-                        )
-                    ),
-                    None,
-                )
-                if selected_deferred is None:
+                        / planned_vertical_runtime_ms
+                        > autonomous_policy.presentation.max_panel_runtime_fraction
+                        + 1e-9
+                    ):
+                        continue
+                    if measured_mode == "solid_matte_fit" and not (
+                        autonomous_policy.presentation.allow_solid_matte_fit
+                    ):
+                        continue
+                    executable_deferred.append(row)
+                if not executable_deferred:
                     return None
+                if scoped_semantic_replan_state["used"] >= (
+                    autonomous_policy.budget.max_semantic_replans
+                ):
+                    raise CandidateKnownInfeasible(
+                        "scoped_semantic_replan_limit_reached"
+                    )
+                active_selections = [
+                    selection.model_dump(mode="json")
+                    for selection in active_runtime_route["route"].selections
+                ]
+                beat_index = next(
+                    index
+                    for index, selection in enumerate(
+                        active_runtime_route["route"].selections
+                    )
+                    if selection.beat_id == feature_id
+                )
+                local_options: list[dict[str, Any]] = []
+                option_id_to_row: dict[str, tuple[int, str, str, Mapping[str, Any]]] = {}
+                for order, row in enumerate(executable_deferred, start=1):
+                    key = _frontier_execution_key(feature_id, row[1], row[2])
+                    local_payload = local_payloads[key]
+                    exact_payload = exact_payloads.get(key, {})
+                    geometry_payload = row[3]
+                    geometry = geometry_payload.get("geometry")
+                    presentation = (
+                        geometry.get("presentation_compilation")
+                        if isinstance(geometry, Mapping)
+                        else None
+                    )
+                    option_id = (
+                        f"replan-{order:02d}-{row[1]}-"
+                        f"{str(geometry_payload.get('measured_presentation_mode') or 'unknown')}"
+                    )
+                    option_id_to_row[option_id] = row
+                    local_options.append(
+                        {
+                            "option_id": option_id,
+                            "candidate_id": row[1],
+                            "candidate_execution_sha256": row[2],
+                            "source_asset_id": local_payload["option"].get(
+                                "source_asset_id"
+                            ),
+                            "event_id": local_payload["option"].get("event_id"),
+                            "source_window_ms": {
+                                "start": local_payload.get("start_ms"),
+                                "end": local_payload.get("end_ms"),
+                            },
+                            "planner_intent": {
+                                "presentation_preference": geometry_payload.get(
+                                    "requested_presentation_mode"
+                                ),
+                                "coverage_mode": local_payload["option"].get(
+                                    "coverage_mode"
+                                ),
+                                "presentation_goal": local_payload["option"].get(
+                                    "presentation_goal"
+                                ),
+                                "source_camera_motion_role": local_payload[
+                                    "option"
+                                ].get("source_camera_motion_role"),
+                            },
+                            "measured_execution": {
+                                "presentation_mode": geometry_payload.get(
+                                    "measured_presentation_mode"
+                                ),
+                                "reason": geometry_payload.get("reason"),
+                                "failure_codes": geometry_payload.get(
+                                    "failure_codes", []
+                                ),
+                                "geometry_risk_codes": (
+                                    geometry.get("risk_codes", [])
+                                    if isinstance(geometry, Mapping)
+                                    else []
+                                ),
+                                "source_camera_motion": (
+                                    geometry.get("source_camera_motion_evidence")
+                                    if isinstance(geometry, Mapping)
+                                    else None
+                                ),
+                                "locally_executable_capability_options": (
+                                    presentation.get("option_set", {}).get(
+                                        "options", []
+                                    )
+                                    if isinstance(presentation, Mapping)
+                                    else []
+                                ),
+                            },
+                            "exact_evidence": {
+                                "locks": exact_payload.get("locks", []),
+                                "fulfillments": exact_payload.get(
+                                    "fulfillments", []
+                                ),
+                            },
+                        }
+                    )
+                semantic_beat = semantic_beat_by_id.get(feature_id)
+                rhythm_chapter = next(
+                    chapter
+                    for chapter in rhythm_plan.chapters
+                    if chapter.feature_id == feature_id
+                )
+                scoped_context = {
+                    "contract_version": "scoped-semantic-replan-context-v2",
+                    "policy_reference": autonomous_policy.policy_reference,
+                    "affected_beat": {
+                        "feature_id": feature_id,
+                        "semantic_beat": (
+                            semantic_beat.model_dump(mode="json")
+                            if semantic_beat is not None
+                            else None
+                        ),
+                        "rhythm": rhythm_chapter.model_dump(mode="json"),
+                        "current_route_selection": active_selections[beat_index],
+                    },
+                    "adjacent_sequence": {
+                        "previous": (
+                            active_selections[beat_index - 1]
+                            if beat_index > 0
+                            else None
+                        ),
+                        "next": (
+                            active_selections[beat_index + 1]
+                            if beat_index + 1 < len(active_selections)
+                            else None
+                        ),
+                        "whole_resolved_timeline": active_selections,
+                    },
+                    "music_context": {
+                        "supplied": music_lock is not None,
+                        "resolved_boundaries": duration_audit.get(
+                            "music_boundary_refinements", []
+                        ),
+                        "output_cues": [
+                            cue.model_dump(mode="json")
+                            for cue in (output_timeline_cues or [])
+                        ],
+                    },
+                    "immutable_options": local_options,
+                    "rules": {
+                        "may_change": [
+                            "affected_candidate",
+                            "affected_presentation_from_immutable_options",
+                        ],
+                        "must_preserve": [
+                            "brief_order",
+                            "exact_event_locks",
+                            "source_windows",
+                            "adjacent_beat_order",
+                            "resolved_music_cue_grid",
+                            "hard_evidence",
+                        ],
+                        "forbidden": [
+                            "invented_timestamp",
+                            "invented_crop_or_bbox",
+                            "new_source_media",
+                            "changing_unaffected_beats",
+                        ],
+                    },
+                }
+                context_path = (
+                    frontier_root
+                    / "scoped-semantic-replans"
+                    / f"{feature_id}.context.json"
+                )
+                write_json(context_path, scoped_context)
+                try:
+                    result = client.negotiate_edit_decision(
+                        beat_id=feature_id,
+                        option_ids=tuple(option_id_to_row),
+                        prompt=(
+                            "[protocol=scoped-semantic-replan-v2] A local "
+                            "measurement found that Gemini's initial presentation "
+                            "cannot execute as selected. Choose exactly one immutable "
+                            "option after preserving the complete music and adjacent "
+                            "sequence context below. The choices are already technically "
+                            "feasible; choose on editorial intent, not numeric geometry. "
+                            "Do not use panel or matte merely to avoid a crop; do use one "
+                            "when its stated semantic relation benefits. Do not alter a "
+                            "cue or duration outside the supplied boundary grid.\n\n"
+                            + json.dumps(scoped_context, ensure_ascii=False)
+                        ),
+                        tool_declarations=(),
+                        tool_handlers={},
+                        policy=autonomous_policy,
+                        run_dir=(
+                            frontier_root
+                            / "scoped-semantic-replans"
+                            / feature_id
+                        ),
+                        recovery_call=True,
+                    )
+                except Exception as error:
+                    write_json(
+                        context_path.with_name(f"{feature_id}.blocked.json"),
+                        {
+                            "contract_version": "scoped-semantic-replan-result-v2",
+                            "context_sha256": sha256_file(context_path),
+                            "status": "blocked",
+                            "reason": f"{type(error).__name__}:{error}",
+                            "policy_reference": autonomous_policy.policy_reference,
+                        },
+                    )
+                    raise CandidateKnownInfeasible(
+                        "scoped_semantic_replan_unavailable:"
+                        + f"{type(error).__name__}"
+                    ) from error
+                selected_deferred = option_id_to_row[
+                    result.decision.selected_option_id
+                ]
+                scoped_semantic_replan_state["used"] += 1
+                scoped_semantic_replan_state["interaction_ids"].extend(
+                    result.interaction_ids
+                )
+                replan_authority = authorize_decision(
+                    policy=autonomous_policy,
+                    decision_scope="scoped_semantic_replan",
+                    input_artifact_hashes=(
+                        f"sha256:{sha256_file(context_path)}",
+                        f"sha256:{route_sha256}",
+                        f"sha256:{frontier_plan_sha256}",
+                    ),
+                    deterministic_gate_results={
+                        "candidate_frontier_complete": "passed",
+                        "exact_event_locked": "passed",
+                        "geometry_executable": "passed",
+                        "music_context_bound": "passed",
+                    },
+                    decision_codes=(
+                        "scoped_semantic_replan_selected_immutable_option",
+                        "local_presentation_change_not_silently_accepted",
+                    ),
+                    gemini_interaction_ids=result.interaction_ids,
+                )
+                write_json(
+                    context_path.with_name(f"{feature_id}.decision.json"),
+                    {
+                        "contract_version": "scoped-semantic-replan-result-v2",
+                        "context_path": str(context_path.resolve()),
+                        "context_sha256": sha256_file(context_path),
+                        "policy_reference": autonomous_policy.policy_reference,
+                        "decision": result.model_dump(mode="json"),
+                        "selected_candidate_id": selected_deferred[1],
+                        "selected_candidate_execution_sha256": selected_deferred[2],
+                        "selected_measured_presentation_mode": (
+                            selected_deferred[3].get(
+                                "measured_presentation_mode"
+                            )
+                        ),
+                        "authority": replan_authority.model_dump(mode="json"),
+                        "generated_at": utc_now(),
+                    },
+                )
                 compatible_route = compatible_deferred_routes[
                     selected_deferred[2]
                 ]
@@ -21956,10 +22244,9 @@ def _run_feature_cut_experiment_impl(
                         "source_out_ms": int(selected_local["end_ms"]),
                     }
                 )
-                if (
-                    selected_deferred[3].get("classification")
-                    == "deferred_panel"
-                ):
+                if selected_deferred[3].get(
+                    "measured_presentation_mode"
+                ) == "two_panel_layout":
                     frontier_constructed_runtime[
                         "panel_ms"
                     ] += feature_runtime_ms
@@ -22239,11 +22526,7 @@ def _run_feature_cut_experiment_impl(
                         }
                     )
                     return None
-                if classification in {
-                    "deferred_panel",
-                    "deferred_fit",
-                    "deferred_scope_fit",
-                }:
+                if classification == "deferred_semantic_replan":
                     deferred_payloads.setdefault(
                         frontier_attempt.beat_id,
                         [],
@@ -22257,11 +22540,14 @@ def _run_feature_cut_experiment_impl(
                             geometry_payload,
                         )
                     )
-                    accepted_deferred = accept_deferred_for_beat(
-                        frontier_attempt.beat_id
+                    # Do not ask Gemini after the first merely executable
+                    # alternate. The frontier must first measure every
+                    # bounded candidate so the scoped replan can compare the
+                    # complete locally viable choice set in its actual music
+                    # and adjacent-sequence context.
+                    raise CandidateKnownInfeasible(
+                        "primary_presentation_requires_scoped_semantic_replan"
                     )
-                    if accepted_deferred is not None:
-                        return accepted_deferred
                 raise CandidateKnownInfeasible(
                     str(
                         geometry_payload.get("reason")
@@ -22450,11 +22736,7 @@ def _run_feature_cut_experiment_impl(
                     if (
                         not persisted_geometry_stale
                         and persisted_geometry_payload.get("classification")
-                        in {
-                            "deferred_panel",
-                            "deferred_fit",
-                            "deferred_scope_fit",
-                        }
+                        == "deferred_semantic_replan"
                     ):
                         deferred_payloads.setdefault(
                             persisted_beat.beat_id,
@@ -22571,12 +22853,9 @@ def _run_feature_cut_experiment_impl(
                                 resumed_execution_sha256,
                             )
                         )
-                        if (
-                            resumed_geometry_payload.get(
-                                "classification"
-                            )
-                            == "deferred_panel"
-                        ):
+                        if resumed_geometry_payload.get(
+                            "measured_presentation_mode"
+                        ) == "two_panel_layout":
                             frontier_constructed_runtime[
                                 "panel_ms"
                             ] += round(
@@ -22587,11 +22866,7 @@ def _run_feature_cut_experiment_impl(
                             )
                         if resumed_geometry_payload.get(
                             "classification"
-                        ) in {
-                            "deferred_panel",
-                            "deferred_fit",
-                            "deferred_scope_fit",
-                        }:
+                        ) == "deferred_semantic_replan":
                             frontier_constructed_acceptances[
                                 resumed_beat.beat.beat_id
                             ] = (
@@ -22732,13 +23007,8 @@ def _run_feature_cut_experiment_impl(
                             candidate.candidate_execution_sha256,
                         )
                     ] = exact_payload
-                    if (
-                        geometry_payload.get("classification")
-                        in {
-                            "deferred_panel",
-                            "deferred_fit",
-                            "deferred_scope_fit",
-                        }
+                    if geometry_payload.get("classification") == (
+                        "deferred_semantic_replan"
                     ):
                         deferred_payloads.setdefault(
                             beat_state.beat.beat_id,
@@ -22821,8 +23091,8 @@ def _run_feature_cut_experiment_impl(
                                 feature_id
                             ],
                         )
-                    ].get("classification")
-                    == "deferred_panel"
+                    ].get("measured_presentation_mode")
+                    == "two_panel_layout"
                 )
                 retained_panel_fraction = (
                     retained_panel_runtime_ms / max(1, retained_runtime_ms)
@@ -23876,13 +24146,51 @@ def _run_feature_cut_experiment_impl(
                         geometry_payload = geometry_stage["payload"]
                         if geometry_payload.get("classification") not in {
                             "natural_accepted",
-                            "deferred_panel",
-                            "deferred_fit",
-                            "deferred_scope_fit",
+                            "deferred_semantic_replan",
                         }:
                             raise FeatureCutSystemFailure(
                                 "frozen frontier selected a rejected geometry"
                             )
+                        if geometry_payload.get("classification") == (
+                            "deferred_semantic_replan"
+                        ):
+                            replan_decision_path = (
+                                output_dir
+                                / "production-frontier"
+                                / "9x16"
+                                / "scoped-semantic-replans"
+                                / f"{selected.feature_id}.decision.json"
+                            )
+                            if not replan_decision_path.is_file():
+                                raise FeatureCutSystemFailure(
+                                    "deferred presentation has no scoped "
+                                    "Gemini replan authority"
+                                )
+                            replan_decision = read_json(replan_decision_path)
+                            replan_authority = DecisionAuthorityV2.model_validate(
+                                replan_decision.get("authority")
+                            )
+                            validate_authority_binding(
+                                replan_authority,
+                                autonomous_policy,
+                            )
+                            if replan_authority.decision_scope != (
+                                "scoped_semantic_replan"
+                            ):
+                                raise FeatureCutSystemFailure(
+                                    "scoped Gemini replan has wrong authority scope"
+                                )
+                            if (
+                                replan_decision.get("selected_candidate_id")
+                                != candidate_id
+                                or replan_decision.get(
+                                    "selected_candidate_execution_sha256"
+                                ) != frozen_frontier_execution_sha256
+                            ):
+                                raise FeatureCutSystemFailure(
+                                    "scoped Gemini replan authority does not "
+                                    "bind frozen presentation execution"
+                                )
                         candidate_frame = RushFrame.model_validate(
                             local_payload["frame"]
                         )

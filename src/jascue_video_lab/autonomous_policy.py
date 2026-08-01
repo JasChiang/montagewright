@@ -60,9 +60,9 @@ class BudgetPolicy(FrozenStrictModel):
         le=100.0,
     )
     max_paid_interactions: int = Field(ge=1, le=100)
-    # V1 production does not yet have a complete bounded semantic-replan
-    # executor. Keep the safe default disabled; a caller may explicitly grant
-    # one only when it also supplies that executor.
+    # A scoped replan is an exception path after all bounded local candidate
+    # facts are known. It is disabled by default; a policy must explicitly
+    # reserve the single allowed replan before production may dispatch it.
     max_semantic_replans: Literal[0, 1] = 0
     max_final_qa_passes: int = Field(default=2, ge=1, le=2)
     reserved_recovery_fraction: float = Field(default=0.20, ge=0.20, le=0.50)
@@ -293,6 +293,7 @@ class DecisionAuthorityV2(FrozenStrictModel):
         "cue_plan",
         "trim_intent",
         "reframe",
+        "scoped_semantic_replan",
         "feature_cut",
         "final_delivery",
     ]
@@ -405,6 +406,7 @@ def authorize_decision(
         "cue_plan",
         "trim_intent",
         "reframe",
+        "scoped_semantic_replan",
         "feature_cut",
         "final_delivery",
     ],

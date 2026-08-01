@@ -52,6 +52,8 @@ from jascue_video_lab.feature_cut import (
     _runtime_exact_event_root,
     _pre_render_execution_bindings_by_beat_and_sha,
     _pre_render_execution_duration_seconds,
+    _pre_render_vertical_feasibility,
+    _presentation_requires_scoped_semantic_replan,
     _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
     _build_production_sequence_optimization,
@@ -2255,6 +2257,78 @@ def test_semantic_replan_frontier_is_bounded_and_carries_adjacent_context() -> N
     assert projection["beats"][1]["adjacent_sequence_context"]["previous"][
         "beat_id"
     ] == "opening"
+
+
+def test_local_presentation_change_requires_scoped_semantic_replan() -> None:
+    """A measured fit/panel/crop alternative is not local creative authority."""
+
+    assert _presentation_requires_scoped_semantic_replan(
+        requested_mode="tracked_full_bleed",
+        measured_mode="static_full_bleed_crop",
+    )
+    assert _presentation_requires_scoped_semantic_replan(
+        requested_mode="two_panel_layout",
+        measured_mode="solid_matte_fit",
+    )
+    assert not _presentation_requires_scoped_semantic_replan(
+        requested_mode="tracked_full_bleed",
+        measured_mode="tracked_crop",
+    )
+
+
+def test_pre_render_feasibility_does_not_locally_pick_an_authorized_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The route records Gemini's first choice even when static crop is easier."""
+
+    class Assessment:
+        status = "feasible"
+        reason_codes = ("static_is_locally_easier",)
+
+    class Lattice:
+        def assessment(self, mode: str) -> Assessment:
+            assert mode == "tracked_full_bleed_crop"
+            return Assessment()
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "assess_prepaid_presentation_feasibility",
+        lambda **_kwargs: Lattice(),
+    )
+    candidate = SimpleNamespace(
+        candidate_id="candidate-a",
+        aspect_suitability="natural",
+        coverage_mode="simultaneous",
+        regions=(),
+        virtual_camera_proposal=None,
+        physical_scale_comparison=False,
+        presentation_preference="tracked_full_bleed",
+    )
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=55_000,
+            max_ms=70_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+    mode, hard_failures, deferred = _pre_render_vertical_feasibility(
+        candidate,
+        policy=policy,
+    )
+
+    assert mode == "tracked_full_bleed_crop"
+    assert hard_failures == ()
+    assert deferred == (
+        "tracked_full_bleed_crop:feasible:static_is_locally_easier",
+    )
 
 
 def test_runtime_panel_fallback_cannot_exceed_global_fraction() -> None:
