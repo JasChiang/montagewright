@@ -547,22 +547,32 @@ def _reconcile_planning_subprocess_usage(
     *,
     budget_ledger: BudgetLedger,
     reservation_id: str,
-    text_only_repair_reservation_id: str | None,
     stage_dir: Path,
     estimate_input_tokens: int,
     estimate_output_tokens: int,
     estimate_thought_tokens: int,
+    exclude_existing_raw_interaction_paths: Collection[Path] = (),
 ) -> dict[str, Any]:
-    usage = summarize_usage_and_list_price(stage_dir)
+    excluded_paths = {
+        path.resolve()
+        for path in exclude_existing_raw_interaction_paths
+    }
+    if excluded_paths:
+        usage = summarize_usage_files(
+            [
+                path
+                for path in stage_dir.rglob("*.raw_interaction.json")
+                if path.resolve() not in excluded_paths
+            ],
+            relative_to=stage_dir,
+        )
+    else:
+        usage = summarize_usage_and_list_price(stage_dir)
     request_count = int(usage["request_count"])
     if request_count == 0:
         dispatched_request_paths = tuple(stage_dir.rglob("*.request.json"))
         if not dispatched_request_paths:
             budget_ledger.cancel_before_dispatch(reservation_id)
-            if text_only_repair_reservation_id is not None:
-                budget_ledger.cancel_before_dispatch(
-                    text_only_repair_reservation_id
-                )
             return usage
         # The request artifact is written immediately before dispatch. If the
         # API failed before returning immutable usage, keep the run fail-closed
@@ -578,12 +588,6 @@ def _reconcile_planning_subprocess_usage(
             },
             model_id=MODEL_ID,
         )
-        if text_only_repair_reservation_id is not None:
-            # A second reservation was held only for an authorized text-only
-            # repair.  With no returned usage we cannot prove that it was
-            # dispatched, so retain the conservative main-call charge and
-            # release the unused repair hold.
-            budget_ledger.cancel_before_dispatch(text_only_repair_reservation_id)
         return {
             **usage,
             "usage_status": "dispatch_recorded_usage_unavailable",
@@ -596,75 +600,21 @@ def _reconcile_planning_subprocess_usage(
                 str(path.resolve()) for path in dispatched_request_paths
             ],
         }
-    # ``summarize_usage_and_list_price`` already removes canonical aliases of
-    # an immutable paid attempt.  Use its authoritative request list rather
-    # than rglob: a successful repair also writes a canonical projection that
-    # must not look like a third provider interaction.
-    raw_paths = [
-        stage_dir / str(row["path"])
-        for row in usage.get("requests", [])
-        if isinstance(row, dict) and isinstance(row.get("path"), str)
-    ]
-    if request_count == 1:
-        budget_ledger.reconcile(
-            reservation_id,
-            usage={
-                "total_input_tokens": usage["total_input_tokens"],
-                "total_cached_tokens": usage["total_cached_input_tokens"],
-                "total_output_tokens": usage["total_output_tokens"],
-                "total_thought_tokens": usage["total_thought_tokens"],
-            },
-            model_id=MODEL_ID,
-        )
-        if text_only_repair_reservation_id is not None:
-            budget_ledger.cancel_before_dispatch(text_only_repair_reservation_id)
-        return usage
-    if request_count != 2 or text_only_repair_reservation_id is None:
+    if request_count != 1:
         raise DeliveryPipelineBlocked(
             "bounded autonomous planning stage produced an unexpected number "
             f"of paid interactions: {request_count}"
         )
-    if len(raw_paths) != 2:
-        raise DeliveryPipelineBlocked(
-            "two paid planning interactions must each preserve raw usage"
-        )
-    text_only_paths: list[Path] = []
-    for raw_path in raw_paths:
-        request_path = raw_path.with_name(
-            raw_path.name.replace(".raw_interaction.json", ".request.json")
-        )
-        request = read_json(request_path) if request_path.is_file() else {}
-        inputs = request.get("input") if isinstance(request, dict) else []
-        if (
-            isinstance(inputs, list)
-            and inputs
-            and all(
-                isinstance(item, dict) and item.get("type") == "text"
-                for item in inputs
-            )
-        ):
-            text_only_paths.append(raw_path)
-    if len(text_only_paths) != 1:
-        raise DeliveryPipelineBlocked(
-            "authorized planning repair must be exactly one text-only interaction"
-        )
-    repair_path = text_only_paths[0]
-    main_path = next(path for path in raw_paths if path != repair_path)
-    for path, active_reservation in (
-        (main_path, reservation_id),
-        (repair_path, text_only_repair_reservation_id),
-    ):
-        single_usage = summarize_usage_files([path], relative_to=stage_dir)
-        budget_ledger.reconcile(
-            active_reservation,
-            usage={
-                "total_input_tokens": single_usage["total_input_tokens"],
-                "total_cached_tokens": single_usage["total_cached_input_tokens"],
-                "total_output_tokens": single_usage["total_output_tokens"],
-                "total_thought_tokens": single_usage["total_thought_tokens"],
-            },
-            model_id=MODEL_ID,
-        )
+    budget_ledger.reconcile(
+        reservation_id,
+        usage={
+            "total_input_tokens": usage["total_input_tokens"],
+            "total_cached_tokens": usage["total_cached_input_tokens"],
+            "total_output_tokens": usage["total_output_tokens"],
+            "total_thought_tokens": usage["total_thought_tokens"],
+        },
+        model_id=MODEL_ID,
+    )
     return usage
 
 
@@ -679,7 +629,8 @@ def _run_budgeted_planning_stage(
     media_resolution: str = "low",
     max_output_tokens: int = 12_000,
     thinking_level: str = "low",
-    allow_one_text_only_repair: bool = False,
+    raise_on_subprocess_error: bool = True,
+    exclude_existing_raw_interaction_paths: Collection[Path] = (),
 ) -> dict[str, Any]:
     estimate = estimate_paid_call(
         stage=stage,
@@ -692,25 +643,6 @@ def _run_budgeted_planning_stage(
         retry_allowance=0,
     )
     reservation = budget_ledger.reserve(estimate)
-    text_only_repair_reservation_id: str | None = None
-    if allow_one_text_only_repair:
-        # The repair receives the prior raw response and contract as text,
-        # never the uploaded reel or music.  Reserve it before the first
-        # dispatch so a syntactic repair cannot silently overspend the run.
-        repair_estimate = estimate_paid_call(
-            stage=f"{stage}_text_only_repair",
-            model_id=MODEL_ID,
-            text_input_tokens=max(estimated_text_tokens, 60_000),
-            max_output_tokens=max_output_tokens,
-            thinking_level="minimal",
-            retry_allowance=0,
-        )
-        try:
-            repair_reservation = budget_ledger.reserve(repair_estimate)
-        except BaseException:
-            budget_ledger.cancel_before_dispatch(reservation.reservation_id)
-            raise
-        text_only_repair_reservation_id = repair_reservation.reservation_id
     started = monotonic()
     completed: subprocess.CompletedProcess[str] | None = None
     error: BaseException | None = None
@@ -743,11 +675,13 @@ def _run_budgeted_planning_stage(
         usage = _reconcile_planning_subprocess_usage(
             budget_ledger=budget_ledger,
             reservation_id=reservation.reservation_id,
-            text_only_repair_reservation_id=text_only_repair_reservation_id,
             stage_dir=stage_dir,
             estimate_input_tokens=estimate.estimated_input_tokens,
             estimate_output_tokens=estimate.max_output_tokens,
             estimate_thought_tokens=estimate.reserved_thought_tokens,
+            exclude_existing_raw_interaction_paths=(
+                exclude_existing_raw_interaction_paths
+            ),
         )
         write_json(
             stage_dir / "orchestration.json",
@@ -785,7 +719,7 @@ def _run_budgeted_planning_stage(
     except BaseException as caught:
         if error is None:
             error = caught
-    if error is not None:
+    if error is not None and raise_on_subprocess_error:
         raise DeliveryPipelineBlocked(
             f"{stage} failed; immutable subprocess artifacts were preserved"
         ) from error
@@ -1472,10 +1406,10 @@ def _prepare_fresh_autonomous_direct_plan(
         "--thinking-level",
         "low",
         "--repair-attempts",
-        # A malformed structured response must be repaired from its saved text,
-        # never by replaying the candidate videos.  One bounded repair is part
-        # of the signed autonomous path; further failures remain fail-closed.
-        "1",
+        # The initial multimodal planner is one dispatch.  An authorized
+        # text-only repair, if its typed contract fails, is launched as a
+        # separate budget reservation below; it never replays video or music.
+        "0",
         "--shortlist",
         str(shortlist_path),
         "--autonomous-policy",
@@ -1535,8 +1469,53 @@ def _prepare_fresh_autonomous_direct_plan(
             ),
             media_duration_ms=360_000 + music_duration_ms,
             max_output_tokens=24_576,
-            allow_one_text_only_repair=True,
+            raise_on_subprocess_error=False,
         )
+        if not all(path.is_file() for path in required):
+            initial_validation_path = (
+                plan_dir
+                / "clip-card-feature-plan.attempt-01.schema-validation.json"
+            )
+            initial_validation = (
+                read_json(initial_validation_path)
+                if initial_validation_path.is_file()
+                else {}
+            )
+            if not (
+                isinstance(initial_validation, dict)
+                and initial_validation.get("ok") is False
+            ):
+                raise DeliveryPipelineBlocked(
+                    "direct-video planning failed without a typed contract "
+                    "error eligible for the single text-only repair"
+                )
+            repair_command = [*plan_command, "--resume-failed-plan"]
+            initial_raw_paths = tuple(
+                plan_dir.rglob("*.raw_interaction.json")
+            )
+            repair_usage = _run_budgeted_planning_stage(
+                command=repair_command,
+                stage="autonomous_direct_video_edit_plan_text_only_repair",
+                stage_dir=plan_dir,
+                budget_ledger=budget_ledger,
+                # The repair carries the original prompt, the failed JSON and
+                # the contract diagnostic as text.  Price that retained
+                # evidence rather than the candidate reel a second time.
+                estimated_text_tokens=max(
+                    60_000,
+                    len(shortlist_path.read_text(encoding="utf-8")) * 3
+                    + 30_000,
+                ),
+                max_output_tokens=24_576,
+                thinking_level="minimal",
+                exclude_existing_raw_interaction_paths=initial_raw_paths,
+            )
+            planning_usage = {
+                "request_count": int(planning_usage["request_count"])
+                + int(repair_usage["request_count"]),
+                "initial_multimodal": planning_usage,
+                "text_only_repair": repair_usage,
+            }
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise DeliveryPipelineBlocked(

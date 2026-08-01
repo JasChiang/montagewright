@@ -100,68 +100,68 @@ def test_budgeted_planning_failure_preserves_subprocess_output(
     assert ledger.committed_interactions == 0
 
 
-def test_budgeted_planning_reserves_and_reconciles_one_text_only_repair(
+def test_budgeted_planning_reconciles_text_only_repair_separately(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     stage_dir = tmp_path / "planner"
+    first_stem = "clip-card-feature-plan.attempt-01"
+    write_json(
+        stage_dir / f"{first_stem}.request.json",
+        {
+            "model": "gemini-3.6-flash",
+            "input": [
+                {"type": "text", "text": "editorial contract"},
+                {"type": "video", "uri": "file-api://candidate"},
+            ],
+        },
+    )
+    first_raw_path = stage_dir / f"{first_stem}.raw_interaction.json"
+    write_json(
+        first_raw_path,
+        {
+            "model": "gemini-3.6-flash",
+            "usage": {
+                "total_input_tokens": 1_000,
+                "total_cached_tokens": 0,
+                "total_output_tokens": 200,
+                "total_thought_tokens": 0,
+            },
+        },
+    )
 
     def complete(*_args, **_kwargs):
         stage_dir.mkdir(parents=True, exist_ok=True)
-        for attempt, inputs, usage in (
-            (
-                1,
-                [
-                    {"type": "text", "text": "editorial contract"},
-                    {"type": "video", "uri": "file-api://candidate"},
-                ],
-                {
-                    "total_input_tokens": 1_000,
-                    "total_cached_tokens": 0,
-                    "total_output_tokens": 200,
-                    "total_thought_tokens": 0,
+        repair_stem = "clip-card-feature-plan.attempt-02"
+        write_json(
+            stage_dir / f"{repair_stem}.request.json",
+            {
+                "model": "gemini-3.6-flash",
+                "input": [{"type": "text", "text": "repair only"}],
+                "generation_config": {
+                    "max_output_tokens": 512,
+                    "thinking_level": "minimal",
                 },
-            ),
-            (
-                2,
-                [{"type": "text", "text": "repair only"}],
-                {
-                    "total_input_tokens": 500,
-                    "total_cached_tokens": 0,
-                    "total_output_tokens": 80,
-                    "total_thought_tokens": 0,
-                },
-            ),
-            ):
-            stem = f"clip-card-feature-plan.attempt-{attempt:02d}"
-            write_json(
-                stage_dir / f"{stem}.request.json",
-                {
-                    "model": "gemini-3.6-flash",
-                    "input": inputs,
-                    "generation_config": {
-                        "max_output_tokens": 512,
-                        "thinking_level": "minimal",
-                    },
-                },
-            )
-            write_json(
-                stage_dir / f"{stem}.raw_interaction.json",
-                {"model": "gemini-3.6-flash", "usage": usage},
-            )
+            },
+        )
+        repair_raw = {
+            "model": "gemini-3.6-flash",
+            "usage": {
+                "total_input_tokens": 500,
+                "total_cached_tokens": 0,
+                "total_output_tokens": 80,
+                "total_thought_tokens": 0,
+            },
+        }
+        write_json(
+            stage_dir / f"{repair_stem}.raw_interaction.json",
+            repair_raw,
+        )
         # The planner writes a canonical alias of its successful repair.  It
         # is evidence, not a third paid interaction.
         write_json(
             stage_dir / "clip-card-feature-plan.raw_interaction.json",
-            {
-                "model": "gemini-3.6-flash",
-                "usage": {
-                    "total_input_tokens": 500,
-                    "total_cached_tokens": 0,
-                    "total_output_tokens": 80,
-                    "total_thought_tokens": 0,
-                },
-            },
+            repair_raw,
         )
         return subprocess.CompletedProcess(["planner"], 0, "ok", "")
 
@@ -170,19 +170,18 @@ def test_budgeted_planning_reserves_and_reconciles_one_text_only_repair(
 
     usage = pipeline._run_budgeted_planning_stage(
         command=["planner"],
-        stage="autonomous_direct_video_edit_plan",
+        stage="autonomous_direct_video_edit_plan_text_only_repair",
         stage_dir=stage_dir,
         budget_ledger=ledger,
         estimated_text_tokens=10_000,
         max_output_tokens=512,
-        thinking_level="low",
-        allow_one_text_only_repair=True,
+        thinking_level="minimal",
+        exclude_existing_raw_interaction_paths=(first_raw_path,),
     )
 
-    assert usage["request_count"] == 2
-    assert ledger.committed_interactions == 2
+    assert usage["request_count"] == 1
+    assert ledger.committed_interactions == 1
     report = ledger.report()["stages"]
-    assert report["autonomous_direct_video_edit_plan"]["actual_input_tokens"] == 1_000
     assert (
         report["autonomous_direct_video_edit_plan_text_only_repair"]
         ["actual_input_tokens"]
@@ -2019,9 +2018,87 @@ def test_fresh_autonomous_planning_uses_shortlist_then_direct_video_projection(
     direct_command = stages[1][1]
     assert "--candidate-video-evidence" in direct_command
     assert "--repair-attempts" in direct_command
-    assert direct_command[direct_command.index("--repair-attempts") + 1] == "1"
+    assert direct_command[direct_command.index("--repair-attempts") + 1] == "0"
     assert "--music" in direct_command
     assert result["plan_dir"].endswith("picture/gemini-plan")
+
+
+def test_fresh_autonomous_planning_budgets_text_repair_after_typed_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    catalog = tmp_path / "catalog.json"
+    brief = tmp_path / "brief.json"
+    policy_path = tmp_path / "policy.json"
+    contracts = tmp_path / "contracts.json"
+    music = tmp_path / "music.wav"
+    library = tmp_path / "clip-cards"
+    for path in (catalog, brief, policy_path, contracts):
+        write_json(path, {})
+    write_json(policy_path, _autonomous_policy())
+    music.write_bytes(b"music")
+    library.mkdir()
+    monkeypatch.setattr(
+        pipeline,
+        "_resolve_prepared_clip_card_library",
+        lambda **_kwargs: (library, SimpleNamespace(), (), 1_000),
+    )
+    monkeypatch.setattr(pipeline, "_refresh_stale_clip_cards", lambda **_kwargs: ())
+    monkeypatch.setattr(
+        pipeline,
+        "_archive_stale_clip_card_supplements",
+        lambda **_kwargs: (),
+    )
+    stages: list[tuple[str, list[str], dict]] = []
+
+    def fake_stage(**kwargs):
+        stage = kwargs["stage"]
+        command = kwargs["command"]
+        stages.append((stage, command, kwargs))
+        delivery = tmp_path / "delivery"
+        if stage == "autonomous_clip_card_shortlist":
+            write_json(delivery / "retrieval" / "feature-shortlist.json", {})
+        elif stage == "autonomous_direct_video_edit_plan":
+            write_json(
+                delivery
+                / "picture"
+                / "gemini-plan"
+                / "clip-card-feature-plan.attempt-01.schema-validation.json",
+                {"ok": False, "error": "typed contract failed"},
+            )
+        else:
+            for name in (
+                "feature_edit_plan.json",
+                "selected-clip-card-evidence.json",
+                "feature-plan.external-projection.json",
+            ):
+                write_json(delivery / "picture" / "gemini-plan" / name, {})
+        return {"request_count": 1}
+
+    monkeypatch.setattr(pipeline, "_run_budgeted_planning_stage", fake_stage)
+
+    result = pipeline._prepare_fresh_autonomous_direct_plan(
+        catalog_path=catalog,
+        brief_path=brief,
+        music_path=music,
+        music_duration_ms=90_000,
+        policy_path=policy_path,
+        editorial_contracts_path=contracts,
+        prepared_library_path=library,
+        output_dir=tmp_path / "delivery",
+        budget_ledger=BudgetLedger(max_cost_usd=1.25, max_interactions=25),
+    )
+
+    assert [stage for stage, _command, _kwargs in stages] == [
+        "autonomous_clip_card_shortlist",
+        "autonomous_direct_video_edit_plan",
+        "autonomous_direct_video_edit_plan_text_only_repair",
+    ]
+    initial_kwargs = stages[1][2]
+    assert initial_kwargs["raise_on_subprocess_error"] is False
+    repair_command = stages[2][1]
+    assert "--resume-failed-plan" in repair_command
+    assert result["planning_usage"]["request_count"] == 2
 
 
 def test_prepared_clip_card_stale_model_blocks_before_paid_planning(
