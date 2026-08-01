@@ -982,6 +982,38 @@ def test_semantic_replan_rebuilds_full_route_after_gemini_reuse_authority() -> N
     )
 
 
+def test_semantic_replan_cannot_attach_reuse_authority_to_safe_candidate() -> None:
+    """A replan may authorize only the measured missing-reuse frontier."""
+
+    opening = _timed_route_option(
+        "opening", "opening-a", "a", source_in_ms=0, source_out_ms=3_000
+    )
+    fold = _timed_route_option(
+        "fold", "fold-b", "b", source_in_ms=0, source_out_ms=3_000
+    )
+    frontier = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(opening,)),
+            CandidateRouteBeat(beat_id="fold", options=(fold,)),
+        )
+    )
+
+    with pytest.raises(ValueError, match="without a measured reuse-authority"):
+        rebuild_route_with_semantic_authorities(
+            frontier,
+            selected_candidate_ids_by_beat={"fold": "fold-b"},
+            reuse_authorities_by_beat={
+                "fold": SemanticReplanReuseAuthority(
+                    beat_id="fold",
+                    candidate_id="fold-b",
+                    reuse_mode="distinct_interval",
+                    reuse_justification="Not needed, so this must fail.",
+                    reuse_of_beat_ids=("opening",),
+                )
+            },
+        )
+
+
 def test_center_overlap_repositions_safe_window_for_distinct_interval() -> None:
     fold_hero = _movable_route_option(
         "fold_hero",

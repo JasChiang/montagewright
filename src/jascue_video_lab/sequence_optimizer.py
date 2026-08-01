@@ -2601,6 +2601,11 @@ def rebuild_route_with_semantic_authorities(
         authority = reuse_authorities_by_beat.get(beat_id)
         option = binding.option
         if authority is not None:
+            if "source_reuse_authority_missing" not in binding.replan_required_codes:
+                raise ValueError(
+                    "semantic reuse authority was supplied for a candidate "
+                    "without a measured reuse-authority requirement"
+                )
             if authority.candidate_id != candidate_id:
                 raise ValueError(
                     "semantic reuse authority does not bind selected candidate"

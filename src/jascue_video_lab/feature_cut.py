@@ -14622,6 +14622,11 @@ def _materialize_resolved_frontier_route(
             source_out_ms=source_out_ms,
             candidate_execution_sha256=execution_sha256,
             reuse_mode=str(option.get("source_reuse_mode") or "none"),
+            reuse_justification=(
+                str(option.get("source_reuse_justification"))
+                if option.get("source_reuse_justification") is not None
+                else None
+            ),
         )
         selections.append(selection)
         bindings.setdefault(beat_id, {})[execution_sha256] = selection
@@ -21752,6 +21757,26 @@ def _run_feature_cut_experiment_impl(
                         raise FeatureCutSystemFailure(
                             "saved preflight semantic reuse replan does not "
                             "match the current immutable context"
+                        )
+                    saved_authority = DecisionAuthorityV2.model_validate(
+                        decision_payload.get("authority")
+                    )
+                    validate_authority_binding(saved_authority, autonomous_policy)
+                    if saved_authority.decision_scope != "scoped_semantic_replan":
+                        raise FeatureCutSystemFailure(
+                            "saved preflight semantic reuse replan has the "
+                            "wrong authority scope"
+                        )
+                    required_hashes = {
+                        f"sha256:{sha256_file(context_path)}",
+                        f"sha256:{sha256_file(plan_path)}",
+                    }
+                    if not required_hashes.issubset(
+                        saved_authority.input_artifact_hashes
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "saved preflight semantic reuse replan authority "
+                            "is missing an immutable input hash"
                         )
                     decisions = decision_payload.get("decisions")
                     interaction_ids = tuple(
