@@ -645,6 +645,9 @@ def _load_or_create_frontier_stage_artifact(
     stale_local_recompile_producer: (
         Callable[[], Mapping[str, Any]] | None
     ) = None,
+    stale_paid_payload_validator: (
+        Callable[[Mapping[str, Any]], bool] | None
+    ) = None,
 ) -> Mapping[str, Any]:
     """Persist a callback result before advancing scheduler state.
 
@@ -766,6 +769,42 @@ def _load_or_create_frontier_stage_artifact(
             )
         )
         if bindings_are_stale:
+            if (
+                stale_paid_payload_validator is not None
+                and stale_paid_payload_validator(payload)
+            ):
+                # A local wrapper revision may change its artifact hash while
+                # leaving the exact provider input unchanged.  Keep the paid
+                # artifact byte-identical, validate its semantic projection,
+                # and record the narrow compatibility proof beside it.
+                write_json(
+                    artifact_path.with_name(
+                        artifact_path.name + ".paid-input-compat.json"
+                    ),
+                    {
+                        "contract_version": (
+                            "vertical-frontier-paid-input-compat-v1"
+                        ),
+                        "artifact_path": str(artifact_path.resolve()),
+                        "artifact_sha256": sha256_file(artifact_path),
+                        "beat_id": beat_id,
+                        "candidate_id": candidate_id,
+                        "candidate_execution_sha256": (
+                            candidate_execution_sha256
+                        ),
+                        "stage": stage,
+                        "previous_dependency_hashes": (
+                            saved_dependency_hashes
+                        ),
+                        "current_dependency_hashes": list(dependency_hashes),
+                        "validation_scope": (
+                            "exact_provider_input_projection_unchanged"
+                        ),
+                        "paid_provider_dispatch_added": False,
+                        "generated_at": utc_now(),
+                    },
+                )
+                return dict(payload)
             locally_recompilable = (
                 stage in {"local_preflight", "finalize"}
                 or (
@@ -901,6 +940,9 @@ def _load_existing_frontier_stage_artifact(
     dependency_hashes: Sequence[str],
     policy_reference: str,
     route_sha256: str,
+    stale_paid_payload_validator: (
+        Callable[[Mapping[str, Any]], bool] | None
+    ) = None,
 ) -> Mapping[str, Any]:
     """Validate an already committed stage without permitting provider work."""
 
@@ -925,6 +967,7 @@ def _load_existing_frontier_stage_artifact(
         policy_reference=policy_reference,
         route_sha256=route_sha256,
         producer=reject_producer,
+        stale_paid_payload_validator=stale_paid_payload_validator,
     )
 
 
@@ -15879,6 +15922,80 @@ def _resolve_autonomous_vertical_candidate_exact(
     }
 
 
+def _exact_payload_matches_local_input_projection(
+    payload: Mapping[str, Any],
+    local_artifact: Mapping[str, Any],
+) -> bool:
+    """Prove a paid exact result remains valid across a local wrapper update.
+
+    This checks the source window, targets/query lock, contracts, and exact
+    locks consumed by Gemini. A presentation-compiler revision must not make
+    Gemini re-watch the same immutable selected window; an input change still
+    fails closed.
+    """
+
+    try:
+        clip = local_artifact["clip"]
+        frame = local_artifact["frame"]
+        query_lock = local_artifact["query_lock"]
+        trim = payload["trim"]
+        source_interval = trim["authorized_source_interval"]
+        if not all(
+            isinstance(value, Mapping)
+            for value in (clip, frame, query_lock, trim, source_interval)
+        ):
+            return False
+        if source_interval.get("source_sha256") != clip.get("sha256"):
+            return False
+        if trim.get("candidate_execution_sha256") != local_artifact.get(
+            "candidate_execution_sha256"
+        ):
+            return False
+        if int(trim.get("resolved_duration_ms")) != (
+            int(local_artifact["end_ms"]) - int(local_artifact["start_ms"])
+        ):
+            return False
+        if not (
+            int(local_artifact["start_ms"])
+            <= int(trim.get("locally_centered_source_in_ms"))
+            <= int(trim.get("locally_centered_source_out_ms"))
+            <= int(local_artifact["end_ms"])
+        ):
+            return False
+        expected_query_sha = EvidenceQueryLockV2.model_validate(
+            query_lock
+        ).definition_sha256()
+        bound_contracts = payload.get("bound_contracts")
+        if not isinstance(bound_contracts, list) or any(
+            not isinstance(contract, Mapping)
+            or contract.get("evidence_query_lock_sha256") != expected_query_sha
+            for contract in bound_contracts
+        ):
+            return False
+        locks = payload.get("locks")
+        if not isinstance(locks, list):
+            return False
+        for lock in locks:
+            if not isinstance(lock, Mapping):
+                return False
+            if lock.get("source_asset_id") != local_artifact.get("media_asset_id"):
+                return False
+            source_time_ms = lock.get("source_time_ms")
+            if not isinstance(source_time_ms, int) or not (
+                int(local_artifact["start_ms"])
+                <= source_time_ms
+                <= int(local_artifact["end_ms"])
+            ):
+                return False
+        grounding_frame = payload.get("grounding_frame")
+        return (
+            isinstance(grounding_frame, Mapping)
+            and grounding_frame.get("clip_id") == frame.get("clip_id")
+        )
+    except (KeyError, TypeError, ValueError, ValidationError):
+        return False
+
+
 def _compile_autonomous_vertical_candidate_geometry(
     *,
     client: GeminiLabClient,
@@ -22455,6 +22572,14 @@ def _run_feature_cut_experiment_impl(
                                     autonomous_policy.policy_reference
                                 ),
                                 route_sha256=route_sha256,
+                                stale_paid_payload_validator=(
+                                    lambda payload: (
+                                        _exact_payload_matches_local_input_projection(
+                                            payload,
+                                            local_payloads[key],
+                                        )
+                                    )
+                                ),
                             )
                         )
                     else:
@@ -22471,6 +22596,14 @@ def _run_feature_cut_experiment_impl(
                                     autonomous_policy.policy_reference
                                 ),
                                 route_sha256=route_sha256,
+                                stale_paid_payload_validator=(
+                                    lambda payload: (
+                                        _exact_payload_matches_local_input_projection(
+                                            payload,
+                                            local_payloads[key],
+                                        )
+                                    )
+                                ),
                                 producer=lambda: (
                                     _resolve_autonomous_vertical_candidate_exact(
                                         client=client,
@@ -22768,6 +22901,12 @@ def _run_feature_cut_experiment_impl(
                     ),
                     policy_reference=autonomous_policy.policy_reference,
                     route_sha256=route_sha256,
+                    stale_paid_payload_validator=(
+                        lambda payload: _exact_payload_matches_local_input_projection(
+                            payload,
+                            local_payload,
+                        )
+                    ),
                 )
                 runtime_semantic_beat = (
                     _semantic_beat_for_runtime_candidate(
