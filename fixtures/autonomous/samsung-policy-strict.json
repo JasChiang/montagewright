@@ -12,6 +12,7 @@
   },
   "budget": {
     "max_gemini_cost_usd": 1.25,
+    "max_cold_ingest_cost_usd": 3.0,
     "max_paid_interactions": 25,
     "max_semantic_replans": 1,
     "max_final_qa_passes": 2,
