@@ -19,8 +19,12 @@
     "reserved_recovery_fraction": 0.2
   },
   "gemini_limits": {
+    "candidate_reel_plan": {
+      "max_output_tokens": 24576,
+      "thinking_level": "low"
+    },
     "text_only_schema_repair": {
-      "max_output_tokens": 12288,
+      "max_output_tokens": 24576,
       "thinking_level": "minimal"
     }
   },

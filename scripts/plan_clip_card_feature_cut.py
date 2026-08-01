@@ -4652,9 +4652,10 @@ def main() -> int:
         type=int,
         default=0,
         help=(
-            "Opt-in full paid retries after schema/lineage validation failure. "
-            "The default is zero so one planning command makes at most one "
-            "Gemini request."
+            "Opt-in bounded text-only schema repairs after schema/lineage "
+            "validation failure. Repairs reuse the persisted raw output and "
+            "never replay candidate video or music inputs. The default is "
+            "zero so one planning command makes at most one Gemini request."
         ),
     )
     parser.add_argument(

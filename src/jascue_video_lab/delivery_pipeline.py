@@ -1385,7 +1385,10 @@ def _prepare_fresh_autonomous_direct_plan(
         "--thinking-level",
         "low",
         "--repair-attempts",
-        "0",
+        # A malformed structured response must be repaired from its saved text,
+        # never by replaying the candidate videos.  One bounded repair is part
+        # of the signed autonomous path; further failures remain fail-closed.
+        "1",
         "--shortlist",
         str(shortlist_path),
         "--autonomous-policy",

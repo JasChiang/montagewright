@@ -1929,7 +1929,7 @@ def test_fresh_autonomous_planning_uses_shortlist_then_direct_video_projection(
     direct_command = stages[1][1]
     assert "--candidate-video-evidence" in direct_command
     assert "--repair-attempts" in direct_command
-    assert direct_command[direct_command.index("--repair-attempts") + 1] == "0"
+    assert direct_command[direct_command.index("--repair-attempts") + 1] == "1"
     assert "--music" in direct_command
     assert result["plan_dir"].endswith("picture/gemini-plan")
 
