@@ -4826,7 +4826,11 @@ class FeatureChapterSelect(StrictModel):
                 )
         for field_name in ("horizontal_candidates", "vertical_candidates"):
             candidates = getattr(self, field_name)
-            minimum_candidates = 1 if self.evidence_status == "partial" else 2
+            # A unique verified event remains usable, but downstream route
+            # recovery must fail closed if that sole candidate proves
+            # non-executable.  Do not invent a second option merely to satisfy
+            # a representation-level Top-K preference.
+            minimum_candidates = 1
             if candidates and not minimum_candidates <= len(candidates) <= 4:
                 raise ValueError(
                     f"{field_name} must preserve {minimum_candidates}-4 options "
