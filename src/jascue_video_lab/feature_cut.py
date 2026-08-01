@@ -621,11 +621,19 @@ def _run_persisted_production_frontier(
                     ),
                 }
             )
+            # A beat may continue measuring later route executions after an
+            # earlier one reached grounding and was deferred for Gemini's
+            # grouped decision.  Bind the acceptance to that selected
+            # execution, not to the final (often local-preflight) attempt of
+            # the whole beat.
             last_attempt = next(
                 (
                     item.attempt
                     for item in reversed(state.attempt_history)
                     if item.attempt.beat_id == beat_state.beat.beat_id
+                    and item.attempt.candidate_id == selected.candidate_id
+                    and item.attempt.candidate_execution_sha256
+                    == selected.candidate_execution_sha256
                 ),
                 None,
             )
