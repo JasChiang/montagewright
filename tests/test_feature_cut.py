@@ -48,6 +48,7 @@ from jascue_video_lab.feature_cut import (
     _audit_requested_candidate_recall,
     _attempt_trim_shift_operation,
     _apply_pre_render_candidate_route,
+    _pre_render_execution_bindings_by_beat_and_sha,
     _pre_render_execution_duration_seconds,
     _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
@@ -2053,6 +2054,47 @@ def test_frontier_preflight_uses_each_complete_route_execution_duration() -> Non
                 "trim_duration_ms": 6_500,
             }
         )
+
+
+def test_frozen_frontier_execution_lookup_preserves_route_specific_trim() -> None:
+    """A finalizer must recover the accepted execution, not candidate first-use."""
+
+    first = CandidateRouteSelection(
+        beat_id="beat",
+        candidate_id="rank-1",
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="event",
+        trim_duration_ms=5_000,
+        cue_id="cue",
+        cue_aligned=True,
+        presentation_mode="static_full_bleed_crop",
+        entry_composition="center",
+        exit_composition="center",
+        decision_codes=("test",),
+        source_in_ms=1_000,
+        source_out_ms=6_000,
+        candidate_execution_sha256="a" * 64,
+    )
+    alternate = first.model_copy(
+        update={
+            "source_in_ms": 2_000,
+            "source_out_ms": 8_500,
+            "trim_duration_ms": 6_500,
+            "candidate_execution_sha256": "b" * 64,
+        }
+    )
+    route = SimpleNamespace(
+        ranked_routes=(
+            SimpleNamespace(selections=(first,)),
+            SimpleNamespace(selections=(alternate,)),
+        )
+    )
+
+    bindings = _pre_render_execution_bindings_by_beat_and_sha(route)
+
+    assert bindings["beat"]["a" * 64].source_in_ms == 1_000
+    assert bindings["beat"]["b" * 64].source_in_ms == 2_000
+    assert bindings["beat"]["b" * 64].trim_duration_ms == 6_500
 
 
 def test_semantic_replan_frontier_is_bounded_and_carries_adjacent_context() -> None:

@@ -14021,6 +14021,37 @@ def _pre_render_execution_duration_seconds(
     return duration_ms / 1000
 
 
+def _pre_render_execution_bindings_by_beat_and_sha(
+    route: Any,
+) -> dict[str, dict[str, Any]]:
+    """Index immutable complete-route executions by beat and execution SHA.
+
+    A semantic candidate may appear in several ranked complete routes with
+    different, but individually policy-legal, source intervals.  The final
+    renderer must therefore recover the exact execution selected by the
+    production frontier, rather than selecting the first execution for that
+    candidate ID.
+    """
+
+    bindings: dict[str, dict[str, Any]] = {}
+    for complete_route in route.ranked_routes or ():
+        for selection in complete_route.selections:
+            execution_sha256 = selection.candidate_execution_sha256
+            if not execution_sha256:
+                raise FeatureCutSystemFailure(
+                    "complete route selection has no execution SHA"
+                )
+            by_sha = bindings.setdefault(selection.beat_id, {})
+            existing = by_sha.get(execution_sha256)
+            if existing is not None and existing != selection:
+                raise FeatureCutSystemFailure(
+                    "complete route execution SHA maps to conflicting "
+                    "source intervals"
+                )
+            by_sha[execution_sha256] = selection
+    return bindings
+
+
 def _apply_pre_render_complete_route_executions(
     options: Sequence[dict[str, Any]],
     *,
@@ -20637,24 +20668,16 @@ def _run_feature_cut_experiment_impl(
             if pre_render_candidate_route is not None
             else {}
         )
-        pre_render_execution_bindings_by_feature: dict[
+        pre_render_execution_bindings_by_feature_and_sha: dict[
             str,
             dict[str, Any],
         ] = {}
         if pre_render_candidate_route is not None:
-            ranked_routes = (
-                pre_render_candidate_route.ranked_routes
-                or ()
+            pre_render_execution_bindings_by_feature_and_sha = (
+                _pre_render_execution_bindings_by_beat_and_sha(
+                    pre_render_candidate_route
+                )
             )
-            for complete_route in ranked_routes:
-                for selection in complete_route.selections:
-                    pre_render_execution_bindings_by_feature.setdefault(
-                        selection.beat_id,
-                        {},
-                    ).setdefault(
-                        selection.candidate_id,
-                        selection,
-                    )
         pre_render_horizontal_candidate_route = (
             _build_pre_render_horizontal_candidate_route(
                 plan,
@@ -23690,6 +23713,44 @@ def _run_feature_cut_experiment_impl(
                 vertical_options = vertical_options[
                     : auto_reframe_policy.max_candidates
                 ]
+                frozen_frontier_candidate_id = (
+                    autonomous_vertical_frontier_selected_ids.get(
+                        selected.feature_id
+                    )
+                )
+                frozen_frontier_execution_sha256 = (
+                    autonomous_vertical_frontier_selected_execution_sha256s.get(
+                        selected.feature_id
+                    )
+                )
+                frozen_execution_bindings: dict[str, Any] = {}
+                if frozen_frontier_candidate_id is not None:
+                    if frozen_frontier_execution_sha256 is None:
+                        raise FeatureCutSystemFailure(
+                            "frozen autonomous frontier candidate has no "
+                            "execution SHA"
+                        )
+                    frozen_execution = (
+                        pre_render_execution_bindings_by_feature_and_sha.get(
+                            selected.feature_id,
+                            {},
+                        ).get(frozen_frontier_execution_sha256)
+                    )
+                    if frozen_execution is None:
+                        raise FeatureCutSystemFailure(
+                            "frozen autonomous frontier execution is absent "
+                            "from the immutable complete-route plan"
+                        )
+                    if frozen_execution.candidate_id != (
+                        frozen_frontier_candidate_id
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "frozen autonomous frontier execution does not "
+                            "belong to its selected candidate"
+                        )
+                    frozen_execution_bindings = {
+                        frozen_frontier_candidate_id: frozen_execution
+                    }
                 vertical_options = _apply_pre_render_candidate_route(
                     vertical_options,
                     selected_candidate_id=(
@@ -23709,16 +23770,7 @@ def _run_feature_cut_experiment_impl(
                             {},
                         )
                     ),
-                )
-                frozen_frontier_candidate_id = (
-                    autonomous_vertical_frontier_selected_ids.get(
-                        selected.feature_id
-                    )
-                )
-                frozen_frontier_execution_sha256 = (
-                    autonomous_vertical_frontier_selected_execution_sha256s.get(
-                        selected.feature_id
-                    )
+                    execution_bindings=frozen_execution_bindings,
                 )
                 if frozen_frontier_candidate_id is not None:
                     vertical_options = [
