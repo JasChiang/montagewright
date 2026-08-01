@@ -100,6 +100,96 @@ def test_budgeted_planning_failure_preserves_subprocess_output(
     assert ledger.committed_interactions == 0
 
 
+def test_budgeted_planning_reserves_and_reconciles_one_text_only_repair(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stage_dir = tmp_path / "planner"
+
+    def complete(*_args, **_kwargs):
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        for attempt, inputs, usage in (
+            (
+                1,
+                [
+                    {"type": "text", "text": "editorial contract"},
+                    {"type": "video", "uri": "file-api://candidate"},
+                ],
+                {
+                    "total_input_tokens": 1_000,
+                    "total_cached_tokens": 0,
+                    "total_output_tokens": 200,
+                    "total_thought_tokens": 0,
+                },
+            ),
+            (
+                2,
+                [{"type": "text", "text": "repair only"}],
+                {
+                    "total_input_tokens": 500,
+                    "total_cached_tokens": 0,
+                    "total_output_tokens": 80,
+                    "total_thought_tokens": 0,
+                },
+            ),
+            ):
+            stem = f"clip-card-feature-plan.attempt-{attempt:02d}"
+            write_json(
+                stage_dir / f"{stem}.request.json",
+                {
+                    "model": "gemini-3.6-flash",
+                    "input": inputs,
+                    "generation_config": {
+                        "max_output_tokens": 512,
+                        "thinking_level": "minimal",
+                    },
+                },
+            )
+            write_json(
+                stage_dir / f"{stem}.raw_interaction.json",
+                {"model": "gemini-3.6-flash", "usage": usage},
+            )
+        # The planner writes a canonical alias of its successful repair.  It
+        # is evidence, not a third paid interaction.
+        write_json(
+            stage_dir / "clip-card-feature-plan.raw_interaction.json",
+            {
+                "model": "gemini-3.6-flash",
+                "usage": {
+                    "total_input_tokens": 500,
+                    "total_cached_tokens": 0,
+                    "total_output_tokens": 80,
+                    "total_thought_tokens": 0,
+                },
+            },
+        )
+        return subprocess.CompletedProcess(["planner"], 0, "ok", "")
+
+    monkeypatch.setattr(pipeline.subprocess, "run", complete)
+    ledger = BudgetLedger(max_cost_usd=1.0, max_interactions=5)
+
+    usage = pipeline._run_budgeted_planning_stage(
+        command=["planner"],
+        stage="autonomous_direct_video_edit_plan",
+        stage_dir=stage_dir,
+        budget_ledger=ledger,
+        estimated_text_tokens=10_000,
+        max_output_tokens=512,
+        thinking_level="low",
+        allow_one_text_only_repair=True,
+    )
+
+    assert usage["request_count"] == 2
+    assert ledger.committed_interactions == 2
+    report = ledger.report()["stages"]
+    assert report["autonomous_direct_video_edit_plan"]["actual_input_tokens"] == 1_000
+    assert (
+        report["autonomous_direct_video_edit_plan_text_only_repair"]
+        ["actual_input_tokens"]
+        == 500
+    )
+
+
 def test_warm_dispatch_migration_counts_attempt_and_alias_once(
     tmp_path: Path,
 ) -> None:

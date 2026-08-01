@@ -1039,6 +1039,73 @@ def test_direct_video_canonicalization_only_removes_incomplete_optional_sync() -
     }
 
 
+def test_direct_video_canonicalization_derives_clip_permission_from_explicit_primary_center_semantic_core() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "tracked_crop",
+                    "crop_mode": "primary_center",
+                    "coverage_mode": "primary_with_context",
+                    "allow_controlled_clip": False,
+                    "required_entity_indices": [1],
+                    "preferred_entity_indices": [],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [
+                        {
+                            "start_progress": 0.0,
+                            "end_progress": 1.0,
+                            "anchor_entity_indices": [1],
+                            "camera_behavior": "hold",
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    vertical = json.loads(canonical)["chapters"][0]["vertical"]
+
+    assert vertical["allow_controlled_clip"] is True
+    assert {
+        change["rule"] for change in changes
+    } >= {"explicit_primary_center_semantic_core_authorizes_controlled_clipping"}
+
+
+def test_direct_video_canonicalization_keeps_static_fit_without_camera_attention() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "fit_with_background",
+                    "crop_mode": "strict",
+                    "coverage_mode": "simultaneous",
+                    "allow_controlled_clip": False,
+                    "required_entity_indices": [1, 2],
+                    "preferred_entity_indices": [],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [],
+                },
+            }
+        ]
+    }
+
+    canonical, _changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    vertical = json.loads(canonical)["chapters"][0]["vertical"]
+
+    assert vertical.get("aspect_suitability") != "unsuitable"
+    assert vertical["attention_sequence"] == []
+
+
 def test_direct_video_canonicalization_disables_clipping_for_fit() -> None:
     payload = {
         "chapters": [
@@ -2231,6 +2298,27 @@ def test_feature_raw_reuse_resolves_complete_set_and_preserves_paid_artifact(
         original_bytes
     ).hexdigest()
     ClipCardFeaturePlanV3.model_validate_json(canonical_text)
+
+
+def test_feature_raw_reuse_prefers_latest_complete_repaired_attempt(
+    tmp_path: Path,
+) -> None:
+    for attempt in (1, 2):
+        stem = f"clip-card-feature-plan.attempt-{attempt:02d}"
+        write_json(tmp_path / f"{stem}.request.json", {"model": MODEL_ID})
+        write_json(
+            tmp_path / f"{stem}.raw_output.json",
+            {"output_text": f"response-{attempt}"},
+        )
+        write_json(
+            tmp_path / f"{stem}.raw_interaction.json",
+            {"model": MODEL_ID, "id": f"paid-{attempt}"},
+        )
+
+    resolved = _resolve_feature_reuse_artifacts(tmp_path)
+
+    assert resolved["kind"] == "attempt-02"
+    assert resolved["raw_output"].name.endswith("attempt-02.raw_output.json")
 
 
 def test_feature_reuse_binding_keeps_original_paid_request_as_source(

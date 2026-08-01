@@ -1691,6 +1691,41 @@ def canonicalize_direct_video_edit_plan_output(
                         ),
                     }
                 )
+            # ``primary_center`` is not a decorative crop label: for a
+            # semantic-core vertical decision it is the model's explicit
+            # declaration that the required primary subject may define the
+            # crop.  The typed contract represents that same fact with the
+            # derived ``allow_controlled_clip`` flag.  Gemini has already made
+            # the editorial choice (strategy, semantic coverage and crop
+            # mode); this only normalizes its representation so the renderer
+            # can execute the stated choice.  Do not infer this for strict
+            # crops or non-semantic coverage modes.
+            if (
+                decision.get("strategy") == "tracked_crop"
+                and decision.get("crop_mode") == "primary_center"
+                and decision.get("coverage_mode")
+                in {
+                    "relation_core",
+                    "primary_with_context",
+                    "independent_detail",
+                }
+                and decision.get("allow_controlled_clip") is not True
+            ):
+                before = decision.get("allow_controlled_clip")
+                decision["allow_controlled_clip"] = True
+                changes.append(
+                    {
+                        "json_path": (
+                            f"{decision_base}.allow_controlled_clip"
+                        ),
+                        "before": before,
+                        "after": True,
+                        "rule": (
+                            "explicit_primary_center_semantic_core_"
+                            "authorizes_controlled_clipping"
+                        ),
+                    }
+                )
             if (
                 decision.get("strategy") == "fit_with_background"
                 and decision.get("allow_controlled_clip") is True
@@ -1754,9 +1789,17 @@ def canonicalize_direct_video_edit_plan_output(
                 for index in step.get("anchor_entity_indices", [])
                 if isinstance(index, int)
             }
-            missing_required = [
-                index for index in required if index not in referenced
-            ]
+            # Attention phases describe a crop/tracker path, not a static
+            # scope-preserving fit.  A fit has no virtual camera to anchor;
+            # its required entities remain an explicit composition contract
+            # for the renderer/QA instead.  Treating its intentionally empty
+            # sequence as missing attention incorrectly rewrote a
+            # Gemini-authorised fit into ``unsuitable``.
+            missing_required = (
+                [index for index in required if index not in referenced]
+                if decision.get("strategy") == "tracked_crop"
+                else []
+            )
             if (
                 decision.get("presentation_preference") == "two_panel_layout"
                 and decision.get("coverage_mode") == "sequential"
@@ -2363,32 +2406,58 @@ def _write_feature_normalization_artifacts(
 def _resolve_feature_reuse_artifacts(output_dir: Path) -> dict[str, Any]:
     """Resolve one complete, non-mixed paid-response artifact set."""
 
-    sets = (
-        {
-            "kind": "canonical",
-            "request": output_dir / "clip-card-feature-plan.request.json",
-            "raw_output": output_dir / "clip-card-feature-plan.raw_output.json",
-            "raw_interaction": output_dir / "clip-card-feature-plan.raw_interaction.json",
-        },
-        {
-            "kind": "attempt-01",
-            "request": output_dir / "clip-card-feature-plan.attempt-01.request.json",
-            "raw_output": output_dir / "clip-card-feature-plan.attempt-01.raw_output.json",
-            "raw_interaction": output_dir
-            / "clip-card-feature-plan.attempt-01.raw_interaction.json",
-        },
-    )
+    canonical_set = {
+        "kind": "canonical",
+        "request": output_dir / "clip-card-feature-plan.request.json",
+        "raw_output": output_dir / "clip-card-feature-plan.raw_output.json",
+        "raw_interaction": output_dir / "clip-card-feature-plan.raw_interaction.json",
+    }
+    canonical_paths = [
+        canonical_set[key]
+        for key in ("request", "raw_output", "raw_interaction")
+    ]
+    if all(path.exists() for path in canonical_paths):
+        return canonical_set
+
+    # A valid repaired response may exist even when the process was
+    # interrupted before it could write the canonical projection.  Reusing
+    # the newest complete numbered attempt lets a later deterministic
+    # canonicalizer benefit from a contract fix without repaying Gemini.  A
+    # text-only repair is still bound back to attempt-01's media request by
+    # the caller below; this only selects its saved response text.
+    attempts: list[tuple[int, dict[str, Any]]] = []
     incomplete: list[str] = []
-    for artifact_set in sets:
-        paths = [artifact_set[key] for key in ("request", "raw_output", "raw_interaction")]
+    for request_path in sorted(
+        output_dir.glob("clip-card-feature-plan.attempt-*.request.json")
+    ):
+        stem = request_path.name.removesuffix(".request.json")
+        try:
+            attempt_number = int(stem.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        artifact_set = {
+            "kind": f"attempt-{attempt_number:02d}",
+            "request": request_path,
+            "raw_output": output_dir / f"{stem}.raw_output.json",
+            "raw_interaction": output_dir / f"{stem}.raw_interaction.json",
+        }
+        paths = [
+            artifact_set[key]
+            for key in ("request", "raw_output", "raw_interaction")
+        ]
         present = [path.exists() for path in paths]
         if all(present):
-            return artifact_set
-        if any(present):
+            attempts.append((attempt_number, artifact_set))
+        elif any(present):
             incomplete.append(str(artifact_set["kind"]))
+    if attempts:
+        return max(attempts, key=lambda item: item[0])[1]
+
+    if any(path.exists() for path in canonical_paths):
+        incomplete.append("canonical")
     detail = f"; incomplete sets: {incomplete}" if incomplete else ""
     raise FileNotFoundError(
-        "--reuse-raw-output requires one complete canonical or attempt-01 "
+        "--reuse-raw-output requires one complete canonical or numbered attempt "
         f"request/raw-output/raw-interaction set{detail}"
     )
 
@@ -5487,6 +5556,20 @@ model_provenance 必須先原樣回傳：
    spatially_optimizable 只表示本機可在各 phase 的可行構圖區域內選較短路徑，
    不得交換影片中的 temporal phase order；no_continuous_traversal 表示應保持
    或只在 cut_admissible=true 的 phase boundary 硬切。
+5a. 請先在送出前逐一檢查每個 9:16 decision（primary 和每個 alternate）的
+    可執行欄位一致性；這是 contract 表達，不是請本機替你補選擇：
+    - tracked_crop 若 coverage_mode 是 relation_core、primary_with_context 或
+      independent_detail，必須同時填 crop_mode=primary_center 與
+      allow_controlled_clip=true。
+    - tracked_crop 的每個 required_entity_index 必須至少出現在一個
+      attention_sequence phase；若關係必須同時被看見，請在同一個 hold phase
+      列出所有 required anchor，而非只列其中一個。
+    - fit_with_background 或 two_panel 的 static layout 沒有虛擬相機：
+      attention_sequence 必須是 []、allow_controlled_clip 必須是 false；required
+      entity 仍照實填寫，表示必須由 scope/layout 保留，而不是由 phase 跟隨。
+    - sequential 只能有至少兩個相鄰 phase 且至少兩個不同 anchor；two_panel
+      只能用於 simultaneous、relation_core 或 primary_with_context，不能只是因
+      畫面同時出現兩個物件。
 6. 每章提供 attention_observation 與 flow_intent，描述資訊量、動作完成度、
    閱讀需求、敘事角色、能量、前後鏡頭關係與 boundary_alignment。
    visual_sync_event 只在影片中真的有可觀察落點時提供，並同時給
