@@ -22160,6 +22160,7 @@ def _run_feature_cut_experiment_impl(
                 local_options: list[dict[str, Any]] = []
                 option_id_to_row: dict[str, tuple[int, str, str, Mapping[str, Any]]] = {}
                 option_id_aliases: dict[str, str] = {}
+                ambiguous_option_id_aliases: set[str] = set()
                 for order, row in enumerate(executable_deferred, start=1):
                     key = _frontier_execution_key(feature_id, row[1], row[2])
                     local_payload = local_payloads[key]
@@ -22197,15 +22198,19 @@ def _run_feature_cut_experiment_impl(
                         )
                         if not isinstance(raw_option_id, str):
                             continue
+                        if raw_option_id in ambiguous_option_id_aliases:
+                            continue
                         prior_alias = option_id_aliases.setdefault(
                             raw_option_id,
                             option_id,
                         )
                         if prior_alias != option_id:
-                            raise FeatureCutSystemFailure(
-                                "scoped semantic replan option alias is "
-                                "ambiguous"
-                            )
+                            # The renderer payload describes a presentation,
+                            # not an immutable route execution.  The same
+                            # payload can occur at multiple source intervals;
+                            # do not make Gemini's shorthand choose one.
+                            option_id_aliases.pop(raw_option_id, None)
+                            ambiguous_option_id_aliases.add(raw_option_id)
                     local_options.append(
                         {
                             "option_id": option_id,
