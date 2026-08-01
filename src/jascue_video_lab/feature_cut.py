@@ -20447,6 +20447,37 @@ def _run_feature_cut_experiment_impl(
             if autonomous_profile and render_vertical
             else None
         )
+        if pre_render_candidate_route is not None:
+            # The bounded optimizer owns the final per-beat duration vector.
+            # It may redistribute dwell inside each Gemini-declared
+            # min/preferred/max envelope while keeping the project total and
+            # music exits valid.  Continuing to render with the earlier
+            # attention-only vector would break the immutable execution
+            # intervals it just selected (and used to leave the optimizer
+            # disconnected from production).
+            route_durations = {
+                selection.beat_id: selection.trim_duration_ms / 1000
+                for selection in pre_render_candidate_route.selections
+            }
+            if set(route_durations) != set(chapter_durations):
+                raise FeatureCutSystemFailure(
+                    "pre-render route does not bind every resolved chapter duration"
+                )
+            chapter_durations = route_durations
+            duration_audit = {
+                **duration_audit,
+                "resolved_chapter_durations_seconds": chapter_durations,
+                "duration_authority": "pre_render_complete_route",
+                "pre_render_route_id": (
+                    pre_render_candidate_route.ranked_routes[0].route_id
+                    if pre_render_candidate_route.ranked_routes
+                    else None
+                ),
+            }
+            write_json(
+                output_dir / "editorial-duration-plan.json",
+                duration_audit,
+            )
         pre_render_candidate_route_path = (
             editorial_dir / "pre-render-candidate-route.json"
         )
