@@ -225,6 +225,7 @@ from .editorial_planning import (
 )
 from .sequence_optimizer import (
     BeatOptionSet,
+    CandidateCompleteRoute,
     CandidateRouteBeat,
     CandidateRouteOption,
     CandidateRouteSelection,
@@ -3134,6 +3135,32 @@ def _exact_render_source_interval(
             ),
         },
     }
+
+
+def _source_interval_duration_seconds(source_interval: Mapping[str, Any]) -> float:
+    """Return the actual legal decoded duration of a bound source interval."""
+
+    time_base = source_interval.get("source_time_base") or source_interval.get(
+        "time_base"
+    )
+    start_pts = source_interval.get("start_pts")
+    if start_pts is None:
+        start_pts = source_interval.get("source_start_pts")
+    end_pts = source_interval.get("end_pts_exclusive")
+    if end_pts is None:
+        end_pts = source_interval.get("source_end_pts_exclusive")
+    if not (
+        isinstance(time_base, Mapping)
+        and isinstance(time_base.get("numerator"), int)
+        and isinstance(time_base.get("denominator"), int)
+        and isinstance(start_pts, int)
+        and isinstance(end_pts, int)
+        and time_base["numerator"] > 0
+        and time_base["denominator"] > 0
+        and end_pts > start_pts
+    ):
+        raise ValueError("source interval has no valid decoded PTS duration")
+    return (end_pts - start_pts) * time_base["numerator"] / time_base["denominator"]
 
 
 def _render_source_segment(
@@ -14364,42 +14391,384 @@ def _pre_render_execution_bindings_by_beat_and_sha(
                 raise FeatureCutSystemFailure(
                     "complete route selection has no execution SHA"
                 )
-        by_sha = bindings.setdefault(selection.beat_id, {})
-        existing = by_sha.get(execution_sha256)
-        if existing is not None:
-            # A complete-route rank can differ in global decision codes or
-            # reuse audit context while pointing at the exact same local
-            # candidate execution.  Those route-level facts are not part of
-            # the execution hash and must not turn one source interval into a
-            # false collision.  Only reject an actual immutable execution
-            # mismatch; retain the first binding for local stage reuse.
-            immutable_fields = (
-                "beat_id",
-                "candidate_id",
-                "source_asset_id",
-                "event_id",
-                "trim_duration_ms",
-                "cue_id",
-                "cue_aligned",
-                "presentation_mode",
-                "entry_composition",
-                "exit_composition",
-                "source_clip_id",
-                "source_in_ms",
-                "source_out_ms",
-                "candidate_execution_sha256",
+            by_sha = bindings.setdefault(selection.beat_id, {})
+            existing = by_sha.get(execution_sha256)
+            if existing is not None:
+                # A complete-route rank can differ in global decision codes or
+                # reuse audit context while pointing at the exact same local
+                # candidate execution.  Those route-level facts are not part of
+                # the execution hash and must not turn one source interval into a
+                # false collision.  Only reject an actual immutable execution
+                # mismatch; retain the first binding for local stage reuse.
+                immutable_fields = (
+                    "beat_id",
+                    "candidate_id",
+                    "source_asset_id",
+                    "event_id",
+                    "trim_duration_ms",
+                    "cue_id",
+                    "cue_aligned",
+                    "presentation_mode",
+                    "entry_composition",
+                    "exit_composition",
+                    "source_clip_id",
+                    "source_in_ms",
+                    "source_out_ms",
+                    "candidate_execution_sha256",
+                )
+                if any(
+                    getattr(existing, field) != getattr(selection, field)
+                    for field in immutable_fields
+                ):
+                    raise FeatureCutSystemFailure(
+                        "complete route execution SHA maps to conflicting "
+                        "immutable execution fields"
+                    )
+                continue
+            by_sha[execution_sha256] = selection
+    return bindings
+
+
+def _pre_render_route_definition_sha256(route: Any) -> str:
+    """Hash route meaning, never an artifact envelope or its creation time."""
+
+    payload = (
+        route.model_dump(mode="json")
+        if hasattr(route, "model_dump")
+        else dict(route)
+    )
+    return _stable_fingerprint(payload)
+
+
+def _materialize_resolved_frontier_route(
+    *,
+    base_route: Any,
+    selected_executions_by_beat: Mapping[str, tuple[str, str]],
+    frontier_root: Path,
+    route_sha256: str,
+    policy_reference: str,
+    replan_authority_by_execution: Mapping[tuple[str, str, str], Any],
+) -> tuple[Any, dict[str, dict[str, CandidateRouteSelection]]]:
+    """Build the only route the renderer may consume after the frontier.
+
+    The pre-render optimiser owns the initial semantic route.  The production
+    frontier can replace an execution only after local, exact-event and
+    geometry evidence is complete and, for a deferred presentation, Gemini's
+    scoped replan is bound.  This function turns that accepted frontier state
+    into one immutable route contract.  It deliberately reads the committed
+    stage artifacts instead of relying on process-local caches, so a resumed
+    run has exactly the same route as the process that made the acceptance.
+    """
+
+    base_by_beat = {item.beat_id: item for item in base_route.selections}
+    if set(selected_executions_by_beat) != set(base_by_beat):
+        raise FeatureCutSystemFailure(
+            "frontier selections do not cover the immutable base route"
+        )
+
+    selections: list[CandidateRouteSelection] = []
+    artifact_rows: list[dict[str, Any]] = []
+    bindings: dict[str, dict[str, CandidateRouteSelection]] = {}
+    for base_selection in base_route.selections:
+        beat_id = base_selection.beat_id
+        candidate_id, execution_sha256 = selected_executions_by_beat[beat_id]
+        candidate_root = _frontier_execution_dir(
+            frontier_root,
+            beat_id=beat_id,
+            candidate_id=candidate_id,
+            candidate_execution_sha256=execution_sha256,
+        )
+        stages = {
+            name: candidate_root / f"{name}.json"
+            for name in ("local", "exact", "geometry")
+        }
+        stage_payloads: dict[str, Mapping[str, Any]] = {}
+        for stage_name, stage_path in stages.items():
+            if not stage_path.is_file():
+                raise FeatureCutSystemFailure(
+                    "resolved frontier execution is missing its committed "
+                    f"{stage_name} stage: {beat_id}/{candidate_id}"
+                )
+            stage = read_json(stage_path)
+            allowed_stage_names = {
+                "local": {"local_preflight"},
+                "exact": {"exact_event"},
+                # ``geometry.json`` is the logical final local evidence
+                # stage.  Older artifact envelopes called the stage
+                # ``grounding`` because that operation also owned the SAM
+                # invocation; both names carry the same immutable geometry
+                # payload and are validated by the prior stage-chain check.
+                "geometry": {"grounding", "geometry"},
+            }
+            execution_matches = (
+                stage.get("candidate_execution_sha256") == execution_sha256
+                or (
+                    stage_name == "exact"
+                    and stage.get("candidate_execution_sha256") is None
+                )
             )
-            if any(
-                getattr(existing, field) != getattr(selection, field)
-                for field in immutable_fields
+            if (
+                stage.get("beat_id") != beat_id
+                or stage.get("candidate_id") != candidate_id
+                or not execution_matches
+                or stage.get("stage") not in allowed_stage_names[stage_name]
+                or stage.get("policy_reference") != policy_reference
+                or not isinstance(stage.get("payload"), Mapping)
             ):
                 raise FeatureCutSystemFailure(
-                    "complete route execution SHA maps to conflicting "
-                    "immutable execution fields"
+                    "resolved frontier execution has an invalid stage binding: "
+                    f"{beat_id}/{candidate_id}/{stage_name}"
                 )
-            continue
-        by_sha[execution_sha256] = selection
-    return bindings
+            stage_payloads[stage_name] = stage["payload"]
+
+        geometry_payload = stage_payloads["geometry"]
+        classification = str(geometry_payload.get("classification") or "")
+        if classification not in {
+            "natural_accepted",
+            "deferred_semantic_replan",
+        }:
+            raise FeatureCutSystemFailure(
+                "resolved frontier route contains a non-accepted geometry"
+            )
+        authority_key = (beat_id, candidate_id, execution_sha256)
+        if classification == "deferred_semantic_replan" and (
+            authority_key not in replan_authority_by_execution
+        ):
+            raise FeatureCutSystemFailure(
+                "deferred frontier presentation has no Gemini replan authority"
+            )
+
+        local_payload = stage_payloads["local"]
+        option = local_payload.get("option")
+        if not isinstance(option, Mapping):
+            raise FeatureCutSystemFailure(
+                "resolved frontier local stage has no immutable option"
+            )
+        clip = RushClip.model_validate(local_payload.get("clip"))
+        source_in_ms = local_payload.get("start_ms")
+        source_out_ms = local_payload.get("end_ms")
+        # ``trim`` is the render-facing projection; ``authorized_trim`` is
+        # its authority record.  Keep the latter as a backwards-compatible
+        # fallback for older exact-event artifacts.
+        exact_trim = stage_payloads["exact"].get("trim")
+        if not isinstance(exact_trim, Mapping):
+            exact_trim = stage_payloads["exact"].get("authorized_trim")
+        if isinstance(exact_trim, Mapping):
+            exact_interval = exact_trim.get("authorized_source_interval")
+            if isinstance(exact_interval, Mapping):
+                exact_start_ms = exact_interval.get("start_ms_display")
+                exact_end_ms = exact_interval.get("end_ms_display")
+                if (
+                    isinstance(exact_start_ms, int)
+                    and isinstance(exact_end_ms, int)
+                    and exact_start_ms < exact_end_ms
+                ):
+                    # The source PTS lock is the executable trim authority.
+                    # Never ask concat to manufacture the planner's nominal
+                    # millisecond duration by cloning a tail frame.  The
+                    # resolved route instead carries the actual legal source
+                    # interval, so sequence timing is reconciled from video
+                    # evidence before render.
+                    source_in_ms = exact_start_ms
+                    source_out_ms = exact_end_ms
+        if not (
+            isinstance(source_in_ms, int)
+            and isinstance(source_out_ms, int)
+            and source_in_ms < source_out_ms
+        ):
+            raise FeatureCutSystemFailure(
+                "resolved frontier local stage has no valid source interval"
+            )
+        presentation_mode = str(
+            geometry_payload.get("measured_presentation_mode")
+            or geometry_payload.get("geometry", {}).get("applied_strategy")
+            or base_selection.presentation_mode
+        )
+        selection = CandidateRouteSelection(
+            beat_id=beat_id,
+            candidate_id=candidate_id,
+            source_asset_id=str(option.get("source_asset_id") or ""),
+            event_id=str(option.get("event_id") or ""),
+            trim_duration_ms=source_out_ms - source_in_ms,
+            cue_id=base_selection.cue_id,
+            cue_aligned=base_selection.cue_aligned,
+            presentation_mode=presentation_mode,
+            entry_composition=base_selection.entry_composition,
+            exit_composition=base_selection.exit_composition,
+            decision_codes=(
+                *base_selection.decision_codes,
+                "frontier_execution_materialized",
+            ),
+            source_clip_id=clip.clip_id,
+            source_in_ms=source_in_ms,
+            source_out_ms=source_out_ms,
+            candidate_execution_sha256=execution_sha256,
+            reuse_mode=str(option.get("source_reuse_mode") or "none"),
+        )
+        selections.append(selection)
+        bindings.setdefault(beat_id, {})[execution_sha256] = selection
+        artifact_rows.append(
+            {
+                "beat_id": beat_id,
+                "candidate_id": candidate_id,
+                "candidate_execution_sha256": execution_sha256,
+                "classification": classification,
+                "local_artifact_sha256": sha256_file(stages["local"]),
+                "exact_artifact_sha256": sha256_file(stages["exact"]),
+                "geometry_artifact_sha256": sha256_file(stages["geometry"]),
+                "exact_source_interval_applied": (
+                    isinstance(exact_trim, Mapping)
+                    and isinstance(
+                        exact_trim.get("authorized_source_interval"),
+                        Mapping,
+                    )
+                ),
+                "replan_authority_bound": authority_key
+                in replan_authority_by_execution,
+            }
+        )
+
+    total_duration_ms = sum(item.trim_duration_ms for item in selections)
+    route_id = _stable_fingerprint(
+        {
+            "contract_version": "resolved-production-route-v1",
+            "base_route_id": base_route.route_id,
+            "route_sha256": route_sha256,
+            "selections": [item.model_dump(mode="json") for item in selections],
+            "stage_artifacts": artifact_rows,
+        }
+    )
+    resolved_route = base_route.model_copy(
+        update={
+            "route_id": route_id,
+            "selections": tuple(selections),
+            "total_duration_ms": total_duration_ms,
+            "panel_duration_ms": sum(
+                item.trim_duration_ms
+                for item in selections
+                if item.presentation_mode == "two_panel_layout"
+            ),
+            "decision_codes": (
+                *base_route.decision_codes,
+                "production_frontier_resolved_route",
+            ),
+        }
+    )
+    write_json(
+        frontier_root / "resolved-route.json",
+        {
+            "contract_version": "resolved-production-route-v1",
+            "policy_reference": policy_reference,
+            "pre_render_route_sha256": route_sha256,
+            "base_route_id": base_route.route_id,
+            "resolved_route": resolved_route.model_dump(mode="json"),
+            "stage_artifacts": artifact_rows,
+            "replan_authorities": [
+                authority.model_dump(mode="json")
+                for _, authority in sorted(
+                    replan_authority_by_execution.items(), key=lambda item: item[0]
+                )
+            ],
+            "generated_at": utc_now(),
+        },
+    )
+    return resolved_route, bindings
+
+
+def _load_frontier_replan_authorities_by_execution(
+    *,
+    frontier_root: Path,
+    autonomous_policy: AutonomousEditPolicy,
+    frontier_plan_sha256: str,
+) -> dict[tuple[str, str, str], DecisionAuthorityV2]:
+    """Recover every committed scoped-replan choice from its own evidence.
+
+    A replan decision is an authority over a finite option set, not a renderer
+    hint.  Resolve its option IDs through the saved context before the render
+    phase so neither resume nor rendering has to infer what Gemini chose.
+    """
+
+    result: dict[tuple[str, str, str], DecisionAuthorityV2] = {}
+    decisions_root = frontier_root / "scoped-semantic-replans"
+    if not decisions_root.is_dir():
+        return result
+    for decision_path in sorted(decisions_root.rglob("decision.json")):
+        decision_payload = read_json(decision_path)
+        authority = DecisionAuthorityV2.model_validate(
+            decision_payload.get("authority")
+        )
+        validate_authority_binding(authority, autonomous_policy)
+        if authority.decision_scope != "scoped_semantic_replan":
+            raise FeatureCutSystemFailure(
+                "frontier replan decision has the wrong authority scope"
+            )
+        context_path = decision_path.with_name("context.json")
+        if not context_path.is_file() or (
+            decision_payload.get("context_sha256")
+            != sha256_file(context_path)
+        ):
+            raise FeatureCutSystemFailure(
+                "frontier replan decision has no immutable context binding"
+            )
+        required_hashes = {
+            f"sha256:{sha256_file(context_path)}",
+            f"sha256:{frontier_plan_sha256}",
+        }
+        if not required_hashes.issubset(authority.input_artifact_hashes):
+            raise FeatureCutSystemFailure(
+                "frontier replan authority is missing a required input hash"
+            )
+        context = read_json(context_path)
+        options_by_id: dict[str, tuple[str, str, str]] = {}
+        for affected in context.get("affected_beats", []):
+            if not isinstance(affected, Mapping):
+                raise FeatureCutSystemFailure(
+                    "frontier replan context has an invalid affected beat"
+                )
+            feature_id = str(affected.get("feature_id") or "")
+            for option in affected.get("immutable_options", []):
+                if not isinstance(option, Mapping):
+                    raise FeatureCutSystemFailure(
+                        "frontier replan context has an invalid immutable option"
+                    )
+                option_id = str(option.get("option_id") or "")
+                candidate_id = str(option.get("candidate_id") or "")
+                execution_sha256 = str(
+                    option.get("candidate_execution_sha256") or ""
+                )
+                if not all((feature_id, option_id, candidate_id, execution_sha256)):
+                    raise FeatureCutSystemFailure(
+                        "frontier replan immutable option has no execution identity"
+                    )
+                if option_id in options_by_id:
+                    raise FeatureCutSystemFailure(
+                        "frontier replan context has duplicate option IDs"
+                    )
+                options_by_id[option_id] = (
+                    feature_id,
+                    candidate_id,
+                    execution_sha256,
+                )
+        for decision in decision_payload.get("decisions", []):
+            if not isinstance(decision, Mapping):
+                raise FeatureCutSystemFailure(
+                    "frontier replan decision has an invalid selection"
+                )
+            feature_id = str(decision.get("beat_id") or "")
+            option_id = str(decision.get("selected_option_id") or "")
+            resolved = options_by_id.get(option_id)
+            if resolved is None or resolved[0] != feature_id:
+                raise FeatureCutSystemFailure(
+                    "frontier replan selected an option outside its context"
+                )
+            key = resolved
+            existing = result.get(key)
+            if existing is not None and existing != authority:
+                raise FeatureCutSystemFailure(
+                    "frontier execution has conflicting semantic authorities"
+                )
+            result[key] = authority
+    return result
 
 
 def _apply_pre_render_complete_route_executions(
@@ -21465,6 +21834,14 @@ def _run_feature_cut_experiment_impl(
             str,
         ] = {}
         autonomous_vertical_frontier_omitted_feature_ids: set[str] = set()
+        resolved_frontier_execution_bindings_by_feature_and_sha: dict[
+            str,
+            dict[str, CandidateRouteSelection],
+        ] = {}
+        resolved_frontier_replan_authority_by_execution: dict[
+            tuple[str, str, str],
+            DecisionAuthorityV2,
+        ] = {}
         if (
             autonomous_profile
             and render_vertical
@@ -21474,9 +21851,23 @@ def _run_feature_cut_experiment_impl(
             and editorial_beat_contracts_path is not None
         ):
             frontier_root = output_dir / "production-frontier" / "9x16"
-            route_sha256 = sha256_file(
-                pre_render_candidate_route_path
+            route_sha256 = _pre_render_route_definition_sha256(
+                pre_render_candidate_route
             )
+            persisted_active_frontier_route: CandidateCompleteRoute | None = None
+            persisted_active_route_path = frontier_root / "active-local-route.json"
+            if (
+                (frontier_root / "state.json").is_file()
+                and persisted_active_route_path.is_file()
+            ):
+                persisted_active_payload = read_json(
+                    persisted_active_route_path
+                )
+                persisted_active_frontier_route = (
+                    CandidateCompleteRoute.model_validate(
+                        persisted_active_payload.get("active_route")
+                    )
+                )
             frontier_plan_sha256 = sha256_file(plan_path)
             frontier_editorial_contracts_sha256 = sha256_file(
                 editorial_beat_contracts_path
@@ -21908,7 +22299,23 @@ def _run_feature_cut_experiment_impl(
                     "no complete autonomous 9:16 route survived the "
                     "all-candidate zero-paid preflight"
                 )
-            active_local_route = locally_viable_complete_routes[0]
+            active_local_route = (
+                persisted_active_frontier_route
+                or locally_viable_complete_routes[0]
+            )
+            if persisted_active_frontier_route is not None and not all(
+                _frontier_execution_key(
+                    selection.beat_id,
+                    selection.candidate_id,
+                    selection.candidate_execution_sha256,
+                )
+                in local_payloads
+                for selection in active_local_route.selections
+            ):
+                raise FeatureCutSystemFailure(
+                    "persisted active route cannot be reconstructed from "
+                    "its frontier local evidence"
+                )
             active_local_selection_by_beat = {
                 selection.beat_id: selection
                 for selection in active_local_route.selections
@@ -24381,6 +24788,57 @@ def _run_feature_cut_experiment_impl(
                         candidate_execution_sha256,
                     )
                 )
+            resolved_frontier_replan_authority_by_execution = (
+                _load_frontier_replan_authorities_by_execution(
+                    frontier_root=frontier_root,
+                    autonomous_policy=autonomous_policy,
+                    frontier_plan_sha256=frontier_plan_sha256,
+                )
+            )
+            resolved_frontier_route, resolved_frontier_execution_bindings_by_feature_and_sha = (
+                _materialize_resolved_frontier_route(
+                    base_route=active_runtime_route["route"],
+                    selected_executions_by_beat={
+                        feature_id: (
+                            candidate_id,
+                            autonomous_vertical_frontier_selected_execution_sha256s[
+                                feature_id
+                            ],
+                        )
+                        for feature_id, candidate_id in (
+                            autonomous_vertical_frontier_selected_ids.items()
+                        )
+                    },
+                    frontier_root=frontier_root,
+                    route_sha256=route_sha256,
+                    policy_reference=autonomous_policy.policy_reference,
+                    replan_authority_by_execution=(
+                        resolved_frontier_replan_authority_by_execution
+                    ),
+                )
+            )
+            active_runtime_route["route"] = resolved_frontier_route
+            pre_render_execution_bindings_by_feature_and_sha = (
+                resolved_frontier_execution_bindings_by_feature_and_sha
+            )
+            # Exact PTS locks can differ from the planner's nominal
+            # millisecond windows by one or more source frames.  From this
+            # point the route's legal decoded duration is authoritative for
+            # concat, music projection and final QA; padding content with a
+            # cloned frame would be an unapproved editorial decision.
+            chapter_durations = {
+                selection.beat_id: selection.trim_duration_ms / 1000
+                for selection in resolved_frontier_route.selections
+            }
+            duration_audit = {
+                **duration_audit,
+                "resolved_chapter_durations_seconds": chapter_durations,
+                "runtime_active_complete_route_id": (
+                    resolved_frontier_route.route_id
+                ),
+                "duration_authority": "resolved_frontier_exact_pts_route",
+            }
+            write_json(output_dir / "editorial-duration-plan.json", duration_audit)
             omission_reconciliation_path: Path | None = None
             if autonomous_vertical_frontier_omitted_feature_ids:
                 if music_lock is not None or render_horizontal:
@@ -25377,49 +25835,10 @@ def _run_feature_cut_experiment_impl(
                         ).get(frozen_frontier_execution_sha256)
                     )
                     if frozen_execution is None:
-                        # Hydrate an execution admitted by a persisted
-                        # grouped replan.  It remains immutable: all fields
-                        # come from the saved frontier local/geometry stages
-                        # and its accepted state, never a renderer choice.
-                        frozen_key = _frontier_execution_key(
-                            selected.feature_id,
-                            frozen_frontier_candidate_id,
-                            frozen_frontier_execution_sha256,
+                        raise FeatureCutSystemFailure(
+                            "resolved production route has no binding for a "
+                            "frontier-selected execution"
                         )
-                        frozen_local = local_payloads.get(frozen_key)
-                        frozen_geometry = geometry_payloads.get(frozen_key)
-                        if frozen_local is None or frozen_geometry is None:
-                            raise FeatureCutSystemFailure(
-                                "frozen autonomous frontier execution has no "
-                                "persisted local geometry binding"
-                            )
-                        prior_selection = next(
-                            item
-                            for item in active_runtime_route["route"].selections
-                            if item.beat_id == selected.feature_id
-                        )
-                        frozen_clip = RushClip.model_validate(frozen_local["clip"])
-                        frozen_execution = CandidateRouteSelection(
-                            beat_id=selected.feature_id,
-                            candidate_id=frozen_frontier_candidate_id,
-                            source_asset_id=str(frozen_local["option"]["source_asset_id"]),
-                            event_id=str(frozen_local["option"]["event_id"]),
-                            trim_duration_ms=int(frozen_local["end_ms"]) - int(frozen_local["start_ms"]),
-                            cue_id=prior_selection.cue_id,
-                            cue_aligned=prior_selection.cue_aligned,
-                            presentation_mode=str(frozen_geometry.get("measured_presentation_mode") or prior_selection.presentation_mode),
-                            entry_composition=prior_selection.entry_composition,
-                            exit_composition=prior_selection.exit_composition,
-                            decision_codes=("persisted_grouped_scoped_semantic_replan",),
-                            source_clip_id=frozen_clip.clip_id,
-                            source_in_ms=int(frozen_local["start_ms"]),
-                            source_out_ms=int(frozen_local["end_ms"]),
-                            candidate_execution_sha256=frozen_frontier_execution_sha256,
-                            reuse_mode=str(frozen_local["option"].get("source_reuse_mode") or "none"),
-                        )
-                        pre_render_execution_bindings_by_feature_and_sha.setdefault(
-                            selected.feature_id, {}
-                        )[frozen_frontier_execution_sha256] = frozen_execution
                     if frozen_execution.candidate_id != (
                         frozen_frontier_candidate_id
                     ):
@@ -25510,42 +25929,18 @@ def _run_feature_cut_experiment_impl(
                         if geometry_payload.get("classification") == (
                             "deferred_semantic_replan"
                         ):
-                            replan_decision_path = (
-                                output_dir
-                                / "production-frontier"
-                                / "9x16"
-                                / "scoped-semantic-replans"
-                                / f"{selected.feature_id}.decision.json"
+                            authority_key = (
+                                selected.feature_id,
+                                candidate_id,
+                                frozen_frontier_execution_sha256,
                             )
-                            if not replan_decision_path.is_file():
-                                raise FeatureCutSystemFailure(
-                                    "deferred presentation has no scoped "
-                                    "Gemini replan authority"
-                                )
-                            replan_decision = read_json(replan_decision_path)
-                            replan_authority = DecisionAuthorityV2.model_validate(
-                                replan_decision.get("authority")
-                            )
-                            validate_authority_binding(
-                                replan_authority,
-                                autonomous_policy,
-                            )
-                            if replan_authority.decision_scope != (
-                                "scoped_semantic_replan"
-                            ):
-                                raise FeatureCutSystemFailure(
-                                    "scoped Gemini replan has wrong authority scope"
-                                )
                             if (
-                                replan_decision.get("selected_candidate_id")
-                                != candidate_id
-                                or replan_decision.get(
-                                    "selected_candidate_execution_sha256"
-                                ) != frozen_frontier_execution_sha256
+                                authority_key
+                                not in resolved_frontier_replan_authority_by_execution
                             ):
                                 raise FeatureCutSystemFailure(
-                                    "scoped Gemini replan authority does not "
-                                    "bind frozen presentation execution"
+                                    "resolved route has no scoped Gemini authority "
+                                    "for its deferred presentation"
                                 )
                         candidate_frame = RushFrame.model_validate(
                             local_payload["frame"]
@@ -25677,6 +26072,11 @@ def _run_feature_cut_experiment_impl(
                             "frame": candidate_frame,
                             "clip": candidate_clip,
                             "media": candidate_media,
+                            # Local/exact event artifacts are addressed in
+                            # their bounded planning window.  The renderer
+                            # keeps that window for dense-catalog lineage;
+                            # the actual decoded PTS duration is projected
+                            # separately once ``source_interval`` is bound.
                             "start_ms": int(local_payload["start_ms"]),
                             "end_ms": int(local_payload["end_ms"]),
                             "shot_id": str(local_payload["shot_id"]),
@@ -28636,6 +29036,11 @@ def _run_feature_cut_experiment_impl(
                         / "9x16"
                     ),
                 )
+                vertical_render_duration_seconds = (
+                    _source_interval_duration_seconds(
+                        vertical_source_interval
+                    )
+                )
                 if chapter_copy_suppression_codes:
                     vertical_geometry["copy_suppression_codes"] = list(
                         chapter_copy_suppression_codes
@@ -28661,7 +29066,7 @@ def _run_feature_cut_experiment_impl(
                     output_dir=output_dir,
                     aspect="9x16",
                     fingerprint=vertical_segment_fingerprint,
-                    expected_duration=(v_end - v_start) / 1000,
+                    expected_duration=vertical_render_duration_seconds,
                     dimensions=(1080, 1920),
                 )
                 vertical_cache_hit = cached_vertical_segment is not None
@@ -28670,7 +29075,7 @@ def _run_feature_cut_experiment_impl(
                     vertical_segment = cached_vertical_segment
                 elif not _segment_is_valid(
                     vertical_segment,
-                    expected_duration=(v_end - v_start) / 1000,
+                    expected_duration=vertical_render_duration_seconds,
                     dimensions=(1080, 1920),
                 ):
                     render_task = {
@@ -28829,9 +29234,25 @@ def _run_feature_cut_experiment_impl(
                     ),
                     "source_frame_id": vertical_frame.frame_id,
                     "source_clip_id": vertical_clip.clip_id,
-                    "source_in_ms": v_start,
-                    "source_out_ms": v_end,
-                    "duration_ms": v_end - v_start,
+                    "source_in_ms": int(
+                        vertical_source_interval.get(
+                            "start_ms_display",
+                            vertical_source_interval.get(
+                                "display_start_ms", v_start
+                            ),
+                        )
+                    ),
+                    "source_out_ms": int(
+                        vertical_source_interval.get(
+                            "end_ms_display",
+                            vertical_source_interval.get(
+                                "display_end_ms", v_end
+                            ),
+                        )
+                    ),
+                    "duration_ms": round(
+                        vertical_render_duration_seconds * 1000
+                    ),
                     "source_shot_id": v_shot,
                     "source_interval": vertical_source_interval,
                     "render_boundary_lineage": vertical_boundary_lineage,
@@ -29165,6 +29586,9 @@ def _run_feature_cut_experiment_impl(
                     ),
                     maximum_total_duration_ms=(
                         autonomous_policy.duration.max_ms
+                    ),
+                    pts_duration_quantization_tolerance_ms=(
+                        round(1000 / 30) + 5
                     ),
                 )
             )
@@ -30054,6 +30478,9 @@ def _run_feature_cut_experiment_impl(
                         ),
                         maximum_total_duration_ms=(
                             autonomous_policy.duration.max_ms
+                        ),
+                        pts_duration_quantization_tolerance_ms=(
+                            round(1000 / 30) + 5
                         ),
                     )
                 )

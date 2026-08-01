@@ -50,6 +50,8 @@ from jascue_video_lab.feature_cut import (
     _apply_pre_render_candidate_route,
     _ensure_runtime_source_metadata,
     _runtime_exact_event_root,
+    _materialize_resolved_frontier_route,
+    _source_interval_duration_seconds,
     _pre_render_execution_bindings_by_beat_and_sha,
     _pre_render_execution_duration_seconds,
     _pre_render_vertical_feasibility,
@@ -2189,6 +2191,157 @@ def test_frozen_frontier_execution_lookup_preserves_route_specific_trim() -> Non
     assert bindings["beat"]["a" * 64].source_in_ms == 1_000
     assert bindings["beat"]["b" * 64].source_in_ms == 2_000
     assert bindings["beat"]["b" * 64].trim_duration_ms == 6_500
+
+
+def test_execution_bindings_index_every_beat_of_a_complete_route() -> None:
+    """Route indexing may not silently keep only each route's last beat."""
+
+    route = _complete_route_for_execution_compatibility(
+        "a",
+        {"opening": "b" * 64, "closing": "c" * 64},
+    )
+
+    bindings = _pre_render_execution_bindings_by_beat_and_sha(
+        SimpleNamespace(ranked_routes=(route,))
+    )
+
+    assert set(bindings) == {"opening", "closing"}
+    assert bindings["opening"]["b" * 64].beat_id == "opening"
+    assert bindings["closing"]["c" * 64].beat_id == "closing"
+
+
+def test_resolved_frontier_route_reads_committed_stage_chain(
+    tmp_path: Path,
+) -> None:
+    """Resume materialises one render route from frontier artifacts alone."""
+
+    base_route = _complete_route_for_execution_compatibility(
+        "d",
+        {"opening": "e" * 64, "closing": "f" * 64},
+    )
+    frontier_root = tmp_path / "frontier"
+    route_sha256 = "1" * 64
+    policy_reference = "sha256:" + "2" * 64
+    selected = {
+        "opening": ("candidate-opening", "e" * 64),
+        "closing": ("candidate-closing", "f" * 64),
+    }
+    for beat_id, (candidate_id, execution_sha256) in selected.items():
+        candidate_root = (
+            frontier_root
+            / beat_id
+            / candidate_id
+            / f"execution-{execution_sha256}"
+        )
+        candidate_root.mkdir(parents=True)
+        clip = RushClip(
+            clip_id=f"clip-{beat_id}",
+            path=f"/{beat_id}.mp4",
+            sha256="a" * 64,
+            duration_ms=5_000,
+            width=1920,
+            height=1080,
+            frame_rate="30/1",
+            size_bytes=1,
+        )
+        shared = {
+            "beat_id": beat_id,
+            "candidate_id": candidate_id,
+            "candidate_execution_sha256": execution_sha256,
+            # Old runs bound stage artifacts to a file hash that included a
+            # generated_at field.  The resolved route must validate the
+            # immutable execution chain, not reject that non-semantic legacy
+            # envelope hash on resume.
+            "route_sha256": "legacy-artifact-envelope-hash",
+            "policy_reference": policy_reference,
+        }
+        (candidate_root / "local.json").write_text(
+            json.dumps(
+                {
+                    **shared,
+                    "stage": "local_preflight",
+                    "payload": {
+                        "option": {
+                            "source_asset_id": "sha256:" + "a" * 64,
+                            "event_id": f"event-{beat_id}",
+                        },
+                        "clip": clip.model_dump(mode="json"),
+                        "start_ms": 100,
+                        "end_ms": 1_100,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (candidate_root / "exact.json").write_text(
+            json.dumps(
+                {
+                    **shared,
+                    "candidate_execution_sha256": None,
+                    "stage": "exact_event",
+                    "payload": {
+                        "authorized_trim": {
+                            "authorized_source_interval": {
+                                "start_ms_display": 120,
+                                "end_ms_display": 1_080,
+                            }
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (candidate_root / "geometry.json").write_text(
+            json.dumps(
+                {
+                    **shared,
+                    "stage": "geometry",
+                    "payload": {
+                        "classification": "natural_accepted",
+                        "measured_presentation_mode": "static_full_bleed_crop",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    resolved, bindings = _materialize_resolved_frontier_route(
+        base_route=base_route,
+        selected_executions_by_beat=selected,
+        frontier_root=frontier_root,
+        route_sha256=route_sha256,
+        policy_reference=policy_reference,
+        replan_authority_by_execution={},
+    )
+
+    assert resolved.route_id != base_route.route_id
+    assert [item.candidate_id for item in resolved.selections] == [
+        "candidate-opening",
+        "candidate-closing",
+    ]
+    assert bindings["opening"]["e" * 64].source_in_ms == 120
+    assert bindings["opening"]["e" * 64].trim_duration_ms == 960
+    assert (frontier_root / "resolved-route.json").is_file()
+
+
+def test_source_interval_duration_uses_pts_not_nominal_window() -> None:
+    """VFR source timing must not be replaced by clone-padding at concat."""
+
+    assert _source_interval_duration_seconds(
+        {
+            "start_pts": 91_091,
+            "end_pts_exclusive": 269_269,
+            "source_time_base": {"numerator": 1, "denominator": 30_000},
+        }
+    ) == pytest.approx(5.9392666667)
+    with pytest.raises(ValueError, match="valid decoded PTS duration"):
+        _source_interval_duration_seconds(
+            {
+                "start_pts": 1,
+                "end_pts_exclusive": 1,
+                "source_time_base": {"numerator": 1, "denominator": 30},
+            }
+        )
 
 
 def test_frozen_execution_lookup_allows_same_execution_in_two_global_routes() -> None:

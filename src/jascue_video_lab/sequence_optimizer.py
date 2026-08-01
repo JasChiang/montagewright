@@ -818,8 +818,10 @@ class RuntimeSegmentTiming(FrozenStrictModel):
 
     The pre-render duration remains the editorial request.  Source capacity
     and actual duration are measured runtime facts.  An actual duration may
-    be shorter, but may never be padded beyond the plan, exceed source
-    capacity, or fall back to freeze/time-stretch inside this contract.
+    be shorter, or differ by at most one output-frame of source-PTS boundary
+    quantization.  It may never be padded, materially extended beyond the
+    plan, exceed source capacity, or fall back to freeze/time-stretch inside
+    this contract.
     """
 
     beat_id: str = Field(min_length=1)
@@ -830,6 +832,7 @@ class RuntimeSegmentTiming(FrozenStrictModel):
     actual_source_capacity_ms: int = Field(gt=0)
     actual_duration_ms: int = Field(gt=0)
     minimum_readable_ms: int = Field(gt=0)
+    max_pts_quantization_delta_ms: int = Field(default=34, ge=0, le=100)
     cue_bindings: tuple[RuntimeCueTimingBinding, ...] = ()
     input_artifact_hashes: tuple[str, ...] = ()
 
@@ -839,9 +842,13 @@ class RuntimeSegmentTiming(FrozenStrictModel):
             raise ValueError(
                 "runtime duration cannot exceed measured source capacity"
             )
-        if self.actual_duration_ms > self.planned_duration_ms:
+        if (
+            self.actual_duration_ms
+            > self.planned_duration_ms + self.max_pts_quantization_delta_ms
+        ):
             raise ValueError(
-                "runtime reconciliation cannot extend a pre-render duration"
+                "runtime reconciliation cannot materially extend a pre-render "
+                "duration beyond its PTS quantization tolerance"
             )
         if any(
             binding.event_offset_ms >= self.actual_duration_ms
@@ -1040,6 +1047,7 @@ def reconcile_runtime_sequence_timing(
     *,
     minimum_total_duration_ms: int | None = None,
     maximum_total_duration_ms: int | None = None,
+    pts_duration_quantization_tolerance_ms: int = 0,
 ) -> RuntimeSequenceTimingReconciliation:
     """Rebase a pre-render sequence onto measured runtime source durations.
 
@@ -1063,6 +1071,8 @@ def reconcile_runtime_sequence_timing(
         )
     ):
         raise ValueError("runtime total duration bounds are invalid")
+    if not 0 <= pts_duration_quantization_tolerance_ms <= 100:
+        raise ValueError("runtime PTS duration quantization tolerance is invalid")
     beat_ids = [segment.beat_id for segment in segments]
     if len(beat_ids) != len(set(beat_ids)):
         raise ValueError("runtime sequence beat IDs must be unique")
@@ -1080,6 +1090,9 @@ def reconcile_runtime_sequence_timing(
         ],
         "minimum_total_duration_ms": minimum_total_duration_ms,
         "maximum_total_duration_ms": maximum_total_duration_ms,
+        "pts_duration_quantization_tolerance_ms": (
+            pts_duration_quantization_tolerance_ms
+        ),
     }
     input_sha256 = hashlib.sha256(
         json.dumps(
@@ -1192,12 +1205,14 @@ def reconcile_runtime_sequence_timing(
 
     if (
         minimum_total_duration_ms is not None
-        and resolved_cursor_ms < minimum_total_duration_ms
+        and resolved_cursor_ms + pts_duration_quantization_tolerance_ms
+        < minimum_total_duration_ms
     ):
         failures.append("resolved_total_duration_below_minimum")
     if (
         maximum_total_duration_ms is not None
-        and resolved_cursor_ms > maximum_total_duration_ms
+        and resolved_cursor_ms - pts_duration_quantization_tolerance_ms
+        > maximum_total_duration_ms
     ):
         failures.append("resolved_total_duration_above_maximum")
     changed = resolved_cursor_ms != planned_cursor_ms or any(

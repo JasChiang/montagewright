@@ -1428,6 +1428,37 @@ def test_runtime_reconciliation_accepts_shorter_sequence_when_gates_pass() -> No
     assert len(result.input_sha256) == 64
 
 
+def test_runtime_reconciliation_allows_only_bounded_pts_total_quantization() -> None:
+    result = reconcile_runtime_sequence_timing(
+        (
+            _runtime_timing(
+                "opening",
+                planned_duration_ms=10_000,
+                actual_duration_ms=9_964,
+            ),
+        ),
+        minimum_total_duration_ms=10_000,
+        maximum_total_duration_ms=11_000,
+        pts_duration_quantization_tolerance_ms=38,
+    )
+
+    assert result.outcome == "reconciled"
+    blocked = reconcile_runtime_sequence_timing(
+        (
+            _runtime_timing(
+                "opening",
+                planned_duration_ms=10_000,
+                actual_duration_ms=9_961,
+            ),
+        ),
+        minimum_total_duration_ms=10_000,
+        maximum_total_duration_ms=11_000,
+        pts_duration_quantization_tolerance_ms=38,
+    )
+    assert blocked.outcome == "blocked"
+    assert blocked.failure_codes == ("resolved_total_duration_below_minimum",)
+
+
 def test_resolved_timeline_is_hash_bound_per_aspect() -> None:
     reconciliation = reconcile_runtime_sequence_timing(
         (
@@ -1492,6 +1523,32 @@ def test_runtime_timing_rejects_duration_beyond_source_capacity() -> None:
             planned_duration_ms=7_000,
             actual_source_capacity_ms=6_000,
             actual_duration_ms=6_500,
+            minimum_readable_ms=5_000,
+        )
+
+
+def test_runtime_timing_allows_only_one_frame_of_pts_boundary_quantization() -> None:
+    timing = RuntimeSegmentTiming(
+        beat_id="opening",
+        planned_candidate_id="primary",
+        runtime_candidate_id="primary",
+        source_asset_id="sha256:" + "d" * 64,
+        planned_duration_ms=6_000,
+        actual_source_capacity_ms=6_006,
+        actual_duration_ms=6_006,
+        minimum_readable_ms=5_000,
+    )
+
+    assert timing.actual_duration_ms == 6_006
+    with pytest.raises(ValidationError, match="PTS quantization tolerance"):
+        RuntimeSegmentTiming(
+            beat_id="opening",
+            planned_candidate_id="primary",
+            runtime_candidate_id="primary",
+            source_asset_id="sha256:" + "d" * 64,
+            planned_duration_ms=6_000,
+            actual_source_capacity_ms=6_100,
+            actual_duration_ms=6_035,
             minimum_readable_ms=5_000,
         )
 
