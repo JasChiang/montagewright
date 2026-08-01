@@ -5279,6 +5279,11 @@ model_provenance 必須先原樣回傳：
    reveal、跟隨動作或回到必要關係；並以 `source_camera_motion_reason` 說明。
    手晃、髒開鏡、無關的 pan/tilt、或不確定時不可標為 useful。本機仍會量測
    motion、jolt、reversal 與 containment，任何量測 hard gate 失敗都會拒絕。
+   `unknown` 只適用於 bounded video 確實無法判定原始鏡頭是否有非微小移動；若
+   畫面可見穩定 hold，應標 `static_or_negligible`；若可見移動，必須在
+   `editorially_useful` 與 `incidental_or_unwanted` 中做判斷。strict delivery
+   會把「本機可靠量到非微小來源運鏡、但 Gemini 仍標 unknown」視為語意未決，
+   而不是由本機自行決定放行或改寫。
 5. 若注意力確實依序轉移，使用 0–1 相對進度列出 attention_sequence。
    每個 phase 的 anchor 只代表該 phase 必須看見的主體；全段 required entity
    不得被本機強塞進每個 phase。若關係必須同時存在，coverage_mode 使用
