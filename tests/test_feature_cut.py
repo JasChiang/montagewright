@@ -49,6 +49,7 @@ from jascue_video_lab.feature_cut import (
     _attempt_trim_shift_operation,
     _apply_pre_render_candidate_route,
     _ensure_runtime_source_metadata,
+    _runtime_exact_event_root,
     _pre_render_execution_bindings_by_beat_and_sha,
     _pre_render_execution_duration_seconds,
     _autonomous_exact_event_source_reservations,
@@ -2142,6 +2143,30 @@ def test_frozen_candidate_metadata_hydrates_audio_and_media_caches(
         source_media_cache=media_cache,
     )
     assert len(calls) == 2
+
+
+def test_frozen_finalizer_keeps_execution_scoped_exact_event_root(
+    tmp_path: Path,
+) -> None:
+    root = _runtime_exact_event_root(
+        tmp_path,
+        feature_id="watch9",
+        candidate_id="rank-01",
+        candidate_execution_sha256="a" * 64,
+    )
+
+    assert root == (
+        tmp_path
+        / "exact-events"
+        / "watch9"
+        / "rank-01"
+        / ("execution-" + "a" * 64)
+    )
+    assert _runtime_exact_event_root(
+        tmp_path,
+        feature_id="watch9",
+        candidate_id="rank-01",
+    ) == (tmp_path / "exact-events" / "watch9" / "rank-01")
 
 
 def test_semantic_replan_frontier_is_bounded_and_carries_adjacent_context() -> None:

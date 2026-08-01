@@ -15423,6 +15423,21 @@ def _ensure_runtime_source_metadata(
     return source_media_cache[clip.sha256]
 
 
+def _runtime_exact_event_root(
+    output_dir: Path,
+    *,
+    feature_id: str,
+    candidate_id: str,
+    candidate_execution_sha256: str | None = None,
+) -> Path:
+    """Resolve exact-event artifacts without dropping frozen execution scope."""
+
+    root = output_dir / "exact-events" / feature_id / candidate_id
+    if candidate_execution_sha256 is not None:
+        root = root / f"execution-{candidate_execution_sha256}"
+    return root
+
+
 def _prepare_autonomous_vertical_candidate(
     *,
     selected: FeatureChapterSelect,
@@ -26152,11 +26167,15 @@ def _run_feature_cut_experiment_impl(
                                 strict=True,
                             )
                         ]
-                        dense_root = (
-                            output_dir
-                            / "exact-events"
-                            / selected.feature_id
-                            / selected_candidate_id
+                        dense_root = _runtime_exact_event_root(
+                            output_dir,
+                            feature_id=selected.feature_id,
+                            candidate_id=selected_candidate_id,
+                            candidate_execution_sha256=(
+                                frozen_frontier_execution_sha256
+                                if frozen_frontier_candidate_id is not None
+                                else None
+                            ),
                         )
                         dense_catalog_path = dense_root / "dense-catalog.json"
                         if dense_catalog_path.is_file():
