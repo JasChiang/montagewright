@@ -1342,6 +1342,87 @@ def validate_direct_video_plan_fulfillment(
     return selections
 
 
+def validate_direct_video_source_allocation(
+    plan: DirectVideoEditPlan,
+    *,
+    shortlist: FeatureShortlistPlan,
+    candidate_depth: int,
+    policy: AutonomousEditPolicy | None = None,
+    requested_aspects: tuple[str, ...] = ("9:16",),
+) -> None:
+    """Fail a semantic plan that cannot honour its own source-use intent.
+
+    This is deliberately checked before any selected-window work.  A local
+    router may advance through Gemini-described Top-K candidates after a
+    measured execution failure, but it must not invent an editorial source
+    repeat because a primary selection later collides with another chapter.
+    The planner therefore owns the typed reuse edges between its primary
+    source choices.  Source frequency remains a soft editorial preference;
+    it is never an unannounced local hard limit.
+    """
+
+    if len(plan.chapters) != len(shortlist.chapters):
+        raise ValueError("direct plan chapter count differs from shortlist")
+
+    aspect_decision_names = {
+        "16:9": "horizontal",
+        "9:16": "vertical",
+    }
+    for aspect in requested_aspects:
+        field_name = aspect_decision_names.get(aspect)
+        if field_name is None:
+            raise ValueError(f"unsupported direct-plan aspect: {aspect}")
+        seen: dict[str, list[tuple[str, str, str, str | None]]] = {}
+        for shortlist_chapter, direct_chapter in zip(
+            shortlist.chapters,
+            plan.chapters,
+            strict=True,
+        ):
+            if direct_chapter.evidence_status == "not_found":
+                continue
+            decision = getattr(direct_chapter, field_name)
+            if decision is None:
+                continue
+            candidates = planning_candidate_slice(
+                shortlist_chapter.candidates,
+                direct_video_evidence=True,
+                depth=candidate_depth,
+            )
+            if decision.candidate_rank > len(candidates):
+                raise ValueError(
+                    "direct plan selected unseen candidate while allocating "
+                    f"{aspect}: {shortlist_chapter.feature_id}"
+                )
+            candidate = candidates[decision.candidate_rank - 1]
+            source_rows = seen.setdefault(candidate.source_asset_id, [])
+            if source_rows:
+                if direct_chapter.source_reuse_mode == "none":
+                    raise ValueError(
+                        "direct plan repeats a primary source without Gemini "
+                        f"reuse authority for {aspect}: "
+                        f"{shortlist_chapter.feature_id} -> "
+                        f"{candidate.source_asset_id}"
+                    )
+                if (
+                    policy is not None
+                    and direct_chapter.source_reuse_mode
+                    not in policy.editorial.allow_source_reuse
+                ):
+                    raise ValueError(
+                        "direct plan uses a source-reuse mode forbidden by "
+                        f"the autonomous policy for {aspect}: "
+                        f"{direct_chapter.source_reuse_mode}"
+                    )
+            source_rows.append(
+                (
+                    shortlist_chapter.feature_id,
+                    candidate.event_id,
+                    direct_chapter.source_reuse_mode,
+                    direct_chapter.source_reuse_justification,
+                )
+            )
+
+
 def canonicalize_feature_plan_output(
     output_text: str,
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -5012,6 +5093,47 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_json(capability_catalog_path, capability_catalog)
     capability_catalog_sha256 = capability_catalog.definition_sha256()
+    primary_source_allocation: dict[str, list[str]] = {}
+    if args.candidate_video_evidence:
+        for chapter_row in evidence:
+            if not isinstance(chapter_row, dict):
+                continue
+            feature_id = str(chapter_row.get("feature_id") or "")
+            for candidate_row in chapter_row.get("candidate_events", []):
+                if not isinstance(candidate_row, dict):
+                    continue
+                card_row = candidate_row.get("clip_card")
+                if not isinstance(card_row, dict):
+                    continue
+                source_asset_id = card_row.get("source_asset_id")
+                rank = candidate_row.get("candidate_rank")
+                if not isinstance(source_asset_id, str) or not isinstance(rank, int):
+                    continue
+                primary_source_allocation.setdefault(source_asset_id, []).append(
+                    f"{feature_id}#rank-{rank:02d}"
+                )
+    repeated_primary_source_rows = [
+        {
+            "source_asset_id": source_asset_id,
+            "candidate_scopes": scopes,
+        }
+        for source_asset_id, scopes in sorted(primary_source_allocation.items())
+        if len(scopes) > 1
+    ]
+    source_allocation_instruction = (
+        "\n## Primary 9:16 source-allocation constraints\n"
+        "First allocate one primary vertical candidate per chapter across the whole "
+        "timeline. A repeated source must be an explicit typed reuse edge with an "
+        "observable reason; `none` means it may not repeat an earlier primary "
+        "source. Local code will reject—not repair—an untyped repeat. Use source "
+        "variety whenever it improves the edit, but do not impose an arbitrary "
+        "count limit when a justified alternate presentation or reprise is needed. "
+        "These are the repeated-source candidate groups in this reel:\n"
+        + json.dumps(repeated_primary_source_rows, ensure_ascii=False, indent=2)
+        + "\n"
+        if repeated_primary_source_rows
+        else ""
+    )
     autonomous_presentation_rules = (
         """
 - 先評估每個候選對 9:16 是 natural、reconstructable 或 unsuitable，並列出
@@ -5181,7 +5303,7 @@ model_provenance 必須先原樣回傳：
 7. 全片要有素材與視覺狀態的多樣性。若同一支 source 已被前章選用，應先選
    不同 take；只有不同 interval 提供新的 hard evidence、alternate presentation
    有新的閱讀目的，或明確 editorial reprise 時才能重用，並填入 typed reuse
-   authority 與具體理由。第一版同一 source 最多使用兩次；手機加立牌等相似構圖
+   authority 與具體理由。不得假設本機會自動授權或修正重用；手機加立牌等相似構圖
    即使來自不同時間，也不能反覆充當無差別 coverage。
 8. 候選索引中的 `evidence_origin` 只描述來源關係。內嵌影片、投影、圖文 claim
    或相關空景可以作為經 brief 授權的 contextual presentation，但不得被描述成
@@ -5947,6 +6069,17 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                             contracts=tuple(editorial_contracts),
                             candidate_depth=args.candidate_video_depth,
                             supplements=supplements,
+                            requested_aspects=(
+                                tuple(policy.requested_aspects)
+                                if policy is not None
+                                else ("16:9", "9:16")
+                            ),
+                        )
+                        validate_direct_video_source_allocation(
+                            direct_video_plan,
+                            shortlist=shortlist,
+                            candidate_depth=args.candidate_video_depth,
+                            policy=policy,
                             requested_aspects=(
                                 tuple(policy.requested_aspects)
                                 if policy is not None

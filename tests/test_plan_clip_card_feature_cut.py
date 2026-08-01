@@ -110,6 +110,7 @@ from scripts.plan_clip_card_feature_cut import (
     validate_candidate_video_budget,
     validate_autonomous_planner_requested_aspects,
     validate_direct_video_plan_fulfillment,
+    validate_direct_video_source_allocation,
     validate_hard_shortlist_provenance,
 )
 from scripts.shortlist_clip_card_feature_candidates import (
@@ -622,6 +623,118 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
     assert '"frame_id"' not in direct_schema
     assert '"project_id"' not in direct_schema
     assert '"model_provenance"' not in direct_schema
+
+
+def test_direct_source_allocation_requires_explicit_reuse_but_has_no_count_cap() -> None:
+    base = DirectVideoChapterDecision(
+        chapter_index=1,
+        evidence_status="partial",
+        observed_visual_evidence="A product is visibly present.",
+        selection_reason="The visible product supports this chapter.",
+        horizontal=DirectVideoHorizontalDecision(
+            candidate_rank=1,
+            strategy="original",
+            zoom_intent="none",
+            camera_intent="hold",
+        ),
+        vertical=DirectVideoVerticalDecision(
+            candidate_rank=1,
+            strategy="tracked_crop",
+            crop_mode="primary_center",
+            coverage_mode="independent_detail",
+            allow_controlled_clip=True,
+            framing_intent="Hold the visible product detail.",
+            required_entity_indices=[1],
+            preferred_entity_indices=[],
+            sacrificable_entity_indices=[],
+            attention_sequence=[],
+        ),
+        recommended_duration_seconds=4,
+        duration_rationale="The product detail remains readable.",
+        attention_observation=AttentionObservation(
+            semantic_novelty=0.5,
+            action_progress=1.0,
+            visual_motion=0.0,
+            composition_change=0.0,
+            reading_load=0.2,
+            unresolved_tension=0.0,
+            emotional_hold_value=0.2,
+            repetition_pressure=0.1,
+            music_transition_opportunity=0.3,
+            minimum_dwell_seconds=3,
+            maximum_dwell_seconds=5,
+            rationale="A short product hold is readable.",
+            uncertainties=[],
+            requires_human_review=True,
+        ),
+        flow_intent=ShotFlowIntent(
+            narrative_role="development",
+            energy_role="low_hold",
+            relation_to_previous="new_context",
+            boundary_alignment="phrase_preferred",
+        ),
+        confidence=0.8,
+    )
+    alternate = base.model_copy(
+        update={
+            "chapter_index": 2,
+            "source_reuse_mode": "alternate_presentation",
+            "source_reuse_justification": "A tighter view has a distinct reading purpose.",
+        }
+    )
+    reprise = base.model_copy(
+        update={
+            "chapter_index": 3,
+            "source_reuse_mode": "editorial_reprise",
+            "source_reuse_justification": "Return to the same product for the ending.",
+        }
+    )
+    plan = DirectVideoEditPlan(
+        contract_version="direct-video-edit-plan-v2",
+        capability_catalog_sha256="a" * 64,
+        title="Three authorized views",
+        strategy_summary="One source deliberately serves distinct editorial roles.",
+        chapters=[base, alternate, reprise],
+        uncertainties=[],
+    )
+    shortlist = FeatureShortlistPlan(
+        project_id="project-1",
+        catalog_id="catalog-1",
+        chapters=[
+            FeatureChapterShortlist(
+                feature_id=feature_id,
+                evidence_status="partial",
+                candidates=[
+                    FeatureShortlistCandidate(
+                        source_asset_id=ASSET_ID,
+                        event_id="demo",
+                        retrieval_reason="The product is visible.",
+                    )
+                ],
+            )
+            for feature_id in ("opening", "detail", "closing")
+        ],
+        uncertainties=[],
+        model_provenance=_provenance(),
+    )
+
+    validate_direct_video_source_allocation(
+        plan,
+        shortlist=shortlist,
+        candidate_depth=1,
+    )
+
+    untyped_repeat = plan.model_copy(
+        update={
+            "chapters": [base, alternate, base.model_copy(update={"chapter_index": 3})]
+        }
+    )
+    with pytest.raises(ValueError, match="without Gemini reuse authority"):
+        validate_direct_video_source_allocation(
+            untyped_repeat,
+            shortlist=shortlist,
+            candidate_depth=1,
+        )
 
 
 def test_direct_video_canonicalization_preserves_phase_local_anchors() -> None:

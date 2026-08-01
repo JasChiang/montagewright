@@ -13695,16 +13695,6 @@ def _build_pre_render_vertical_candidate_route(
             planned_reuse_justification = (
                 chapter.source_reuse_justification
             )
-            if (
-                planned_reuse_mode == "none"
-                and "distinct_interval"
-                in policy.editorial.allow_source_reuse
-            ):
-                planned_reuse_mode = "distinct_interval"
-                planned_reuse_justification = (
-                    "AUTO_POLICY permits only measured non-overlapping "
-                    "candidate intervals; runtime reuse remains fail-closed."
-                )
             return CandidateRouteOption(
                 beat_id=chapter.feature_id,
                 candidate_id=candidate.candidate_id,
@@ -16472,10 +16462,10 @@ def _effective_runtime_source_reuse_authority(
     """Resolve candidate-specific reuse after immutable intervals are known.
 
     A fallback candidate can change the selected source after Gemini planning,
-    so chapter-level intent cannot authorize every runtime combination.
-    AUTO_POLICY may authorize a measured, zero-overlap distinct interval
-    without inventing semantic evidence. Overlap and presentation reprises
-    continue to require the planner's explicit typed authority.
+    but that does not grant local code authority to reuse it.  A chapter's
+    typed Gemini decision is the only reuse authority; AUTO_POLICY constrains
+    an already-authorized decision rather than promoting ``none`` into a new
+    editorial choice.
     """
 
     if selected.source_reuse_mode != "none":
@@ -16483,21 +16473,6 @@ def _effective_runtime_source_reuse_authority(
             selected.source_reuse_mode,
             selected.source_reuse_justification,
             "gemini_chapter_intent",
-        )
-    if (
-        overlap_ms == 0
-        and allowed_reuse_modes is not None
-        and "distinct_interval" in allowed_reuse_modes
-        and selected.selection_reason.strip()
-    ):
-        return (
-            "distinct_interval",
-            (
-                "AUTO_POLICY measured a non-overlapping runtime interval after "
-                f"{prior_feature_id}; existing chapter selection reason: "
-                f"{selected.selection_reason.strip()}"
-            ),
-            "auto_policy_runtime_interval",
         )
     return "none", None, "none"
 

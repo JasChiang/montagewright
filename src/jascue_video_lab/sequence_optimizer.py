@@ -1677,7 +1677,16 @@ def _candidate_route_intervals(
     *,
     max_editorial_reprise_overlap_fraction: float,
 ) -> tuple[tuple[int | None, int | None], ...] | None:
-    """Jointly place up to two timed uses of each source."""
+    """Jointly place every timed use of a source inside its safe window.
+
+    Reusing a source more than twice is an editorial decision, not an
+    optimizer limitation.  The later use owns the typed reuse edge to every
+    earlier use: ``none`` rejects it, ``distinct_interval`` forbids overlap,
+    ``alternate_presentation`` permits overlap, and ``editorial_reprise``
+    uses the policy-bound overlap allowance.  The search only considers range
+    endpoints, preferred centers and exact overlap boundaries, so it remains
+    small and deterministic without adding a general solver dependency.
+    """
 
     ranges = [
         _candidate_source_start_range(option, duration_ms=duration_ms)
@@ -1706,40 +1715,129 @@ def _candidate_route_intervals(
         # interval authority starts only once both uses are measurable.
         if len(timed_indices) < 2:
             continue
-        if len(timed_indices) > 2:
-            return None
-        first_index, second_index = timed_indices
-        second_option = options[second_index]
-        if second_option.reuse_mode == "none":
-            return None
-        if second_option.reuse_mode == "alternate_presentation":
-            continue
-        permitted_overlap_ms = 0.0
-        if second_option.reuse_mode == "editorial_reprise":
-            permitted_overlap_ms = (
-                durations_ms[second_index]
-                * max_editorial_reprise_overlap_fraction
+        constraints: dict[tuple[int, int], int] = {}
+        for later_position, later_index in enumerate(timed_indices[1:], start=1):
+            later_option = options[later_index]
+            if later_option.reuse_mode == "none":
+                return None
+            for earlier_index in timed_indices[:later_position]:
+                if later_option.reuse_mode == "alternate_presentation":
+                    continue
+                permitted_overlap_ms = 0
+                if later_option.reuse_mode == "editorial_reprise":
+                    permitted_overlap_ms = math.floor(
+                        durations_ms[later_index]
+                        * max_editorial_reprise_overlap_fraction
+                    )
+                constraints[(earlier_index, later_index)] = permitted_overlap_ms
+
+        candidate_starts: dict[int, set[int]] = {
+            index: {
+                ranges[index][0],  # type: ignore[index]
+                ranges[index][1],  # type: ignore[index]
+                ranges[index][2],  # type: ignore[index]
+            }
+            for index in timed_indices
+        }
+        # A feasible region can only start/end at a safe boundary, preferred
+        # center, or an exact pairwise overlap boundary. Close the finite set
+        # under those boundaries before the bounded backtracking pass.
+        for _ in range(len(timed_indices) + 1):
+            changed = False
+            for (first_index, second_index), permitted_overlap_ms in constraints.items():
+                first_range = ranges[first_index]
+                second_range = ranges[second_index]
+                assert first_range is not None
+                assert second_range is not None
+                for first_start in tuple(candidate_starts[first_index]):
+                    for candidate_start in (
+                        first_start + permitted_overlap_ms - durations_ms[second_index],
+                        first_start + durations_ms[first_index] - permitted_overlap_ms,
+                    ):
+                        if second_range[0] <= candidate_start <= second_range[1] and candidate_start not in candidate_starts[second_index]:
+                            candidate_starts[second_index].add(candidate_start)
+                            changed = True
+                for second_start in tuple(candidate_starts[second_index]):
+                    for candidate_start in (
+                        second_start + permitted_overlap_ms - durations_ms[first_index],
+                        second_start + durations_ms[second_index] - permitted_overlap_ms,
+                    ):
+                        if first_range[0] <= candidate_start <= first_range[1] and candidate_start not in candidate_starts[first_index]:
+                            candidate_starts[first_index].add(candidate_start)
+                            changed = True
+            if not changed:
+                break
+
+        ordered_indices = sorted(
+            timed_indices,
+            key=lambda index: (
+                len(candidate_starts[index]),
+                index,
+            ),
+        )
+        best: tuple[int, tuple[int, ...], dict[int, int]] | None = None
+
+        def overlap_ms(first_index: int, first_start: int, second_index: int, second_start: int) -> int:
+            return max(
+                0,
+                min(
+                    first_start + durations_ms[first_index],
+                    second_start + durations_ms[second_index],
+                )
+                - max(first_start, second_start),
             )
-        assert ranges[first_index] is not None
-        assert ranges[second_index] is not None
-        placed = _joint_pair_interval_placement(
-            first_range=ranges[first_index],
-            first_duration_ms=durations_ms[first_index],
-            second_range=ranges[second_index],
-            second_duration_ms=durations_ms[second_index],
-            permitted_overlap_ms=permitted_overlap_ms,
-        )
-        if placed is None:
+
+        def search(position: int, chosen: dict[int, int], displacement: int) -> None:
+            nonlocal best
+            if best is not None and displacement > best[0]:
+                return
+            if position == len(ordered_indices):
+                ordered_starts = tuple(chosen[index] for index in timed_indices)
+                candidate = (displacement, ordered_starts, dict(chosen))
+                if best is None or candidate[:2] < best[:2]:
+                    best = candidate
+                return
+            index = ordered_indices[position]
+            current_range = ranges[index]
+            assert current_range is not None
+            for start_ms in sorted(
+                candidate_starts[index],
+                key=lambda value: (abs(value - current_range[2]), value),
+            ):
+                valid = True
+                for other_index, other_start_ms in chosen.items():
+                    key = (
+                        (other_index, index)
+                        if other_index < index
+                        else (index, other_index)
+                    )
+                    permitted_overlap_ms = constraints.get(key)
+                    if permitted_overlap_ms is not None and overlap_ms(
+                        index,
+                        start_ms,
+                        other_index,
+                        other_start_ms,
+                    ) > permitted_overlap_ms:
+                        valid = False
+                        break
+                if not valid:
+                    continue
+                chosen[index] = start_ms
+                search(
+                    position + 1,
+                    chosen,
+                    displacement + abs(start_ms - current_range[2]),
+                )
+                chosen.pop(index)
+
+        search(0, {}, 0)
+        if best is None:
             return None
-        first_start_ms, second_start_ms = placed
-        intervals[first_index] = (
-            first_start_ms,
-            first_start_ms + durations_ms[first_index],
-        )
-        intervals[second_index] = (
-            second_start_ms,
-            second_start_ms + durations_ms[second_index],
-        )
+        for index, start_ms in best[2].items():
+            intervals[index] = (
+                start_ms,
+                start_ms + durations_ms[index],
+            )
     return tuple(intervals)
 
 

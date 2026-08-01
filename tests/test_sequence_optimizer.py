@@ -742,6 +742,123 @@ def test_non_overlapping_distinct_interval_reuse_is_hard_safe() -> None:
     assert result.selections[1].reuse_mode == "distinct_interval"
 
 
+def test_three_distinct_intervals_from_one_source_are_hard_safe() -> None:
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(
+                    _timed_route_option(
+                        "opening",
+                        "opening-a",
+                        "a",
+                        source_in_ms=0,
+                        source_out_ms=3_000,
+                    ),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="detail",
+                options=(
+                    _timed_route_option(
+                        "detail",
+                        "detail-a",
+                        "a",
+                        source_in_ms=3_000,
+                        source_out_ms=6_000,
+                        reuse_mode="distinct_interval",
+                    ),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="closing",
+                options=(
+                    _timed_route_option(
+                        "closing",
+                        "closing-a",
+                        "a",
+                        source_in_ms=6_000,
+                        source_out_ms=9_000,
+                        reuse_mode="distinct_interval",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert [selection.source_in_ms for selection in result.selections] == [
+        0,
+        3_000,
+        6_000,
+    ]
+
+
+def test_mixed_alternate_presentation_and_reprise_support_three_source_uses() -> None:
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(
+                    _movable_route_option(
+                        "opening",
+                        "opening-a",
+                        "a",
+                        duration_ms=4_000,
+                        safe_window_start_ms=0,
+                        safe_window_end_ms=9_643,
+                        source_anchor_ms=7_000,
+                    ),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="detail",
+                options=(
+                    _movable_route_option(
+                        "detail",
+                        "detail-a",
+                        "a",
+                        duration_ms=4_000,
+                        safe_window_start_ms=0,
+                        safe_window_end_ms=9_643,
+                        source_anchor_ms=7_000,
+                        reuse_mode="alternate_presentation",
+                    ),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="closing",
+                options=(
+                    _movable_route_option(
+                        "closing",
+                        "closing-a",
+                        "a",
+                        duration_ms=4_000,
+                        safe_window_start_ms=0,
+                        safe_window_end_ms=9_643,
+                        source_anchor_ms=7_000,
+                        reuse_mode="editorial_reprise",
+                    ),
+                ),
+            ),
+        ),
+        max_editorial_reprise_overlap_fraction=0.5,
+    )
+
+    intervals = [
+        (selection.source_in_ms, selection.source_out_ms)
+        for selection in result.selections
+    ]
+    assert all(interval[0] is not None and interval[1] is not None for interval in intervals)
+    closing_interval = intervals[-1]
+    for interval in intervals[:-1]:
+        overlap = max(
+            0,
+            min(interval[1], closing_interval[1])
+            - max(interval[0], closing_interval[0]),
+        )
+        assert overlap <= 2_000
+
+
 def test_center_overlap_repositions_safe_window_for_distinct_interval() -> None:
     fold_hero = _movable_route_option(
         "fold_hero",

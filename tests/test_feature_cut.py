@@ -12230,7 +12230,7 @@ def test_runtime_candidate_reuse_allows_authorized_distinct_interval() -> None:
     assert policy_block["reuse_mode"] == "distinct_interval"
 
 
-def test_runtime_candidate_reuse_auto_policy_authorizes_measured_distinct_interval(
+def test_runtime_candidate_reuse_rejects_unplanned_distinct_interval(
 ) -> None:
     selected = FeatureChapterSelect(
         feature_id="second",
@@ -12256,17 +12256,16 @@ def test_runtime_candidate_reuse_auto_policy_authorizes_measured_distinct_interv
         }
     ]
 
-    assert (
-        _runtime_candidate_reuse_violation(
-            selected,
-            prior,
-            source_clip_id="clip-a",
-            source_in_ms=4000,
-            source_out_ms=6000,
-            allowed_reuse_modes={"distinct_interval"},
-        )
-        is None
+    distinct = _runtime_candidate_reuse_violation(
+        selected,
+        prior,
+        source_clip_id="clip-a",
+        source_in_ms=4000,
+        source_out_ms=6000,
+        allowed_reuse_modes={"distinct_interval"},
     )
+    assert distinct is not None
+    assert distinct["reuse_authority_source"] == "none"
     overlap = _runtime_candidate_reuse_violation(
         selected,
         prior,
@@ -12279,7 +12278,7 @@ def test_runtime_candidate_reuse_auto_policy_authorizes_measured_distinct_interv
     assert overlap["reuse_authority_source"] == "none"
 
 
-def test_render_reuse_audit_records_runtime_auto_policy_authority() -> None:
+def test_render_reuse_audit_rejects_unplanned_distinct_interval_reuse() -> None:
     first = FeatureChapterSelect(
         feature_id="first",
         evidence_status="supported",
@@ -12339,12 +12338,9 @@ def test_render_reuse_audit_records_runtime_auto_policy_authority() -> None:
         aspect="9x16",
         allowed_reuse_modes={"distinct_interval"},
     )
-    assert audit["status"] == "passed"
-    assert audit["rows"][0]["reuse_mode"] == "distinct_interval"
-    assert (
-        audit["rows"][0]["reuse_authority_source"]
-        == "auto_policy_runtime_interval"
-    )
+    assert audit["status"] == "blocked"
+    assert audit["rows"][0]["reuse_mode"] == "none"
+    assert audit["rows"][0]["reuse_authority_source"] == "none"
     assert audit["rows"][0]["planned_reuse_mode"] == "none"
 
 
