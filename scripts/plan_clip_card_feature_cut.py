@@ -1344,6 +1344,24 @@ def validate_direct_video_plan_fulfillment(
                     f"for {shortlist_chapter.feature_id}: expected "
                     f"{sorted(expected_ranks)}, got {sorted(described_ranks)}"
                 )
+            vertical_decisions = (
+                direct_chapter.vertical,
+                *direct_chapter.vertical_alternates,
+            )
+            if all(
+                decision.aspect_suitability == "unsuitable"
+                for decision in vertical_decisions
+            ):
+                # ``unsuitable`` is useful evidence about one candidate, but
+                # an entire requested aspect cannot enter the local execution
+                # frontier with no Gemini-authorised presentation.  Treat it
+                # as a planner-contract failure so the one bounded *text-only*
+                # repair can revise entity priority / candidate choice rather
+                # than making local geometry invent a substitute.
+                raise ValueError(
+                    "direct plan has no Gemini-authorised executable 9:16 "
+                    f"candidate for {shortlist_chapter.feature_id}"
+                )
     for contract in contracts:
         if contract.priority != "hard" or contract.feature_id is None:
             continue
@@ -6198,6 +6216,12 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                         "不可執行，保留其 unsuitable 狀態，不得捏造 crop、panel、"
                         "fit 或其他未授權的呈現方式。不得為了通過 contract 改變"
                         "已選來源、全片順序、音樂 cue 關係或 hard evidence。"
+                        "若錯誤明示某 requested aspect 沒有任何 Gemini-authorised "
+                        "executable candidate，你必須以先前已觀察的候選 evidence "
+                        "修正該章的 candidate、required/preferred/sacrificable entity "
+                        "與 presentation intent；保留 brief 順序、hard evidence、"
+                        "音樂關係與所有未受影響章節。此時不能讓所有候選仍是 "
+                        "unsuitable，也不能把本機 geometry 假設成會自行發明解法。"
                     )
                     repair_limits = (
                         policy.gemini_limits.text_only_schema_repair

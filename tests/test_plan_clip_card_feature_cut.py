@@ -718,6 +718,31 @@ def test_vertical_only_direct_plan_projects_neutral_unrequested_horizontal_shado
     )
 
     assert direct.chapters[0].horizontal is None
+    unsuitable = direct.model_copy(
+        update={
+            "chapters": [
+                direct.chapters[0].model_copy(
+                    update={
+                        "vertical": direct.chapters[0].vertical.model_copy(
+                            update={"aspect_suitability": "unsuitable"}
+                        )
+                    }
+                )
+            ]
+        }
+    )
+    with pytest.raises(
+        ValueError,
+        match="no Gemini-authorised executable 9:16 candidate",
+    ):
+        validate_direct_video_plan_fulfillment(
+            unsuitable,
+            shortlist=shortlist,
+            cards={ASSET_ID: card},
+            contracts=(),
+            candidate_depth=2,
+            requested_aspects=("9:16",),
+        )
     assert projected.chapters[0].vertical_candidate_id == "rank-01"
     assert projected.chapters[0].horizontal_candidate_id == "rank-01"
     shadow = projected.chapters[0].candidates[0]
