@@ -16634,9 +16634,22 @@ def _audit_requested_candidate_recall(
                 if chapter.vertical_candidates
                 else int(chapter.vertical_frame_id is not None)
             )
+        # The direct-video shortlist is the evidence-bearing source for this
+        # exception.  Its ``partial`` status means that Gemini found exactly
+        # one usable item for the requested beat, not that the projected
+        # FeatureEditPlan must keep the same convenience status.  Projection
+        # can legitimately promote the beat to ``supported`` once it binds
+        # the one candidate to the brief.  Requiring both representations to
+        # say ``partial`` therefore turned a verified unique candidate into a
+        # fake "recall incomplete" failure before any geometry was tried.
+        #
+        # This is deliberately *not* a local fallback: the feature id is
+        # admitted only when a hash-bound, Gemini-produced exhaustive
+        # shortlist declared it as the sole evidence.  It has no substitute;
+        # a later numeric failure must surface as an execution failure/replan
+        # input instead of selecting an invented candidate.
         only_evidence_exception = (
             chapter.feature_id in only_evidence_feature_ids
-            and chapter.evidence_status == "partial"
             and all(count == 1 for count in aspect_counts.values())
         )
         incomplete = [
@@ -16650,6 +16663,11 @@ def _audit_requested_candidate_recall(
                 "evidence_status": chapter.evidence_status,
                 "candidate_counts": aspect_counts,
                 "only_evidence_exception": only_evidence_exception,
+                "unique_candidate_execution_mode": (
+                    "hash_bound_unique_evidence"
+                    if only_evidence_exception
+                    else None
+                ),
                 "incomplete_aspects": incomplete,
                 "complete": not incomplete,
             }
@@ -16662,7 +16680,8 @@ def _audit_requested_candidate_recall(
         "policy": (
             "production-review requires at least two evidence-bound candidates "
             "for every requested aspect, except a hash-bound exhaustive shortlist "
-            "may declare one partial chapter candidate as the only real evidence"
+            "may declare one candidate as the only real evidence; this permits "
+            "execution without inventing a fallback candidate"
         ),
     }
     return {**body, "audit_sha256": _stable_fingerprint(body)}

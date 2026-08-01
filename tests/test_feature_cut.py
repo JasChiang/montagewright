@@ -11565,6 +11565,71 @@ def test_requested_candidate_recall_accepts_typed_only_evidence_exception() -> N
     assert accepted["rows"][0]["only_evidence_exception"] is True
 
 
+def test_requested_candidate_recall_keeps_hash_bound_unique_evidence_after_projection() -> None:
+    """A projected supported beat may still have one verified shortlist item.
+
+    The direct shortlist, rather than the convenience status of the projected
+    feature plan, is authoritative for the no-fallback exception.
+    """
+    chapter = FeatureChapterSelect(
+        feature_id="closing",
+        evidence_status="supported",
+        observed_visual_evidence="A single observed closing product shot.",
+        selection_reason="The hash-bound shortlist contains one closing shot.",
+        horizontal_frame_id="RF000001",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000001",
+        vertical_strategy="tracked_crop",
+        vertical_target_description="the product",
+        vertical_candidates=[
+            {
+                "candidate_id": "closing-only",
+                "rank": 1,
+                "source_asset_id": "sha256:" + "b" * 64,
+                "event_id": "event-closing",
+                "frame_id": "RF000001",
+                "observed_visual_evidence": "A visible closing product shot.",
+                "selection_reason": "Only candidate in the bound shortlist.",
+                "strategy": "tracked_crop",
+                "target_description": "the product",
+                "confidence": 0.9,
+            }
+        ],
+        quality_risks=[],
+        confidence=0.9,
+    )
+    plan = FeatureEditPlan(
+        project_id="generic-project",
+        catalog_id="generic-catalog",
+        title="Generic",
+        chapters=[chapter],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+    audit = _audit_requested_candidate_recall(
+        plan,
+        aspect="9x16",
+        only_evidence_feature_ids=frozenset({"closing"}),
+    )
+
+    assert audit["complete"] is True
+    assert audit["rows"][0]["only_evidence_exception"] is True
+    assert (
+        audit["rows"][0]["unique_candidate_execution_mode"]
+        == "hash_bound_unique_evidence"
+    )
+
+
 def test_missing_evidence_render_is_partial_not_delivery_success() -> None:
     manifest = {
         "horizontal": {
