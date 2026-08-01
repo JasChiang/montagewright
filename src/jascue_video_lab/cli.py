@@ -13,7 +13,7 @@ from PIL import Image
 
 from .ab_review import render_grounding_ab_review
 from .autonomous_policy import AutonomousEditPolicy
-from .billing import summarize_usage_and_list_price
+from .billing import BudgetLedger, summarize_usage_and_list_price
 from .compare import compare_runs
 from .delivery_pipeline import run_feature_delivery_pipeline
 from .feature_cut import run_feature_cut_experiment
@@ -706,6 +706,37 @@ def command_feature_cut(args: argparse.Namespace) -> int:
     brief_path = args.brief_json
     music_lock_path = args.music_map_lock
     plan_prompt = _load_prompt("feature_cut_selects_zh-TW.txt")
+    budget_ledger: BudgetLedger | None = None
+    if args.execution_profile.startswith("autonomous_"):
+        if args.autonomous_policy is None or args.editorial_beat_contracts is None:
+            raise ValueError(
+                "autonomous feature-cut requires --autonomous-policy and "
+                "--editorial-beat-contracts"
+            )
+        policy = AutonomousEditPolicy.model_validate(
+            read_json(args.autonomous_policy)
+        )
+        if policy.execution_profile.value != args.execution_profile:
+            raise ValueError(
+                "autonomous policy profile does not match --execution-profile"
+            )
+        requested_aspects = (
+            {"16:9", "9:16"}
+            if args.aspect == "both"
+            else {args.aspect.replace("x", ":")}
+        )
+        if set(policy.requested_aspects) != requested_aspects:
+            raise ValueError(
+                "autonomous policy requested_aspects does not match --aspect"
+            )
+        # Direct feature-cut is a production entrypoint too: without this
+        # ledger the final QA would be the first uncapped paid call in the
+        # path.  The full delivery wrapper may pass its more detailed ledger.
+        budget_ledger = BudgetLedger(
+            max_cost_usd=policy.budget.max_gemini_cost_usd,
+            max_interactions=policy.budget.max_paid_interactions,
+            reserved_recovery_fraction=policy.budget.reserved_recovery_fraction,
+        )
     if args.music_first_cue_lock is not None:
         cue_lock_path = args.music_first_cue_lock.expanduser().resolve(strict=True)
         cue_lock = CuePlanLock.model_validate(read_json(cue_lock_path))
@@ -813,6 +844,9 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         ),
         auto_vertical_framing=args.auto_vertical_framing,
         execution_profile=args.execution_profile,
+        autonomous_policy_path=args.autonomous_policy,
+        editorial_beat_contracts_path=args.editorial_beat_contracts,
+        budget_ledger=budget_ledger,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -2407,14 +2441,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feature_cut_parser.add_argument(
         "--execution-profile",
-        choices=["review_preview", "production_review"],
+        choices=[
+            "review_preview",
+            "production_review",
+            "autonomous_strict",
+            "autonomous_best_effort",
+        ],
         default="review_preview",
         help=(
             "review_preview preserves auditable media even when production "
             "prerequisites are incomplete. production_review requires complete "
             "requested-aspect Top-K recall and ShotQualityMap coverage before "
-            "rendering. Neither profile makes feature-cut delivery eligible "
-            "without downstream final QA and human approval."
+            "rendering. Autonomous profiles require signed policy/contracts; "
+            "the final media assembly, semantic QA, and delivery authority run "
+            "in feature-delivery after the soundtrack is muxed."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--autonomous-policy",
+        type=Path,
+        help=(
+            "Hash-bound AutonomousEditPolicy required for autonomous "
+            "execution profiles."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--editorial-beat-contracts",
+        type=Path,
+        help=(
+            "Selected-window EditorialBeatContracts required for autonomous "
+            "execution profiles."
         ),
     )
     feature_cut_parser.add_argument(

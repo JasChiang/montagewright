@@ -3728,6 +3728,7 @@ def test_static_presentation_does_not_require_reliable_source_motion() -> None:
     )
 from jascue_video_lab.cli import build_parser
 from jascue_video_lab.models import (
+    EligibilityGateStatus,
     FeatureCutExecutionProfile,
     FeatureCutRunState,
     FeatureChapterBrief,
@@ -4123,6 +4124,8 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
     assert defaults.allow_shorter_within_delivery_range is False
     assert defaults.auto_vertical_framing is True
     assert defaults.execution_profile == "review_preview"
+    assert defaults.autonomous_policy is None
+    assert defaults.editorial_beat_contracts is None
     vertical = build_parser().parse_args(
         [
             "feature-cut",
@@ -4137,6 +4140,28 @@ def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
         ]
     )
     assert vertical.aspect == "9x16"
+    autonomous = build_parser().parse_args(
+        [
+            "feature-cut",
+            "catalog.json",
+            "brief.json",
+            "--sam-checkpoint",
+            "sam.pt",
+            "--aspect",
+            "9x16",
+            "--execution-profile",
+            "autonomous_strict",
+            "--autonomous-policy",
+            "policy.json",
+            "--editorial-beat-contracts",
+            "beats.json",
+            "--output-dir",
+            "output",
+        ]
+    )
+    assert autonomous.execution_profile == "autonomous_strict"
+    assert autonomous.autonomous_policy == Path("policy.json")
+    assert autonomous.editorial_beat_contracts == Path("beats.json")
 
 
 def test_direct_video_v2_never_reopens_selected_clip_semantics() -> None:
@@ -12473,6 +12498,82 @@ def test_all_automatic_gates_only_reach_ready_for_human_review() -> None:
     assert report.delivery_eligible is False
     assert report.editorial_contract.final_sequence_qa_passed == "not_run"
     assert report.editorial_contract.human_approval_passed == "not_run"
+
+
+def test_autonomous_final_qa_and_auto_authority_can_grant_delivery() -> None:
+    manifest = {
+        "horizontal": {"requested": False, "status": "not_requested", "chapters": []},
+        "vertical": {
+            "requested": True,
+            "status": "rendered",
+            "chapters": [
+                {
+                    "feature_id": "supported",
+                    "source_clip_id": "clip-a",
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                }
+            ],
+        },
+        "requested_candidate_recall_audit": {"complete": True},
+        "quality_map_coverage_audit": {"complete": True},
+        "reframe_policy_binding": None,
+        "post_render_quality_qc": {
+            "requested": True,
+            "technical_qc_passed": True,
+        },
+    }
+
+    report = _build_feature_cut_eligibility_report(
+        manifest,
+        execution_profile=FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+        final_sequence_qa_status=EligibilityGateStatus.PASSED,
+        human_approval_status=EligibilityGateStatus.NOT_REQUIRED,
+        autonomous_delivery_authorized=True,
+    )
+
+    assert report.run_state == FeatureCutRunState.DELIVERY_ELIGIBLE
+    assert report.delivery_eligible is True
+    assert report.ready_for_human_review is True
+    assert report.editorial_contract.final_sequence_qa_passed == "passed"
+    assert report.editorial_contract.human_approval_passed == "not_required"
+    assert report.review_reasons == []
+
+
+def test_autonomous_final_qa_failure_never_falls_back_to_human_not_run() -> None:
+    manifest = {
+        "horizontal": {"requested": False, "status": "not_requested", "chapters": []},
+        "vertical": {
+            "requested": True,
+            "status": "rendered",
+            "chapters": [
+                {
+                    "feature_id": "supported",
+                    "source_clip_id": "clip-a",
+                    "fallback_reason": None,
+                    "risk_codes": [],
+                }
+            ],
+        },
+        "requested_candidate_recall_audit": {"complete": True},
+        "quality_map_coverage_audit": {"complete": True},
+        "reframe_policy_binding": None,
+        "post_render_quality_qc": {
+            "requested": True,
+            "technical_qc_passed": True,
+        },
+    }
+
+    report = _build_feature_cut_eligibility_report(
+        manifest,
+        execution_profile=FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+        final_sequence_qa_status=EligibilityGateStatus.FAILED,
+        human_approval_status=EligibilityGateStatus.NOT_REQUIRED,
+    )
+
+    assert report.delivery_eligible is False
+    assert "final_sequence_qa_failed" in report.blocking_reasons
+    assert "human_approval_not_run" not in report.review_reasons
 
 
 def test_unauthorized_source_overlap_keeps_review_media_but_blocks_readiness() -> None:

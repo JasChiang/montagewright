@@ -79,7 +79,13 @@ from .editing_capabilities import (
     VisibilityTarget,
     autonomous_capability_registry_v2,
 )
-from .final_edit_qa import DeterministicDeliveryEvidence
+from .final_edit_qa import (
+    AutonomousFinalEditQa,
+    DeterministicDeliveryEvidence,
+    execute_final_edit_qa,
+    prepare_final_edit_qa,
+    run_deterministic_delivery_qa,
+)
 from .full_v1 import create_dense_window_catalog
 from .gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
@@ -18194,10 +18200,161 @@ def _validate_autonomous_plan_reuse_flags(
         )
 
 
+def _autonomous_semantic_qa_passed(result: object) -> bool:
+    """Return whether a typed final-QA observation contains no blockers."""
+
+    return isinstance(result, AutonomousFinalEditQa) and (
+        result.qa_observation_status == "no_blocking_observation"
+        and not result.issues
+    )
+
+
+def _final_qa_interaction_id(attempt_dir: Path) -> str | None:
+    """Read the immutable Gemini interaction ID without inventing one."""
+
+    raw_path = attempt_dir / "raw_interaction.json"
+    if not raw_path.is_file():
+        return None
+    raw = read_json(raw_path)
+    interaction_id = raw.get("id") if isinstance(raw, Mapping) else None
+    return str(interaction_id) if isinstance(interaction_id, str) else None
+
+
+def _run_feature_cut_autonomous_final_qa(
+    *,
+    output_dir: Path,
+    render_manifest_path: Path,
+    brief_path: Path,
+    policy: AutonomousEditPolicy,
+    outputs_by_aspect: Mapping[str, Path],
+    autonomous_context_paths_by_aspect: Mapping[str, Mapping[str, Path]],
+    deterministic_delivery_evidence_paths_by_aspect: Mapping[str, Path],
+    music_supplied: bool,
+    budget_ledger: BudgetLedger | None,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, object],
+    dict[str, object],
+    tuple[str, ...],
+]:
+    """Run the one bounded final-QA observation per requested output aspect.
+
+    This is intentionally a terminal observer, not a second edit planner.  A
+    failed deterministic gate prevents a paid semantic observation; a typed
+    semantic issue remains an auditable failed gate for the caller's bounded
+    recovery path rather than an excuse for the renderer to pick a fallback.
+    """
+
+    results: dict[str, dict[str, Any]] = {}
+    qa_results: dict[str, object] = {}
+    deterministic_reports: dict[str, object] = {}
+    prepared_rows: list[tuple[str, Any]] = []
+    for aspect, final_output in outputs_by_aspect.items():
+        if aspect not in policy.requested_aspects:
+            raise ValueError(f"final QA received unrequested aspect {aspect}")
+        context_paths = autonomous_context_paths_by_aspect.get(aspect)
+        evidence_path = deterministic_delivery_evidence_paths_by_aspect.get(aspect)
+        if context_paths is None or evidence_path is None:
+            raise ValueError(
+                f"{aspect} final QA is missing selected-window context or deterministic evidence"
+            )
+        evidence = DeterministicDeliveryEvidence.model_validate(read_json(evidence_path))
+        deterministic = run_deterministic_delivery_qa(evidence, policy=policy)
+        deterministic_reports[aspect] = deterministic
+        qa_dir = output_dir / "final-edit-qa" / aspect.replace(":", "x")
+        qa_dir.mkdir(parents=True, exist_ok=True)
+        if not deterministic.passed:
+            report_path = qa_dir / "deterministic-gate.json"
+            write_json(report_path, deterministic)
+            results[aspect] = {
+                "status": "not_dispatched_deterministic_gate_failed",
+                "deterministic_report_path": str(report_path.resolve()),
+                "deterministic_evidence_path": str(evidence_path.resolve()),
+                "semantic_passed": False,
+                "qa_pass_count": 0,
+            }
+            continue
+        mode = (
+            "autonomous_final_16x9"
+            if aspect == "16:9"
+            else "autonomous_final_9x16"
+        )
+        prepared = prepare_final_edit_qa(
+            mode=mode,
+            render_path=final_output,
+            manifest_path=render_manifest_path,
+            output_dir=qa_dir,
+            model_id=policy.model_id,
+            brief_path=brief_path,
+            autonomous_context_paths=context_paths,
+            music_supplied=music_supplied,
+            autonomous_policy=policy,
+        )
+        prepared_rows.append((aspect, prepared))
+
+    if prepared_rows:
+        client = GeminiLabClient(
+            budget_ledger=budget_ledger,
+            autonomous_policy=policy,
+        )
+        try:
+            for aspect, prepared in prepared_rows:
+                qa_dir = (
+                    output_dir / "final-edit-qa" / aspect.replace(":", "x")
+                )
+                uploaded_video, file_api_reused = client.ensure_video_upload(
+                    prepared.proxy_path,
+                    qa_dir / "file-api" / prepared.input_hashes["proxy_sha256"],
+                )
+                execution = execute_final_edit_qa(
+                    prepared=prepared,
+                    client=client.client,
+                    uploaded_video=uploaded_video,
+                    output_dir=qa_dir,
+                    budget_ledger=budget_ledger,
+                    recovery_call=True,
+                )
+                qa_results[aspect] = execution.result
+                interaction_id = _final_qa_interaction_id(execution.attempt_dir)
+                results[aspect] = {
+                    "status": "completed",
+                    "qa_run_dir": str(execution.run_dir.resolve()),
+                    "qa_validated_path": str(
+                        (execution.run_dir / "validated.json").resolve()
+                    ),
+                    "qa_cache_hit": execution.cache_hit,
+                    "file_api_reused": file_api_reused,
+                    "semantic_passed": _autonomous_semantic_qa_passed(
+                        execution.result
+                    ),
+                    "qa_pass_count": 1,
+                    "gemini_interaction_id": interaction_id,
+                    "deterministic_evidence_path": str(
+                        deterministic_delivery_evidence_paths_by_aspect[
+                            aspect
+                        ].resolve()
+                    ),
+                }
+        finally:
+            client.close()
+    interaction_ids = tuple(
+        dict.fromkeys(
+            str(row["gemini_interaction_id"])
+            for row in results.values()
+            if isinstance(row.get("gemini_interaction_id"), str)
+        )
+    )
+    return results, qa_results, deterministic_reports, interaction_ids
+
+
 def _build_feature_cut_eligibility_report(
     manifest: Mapping[str, Any],
     *,
     execution_profile: FeatureCutExecutionProfile,
+    final_sequence_qa_status: EligibilityGateStatus = EligibilityGateStatus.NOT_RUN,
+    human_approval_status: EligibilityGateStatus = EligibilityGateStatus.NOT_RUN,
+    autonomous_delivery_authorized: bool = False,
+    best_effort_complete: bool = False,
 ) -> FeatureCutEligibilityReport:
     """Separate playable review media from semantic delivery eligibility."""
 
@@ -18322,14 +18479,19 @@ def _build_feature_cut_eligibility_report(
             else EligibilityGateStatus.NOT_REQUIRED
         ),
         technical_quality_passed=technical_status,
-        final_sequence_qa_passed=EligibilityGateStatus.NOT_RUN,
-        human_approval_passed=EligibilityGateStatus.NOT_RUN,
+        final_sequence_qa_passed=final_sequence_qa_status,
+        human_approval_passed=human_approval_status,
     )
     blocking_reasons: list[str] = []
-    review_reasons = [
-        "final_sequence_qa_not_run",
-        "human_approval_not_run",
-    ]
+    review_reasons: list[str] = []
+    if final_sequence_qa_status == EligibilityGateStatus.NOT_RUN:
+        review_reasons.append("final_sequence_qa_not_run")
+    elif final_sequence_qa_status == EligibilityGateStatus.FAILED:
+        blocking_reasons.append("final_sequence_qa_failed")
+    if human_approval_status == EligibilityGateStatus.NOT_RUN:
+        review_reasons.append("human_approval_not_run")
+    elif human_approval_status == EligibilityGateStatus.FAILED:
+        blocking_reasons.append("human_approval_failed")
     if not evidence_complete:
         blocking_reasons.append("required_evidence_incomplete")
     if not candidate_resolution_passed:
@@ -18359,6 +18521,18 @@ def _build_feature_cut_eligibility_report(
             else review_reasons
         ).append("technical_quality_not_verified")
 
+    autonomous_profile = execution_profile in {
+        FeatureCutExecutionProfile.AUTONOMOUS_STRICT,
+        FeatureCutExecutionProfile.AUTONOMOUS_BEST_EFFORT,
+    }
+    delivery_eligible = (
+        autonomous_profile
+        and autonomous_delivery_authorized
+        and final_sequence_qa_status == EligibilityGateStatus.PASSED
+        and human_approval_status == EligibilityGateStatus.NOT_REQUIRED
+        and not blocking_reasons
+        and media_rendered
+    )
     if not media_rendered:
         run_state = FeatureCutRunState.FAILED
     elif not evidence_complete:
@@ -18370,17 +18544,23 @@ def _build_feature_cut_eligibility_report(
         or technical_status != EligibilityGateStatus.PASSED
     ):
         run_state = FeatureCutRunState.REVIEW_PREVIEW
+    elif delivery_eligible and best_effort_complete:
+        run_state = FeatureCutRunState.BEST_EFFORT_COMPLETE
+    elif delivery_eligible:
+        run_state = FeatureCutRunState.DELIVERY_ELIGIBLE
     else:
         run_state = FeatureCutRunState.READY_FOR_HUMAN_REVIEW
-    ready_for_human_review = (
-        run_state == FeatureCutRunState.READY_FOR_HUMAN_REVIEW
-    )
+    ready_for_human_review = run_state in {
+        FeatureCutRunState.READY_FOR_HUMAN_REVIEW,
+        FeatureCutRunState.DELIVERY_ELIGIBLE,
+        FeatureCutRunState.BEST_EFFORT_COMPLETE,
+    }
     return FeatureCutEligibilityReport(
         execution_profile=execution_profile,
         media_rendered=media_rendered,
         run_state=run_state,
         ready_for_human_review=ready_for_human_review,
-        delivery_eligible=False,
+        delivery_eligible=delivery_eligible,
         editorial_contract=contract,
         blocking_reasons=blocking_reasons,
         review_reasons=review_reasons,
@@ -20508,6 +20688,7 @@ def _run_feature_cut_experiment_impl(
     autonomous_policy_path: Path | None = None,
     editorial_beat_contracts_path: Path | None = None,
     budget_ledger: BudgetLedger | None = None,
+    final_delivery_qa: bool = False,
 ) -> dict[str, Any]:
     resolved_vertical_framing_prompt = vertical_framing_prompt or (
         "Inspect the complete selected clip and propose a generic evidence-only "
@@ -21039,7 +21220,7 @@ def _run_feature_cut_experiment_impl(
             plan_dir,
             require_provenance=autonomous_profile,
         )
-        if autonomous_profile:
+        if autonomous_profile and final_delivery_qa:
             _validate_hard_exact_event_candidate_provenance(
                 plan,
                 editorial_templates,
@@ -31393,14 +31574,217 @@ def _run_feature_cut_experiment_impl(
                     presentation_authority_paths_by_aspect.items()
                 )
             }
+        # Final semantic QA must consume an immutable rendered timeline, not a
+        # later handoff document that happens to mention the same output.  The
+        # QA module derives and signs its segment-contract projection from this
+        # manifest, so persist it before dispatch and only append references to
+        # its result afterwards.
+        render_manifest_path = output_dir / "render-manifest.json"
+        manifest["generated_at"] = utc_now()
+        write_json(render_manifest_path, manifest)
+        final_qa_by_aspect: dict[str, dict[str, Any]] = {}
+        final_delivery_authority_path: Path | None = None
+        final_sequence_qa_status = EligibilityGateStatus.NOT_RUN
+        human_approval_status = EligibilityGateStatus.NOT_RUN
+        best_effort_complete = False
+        if autonomous_profile:
+            assert autonomous_policy is not None
+            outputs_by_aspect = {
+                aspect_key: output
+                for aspect_key, output in (
+                    ("16:9", horizontal_output),
+                    ("9:16", vertical_output),
+                )
+                if output is not None
+            }
+            (
+                final_qa_by_aspect,
+                final_qa_results,
+                deterministic_qa_reports,
+                final_qa_interaction_ids,
+            ) = _run_feature_cut_autonomous_final_qa(
+                output_dir=output_dir,
+                render_manifest_path=render_manifest_path,
+                brief_path=brief_path,
+                policy=autonomous_policy,
+                outputs_by_aspect=outputs_by_aspect,
+                autonomous_context_paths_by_aspect=(
+                    autonomous_context_paths_by_aspect
+                ),
+                deterministic_delivery_evidence_paths_by_aspect=(
+                    deterministic_delivery_evidence_paths_by_aspect
+                ),
+                music_supplied=music_lock is not None,
+                budget_ledger=budget_ledger,
+            )
+            final_qa_summary_path = output_dir / "final-qa-summary.json"
+            write_json(
+                final_qa_summary_path,
+                {
+                    "contract_version": "feature-cut-final-qa-summary-v1",
+                    "policy_reference": autonomous_policy.policy_reference,
+                    "render_manifest_path": str(render_manifest_path.resolve()),
+                    "render_manifest_sha256": sha256_file(render_manifest_path),
+                    "aspects": final_qa_by_aspect,
+                    "deterministic_reports": {
+                        aspect_key: report.model_dump(mode="json")
+                        for aspect_key, report in (
+                            deterministic_qa_reports.items()
+                        )
+                    },
+                    "gemini_interaction_ids": list(final_qa_interaction_ids),
+                    "generated_at": utc_now(),
+                },
+            )
+            all_deterministic_passed = bool(deterministic_qa_reports) and all(
+                report.passed for report in deterministic_qa_reports.values()
+            )
+            all_semantic_passed = (
+                set(final_qa_results) == set(outputs_by_aspect)
+                and all(
+                    _autonomous_semantic_qa_passed(result)
+                    for result in final_qa_results.values()
+                )
+            )
+            final_sequence_qa_status = (
+                EligibilityGateStatus.PASSED
+                if all_deterministic_passed and all_semantic_passed
+                else EligibilityGateStatus.FAILED
+            )
+            # AUTO_POLICY replaces human approval only after both independent
+            # gates pass; it never means Gemini approved its own answer.
+            human_approval_status = EligibilityGateStatus.NOT_REQUIRED
+            degradation_records: list[DegradationRecord] = []
+            for aspect_key, context_paths in (
+                autonomous_context_paths_by_aspect.items()
+            ):
+                degradation = AutonomousDegradationManifest.model_validate(
+                    read_json(context_paths["reuse_degradation"])
+                )
+                if degradation.policy_reference != autonomous_policy.policy_reference:
+                    raise ValueError(
+                        f"{aspect_key} degradation manifest policy mismatch"
+                    )
+                degradation_records.extend(degradation.records)
+            if not omissions_are_policy_authorized(
+                autonomous_policy, tuple(degradation_records)
+            ):
+                final_sequence_qa_status = EligibilityGateStatus.FAILED
+            final_delivery_proposal_path = output_dir / "final-delivery-proposal.json"
+            write_json(
+                final_delivery_proposal_path,
+                {
+                    "contract_version": "feature-cut-final-delivery-proposal-v1",
+                    "policy_reference": autonomous_policy.policy_reference,
+                    "render_manifest_sha256": sha256_file(render_manifest_path),
+                    "final_qa_summary_sha256": sha256_file(final_qa_summary_path),
+                    "outputs": {
+                        aspect_key: {
+                            "path": str(path.resolve()),
+                            "sha256": sha256_file(path),
+                        }
+                        for aspect_key, path in outputs_by_aspect.items()
+                    },
+                    "generated_at": utc_now(),
+                },
+            )
+            if final_sequence_qa_status == EligibilityGateStatus.PASSED:
+                authority_inputs = {
+                    "final_qa_summary": final_qa_summary_path,
+                    "final_delivery_proposal": final_delivery_proposal_path,
+                    **{
+                        "presentation_authority_" + aspect_key.replace(":", "x"): path
+                        for aspect_key, path in (
+                            presentation_authority_paths_by_aspect.items()
+                        )
+                    },
+                    **{
+                        "deterministic_evidence_" + aspect_key.replace(":", "x"): path
+                        for aspect_key, path in (
+                            deterministic_delivery_evidence_paths_by_aspect.items()
+                        )
+                    },
+                    **{
+                        "evidence_bundle_" + aspect_key.replace(":", "x"): path
+                        for aspect_key, path in (
+                            autonomous_evidence_bundle_paths_by_aspect.items()
+                        )
+                    },
+                }
+                input_hashes = tuple(
+                    dict.fromkeys(
+                        (
+                            *(
+                                f"sha256:{sha256_file(path)}"
+                                for path in authority_inputs.values()
+                            ),
+                            *(f"sha256:{sha256_file(path)}" for path in outputs_by_aspect.values()),
+                            f"sha256:{sha256_file(render_manifest_path)}",
+                            f"sha256:{sha256_file(brief_path)}",
+                        )
+                    )
+                )
+                gate_results = {
+                    f"{aspect_key}_{name}": "passed"
+                    for aspect_key, report in deterministic_qa_reports.items()
+                    for name, value in report.gate_results.items()
+                    if value == "passed"
+                }
+                gate_results.update(
+                    {
+                        "semantic_final_qa": "passed",
+                        "policy_binding": "passed",
+                        "hard_evidence_omission_forbidden": "passed",
+                    }
+                )
+                final_authority = authorize_decision(
+                    autonomous_policy,
+                    decision_scope="final_delivery",
+                    input_artifact_hashes=input_hashes,
+                    deterministic_gate_results=gate_results,
+                    decision_codes=(
+                        "hard_evidence_passed",
+                        (
+                            "music_sync_passed"
+                            if music_lock is not None
+                            else "semantic_visual_cadence_passed"
+                        ),
+                        "geometry_passed",
+                        "final_qa_passed",
+                    ),
+                    gemini_interaction_ids=final_qa_interaction_ids,
+                )
+                validate_authority_binding(final_authority, autonomous_policy)
+                final_delivery_authority_path = (
+                    output_dir / "final-delivery-authority.json"
+                )
+                write_json(final_delivery_authority_path, final_authority)
+                best_effort_complete = (
+                    execution_profile
+                    == FeatureCutExecutionProfile.AUTONOMOUS_BEST_EFFORT
+                    and bool(degradation_records)
+                )
         eligibility = _build_feature_cut_eligibility_report(
             manifest,
             execution_profile=execution_profile,
+            final_sequence_qa_status=final_sequence_qa_status,
+            human_approval_status=human_approval_status,
+            autonomous_delivery_authorized=(
+                final_delivery_authority_path is not None
+            ),
+            best_effort_complete=best_effort_complete,
         )
         manifest["media_rendered"] = eligibility.media_rendered
         manifest["run_state"] = eligibility.run_state.value
         manifest["delivery_eligible"] = eligibility.delivery_eligible
         manifest["delivery_eligibility"] = eligibility.model_dump(mode="json")
+        if final_qa_by_aspect:
+            manifest["autonomous_final_qa_by_aspect"] = final_qa_by_aspect
+        if final_delivery_authority_path is not None:
+            manifest["final_delivery_authority"] = {
+                "path": str(final_delivery_authority_path.resolve()),
+                "sha256": sha256_file(final_delivery_authority_path),
+            }
         manifest["generated_at"] = utc_now()
         eligibility_path = output_dir / "delivery-eligibility.json"
         write_json(eligibility_path, eligibility)
@@ -31641,6 +32025,7 @@ def run_feature_cut_experiment(
     autonomous_policy_path: Path | None = None,
     editorial_beat_contracts_path: Path | None = None,
     budget_ledger: BudgetLedger | None = None,
+    final_delivery_qa: bool = False,
 ) -> dict[str, Any]:
     """Run feature-cut while atomically preserving terminal editorial state."""
 
@@ -31731,6 +32116,7 @@ def run_feature_cut_experiment(
             autonomous_policy_path=autonomous_policy_path,
             editorial_beat_contracts_path=editorial_beat_contracts_path,
             budget_ledger=budget_ledger,
+            final_delivery_qa=final_delivery_qa,
         )
     except Exception as error:
         saved_eligibility_path = output_dir / "delivery-eligibility.json"
