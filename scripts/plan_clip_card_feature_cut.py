@@ -646,14 +646,10 @@ class ClipCardFeatureCandidateV3(StrictModel):
                     "virtual camera proposal references entities without crop "
                     "regions: " + ", ".join(unknown)
                 )
-            missing_required = sorted(
-                set(self.required_entity_ids) - referenced_ids
-            )
-            if missing_required:
-                raise ValueError(
-                    "every required entity must appear in the virtual camera "
-                    "proposal: " + ", ".join(missing_required)
-                )
+            # Required entities are visibility/containment obligations.  The
+            # virtual camera proposal describes only the anchors that receive
+            # camera attention, so required context must not be promoted to a
+            # fake camera phase merely to satisfy schema validation.
         return self
 
 
