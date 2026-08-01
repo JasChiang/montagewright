@@ -15955,11 +15955,20 @@ def _exact_payload_matches_local_input_projection(
             int(local_artifact["end_ms"]) - int(local_artifact["start_ms"])
         ):
             return False
-        if not (
-            int(local_artifact["start_ms"])
-            <= int(trim.get("locally_centered_source_in_ms"))
-            <= int(trim.get("locally_centered_source_out_ms"))
-            <= int(local_artifact["end_ms"])
+        # ``locally_centered_*`` documents the exploratory trim before the
+        # immutable pre-render interval was applied.  The authorized PTS
+        # interval is the only render/exact boundary that must match.
+        if (
+            abs(
+                int(source_interval.get("start_ms_display"))
+                - int(local_artifact["start_ms"])
+            )
+            > 100
+            or abs(
+                int(source_interval.get("end_ms_display"))
+                - int(local_artifact["end_ms"])
+            )
+            > 100
         ):
             return False
         expected_query_sha = EvidenceQueryLockV2.model_validate(
