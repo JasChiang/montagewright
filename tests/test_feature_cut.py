@@ -48,6 +48,7 @@ from jascue_video_lab.feature_cut import (
     _audit_requested_candidate_recall,
     _attempt_trim_shift_operation,
     _apply_pre_render_candidate_route,
+    _ensure_runtime_source_metadata,
     _pre_render_execution_bindings_by_beat_and_sha,
     _pre_render_execution_duration_seconds,
     _autonomous_exact_event_source_reservations,
@@ -2103,6 +2104,44 @@ def test_feature_cut_runner_does_not_shadow_dense_catalog_model() -> None:
     assert "DenseFrameCatalog" not in (
         run_feature_cut_experiment.__code__.co_varnames
     )
+
+
+def test_frozen_candidate_metadata_hydrates_audio_and_media_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resumed finalizer may not assume preflight's old process cache."""
+
+    clip = SimpleNamespace(sha256="source-sha", path="/tmp/source.mp4")
+    media = SimpleNamespace()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        feature_cut_module,
+        "has_audio_stream",
+        lambda path: calls.append(f"audio:{path}") or True,
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "probe_video",
+        lambda path: calls.append(f"media:{path}") or media,
+    )
+    audio_cache: dict[str, bool] = {}
+    media_cache: dict[str, object] = {}
+
+    assert _ensure_runtime_source_metadata(
+        clip,
+        source_audio_cache=audio_cache,
+        source_media_cache=media_cache,
+    ) is media
+    assert audio_cache == {"source-sha": True}
+    assert media_cache == {"source-sha": media}
+    assert len(calls) == 2
+
+    _ensure_runtime_source_metadata(
+        clip,
+        source_audio_cache=audio_cache,
+        source_media_cache=media_cache,
+    )
+    assert len(calls) == 2
 
 
 def test_semantic_replan_frontier_is_bounded_and_carries_adjacent_context() -> None:

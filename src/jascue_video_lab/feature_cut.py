@@ -15408,6 +15408,21 @@ def _resolve_selected_window_grouped_exact_event_locks(
     )
 
 
+def _ensure_runtime_source_metadata(
+    clip: RushClip,
+    *,
+    source_audio_cache: dict[str, bool],
+    source_media_cache: dict[str, MediaInfo],
+) -> MediaInfo:
+    """Populate per-process source facts for normal and frozen candidates."""
+
+    if clip.sha256 not in source_audio_cache:
+        source_audio_cache[clip.sha256] = has_audio_stream(Path(clip.path))
+    if clip.sha256 not in source_media_cache:
+        source_media_cache[clip.sha256] = probe_video(Path(clip.path))
+    return source_media_cache[clip.sha256]
+
+
 def _prepare_autonomous_vertical_candidate(
     *,
     selected: FeatureChapterSelect,
@@ -15457,11 +15472,11 @@ def _prepare_autonomous_vertical_candidate(
         evidence_events=evidence_events,
     )
 
-    if clip.sha256 not in source_audio_cache:
-        source_audio_cache[clip.sha256] = has_audio_stream(Path(clip.path))
-    if clip.sha256 not in source_media_cache:
-        source_media_cache[clip.sha256] = probe_video(Path(clip.path))
-    media = source_media_cache[clip.sha256]
+    media = _ensure_runtime_source_metadata(
+        clip,
+        source_audio_cache=source_audio_cache,
+        source_media_cache=source_media_cache,
+    )
     display_sar = (
         media.video.display_sample_aspect_ratio.numerator
         / media.video.display_sample_aspect_ratio.denominator
@@ -23860,13 +23875,11 @@ def _run_feature_cut_experiment_impl(
                         candidate_clip = RushClip.model_validate(
                             local_payload["clip"]
                         )
-                        if candidate_clip.sha256 not in source_media_cache:
-                            source_media_cache[candidate_clip.sha256] = (
-                                probe_video(Path(candidate_clip.path))
-                            )
-                        candidate_media = source_media_cache[
-                            candidate_clip.sha256
-                        ]
+                        candidate_media = _ensure_runtime_source_metadata(
+                            candidate_clip,
+                            source_audio_cache=source_audio_cache,
+                            source_media_cache=source_media_cache,
+                        )
                         candidate_regions = [
                             FramingRegionIntent.model_validate(row)
                             for row in local_payload["regions"]
@@ -24170,17 +24183,11 @@ def _run_feature_cut_experiment_impl(
                                 }
                             )
                             continue
-                        if candidate_clip.sha256 not in source_audio_cache:
-                            source_audio_cache[candidate_clip.sha256] = (
-                                has_audio_stream(Path(candidate_clip.path))
-                            )
-                        if candidate_clip.sha256 not in source_media_cache:
-                            source_media_cache[candidate_clip.sha256] = probe_video(
-                                Path(candidate_clip.path)
-                            )
-                        candidate_media = source_media_cache[
-                            candidate_clip.sha256
-                        ]
+                        candidate_media = _ensure_runtime_source_metadata(
+                            candidate_clip,
+                            source_audio_cache=source_audio_cache,
+                            source_media_cache=source_media_cache,
+                        )
                         candidate_display_sar = (
                             candidate_media.video.display_sample_aspect_ratio.numerator
                             / candidate_media.video.display_sample_aspect_ratio.denominator
