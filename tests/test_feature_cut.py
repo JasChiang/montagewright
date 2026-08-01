@@ -898,6 +898,49 @@ def test_zero_paid_local_stage_archives_stale_binding_and_recomputes(
     )
 
 
+def test_finalize_projection_archives_stale_binding_and_recomputes_locally(
+    tmp_path: Path,
+) -> None:
+    """A finalizer is a derived local projection, never provider evidence."""
+
+    kwargs = {
+        **_frontier_stage_artifact_kwargs(tmp_path),
+        "stage": "finalize",
+    }
+    artifact_path = kwargs["artifact_path"]
+    assert isinstance(artifact_path, Path)
+    _load_or_create_frontier_stage_artifact(
+        **kwargs,
+        producer=lambda: {"filter_graph_sha256": "old"},
+    )
+    calls: list[str] = []
+
+    refreshed = _load_or_create_frontier_stage_artifact(
+        **{
+            **kwargs,
+            "dependency_hashes": (
+                *kwargs["dependency_hashes"],
+                "sha256:" + "f" * 64,
+            ),
+        },
+        producer=lambda: calls.append("local-finalizer")
+        or {"filter_graph_sha256": "current"},
+    )
+
+    archive_records = list(
+        (artifact_path.parent / "archive").glob(
+            "*.archive-record.json"
+        )
+    )
+    assert refreshed == {"filter_graph_sha256": "current"}
+    assert calls == ["local-finalizer"]
+    assert len(archive_records) == 1
+    record = json.loads(archive_records[0].read_text(encoding="utf-8"))
+    assert record["stage"] == "finalize"
+    assert record["recompile_mode"] == "finalize_projection"
+    assert record["paid_provider_dispatch_added"] is False
+
+
 def test_grounding_stage_recompiles_locally_from_saved_provider_evidence(
     tmp_path: Path,
 ) -> None:

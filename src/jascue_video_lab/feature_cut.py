@@ -764,7 +764,7 @@ def _load_or_create_frontier_stage_artifact(
         )
         if bindings_are_stale:
             locally_recompilable = (
-                stage == "local_preflight"
+                stage in {"local_preflight", "finalize"}
                 or (
                     stage == "grounding"
                     and stale_local_recompile_producer is not None
@@ -807,6 +807,8 @@ def _load_or_create_frontier_stage_artifact(
                     "recompile_mode": (
                         "local_preflight"
                         if stage == "local_preflight"
+                        else "finalize_projection"
+                        if stage == "finalize"
                         else "saved_provider_evidence_local_recompile"
                     ),
                     "generated_at": utc_now(),
