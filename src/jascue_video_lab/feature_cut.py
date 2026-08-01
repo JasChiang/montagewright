@@ -24141,11 +24141,22 @@ def _run_feature_cut_experiment_impl(
                     ),
                 )
                 if resumed_route is None:
-                    raise FeatureCutSystemFailure(
-                        "persisted frontier state has no compatible complete "
-                        "route"
-                    )
-                active_runtime_route["route"] = resumed_route
+                    # All remaining candidates can be exhausted while a
+                    # grouped semantic replan is still authorised to resolve
+                    # them.  No callback will run before that batch resolver,
+                    # so retain the last route for context instead of making
+                    # resume impossible merely because no *local* complete
+                    # route remains.
+                    if not any(
+                        beat.status == "exhausted"
+                        for beat in resumed_state.beats
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "persisted frontier state has no compatible complete "
+                            "route"
+                        )
+                else:
+                    active_runtime_route["route"] = resumed_route
             naturally_accepted = _run_persisted_production_frontier(
                 state_path=frontier_state_path,
                 beats=tuple(frontier_beats),
