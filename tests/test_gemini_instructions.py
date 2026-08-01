@@ -22,6 +22,7 @@ from jascue_video_lab.gemini import (
     canonical_interactions_mime_type,
     canonicalize_feature_edit_plan_output,
     canonicalize_selected_vertical_framing_output,
+    normalize_full_clip_card_output_text,
 )
 from jascue_video_lab.models import (
     ContentMap,
@@ -1800,3 +1801,36 @@ def test_content_map_schema_repair_is_text_only_and_video_is_low_resolution(
     assert requests[0]["input"][0]["media_resolution"] == "low"
     assert [item["type"] for item in requests[1]["input"]] == ["text"]
     assert requests[1]["generation_config"]["thinking_level"] == "minimal"
+
+
+def test_full_clip_card_normalization_clamps_half_open_keyframe_endpoint() -> None:
+    raw = json.dumps(
+        {
+            "events": [
+                {
+                    "event_id": "pose",
+                    "start_mmss": "00:00",
+                    "end_mmss": "00:02",
+                    "recommended_keyframe_mmss": "00:02",
+                },
+                {
+                    "event_id": "hold",
+                    "start_mmss": "00:05",
+                    "end_mmss": "00:06",
+                    "recommended_keyframe_mmss": "00:06",
+                },
+            ]
+        }
+    )
+
+    canonical, changes = normalize_full_clip_card_output_text(raw)
+    events = json.loads(canonical)["events"]
+
+    assert [item["recommended_keyframe_mmss"] for item in events] == [
+        "00:01",
+        "00:05",
+    ]
+    assert [item["reason"] for item in changes] == [
+        "half_open_event_interval_clamp",
+        "half_open_event_interval_clamp",
+    ]

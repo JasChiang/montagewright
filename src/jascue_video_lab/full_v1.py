@@ -18,6 +18,7 @@ from .gemini import (
     GroundingIdentityReference,
     MODEL_ID,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+    normalize_full_clip_card_output_text,
 )
 from .grounding_selection import (
     require_grounding_request_match,
@@ -553,7 +554,10 @@ def _revalidate_saved_clip_card(
         return None
     try:
         raw_output = read_json(raw_output_path)
-        card = FullClipCard.model_validate_json(raw_output["output_text"])
+        canonical_text, normalization_changes = normalize_full_clip_card_output_text(
+            raw_output["output_text"]
+        )
+        card = FullClipCard.model_validate_json(canonical_text)
         if (
             card.source_asset_id != source_asset_id
             or card.proxy_asset_id != proxy_asset_id
@@ -581,6 +585,14 @@ def _revalidate_saved_clip_card(
             {
                 "ok": True,
                 "errors": [],
+                "revalidated_from_saved_raw_output": True,
+            },
+        )
+        write_json(
+            run_dir / "clip_card.normalization_audit.json",
+            {
+                "contract_version": "full-clip-card-normalization-v1",
+                "changes": list(normalization_changes),
                 "revalidated_from_saved_raw_output": True,
             },
         )

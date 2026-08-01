@@ -96,6 +96,67 @@ SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION = (
 )
 
 
+def normalize_full_clip_card_output_text(
+    output_text: str,
+) -> tuple[str, tuple[dict[str, Any], ...]]:
+    """Repair the one representational MM:SS endpoint error locally.
+
+    Full Clip Cards intentionally use coarse whole-second labels. Gemini can
+    occasionally select the event's half-open ``end_mmss`` as a recommended
+    keyframe. Its nearest legal representable frame is the preceding whole
+    second (or the start for a one-second interval). Preserve the raw response
+    and record every correction so schema repair never re-watches the video.
+    """
+
+    try:
+        payload = json.loads(output_text)
+    except json.JSONDecodeError:
+        return output_text, ()
+    if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
+        return output_text, ()
+
+    def seconds(value: Any) -> int | None:
+        if not isinstance(value, str) or not re.fullmatch(r"\d{2}:\d{2}", value):
+            return None
+        minutes, remaining = value.split(":")
+        return int(minutes) * 60 + int(remaining)
+
+    def mmss(value: int) -> str:
+        return f"{value // 60:02d}:{value % 60:02d}"
+
+    changes: list[dict[str, Any]] = []
+    for index, event in enumerate(payload["events"]):
+        if not isinstance(event, dict):
+            continue
+        start = seconds(event.get("start_mmss"))
+        end = seconds(event.get("end_mmss"))
+        keyframe = seconds(event.get("recommended_keyframe_mmss"))
+        if (
+            start is None
+            or end is None
+            or keyframe is None
+            or end <= start
+            or start <= keyframe < end
+        ):
+            continue
+        normalized = min(max(keyframe, start), end - 1)
+        prior = event["recommended_keyframe_mmss"]
+        event["recommended_keyframe_mmss"] = mmss(normalized)
+        changes.append(
+            {
+                "event_index": index,
+                "event_id": event.get("event_id"),
+                "field": "recommended_keyframe_mmss",
+                "from": prior,
+                "to": event["recommended_keyframe_mmss"],
+                "reason": "half_open_event_interval_clamp",
+            }
+        )
+    if not changes:
+        return output_text, ()
+    return json.dumps(payload, ensure_ascii=False), tuple(changes)
+
+
 class EditDecisionProposal(FrozenStrictModel):
     """Semantic preference over immutable local options; never executable."""
 
@@ -3883,7 +3944,23 @@ model_provenance (return it unchanged with interaction_id=null):
                 run_dir / "clip_card.raw_output.json",
                 {"output_text": interaction.output_text},
             )
-            parsed = FullClipCard.model_validate_json(interaction.output_text)
+            canonical_text, normalization_changes = (
+                normalize_full_clip_card_output_text(interaction.output_text)
+            )
+            write_json(
+                run_dir / "clip_card.normalization_audit.json",
+                {
+                    "contract_version": "full-clip-card-normalization-v1",
+                    "changes": list(normalization_changes),
+                    "raw_output_sha256": hashlib.sha256(
+                        interaction.output_text.encode("utf-8")
+                    ).hexdigest(),
+                    "canonical_output_sha256": hashlib.sha256(
+                        canonical_text.encode("utf-8")
+                    ).hexdigest(),
+                },
+            )
+            parsed = FullClipCard.model_validate_json(canonical_text)
             expected = {
                 "source_asset_id": source_media.asset_id,
                 "proxy_asset_id": proxy_media.asset_id,
