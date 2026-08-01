@@ -502,6 +502,13 @@ def test_pre_render_route_uses_global_variety_without_discarding_semantics() -> 
     assert "adjacent_source_variety_preferred" in (
         route.selections[1].decision_codes
     )
+    # The alternate complete route remains a valid strict-frontier attempt,
+    # so its candidate needs the same immutable timing binding as the winner.
+    for complete_route in route.ranked_routes:
+        for selection in complete_route.selections:
+            assert selection.candidate_id in route.option_bindings_by_beat[
+                selection.beat_id
+            ]
 
 
 def test_pre_render_route_does_not_replace_clear_semantic_winner() -> None:
@@ -1165,13 +1172,15 @@ def test_ranked_routes_include_bounded_duration_recovery_execution() -> None:
         recovery.selections[1].source_in_ms,
         recovery.selections[1].source_out_ms,
     ) == (0, 2_000)
-    # A bounded duration variant changes the immutable execution interval, but
-    # it must not make the selected semantic candidate disappear from its own
-    # runtime binding table.
-    for selection in result.selections:
-        assert selection.candidate_id in result.option_bindings_by_beat[
-            selection.beat_id
-        ]
+    # Every execution exposed to the production frontier, including a bounded
+    # duration variant or a globally different candidate route, must retain
+    # its candidate-local timing fact. Otherwise strict preflight would know
+    # the selected source interval but not the safe window that authorizes it.
+    for route in result.ranked_routes:
+        for selection in route.selections:
+            assert selection.candidate_id in result.option_bindings_by_beat[
+                selection.beat_id
+            ]
 
 
 def test_duration_recovery_frontier_is_locally_bounded() -> None:

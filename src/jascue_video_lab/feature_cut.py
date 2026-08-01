@@ -13678,6 +13678,27 @@ def _build_pre_render_vertical_candidate_route(
             timing_failure = timing.get("hard_failure")
             if timing_failure is not None:
                 hard_failures.append(str(timing_failure))
+            if candidate_timing_facts is not None and not timing:
+                hard_failures.append(
+                    "missing_candidate_local_timing_fact"
+                )
+            elif timing_failure is None and candidate_timing_facts is not None:
+                required_timing_fields = (
+                    "candidate_timing_sha256",
+                    "safe_window_start_ms",
+                    "safe_window_end_ms",
+                    "source_anchor_ms",
+                )
+                missing_timing_fields = tuple(
+                    field
+                    for field in required_timing_fields
+                    if timing.get(field) is None
+                )
+                if missing_timing_fields:
+                    hard_failures.append(
+                        "incomplete_candidate_local_timing_fact:"
+                        + ",".join(missing_timing_fields)
+                    )
             safe_capacity_ms = (
                 int(timing["safe_capacity_ms"])
                 if timing.get("safe_capacity_ms") is not None

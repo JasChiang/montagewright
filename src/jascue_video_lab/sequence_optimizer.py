@@ -2373,66 +2373,16 @@ def optimize_pre_render_candidate_route(
             if not option.preflight_hard_failures
             and option.candidate_id in route_compatible_candidate_ids
         ]
-        primary = next(
-            option
-            for option in legal
-            if option.candidate_id == selected_candidate_id
-        )
-        # The selected option is already proved jointly feasible by the
-        # complete route. Its source trim can differ from ``option``'s
-        # preferred duration when a bounded duration variant was selected, so
-        # rechecking it as a hypothetical substitution can falsely remove the
-        # primary from its own binding table. Only alternates need that test.
-        contextual_legal: list[CandidateRouteOption] = [primary]
-        for option in legal:
-            if option.candidate_id == selected_candidate_id:
-                continue
-            substituted_duration_ms = (
-                best_route.total_duration_ms
-                - next(
-                    selection.trim_duration_ms
-                    for selection in best_route.selections
-                    if selection.beat_id == beat.beat_id
-                )
-                + option.trim_duration_ms
-            )
-            substituted_panel_duration_ms = (
-                best_route.panel_duration_ms
-                - (
-                    next(
-                        selection.trim_duration_ms
-                        for selection in best_route.selections
-                        if selection.beat_id == beat.beat_id
-                    )
-                    if primary.presentation_mode
-                    == "two_panel_layout"
-                    else 0
-                )
-                + (
-                    option.trim_duration_ms
-                    if option.presentation_mode == "two_panel_layout"
-                    else 0
-                )
-            )
-            duration_safe = (
-                minimum_duration_ms is None
-                or maximum_duration_ms is None
-                or minimum_duration_ms
-                <= substituted_duration_ms
-                <= maximum_duration_ms
-            )
-            panel_safe = (
-                max_panel_runtime_fraction is None
-                or substituted_duration_ms == 0
-                or substituted_panel_duration_ms
-                / substituted_duration_ms
-                <= max_panel_runtime_fraction + 1e-9
-            )
-            if duration_safe and panel_safe:
-                contextual_legal.append(option)
-        # The primary comes from the global beam.  Remaining options use the
-        # same hard-first local terms and are deterministic.  Runtime never
-        # falls back to an option that the pre-render frontier rejected.
+        # Every candidate that occurs in a ranked complete route must retain
+        # its own timing binding.  A global alternate is not a hypothetical
+        # one-beat substitution: its source interval and duration can be
+        # jointly feasible only with the other selections in *that* route.
+        # Dropping it here previously produced an execution binding without
+        # the candidate-local safe-window fact required by strict preflight.
+        contextual_legal = list(legal)
+        # The primary comes from the global beam. Remaining options are
+        # present only because at least one saved complete route proved them
+        # jointly feasible; runtime never invents an unranked fallback.
         alternatives = sorted(
             (
                 option
