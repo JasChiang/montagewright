@@ -275,7 +275,7 @@ _EXTERNAL_PROJECTION_SIDECAR_VERSION = "external-feature-plan-projection-v1"
 _EXTERNAL_PROJECTION_POINTER_NAME = "feature-plan.external-projection.json"
 _FRONTIER_LOCAL_BINDING_VERSION = "vertical-frontier-local-input-v3"
 _FRONTIER_EXACT_BINDING_VERSION = "vertical-frontier-exact-input-v2"
-_FRONTIER_GEOMETRY_BINDING_VERSION = "vertical-frontier-geometry-input-v3"
+_FRONTIER_GEOMETRY_BINDING_VERSION = "vertical-frontier-geometry-input-v4"
 _FRONTIER_FULFILLMENT_COMPILER_VERSION = (
     "runtime-candidate-fulfillment-compiler-v2"
 )
@@ -7536,6 +7536,38 @@ def _vertical_filter_from_track(
     )
 
 
+def _tracked_crop_kinematics_exceed_delivery_limits(
+    geometry: Mapping[str, Any],
+) -> bool:
+    """Use the same numeric limits as deterministic auto-reframe QA.
+
+    A tracked implementation is only a numeric realization of Gemini's
+    full-bleed envelope. If its measured curve is too abrupt, an already
+    authorized static full-bleed realization must be considered before the
+    beat is rejected; local scoring cannot preserve an inferior moving crop.
+    """
+
+    limits = AutoReframePolicy()
+    return any(
+        float(geometry.get(metric, 0.0))
+        > float(getattr(limits, policy_field))
+        for metric, policy_field in (
+            (
+                "max_crop_speed_pixels_per_second",
+                "max_crop_speed_pixels_per_second",
+            ),
+            (
+                "max_crop_acceleration_pixels_per_second_squared",
+                "max_crop_acceleration_pixels_per_second_squared",
+            ),
+            (
+                "max_crop_jerk_pixels_per_second_cubed",
+                "max_crop_jerk_pixels_per_second_cubed",
+            ),
+        )
+    )
+
+
 def _visible_area_fraction(
     box: Sequence[float],
     *,
@@ -12253,6 +12285,22 @@ def _vertical_candidate_geometry(
                 required_regions=hard_regions,
                 preferred_tracks=soft_tracks,
                 preferred_regions=available_soft_regions,
+            )
+        if (
+            autonomous_compilation is not None
+            and geometry.get("applied_strategy") == "tracked_crop"
+            and _tracked_crop_kinematics_exceed_delivery_limits(geometry)
+        ):
+            # The compiler already generated static full-bleed as a
+            # semantically equivalent realization.  Mark the numeric tracking
+            # curve as invalid so the deterministic scope-preserving compiler
+            # can choose that no-motion option; do not silently render a curve
+            # that the same deterministic QA would reject.
+            geometry["fallback_reason"] = (
+                "tracked_crop_kinematics_exceed_delivery_limits"
+            )
+            geometry.setdefault("risk_codes", []).append(
+                "tracked_crop_kinematics_exceed_delivery_limits"
             )
         runtime_fallback = _runtime_scope_preserving_presentation_fallback(
             failed_geometry=geometry,

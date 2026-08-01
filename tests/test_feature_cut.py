@@ -119,6 +119,7 @@ from jascue_video_lab.feature_cut import (
     _summarize_automatic_reframe,
     _tracking_coverage_recovery_window,
     _tracking_seed_request_ms,
+    _tracked_crop_kinematics_exceed_delivery_limits,
     _tracked_crop_geometry,
     _usable_track_centers,
     _validate_autonomous_plan_reuse_flags,
@@ -1915,6 +1916,23 @@ def test_editorial_reconstruction_requires_all_bound_contracts_to_authorize() ->
             },
         )
     ) == ("solid_matte_fit",)
+
+
+def test_tracked_crop_kinematic_limit_prefers_a_simpler_authorized_mode() -> None:
+    assert not _tracked_crop_kinematics_exceed_delivery_limits(
+        {
+            "max_crop_speed_pixels_per_second": 720.0,
+            "max_crop_acceleration_pixels_per_second_squared": 1800.0,
+            "max_crop_jerk_pixels_per_second_cubed": 7200.0,
+        }
+    )
+    assert _tracked_crop_kinematics_exceed_delivery_limits(
+        {
+            "max_crop_speed_pixels_per_second": 0.0,
+            "max_crop_acceleration_pixels_per_second_squared": 1800.1,
+            "max_crop_jerk_pixels_per_second_cubed": 0.0,
+        }
+    )
 
 
 def test_external_projection_binding_refreshes_only_derived_reprojection_hashes() -> None:
