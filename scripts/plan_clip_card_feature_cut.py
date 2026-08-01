@@ -1758,6 +1758,53 @@ def canonicalize_direct_video_edit_plan_output(
                         "limit"
                     ),
                 )
+            if decision.get("aspect_suitability") == "unsuitable":
+                # The raw response is preserved verbatim, but its impossible
+                # execution lists must fit the typed contract so this candidate
+                # can be carried forward as an explicit non-option.  Do not
+                # reinterpret the first four as an executable crop: the
+                # unsuitable verdict remains authoritative.
+                for field in (
+                    "required_entity_indices",
+                    "preferred_entity_indices",
+                    "sacrificable_entity_indices",
+                ):
+                    values = list(decision.get(field) or [])
+                    if len(values) <= 4:
+                        continue
+                    decision[field] = values[:4]
+                    changes.append(
+                        {
+                            "json_path": f"{decision_base}.{field}",
+                            "before": values,
+                            "after": values[:4],
+                            "rule": (
+                                "unsuitable_candidate_execution_indices_"
+                                "bounded_without_authorizing_a_crop"
+                            ),
+                        }
+                    )
+                for step_index, step in enumerate(sequence):
+                    if not isinstance(step, dict):
+                        continue
+                    anchors = list(step.get("anchor_entity_indices") or [])
+                    if len(anchors) <= 4:
+                        continue
+                    step["anchor_entity_indices"] = anchors[:4]
+                    changes.append(
+                        {
+                            "json_path": (
+                                f"{decision_base}.attention_sequence"
+                                f"[{step_index}].anchor_entity_indices"
+                            ),
+                            "before": anchors,
+                            "after": anchors[:4],
+                            "rule": (
+                                "unsuitable_candidate_execution_indices_"
+                                "bounded_without_authorizing_a_crop"
+                            ),
+                        }
+                    )
             if (
                 decision.get("presentation_preference")
                 == "phase_virtual_camera"

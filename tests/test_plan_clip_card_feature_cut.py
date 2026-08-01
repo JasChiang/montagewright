@@ -1109,7 +1109,7 @@ def test_direct_video_canonicalization_repairs_bounded_representation_conflicts(
     assert chapter["source_reuse_mode"] == "none"
     assert chapter["source_reuse_justification"] is None
     assert chapter["vertical"]["presentation_preference"] == "two_panel_layout"
-    assert chapter["vertical"]["preferred_entity_indices"] == [3, 4, 5, 6, 7]
+    assert chapter["vertical"]["preferred_entity_indices"] == [3, 4, 5, 6]
     assert chapter["vertical"]["aspect_suitability"] == "unsuitable"
     assert {
         change["rule"] for change in changes
@@ -1599,6 +1599,46 @@ def test_direct_video_canonicalization_completes_locked_required_suffix() -> Non
         change["rule"] for change in changes
     } >= {
         "planner_contract_failure_is_typed_not_repaired"
+    }
+
+
+def test_unsuitable_direct_candidate_is_bounded_before_schema_validation() -> None:
+    """An impossible alternate remains reported, rather than aborting the plan."""
+
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "vertical": {
+                    "strategy": "tracked_crop",
+                    "crop_mode": "strict",
+                    "coverage_mode": "simultaneous",
+                    "aspect_suitability": "reconstructable",
+                    "presentation_preference": "tracked_full_bleed",
+                    "required_entity_indices": [1, 2, 3, 4, 5, 6],
+                    "preferred_entity_indices": [7, 8, 9, 10, 11],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [
+                        {
+                            "anchor_entity_indices": [1, 2, 3, 4, 5, 6],
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    vertical = json.loads(canonical)["chapters"][0]["vertical"]
+
+    assert vertical["aspect_suitability"] == "unsuitable"
+    assert len(vertical["required_entity_indices"]) == 4
+    assert len(vertical["preferred_entity_indices"]) == 4
+    assert len(vertical["attention_sequence"][0]["anchor_entity_indices"]) == 4
+    assert "unsuitable_candidate_execution_indices_bounded_without_authorizing_a_crop" in {
+        change["rule"] for change in changes
     }
 
 
