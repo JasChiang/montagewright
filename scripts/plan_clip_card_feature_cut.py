@@ -4275,7 +4275,12 @@ def reproject_direct_video_edit_plan(
         ):
             raise ValueError("derived entity resolution escaped selected evidence")
         proposal = vertical.virtual_camera_proposal
-        if direct.vertical.attention_sequence:
+        if direct.vertical.aspect_suitability == "unsuitable":
+            if proposal is not None:
+                raise ValueError(
+                    "derived unsuitable candidate must not compile a camera proposal"
+                )
+        elif direct.vertical.attention_sequence:
             if proposal is None or len(proposal.phases) != len(
                 direct.vertical.attention_sequence
             ):
