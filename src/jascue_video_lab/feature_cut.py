@@ -17447,6 +17447,17 @@ def _audit_render_source_reuse(
             ),
             None,
         )
+        runtime_reuse = chapter.get("runtime_source_reuse_authority")
+        if isinstance(runtime_reuse, Mapping):
+            selected_candidate = {
+                **(selected_candidate or {}),
+                "source_reuse_mode": runtime_reuse.get(
+                    "source_reuse_mode", "none"
+                ),
+                "source_reuse_justification": runtime_reuse.get(
+                    "source_reuse_justification"
+                ),
+            }
         current_start = int(chapter["source_in_ms"])
         current_end = int(chapter["source_out_ms"])
         current_fingerprint = chapter.get("segment_render_fingerprint")
@@ -21653,6 +21664,238 @@ def _run_feature_cut_experiment_impl(
             if autonomous_profile and render_vertical
             else None
         )
+        # A candidate that is only absent because it lacks *editorial* reuse
+        # authority must not be silently replaced by a locally more convenient
+        # route. Before any paid exact/grounding work, give Gemini one bounded
+        # whole-timeline decision over the already hash-bound candidates and
+        # cue context. The result is rebuilt through the same deterministic
+        # route solver; it never patches an individual selection in place.
+        if pre_render_candidate_route is not None:
+            semantic_reuse_affected = {
+                beat_id: bindings
+                for beat_id, bindings in (
+                    pre_render_candidate_route
+                    .semantic_replan_candidate_bindings_by_beat.items()
+                )
+                if bindings
+                and min(
+                    binding.option.planner_rank for binding in bindings
+                ) == 1
+                and any(
+                    binding.option.planner_rank == 1
+                    and "source_reuse_authority_missing"
+                    in binding.replan_required_codes
+                    for binding in bindings
+                )
+            }
+            if semantic_reuse_affected:
+                replan_dir = editorial_dir / "preflight-semantic-replan"
+                semantic_frontier = _semantic_replan_frontier_projection(
+                    pre_render_candidate_route
+                )
+                option_ids_by_beat = {
+                    beat_id: tuple(
+                        f"{beat_id}--{binding.option.candidate_id}"
+                        for binding in bindings
+                    )
+                    for beat_id, bindings in semantic_reuse_affected.items()
+                }
+                context = {
+                    "contract_version": "preflight-semantic-reuse-replan-v1",
+                    "policy_reference": autonomous_policy.policy_reference,
+                    "affected_beats": [
+                        row
+                        for row in semantic_frontier["beats"]
+                        if row["beat_id"] in semantic_reuse_affected
+                    ],
+                    "whole_resolved_timeline": [
+                        selection.model_dump(mode="json")
+                        for selection in pre_render_candidate_route.selections
+                    ],
+                    "music_context": {
+                        "supplied": music_lock is not None,
+                        "output_cues": [
+                            cue.model_dump(mode="json")
+                            for cue in (output_timeline_cues or [])
+                        ],
+                    },
+                    "rules": {
+                        "may_change": [
+                            "affected_candidate",
+                            "explicit_source_reuse_authority",
+                        ],
+                        "must_preserve": [
+                            "brief_order",
+                            "source_asset_id",
+                            "event_id",
+                            "candidate_timing_bounds",
+                            "resolved_music_cue_grid",
+                            "presentation_preference",
+                        ],
+                        "forbidden": [
+                            "invented_source_media",
+                            "invented_timestamp",
+                            "invented_crop_or_bbox",
+                            "local_fallback_authority",
+                        ],
+                    },
+                }
+                context_path = replan_dir / "context.json"
+                decision_path = replan_dir / "decision.json"
+                if decision_path.is_file() and context_path.is_file():
+                    decision_payload = read_json(decision_path)
+                    if (
+                        decision_payload.get("context_sha256")
+                        != sha256_file(context_path)
+                        or read_json(context_path) != context
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "saved preflight semantic reuse replan does not "
+                            "match the current immutable context"
+                        )
+                    decisions = decision_payload.get("decisions")
+                    interaction_ids = tuple(
+                        str(value)
+                        for value in decision_payload.get(
+                            "gemini_interaction_ids", []
+                        )
+                    )
+                else:
+                    write_json(context_path, context)
+                    result = client.negotiate_grouped_edit_decisions(
+                        option_ids_by_beat=option_ids_by_beat,
+                        prompt=(
+                            "[protocol=preflight-semantic-reuse-replan-v1] "
+                            "A Gemini rank-1 candidate is excluded only because "
+                            "its source reuse lacks typed authority. Choose one "
+                            "immutable candidate for every affected beat while "
+                            "preserving the supplied whole timeline and music "
+                            "context. Select source reuse only if its exact mode, "
+                            "observable reason, and every reused beat are stated. "
+                            "Do not choose a local fallback or invent media/time.\n\n"
+                            + json.dumps(context, ensure_ascii=False)
+                        ),
+                        policy=autonomous_policy,
+                        run_dir=replan_dir,
+                        recovery_call=True,
+                    )
+                    decisions = [
+                        decision.model_dump(mode="json")
+                        for decision in result.decision.decisions
+                    ]
+                    interaction_ids = result.interaction_ids
+                    authority = authorize_decision(
+                        policy=autonomous_policy,
+                        decision_scope="scoped_semantic_replan",
+                        input_artifact_hashes=(
+                            f"sha256:{sha256_file(context_path)}",
+                            f"sha256:{sha256_file(plan_path)}",
+                        ),
+                        deterministic_gate_results={
+                            "candidate_timing_bound": "passed",
+                            "source_reuse_conflict_observed": "passed",
+                            "music_context_bound": "passed",
+                        },
+                        decision_codes=(
+                            "gemini_preflight_semantic_reuse_choice",
+                        ),
+                        gemini_interaction_ids=interaction_ids,
+                    )
+                    write_json(
+                        decision_path,
+                        {
+                            "contract_version": (
+                                "preflight-semantic-reuse-replan-result-v1"
+                            ),
+                            "context_sha256": sha256_file(context_path),
+                            "decisions": decisions,
+                            "gemini_interaction_ids": interaction_ids,
+                            "authority": authority.model_dump(mode="json"),
+                            "generated_at": utc_now(),
+                        },
+                    )
+                if not isinstance(decisions, list):
+                    raise FeatureCutSystemFailure(
+                        "preflight semantic reuse replan has no decisions"
+                    )
+                selected_candidate_ids: dict[str, str] = {}
+                reuse_authorities: dict[str, SemanticReplanReuseAuthority] = {}
+                for decision in decisions:
+                    if not isinstance(decision, Mapping):
+                        raise FeatureCutSystemFailure(
+                            "preflight semantic reuse replan has invalid decision"
+                        )
+                    beat_id = str(decision.get("beat_id") or "")
+                    option_id = str(decision.get("selected_option_id") or "")
+                    prefix = beat_id + "--"
+                    if beat_id not in option_ids_by_beat or (
+                        option_id not in option_ids_by_beat[beat_id]
+                    ) or not option_id.startswith(prefix):
+                        raise FeatureCutSystemFailure(
+                            "preflight semantic reuse replan selected an "
+                            "unknown immutable option"
+                        )
+                    selected_candidate_ids[beat_id] = option_id.removeprefix(prefix)
+                    reuse_mode = str(
+                        decision.get("source_reuse_mode") or "none"
+                    )
+                    if reuse_mode != "none":
+                        reuse_authorities[beat_id] = SemanticReplanReuseAuthority(
+                            beat_id=beat_id,
+                            candidate_id=selected_candidate_ids[beat_id],
+                            reuse_mode=reuse_mode,
+                            reuse_justification=decision.get(
+                                "source_reuse_justification"
+                            ),
+                            reuse_of_beat_ids=tuple(
+                                decision.get("reuse_of_beat_ids") or ()
+                            ),
+                        )
+                if set(selected_candidate_ids) != set(option_ids_by_beat):
+                    raise FeatureCutSystemFailure(
+                        "preflight semantic reuse replan did not resolve every beat"
+                    )
+                rebuilt_route = rebuild_route_with_semantic_authorities(
+                    pre_render_candidate_route,
+                    selected_candidate_ids_by_beat=selected_candidate_ids,
+                    reuse_authorities_by_beat=reuse_authorities,
+                    minimum_duration_ms=(
+                        1
+                        if autonomous_policy.execution_profile
+                        == "autonomous_best_effort"
+                        else autonomous_policy.duration.min_ms
+                    ),
+                    maximum_duration_ms=autonomous_policy.duration.max_ms,
+                    max_panel_runtime_fraction=(
+                        autonomous_policy.presentation.max_panel_runtime_fraction
+                    ),
+                    target_duration_ms=round(
+                        sum(chapter_durations.values()) * 1000
+                    ),
+                    max_editorial_reprise_overlap_fraction=(
+                        autonomous_policy.editorial
+                        .max_editorial_reprise_overlap_fraction
+                    ),
+                )
+                merged_bindings = {
+                    beat_id: {
+                        binding.option.candidate_id: binding.option
+                        for binding in bindings
+                    }
+                    for beat_id, bindings in (
+                        pre_render_candidate_route
+                        .semantic_replan_candidate_bindings_by_beat.items()
+                    )
+                }
+                pre_render_candidate_route = pre_render_candidate_route.model_copy(
+                    update={
+                        "selections": rebuilt_route.selections,
+                        "ranked_routes": (rebuilt_route,),
+                        "option_bindings_by_beat": merged_bindings,
+                        "objective_score": rebuilt_route.objective_score,
+                        "total_duration_ms": rebuilt_route.total_duration_ms,
+                    }
+                )
         if pre_render_candidate_route is not None:
             # The bounded optimizer owns the final per-beat duration vector.
             # It may redistribute dwell inside each Gemini-declared
@@ -29440,10 +29683,35 @@ def _run_feature_cut_experiment_impl(
                     ),
                     "observed_visual_evidence": selected.observed_visual_evidence,
                     "selection_reason": selected.selection_reason,
-                    "source_reuse_mode": selected.source_reuse_mode,
-                    "source_reuse_justification": (
-                        selected.source_reuse_justification
+                    "source_reuse_mode": str(
+                        selected_vertical["option"].get(
+                            "source_reuse_mode",
+                            selected.source_reuse_mode,
+                        )
                     ),
+                    "source_reuse_justification": selected_vertical[
+                        "option"
+                    ].get(
+                        "source_reuse_justification",
+                        selected.source_reuse_justification,
+                    ),
+                    "runtime_source_reuse_authority": {
+                        "source_reuse_mode": str(
+                            selected_vertical["option"].get(
+                                "source_reuse_mode",
+                                selected.source_reuse_mode,
+                            )
+                        ),
+                        "source_reuse_justification": selected_vertical[
+                            "option"
+                        ].get(
+                            "source_reuse_justification",
+                            selected.source_reuse_justification,
+                        ),
+                        "execution_binding": selected_vertical["option"].get(
+                            "_pre_render_execution_binding"
+                        ),
+                    },
                     "source_frame_id": vertical_frame.frame_id,
                     "source_clip_id": vertical_clip.clip_id,
                     "source_in_ms": int(

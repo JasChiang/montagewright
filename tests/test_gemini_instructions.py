@@ -14,6 +14,7 @@ from jascue_video_lab.billing import summarize_usage_and_list_price
 from jascue_video_lab.gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
     GroundingIdentityReference,
+    GroupedSemanticReplanDecision,
     MODEL_ID,
     SEMANTIC_IDENTITY_GENERATION_CONFIG,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
@@ -88,7 +89,36 @@ def test_portrait_prompts_require_relation_timing_and_presentation_alternatives(
     assert "不得只說「太寬」就跳到固定中央裁切" in selected
     assert "相對大小本身不會自動要求全程同框" in coarse
     assert "不得固定左→右" in coarse
+    assert "剪輯呈現的決策權" in coarse
+    assert "互不等價" in coarse
     assert "required region 不只可以是人物或主要物件" in coarse
+
+
+def test_grouped_semantic_replan_reuse_authority_is_typed() -> None:
+    with pytest.raises(ValueError, match="requires a justification"):
+        GroupedSemanticReplanDecision(
+            beat_id="fold",
+            selected_option_id="fold--candidate-a",
+            semantic_reason="preserve_readability",
+            source_reuse_mode="distinct_interval",
+            reuse_of_beat_ids=("opening",),
+        )
+    with pytest.raises(ValueError, match="none source reuse"):
+        GroupedSemanticReplanDecision(
+            beat_id="fold",
+            selected_option_id="fold--candidate-a",
+            semantic_reason="preserve_readability",
+            source_reuse_justification="not allowed",
+        )
+    accepted = GroupedSemanticReplanDecision(
+        beat_id="fold",
+        selected_option_id="fold--candidate-a",
+        semantic_reason="preserve_readability",
+        source_reuse_mode="distinct_interval",
+        source_reuse_justification="The later interval shows a different state.",
+        reuse_of_beat_ids=("opening",),
+    )
+    assert accepted.reuse_of_beat_ids == ("opening",)
 
 
 def test_interactions_mime_type_normalizes_common_audio_aliases() -> None:
