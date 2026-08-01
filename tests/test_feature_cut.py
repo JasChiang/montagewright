@@ -48,6 +48,7 @@ from jascue_video_lab.feature_cut import (
     _audit_requested_candidate_recall,
     _attempt_trim_shift_operation,
     _apply_pre_render_candidate_route,
+    _pre_render_execution_duration_seconds,
     _autonomous_exact_event_source_reservations,
     _build_feature_cut_eligibility_report,
     _build_production_sequence_optimization,
@@ -1960,6 +1961,32 @@ def test_pre_render_frontier_order_drives_runtime_fallback_sequence() -> None:
     assert ordered[0]["_pre_render_execution_binding"][
         "source_in_ms"
     ] == 1_000
+
+
+def test_frontier_preflight_uses_each_complete_route_execution_duration() -> None:
+    """Duration variants cannot be rejected using the primary route's trim."""
+
+    primary_execution = {
+        "source_in_ms": 1_000,
+        "source_out_ms": 6_000,
+        "trim_duration_ms": 5_000,
+    }
+    alternate_execution = {
+        "source_in_ms": 2_000,
+        "source_out_ms": 8_500,
+        "trim_duration_ms": 6_500,
+    }
+
+    assert _pre_render_execution_duration_seconds(primary_execution) == 5.0
+    assert _pre_render_execution_duration_seconds(alternate_execution) == 6.5
+    with pytest.raises(feature_cut_module.FeatureCutSystemFailure):
+        _pre_render_execution_duration_seconds(
+            {
+                "source_in_ms": 2_000,
+                "source_out_ms": 8_000,
+                "trim_duration_ms": 6_500,
+            }
+        )
 
 
 def test_semantic_replan_frontier_is_bounded_and_carries_adjacent_context() -> None:

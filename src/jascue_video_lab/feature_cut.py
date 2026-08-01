@@ -13910,6 +13910,35 @@ def _apply_pre_render_candidate_route(
     return applied
 
 
+def _pre_render_execution_duration_seconds(
+    execution_binding: Mapping[str, Any],
+) -> float:
+    """Return the immutable duration attached to one complete-route option.
+
+    A semantic candidate can occur in more than one complete route with a
+    different, still policy-legal source interval.  Frontier preflight must
+    validate *that execution*, rather than applying the primary route's
+    duration to every alternate execution of the same candidate.
+    """
+
+    start_ms = execution_binding.get("source_in_ms")
+    end_ms = execution_binding.get("source_out_ms")
+    duration_ms = execution_binding.get("trim_duration_ms")
+    if not (
+        isinstance(start_ms, int)
+        and isinstance(end_ms, int)
+        and isinstance(duration_ms, int)
+        and start_ms < end_ms
+        and end_ms - start_ms == duration_ms
+        and duration_ms > 0
+    ):
+        raise FeatureCutSystemFailure(
+            "complete-route execution binding has no valid immutable "
+            "source interval"
+        )
+    return duration_ms / 1000
+
+
 def _apply_pre_render_complete_route_executions(
     options: Sequence[dict[str, Any]],
     *,
@@ -21154,9 +21183,11 @@ def _run_feature_cut_experiment_impl(
                                         frames=frames,
                                         clips=clips,
                                         chapter_duration_seconds=(
-                                            chapter_durations[
-                                                selected.feature_id
-                                            ]
+                                            _pre_render_execution_duration_seconds(
+                                                option[
+                                                    "_pre_render_execution_binding"
+                                                ]
+                                            )
                                         ),
                                         shot_cache=shot_cache,
                                         shots_dir=shots_dir,
@@ -21368,6 +21399,24 @@ def _run_feature_cut_experiment_impl(
                         ),
                     }
                 )
+            )
+            # A local hard failure can select another already-planned complete
+            # route. Its per-beat durations are immutable execution facts, so
+            # render, cue and QA must use this active route's vector rather
+            # than the initial route preference.
+            chapter_durations = {
+                selection.beat_id: selection.trim_duration_ms / 1000
+                for selection in active_local_route.selections
+            }
+            duration_audit = {
+                **duration_audit,
+                "resolved_chapter_durations_seconds": chapter_durations,
+                "runtime_active_complete_route_id": active_local_route.route_id,
+                "duration_authority": "production_frontier_complete_route",
+            }
+            write_json(
+                output_dir / "editorial-duration-plan.json",
+                duration_audit,
             )
             pre_render_candidate_id_by_feature = {
                 selection.beat_id: selection.candidate_id
