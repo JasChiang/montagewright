@@ -2191,6 +2191,43 @@ def test_frozen_frontier_execution_lookup_preserves_route_specific_trim() -> Non
     assert bindings["beat"]["b" * 64].trim_duration_ms == 6_500
 
 
+def test_frozen_execution_lookup_allows_same_execution_in_two_global_routes() -> None:
+    """Route-level reuse rationale must not collide with a shared execution."""
+
+    execution = CandidateRouteSelection(
+        beat_id="beat",
+        candidate_id="rank-1",
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="event",
+        trim_duration_ms=5_000,
+        cue_id="cue",
+        cue_aligned=True,
+        presentation_mode="static_full_bleed_crop",
+        entry_composition="center",
+        exit_composition="center",
+        decision_codes=("primary_route",),
+        source_in_ms=1_000,
+        source_out_ms=6_000,
+        candidate_execution_sha256="a" * 64,
+        reuse_mode="none",
+    )
+    same_execution_other_route = execution.model_copy(
+        update={
+            "decision_codes": ("alternate_global_route",),
+            "reuse_mode": "alternate_presentation",
+        }
+    )
+    bindings = _pre_render_execution_bindings_by_beat_and_sha(
+        SimpleNamespace(
+            ranked_routes=(
+                SimpleNamespace(selections=(execution,)),
+                SimpleNamespace(selections=(same_execution_other_route,)),
+            )
+        )
+    )
+    assert bindings["beat"]["a" * 64].source_in_ms == 1_000
+
+
 def test_feature_cut_runner_does_not_shadow_dense_catalog_model() -> None:
     """Cached dense catalogs must remain usable in the finalizer scope."""
 

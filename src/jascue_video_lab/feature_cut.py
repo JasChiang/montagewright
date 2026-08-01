@@ -14355,14 +14355,41 @@ def _pre_render_execution_bindings_by_beat_and_sha(
                 raise FeatureCutSystemFailure(
                     "complete route selection has no execution SHA"
                 )
-            by_sha = bindings.setdefault(selection.beat_id, {})
-            existing = by_sha.get(execution_sha256)
-            if existing is not None and existing != selection:
+        by_sha = bindings.setdefault(selection.beat_id, {})
+        existing = by_sha.get(execution_sha256)
+        if existing is not None:
+            # A complete-route rank can differ in global decision codes or
+            # reuse audit context while pointing at the exact same local
+            # candidate execution.  Those route-level facts are not part of
+            # the execution hash and must not turn one source interval into a
+            # false collision.  Only reject an actual immutable execution
+            # mismatch; retain the first binding for local stage reuse.
+            immutable_fields = (
+                "beat_id",
+                "candidate_id",
+                "source_asset_id",
+                "event_id",
+                "trim_duration_ms",
+                "cue_id",
+                "cue_aligned",
+                "presentation_mode",
+                "entry_composition",
+                "exit_composition",
+                "source_clip_id",
+                "source_in_ms",
+                "source_out_ms",
+                "candidate_execution_sha256",
+            )
+            if any(
+                getattr(existing, field) != getattr(selection, field)
+                for field in immutable_fields
+            ):
                 raise FeatureCutSystemFailure(
                     "complete route execution SHA maps to conflicting "
-                    "source intervals"
+                    "immutable execution fields"
                 )
-            by_sha[execution_sha256] = selection
+            continue
+        by_sha[execution_sha256] = selection
     return bindings
 
 
