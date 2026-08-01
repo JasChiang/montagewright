@@ -556,6 +556,16 @@ class ClipCardFeatureCandidateV3(StrictModel):
         "context_detail",
         "emphasize",
     ] = "hold"
+    source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = "unknown"
+    source_camera_motion_reason: str | None = Field(
+        default=None,
+        max_length=300,
+    )
     physical_scale_comparison: bool = False
     allow_controlled_clip: bool = False
     framing_intent: str = Field(min_length=1, max_length=300)
@@ -567,6 +577,13 @@ class ClipCardFeatureCandidateV3(StrictModel):
 
     @model_validator(mode="after")
     def validate_candidate(self) -> "ClipCardFeatureCandidateV3":
+        if (
+            self.source_camera_motion_role != "unknown"
+            and not (self.source_camera_motion_reason or "").strip()
+        ):
+            raise ValueError(
+                "classified source-camera motion requires an observable reason"
+            )
         if self.horizontal_strategy == "tracked_reframe":
             if self.horizontal_zoom_intent == "none" or not self.horizontal_focus_entity_id:
                 raise ValueError("tracked_reframe requires a focus entity and zoom intent")
@@ -806,6 +823,16 @@ class DirectVideoVerticalDecision(StrictModel):
         "context_detail",
         "emphasize",
     ] = "hold"
+    source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = "unknown"
+    source_camera_motion_reason: str | None = Field(
+        default=None,
+        max_length=300,
+    )
     physical_scale_comparison: bool = False
     traversal_policy: Literal[
         "semantic_order_locked",
@@ -823,6 +850,13 @@ class DirectVideoVerticalDecision(StrictModel):
 
     @model_validator(mode="after")
     def validate_vertical(self) -> "DirectVideoVerticalDecision":
+        if (
+            self.source_camera_motion_role != "unknown"
+            and not (self.source_camera_motion_reason or "").strip()
+        ):
+            raise ValueError(
+                "classified source-camera motion requires an observable reason"
+            )
         classified = (
             self.required_entity_indices
             + self.preferred_entity_indices
@@ -944,6 +978,14 @@ class DirectVideoChapterDecision(StrictModel):
     quality_risks: list[str] = Field(default_factory=list, max_length=8)
     horizontal: DirectVideoHorizontalDecision | None = None
     vertical: DirectVideoVerticalDecision | None = None
+    vertical_alternates: list[DirectVideoVerticalDecision] = Field(
+        default_factory=list,
+        max_length=3,
+        description=(
+            "Candidate-scoped semantic presentation decisions for retained "
+            "Top-K fallbacks. They are evaluated in the same planning call."
+        ),
+    )
     recommended_duration_seconds: float | None = Field(
         default=None,
         ge=1.0,
@@ -963,6 +1005,19 @@ class DirectVideoChapterDecision(StrictModel):
 
     @model_validator(mode="after")
     def validate_chapter(self) -> "DirectVideoChapterDecision":
+        alternate_ranks = [
+            decision.candidate_rank
+            for decision in self.vertical_alternates
+        ]
+        if len(alternate_ranks) != len(set(alternate_ranks)):
+            raise ValueError("vertical alternate candidate ranks must be unique")
+        if (
+            self.vertical is not None
+            and self.vertical.candidate_rank in alternate_ranks
+        ):
+            raise ValueError(
+                "primary vertical candidate cannot repeat as an alternate"
+            )
         if self.source_reuse_mode == "none":
             if self.source_reuse_justification is not None:
                 raise ValueError(
@@ -979,6 +1034,7 @@ class DirectVideoChapterDecision(StrictModel):
             if (
                 self.horizontal is not None
                 or self.vertical is not None
+                or self.vertical_alternates
                 or self.recommended_duration_seconds is not None
                 or self.attention_observation is not None
                 or self.flow_intent is not None
@@ -2523,6 +2579,14 @@ def project_direct_video_edit_plan(
             preferred_entity_ids: list[str] = []
             sacrificable_entity_ids: list[str] = []
             virtual_camera_proposal = None
+            vertical_decision_by_rank = {
+                decision.candidate_rank: decision
+                for decision in (
+                    [direct_chapter.vertical]
+                    + list(direct_chapter.vertical_alternates)
+                )
+                if decision is not None
+            }
             if rank == direct_chapter.horizontal.candidate_rank:
                 horizontal_strategy = direct_chapter.horizontal.strategy
                 horizontal_zoom_intent = direct_chapter.horizontal.zoom_intent
@@ -2538,43 +2602,53 @@ def project_direct_video_edit_plan(
                     if direct_chapter.horizontal.focus_entity_index is not None
                     else None
                 )
-            if rank == direct_chapter.vertical.candidate_rank:
-                vertical_strategy = direct_chapter.vertical.strategy
+            vertical_decision = vertical_decision_by_rank.get(rank)
+            if vertical_decision is not None:
+                vertical_strategy = vertical_decision.strategy
                 aspect_suitability = (
-                    direct_chapter.vertical.aspect_suitability
+                    vertical_decision.aspect_suitability
                 )
                 suitability_risks = list(
-                    direct_chapter.vertical.suitability_risks
+                    vertical_decision.suitability_risks
                 )
                 presentation_preference = (
-                    direct_chapter.vertical.presentation_preference
+                    vertical_decision.presentation_preference
                 )
-                presentation_goal = direct_chapter.vertical.presentation_goal
+                presentation_goal = vertical_decision.presentation_goal
+                source_camera_motion_role = (
+                    vertical_decision.source_camera_motion_role
+                )
+                source_camera_motion_reason = (
+                    vertical_decision.source_camera_motion_reason
+                )
                 physical_scale_comparison = (
-                    direct_chapter.vertical.physical_scale_comparison
+                    vertical_decision.physical_scale_comparison
                 )
-                vertical_crop_mode = direct_chapter.vertical.crop_mode
-                framing_intent = direct_chapter.vertical.framing_intent
+                vertical_crop_mode = vertical_decision.crop_mode
+                framing_intent = vertical_decision.framing_intent
                 required_entity_ids = resolve_entity_indices(
                     source_asset_id=shortlisted.source_asset_id,
                     event_id=shortlisted.event_id,
-                    indices=direct_chapter.vertical.required_entity_indices,
+                    indices=vertical_decision.required_entity_indices,
                 )
                 preferred_entity_ids = resolve_entity_indices(
                     source_asset_id=shortlisted.source_asset_id,
                     event_id=shortlisted.event_id,
-                    indices=direct_chapter.vertical.preferred_entity_indices,
+                    indices=vertical_decision.preferred_entity_indices,
                 )
                 sacrificable_entity_ids = resolve_entity_indices(
                     source_asset_id=shortlisted.source_asset_id,
                     event_id=shortlisted.event_id,
-                    indices=direct_chapter.vertical.sacrificable_entity_indices,
+                    indices=vertical_decision.sacrificable_entity_indices,
                 )
                 virtual_camera_proposal = camera_proposal(
-                    direct_chapter.vertical,
+                    vertical_decision,
                     source_asset_id=shortlisted.source_asset_id,
                     event_id=shortlisted.event_id,
                 )
+            else:
+                source_camera_motion_role = "unknown"
+                source_camera_motion_reason = None
             candidates.append(
                 ClipCardFeatureCandidateV3(
                     candidate_id=planning_candidate_id(rank),
@@ -2594,18 +2668,20 @@ def project_direct_video_edit_plan(
                     vertical_strategy=vertical_strategy,
                     vertical_crop_mode=vertical_crop_mode,
                     coverage_mode=(
-                        direct_chapter.vertical.coverage_mode
-                        if rank == direct_chapter.vertical.candidate_rank
+                        vertical_decision.coverage_mode
+                        if vertical_decision is not None
                         else "simultaneous"
                     ),
                     aspect_suitability=aspect_suitability,
                     suitability_risks=suitability_risks,
                     presentation_preference=presentation_preference,
                     presentation_goal=presentation_goal,
+                    source_camera_motion_role=source_camera_motion_role,
+                    source_camera_motion_reason=source_camera_motion_reason,
                     physical_scale_comparison=physical_scale_comparison,
                     allow_controlled_clip=(
-                        direct_chapter.vertical.allow_controlled_clip
-                        if rank == direct_chapter.vertical.candidate_rank
+                        vertical_decision.allow_controlled_clip
+                        if vertical_decision is not None
                         else False
                     ),
                     framing_intent=framing_intent,
@@ -3474,6 +3550,12 @@ def project_feature_contracts_v3(
                 suitability_risks=candidate.suitability_risks,
                 presentation_preference=candidate.presentation_preference,
                 presentation_goal=candidate.presentation_goal,
+                source_camera_motion_role=(
+                    candidate.source_camera_motion_role
+                ),
+                source_camera_motion_reason=(
+                    candidate.source_camera_motion_reason
+                ),
                 physical_scale_comparison=(
                     candidate.physical_scale_comparison
                 ),
@@ -4861,11 +4943,21 @@ model_provenance 必須先原樣回傳：
 {content_mode_instructions}
 
 只能回傳：
-1. 每個 chapter_index 的橫式與直式各選哪一個 candidate_rank。
+1. 每個 chapter_index 的橫式與直式各選哪一個 candidate_rank；並為該章其餘
+   所有附帶直式影片的候選，在 `vertical_alternates` 提供各自獨立的直式決定。
+   備選不是套用首選的裁切或關係：每一個候選都要判斷其本身是否適合 9:16、
+   應滿版、虛擬鏡頭、two-panel、solid fit，或根本不適合。
 2. 選擇理由、直接可見的證據、風險與建議停留秒數。
 3. 橫式是否保持原構圖，或對一個可見 entity 做有目的的推近／跟隨。
 4. 直式 coverage_mode、是否允許 controlled semantic clip，以及全段必須曾被
    看見、最好保留、可犧牲的 entity_index。
+   對首選與每個 `vertical_alternates` 均要填寫 `source_camera_motion_role`：
+   `static_or_negligible`、`editorially_useful`、`incidental_or_unwanted` 或
+   `unknown`。這只是在描述原始素材已存在的鏡頭運動，並非要求本機增加運鏡。
+   只在影片直接看得到且有可觀察剪輯理由時才可標 `editorially_useful`，例如
+   reveal、跟隨動作或回到必要關係；並以 `source_camera_motion_reason` 說明。
+   手晃、髒開鏡、無關的 pan/tilt、或不確定時不可標為 useful。本機仍會量測
+   motion、jolt、reversal 與 containment，任何量測 hard gate 失敗都會拒絕。
 5. 若注意力確實依序轉移，使用 0–1 相對進度列出 attention_sequence。
    每個 phase 的 anchor 只代表該 phase 必須看見的主體；全段 required entity
    不得被本機強塞進每個 phase。若關係必須同時存在，coverage_mode 使用
@@ -4925,6 +5017,9 @@ model_provenance 必須先原樣回傳：
   cut_admissible 才可為 true；本機 motion gate 也只能在此條件下改成 cut。
 - 沒有可見注意力轉移時，sequence 可以是空陣列；不得為了看起來有運鏡而發明移動。
 - candidate_rank 必須直接複製該章候選索引中的整數，不得引用未附影片的 rank。
+- `vertical_alternates` 必須恰好涵蓋該章所有非首選、且附有 bounded candidate
+  video 的 candidate_rank；不得重複首選 rank。若某備選不適合 9:16，仍必須以
+  `aspect_suitability=unsuitable` 如實回傳，不得省略它或假裝可用。
 - chapter_index 與 entity_index 也只能複製輸入中的整數；本機會解析成不可變 ID。
 - brief 章節順序必須保留。音樂影響相對停留、章節能量、鏡頭關係與視覺
   落點意圖；不得自創 beat timestamp。本機 MusicMap 會解析合法影格與音訊點。

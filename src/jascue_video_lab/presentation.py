@@ -1008,6 +1008,7 @@ def compile_presentation(
     source_camera_x_values: Sequence[float] = (),
     source_camera_motion_evidence: SourceCameraMotionEvidence | None = None,
     movement_motivated: bool = False,
+    source_motion_motivated: bool | None = None,
     preferred_capability_ids: Sequence[str] = (),
     acceptable_capability_ids: Sequence[str] = (),
     forbidden_capability_ids: Sequence[str] = (),
@@ -1036,6 +1037,7 @@ def compile_presentation(
         source_camera_x_values=source_camera_x_values,
         source_camera_motion_evidence=source_camera_motion_evidence,
         movement_motivated=movement_motivated,
+        source_motion_motivated=source_motion_motivated,
         acceptable_capability_ids=acceptable_capability_ids,
         forbidden_capability_ids=forbidden_capability_ids,
         required_readability_by_target=required_readability_by_target,
@@ -1098,6 +1100,7 @@ def generate_presentation_options(
     source_camera_x_values: Sequence[float] = (),
     source_camera_motion_evidence: SourceCameraMotionEvidence | None = None,
     movement_motivated: bool = False,
+    source_motion_motivated: bool | None = None,
     acceptable_capability_ids: Sequence[str] = (),
     forbidden_capability_ids: Sequence[str] = (),
     required_readability_by_target: Mapping[str, float] | None = None,
@@ -1112,6 +1115,16 @@ def generate_presentation_options(
 
     if not targets:
         raise ValueError("presentation option generation requires targets")
+    # Synthetic framing motion and source-camera motion are different
+    # decisions.  Preserve the legacy default for callers that have no
+    # candidate-scoped source-motion semantics, while allowing a planner to
+    # retain a measured, editorially useful source reveal without authorizing
+    # synthetic movement.
+    resolved_source_motion_motivated = (
+        movement_motivated
+        if source_motion_motivated is None
+        else source_motion_motivated
+    )
     registry = autonomous_capability_registry_v2(
         allow_two_panel_layout=policy.presentation.allow_two_panel_layout,
         allow_solid_matte_fit=policy.presentation.allow_solid_matte_fit,
@@ -1325,7 +1338,7 @@ def generate_presentation_options(
         accepted = (
             scene_facts.source_camera_motion.direction == "static"
             or (
-                movement_motivated
+                resolved_source_motion_motivated
                 and scene_facts.source_camera_motion.reversal_count <= 1
             )
         )
@@ -1336,9 +1349,9 @@ def generate_presentation_options(
                 "source_camera_static"
                 if scene_facts.source_camera_motion.direction == "static"
                 else "source_camera_motion_semantically_motivated"
-                if accepted and movement_motivated
+                if accepted and resolved_source_motion_motivated
                 else "source_camera_motion_reversal_exceeds_policy"
-                if movement_motivated
+                if resolved_source_motion_motivated
                 else "unmotivated_source_camera_motion"
             ),
             evidence_refs=(

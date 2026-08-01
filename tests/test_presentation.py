@@ -862,6 +862,45 @@ def test_one_measured_source_reversal_is_allowed_only_when_motivated() -> None:
     )
 
 
+def test_editorially_useful_source_motion_does_not_authorize_synthetic_motion() -> None:
+    evidence = SourceCameraMotionEvidence(
+        source_asset_id="sha256:" + "a" * 64,
+        window_start_ms=0,
+        window_end_ms=5_500,
+        sample_times_ms=(0, 2_750, 5_500),
+        sample_frame_pts=(0, 83, 165),
+        sample_frame_hashes=("b" * 64, "c" * 64, "d" * 64),
+        subject_exclusion_mode="sam_track_boxes",
+        mean_excluded_area_fraction=0.06,
+        pairs=(),
+        classification="tilt_down",
+        reliable=True,
+        confidence=0.49,
+        normalized_translation_x_per_second=0.0,
+        normalized_translation_y_per_second=0.01,
+        scale_rate_per_second=0.0,
+        rotation_degrees_per_second=0.0,
+        normalized_travel=0.18,
+        reversal_count=0,
+        reason_codes=("monotonic_source_reveal",),
+        cache_key_sha256="e" * 64,
+    )
+
+    compilation = compile_presentation(
+        targets=[_target("device", (400, 250, 600, 750))],
+        source_width=1920,
+        source_height=1080,
+        relation_mode="single_subject",
+        policy=_policy(),
+        source_camera_motion_evidence=evidence,
+        movement_motivated=False,
+        source_motion_motivated=True,
+    )
+
+    assert compilation.mode == "static_full_bleed_crop"
+    assert compilation.camera_motion is None
+
+
 def test_impossible_two_device_crop_uses_scale_locked_two_panel() -> None:
     compilation = compile_presentation(
         targets=[

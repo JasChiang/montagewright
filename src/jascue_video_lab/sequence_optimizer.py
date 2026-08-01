@@ -1355,6 +1355,155 @@ def _allocate_candidate_route_durations(
     return tuple(durations)
 
 
+def _redistribute_candidate_route_duration(
+    options: Sequence[CandidateRouteOption],
+    *,
+    primary_durations_ms: Sequence[int],
+    forced_index: int,
+    forced_duration_ms: int,
+) -> tuple[int, ...] | None:
+    """Move one execution to a legal contract boundary and preserve runtime.
+
+    This is deliberately a bounded local repair, not a second rhythm solver.
+    The selected beat moves to one of its declared min/preferred/max
+    durations, while the delta is absorbed by the fewest other beats with
+    legal readability headroom.  Cue-aligned beats are changed last.
+    """
+
+    if len(options) != len(primary_durations_ms):
+        raise ValueError("duration redistribution inputs must have equal size")
+    if not 0 <= forced_index < len(options):
+        raise ValueError("forced duration index is out of range")
+    bounds = [_candidate_duration_bounds(option) for option in options]
+    if any(item is None for item in bounds):
+        return None
+    resolved_bounds = [item for item in bounds if item is not None]
+    minimum_ms, _, maximum_ms = resolved_bounds[forced_index]
+    if not minimum_ms <= forced_duration_ms <= maximum_ms:
+        return None
+
+    durations = list(primary_durations_ms)
+    delta_ms = durations[forced_index] - forced_duration_ms
+    durations[forced_index] = forced_duration_ms
+    if delta_ms == 0:
+        return tuple(durations)
+
+    if delta_ms > 0:
+        # The forced beat became shorter. Give the released runtime to the
+        # smallest possible set of non-cue-locked beats with largest headroom.
+        recipient_rows = [
+            (
+                options[index].cue_aligned,
+                -(
+                    resolved_bounds[index][2]
+                    - durations[index]
+                ),
+                index,
+            )
+            for index in range(len(options))
+            if index != forced_index
+            and durations[index] < resolved_bounds[index][2]
+        ]
+        for _, _, index in sorted(recipient_rows):
+            awarded_ms = min(
+                delta_ms,
+                resolved_bounds[index][2] - durations[index],
+            )
+            durations[index] += awarded_ms
+            delta_ms -= awarded_ms
+            if delta_ms == 0:
+                break
+    else:
+        # The forced beat became longer. Recover the required runtime from the
+        # fewest other beats that remain above their declared minimum.
+        remaining_ms = -delta_ms
+        donor_rows = [
+            (
+                options[index].cue_aligned,
+                -(
+                    durations[index]
+                    - resolved_bounds[index][0]
+                ),
+                index,
+            )
+            for index in range(len(options))
+            if index != forced_index
+            and durations[index] > resolved_bounds[index][0]
+        ]
+        for _, _, index in sorted(donor_rows):
+            removed_ms = min(
+                remaining_ms,
+                durations[index] - resolved_bounds[index][0],
+            )
+            durations[index] -= removed_ms
+            remaining_ms -= removed_ms
+            if remaining_ms == 0:
+                break
+        delta_ms = -remaining_ms
+
+    if delta_ms != 0:
+        return None
+    return tuple(durations)
+
+
+def _candidate_route_duration_variants(
+    options: Sequence[CandidateRouteOption],
+    *,
+    target_duration_ms: int | None,
+    max_variants: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Enumerate a small execution frontier from editorial duration bounds.
+
+    The first row is always the normal rhythm allocation. Additional rows
+    move exactly one beat to a declared boundary and redistribute its delta.
+    This avoids a Cartesian product while giving runtime geometry/quality
+    failures a shorter or longer execution of the same semantic candidate.
+    """
+
+    if max_variants < 1:
+        raise ValueError("candidate duration frontier must retain one variant")
+    primary = _allocate_candidate_route_durations(
+        options,
+        target_duration_ms=target_duration_ms,
+    )
+    if primary is None:
+        return ()
+    if target_duration_ms is None or max_variants == 1:
+        return (primary,)
+
+    variants: list[tuple[int, ...]] = [primary]
+    seen = {primary}
+    bounds = [_candidate_duration_bounds(option) for option in options]
+    if any(item is None for item in bounds):
+        return (primary,)
+    resolved_bounds = [item for item in bounds if item is not None]
+
+    # Shorter executions are the common recovery for dirty heads/tails and
+    # source-camera motion, so enumerate all minima before expansion variants.
+    boundary_passes = (
+        tuple(item[0] for item in resolved_bounds),
+        tuple(item[1] for item in resolved_bounds),
+        tuple(item[2] for item in resolved_bounds),
+    )
+    for boundary_values in boundary_passes:
+        for forced_index, forced_duration_ms in enumerate(boundary_values):
+            if forced_duration_ms == primary[forced_index]:
+                continue
+            variant = _redistribute_candidate_route_duration(
+                options,
+                primary_durations_ms=primary,
+                forced_index=forced_index,
+                forced_duration_ms=forced_duration_ms,
+            )
+            if variant is None or variant in seen:
+                continue
+            seen.add(variant)
+            variants.append(variant)
+            if len(variants) >= max_variants:
+                return tuple(variants)
+    return tuple(variants)
+
+
 def _candidate_source_interval(
     option: CandidateRouteOption,
     *,
@@ -1720,10 +1869,16 @@ def _candidate_complete_route(
     target_duration_ms: int | None,
     max_panel_runtime_fraction: float | None,
     max_editorial_reprise_overlap_fraction: float,
+    durations_ms: Sequence[int] | None = None,
+    primary_durations_ms: Sequence[int] | None = None,
 ) -> CandidateCompleteRoute | None:
-    durations = _allocate_candidate_route_durations(
-        state.options,
-        target_duration_ms=target_duration_ms,
+    durations = (
+        tuple(durations_ms)
+        if durations_ms is not None
+        else _allocate_candidate_route_durations(
+            state.options,
+            target_duration_ms=target_duration_ms,
+        )
     )
     if durations is None:
         return None
@@ -1799,16 +1954,39 @@ def _candidate_complete_route(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    duration_deviation_ms = (
+        sum(
+            abs(duration_ms - primary_duration_ms)
+            for duration_ms, primary_duration_ms in zip(
+                durations,
+                primary_durations_ms,
+                strict=True,
+            )
+        )
+        if primary_durations_ms is not None
+        else 0
+    )
     return CandidateCompleteRoute(
         route_id=route_id,
         selections=tuple(selections),
-        objective_score=round(state.score, 6),
+        objective_score=round(
+            state.score
+            - duration_deviation_ms
+            / max(total_duration_ms, 1)
+            * 0.05,
+            6,
+        ),
         total_duration_ms=total_duration_ms,
         panel_duration_ms=panel_duration_ms,
         decision_codes=(
             "complete_route_ranked_before_runtime",
             "candidate_local_timing_bound",
             "source_reuse_hard_checked",
+            *(
+                ("bounded_duration_recovery_variant",)
+                if duration_deviation_ms
+                else ()
+            ),
             *(
                 ("source_intervals_jointly_placed",)
                 if repositioned
@@ -1828,6 +2006,7 @@ def optimize_pre_render_candidate_route(
     target_duration_ms: int | None = None,
     max_editorial_reprise_overlap_fraction: float = 0.5,
     max_ranked_routes: int | None = None,
+    max_duration_variants_per_route: int = 16,
 ) -> CandidateRouteResult:
     """Choose the executable pre-render frontier without inventing geometry.
 
@@ -1875,6 +2054,10 @@ def optimize_pre_render_candidate_route(
         )
     if max_ranked_routes is not None and max_ranked_routes < 1:
         raise ValueError("max ranked routes must be positive")
+    if max_duration_variants_per_route < 1:
+        raise ValueError(
+            "max duration variants per route must be positive"
+        )
     states = [_CandidateRouteState()]
     for beat in beats:
         feasible_options = [
@@ -2018,25 +2201,36 @@ def optimize_pre_render_candidate_route(
         tuple[CandidateCompleteRoute, _CandidateRouteState]
     ] = []
     for state in states:
-        route = _candidate_complete_route(
-            state,
+        duration_variants = _candidate_route_duration_variants(
+            state.options,
             target_duration_ms=target_duration_ms,
-            max_panel_runtime_fraction=max_panel_runtime_fraction,
-            max_editorial_reprise_overlap_fraction=(
-                max_editorial_reprise_overlap_fraction
-            ),
+            max_variants=max_duration_variants_per_route,
         )
-        if route is None:
-            continue
-        if (
-            minimum_duration_ms is not None
-            and maximum_duration_ms is not None
-            and not minimum_duration_ms
-            <= route.total_duration_ms
-            <= maximum_duration_ms
-        ):
-            continue
-        ranked_route_states.append((route, state))
+        primary_durations_ms = (
+            duration_variants[0] if duration_variants else None
+        )
+        for durations_ms in duration_variants:
+            route = _candidate_complete_route(
+                state,
+                target_duration_ms=target_duration_ms,
+                max_panel_runtime_fraction=max_panel_runtime_fraction,
+                max_editorial_reprise_overlap_fraction=(
+                    max_editorial_reprise_overlap_fraction
+                ),
+                durations_ms=durations_ms,
+                primary_durations_ms=primary_durations_ms,
+            )
+            if route is None:
+                continue
+            if (
+                minimum_duration_ms is not None
+                and maximum_duration_ms is not None
+                and not minimum_duration_ms
+                <= route.total_duration_ms
+                <= maximum_duration_ms
+            ):
+                continue
+            ranked_route_states.append((route, state))
     ranked_route_states.sort(
         key=lambda item: (
             item[0].objective_score,

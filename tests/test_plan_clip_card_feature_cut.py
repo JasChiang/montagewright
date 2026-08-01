@@ -496,6 +496,11 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
                     strategy="tracked_crop",
                     crop_mode="primary_center",
                     coverage_mode="sequential",
+                    source_camera_motion_role="editorially_useful",
+                    source_camera_motion_reason=(
+                        "The bounded candidate visibly reveals the complete "
+                        "demonstration while moving."
+                    ),
                     allow_controlled_clip=True,
                     framing_intent="Observe the subject, then the sign.",
                     required_entity_indices=[1, 2],
@@ -566,6 +571,7 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
     assert candidate.source_asset_id == ASSET_ID
     assert candidate.event_id == "demo"
     assert candidate.frame_id == "RF000001"
+    assert candidate.source_camera_motion_role == "editorially_useful"
     assert projected.chapters[0].horizontal_candidate_id == "rank-01"
     assert projected.chapters[0].vertical_candidate_id == "rank-01"
     assert (
@@ -609,6 +615,8 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
     assert '"chapter_index"' in direct_schema
     assert '"entity_index"' not in direct_schema
     assert '"required_entity_indices"' in direct_schema
+    assert '"vertical_alternates"' in direct_schema
+    assert '"source_camera_motion_role"' in direct_schema
     assert '"candidate_id"' not in direct_schema
     assert '"source_asset_id"' not in direct_schema
     assert '"frame_id"' not in direct_schema

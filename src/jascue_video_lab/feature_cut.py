@@ -11226,6 +11226,7 @@ def _runtime_scope_preserving_presentation_fallback(
     physical_scale_comparison: bool,
     semantic_beat: SemanticBeat | None,
     source_camera_motion_evidence: SourceCameraMotionEvidence | None = None,
+    source_motion_motivated: bool | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     """Recover locally after whole-window evidence invalidates a crop.
 
@@ -11305,6 +11306,7 @@ def _runtime_scope_preserving_presentation_fallback(
             allow_static_full_bleed=True,
             tracking_available=False,
             source_camera_motion_evidence=source_camera_motion_evidence,
+            source_motion_motivated=source_motion_motivated,
             acceptable_capability_ids=acceptable_capability_ids,
             forbidden_capability_ids=forbidden_capability_ids,
             required_readability_by_target={
@@ -11478,6 +11480,12 @@ def _vertical_candidate_geometry(
     presentation_preference: str = "tracked_full_bleed",
     relation_mode: str = "single_subject",
     physical_scale_comparison: bool = False,
+    source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = "unknown",
     semantic_negotiation_state: dict[str, int] | None = None,
     semantic_beat: SemanticBeat | None = None,
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
@@ -11594,6 +11602,9 @@ def _vertical_candidate_geometry(
                 and semantic_beat.attention_intent.motion_motivation
                 != "none"
             )
+            source_motion_motivated = (
+                source_camera_motion_role == "editorially_useful"
+            )
             source_camera_motion_evidence = measure_source_camera_motion(
                 source_path=Path(clip.path),
                 source_asset_id=f"sha256:{clip.sha256}",
@@ -11622,6 +11633,7 @@ def _vertical_candidate_geometry(
                     source_camera_motion_evidence
                 ),
                 movement_motivated=movement_motivated,
+                source_motion_motivated=source_motion_motivated,
                 preferred_capability_ids=_preferred_capability_ids(
                     presentation_preference
                 ),
@@ -11760,6 +11772,7 @@ def _vertical_candidate_geometry(
                             source_camera_motion_evidence
                         ),
                         movement_motivated=movement_motivated,
+                        source_motion_motivated=source_motion_motivated,
                         preferred_capability_ids=(
                             preferred_capability_id,
                         ),
@@ -12173,6 +12186,9 @@ def _vertical_candidate_geometry(
                 if autonomous_compilation is not None
                 else None
             ),
+            source_motion_motivated=(
+                source_camera_motion_role == "editorially_useful"
+            ),
         )
         if runtime_fallback is not None:
             filter_graph, geometry = runtime_fallback
@@ -12197,6 +12213,9 @@ def _vertical_candidate_geometry(
             geometry["source_camera_motion_note"] = (
                 "Measured locally from background features after excluding "
                 "SAM-track subject boxes; Gemini did not infer geometry."
+            )
+            geometry["source_camera_motion_role"] = (
+                source_camera_motion_role
             )
         if semantic_negotiation_artifact is not None:
             geometry["semantic_negotiation"] = (
@@ -13566,10 +13585,13 @@ def _build_pre_render_vertical_candidate_route(
                 minimum_readable_ms=round(
                     rhythm.minimum_duration_seconds * 1000
                 ),
-                # The joint semantic/music solver already froze this beat's
-                # project boundary.  Candidate routing may choose another
-                # take, but production must not silently move that cue.
-                preferred_readable_ms=trim_duration_ms,
+                # Preserve the semantic dwell envelope separately from the
+                # currently resolved project boundary. The primary route
+                # still uses ``trim_duration_ms``; bounded recovery routes
+                # may only move inside the declared min/preferred/max range.
+                preferred_readable_ms=round(
+                    rhythm.preferred_duration_seconds * 1000
+                ),
                 maximum_readable_ms=round(
                     rhythm.maximum_duration_seconds * 1000
                 ),
@@ -15658,6 +15680,9 @@ def _compile_autonomous_vertical_candidate_geometry(
             ),
             physical_scale_comparison=bool(
                 option.get("physical_scale_comparison", False)
+            ),
+            source_camera_motion_role=str(
+                option.get("source_camera_motion_role", "unknown")
             ),
             semantic_negotiation_state=semantic_negotiation_state,
             semantic_beat=semantic_beat,

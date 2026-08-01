@@ -4373,6 +4373,23 @@ class FeatureVerticalCandidate(StrictModel):
         "context_detail",
         "emphasize",
     ] = "hold"
+    source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = Field(
+        default="unknown",
+        description=(
+            "Gemini's evidence-bound semantic judgment about motion already "
+            "present in the source take. This never replaces local motion "
+            "measurement and never authorizes synthetic camera movement."
+        ),
+    )
+    source_camera_motion_reason: str | None = Field(
+        default=None,
+        max_length=300,
+    )
     physical_scale_comparison: bool = False
     allow_controlled_clip: bool = False
     target_description: str | None = None
@@ -4383,6 +4400,13 @@ class FeatureVerticalCandidate(StrictModel):
 
     @model_validator(mode="after")
     def validate_geometry_intent(self) -> "FeatureVerticalCandidate":
+        if (
+            self.source_camera_motion_role != "unknown"
+            and not (self.source_camera_motion_reason or "").strip()
+        ):
+            raise ValueError(
+                "classified source-camera motion requires an observable reason"
+            )
         hard_regions = [
             region for region in self.regions if region.execution_role == "hard_core"
         ]

@@ -974,6 +974,124 @@ def test_allocated_duration_changes_candidate_execution_hash() -> None:
     )
 
 
+def test_ranked_routes_include_bounded_duration_recovery_execution() -> None:
+    opening = CandidateRouteOption(
+        beat_id="opening",
+        candidate_id="opening-a",
+        source_asset_id="sha256:" + "a" * 64,
+        source_clip_id="clip-a",
+        event_id="opening-event",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=6_500,
+        minimum_readable_ms=5_000,
+        preferred_readable_ms=6_500,
+        maximum_readable_ms=8_000,
+        safe_capacity_ms=10_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=10_000,
+        source_anchor_ms=5_000,
+        candidate_timing_sha256="a" * 64,
+    )
+    closing = CandidateRouteOption(
+        beat_id="closing",
+        candidate_id="closing-a",
+        source_asset_id="sha256:" + "b" * 64,
+        source_clip_id="clip-b",
+        event_id="closing-event",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=3_500,
+        minimum_readable_ms=2_000,
+        preferred_readable_ms=3_500,
+        maximum_readable_ms=3_500,
+        safe_capacity_ms=9_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=9_000,
+        source_anchor_ms=0,
+        candidate_timing_sha256="b" * 64,
+    )
+
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(opening,)),
+            CandidateRouteBeat(beat_id="closing", options=(closing,)),
+        ),
+        target_duration_ms=10_000,
+    )
+
+    duration_vectors = {
+        tuple(
+            selection.trim_duration_ms
+            for selection in route.selections
+        )
+        for route in result.ranked_routes
+    }
+    assert (6_500, 3_500) in duration_vectors
+    assert (8_000, 2_000) in duration_vectors
+    assert all(route.total_duration_ms == 10_000 for route in result.ranked_routes)
+    recovery = next(
+        route
+        for route in result.ranked_routes
+        if tuple(
+            selection.trim_duration_ms
+            for selection in route.selections
+        )
+        == (8_000, 2_000)
+    )
+    assert "bounded_duration_recovery_variant" in recovery.decision_codes
+    assert (
+        recovery.selections[1].candidate_execution_sha256
+        != result.selections[1].candidate_execution_sha256
+    )
+    assert (
+        recovery.selections[1].source_in_ms,
+        recovery.selections[1].source_out_ms,
+    ) == (0, 2_000)
+
+
+def test_duration_recovery_frontier_is_locally_bounded() -> None:
+    opening = CandidateRouteOption(
+        beat_id="opening",
+        candidate_id="opening-a",
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="opening-event",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=6_500,
+        minimum_readable_ms=5_000,
+        preferred_readable_ms=6_500,
+        maximum_readable_ms=8_000,
+    )
+    closing = CandidateRouteOption(
+        beat_id="closing",
+        candidate_id="closing-a",
+        source_asset_id="sha256:" + "b" * 64,
+        event_id="closing-event",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=3_500,
+        minimum_readable_ms=2_000,
+        preferred_readable_ms=3_500,
+        maximum_readable_ms=3_500,
+    )
+
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(opening,)),
+            CandidateRouteBeat(beat_id="closing", options=(closing,)),
+        ),
+        target_duration_ms=10_000,
+        max_duration_variants_per_route=1,
+    )
+
+    assert len(result.ranked_routes) == 1
+    assert [
+        selection.trim_duration_ms
+        for selection in result.ranked_routes[0].selections
+    ] == [6_500, 3_500]
+
+
 def test_next_route_preserves_accepted_execution_and_skips_failed_one() -> None:
     result = optimize_pre_render_candidate_route(
         (
