@@ -55,6 +55,7 @@ from jascue_video_lab.feature_cut import (
     _bounded_cue_shifted_window,
     _bind_regions_to_editorial_relation,
     _candidate_capability_boundaries,
+    _editorial_reconstruction_capability_ids,
     _external_projection_binding_can_refresh_locally,
     _semantic_beat_for_runtime_candidate,
     _bind_runtime_candidate_coverage,
@@ -1867,6 +1868,53 @@ def test_candidate_capability_boundary_does_not_rewrite_panel_to_crop() -> None:
 
     assert acceptable == ("two_panel_layout",)
     assert "tracked_full_bleed_crop" in forbidden
+
+
+def test_candidate_capability_boundary_honors_bound_editorial_reconstruction() -> None:
+    """A contract may pre-authorize truthful fit without opening all fallbacks."""
+
+    semantic_beat = SimpleNamespace(
+        acceptable_capability_ids=(
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+        ),
+        forbidden_capability_ids=(
+            "solid_matte_fit",
+            "two_panel_layout",
+        ),
+    )
+
+    acceptable, forbidden = _candidate_capability_boundaries(
+        presentation_preference="static_full_bleed",
+        semantic_beat=semantic_beat,
+        physical_scale_comparison=False,
+        editorial_reconstruction_capability_ids=("solid_matte_fit",),
+    )
+
+    assert acceptable == (
+        "solid_matte_fit",
+        "static_full_bleed_crop",
+        "tracked_full_bleed_crop",
+    )
+    assert "solid_matte_fit" not in forbidden
+    assert "two_panel_layout" in forbidden
+
+
+def test_editorial_reconstruction_requires_all_bound_contracts_to_authorize() -> None:
+    assert _editorial_reconstruction_capability_ids(
+        (
+            {
+                "allowed_reconstruction": [
+                    "continuous",
+                    "solid_fit",
+                    "two_panel_layout",
+                ]
+            },
+            {
+                "allowed_reconstruction": ["continuous", "solid_fit"]
+            },
+        )
+    ) == ("solid_matte_fit",)
 
 
 def test_external_projection_binding_refreshes_only_derived_reprojection_hashes() -> None:

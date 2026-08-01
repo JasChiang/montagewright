@@ -10543,21 +10543,61 @@ def _normal_acceptable_capability_ids(
     }.get(presentation_preference, ())
 
 
+def _editorial_reconstruction_capability_ids(
+    contracts: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Return only reconstruction families every bound contract permits.
+
+    The direct-video plan expresses Gemini's preferred presentation for a
+    concrete candidate.  A bound EditorialBeatContract can separately permit
+    a truthful reconstruction for a lower evidence tier (for example a
+    contextual product identity shown with solid fit).  That is not a local
+    fallback invention: it is pre-authorized semantic scope.  Multiple
+    contracts are intersected so one beat may never loosen another's rule.
+    """
+
+    if not contracts:
+        return ()
+    capability_by_reconstruction = {
+        "two_panel_layout": "two_panel_layout",
+        "solid_fit": "solid_matte_fit",
+    }
+    permitted_sets: list[set[str]] = []
+    for contract in contracts:
+        allowed = contract.get("allowed_reconstruction")
+        if not isinstance(allowed, Sequence) or isinstance(
+            allowed, (str, bytes)
+        ):
+            return ()
+        permitted_sets.append(
+            {
+                capability_by_reconstruction[str(value)]
+                for value in allowed
+                if str(value) in capability_by_reconstruction
+            }
+        )
+    return tuple(sorted(set.intersection(*permitted_sets)))
+
+
 def _candidate_capability_boundaries(
     *,
     presentation_preference: str,
     semantic_beat: SemanticBeat | None,
     physical_scale_comparison: bool,
+    editorial_reconstruction_capability_ids: Sequence[str] = (),
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Narrow a beat-level union to one candidate's immutable authority."""
 
+    contractual_family = set(editorial_reconstruction_capability_ids)
     candidate_family = set(
         _normal_acceptable_capability_ids(presentation_preference)
-    )
+    ) | contractual_family
     if semantic_beat is None:
         return tuple(sorted(candidate_family)), ()
 
-    beat_acceptable = set(semantic_beat.acceptable_capability_ids)
+    beat_acceptable = (
+        set(semantic_beat.acceptable_capability_ids) | contractual_family
+    )
     known_capabilities = (
         beat_acceptable | set(semantic_beat.forbidden_capability_ids)
     )
@@ -11518,6 +11558,7 @@ def _vertical_candidate_geometry(
     ] = "unknown",
     semantic_negotiation_state: dict[str, int] | None = None,
     semantic_beat: SemanticBeat | None = None,
+    editorial_reconstruction_capability_ids: Sequence[str] = (),
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
     """Evaluate one immutable vertical candidate without rendering a segment."""
 
@@ -11650,6 +11691,9 @@ def _vertical_candidate_geometry(
                 presentation_preference=presentation_preference,
                 semantic_beat=semantic_beat,
                 physical_scale_comparison=physical_scale_comparison,
+                editorial_reconstruction_capability_ids=(
+                    editorial_reconstruction_capability_ids
+                ),
             )
             autonomous_compilation = compile_presentation(
                 targets=presentation_targets,
@@ -15693,6 +15737,14 @@ def _compile_autonomous_vertical_candidate_geometry(
     query_lock = EvidenceQueryLockV2.model_validate(
         local_artifact["query_lock"]
     )
+    bound_contract_rows = tuple(
+        row
+        for row in (exact_artifact.get("bound_contracts") or ())
+        if isinstance(row, Mapping)
+    )
+    contractual_reconstruction_capability_ids = (
+        _editorial_reconstruction_capability_ids(bound_contract_rows)
+    )
     candidate_root = Path(str(local_artifact["candidate_root"]))
     try:
         (
@@ -15757,6 +15809,9 @@ def _compile_autonomous_vertical_candidate_geometry(
             ),
             semantic_negotiation_state=semantic_negotiation_state,
             semantic_beat=semantic_beat,
+            editorial_reconstruction_capability_ids=(
+                contractual_reconstruction_capability_ids
+            ),
         )
     except CandidateKnownInfeasible as error:
         return {
@@ -21956,6 +22011,9 @@ def _run_feature_cut_experiment_impl(
                             runtime_semantic_beat.model_dump(mode="json")
                             if runtime_semantic_beat is not None
                             else None
+                        ),
+                        "bound_editorial_reconstruction_contracts": (
+                            exact_payloads[key].get("bound_contracts")
                         ),
                         "brief_chapter": brief_by_id[
                             frontier_attempt.beat_id
