@@ -1610,6 +1610,7 @@ def _is_file_api_not_reusable(error: BaseException) -> bool:
         or "NOT_FOUND" in text
         or "403" in text
         or "PERMISSION_DENIED" in text
+        or "FILE API ENDED IN STATE FAILED" in text
     )
 
 

@@ -89,6 +89,30 @@ def test_ensure_upload_reuploads_after_file_api_403(tmp_path: Path) -> None:
     assert "expired_deleted_or_inaccessible" in record
 
 
+def test_ensure_upload_reuploads_after_confirmed_file_api_failed_state(
+    tmp_path: Path,
+) -> None:
+    upload_dir = tmp_path / "upload"
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"failed remote processing")
+    write_json(upload_dir / "file_upload_initial.json", {"name": "files/failed"})
+    write_json(
+        upload_dir / "local_source_binding.json",
+        {"sha256": sha256_file(source)},
+    )
+    client = _client_without_network()
+    replacement = SimpleNamespace(name="files/reuploaded")
+    client.resume_video_upload = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        RuntimeError("Gemini File API ended in state FAILED")
+    )
+    client.upload_video = lambda *_args, **_kwargs: replacement  # type: ignore[method-assign]
+
+    result, reused = client.ensure_video_upload(source, upload_dir)
+
+    assert result is replacement
+    assert reused is False
+
+
 def test_ensure_upload_replaces_noncanonical_audio_mime_alias(
     tmp_path: Path,
 ) -> None:
