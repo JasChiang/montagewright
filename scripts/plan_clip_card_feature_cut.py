@@ -573,10 +573,26 @@ class ClipCardFeatureCandidateV3(StrictModel):
     preferred_entity_ids: list[str] = Field(default_factory=list, max_length=4)
     sacrificable_entity_ids: list[str] = Field(default_factory=list, max_length=4)
     virtual_camera_proposal: "ClipCardVirtualCameraProposalV1 | None" = None
+    # Reuse belongs to the candidate, not to the chapter.  A Top-K alternate
+    # can legitimately be a different interval/presentation of an already
+    # used source while the primary take is not.  Keeping this fact here means
+    # the route solver never has to invent an editorial exception.
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_candidate(self) -> "ClipCardFeatureCandidateV3":
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError("candidate reuse justification requires a typed reuse mode")
+        elif not (self.source_reuse_justification and self.source_reuse_justification.strip()):
+            raise ValueError("candidate reuse requires an observable justification")
         if (
             self.source_camera_motion_role != "unknown"
             and not (self.source_camera_motion_reason or "").strip()
@@ -851,9 +867,21 @@ class DirectVideoVerticalDecision(StrictModel):
     attention_sequence: list[DirectVideoAttentionStep] = Field(
         max_length=4,
     )
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
 
     @model_validator(mode="after")
     def validate_vertical(self) -> "DirectVideoVerticalDecision":
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError("vertical reuse justification requires a typed reuse mode")
+        elif not (self.source_reuse_justification and self.source_reuse_justification.strip()):
+            raise ValueError("vertical reuse requires an observable justification")
         if (
             self.source_camera_motion_role != "unknown"
             and not (self.source_camera_motion_reason or "").strip()
@@ -1047,6 +1075,17 @@ class DirectVideoChapterDecision(StrictModel):
         ):
             raise ValueError(
                 "intentional source reuse requires an observable justification"
+            )
+        # The legacy chapter fields remain an audit mirror for the selected
+        # primary.  Alternates must carry their own authority and never
+        # inherit this value implicitly.
+        if self.vertical is not None and "source_reuse_mode" in self.vertical.model_fields_set and (
+            self.vertical.source_reuse_mode != self.source_reuse_mode
+            or self.vertical.source_reuse_justification
+            != self.source_reuse_justification
+        ):
+            raise ValueError(
+                "primary vertical reuse authority must match the chapter audit mirror"
             )
         if self.evidence_status == "not_found":
             if (
@@ -1819,6 +1858,31 @@ def canonicalize_direct_video_edit_plan_output(
                     reason_code=(
                         "planner_contract_phase_requires_sequential_attention"
                     ),
+                )
+        # The primary's candidate-level reuse authority is the source of
+        # truth.  The chapter field exists solely for old render/audit
+        # compatibility, so synchronize the mirror deterministically rather
+        # than allowing an alternate to inherit it.
+        if isinstance(primary_vertical, dict) and "source_reuse_mode" in primary_vertical:
+            primary_reuse_mode = primary_vertical.get("source_reuse_mode")
+            primary_reuse_reason = primary_vertical.get("source_reuse_justification")
+            before_primary_mirror = {
+                "source_reuse_mode": chapter.get("source_reuse_mode"),
+                "source_reuse_justification": chapter.get("source_reuse_justification"),
+            }
+            after_primary_mirror = {
+                "source_reuse_mode": primary_reuse_mode,
+                "source_reuse_justification": primary_reuse_reason,
+            }
+            if before_primary_mirror != after_primary_mirror:
+                chapter.update(after_primary_mirror)
+                changes.append(
+                    {
+                        "json_path": f"chapters[{chapter_index}].source_reuse_*",
+                        "before": before_primary_mirror,
+                        "after": after_primary_mirror,
+                        "rule": "primary_candidate_reuse_authority_binds_chapter_audit_mirror",
+                    }
                 )
         reuse_mode = chapter.get("source_reuse_mode")
         reuse_justification = chapter.get("source_reuse_justification")
@@ -3044,6 +3108,29 @@ def project_direct_video_edit_plan(
                     preferred_entity_ids=preferred_entity_ids,
                     sacrificable_entity_ids=sacrificable_entity_ids,
                     virtual_camera_proposal=virtual_camera_proposal,
+                    # A pre-candidate schema did not have these fields.
+                    # Only its selected primary may inherit the legacy
+                    # chapter mirror; alternates must remain unauthorised.
+                    source_reuse_mode=(
+                        vertical_decision.source_reuse_mode
+                        if vertical_decision is not None
+                        and "source_reuse_mode" in vertical_decision.model_fields_set
+                        else (
+                            direct_chapter.source_reuse_mode
+                            if rank == direct_chapter.vertical.candidate_rank
+                            else "none"
+                        )
+                    ),
+                    source_reuse_justification=(
+                        vertical_decision.source_reuse_justification
+                        if vertical_decision is not None
+                        and "source_reuse_mode" in vertical_decision.model_fields_set
+                        else (
+                            direct_chapter.source_reuse_justification
+                            if rank == direct_chapter.vertical.candidate_rank
+                            else None
+                        )
+                    ),
                     confidence=direct_chapter.confidence,
                 )
             )
@@ -3922,6 +4009,10 @@ def project_feature_contracts_v3(
                     regions,
                 ),
                 quality_risks=candidate.quality_risks,
+                source_reuse_mode=candidate.source_reuse_mode,
+                source_reuse_justification=(
+                    candidate.source_reuse_justification
+                ),
                 confidence=candidate.confidence,
             )
 
@@ -5389,11 +5480,15 @@ model_provenance 必須先原樣回傳：
     音樂 exit 決定。穩定但仍有閱讀、情緒或產品觀察價值的畫面可分配合理 hold。
     若素材確實不能滿足，必須如實以 evidence_status 與 risks 表示缺口，不能捏造
     補秒方式。
-7. 全片要有素材與視覺狀態的多樣性。若同一支 source 已被前章選用，應先選
-   不同 take；只有不同 interval 提供新的 hard evidence、alternate presentation
-   有新的閱讀目的，或明確 editorial reprise 時才能重用，並填入 typed reuse
-   authority 與具體理由。不得假設本機會自動授權或修正重用；手機加立牌等相似構圖
-   即使來自不同時間，也不能反覆充當無差別 coverage。
+7. 全片要有素材與視覺狀態的多樣性。每一個直式 decision（primary 與每個
+   `vertical_alternates`）都要各自填 `source_reuse_mode` 與
+   `source_reuse_justification`；它們不會繼承 chapter primary 的值。若該候選的
+   source 已被前章選用，應先選不同 take；只有不同 interval 提供新的 hard
+   evidence、alternate presentation 有新的閱讀目的，或明確 editorial reprise 時
+   才能重用，並在該候選填 typed reuse authority 與具體可觀察理由。不得假設本機
+   會自動授權或修正重用；手機加立牌等相似構圖即使來自不同時間，也不能反覆充當
+   無差別 coverage。chapter-level source_reuse_* 必須與 selected primary vertical
+   decision 完全相同，只是 audit mirror。
 8. 候選索引中的 `evidence_origin` 只描述來源關係。內嵌影片、投影、圖文 claim
    或相關空景可以作為經 brief 授權的 contextual presentation，但不得被描述成
    來源場景中直接發生的動作、狀態轉換或功能結果。若 hard predicate 只得到
@@ -5437,6 +5532,10 @@ model_provenance 必須先原樣回傳：
 - `vertical_alternates` 必須恰好涵蓋該章所有非首選、且附有 bounded candidate
   video 的 candidate_rank；不得重複首選 rank。若某備選不適合 9:16，仍必須以
   `aspect_suitability=unsuitable` 如實回傳，不得省略它或假裝可用。
+- 9:16 primary 必須同時考慮此候選在全片的敘事功能、可讀性與已簽署的呈現能力。
+  若存在 natural 或 reconstructable 的候選可完成章節證據，不得把 unsuitable 候選
+  當 primary，再假設本機會用未宣告的裁切來拯救它。unsuitable 候選只能作為
+  明確不同 coverage function 的備選，且仍可能被本機 fail-closed。
 - chapter_index 與 entity_index 也只能複製輸入中的整數；本機會解析成不可變 ID。
 - brief 章節順序必須保留。音樂影響相對停留、章節能量、鏡頭關係與視覺
   落點意圖；不得自創 beat timestamp。本機 MusicMap 會解析合法影格與音訊點。

@@ -14003,10 +14003,12 @@ def _build_pre_render_vertical_candidate_route(
                     "candidate_capacity_below_resolved:"
                     f"{safe_capacity_ms}<{trim_duration_ms}"
                 )
-            planned_reuse_mode = chapter.source_reuse_mode
-            planned_reuse_justification = (
-                chapter.source_reuse_justification
-            )
+            # Source reuse is a property of the exact Top-K candidate.  The
+            # chapter fields are a backwards-compatible audit mirror for the
+            # selected primary only; applying them to every alternate used to
+            # let routing manufacture an editorial permission.
+            planned_reuse_mode = candidate.source_reuse_mode
+            planned_reuse_justification = candidate.source_reuse_justification
             return CandidateRouteOption(
                 beat_id=chapter.feature_id,
                 candidate_id=candidate.candidate_id,
@@ -16928,6 +16930,7 @@ def _audit_feature_plan_candidate_recall(
 def _effective_runtime_source_reuse_authority(
     selected: FeatureChapterSelect,
     *,
+    candidate: Mapping[str, Any] | None = None,
     prior_feature_id: str,
     overlap_ms: int,
     allowed_reuse_modes: Collection[str] | None,
@@ -16941,6 +16944,20 @@ def _effective_runtime_source_reuse_authority(
     editorial choice.
     """
 
+    if candidate is not None:
+        candidate_mode = str(candidate.get("source_reuse_mode") or "none")
+        candidate_justification = candidate.get("source_reuse_justification")
+        if candidate_mode != "none":
+            return (
+                candidate_mode,
+                str(candidate_justification)
+                if candidate_justification is not None
+                else None,
+                "gemini_candidate_intent",
+            )
+        # Candidate data is present and explicitly says none.  Do not let a
+        # chapter-level primary mirror authorize a different fallback.
+        return "none", None, "none"
     if selected.source_reuse_mode != "none":
         return (
             selected.source_reuse_mode,
@@ -16989,6 +17006,15 @@ def _audit_render_source_reuse(
             continue
         source_clip_id = str(chapter["source_clip_id"])
         selected = plan_by_id[feature_id]
+        selected_candidate_id = chapter.get("candidate_id")
+        selected_candidate = next(
+            (
+                candidate.model_dump(mode="json")
+                for candidate in selected.vertical_candidates
+                if candidate.candidate_id == selected_candidate_id
+            ),
+            None,
+        )
         current_start = int(chapter["source_in_ms"])
         current_end = int(chapter["source_out_ms"])
         current_fingerprint = chapter.get("segment_render_fingerprint")
@@ -17020,6 +17046,7 @@ def _audit_render_source_reuse(
                 reuse_authority_source,
             ) = _effective_runtime_source_reuse_authority(
                 selected,
+                candidate=selected_candidate,
                 prior_feature_id=str(prior["feature_id"]),
                 overlap_ms=overlap_ms,
                 allowed_reuse_modes=allowed_reuse_modes,
@@ -17045,7 +17072,6 @@ def _audit_render_source_reuse(
                 "planned_reuse_mode": selected.source_reuse_mode,
                 "reuse_authority_source": reuse_authority_source,
                 "source_use_index": source_use_index,
-                "maximum_source_uses": 2,
                 "requires_human_review": (
                     effective_reuse_mode
                     in {"alternate_presentation", "editorial_reprise"}
@@ -17053,8 +17079,7 @@ def _audit_render_source_reuse(
                 ),
             }
             row_violates = (
-                source_use_index > 2
-                or effective_reuse_mode == "none"
+                effective_reuse_mode == "none"
                 or (
                     allowed_reuse_modes is not None
                     and effective_reuse_mode
@@ -17108,6 +17133,7 @@ def _runtime_candidate_reuse_violation(
     selected: FeatureChapterSelect,
     prior_chapters: Sequence[Mapping[str, Any]],
     *,
+    candidate: Mapping[str, Any] | None = None,
     source_clip_id: str,
     source_in_ms: int,
     source_out_ms: int,
@@ -17136,19 +17162,11 @@ def _runtime_candidate_reuse_violation(
         and prior.get("source_in_ms") is not None
         and prior.get("source_out_ms") is not None
     ]
-    if len(prior_source_uses) >= 2:
-        return {
-            "prior_feature_ids": [
-                str(prior["feature_id"]) for prior in prior_source_uses
-            ],
-            "source_clip_id": source_clip_id,
-            "source_in_ms": source_in_ms,
-            "source_out_ms": source_out_ms,
-            "reuse_mode": selected.source_reuse_mode,
-            "justification": selected.source_reuse_justification,
-            "reason_code": "source_use_count_exceeds_bounded_v1_limit",
-            "maximum_source_uses": 2,
-        }
+    # A source may appear more than twice when Gemini explicitly assigns a
+    # different editorial purpose to each interval.  The old two-use limit
+    # was an implementation shortcut that silently turned a source-count
+    # heuristic into creative authority.  Validate every interval below;
+    # repetition remains a route-ranking penalty, never a local hard cap.
     for prior in prior_source_uses:
         if (
             prior.get("source_clip_id") != source_clip_id
@@ -17174,6 +17192,7 @@ def _runtime_candidate_reuse_violation(
             reuse_authority_source,
         ) = _effective_runtime_source_reuse_authority(
             selected,
+            candidate=candidate,
             prior_feature_id=str(prior["feature_id"]),
             overlap_ms=overlap_ms,
             allowed_reuse_modes=allowed_reuse_modes,
@@ -22249,6 +22268,11 @@ def _run_feature_cut_experiment_impl(
                     if _runtime_candidate_reuse_violation(
                         selected_chapter_for_fallback,
                         frontier_accepted_source_uses,
+                        candidate=local_payloads[
+                            _frontier_execution_key(
+                                feature_id, row[1], row[2]
+                            )
+                        ]["option"],
                         source_clip_id=RushClip.model_validate(
                             local_payloads[
                                 _frontier_execution_key(
@@ -23268,6 +23292,7 @@ def _run_feature_cut_experiment_impl(
                 reuse_violation = _runtime_candidate_reuse_violation(
                     selected_chapter,
                     frontier_accepted_source_uses,
+                    candidate=local_for_attempt["option"],
                     source_clip_id=local_clip.clip_id,
                     source_in_ms=int(local_for_attempt["start_ms"]),
                     source_out_ms=int(local_for_attempt["end_ms"]),
@@ -25721,6 +25746,7 @@ def _run_feature_cut_experiment_impl(
                         reuse_violation = _runtime_candidate_reuse_violation(
                             selected,
                             manifest["vertical"]["chapters"],
+                            candidate=option_data,
                             source_clip_id=candidate_clip.clip_id,
                             source_in_ms=candidate_start,
                             source_out_ms=candidate_end,

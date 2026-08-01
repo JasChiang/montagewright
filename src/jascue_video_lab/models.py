@@ -4396,10 +4396,30 @@ class FeatureVerticalCandidate(StrictModel):
     regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=8)
     virtual_camera_proposal: VerticalVirtualCameraProposal | None = None
     quality_risks: list[str] = Field(default_factory=list)
+    # Candidate-local reuse authority is intentionally separate from the
+    # chapter's selected-primary audit mirror.  The route optimizer may only
+    # select a repeated source when this exact candidate signed the reason.
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
     confidence: Confidence
 
     @model_validator(mode="after")
     def validate_geometry_intent(self) -> "FeatureVerticalCandidate":
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "candidate reuse justification requires a non-none reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError("candidate reuse requires an observable justification")
         if (
             self.source_camera_motion_role != "unknown"
             and not (self.source_camera_motion_reason or "").strip()

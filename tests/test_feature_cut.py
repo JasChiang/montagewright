@@ -12787,7 +12787,7 @@ def test_autonomous_editorial_reprise_rejects_major_interval_overlap() -> None:
     )
 
 
-def test_runtime_candidate_reuse_blocks_third_use_even_with_authority() -> None:
+def test_runtime_candidate_reuse_allows_third_distinct_interval_with_authority() -> None:
     selected = FeatureChapterSelect(
         feature_id="third",
         evidence_status="supported",
@@ -12823,10 +12823,37 @@ def test_runtime_candidate_reuse_blocks_third_use_even_with_authority() -> None:
         source_out_ms=5000,
     )
 
-    assert violation is not None
-    assert violation["reason_code"] == (
-        "source_use_count_exceeds_bounded_v1_limit"
+    assert violation is None
+
+
+def test_runtime_fallback_does_not_inherit_primary_reuse_authority() -> None:
+    selected = FeatureChapterSelect(
+        feature_id="fallback",
+        evidence_status="supported",
+        observed_visual_evidence="A different take.",
+        selection_reason="Fallback candidate.",
+        horizontal_frame_id="RF000004",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_frame_id="RF000004",
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.9,
+        source_reuse_mode="alternate_presentation",
+        source_reuse_justification="Primary is a deliberate reprise.",
     )
+    violation = _runtime_candidate_reuse_violation(
+        selected,
+        [{"feature_id": "first", "source_clip_id": "clip-a", "source_in_ms": 0, "source_out_ms": 1000}],
+        candidate={"source_reuse_mode": "none", "source_reuse_justification": None},
+        source_clip_id="clip-a",
+        source_in_ms=2000,
+        source_out_ms=3000,
+    )
+    assert violation is not None
+    assert violation["reason_code"] == "source_reuse_authority_failed"
 
 
 def test_music_cues_are_projected_from_source_to_assembly_timeline() -> None:
