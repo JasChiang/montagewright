@@ -2119,6 +2119,52 @@ def _validate_feature_plan_binding(
         )
 
 
+def _external_projection_binding_can_refresh_locally(
+    saved: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> bool:
+    """Permit a verified local reprojection without reusing stale sidecars.
+
+    A direct-plan canonicalization/schema migration can deterministically
+    regenerate the projected FeatureEditPlan and its pointer record from the
+    same paid request.  The external projection validator has already checked
+    every raw artifact before this predicate is called.  We may archive and
+    replace only the stale *derived* binding; changing paid-request, media,
+    brief, music, model, or schema provenance still fails closed.
+    """
+
+    identity_keys = (
+        "origin",
+        "external_projection_contract_id",
+        "catalog_sha256",
+        "catalog_reel_sha256",
+        "brief_sha256",
+        "music_sha256",
+        "plan_prompt_sha256",
+        "system_instruction_sha256",
+        "model_id",
+        "model_id_sha256",
+        "response_schema_sha256",
+        "request_sha256",
+        "projection_contract_sha256",
+    )
+    if any(saved.get(key) != current.get(key) for key in identity_keys):
+        return False
+    derived_keys = {
+        "plan_sha256",
+        "projection_pointer_sha256",
+        "projection_record_sha256",
+        "source_artifact_set_sha256",
+        "source_plan_sha256",
+    }
+    changed = {
+        key
+        for key in set(saved) | set(current)
+        if key != "created_at" and saved.get(key) != current.get(key)
+    }
+    return bool(changed) and changed <= derived_keys
+
+
 def _migrate_legacy_feature_plan_binding(
     *,
     plan_dir: Path,
@@ -19750,6 +19796,19 @@ def _run_feature_cut_experiment_impl(
                         music_sha256=music_sha256,
                         created_at=utc_now(),
                     )
+                    if _external_projection_binding_can_refresh_locally(
+                        saved_binding,
+                        current_binding,
+                    ):
+                        archived_binding_path = plan_binding_path.with_name(
+                            "feature-plan.binding.superseded-"
+                            + sha256_file(plan_binding_path)[:16]
+                            + ".json"
+                        )
+                        if not archived_binding_path.exists():
+                            write_json(archived_binding_path, saved_binding)
+                        write_json(plan_binding_path, current_binding)
+                        saved_binding = current_binding
                 else:
                     saved_origin = saved_binding.get("origin")
                     if saved_origin not in {"generated", "migrated_legacy_reuse"}:

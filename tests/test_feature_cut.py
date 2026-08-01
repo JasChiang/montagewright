@@ -54,6 +54,7 @@ from jascue_video_lab.feature_cut import (
     _bounded_cue_shifted_window,
     _bind_regions_to_editorial_relation,
     _candidate_capability_boundaries,
+    _external_projection_binding_can_refresh_locally,
     _semantic_beat_for_runtime_candidate,
     _bind_runtime_candidate_coverage,
     _audit_render_source_reuse,
@@ -1865,6 +1866,39 @@ def test_candidate_capability_boundary_does_not_rewrite_panel_to_crop() -> None:
 
     assert acceptable == ("two_panel_layout",)
     assert "tracked_full_bleed_crop" in forbidden
+
+
+def test_external_projection_binding_refreshes_only_derived_reprojection_hashes() -> None:
+    identity = {
+        "origin": "external_projection",
+        "external_projection_contract_id": "direct-video-edit-plan-v2",
+        "catalog_sha256": "a" * 64,
+        "catalog_reel_sha256": "b" * 64,
+        "brief_sha256": "c" * 64,
+        "music_sha256": "d" * 64,
+        "plan_prompt_sha256": "e" * 64,
+        "system_instruction_sha256": "f" * 64,
+        "model_id": MODEL_ID,
+        "model_id_sha256": "1" * 64,
+        "response_schema_sha256": "2" * 64,
+        "request_sha256": "3" * 64,
+        "projection_contract_sha256": "4" * 64,
+    }
+    saved = {
+        **identity,
+        "plan_sha256": "5" * 64,
+        "projection_pointer_sha256": "6" * 64,
+        "projection_record_sha256": "7" * 64,
+        "source_artifact_set_sha256": "8" * 64,
+        "source_plan_sha256": "9" * 64,
+    }
+    refreshed = {**saved, "plan_sha256": "0" * 64}
+
+    assert _external_projection_binding_can_refresh_locally(saved, refreshed)
+    assert not _external_projection_binding_can_refresh_locally(
+        saved,
+        {**refreshed, "request_sha256": "0" * 64},
+    )
 
 
 def test_pre_render_frontier_order_drives_runtime_fallback_sequence() -> None:
