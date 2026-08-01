@@ -2097,6 +2097,14 @@ def test_frozen_frontier_execution_lookup_preserves_route_specific_trim() -> Non
     assert bindings["beat"]["b" * 64].trim_duration_ms == 6_500
 
 
+def test_feature_cut_runner_does_not_shadow_dense_catalog_model() -> None:
+    """Cached dense catalogs must remain usable in the finalizer scope."""
+
+    assert "DenseFrameCatalog" not in (
+        run_feature_cut_experiment.__code__.co_varnames
+    )
+
+
 def test_semantic_replan_frontier_is_bounded_and_carries_adjacent_context() -> None:
     def option(
         beat_id: str,

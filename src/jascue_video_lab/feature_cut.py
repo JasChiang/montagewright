@@ -26153,8 +26153,6 @@ def _run_feature_cut_experiment_impl(
                         )
                         dense_catalog_path = dense_root / "dense-catalog.json"
                         if dense_catalog_path.is_file():
-                            from .models import DenseFrameCatalog
-
                             dense_catalog = DenseFrameCatalog.model_validate(
                                 read_json(dense_catalog_path)
                             )
