@@ -2274,6 +2274,14 @@ def test_local_presentation_change_requires_scoped_semantic_replan() -> None:
         requested_mode="tracked_full_bleed",
         measured_mode="tracked_crop",
     )
+    assert not _presentation_requires_scoped_semantic_replan(
+        requested_mode="tracked_full_bleed",
+        measured_mode="static_full_bleed_crop",
+        gemini_authorized_modes=(
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+        ),
+    )
 
 
 def test_pre_render_feasibility_does_not_locally_pick_an_authorized_fallback(

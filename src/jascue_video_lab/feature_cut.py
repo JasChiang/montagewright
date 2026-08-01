@@ -273,7 +273,7 @@ _CONTROLLED_PHASE_MIN_VISIBLE_FRACTION = 2 / 3
 _FEATURE_PLAN_BINDING_VERSION = "feature-plan-binding-v1"
 _EXTERNAL_PROJECTION_SIDECAR_VERSION = "external-feature-plan-projection-v1"
 _EXTERNAL_PROJECTION_POINTER_NAME = "feature-plan.external-projection.json"
-_FRONTIER_LOCAL_BINDING_VERSION = "vertical-frontier-local-input-v3"
+_FRONTIER_LOCAL_BINDING_VERSION = "vertical-frontier-local-input-v4"
 _FRONTIER_EXACT_BINDING_VERSION = "vertical-frontier-exact-input-v2"
 _FRONTIER_GEOMETRY_BINDING_VERSION = "vertical-frontier-geometry-input-v4"
 _FRONTIER_FULFILLMENT_COMPILER_VERSION = (
@@ -13540,12 +13540,26 @@ def _presentation_requires_scoped_semantic_replan(
     *,
     requested_mode: str,
     measured_mode: str,
+    gemini_authorized_modes: Sequence[str] = (),
 ) -> bool:
-    """Keep a numeric presentation recovery from becoming an edit decision."""
+    """Require replan only outside Gemini's declared capability boundary.
 
+    ``tracked_full_bleed`` is an attention policy, not an instruction to add
+    motion when the measured source and subject are stable.  If the semantic
+    plan explicitly allows a static full-bleed crop for this candidate, that
+    measured hold is already a Gemini-authorized execution, rather than a
+    local fallback.
+    """
+
+    normalized_measured = _normalized_vertical_presentation_mode(measured_mode)
+    normalized_authorized = {
+        _normalized_vertical_presentation_mode(mode)
+        for mode in gemini_authorized_modes
+    }
     return (
         _normalized_vertical_presentation_mode(requested_mode)
-        != _normalized_vertical_presentation_mode(measured_mode)
+        != normalized_measured
+        and normalized_measured not in normalized_authorized
     )
 
 
@@ -16045,6 +16059,11 @@ def _compile_autonomous_vertical_candidate_geometry(
             or _presentation_requires_scoped_semantic_replan(
                 requested_mode=requested_mode,
                 measured_mode=applied_mode,
+                gemini_authorized_modes=(
+                    semantic_beat.acceptable_capability_ids
+                    if semantic_beat is not None
+                    else ()
+                ),
             )
         )
         else "deferred_semantic_replan"
