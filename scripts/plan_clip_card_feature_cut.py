@@ -1521,6 +1521,80 @@ def canonicalize_direct_video_edit_plan_output(
                             ),
                         }
                     )
+            sequence = decision.get("attention_sequence")
+            if not isinstance(sequence, list):
+                sequence = []
+                decision["attention_sequence"] = sequence
+            referenced = {
+                index
+                for step in sequence
+                if isinstance(step, dict)
+                for index in step.get("anchor_entity_indices", [])
+                if isinstance(index, int)
+            }
+            missing_required = [
+                index for index in required if index not in referenced
+            ]
+            if (
+                sequence
+                and missing_required
+                and decision_path != "vertical"
+            ):
+                before_sequence = [dict(step) for step in sequence]
+                # Missing required attention is not evidence that a particular
+                # traversal order is safe.  Preserve all hard scope in one
+                # static phase; local geometry can then accept, panel, fit, or
+                # reject it without a fabricated camera path.
+                decision["attention_sequence"] = [
+                    {
+                        "start_progress": 0.0,
+                        "end_progress": 1.0,
+                        "anchor_entity_indices": required,
+                        "camera_behavior": "hold",
+                        "movement_motivation": "none",
+                        "cut_admissible": False,
+                        "transition_preference": "auto",
+                    }
+                ]
+                before_coverage = decision.get("coverage_mode")
+                before_traversal = decision.get("traversal_policy")
+                decision["coverage_mode"] = "simultaneous"
+                decision["traversal_policy"] = "no_continuous_traversal"
+                changes.append(
+                    {
+                        "json_path": f"{decision_base}.attention_sequence",
+                        "before": before_sequence,
+                        "after": decision["attention_sequence"],
+                        "rule": (
+                            "incomplete_required_attention_fails_safe_to_"
+                            "joint_static_hold"
+                        ),
+                    }
+                )
+                if before_coverage != "simultaneous":
+                    changes.append(
+                        {
+                            "json_path": f"{decision_base}.coverage_mode",
+                            "before": before_coverage,
+                            "after": "simultaneous",
+                            "rule": (
+                                "joint_static_hold_requires_simultaneous_"
+                                "coverage"
+                            ),
+                        }
+                    )
+                if before_traversal != "no_continuous_traversal":
+                    changes.append(
+                        {
+                            "json_path": f"{decision_base}.traversal_policy",
+                            "before": before_traversal,
+                            "after": "no_continuous_traversal",
+                            "rule": (
+                                "joint_static_hold_disables_synthetic_"
+                                "traversal"
+                            ),
+                        }
+                    )
         reuse_mode = chapter.get("source_reuse_mode")
         reuse_justification = chapter.get("source_reuse_justification")
         if reuse_mode == "distinct_interval" and not (

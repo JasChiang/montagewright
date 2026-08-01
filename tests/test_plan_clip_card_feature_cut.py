@@ -702,6 +702,14 @@ def test_direct_video_canonicalization_demotes_unexplained_source_motion() -> No
                         "required_entity_indices": [1, 2],
                         "preferred_entity_indices": [3],
                         "sacrificable_entity_indices": [3],
+                        "attention_sequence": [
+                            {
+                                "start_progress": 0.0,
+                                "end_progress": 1.0,
+                                "anchor_entity_indices": [1],
+                                "camera_behavior": "hold",
+                            }
+                        ],
                     }
                 ],
             }
@@ -720,12 +728,25 @@ def test_direct_video_canonicalization_demotes_unexplained_source_motion() -> No
     )
     assert chapter["vertical_alternates"][0]["crop_mode"] == "primary_center"
     assert chapter["vertical_alternates"][0]["sacrificable_entity_indices"] == []
+    assert chapter["vertical_alternates"][0]["coverage_mode"] == "simultaneous"
+    assert chapter["vertical_alternates"][0]["attention_sequence"] == [
+        {
+            "start_progress": 0.0,
+            "end_progress": 1.0,
+            "anchor_entity_indices": [1, 2],
+            "camera_behavior": "hold",
+            "movement_motivation": "none",
+            "cut_admissible": False,
+            "transition_preference": "auto",
+        }
+    ]
     assert {
         change["rule"] for change in changes
     } >= {
         "unexplained_source_camera_motion_classification_fails_safe_to_unknown",
         "explicit_controlled_clip_uses_primary_center_representation",
         "entity_role_precedence_required_preferred_sacrificable",
+        "incomplete_required_attention_fails_safe_to_joint_static_hold",
     }
 
 
