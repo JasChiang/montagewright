@@ -24,6 +24,7 @@ from jascue_video_lab.sequence_optimizer import (
     RuntimeSegmentTiming,
     SegmentRenderCacheKey,
     SegmentRenderRequest,
+    SemanticReplanReuseAuthority,
     SemanticRhythmSpec,
     SequenceOption,
     ResolvedTimelineV1,
@@ -35,6 +36,7 @@ from jascue_video_lab.sequence_optimizer import (
     optimize_sequence,
     optimize_pre_render_candidate_route,
     record_round_robin_frontier_attempt,
+    rebuild_route_with_semantic_authorities,
     reconcile_runtime_sequence_timing,
     render_segments_incrementally,
     select_next_compatible_route,
@@ -506,7 +508,7 @@ def _movable_route_option(
     )
 
 
-def test_pre_render_route_uses_global_variety_without_discarding_semantics() -> None:
+def test_pre_render_route_preserves_gemini_rank_without_measured_hard_conflict() -> None:
     route = optimize_pre_render_candidate_route(
         (
             CandidateRouteBeat(
@@ -525,8 +527,11 @@ def test_pre_render_route_uses_global_variety_without_discarding_semantics() -> 
         )
     )
 
-    assert [row.candidate_id for row in route.selections] == ["a1", "b2"]
-    assert "adjacent_source_variety_preferred" in (
+    # The lightweight pre-render facts do not prove an interval collision, so
+    # local variety scoring must not overrule Gemini's rank-1 selection. A
+    # later measured reuse conflict is a hard gate and reaches scoped replan.
+    assert [row.candidate_id for row in route.selections] == ["a1", "b1"]
+    assert "gemini_candidate_rank_preserved" in (
         route.selections[1].decision_codes
     )
     # The alternate complete route remains a valid strict-frontier attempt,
@@ -891,6 +896,90 @@ def test_mixed_alternate_presentation_and_reprise_support_three_source_uses() ->
             - max(interval[0], closing_interval[0]),
         )
         assert overlap <= 2_000
+
+
+def test_semantic_replan_rebuilds_full_route_after_gemini_reuse_authority() -> None:
+    """A reuse decision rebuilds every hard route constraint, never a splice."""
+
+    opening = _timed_route_option(
+        "opening",
+        "opening-a",
+        "a",
+        source_in_ms=0,
+        source_out_ms=3_000,
+    )
+    fold_primary = _timed_route_option(
+        "fold",
+        "fold-b",
+        "b",
+        source_in_ms=0,
+        source_out_ms=3_000,
+        rank=1,
+    )
+    fold_reuse_candidate = _timed_route_option(
+        "fold",
+        "fold-a-detail",
+        "a",
+        source_in_ms=3_000,
+        source_out_ms=6_000,
+        rank=2,
+    )
+    closing = _timed_route_option(
+        "closing",
+        "closing-c",
+        "c",
+        source_in_ms=0,
+        source_out_ms=3_000,
+    )
+    frontier = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(opening,)),
+            CandidateRouteBeat(
+                beat_id="fold",
+                options=(fold_primary, fold_reuse_candidate),
+            ),
+            CandidateRouteBeat(beat_id="closing", options=(closing,)),
+        )
+    )
+
+    assert [selection.candidate_id for selection in frontier.selections] == [
+        "opening-a",
+        "fold-b",
+        "closing-c",
+    ]
+    replan_binding = next(
+        binding
+        for binding in frontier.semantic_replan_candidate_bindings_by_beat["fold"]
+        if binding.option.candidate_id == "fold-a-detail"
+    )
+    assert replan_binding.replan_required_codes == (
+        "source_reuse_authority_missing",
+    )
+    assert "fold-a-detail" not in frontier.option_bindings_by_beat["fold"]
+
+    rebuilt = rebuild_route_with_semantic_authorities(
+        frontier,
+        selected_candidate_ids_by_beat={"fold": "fold-a-detail"},
+        reuse_authorities_by_beat={
+            "fold": SemanticReplanReuseAuthority(
+                beat_id="fold",
+                candidate_id="fold-a-detail",
+                reuse_mode="distinct_interval",
+                reuse_justification="The later detail exposes a different state.",
+                reuse_of_beat_ids=("opening",),
+            )
+        },
+    )
+
+    assert [selection.candidate_id for selection in rebuilt.selections] == [
+        "opening-a",
+        "fold-a-detail",
+        "closing-c",
+    ]
+    assert rebuilt.selections[1].reuse_mode == "distinct_interval"
+    assert rebuilt.selections[1].candidate_execution_sha256 != (
+        frontier.selections[1].candidate_execution_sha256
+    )
 
 
 def test_center_overlap_repositions_safe_window_for_distinct_interval() -> None:

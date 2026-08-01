@@ -143,7 +143,7 @@ class BoundedSemanticNegotiationResult(FrozenStrictModel):
 class GroupedEditDecisionProposal(FrozenStrictModel):
     """One immutable option choice for every beat in a grouped replan."""
 
-    decisions: tuple[EditDecisionProposal, ...] = Field(
+    decisions: tuple["GroupedSemanticReplanDecision", ...] = Field(
         min_length=1,
         max_length=8,
     )
@@ -153,6 +153,40 @@ class GroupedEditDecisionProposal(FrozenStrictModel):
         beat_ids = [decision.beat_id for decision in self.decisions]
         if len(beat_ids) != len(set(beat_ids)):
             raise ValueError("grouped edit decisions must have unique beat IDs")
+        return self
+
+
+class GroupedSemanticReplanDecision(EditDecisionProposal):
+    """A bounded whole-route choice, optionally authorizing source reuse."""
+
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
+    reuse_of_beat_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_reuse_authority(self) -> "GroupedSemanticReplanDecision":
+        if self.source_reuse_mode == "none":
+            if (
+                self.source_reuse_justification is not None
+                or self.reuse_of_beat_ids
+            ):
+                raise ValueError(
+                    "none source reuse decision cannot carry reuse authority"
+                )
+            return self
+        if not (self.source_reuse_justification or "").strip():
+            raise ValueError("source reuse decision requires a justification")
+        if not self.reuse_of_beat_ids:
+            raise ValueError("source reuse decision requires reused beat IDs")
+        if self.beat_id in self.reuse_of_beat_ids:
+            raise ValueError("source reuse decision cannot reference its own beat")
+        if len(set(self.reuse_of_beat_ids)) != len(self.reuse_of_beat_ids):
+            raise ValueError("source reuse decision beat IDs must be unique")
         return self
 
 
@@ -1857,6 +1891,15 @@ class GeminiLabClient:
                     + beat_id
                     + ": "
                     + ", ".join(sorted(invalid_ids))
+                )
+            if (
+                decision.source_reuse_mode != "none"
+                and decision.source_reuse_mode
+                not in policy.editorial.allow_source_reuse
+            ):
+                raise ValueError(
+                    "grouped semantic decision selected a source reuse mode "
+                    "forbidden by policy: " + decision.source_reuse_mode
                 )
         result = BoundedGroupedSemanticNegotiationResult(
             decision=proposal,

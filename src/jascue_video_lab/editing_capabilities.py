@@ -1,8 +1,10 @@
 """Versioned editing capabilities exposed to semantic planners.
 
-The catalog is intentionally small.  Gemini chooses editorial intent from
-these verbs; deterministic code still owns exact PTS, Grounding, tracking,
-geometry, motion limits, candidate routing, and delivery eligibility.
+The catalog is intentionally small. Gemini chooses editorial intent from
+these verbs; deterministic code owns exact PTS, Grounding, tracking,
+geometry, motion limits and delivery eligibility. It may reject an infeasible
+candidate or bind a Gemini-ranked recovery frontier, but it must not use
+candidate routing to replace Gemini's selected source or presentation family.
 """
 
 from __future__ import annotations

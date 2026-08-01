@@ -158,6 +158,14 @@ class EditorialPolicy(FrozenStrictModel):
         ],
         ...,
     ] = ("distinct_interval", "alternate_presentation", "editorial_reprise")
+    # This is an editorial limit, not an implementation convenience.  It is
+    # hash-bound so the candidate-route solver, runtime reuse preflight and
+    # final audit all prove the same permission boundary.
+    max_editorial_reprise_overlap_fraction: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+    )
 
 
 class SyncPolicy(FrozenStrictModel):

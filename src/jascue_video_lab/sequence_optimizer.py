@@ -719,6 +719,7 @@ class CandidateRouteSelection(FrozenStrictModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     reuse_mode: SourceReuseMode = "none"
+    reuse_justification: str | None = None
 
     @model_validator(mode="after")
     def validate_source_interval(self) -> "CandidateRouteSelection":
@@ -770,6 +771,47 @@ class CandidateCompleteRoute(FrozenStrictModel):
         return self
 
 
+class SemanticReplanCandidateBinding(FrozenStrictModel):
+    """A preflight-safe option reserved for Gemini, not local fallback.
+
+    A candidate can be absent from every complete route solely because it
+    requires an editorial reuse authorization in the eventual whole sequence.
+    Keeping it here lets one bounded semantic replan consider the real
+    candidate without letting the renderer execute it speculatively.
+    """
+
+    option: CandidateRouteOption
+    replan_required_codes: tuple[str, ...] = ()
+
+
+class SemanticReplanReuseAuthority(FrozenStrictModel):
+    """Gemini's limited authority to reuse one immutable candidate."""
+
+    beat_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    reuse_mode: SourceReuseMode = "none"
+    reuse_justification: str | None = None
+    reuse_of_beat_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> "SemanticReplanReuseAuthority":
+        if self.reuse_mode == "none":
+            if self.reuse_justification is not None or self.reuse_of_beat_ids:
+                raise ValueError(
+                    "none reuse authority cannot include a reason or source beats"
+                )
+            return self
+        if not (self.reuse_justification or "").strip():
+            raise ValueError("semantic reuse authority requires a justification")
+        if not self.reuse_of_beat_ids:
+            raise ValueError("semantic reuse authority requires source beat IDs")
+        if len(set(self.reuse_of_beat_ids)) != len(self.reuse_of_beat_ids):
+            raise ValueError("semantic reuse authority source beat IDs must be unique")
+        if self.beat_id in self.reuse_of_beat_ids:
+            raise ValueError("semantic reuse authority cannot reference itself")
+        return self
+
+
 class CandidateRouteResult(FrozenStrictModel):
     contract_version: Literal["pre-render-sequence-frontier-v2"] = (
         "pre-render-sequence-frontier-v2"
@@ -784,6 +826,12 @@ class CandidateRouteResult(FrozenStrictModel):
     beam_width: int = Field(gt=0)
     total_duration_ms: int = Field(gt=0)
     ranked_routes: tuple[CandidateCompleteRoute, ...] = ()
+    # These options are deliberately separate from ``option_bindings``:
+    # being available for one Gemini replan does not authorize renderer
+    # fallback or paid exact/grounding work.
+    semantic_replan_candidate_bindings_by_beat: Mapping[
+        str, tuple[SemanticReplanCandidateBinding, ...]
+    ] = Field(default_factory=dict)
     unresolved_runtime_hard_gates: tuple[str, ...] = (
         "exact_event_evidence",
         "identity",
@@ -1888,6 +1936,8 @@ def candidate_route_execution_sha256(
         "source_out_ms": source_out_ms,
         "cue_id": option.cue_id,
         "presentation_mode": option.presentation_mode,
+        "reuse_mode": option.reuse_mode,
+        "reuse_justification": option.reuse_justification,
         "entry_composition": option.entry_composition,
         "exit_composition": option.exit_composition,
     }
@@ -1937,6 +1987,7 @@ def _candidate_route_selection(
             source_out_ms=source_out_ms,
         ),
         reuse_mode=option.reuse_mode,
+        reuse_justification=option.reuse_justification,
     )
 
 
@@ -2119,6 +2170,73 @@ def _candidate_complete_route(
     )
 
 
+def _semantic_replan_bindings(
+    beats: Sequence[CandidateRouteBeat],
+    *,
+    primary_route: CandidateCompleteRoute,
+    max_editorial_reprise_overlap_fraction: float,
+) -> dict[str, tuple[SemanticReplanCandidateBinding, ...]]:
+    """Retain safe candidates that need Gemini's whole-route judgement.
+
+    This is intentionally conservative: candidates with preflight hard
+    failures never enter the semantic set.  A possible source-reuse conflict
+    is reported as a requirement rather than locally solved; the later
+    replan/rebuild must still prove the final intervals and all project gates.
+    """
+
+    option_by_beat_and_id = {
+        (beat.beat_id, option.candidate_id): option
+        for beat in beats
+        for option in beat.options
+    }
+    bindings: dict[str, tuple[SemanticReplanCandidateBinding, ...]] = {}
+    for beat in beats:
+        rows: list[SemanticReplanCandidateBinding] = []
+        for option in beat.options:
+            if option.preflight_hard_failures:
+                continue
+            candidate_selection = _candidate_route_selection(
+                option,
+                duration_ms=option.trim_duration_ms,
+                decision_codes=("semantic_replan_candidate_projection",),
+            )
+            prior: list[tuple[CandidateRouteOption, CandidateRouteSelection]] = []
+            for selection in primary_route.selections:
+                if selection.beat_id == beat.beat_id:
+                    continue
+                selected_option = option_by_beat_and_id.get(
+                    (selection.beat_id, selection.candidate_id)
+                )
+                if selected_option is not None:
+                    prior.append((selected_option, selection))
+            reuse_failure = _candidate_reuse_failure(
+                prior,
+                option,
+                candidate_selection,
+                max_editorial_reprise_overlap_fraction=(
+                    max_editorial_reprise_overlap_fraction
+                ),
+            )
+            rows.append(
+                SemanticReplanCandidateBinding(
+                    option=option,
+                    replan_required_codes=(
+                        (reuse_failure,) if reuse_failure is not None else ()
+                    ),
+                )
+            )
+        bindings[beat.beat_id] = tuple(
+            sorted(
+                rows,
+                key=lambda row: (
+                    row.option.planner_rank,
+                    row.option.candidate_id,
+                ),
+            )
+        )
+    return bindings
+
+
 def optimize_pre_render_candidate_route(
     beats: Sequence[CandidateRouteBeat],
     *,
@@ -2131,12 +2249,16 @@ def optimize_pre_render_candidate_route(
     max_ranked_routes: int | None = None,
     max_duration_variants_per_route: int = 16,
 ) -> CandidateRouteResult:
-    """Choose the executable pre-render frontier without inventing geometry.
+    """Build an executable frontier without making editorial substitutions.
 
-    Options with a known hard failure are removed before any preference score
-    is evaluated.  This is intentionally a first-stage optimizer: runtime
-    exact evidence and geometry remain fail-closed gates, and the result also
-    carries a globally contextual fallback order for those later failures.
+    Gemini ranks source/event/presentation candidates.  This routine may
+    remove only candidates with a deterministic hard failure, bind legal
+    source intervals and validate project limits.  When more than one complete
+    route remains, its primary route is therefore the lexicographic Gemini
+    rank vector, never a local blend of confidence, technical quality,
+    apparent variety or presentation intrusion.  Those measurements stay in
+    the artifacts for a bounded semantic replan; they are not local creative
+    authority.
     """
 
     if beam_width < 1:
@@ -2225,46 +2347,14 @@ def optimize_pre_render_candidate_route(
                     ),
                 ) is None:
                     continue
-                exact_repeat = (
-                    option.source_asset_id,
-                    option.event_id,
-                ) in state.source_events
-                source_repeat_count = state.source_asset_ids.count(
-                    option.source_asset_id
-                )
-                immediate_repeat = bool(
-                    state.source_asset_ids
-                    and state.source_asset_ids[-1] == option.source_asset_id
-                )
-                composition_continuity = (
-                    state.exit_composition is not None
-                    and state.exit_composition != "unresolved"
-                    and option.entry_composition != "unresolved"
-                    and state.exit_composition == option.entry_composition
-                )
-                readability = min(
-                    1.0,
-                    option.trim_duration_ms
-                    / max(option.preferred_readable_ms, 1),
-                )
-                score = (
-                    state.score
-                    + option.semantic_confidence * 1.2
-                    + option.technical_quality * 0.20
-                    + readability * 0.15
-                    + (0.08 if option.cue_aligned else 0.0)
-                    + (0.05 if composition_continuity else 0.0)
-                    - (option.planner_rank - 1) * 0.10
-                    - option.presentation_intrusion_rank * 0.025
-                    - source_repeat_count * 0.12
-                    - (0.22 if immediate_repeat else 0.0)
-                    - (0.75 if exact_repeat else 0.0)
-                )
-                codes = ["gemini_semantic_rank_respected"]
-                if not exact_repeat:
-                    codes.append("exact_source_event_repetition_avoided")
-                if not immediate_repeat:
-                    codes.append("adjacent_source_variety_preferred")
+                # This is deliberately *not* an aesthetic score.  Source
+                # variety, confidence, technical quality and composition are
+                # useful observations, but using them to promote an otherwise
+                # feasible rank-2 candidate would turn the executor into a
+                # second editor.  Reuse/identity/geometry constraints remain
+                # hard gates elsewhere in this route construction.
+                score = state.score - option.planner_rank
+                codes = ["gemini_candidate_rank_preserved"]
                 codes.extend(
                     (
                         "resolved_trim_bound_before_render",
@@ -2274,8 +2364,6 @@ def optimize_pre_render_candidate_route(
                         "runtime_hard_gates_remain_fail_closed",
                     )
                 )
-                if composition_continuity:
-                    codes.append("symbolic_composition_continuity_preferred")
                 expanded.append(
                     _CandidateRouteState(
                         selections=state.selections
@@ -2312,13 +2400,12 @@ def optimize_pre_render_candidate_route(
         states = sorted(
             expanded,
             key=lambda state: (
-                state.score,
+                tuple(option.planner_rank for option in state.options),
                 tuple(
                     selection.candidate_id
                     for selection in state.selections
                 ),
             ),
-            reverse=True,
         )[:beam_width]
     ranked_route_states: list[
         tuple[CandidateCompleteRoute, _CandidateRouteState]
@@ -2356,13 +2443,14 @@ def optimize_pre_render_candidate_route(
             ranked_route_states.append((route, state))
     ranked_route_states.sort(
         key=lambda item: (
-            item[0].objective_score,
+            tuple(
+                option.planner_rank for option in item[1].options
+            ),
             tuple(
                 selection.candidate_id
                 for selection in item[0].selections
             ),
         ),
-        reverse=True,
     )
     if max_ranked_routes is not None:
         ranked_route_states = ranked_route_states[:max_ranked_routes]
@@ -2405,9 +2493,10 @@ def optimize_pre_render_candidate_route(
         # Dropping it here previously produced an execution binding without
         # the candidate-local safe-window fact required by strict preflight.
         contextual_legal = list(legal)
-        # The primary comes from the global beam. Remaining options are
+        # The primary comes from Gemini's rank vector. Remaining options are
         # present only because at least one saved complete route proved them
-        # jointly feasible; runtime never invents an unranked fallback.
+        # jointly feasible; runtime never invents an unranked fallback or
+        # locally promotes one for variety/quality reasons.
         alternatives = sorted(
             (
                 option
@@ -2415,20 +2504,9 @@ def optimize_pre_render_candidate_route(
                 if option.candidate_id != selected_candidate_id
             ),
             key=lambda option: (
-                option.semantic_confidence * 1.2
-                + option.technical_quality * 0.20
-                + min(
-                    1.0,
-                    option.trim_duration_ms
-                    / max(option.preferred_readable_ms, 1),
-                )
-                * 0.15
-                + (0.08 if option.cue_aligned else 0.0)
-                - (option.planner_rank - 1) * 0.10
-                - option.presentation_intrusion_rank * 0.025,
+                option.planner_rank,
                 option.candidate_id,
             ),
-            reverse=True,
         )
         fallback_candidate_ids_by_beat[beat.beat_id] = (
             selected_candidate_id,
@@ -2447,7 +2525,133 @@ def optimize_pre_render_candidate_route(
         ranked_routes=tuple(
             route for route, _ in ranked_route_states
         ),
+        semantic_replan_candidate_bindings_by_beat=(
+            _semantic_replan_bindings(
+                beats,
+                primary_route=best_route,
+                max_editorial_reprise_overlap_fraction=(
+                    max_editorial_reprise_overlap_fraction
+                ),
+            )
+        ),
     )
+
+
+def rebuild_route_with_semantic_authorities(
+    frontier: CandidateRouteResult,
+    *,
+    selected_candidate_ids_by_beat: Mapping[str, str],
+    reuse_authorities_by_beat: Mapping[str, SemanticReplanReuseAuthority],
+    minimum_duration_ms: int | None = None,
+    maximum_duration_ms: int | None = None,
+    max_panel_runtime_fraction: float | None = None,
+    target_duration_ms: int | None = None,
+    max_editorial_reprise_overlap_fraction: float = 0.5,
+) -> CandidateCompleteRoute:
+    """Rebuild one full route after Gemini makes a bounded replan decision.
+
+    No existing ``CandidateRouteSelection`` is patched.  Gemini may select
+    only one retained candidate per affected beat and may add a typed reuse
+    authority for that exact candidate.  The whole route is then re-solved so
+    timing, source intervals, panel runtime and reuse constraints are proved
+    together before any paid exact-event or grounding stage is admitted.
+    """
+
+    known_beats = tuple(frontier.semantic_replan_candidate_bindings_by_beat)
+    if set(selected_candidate_ids_by_beat) - set(known_beats):
+        raise ValueError("semantic replan selected an unknown beat")
+    if set(reuse_authorities_by_beat) - set(known_beats):
+        raise ValueError("semantic replan reuse authority references an unknown beat")
+
+    primary_by_beat = {
+        selection.beat_id: selection.candidate_id
+        for selection in frontier.selections
+    }
+    rebuilt_beats: list[CandidateRouteBeat] = []
+    for beat_id in known_beats:
+        candidate_id = selected_candidate_ids_by_beat.get(
+            beat_id,
+            primary_by_beat.get(beat_id),
+        )
+        if candidate_id is None:
+            raise ValueError("semantic replan has no primary candidate for " + beat_id)
+        binding = next(
+            (
+                row
+                for row in frontier.semantic_replan_candidate_bindings_by_beat[
+                    beat_id
+                ]
+                if row.option.candidate_id == candidate_id
+            ),
+            None,
+        )
+        if binding is None:
+            raise ValueError(
+                "semantic replan selected a candidate outside its immutable "
+                "candidate bindings: " + beat_id + ":" + candidate_id
+            )
+        if binding.replan_required_codes and any(
+            code != "source_reuse_authority_missing"
+            for code in binding.replan_required_codes
+        ):
+            raise ValueError(
+                "semantic replan candidate retains a non-authorizable hard "
+                "conflict: " + ",".join(binding.replan_required_codes)
+            )
+        authority = reuse_authorities_by_beat.get(beat_id)
+        option = binding.option
+        if authority is not None:
+            if authority.candidate_id != candidate_id:
+                raise ValueError(
+                    "semantic reuse authority does not bind selected candidate"
+                )
+            if option.reuse_mode != "none":
+                raise ValueError(
+                    "semantic replan cannot replace existing candidate reuse authority"
+                )
+            option = option.model_copy(
+                update={
+                    "reuse_mode": authority.reuse_mode,
+                    "reuse_justification": authority.reuse_justification,
+                }
+            )
+        elif "source_reuse_authority_missing" in binding.replan_required_codes:
+            raise ValueError(
+                "semantic replan selected a candidate that requires explicit "
+                "reuse authority"
+            )
+        rebuilt_beats.append(
+            CandidateRouteBeat(beat_id=beat_id, options=(option,))
+        )
+
+    rebuilt = optimize_pre_render_candidate_route(
+        tuple(rebuilt_beats),
+        beam_width=1,
+        minimum_duration_ms=minimum_duration_ms,
+        maximum_duration_ms=maximum_duration_ms,
+        max_panel_runtime_fraction=max_panel_runtime_fraction,
+        target_duration_ms=target_duration_ms,
+        max_editorial_reprise_overlap_fraction=(
+            max_editorial_reprise_overlap_fraction
+        ),
+        max_ranked_routes=1,
+    )
+    route = rebuilt.ranked_routes[0]
+    by_beat = {selection.beat_id: selection for selection in route.selections}
+    for beat_id, authority in reuse_authorities_by_beat.items():
+        current = by_beat[beat_id]
+        source_beats = tuple(
+            selection.beat_id
+            for selection in route.selections
+            if selection.beat_id != beat_id
+            and selection.source_clip_id is not None
+            and selection.source_clip_id == current.source_clip_id
+        )
+        if tuple(sorted(source_beats)) != tuple(sorted(authority.reuse_of_beat_ids)):
+            raise ValueError(
+                "semantic reuse authority does not name every reused source beat"
+            )
+    return route
 
 
 def select_next_compatible_route(

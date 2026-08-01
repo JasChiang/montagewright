@@ -1937,10 +1937,7 @@ def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
         physical_scale_comparison=False,
     )
 
-    assert acceptable == (
-        "static_full_bleed_crop",
-        "tracked_full_bleed_crop",
-    )
+    assert acceptable == ("tracked_full_bleed_crop",)
     assert "two_panel_layout" in forbidden
     assert "solid_matte_fit" in forbidden
 
@@ -1968,8 +1965,8 @@ def test_candidate_capability_boundary_does_not_rewrite_panel_to_crop() -> None:
     assert "tracked_full_bleed_crop" in forbidden
 
 
-def test_candidate_capability_boundary_honors_bound_editorial_reconstruction() -> None:
-    """A contract may pre-authorize truthful fit without opening all fallbacks."""
+def test_candidate_capability_boundary_does_not_locally_select_contractual_fit() -> None:
+    """A contract permits Gemini to replan, never a local fit fallback."""
 
     semantic_beat = SimpleNamespace(
         acceptable_capability_ids=(
@@ -1989,12 +1986,8 @@ def test_candidate_capability_boundary_honors_bound_editorial_reconstruction() -
         editorial_reconstruction_capability_ids=("solid_matte_fit",),
     )
 
-    assert acceptable == (
-        "solid_matte_fit",
-        "static_full_bleed_crop",
-        "tracked_full_bleed_crop",
-    )
-    assert "solid_matte_fit" not in forbidden
+    assert acceptable == ("static_full_bleed_crop",)
+    assert "solid_matte_fit" in forbidden
     assert "two_panel_layout" in forbidden
 
 

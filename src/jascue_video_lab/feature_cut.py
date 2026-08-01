@@ -245,11 +245,13 @@ from .sequence_optimizer import (
     RoundRobinFrontierBeat,
     RoundRobinFrontierCandidate,
     RoundRobinFrontierState,
+    SemanticReplanReuseAuthority,
     build_resolved_timeline,
     initialize_round_robin_frontier,
     next_round_robin_frontier_attempt,
     record_round_robin_frontier_attempt,
     reconcile_runtime_sequence_timing,
+    rebuild_route_with_semantic_authorities,
     select_next_compatible_route,
     optimize_sequence,
     optimize_pre_render_candidate_route,
@@ -10764,30 +10766,20 @@ def _preferred_capability_ids(
 def _normal_acceptable_capability_ids(
     presentation_preference: str,
 ) -> tuple[str, ...]:
-    """Return the numeric-realization envelope Gemini authorized.
+    """Return the one presentation family Gemini explicitly selected.
 
-    The planner owns the editorial presentation family.  Local geometry may
-    choose a static versus containment-tracked realization of a full-bleed
-    instruction, but it must not promote that instruction into a phase move,
-    hard cut, panel, or matte.  A phase plan carries its own explicit phase
-    transitions; a whole-window hard-cut rewrite is never an implicit local
-    fallback.
+    Geometry can verify whether a proposed operation is executable, but it
+    cannot exchange a hold for a follow, a follow for a phase move, or either
+    for a matte/panel.  Those are editorial choices because they change what
+    the viewer attends to and when.  If the selected family is infeasible, the
+    frontier must surface bounded alternatives to Gemini; it must not widen
+    this list and silently keep rendering.
     """
 
     return {
-        "static_full_bleed": (
-            "static_full_bleed_crop",
-            "tracked_full_bleed_crop",
-        ),
-        "tracked_full_bleed": (
-            "static_full_bleed_crop",
-            "tracked_full_bleed_crop",
-        ),
-        "phase_virtual_camera": (
-            "static_full_bleed_crop",
-            "tracked_full_bleed_crop",
-            "phase_virtual_camera",
-        ),
+        "static_full_bleed": ("static_full_bleed_crop",),
+        "tracked_full_bleed": ("tracked_full_bleed_crop",),
+        "phase_virtual_camera": ("phase_virtual_camera",),
         "two_panel_layout": ("two_panel_layout",),
         "solid_matte_fit": ("solid_matte_fit",),
     }.get(presentation_preference, ())
@@ -10838,16 +10830,17 @@ def _candidate_capability_boundaries(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Narrow a beat-level union to one candidate's immutable authority."""
 
-    contractual_family = set(editorial_reconstruction_capability_ids)
+    # ``allowed_reconstruction`` is a semantic permission that Gemini may use
+    # in a bounded replan.  It is deliberately *not* a local rendering
+    # fallback: otherwise a beat whose plan says full-bleed can become a matte
+    # merely because a contract mentions that matte would be truthful.
     candidate_family = set(
         _normal_acceptable_capability_ids(presentation_preference)
-    ) | contractual_family
+    )
     if semantic_beat is None:
         return tuple(sorted(candidate_family)), ()
 
-    beat_acceptable = (
-        set(semantic_beat.acceptable_capability_ids) | contractual_family
-    )
+    beat_acceptable = set(semantic_beat.acceptable_capability_ids)
     known_capabilities = (
         beat_acceptable | set(semantic_beat.forbidden_capability_ids)
     )
@@ -14168,6 +14161,9 @@ def _build_pre_render_vertical_candidate_route(
             policy.presentation.max_panel_runtime_fraction
         ),
         target_duration_ms=round(sum(chapter_durations.values()) * 1000),
+        max_editorial_reprise_overlap_fraction=(
+            policy.editorial.max_editorial_reprise_overlap_fraction
+        ),
     )
 
 
@@ -14267,6 +14263,9 @@ def _build_pre_render_horizontal_candidate_route(
         max_panel_runtime_fraction=(
             policy.presentation.max_panel_runtime_fraction
         ),
+        max_editorial_reprise_overlap_fraction=(
+            policy.editorial.max_editorial_reprise_overlap_fraction
+        ),
     )
 
 
@@ -14339,11 +14338,24 @@ def _apply_pre_render_candidate_route(
                 )
         execution_binding = (execution_bindings or {}).get(candidate_id)
         if execution_binding is not None:
-            option["_pre_render_execution_binding"] = (
+            execution_binding_payload = (
                 execution_binding.model_dump(mode="json")
                 if hasattr(execution_binding, "model_dump")
                 else dict(execution_binding)
             )
+            option["_pre_render_execution_binding"] = execution_binding_payload
+            # A semantic replan can supply a hash-bound reuse authority for
+            # this exact candidate execution.  Carry it into the immutable
+            # runtime option so the later local preflight and render audit
+            # validate the Gemini decision rather than inheriting the
+            # chapter-primary mirror or inventing a reason locally.
+            if execution_binding_payload.get("reuse_mode") != "none":
+                option["source_reuse_mode"] = execution_binding_payload[
+                    "reuse_mode"
+                ]
+                option["source_reuse_justification"] = (
+                    execution_binding_payload.get("reuse_justification")
+                )
         applied.append(option)
     return applied
 
@@ -14844,21 +14856,30 @@ def _semantic_replan_frontier_projection(
     selections = list(route.selections)
     rows: list[dict[str, Any]] = []
     for index, selection in enumerate(selections):
-        ordered_ids = tuple(
-            route.fallback_candidate_ids_by_beat[selection.beat_id]
+        semantic_bindings = tuple(
+            route.semantic_replan_candidate_bindings_by_beat.get(
+                selection.beat_id,
+                (),
+            )
         )
-        candidate_ids = ordered_ids[: 1 + max_alternates_per_beat]
-        bindings = route.option_bindings_by_beat[selection.beat_id]
+        candidate_bindings = semantic_bindings[: 1 + max_alternates_per_beat]
         rows.append(
             {
                 "beat_id": selection.beat_id,
                 "selected_candidate_id": selection.candidate_id,
-                "alternate_candidate_ids": list(candidate_ids[1:]),
+                "alternate_candidate_ids": [
+                    binding.option.candidate_id
+                    for binding in candidate_bindings
+                    if binding.option.candidate_id != selection.candidate_id
+                ],
                 "candidate_bindings": {
-                    candidate_id: bindings[candidate_id].model_dump(
-                        mode="json"
-                    )
-                    for candidate_id in candidate_ids
+                    binding.option.candidate_id: {
+                        **binding.option.model_dump(mode="json"),
+                        "replan_required_codes": list(
+                            binding.replan_required_codes
+                        ),
+                    }
+                    for binding in candidate_bindings
                 },
                 "adjacent_sequence_context": {
                     "previous": (
@@ -22924,7 +22945,10 @@ def _run_feature_cut_experiment_impl(
                                 )
                             ]["end_ms"]
                         ),
-                        max_editorial_reprise_overlap_fraction=0.5,
+                        max_editorial_reprise_overlap_fraction=(
+                            autonomous_policy.editorial
+                            .max_editorial_reprise_overlap_fraction
+                        ),
                         allowed_reuse_modes=(
                             autonomous_policy.editorial.allow_source_reuse
                         ),
@@ -23996,7 +24020,10 @@ def _run_feature_cut_experiment_impl(
                     source_clip_id=local_clip.clip_id,
                     source_in_ms=int(local_for_attempt["start_ms"]),
                     source_out_ms=int(local_for_attempt["end_ms"]),
-                    max_editorial_reprise_overlap_fraction=0.5,
+                    max_editorial_reprise_overlap_fraction=(
+                        autonomous_policy.editorial
+                        .max_editorial_reprise_overlap_fraction
+                    ),
                     allowed_reuse_modes=(
                         autonomous_policy.editorial.allow_source_reuse
                     ),
@@ -26494,7 +26521,11 @@ def _run_feature_cut_experiment_impl(
                             source_in_ms=candidate_start,
                             source_out_ms=candidate_end,
                             max_editorial_reprise_overlap_fraction=(
-                                0.5 if autonomous_profile else None
+                                autonomous_policy.editorial
+                                .max_editorial_reprise_overlap_fraction
+                                if autonomous_profile
+                                and autonomous_policy is not None
+                                else None
                             ),
                             allowed_reuse_modes=(
                                 autonomous_policy.editorial.allow_source_reuse
@@ -29511,7 +29542,10 @@ def _run_feature_cut_experiment_impl(
                 manifest["horizontal"]["chapters"],
                 aspect="16x9",
                 max_editorial_reprise_overlap_fraction=(
-                    0.5 if autonomous_profile else None
+                    autonomous_policy.editorial
+                    .max_editorial_reprise_overlap_fraction
+                    if autonomous_profile and autonomous_policy is not None
+                    else None
                 ),
                 allowed_reuse_modes=(
                     autonomous_policy.editorial.allow_source_reuse
@@ -29525,7 +29559,10 @@ def _run_feature_cut_experiment_impl(
                 manifest["vertical"]["chapters"],
                 aspect="9x16",
                 max_editorial_reprise_overlap_fraction=(
-                    0.5 if autonomous_profile else None
+                    autonomous_policy.editorial
+                    .max_editorial_reprise_overlap_fraction
+                    if autonomous_profile and autonomous_policy is not None
+                    else None
                 ),
                 allowed_reuse_modes=(
                     autonomous_policy.editorial.allow_source_reuse

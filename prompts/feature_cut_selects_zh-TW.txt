@@ -143,6 +143,40 @@
 
 優先：主體清楚、低動態模糊、低遮擋、構圖乾淨、能代表 chapter、與前後 chapter 不重複。把 2 秒抽樣、相似 take、UI 反光、手部遮擋與功能證據不足寫入 uncertainties／quality_risks。
 
+## 剪輯呈現的決策權
+
+你不只是在標示「這支素材可不可以裁成直式」，也要為每一個
+`vertical_candidate` 選擇一個**主要剪輯呈現方式**。這是全片剪輯計畫的一
+部分：選擇時要同時考慮本 chapter 的資訊揭露、前後鏡頭、素材重複壓力、以及
+音樂段落的推進／呼吸／峰值／收尾。可用的方式只有 schema 中的
+`presentation_preference`：
+
+- `static_full_bleed`：固定滿版構圖已清楚，移動不會增加資訊。
+- `tracked_full_bleed`：主體的真實位移需要被持續保留；這是跟隨，不是把 tracker
+  的細小抖動做成運鏡。
+- `phase_virtual_camera`：同一鏡頭有可觀察、按順序揭露的資訊，且你已提出可驗證
+  phase proposal。它可以是 hold、follow、reveal、短暫 emphasis 或合乎畫面條件的
+  punch-in cut；不得為了填秒數發明移動。
+- `two_panel_layout`：觀眾必須同時比較、同時保留 relation，或 context 與 detail
+  必須並讀時才選。它不是「裁不下就分割」的技術保底。
+- `solid_matte_fit`：完整來源範圍本身就是正確語意，且比改選更合適的 take、滿版或
+  有動機的分段觀看更能保留必要資訊時才選；它不是安全檢查失敗時的預設答案。
+
+上述五種方式互不等價。請把最符合剪輯意圖的一種填為此 candidate 的
+`presentation_preference`，並用 `presentation_goal`、coverage intent、regions、
+source camera motion 與（需要時）phase proposal 說清楚原因。本機只會測量 bbox、
+PTS、可見面積、來源運動、SAM track、可行 crop path、panel 像素配置與音樂 cue
+誤差，並嚴格執行你選定的方式；它不會把 static 改成 tracked、把 tracked 改成
+virtual camera、或因為可以保留所有人就自行改成 two-panel／solid fit。
+
+若你選的方式經本機測量不可執行，系統會帶著該 candidate、其他已量測的候選、
+相鄰 sequence、完整音樂 cue context 與失敗原因，進行一次受限的 semantic replan。
+那時才由你在既有、可執行的 immutable options 中改選；本機不會自行降級或捏造
+新的剪輯方式。因此每個 Top-K 候選都應提出自己真正適合的呈現方式，不能把 rank-2
+到 rank-4 都複製成同一個保守 fallback。若候選重用先前 source，必須在該 candidate
+本身提供符合全片目的的 `source_reuse_mode` 與可觀察 justification；後續本機只會
+驗證這份授權，不能自行補上重用理由。
+
 若本次同時提供音樂，必須真的聆聽音樂，讓開場、建立、推進、峰值、呼吸與收尾等可聽見的段落角色影響素材、動作相位與相對停留長度；不得為了逐拍對齊而破壞 brief 順序、切斷完整動作或重複素材。不得輸出音樂 timestamp、sample 或自行改寫本機鎖定的時間證據。
 
 只回傳符合 Structured Output schema 的資料。
