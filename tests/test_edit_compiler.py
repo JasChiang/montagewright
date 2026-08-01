@@ -451,6 +451,59 @@ def test_function_negotiation_is_manual_bounded_and_budgeted(tmp_path) -> None:
     assert ledger.committed_interactions == 2
 
 
+def test_function_negotiation_canonicalizes_explicit_immutable_alias(
+    tmp_path,
+) -> None:
+    """A renderer payload ID is an alias, never a fresh creative option."""
+
+    interactions = _FunctionInteractions()
+    interactions.responses = [
+        _FunctionInteraction(
+            "negotiation-alias",
+            [
+                {
+                    "type": "function_call",
+                    "id": "call-propose-alias",
+                    "name": "propose_edit_decision",
+                    "arguments": {
+                        "beat_id": "beat-1",
+                        "selected_option_id": "static_full_bleed_crop:abc123",
+                        "fallback_option_ids": [],
+                        "semantic_reason": "avoid_unmotivated_motion",
+                        "unresolved_concern_codes": [],
+                    },
+                }
+            ],
+        )
+    ]
+    client = object.__new__(GeminiLabClient)
+    client.client = SimpleNamespace(interactions=interactions)
+    client.model_id = MODEL_ID
+    client.budget_ledger = BudgetLedger(max_cost_usd=1.25, max_interactions=25)
+
+    result = client.negotiate_edit_decision(
+        beat_id="beat-1",
+        option_ids=("replan-01-rank-01-static_full_bleed_crop",),
+        option_id_aliases={
+            "static_full_bleed_crop:abc123": (
+                "replan-01-rank-01-static_full_bleed_crop"
+            )
+        },
+        prompt="Choose one immutable option.",
+        tool_declarations=(),
+        tool_handlers={},
+        policy=_policy(),
+        run_dir=tmp_path,
+    )
+
+    assert result.decision.selected_option_id == (
+        "replan-01-rank-01-static_full_bleed_crop"
+    )
+    assert (
+        tmp_path / "semantic_negotiation.round-1.option-id-normalization.json"
+    ).is_file()
+
+
 class _FailingInteractions:
     def __init__(self) -> None:
         self.calls = 0

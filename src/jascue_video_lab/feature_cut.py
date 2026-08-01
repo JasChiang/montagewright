@@ -22003,6 +22003,7 @@ def _run_feature_cut_experiment_impl(
                 )
                 local_options: list[dict[str, Any]] = []
                 option_id_to_row: dict[str, tuple[int, str, str, Mapping[str, Any]]] = {}
+                option_id_aliases: dict[str, str] = {}
                 for order, row in enumerate(executable_deferred, start=1):
                     key = _frontier_execution_key(feature_id, row[1], row[2])
                     local_payload = local_payloads[key]
@@ -22019,6 +22020,36 @@ def _run_feature_cut_experiment_impl(
                         f"{str(geometry_payload.get('measured_presentation_mode') or 'unknown')}"
                     )
                     option_id_to_row[option_id] = row
+                    measured_mode = str(
+                        geometry_payload.get("measured_presentation_mode")
+                        or ""
+                    )
+                    for executable_option in (
+                        presentation.get("option_set", {}).get("options", [])
+                        if isinstance(presentation, Mapping)
+                        else []
+                    ):
+                        if not isinstance(executable_option, Mapping):
+                            continue
+                        if executable_option.get("mode") != measured_mode:
+                            continue
+                        raw_option = executable_option.get("option")
+                        raw_option_id = (
+                            raw_option.get("option_id")
+                            if isinstance(raw_option, Mapping)
+                            else None
+                        )
+                        if not isinstance(raw_option_id, str):
+                            continue
+                        prior_alias = option_id_aliases.setdefault(
+                            raw_option_id,
+                            option_id,
+                        )
+                        if prior_alias != option_id:
+                            raise FeatureCutSystemFailure(
+                                "scoped semantic replan option alias is "
+                                "ambiguous"
+                            )
                     local_options.append(
                         {
                             "option_id": option_id,
@@ -22225,6 +22256,7 @@ def _run_feature_cut_experiment_impl(
                         result = client.negotiate_edit_decision(
                             beat_id=feature_id,
                             option_ids=tuple(option_id_to_row),
+                            option_id_aliases=option_id_aliases,
                             prompt=(
                                 "[protocol=scoped-semantic-replan-v2] A local "
                                 "measurement found that Gemini's initial presentation "
@@ -23061,6 +23093,78 @@ def _run_feature_cut_experiment_impl(
                             "records": reconciliation_records,
                             "generated_at": utc_now(),
                         },
+                    )
+                # Reconstruct the semantic-replan quota from the persisted
+                # accepted decisions on every resume.  A Python-local counter
+                # starts at zero for each process, while the policy limit is a
+                # limit for the whole run, not for each resumed process.
+                persisted_replan_ids: set[str] = set()
+                for persisted_beat in resumed_state.beats:
+                    if persisted_beat.status != "accepted":
+                        continue
+                    decision_path = (
+                        frontier_root
+                        / "scoped-semantic-replans"
+                        / f"{persisted_beat.beat.beat_id}.decision.json"
+                    )
+                    if not decision_path.is_file():
+                        continue
+                    saved_replan = read_json(decision_path)
+                    if (
+                        saved_replan.get("selected_candidate_id")
+                        != persisted_beat.accepted_candidate_id
+                        or saved_replan.get(
+                            "selected_candidate_execution_sha256"
+                        )
+                        != persisted_beat.accepted_candidate_execution_sha256
+                    ):
+                        continue
+                    context_path = Path(
+                        str(saved_replan.get("context_path") or "")
+                    )
+                    if (
+                        not context_path.is_file()
+                        or saved_replan.get("context_sha256")
+                        != sha256_file(context_path)
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "accepted scoped semantic replan lost its context "
+                            "binding during resume"
+                        )
+                    replan_authority = DecisionAuthorityV2.model_validate(
+                        saved_replan.get("authority")
+                    )
+                    validate_authority_binding(
+                        replan_authority,
+                        autonomous_policy,
+                    )
+                    if (
+                        replan_authority.decision_scope
+                        != "scoped_semantic_replan"
+                        or f"sha256:{sha256_file(context_path)}"
+                        not in replan_authority.input_artifact_hashes
+                        or f"sha256:{frontier_plan_sha256}"
+                        not in replan_authority.input_artifact_hashes
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "accepted scoped semantic replan authority is "
+                            "incomplete during resume"
+                        )
+                    persisted_replan_ids.update(
+                        replan_authority.gemini_interaction_ids
+                    )
+                scoped_semantic_replan_state["used"] = len(
+                    persisted_replan_ids
+                )
+                scoped_semantic_replan_state["interaction_ids"] = sorted(
+                    persisted_replan_ids
+                )
+                if scoped_semantic_replan_state["used"] > (
+                    autonomous_policy.budget.max_semantic_replans
+                ):
+                    raise FeatureCutSystemFailure(
+                        "persisted scoped semantic replans exceed the policy "
+                        "limit during resume"
                     )
                 for resumed_beat in resumed_state.beats:
                     resumed_candidate_id = (

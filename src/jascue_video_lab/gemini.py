@@ -1674,6 +1674,7 @@ class GeminiLabClient:
         *,
         beat_id: str,
         option_ids: Sequence[str],
+        option_id_aliases: Mapping[str, str] | None = None,
         prompt: str,
         tool_declarations: Sequence[FunctionToolDeclaration],
         tool_handlers: Mapping[str, Callable[[Mapping[str, Any]], Any]],
@@ -1701,6 +1702,18 @@ class GeminiLabClient:
             raise ValueError("semantic negotiation requires immutable options")
         if len(known_options) != len(option_ids):
             raise ValueError("semantic negotiation option IDs must be unique")
+        aliases = dict(option_id_aliases or {})
+        invalid_aliases = {
+            alias: canonical
+            for alias, canonical in aliases.items()
+            if canonical not in known_options
+            or (alias in known_options and alias != canonical)
+        }
+        if invalid_aliases:
+            raise ValueError(
+                "semantic negotiation aliases must map external immutable "
+                "option IDs to known canonical IDs"
+            )
         declarations = {item.name: item for item in tool_declarations}
         if "propose_edit_decision" in declarations:
             raise ValueError(
@@ -1876,11 +1889,47 @@ class GeminiLabClient:
                     proposal.selected_option_id,
                     *proposal.fallback_option_ids,
                 )
-                invalid_ids = set(proposed_ids) - set(known_options)
+                normalized_ids = tuple(
+                    aliases.get(option_id, option_id)
+                    for option_id in proposed_ids
+                )
+                invalid_ids = set(normalized_ids) - set(known_options)
                 if invalid_ids:
                     raise ValueError(
                         "semantic decision invented option IDs: "
                         + ", ".join(sorted(invalid_ids))
+                    )
+                if len(normalized_ids) != len(set(normalized_ids)):
+                    raise ValueError(
+                        "semantic decision aliases collapse distinct options"
+                    )
+                if normalized_ids != proposed_ids:
+                    proposal = proposal.model_copy(
+                        update={
+                            "selected_option_id": normalized_ids[0],
+                            "fallback_option_ids": normalized_ids[1:],
+                        }
+                    )
+                    write_json(
+                        run_dir
+                        / (
+                            "semantic_negotiation.round-"
+                            f"{round_number}.option-id-normalization.json"
+                        ),
+                        {
+                            "contract_version": (
+                                "semantic-negotiation-option-id-"
+                                "normalization-v1"
+                            ),
+                            "raw_option_ids": proposed_ids,
+                            "canonical_option_ids": normalized_ids,
+                            "aliases_used": {
+                                option_id: aliases[option_id]
+                                for option_id in proposed_ids
+                                if option_id in aliases
+                            },
+                            "raw_interaction_id": interaction_id,
+                        },
                     )
                 result = BoundedSemanticNegotiationResult(
                     decision=proposal,
