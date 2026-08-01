@@ -240,7 +240,7 @@ def test_local_preflight_failure_requires_gemini_route_rebuild(
     class FakeClient:
         def negotiate_grouped_edit_decisions(self, **kwargs):
             assert kwargs["option_ids_by_beat"] == {
-                "fold": ("fold--fold-1", "fold--fold-2")
+                "fold": ("fold--fold-2",)
             }
             decision = SimpleNamespace(
                 decisions=(
@@ -259,14 +259,16 @@ def test_local_preflight_failure_requires_gemini_route_rebuild(
 
     _persist_preflight_local_infeasibility_replan(
         route=route,
-        feature_id="fold",
-        local_failures=(
-            {
-                "candidate_id": "fold-1",
-                "reason": "maskless source-motion preflight found a jolt",
-                "paid_calls_added": 0,
-            },
-        ),
+        local_failures_by_feature={
+            "fold": (
+                {
+                    "candidate_id": "fold-1",
+                    "reason": "maskless source-motion preflight found a jolt",
+                    "paid_calls_added": 0,
+                },
+            )
+        },
+        viable_candidate_ids_by_feature={"fold": ("fold-2",)},
         editorial_dir=tmp_path / "editorial",
         policy=policy,
         client=FakeClient(),
@@ -293,6 +295,165 @@ def test_local_preflight_failure_requires_gemini_route_rebuild(
     )
     assert context["local_measurement_reports"]["fold"][0]["paid_calls_added"] == 0
     assert context["affected_beats"][0]["adjacent_sequence_context"]["previous"]["beat_id"] == "opening"
+
+
+def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(
+    tmp_path: Path,
+) -> None:
+    """A second beat cannot overwrite or trigger a second local replan."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=40_000, min_ms=40_000, max_ms=40_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(_local_replan_option("opening", "open", "a", rank=1),),
+            ),
+            CandidateRouteBeat(
+                beat_id="fold",
+                options=(
+                    _local_replan_option("fold", "fold-1", "b", rank=1),
+                    _local_replan_option("fold", "fold-2", "c", rank=2),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="camera",
+                options=(
+                    _local_replan_option("camera", "camera-1", "d", rank=1),
+                    _local_replan_option("camera", "camera-2", "e", rank=2),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="ending",
+                options=(_local_replan_option("ending", "end", "f", rank=1),),
+            ),
+        )
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        calls = 0
+
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            self.calls += 1
+            assert kwargs["option_ids_by_beat"] == {
+                "camera": ("camera--camera-2",),
+                "fold": ("fold--fold-2",),
+            }
+            decisions = []
+            for beat_id, candidate_id in (("camera", "camera-2"), ("fold", "fold-2")):
+                decisions.append(
+                    SimpleNamespace(
+                        model_dump=lambda beat_id=beat_id, candidate_id=candidate_id, **_kwargs: {
+                            "beat_id": beat_id,
+                            "selected_option_id": f"{beat_id}--{candidate_id}",
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    )
+                )
+            return SimpleNamespace(
+                decision=SimpleNamespace(decisions=tuple(decisions)),
+                interaction_ids=("int-grouped",),
+            )
+
+    client = FakeClient()
+    _persist_preflight_local_infeasibility_replan(
+        route=route,
+        local_failures_by_feature={
+            "fold": ({"candidate_id": "fold-1", "paid_calls_added": 0},),
+            "camera": ({"candidate_id": "camera-1", "paid_calls_added": 0},),
+        },
+        viable_candidate_ids_by_feature={
+            "fold": ("fold-2",),
+            "camera": ("camera-2",),
+        },
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        client=client,
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    assert client.calls == 1
+    rebuilt = _selected_preflight_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={
+            "opening": 10.0,
+            "fold": 10.0,
+            "camera": 10.0,
+            "ending": 10.0,
+        },
+    )
+    assert rebuilt is not None
+    assert [selection.candidate_id for selection in rebuilt.selections] == [
+        "open",
+        "fold-2",
+        "camera-2",
+        "end",
+    ]
+
+
+def test_local_preflight_without_a_viable_candidate_does_not_call_gemini(
+    tmp_path: Path,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="fold",
+                options=(_local_replan_option("fold", "fold-1", "b", rank=1),),
+            ),
+            CandidateRouteBeat(
+                beat_id="ending",
+                options=(_local_replan_option("ending", "end", "c", rank=1),),
+            ),
+        )
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class NeverCalled:
+        def negotiate_grouped_edit_decisions(self, **_kwargs):
+            raise AssertionError("no viable local candidate must block before Gemini")
+
+    with pytest.raises(CandidateKnownInfeasible, match="all immutable candidates"):
+        _persist_preflight_local_infeasibility_replan(
+            route=route,
+            local_failures_by_feature={"fold": ({"candidate_id": "fold-1"},)},
+            viable_candidate_ids_by_feature={"fold": ()},
+            editorial_dir=tmp_path / "editorial",
+            policy=policy,
+            client=NeverCalled(),
+            plan_path=plan_path,
+            music_supplied=False,
+            output_timeline_cues=(),
+        )
 
 
 def _complete_route_for_execution_compatibility(
