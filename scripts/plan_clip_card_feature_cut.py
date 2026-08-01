@@ -1009,10 +1009,10 @@ class DirectVideoVerticalDecision(StrictModel):
                 raise ValueError(
                     "attention sequence may only use required or preferred entities"
                 )
-            if set(self.required_entity_indices) - referenced:
-                raise ValueError(
-                    "attention sequence must represent every required entity"
-                )
+            # Required visibility is a downstream containment obligation.
+            # Anchors only declare camera attention; requiring every visible
+            # context subject to be an anchor conflates those two contracts
+            # and rejects a valid hold/follow composition before geometry.
         return self
 
 
