@@ -39,6 +39,7 @@ from .clip_card_supplement_runner import (
 from .clip_card_retrieval import compact_retrieval_card
 from .clip_card_retrieval import FeatureShortlistPlan
 from .feature_cut import (
+    PreflightSemanticReplanReady,
     compile_repair_request,
     render_changed_segments_and_concat,
     run_feature_cut_experiment,
@@ -715,6 +716,9 @@ def _run_budgeted_planning_stage(
         _migrate_completed_planning_dispatches(
             stage_dir=stage_dir,
             stage=stage,
+            exclude_existing_raw_interaction_paths=(
+                exclude_existing_raw_interaction_paths
+            ),
         )
     except BaseException as caught:
         if error is None:
@@ -2516,6 +2520,7 @@ def _migrate_completed_planning_dispatches(
     *,
     stage_dir: Path,
     stage: str,
+    exclude_existing_raw_interaction_paths: Collection[Path] = (),
 ) -> tuple[Path, ...]:
     """Journal completed child-process calls without dispatching again."""
 
@@ -2530,12 +2535,18 @@ def _migrate_completed_planning_dispatches(
     )
     migrated: list[Path] = []
     seen_raw_sha256: set[str] = set()
+    excluded = {
+        path.resolve()
+        for path in exclude_existing_raw_interaction_paths
+    }
     for request_path in request_paths:
         raw_path = request_path.with_name(
             request_path.name.removesuffix(".request.json")
             + ".raw_interaction.json"
         )
         if not raw_path.is_file():
+            continue
+        if raw_path.resolve() in excluded:
             continue
         raw_sha256 = sha256_file(raw_path)
         if raw_sha256 in seen_raw_sha256:
@@ -3147,7 +3158,14 @@ def run_feature_delivery_pipeline(
                 music_path=music_path,
             )
         else:
-            feature_result = run_feature_cut_experiment(**kwargs)
+            try:
+                feature_result = run_feature_cut_experiment(**kwargs)
+            except PreflightSemanticReplanReady:
+                # The first pass only persisted a Gemini-authorised choice
+                # after all zero-paid local measurements failed.  A single
+                # clean restart rebuilds the complete route from that choice;
+                # it is not a local fallback or an open retry loop.
+                feature_result = run_feature_cut_experiment(**kwargs)
         outputs["feature_cut"] = feature_result
         if policy is not None:
             presentation_authorities = feature_result.get(

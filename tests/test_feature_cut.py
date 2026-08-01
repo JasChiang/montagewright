@@ -121,6 +121,8 @@ from jascue_video_lab.feature_cut import (
     _segment_variant_fingerprint,
     _selected_source_capacity_seconds,
     _semantic_replan_frontier_projection,
+    _persist_preflight_local_infeasibility_replan,
+    _selected_preflight_local_replan,
     _source_motion_clean_recovery_window,
     _should_refine_selected_vertical_candidate,
     _soft_extent_visibility_audit,
@@ -170,6 +172,127 @@ from jascue_video_lab.sequence_optimizer import (
     optimize_pre_render_candidate_route,
     select_next_compatible_route,
 )
+
+
+def _local_replan_option(
+    beat_id: str,
+    candidate_id: str,
+    source_marker: str,
+    *,
+    rank: int,
+) -> CandidateRouteOption:
+    return CandidateRouteOption(
+        beat_id=beat_id,
+        candidate_id=candidate_id,
+        source_asset_id="sha256:" + source_marker * 64,
+        source_clip_id=f"clip-{source_marker}",
+        event_id=f"event-{candidate_id}",
+        planner_rank=rank,
+        semantic_confidence=0.9,
+        trim_duration_ms=10_000,
+        minimum_readable_ms=10_000,
+        preferred_readable_ms=10_000,
+        maximum_readable_ms=10_000,
+        fixed_source_in_ms=0,
+        fixed_source_out_ms=10_000,
+        candidate_timing_sha256=source_marker * 64,
+    )
+
+
+def test_local_preflight_failure_requires_gemini_route_rebuild(
+    tmp_path: Path,
+) -> None:
+    """The local layer reports failure; it cannot promote rank two itself."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(_local_replan_option("opening", "open", "a", rank=1),),
+            ),
+            CandidateRouteBeat(
+                beat_id="fold",
+                options=(
+                    _local_replan_option("fold", "fold-1", "b", rank=1),
+                    _local_replan_option("fold", "fold-2", "c", rank=2),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="ending",
+                options=(_local_replan_option("ending", "end", "d", rank=1),),
+            ),
+        )
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["option_ids_by_beat"] == {
+                "fold": ("fold--fold-1", "fold--fold-2")
+            }
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "fold",
+                            "selected_option_id": "fold--fold-2",
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    ),
+                )
+            )
+            return SimpleNamespace(decision=decision, interaction_ids=("int-1",))
+
+    _persist_preflight_local_infeasibility_replan(
+        route=route,
+        feature_id="fold",
+        local_failures=(
+            {
+                "candidate_id": "fold-1",
+                "reason": "maskless source-motion preflight found a jolt",
+                "paid_calls_added": 0,
+            },
+        ),
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    rebuilt = _selected_preflight_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"opening": 10.0, "fold": 10.0, "ending": 10.0},
+    )
+
+    assert rebuilt is not None
+    assert [selection.candidate_id for selection in rebuilt.selections] == [
+        "open",
+        "fold-2",
+        "end",
+    ]
+    context = read_json(
+        tmp_path / "editorial" / "preflight-local-infeasibility-replan" / "context.json"
+    )
+    assert context["local_measurement_reports"]["fold"][0]["paid_calls_added"] == 0
+    assert context["affected_beats"][0]["adjacent_sequence_context"]["previous"]["beat_id"] == "opening"
 
 
 def _complete_route_for_execution_compatibility(

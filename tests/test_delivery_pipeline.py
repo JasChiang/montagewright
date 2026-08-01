@@ -187,6 +187,11 @@ def test_budgeted_planning_reconciles_text_only_repair_separately(
         ["actual_input_tokens"]
         == 500
     )
+    repair_journals = sorted(stage_dir.glob("*.paid_dispatch.json"))
+    assert len(repair_journals) == 1
+    assert read_json(repair_journals[0])["raw_artifact_path"].endswith(
+        "attempt-02.raw_interaction.json"
+    )
 
 
 def test_warm_dispatch_migration_counts_attempt_and_alias_once(

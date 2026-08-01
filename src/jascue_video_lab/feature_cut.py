@@ -308,6 +308,17 @@ class FeatureCutSystemFailure(RuntimeError):
     """A wiring, artifact, tool, or invariant failure that stops the run."""
 
 
+class PreflightSemanticReplanReady(FeatureCutSystemFailure):
+    """A persisted Gemini choice requires one clean route reconstruction.
+
+    This is deliberately distinct from an ordinary candidate failure.  The
+    first execution measures a problem without spending any paid visual work,
+    Gemini selects among the immutable alternatives, and the caller starts the
+    feature cut again so every downstream binding is derived from that one
+    authorised route.  It is never a signal for local candidate promotion.
+    """
+
+
 def _frontier_execution_key(
     beat_id: str,
     candidate_id: str,
@@ -14912,6 +14923,299 @@ def _semantic_replan_frontier_projection(
     }
 
 
+def _preflight_local_infeasibility_replan_paths(
+    editorial_dir: Path,
+) -> tuple[Path, Path]:
+    root = editorial_dir / "preflight-local-infeasibility-replan"
+    return root / "context.json", root / "decision.json"
+
+
+def _selected_preflight_local_replan(
+    *,
+    route: Any,
+    editorial_dir: Path,
+    policy: AutonomousEditPolicy,
+    plan_path: Path,
+    chapter_durations: Mapping[str, float],
+) -> Any | None:
+    """Restore a persisted Gemini choice by rebuilding the entire route.
+
+    The saved choice is intentionally applied before candidate-local work.  A
+    route selection carries trims, cue exits, reuse authority and execution
+    hashes together, so replacing only one candidate after a failed local
+    measurement would create exactly the disconnected pipeline the autonomous
+    path is meant to prevent.
+    """
+
+    context_path, decision_path = _preflight_local_infeasibility_replan_paths(
+        editorial_dir
+    )
+    if not decision_path.is_file() and not context_path.is_file():
+        return None
+    if not decision_path.is_file() or not context_path.is_file():
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan is only partially persisted"
+        )
+    context = read_json(context_path)
+    decision_payload = read_json(decision_path)
+    if not isinstance(context, Mapping) or not isinstance(decision_payload, Mapping):
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan artifacts are malformed"
+        )
+    if (
+        context.get("contract_version")
+        != "preflight-local-infeasibility-replan-v1"
+        or decision_payload.get("context_sha256") != sha256_file(context_path)
+        or context.get("policy_reference") != policy.policy_reference
+    ):
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan does not match policy/context"
+        )
+    authority = DecisionAuthorityV2.model_validate(decision_payload.get("authority"))
+    validate_authority_binding(authority, policy)
+    required_hashes = {
+        f"sha256:{sha256_file(context_path)}",
+        f"sha256:{sha256_file(plan_path)}",
+    }
+    if (
+        authority.decision_scope != "scoped_semantic_replan"
+        or not required_hashes.issubset(authority.input_artifact_hashes)
+    ):
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan authority is incomplete"
+        )
+    decisions = decision_payload.get("decisions")
+    affected = context.get("affected_beats")
+    if not isinstance(decisions, list) or not isinstance(affected, list):
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan has no bounded decision"
+        )
+    affected_by_id = {
+        str(row.get("beat_id")): row
+        for row in affected
+        if isinstance(row, Mapping) and str(row.get("beat_id") or "")
+    }
+    if len(affected_by_id) != 1:
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan must affect exactly one beat"
+        )
+    selected_candidate_ids: dict[str, str] = {}
+    reuse_authorities: dict[str, SemanticReplanReuseAuthority] = {}
+    current_bindings = route.semantic_replan_candidate_bindings_by_beat
+    for decision in decisions:
+        if not isinstance(decision, Mapping):
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan has invalid decision"
+            )
+        beat_id = str(decision.get("beat_id") or "")
+        option_id = str(decision.get("selected_option_id") or "")
+        prefix = beat_id + "--"
+        saved_beat = affected_by_id.get(beat_id)
+        if saved_beat is None or not option_id.startswith(prefix):
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan selected an unknown beat"
+            )
+        candidate_id = option_id.removeprefix(prefix)
+        saved_options = saved_beat.get("candidate_bindings")
+        current_options = {
+            binding.option.candidate_id: {
+                **binding.option.model_dump(mode="json"),
+                "replan_required_codes": list(binding.replan_required_codes),
+            }
+            for binding in current_bindings.get(beat_id, ())
+        }
+        if (
+            not isinstance(saved_options, Mapping)
+            or candidate_id not in saved_options
+            or current_options.get(candidate_id) != saved_options[candidate_id]
+        ):
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan option binding changed"
+            )
+        selected_candidate_ids[beat_id] = candidate_id
+        reuse_mode = str(decision.get("source_reuse_mode") or "none")
+        if reuse_mode != "none":
+            reuse_authorities[beat_id] = SemanticReplanReuseAuthority(
+                beat_id=beat_id,
+                candidate_id=candidate_id,
+                reuse_mode=reuse_mode,
+                reuse_justification=decision.get("source_reuse_justification"),
+                reuse_of_beat_ids=tuple(decision.get("reuse_of_beat_ids") or ()),
+            )
+    if set(selected_candidate_ids) != set(affected_by_id):
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan did not resolve every beat"
+        )
+    rebuilt = rebuild_route_with_semantic_authorities(
+        route,
+        selected_candidate_ids_by_beat=selected_candidate_ids,
+        reuse_authorities_by_beat=reuse_authorities,
+        minimum_duration_ms=(
+            1
+            if policy.execution_profile == "autonomous_best_effort"
+            else policy.duration.min_ms
+        ),
+        maximum_duration_ms=policy.duration.max_ms,
+        max_panel_runtime_fraction=policy.presentation.max_panel_runtime_fraction,
+        target_duration_ms=round(sum(chapter_durations.values()) * 1000),
+        max_editorial_reprise_overlap_fraction=(
+            policy.editorial.max_editorial_reprise_overlap_fraction
+        ),
+    )
+    merged_bindings = {
+        beat_id: {
+            binding.option.candidate_id: binding.option
+            for binding in bindings
+        }
+        for beat_id, bindings in current_bindings.items()
+    }
+    return route.model_copy(
+        update={
+            "selections": rebuilt.selections,
+            "ranked_routes": (rebuilt,),
+            "option_bindings_by_beat": merged_bindings,
+            "objective_score": rebuilt.objective_score,
+            "total_duration_ms": rebuilt.total_duration_ms,
+        }
+    )
+
+
+def _persist_preflight_local_infeasibility_replan(
+    *,
+    route: Any,
+    feature_id: str,
+    local_failures: Sequence[Mapping[str, Any]],
+    editorial_dir: Path,
+    policy: AutonomousEditPolicy,
+    client: GeminiLabClient,
+    plan_path: Path,
+    music_supplied: bool,
+    output_timeline_cues: Sequence[Any],
+) -> None:
+    """Ask Gemini once to choose after all zero-paid local options failed."""
+
+    if policy.budget.max_semantic_replans < 1:
+        raise CandidateKnownInfeasible(
+            "preflight_local_infeasibility_replan_limit_reached"
+        )
+    bindings = tuple(
+        route.semantic_replan_candidate_bindings_by_beat.get(feature_id, ())
+    )
+    if not 2 <= len(bindings) <= 3:
+        raise FeatureCutSystemFailure(
+            "local infeasibility replan requires two or three immutable candidates"
+        )
+    frontier = _semantic_replan_frontier_projection(route)
+    affected = [
+        row for row in frontier["beats"] if row["beat_id"] == feature_id
+    ]
+    if len(affected) != 1:
+        raise FeatureCutSystemFailure(
+            "local infeasibility replan cannot locate its frontier beat"
+        )
+    context = {
+        "contract_version": "preflight-local-infeasibility-replan-v1",
+        "policy_reference": policy.policy_reference,
+        "affected_beats": affected,
+        "whole_resolved_timeline": [
+            selection.model_dump(mode="json") for selection in route.selections
+        ],
+        "music_context": {
+            "supplied": music_supplied,
+            "output_cues": [
+                cue.model_dump(mode="json") for cue in output_timeline_cues
+            ],
+        },
+        "local_measurement_reports": {
+            feature_id: [dict(row) for row in local_failures],
+        },
+        "rules": {
+            "may_change": ["affected_candidate", "explicit_source_reuse_authority"],
+            "must_preserve": [
+                "brief_order",
+                "all_unaffected_beats",
+                "candidate_timing_bounds",
+                "resolved_music_cue_grid",
+                "hard_evidence",
+            ],
+            "forbidden": [
+                "invented_source_media",
+                "invented_timestamp",
+                "invented_crop_or_bbox",
+                "local_fallback_authority",
+            ],
+        },
+    }
+    context_path, decision_path = _preflight_local_infeasibility_replan_paths(
+        editorial_dir
+    )
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    if decision_path.is_file() and context_path.is_file():
+        if read_json(context_path) != context:
+            raise FeatureCutSystemFailure(
+                "saved local infeasibility replan does not match measured context"
+            )
+        return
+    write_json(context_path, context)
+    option_ids_by_beat = {
+        feature_id: tuple(
+            f"{feature_id}--{binding.option.candidate_id}" for binding in bindings
+        )
+    }
+    result = client.negotiate_grouped_edit_decisions(
+        option_ids_by_beat=option_ids_by_beat,
+        prompt=(
+            "[protocol=preflight-local-infeasibility-replan-v1] Every initial "
+            "candidate execution for this one beat failed a zero-paid local "
+            "measurement. Choose exactly one of the supplied immutable source "
+            "candidates using the whole sequence, adjacent shots, music cue grid, "
+            "and failure reports. This is a creative decision: do not make a local "
+            "fallback, invent media/time/crop, or change unaffected beats. Preserve "
+            "the brief and hard evidence; choose source reuse only with typed "
+            "authority.\n\n" + json.dumps(context, ensure_ascii=False)
+        ),
+        policy=policy,
+        run_dir=context_path.parent,
+        recovery_call=True,
+    )
+    decisions = [decision.model_dump(mode="json") for decision in result.decision.decisions]
+    allowed = set(option_ids_by_beat[feature_id])
+    if len(decisions) != 1 or str(decisions[0].get("selected_option_id")) not in allowed:
+        raise FeatureCutSystemFailure(
+            "local infeasibility replan selected an unknown immutable option"
+        )
+    authority = authorize_decision(
+        policy=policy,
+        decision_scope="scoped_semantic_replan",
+        input_artifact_hashes=(
+            f"sha256:{sha256_file(context_path)}",
+            f"sha256:{sha256_file(plan_path)}",
+        ),
+        deterministic_gate_results={
+            "candidate_frontier_complete": "passed",
+            "all_candidate_local_preflight_failed": "passed",
+            "music_context_bound": "passed",
+            "local_measurement_reports_bound": "passed",
+        },
+        decision_codes=(
+            "gemini_preflight_local_infeasibility_choice",
+            "no_local_candidate_promotion",
+        ),
+        gemini_interaction_ids=result.interaction_ids,
+    )
+    write_json(
+        decision_path,
+        {
+            "contract_version": "preflight-local-infeasibility-replan-result-v1",
+            "context_sha256": sha256_file(context_path),
+            "decisions": decisions,
+            "gemini_interaction_ids": result.interaction_ids,
+            "authority": authority.model_dump(mode="json"),
+            "generated_at": utc_now(),
+        },
+    )
+
+
 def _runtime_panel_budget_allows(
     prior_chapters: Sequence[Mapping[str, Any]],
     *,
@@ -21922,6 +22226,16 @@ def _run_feature_cut_experiment_impl(
                     }
                 )
         if pre_render_candidate_route is not None:
+            restored_local_replan = _selected_preflight_local_replan(
+                route=pre_render_candidate_route,
+                editorial_dir=editorial_dir,
+                policy=autonomous_policy,
+                plan_path=plan_path,
+                chapter_durations=chapter_durations,
+            )
+            if restored_local_replan is not None:
+                pre_render_candidate_route = restored_local_replan
+        if pre_render_candidate_route is not None:
             # The bounded optimizer owns the final per-beat duration vector.
             # It may redistribute dwell inside each Gemini-declared
             # min/preferred/max envelope while keeping the project total and
@@ -22738,9 +23052,21 @@ def _run_feature_cut_experiment_impl(
                     },
                 )
                 if not viable_candidates:
-                    raise CandidateKnownInfeasible(
+                    _persist_preflight_local_infeasibility_replan(
+                        route=pre_render_candidate_route,
+                        feature_id=frontier_feature_id,
+                        local_failures=local_failures,
+                        editorial_dir=editorial_dir,
+                        policy=autonomous_policy,
+                        client=client,
+                        plan_path=plan_path,
+                        music_supplied=music_lock is not None,
+                        output_timeline_cues=output_timeline_cues or (),
+                    )
+                    raise PreflightSemanticReplanReady(
                         "all autonomous 9:16 candidates failed zero-paid "
-                        f"preflight for {frontier_feature_id}"
+                        "preflight; Gemini selected a bounded replacement for "
+                        f"{frontier_feature_id}; restart required"
                     )
                 frontier_beats.append(
                     RoundRobinFrontierBeat(
