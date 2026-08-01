@@ -21990,12 +21990,6 @@ def _run_feature_cut_experiment_impl(
                     executable_deferred.append(row)
                 if not executable_deferred:
                     return None
-                if scoped_semantic_replan_state["used"] >= (
-                    autonomous_policy.budget.max_semantic_replans
-                ):
-                    raise CandidateKnownInfeasible(
-                        "scoped_semantic_replan_limit_reached"
-                    )
                 active_selections = [
                     selection.model_dump(mode="json")
                     for selection in active_runtime_route["route"].selections
@@ -22155,94 +22149,166 @@ def _run_feature_cut_experiment_impl(
                     / "scoped-semantic-replans"
                     / f"{feature_id}.context.json"
                 )
-                write_json(context_path, scoped_context)
-                try:
-                    result = client.negotiate_edit_decision(
-                        beat_id=feature_id,
-                        option_ids=tuple(option_id_to_row),
-                        prompt=(
-                            "[protocol=scoped-semantic-replan-v2] A local "
-                            "measurement found that Gemini's initial presentation "
-                            "cannot execute as selected. Choose exactly one immutable "
-                            "option after preserving the complete music and adjacent "
-                            "sequence context below. The choices are already technically "
-                            "feasible; choose on editorial intent, not numeric geometry. "
-                            "Do not use panel or matte merely to avoid a crop; do use one "
-                            "when its stated semantic relation benefits. Do not alter a "
-                            "cue or duration outside the supplied boundary grid.\n\n"
-                            + json.dumps(scoped_context, ensure_ascii=False)
-                        ),
-                        tool_declarations=(),
-                        tool_handlers={},
-                        policy=autonomous_policy,
-                        run_dir=(
-                            frontier_root
-                            / "scoped-semantic-replans"
-                            / feature_id
-                        ),
-                        recovery_call=True,
-                    )
-                except Exception as error:
-                    write_json(
-                        context_path.with_name(f"{feature_id}.blocked.json"),
-                        {
-                            "contract_version": "scoped-semantic-replan-result-v2",
-                            "context_sha256": sha256_file(context_path),
-                            "status": "blocked",
-                            "reason": f"{type(error).__name__}:{error}",
-                            "policy_reference": autonomous_policy.policy_reference,
-                        },
-                    )
-                    raise CandidateKnownInfeasible(
-                        "scoped_semantic_replan_unavailable:"
-                        + f"{type(error).__name__}"
-                    ) from error
-                selected_deferred = option_id_to_row[
-                    result.decision.selected_option_id
-                ]
-                scoped_semantic_replan_state["used"] += 1
-                scoped_semantic_replan_state["interaction_ids"].extend(
-                    result.interaction_ids
+                decision_path = context_path.with_name(
+                    f"{feature_id}.decision.json"
                 )
-                replan_authority = authorize_decision(
-                    policy=autonomous_policy,
-                    decision_scope="scoped_semantic_replan",
-                    input_artifact_hashes=(
+                saved_decision = (
+                    read_json(decision_path)
+                    if decision_path.is_file() and context_path.is_file()
+                    else None
+                )
+                if saved_decision is not None:
+                    if (
+                        read_json(context_path) != scoped_context
+                        or saved_decision.get("context_sha256")
+                        != sha256_file(context_path)
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "saved scoped semantic replan does not bind the "
+                            "current complete route context"
+                        )
+                    replan_authority = DecisionAuthorityV2.model_validate(
+                        saved_decision.get("authority")
+                    )
+                    validate_authority_binding(
+                        replan_authority,
+                        autonomous_policy,
+                    )
+                    required_replan_hashes = {
                         f"sha256:{sha256_file(context_path)}",
                         f"sha256:{route_sha256}",
                         f"sha256:{frontier_plan_sha256}",
-                    ),
-                    deterministic_gate_results={
-                        "candidate_frontier_complete": "passed",
-                        "exact_event_locked": "passed",
-                        "geometry_executable": "passed",
-                        "music_context_bound": "passed",
-                    },
-                    decision_codes=(
-                        "scoped_semantic_replan_selected_immutable_option",
-                        "local_presentation_change_not_silently_accepted",
-                    ),
-                    gemini_interaction_ids=result.interaction_ids,
-                )
-                write_json(
-                    context_path.with_name(f"{feature_id}.decision.json"),
-                    {
-                        "contract_version": "scoped-semantic-replan-result-v2",
-                        "context_path": str(context_path.resolve()),
-                        "context_sha256": sha256_file(context_path),
-                        "policy_reference": autonomous_policy.policy_reference,
-                        "decision": result.model_dump(mode="json"),
-                        "selected_candidate_id": selected_deferred[1],
-                        "selected_candidate_execution_sha256": selected_deferred[2],
-                        "selected_measured_presentation_mode": (
-                            selected_deferred[3].get(
-                                "measured_presentation_mode"
-                            )
+                    }
+                    if (
+                        replan_authority.decision_scope
+                        != "scoped_semantic_replan"
+                        or not required_replan_hashes.issubset(
+                            set(replan_authority.input_artifact_hashes)
+                        )
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "saved scoped semantic replan authority is incomplete"
+                        )
+                    selected_execution = str(
+                        saved_decision.get(
+                            "selected_candidate_execution_sha256"
+                        )
+                        or ""
+                    )
+                    selected_deferred = next(
+                        (
+                            row
+                            for row in executable_deferred
+                            if row[1]
+                            == saved_decision.get("selected_candidate_id")
+                            and row[2] == selected_execution
                         ),
-                        "authority": replan_authority.model_dump(mode="json"),
-                        "generated_at": utc_now(),
-                    },
-                )
+                        None,
+                    )
+                    if selected_deferred is None:
+                        raise FeatureCutSystemFailure(
+                            "saved scoped semantic replan selected an unavailable "
+                            "immutable execution"
+                        )
+                    scoped_semantic_replan_state["used"] = 1
+                    scoped_semantic_replan_state["interaction_ids"].extend(
+                        replan_authority.gemini_interaction_ids
+                    )
+                else:
+                    if scoped_semantic_replan_state["used"] >= (
+                        autonomous_policy.budget.max_semantic_replans
+                    ):
+                        raise CandidateKnownInfeasible(
+                            "scoped_semantic_replan_limit_reached"
+                        )
+                    write_json(context_path, scoped_context)
+                    try:
+                        result = client.negotiate_edit_decision(
+                            beat_id=feature_id,
+                            option_ids=tuple(option_id_to_row),
+                            prompt=(
+                                "[protocol=scoped-semantic-replan-v2] A local "
+                                "measurement found that Gemini's initial presentation "
+                                "cannot execute as selected. Choose exactly one immutable "
+                                "option after preserving the complete music and adjacent "
+                                "sequence context below. The choices are already technically "
+                                "feasible; choose on editorial intent, not numeric geometry. "
+                                "Do not use panel or matte merely to avoid a crop; do use one "
+                                "when its stated semantic relation benefits. Do not alter a "
+                                "cue or duration outside the supplied boundary grid.\n\n"
+                                + json.dumps(scoped_context, ensure_ascii=False)
+                            ),
+                            tool_declarations=(),
+                            tool_handlers={},
+                            policy=autonomous_policy,
+                            run_dir=(
+                                frontier_root
+                                / "scoped-semantic-replans"
+                                / feature_id
+                            ),
+                            recovery_call=True,
+                        )
+                    except Exception as error:
+                        write_json(
+                            context_path.with_name(f"{feature_id}.blocked.json"),
+                            {
+                                "contract_version": "scoped-semantic-replan-result-v2",
+                                "context_sha256": sha256_file(context_path),
+                                "status": "blocked",
+                                "reason": f"{type(error).__name__}:{error}",
+                                "policy_reference": autonomous_policy.policy_reference,
+                            },
+                        )
+                        raise CandidateKnownInfeasible(
+                            "scoped_semantic_replan_unavailable:"
+                            + f"{type(error).__name__}"
+                        ) from error
+                    selected_deferred = option_id_to_row[
+                        result.decision.selected_option_id
+                    ]
+                    scoped_semantic_replan_state["used"] += 1
+                    scoped_semantic_replan_state["interaction_ids"].extend(
+                        result.interaction_ids
+                    )
+                    replan_authority = authorize_decision(
+                        policy=autonomous_policy,
+                        decision_scope="scoped_semantic_replan",
+                        input_artifact_hashes=(
+                            f"sha256:{sha256_file(context_path)}",
+                            f"sha256:{route_sha256}",
+                            f"sha256:{frontier_plan_sha256}",
+                        ),
+                        deterministic_gate_results={
+                            "candidate_frontier_complete": "passed",
+                            "exact_event_locked": "passed",
+                            "geometry_executable": "passed",
+                            "music_context_bound": "passed",
+                        },
+                        decision_codes=(
+                            "scoped_semantic_replan_selected_immutable_option",
+                            "local_presentation_change_not_silently_accepted",
+                        ),
+                        gemini_interaction_ids=result.interaction_ids,
+                    )
+                    write_json(
+                        decision_path,
+                        {
+                            "contract_version": "scoped-semantic-replan-result-v2",
+                            "context_path": str(context_path.resolve()),
+                            "context_sha256": sha256_file(context_path),
+                            "policy_reference": autonomous_policy.policy_reference,
+                            "decision": result.model_dump(mode="json"),
+                            "selected_candidate_id": selected_deferred[1],
+                            "selected_candidate_execution_sha256": selected_deferred[2],
+                            "selected_measured_presentation_mode": (
+                                selected_deferred[3].get(
+                                    "measured_presentation_mode"
+                                )
+                            ),
+                            "authority": replan_authority.model_dump(mode="json"),
+                            "generated_at": utc_now(),
+                        },
+                    )
                 compatible_route = compatible_deferred_routes[
                     selected_deferred[2]
                 ]

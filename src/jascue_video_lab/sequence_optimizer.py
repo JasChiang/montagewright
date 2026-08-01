@@ -204,7 +204,17 @@ class RoundRobinFrontierAttemptResult(FrozenStrictModel):
             None,
             0,
         }:
-            raise ValueError("local preflight cannot add a paid call")
+            # A local-preflight failure may exhaust its route candidates and
+            # synchronously invoke the one policy-authorized scoped semantic
+            # replan.  The attempt itself remains a failed local preflight;
+            # the explicit decision code makes the exceptional paid action
+            # auditable instead of misclassifying it as silent local work.
+            if not (
+                self.outcome == "local_preflight_failed"
+                and "earlier_deferred_fallback_accepted_before_next_priority_tier"
+                in self.decision_codes
+            ):
+                raise ValueError("local preflight cannot add a paid call")
         return self
 
 

@@ -259,6 +259,33 @@ def test_round_robin_frontier_requires_exact_before_grounding() -> None:
     assert grounding_attempt.candidate_id == "candidate"
 
 
+def test_local_exhaustion_can_audit_one_scoped_semantic_replan_charge() -> None:
+    """The decision is paid, even when exhaustion is discovered locally."""
+
+    state = initialize_round_robin_frontier(
+        (_frontier_beat("beat", 0, ("candidate", False)),)
+    )
+    attempt = next_round_robin_frontier_attempt(state)
+    assert attempt is not None and attempt.stage == "local_preflight"
+
+    recorded = record_round_robin_frontier_attempt(
+        state,
+        RoundRobinFrontierAttemptResult(
+            attempt=attempt,
+            outcome="local_preflight_failed",
+            accepted_candidate_id="candidate",
+            decision_codes=(
+                "local_preflight_candidate_known_infeasible",
+                "earlier_deferred_fallback_accepted_before_next_priority_tier",
+            ),
+            paid_calls_added=1,
+        ),
+    )
+
+    assert recorded.paid_calls_consumed == 1
+    assert recorded.beats[0].status == "accepted"
+
+
 def test_round_robin_frontier_exact_failure_can_accept_earlier_deferred() -> None:
     state = initialize_round_robin_frontier(
         (
