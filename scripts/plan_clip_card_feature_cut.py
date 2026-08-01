@@ -1116,7 +1116,7 @@ class SelectedClipCardEvidence(StrictModel):
     events: list[SelectedEvidenceEvent]
 
 
-FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v2"
+FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v3"
 
 
 def fulfillment_observation_from_clip_card(
@@ -1398,6 +1398,43 @@ def canonicalize_direct_video_edit_plan_output(
     for chapter_index, chapter in enumerate(chapters):
         if not isinstance(chapter, dict) or chapter.get("evidence_status") == "not_found":
             continue
+        vertical_decisions: list[tuple[str, dict[str, Any]]] = []
+        primary_vertical = chapter.get("vertical")
+        if isinstance(primary_vertical, dict):
+            vertical_decisions.append(("vertical", primary_vertical))
+        alternates = chapter.get("vertical_alternates")
+        if isinstance(alternates, list):
+            vertical_decisions.extend(
+                (f"vertical_alternates[{alternate_index}]", alternate)
+                for alternate_index, alternate in enumerate(alternates)
+                if isinstance(alternate, dict)
+            )
+        for decision_path, decision in vertical_decisions:
+            source_motion_role = decision.get("source_camera_motion_role")
+            source_motion_reason = decision.get("source_camera_motion_reason")
+            if source_motion_role not in {None, "unknown"} and not (
+                isinstance(source_motion_reason, str)
+                and source_motion_reason.strip()
+            ):
+                # A label without its observable rationale is not usable
+                # evidence.  Preserve the conservative default rather than
+                # inventing a reason or rejecting the whole paid plan.
+                decision["source_camera_motion_role"] = "unknown"
+                decision["source_camera_motion_reason"] = None
+                changes.append(
+                    {
+                        "json_path": (
+                            f"chapters[{chapter_index}].{decision_path}"
+                            ".source_camera_motion_role"
+                        ),
+                        "before": source_motion_role,
+                        "after": "unknown",
+                        "rule": (
+                            "unexplained_source_camera_motion_classification_"
+                            "fails_safe_to_unknown"
+                        ),
+                    }
+                )
         reuse_mode = chapter.get("source_reuse_mode")
         reuse_justification = chapter.get("source_reuse_justification")
         if reuse_mode == "distinct_interval" and not (

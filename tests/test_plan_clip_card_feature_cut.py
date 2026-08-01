@@ -680,6 +680,42 @@ def test_direct_video_canonicalization_preserves_phase_local_anchors() -> None:
     )
 
 
+def test_direct_video_canonicalization_demotes_unexplained_source_motion() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "vertical": {
+                    "candidate_rank": 1,
+                    "source_camera_motion_role": "editorially_useful",
+                    "source_camera_motion_reason": None,
+                },
+                "vertical_alternates": [
+                    {
+                        "candidate_rank": 2,
+                        "source_camera_motion_role": "static_or_negligible",
+                        "source_camera_motion_reason": "",
+                    }
+                ],
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+
+    assert chapter["vertical"]["source_camera_motion_role"] == "unknown"
+    assert (
+        chapter["vertical_alternates"][0]["source_camera_motion_role"]
+        == "unknown"
+    )
+    assert {
+        change["rule"] for change in changes
+    } >= {"unexplained_source_camera_motion_classification_fails_safe_to_unknown"}
+
+
 def test_direct_video_canonicalization_only_removes_incomplete_optional_sync() -> None:
     payload = {
         "chapters": [
