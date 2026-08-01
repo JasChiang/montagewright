@@ -13642,9 +13642,19 @@ def _scoped_semantic_replan_reuse_binding(
         and option["measured_execution"].get("presentation_mode")
         == selected_measured_presentation_mode
     ]
-    if len(selected_options) != 1:
+    selected_options_by_content = {
+        _sha256_json(
+            {
+                key: value
+                for key, value in option.items()
+                if key != "option_id"
+            }
+        ): option
+        for option in selected_options
+    }
+    if len(selected_options_by_content) != 1:
         return None
-    selected_option = dict(selected_options[0])
+    selected_option = dict(next(iter(selected_options_by_content.values())))
     # Wrapper IDs enumerate the current frontier.  They are not identities of
     # a source interval and can legitimately change if unrelated options are
     # added during a resume.
@@ -22436,6 +22446,32 @@ def _run_feature_cut_experiment_impl(
                         or saved_decision.get("context_sha256")
                         != sha256_file(context_path)
                     ):
+                        write_json(
+                            context_path.with_name(
+                                f"{feature_id}.reuse-binding-mismatch.json"
+                            ),
+                            {
+                                "contract_version": (
+                                    "scoped-semantic-replan-reuse-audit-v1"
+                                ),
+                                "saved_context_sha256": sha256_file(
+                                    context_path
+                                ),
+                                "current_context_sha256": _sha256_json(
+                                    scoped_context
+                                ),
+                                "saved_reuse_binding": saved_reuse_binding,
+                                "current_reuse_binding": current_reuse_binding,
+                                "current_immutable_options": (
+                                    scoped_context.get("immutable_options")
+                                ),
+                                "selected_candidate_id": selected_candidate_id,
+                                "selected_candidate_execution_sha256": (
+                                    selected_execution
+                                ),
+                                "generated_at": utc_now(),
+                            },
+                        )
                         raise FeatureCutSystemFailure(
                             "saved scoped semantic replan does not bind the "
                             "current complete route context"

@@ -2307,6 +2307,7 @@ def test_scoped_replan_reuse_keeps_creative_context_and_selected_execution() -> 
         **context,
         "immutable_options": [
             {**selected, "option_id": "replan-02-rank-01-solid_matte_fit"},
+            {**selected, "option_id": "replan-03-rank-01-solid_matte_fit"},
             {
                 "option_id": "replan-01-rank-02-static_full_bleed_crop",
                 "candidate_id": "rank-02",
