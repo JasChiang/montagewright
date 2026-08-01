@@ -2331,6 +2331,53 @@ def test_pre_render_feasibility_does_not_locally_pick_an_authorized_fallback(
     )
 
 
+def test_pre_render_unsuitable_semantic_label_requires_scoped_replan_not_local_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Gemini self-contradiction reaches contextual replan before rejection."""
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "assess_prepaid_presentation_feasibility",
+        lambda **_kwargs: pytest.fail("unsuitable label must defer before lattice"),
+    )
+    candidate = SimpleNamespace(
+        candidate_id="candidate-a",
+        aspect_suitability="unsuitable",
+        coverage_mode="sequential",
+        regions=(),
+        virtual_camera_proposal=None,
+        physical_scale_comparison=False,
+        presentation_preference="tracked_full_bleed",
+    )
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=55_000,
+            max_ms=70_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+    mode, hard_failures, deferred = _pre_render_vertical_feasibility(
+        candidate,
+        policy=policy,
+    )
+
+    assert mode == "tracked_full_bleed_crop"
+    assert hard_failures == ()
+    assert deferred == (
+        "semantic_aspect_suitability_reassessment_required:"
+        "gemini_declared_unsuitable",
+    )
+
+
 def test_runtime_panel_fallback_cannot_exceed_global_fraction() -> None:
     prior = (
         {

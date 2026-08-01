@@ -13585,6 +13585,33 @@ def _pre_render_vertical_feasibility(
     locally convenient capability would silently change the edit.
     """
 
+    preferred = _pre_render_vertical_presentation_mode(
+        candidate,
+        policy=policy,
+    )
+    authorized = set(
+        _normal_acceptable_capability_ids(candidate.presentation_preference)
+    )
+    if preferred not in authorized:
+        raise ValueError(
+            "candidate's Gemini-selected presentation is not authorized"
+        )
+    # ``unsuitable`` is a Gemini semantic assessment, not a local pixel
+    # measurement.  It must never cause the sequence optimizer to silently
+    # replace the take with a different source/presentation.  Retain the
+    # explicitly selected candidate through zero-paid and measured geometry,
+    # then require the one scoped replan to either affirm or reject that
+    # conflict with its adjacent sequence and music context.
+    if candidate.aspect_suitability == "unsuitable":
+        return (
+            preferred,
+            (),
+            (
+                "semantic_aspect_suitability_reassessment_required:"
+                "gemini_declared_unsuitable",
+            ),
+        )
+
     relation_mode = _resolved_autonomous_relation_mode(
         candidate.coverage_mode,
         presentation_preference=candidate.presentation_preference,
@@ -13611,17 +13638,6 @@ def _pre_render_vertical_feasibility(
         ),
         policy=policy,
     )
-    preferred = _pre_render_vertical_presentation_mode(
-        candidate,
-        policy=policy,
-    )
-    authorized = set(
-        _normal_acceptable_capability_ids(candidate.presentation_preference)
-    )
-    if preferred not in authorized:
-        raise ValueError(
-            "candidate's Gemini-selected presentation is not authorized"
-        )
     assessment = lattice.assessment(preferred)
     if assessment.status == "known_infeasible":
         hard_failures = tuple(
@@ -16019,11 +16035,17 @@ def _compile_autonomous_vertical_candidate_geometry(
         str(option.get("presentation_preference", "tracked_full_bleed"))
     )
     applied_mode = _normalized_vertical_presentation_mode(applied)
+    semantic_aspect_reassessment_required = (
+        str(option.get("aspect_suitability")) == "unsuitable"
+    )
     classification = (
         "natural_accepted"
-        if not _presentation_requires_scoped_semantic_replan(
-            requested_mode=requested_mode,
-            measured_mode=applied_mode,
+        if not (
+            semantic_aspect_reassessment_required
+            or _presentation_requires_scoped_semantic_replan(
+                requested_mode=requested_mode,
+                measured_mode=applied_mode,
+            )
         )
         else "deferred_semantic_replan"
     )
@@ -16032,6 +16054,9 @@ def _compile_autonomous_vertical_candidate_geometry(
         "requested_presentation_mode": requested_mode,
         "measured_presentation_mode": applied_mode,
         "semantic_replan_required": classification != "natural_accepted",
+        "semantic_aspect_reassessment_required": (
+            semantic_aspect_reassessment_required
+        ),
         "filter_graph": filter_graph,
         "geometry": geometry,
         "debug_paths": [str(path.resolve()) for path in debug_paths],
