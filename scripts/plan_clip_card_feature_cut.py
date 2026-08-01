@@ -5139,6 +5139,9 @@ model_provenance 必須先原樣回傳：
 ## 已簽署的內容 grammar
 {content_mode_instructions}
 
+## 已簽署的成片時長範圍
+{policy.duration.model_dump_json(indent=2) if policy is not None else json.dumps({"target_seconds": brief.target_duration_seconds}, ensure_ascii=False)}
+
 只能回傳：
 1. 每個 chapter_index 的橫式與直式各選哪一個 candidate_rank；並為該章其餘
    所有附帶直式影片的候選，在 `vertical_alternates` 提供各自獨立的直式決定。
@@ -5169,6 +5172,13 @@ model_provenance 必須先原樣回傳：
    visual_sync_event 只在影片中真的有可觀察落點時提供，並同時給
    visual_sync_predicate 與 music_target；安靜訪談、空景或純 hold 可為 null。
    這些是相對剪輯意圖，不是精確剪點。
+6a. 全片必須滿足已簽署的 duration range。所有 supported／partial chapters 的
+    `maximum_dwell_seconds` 合計至少要覆蓋 `min_ms`；建議停留的總和應能在不靠
+    accidental freeze、無理由重複或未完成動作的前提下達到 target range。不要把
+    每章 arbitrarily 限成 5–6 秒；應按 setup、action、result readability 與合法
+    音樂 exit 決定。穩定但仍有閱讀、情緒或產品觀察價值的畫面可分配合理 hold。
+    若素材確實不能滿足，必須如實以 evidence_status 與 risks 表示缺口，不能捏造
+    補秒方式。
 7. 全片要有素材與視覺狀態的多樣性。若同一支 source 已被前章選用，應先選
    不同 take；只有不同 interval 提供新的 hard evidence、alternate presentation
    有新的閱讀目的，或明確 editorial reprise 時才能重用，並填入 typed reuse
