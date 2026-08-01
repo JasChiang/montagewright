@@ -2280,8 +2280,15 @@ def optimize_pre_render_candidate_route(
             for option in legal
             if option.candidate_id == selected_candidate_id
         )
-        contextual_legal: list[CandidateRouteOption] = []
+        # The selected option is already proved jointly feasible by the
+        # complete route. Its source trim can differ from ``option``'s
+        # preferred duration when a bounded duration variant was selected, so
+        # rechecking it as a hypothetical substitution can falsely remove the
+        # primary from its own binding table. Only alternates need that test.
+        contextual_legal: list[CandidateRouteOption] = [primary]
         for option in legal:
+            if option.candidate_id == selected_candidate_id:
+                continue
             substituted_duration_ms = (
                 best_route.total_duration_ms
                 - next(

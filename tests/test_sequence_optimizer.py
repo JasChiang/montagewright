@@ -1048,6 +1048,13 @@ def test_ranked_routes_include_bounded_duration_recovery_execution() -> None:
         recovery.selections[1].source_in_ms,
         recovery.selections[1].source_out_ms,
     ) == (0, 2_000)
+    # A bounded duration variant changes the immutable execution interval, but
+    # it must not make the selected semantic candidate disappear from its own
+    # runtime binding table.
+    for selection in result.selections:
+        assert selection.candidate_id in result.option_bindings_by_beat[
+            selection.beat_id
+        ]
 
 
 def test_duration_recovery_frontier_is_locally_bounded() -> None:
