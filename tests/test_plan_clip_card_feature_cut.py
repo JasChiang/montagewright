@@ -693,8 +693,15 @@ def test_direct_video_canonicalization_demotes_unexplained_source_motion() -> No
                 "vertical_alternates": [
                     {
                         "candidate_rank": 2,
+                        "strategy": "tracked_crop",
+                        "crop_mode": "strict",
+                        "coverage_mode": "relation_core",
+                        "allow_controlled_clip": True,
                         "source_camera_motion_role": "static_or_negligible",
                         "source_camera_motion_reason": "",
+                        "required_entity_indices": [1, 2],
+                        "preferred_entity_indices": [3],
+                        "sacrificable_entity_indices": [3],
                     }
                 ],
             }
@@ -711,9 +718,15 @@ def test_direct_video_canonicalization_demotes_unexplained_source_motion() -> No
         chapter["vertical_alternates"][0]["source_camera_motion_role"]
         == "unknown"
     )
+    assert chapter["vertical_alternates"][0]["crop_mode"] == "primary_center"
+    assert chapter["vertical_alternates"][0]["sacrificable_entity_indices"] == []
     assert {
         change["rule"] for change in changes
-    } >= {"unexplained_source_camera_motion_classification_fails_safe_to_unknown"}
+    } >= {
+        "unexplained_source_camera_motion_classification_fails_safe_to_unknown",
+        "explicit_controlled_clip_uses_primary_center_representation",
+        "entity_role_precedence_required_preferred_sacrificable",
+    }
 
 
 def test_direct_video_canonicalization_only_removes_incomplete_optional_sync() -> None:

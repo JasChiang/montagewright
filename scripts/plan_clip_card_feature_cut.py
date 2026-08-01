@@ -1116,7 +1116,7 @@ class SelectedClipCardEvidence(StrictModel):
     events: list[SelectedEvidenceEvent]
 
 
-FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v3"
+FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v4"
 
 
 def fulfillment_observation_from_clip_card(
@@ -1410,6 +1410,7 @@ def canonicalize_direct_video_edit_plan_output(
                 if isinstance(alternate, dict)
             )
         for decision_path, decision in vertical_decisions:
+            decision_base = f"chapters[{chapter_index}].{decision_path}"
             source_motion_role = decision.get("source_camera_motion_role")
             source_motion_reason = decision.get("source_camera_motion_reason")
             if source_motion_role not in {None, "unknown"} and not (
@@ -1424,7 +1425,7 @@ def canonicalize_direct_video_edit_plan_output(
                 changes.append(
                     {
                         "json_path": (
-                            f"chapters[{chapter_index}].{decision_path}"
+                            f"{decision_base}"
                             ".source_camera_motion_role"
                         ),
                         "before": source_motion_role,
@@ -1435,6 +1436,91 @@ def canonicalize_direct_video_edit_plan_output(
                         ),
                     }
                 )
+            if (
+                decision.get("strategy") == "tracked_crop"
+                and decision.get("allow_controlled_clip") is True
+                and decision.get("crop_mode") == "strict"
+            ):
+                decision["crop_mode"] = "primary_center"
+                changes.append(
+                    {
+                        "json_path": f"{decision_base}.crop_mode",
+                        "before": "strict",
+                        "after": "primary_center",
+                        "rule": (
+                            "explicit_controlled_clip_uses_primary_center_"
+                            "representation"
+                        ),
+                    }
+                )
+            if (
+                decision.get("strategy") == "fit_with_background"
+                and decision.get("allow_controlled_clip") is True
+            ):
+                decision["allow_controlled_clip"] = False
+                changes.append(
+                    {
+                        "json_path": f"{decision_base}.allow_controlled_clip",
+                        "before": True,
+                        "after": False,
+                        "rule": (
+                            "fit_with_background_preserves_scope_without_"
+                            "controlled_clipping"
+                        ),
+                    }
+                )
+            if (
+                decision.get("presentation_preference") == "two_panel_layout"
+                and decision.get("coverage_mode") == "sequential"
+            ):
+                decision["presentation_preference"] = "phase_virtual_camera"
+                changes.append(
+                    {
+                        "json_path": f"{decision_base}.presentation_preference",
+                        "before": "two_panel_layout",
+                        "after": "phase_virtual_camera",
+                        "rule": (
+                            "sequential_attention_uses_declared_phases_instead_"
+                            "of_implying_simultaneity"
+                        ),
+                    }
+                )
+            required_before = list(decision.get("required_entity_indices") or [])
+            preferred_before = list(decision.get("preferred_entity_indices") or [])
+            sacrificable_before = list(
+                decision.get("sacrificable_entity_indices") or []
+            )
+            required = list(dict.fromkeys(required_before))
+            preferred = [
+                index
+                for index in dict.fromkeys(preferred_before)
+                if index not in required
+            ]
+            sacrificable = [
+                index
+                for index in dict.fromkeys(sacrificable_before)
+                if index not in required and index not in preferred
+            ]
+            normalized_roles = {
+                "required_entity_indices": required,
+                "preferred_entity_indices": preferred,
+                "sacrificable_entity_indices": sacrificable,
+            }
+            for field, after in normalized_roles.items():
+                before = list(decision.get(field) or [])
+                decision[field] = after
+                if before != after:
+                    changes.append(
+                        {
+                            "json_path": f"{decision_base}.{field}",
+                            "before": before,
+                            "after": after,
+                            "rule": (
+                                "entity_role_precedence_required_preferred_"
+                                "sacrificable"
+                            ),
+                        }
+                    )
         reuse_mode = chapter.get("source_reuse_mode")
         reuse_justification = chapter.get("source_reuse_justification")
         if reuse_mode == "distinct_interval" and not (
