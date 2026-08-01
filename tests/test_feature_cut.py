@@ -1297,6 +1297,52 @@ def test_production_frontier_runs_all_primaries_before_retry(
     assert accepted == {"a": "a2", "b": "b1", "c": "c2"}
 
 
+def test_production_frontier_groups_deferred_resolution_after_measurement(
+    tmp_path: Path,
+) -> None:
+    """One semantic replan sees every measured conflict, not the first one."""
+
+    measured: list[str] = []
+    grouped_states: list[RoundRobinFrontierState] = []
+
+    def grounding(attempt) -> None:
+        measured.append(attempt.beat_id)
+        if attempt.beat_id in {"opening", "closing"}:
+            raise CandidateKnownInfeasible("presentation needs semantic replan")
+
+    def resolve_batch(
+        state: RoundRobinFrontierState,
+    ) -> dict[str, str]:
+        grouped_states.append(state)
+        assert {
+            beat.beat.beat_id
+            for beat in state.beats
+            if beat.status == "exhausted"
+        } == {"opening", "closing"}
+        return {"opening": "open-1", "closing": "close-1"}
+
+    accepted = _run_persisted_production_frontier(
+        state_path=tmp_path / "frontier.json",
+        beats=(
+            _production_frontier_beat("opening", 0, ("open-1", False)),
+            _production_frontier_beat("middle", 1, ("middle-1", False)),
+            _production_frontier_beat("closing", 2, ("close-1", False)),
+        ),
+        local_preflight=lambda _attempt: None,
+        exact_event=lambda _attempt: None,
+        grounding=grounding,
+        resolve_deferred_batch=resolve_batch,
+    )
+
+    assert measured == ["opening", "middle", "closing"]
+    assert len(grouped_states) == 1
+    assert accepted == {
+        "opening": "open-1",
+        "middle": "middle-1",
+        "closing": "close-1",
+    }
+
+
 def test_production_frontier_accepted_beat_exits(
     tmp_path: Path,
 ) -> None:

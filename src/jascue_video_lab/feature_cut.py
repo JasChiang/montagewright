@@ -343,6 +343,13 @@ def _run_persisted_production_frontier(
     resolve_deferred_on_exhaustion: (
         Callable[[str], str | tuple[str, str] | None] | None
     ) = None,
+    resolve_deferred_batch: (
+        Callable[
+            [RoundRobinFrontierState],
+            Mapping[str, str | tuple[str, str] | None],
+        ]
+        | None
+    ) = None,
     allow_beat_omission: Callable[[str], bool] | None = None,
     on_frontier_frozen: (
         Callable[[RoundRobinFrontierState, Mapping[str, str]], None] | None
@@ -409,12 +416,23 @@ def _run_persisted_production_frontier(
         "grounding": "grounding_failed",
     }
 
+    if (
+        resolve_deferred_on_exhaustion is not None
+        and resolve_deferred_batch is not None
+    ):
+        raise ValueError(
+            "frontier supports either per-beat or grouped deferred resolution"
+        )
+
     preexisting_exhausted = [
         row.beat.beat_id
         for row in state.beats
         if row.status == "exhausted"
     ]
-    if resolve_deferred_on_exhaustion is not None and preexisting_exhausted:
+    if (
+        resolve_deferred_on_exhaustion is not None
+        and preexisting_exhausted
+    ):
         raise FeatureCutSystemFailure(
             "persisted production frontier already contains exhausted beats "
             "from an older execution contract; use a fresh output namespace "
@@ -526,7 +544,10 @@ def _run_persisted_production_frontier(
             for row in state.beats
             if row.beat.beat_id == attempt.beat_id
         )
-        if just_updated.status == "exhausted":
+        if (
+            just_updated.status == "exhausted"
+            and resolve_deferred_batch is None
+        ):
             raise FeatureCutSystemFailure(
                 "production frontier exhausted a non-omittable beat before any "
                 "lower-priority callback could run: "
@@ -538,6 +559,113 @@ def _run_persisted_production_frontier(
         for row in state.beats
         if row.status == "exhausted"
     ]
+    if resolve_deferred_batch is not None and unresolved_exhausted:
+        paid_count_before = (
+            paid_interaction_counter()
+            if paid_interaction_counter is not None
+            else None
+        )
+        batch_resolutions = resolve_deferred_batch(state)
+        paid_calls_added = (
+            None
+            if paid_count_before is None
+            else max(0, paid_interaction_counter() - paid_count_before)
+        )
+        resolved_beats = list(state.beats)
+        batch_results: list[RoundRobinFrontierAttemptResult] = []
+        for beat_index, beat_state in enumerate(resolved_beats):
+            if beat_state.status != "exhausted":
+                continue
+            resolution = batch_resolutions.get(beat_state.beat.beat_id)
+            if isinstance(resolution, tuple):
+                candidate_id, execution_sha256 = resolution
+            elif isinstance(resolution, str):
+                candidate_id, execution_sha256 = resolution, None
+            else:
+                candidate_id, execution_sha256 = None, None
+            if candidate_id is None:
+                if allow_beat_omission is None or not allow_beat_omission(
+                    beat_state.beat.beat_id
+                ):
+                    raise FeatureCutSystemFailure(
+                        "grouped deferred resolver left a non-omittable beat "
+                        "unresolved: " + beat_state.beat.beat_id
+                    )
+                resolved_beats[beat_index] = beat_state.model_copy(
+                    update={"status": "omitted"}
+                )
+                continue
+            matching_candidates = [
+                candidate
+                for candidate in beat_state.beat.candidates
+                if candidate.candidate_id == candidate_id
+                and (
+                    execution_sha256 is None
+                    or candidate.candidate_execution_sha256 == execution_sha256
+                )
+            ]
+            if len(matching_candidates) != 1:
+                raise FeatureCutSystemFailure(
+                    "grouped deferred resolver selected an unknown immutable "
+                    "candidate for " + beat_state.beat.beat_id
+                )
+            selected = matching_candidates[0]
+            resolved_beats[beat_index] = beat_state.model_copy(
+                update={
+                    "status": "accepted",
+                    "active_candidate_id": None,
+                    "active_candidate_execution_sha256": None,
+                    "accepted_candidate_id": selected.candidate_id,
+                    "accepted_candidate_execution_sha256": (
+                        selected.candidate_execution_sha256
+                    ),
+                }
+            )
+            last_attempt = next(
+                (
+                    item.attempt
+                    for item in reversed(state.attempt_history)
+                    if item.attempt.beat_id == beat_state.beat.beat_id
+                ),
+                None,
+            )
+            if last_attempt is None or last_attempt.stage != "grounding":
+                raise FeatureCutSystemFailure(
+                    "grouped deferred resolver has no terminal grounding "
+                    "attempt for " + beat_state.beat.beat_id
+                )
+            batch_results.append(
+                RoundRobinFrontierAttemptResult(
+                    attempt=last_attempt,
+                    outcome="grounding_failed",
+                    accepted_candidate_id=selected.candidate_id,
+                    accepted_candidate_execution_sha256=(
+                        selected.candidate_execution_sha256
+                    ),
+                    paid_calls_added=(
+                        paid_calls_added if not batch_results else 0
+                    ),
+                    decision_codes=(
+                        "grouped_scoped_semantic_replan_selected_"
+                        "immutable_option",
+                    ),
+                )
+            )
+        state = state.model_copy(
+            update={
+                "revision": state.revision + len(batch_results),
+                "beats": tuple(resolved_beats),
+                "attempt_history": (*state.attempt_history, *batch_results),
+                "paid_calls_consumed": state.paid_calls_consumed
+                + (paid_calls_added or 0),
+            }
+        )
+        write_json(state_path, state)
+        unresolved_exhausted = [
+            row.beat.beat_id
+            for row in state.beats
+            if row.status == "exhausted"
+        ]
     if resolve_deferred_on_exhaustion is not None and unresolved_exhausted:
         raise FeatureCutSystemFailure(
             "production frontier exhausted without a validated natural or "
@@ -22684,6 +22812,345 @@ def _run_feature_cut_experiment_impl(
                     selected_deferred[2],
                 )
 
+            def accept_deferred_batch(
+                frontier_state: RoundRobinFrontierState,
+            ) -> Mapping[str, tuple[str, str]]:
+                """Let Gemini resolve all measured route conflicts together.
+
+                The scheduler calls this only after it has exhausted every
+                technically measured candidate.  The local process supplies
+                facts and immutable source/presentation options; Gemini makes
+                the cross-beat editorial selection once with the complete cue
+                grid and timeline in view.
+                """
+
+                feature_ids = [
+                    state_beat.beat.beat_id
+                    for state_beat in frontier_state.beats
+                    if state_beat.status == "exhausted"
+                ]
+                if not feature_ids:
+                    return {}
+                if scoped_semantic_replan_state["used"] >= (
+                    autonomous_policy.budget.max_semantic_replans
+                ):
+                    raise CandidateKnownInfeasible(
+                        "scoped_semantic_replan_limit_reached"
+                    )
+                active_selections = [
+                    selection.model_dump(mode="json")
+                    for selection in active_runtime_route["route"].selections
+                ]
+                option_rows: dict[str, tuple[str, str, str, Mapping[str, Any]]] = {}
+                options_by_beat: dict[str, list[str]] = {}
+                affected_beats: list[dict[str, Any]] = []
+                for feature_id in feature_ids:
+                    active_execution = active_execution_sha256(feature_id)
+                    rows = [
+                        row
+                        for row in sorted(
+                            deferred_payloads.get(feature_id, []),
+                            key=lambda item: item[0],
+                        )
+                        if row[2] == active_execution
+                    ]
+                    if not rows:
+                        raise CandidateKnownInfeasible(
+                            "grouped_scoped_replan_has_no_active_immutable_option:"
+                            + feature_id
+                        )
+                    unique_rows: dict[str, tuple[int, str, str, Mapping[str, Any]]] = {}
+                    for row in rows:
+                        fingerprint = _sha256_json(
+                            {
+                                "candidate_id": row[1],
+                                "candidate_execution_sha256": row[2],
+                                "geometry": row[3],
+                            }
+                        )
+                        unique_rows.setdefault(fingerprint, row)
+                    immutable_options: list[dict[str, Any]] = []
+                    for order, row in enumerate(unique_rows.values(), start=1):
+                        key = _frontier_execution_key(feature_id, row[1], row[2])
+                        local_payload = local_payloads[key]
+                        exact_payload = exact_payloads.get(key, {})
+                        geometry_payload = row[3]
+                        geometry = geometry_payload.get("geometry")
+                        presentation = (
+                            geometry.get("presentation_compilation")
+                            if isinstance(geometry, Mapping)
+                            else None
+                        )
+                        option_id = (
+                            f"{feature_id}--replan-{order:02d}-{row[1]}-"
+                            f"{str(geometry_payload.get('measured_presentation_mode') or 'unknown')}"
+                        )
+                        option_rows[option_id] = (
+                            feature_id,
+                            row[1],
+                            row[2],
+                            row[3],
+                        )
+                        options_by_beat.setdefault(feature_id, []).append(option_id)
+                        immutable_options.append(
+                            {
+                                "option_id": option_id,
+                                "candidate_id": row[1],
+                                "candidate_execution_sha256": row[2],
+                                "source_asset_id": local_payload["option"].get(
+                                    "source_asset_id"
+                                ),
+                                "event_id": local_payload["option"].get("event_id"),
+                                "source_window_ms": {
+                                    "start": local_payload.get("start_ms"),
+                                    "end": local_payload.get("end_ms"),
+                                },
+                                "planner_intent": {
+                                    "presentation_preference": geometry_payload.get(
+                                        "requested_presentation_mode"
+                                    ),
+                                    "coverage_mode": local_payload["option"].get(
+                                        "coverage_mode"
+                                    ),
+                                    "presentation_goal": local_payload["option"].get(
+                                        "presentation_goal"
+                                    ),
+                                },
+                                "measured_execution": {
+                                    "presentation_mode": geometry_payload.get(
+                                        "measured_presentation_mode"
+                                    ),
+                                    "reason": geometry_payload.get("reason"),
+                                    "failure_codes": geometry_payload.get(
+                                        "failure_codes", []
+                                    ),
+                                    "geometry_risk_codes": (
+                                        geometry.get("risk_codes", [])
+                                        if isinstance(geometry, Mapping)
+                                        else []
+                                    ),
+                                    "source_camera_motion": (
+                                        geometry.get(
+                                            "source_camera_motion_evidence"
+                                        )
+                                        if isinstance(geometry, Mapping)
+                                        else None
+                                    ),
+                                    "locally_executable_capability_options": (
+                                        presentation.get("option_set", {}).get(
+                                            "options", []
+                                        )
+                                        if isinstance(presentation, Mapping)
+                                        else []
+                                    ),
+                                },
+                                "exact_evidence": {
+                                    "locks": exact_payload.get("locks", []),
+                                    "fulfillments": exact_payload.get(
+                                        "fulfillments", []
+                                    ),
+                                },
+                            }
+                        )
+                    beat_index = next(
+                        index
+                        for index, selection in enumerate(active_selections)
+                        if selection["beat_id"] == feature_id
+                    )
+                    rhythm_chapter = next(
+                        chapter
+                        for chapter in rhythm_plan.chapters
+                        if chapter.feature_id == feature_id
+                    )
+                    semantic_beat = semantic_beat_by_id.get(feature_id)
+                    affected_beats.append(
+                        {
+                            "feature_id": feature_id,
+                            "semantic_beat": (
+                                semantic_beat.model_dump(mode="json")
+                                if semantic_beat is not None
+                                else None
+                            ),
+                            "rhythm": rhythm_chapter.model_dump(mode="json"),
+                            "current_route_selection": active_selections[beat_index],
+                            "previous": (
+                                active_selections[beat_index - 1]
+                                if beat_index > 0
+                                else None
+                            ),
+                            "next": (
+                                active_selections[beat_index + 1]
+                                if beat_index + 1 < len(active_selections)
+                                else None
+                            ),
+                            "immutable_options": immutable_options,
+                        }
+                    )
+                scoped_context = {
+                    "contract_version": "grouped-scoped-semantic-replan-context-v1",
+                    "policy_reference": autonomous_policy.policy_reference,
+                    "affected_beats": affected_beats,
+                    "whole_resolved_timeline": active_selections,
+                    "music_context": {
+                        "supplied": music_lock is not None,
+                        "resolved_boundaries": duration_audit.get(
+                            "music_boundary_refinements", []
+                        ),
+                        "output_cues": [
+                            cue.model_dump(mode="json")
+                            for cue in (output_timeline_cues or [])
+                        ],
+                    },
+                    "rules": {
+                        "may_change": [
+                            "affected_candidate",
+                            "affected_presentation_from_immutable_options",
+                        ],
+                        "must_preserve": [
+                            "brief_order",
+                            "exact_event_locks",
+                            "source_windows",
+                            "resolved_music_cue_grid",
+                            "hard_evidence",
+                        ],
+                        "forbidden": [
+                            "invented_timestamp",
+                            "invented_crop_or_bbox",
+                            "new_source_media",
+                            "changing_unaffected_beats",
+                        ],
+                    },
+                }
+                grouped_dir = frontier_root / "scoped-semantic-replans" / "grouped"
+                context_path = grouped_dir / "context.json"
+                decision_path = grouped_dir / "decision.json"
+                if decision_path.is_file() and context_path.is_file():
+                    saved = read_json(decision_path)
+                    if (
+                        read_json(context_path) != scoped_context
+                        or saved.get("context_sha256") != sha256_file(context_path)
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "saved grouped scoped semantic replan does not bind "
+                            "the current complete route context"
+                        )
+                    decisions = saved.get("decisions")
+                    if not isinstance(decisions, list):
+                        raise FeatureCutSystemFailure(
+                            "saved grouped scoped semantic replan has no decisions"
+                        )
+                    selected_option_ids = {
+                        str(row.get("beat_id")): str(row.get("selected_option_id"))
+                        for row in decisions
+                        if isinstance(row, Mapping)
+                    }
+                    interaction_ids = tuple(
+                        str(value)
+                        for value in saved.get("gemini_interaction_ids", [])
+                    )
+                else:
+                    write_json(context_path, scoped_context)
+                    result = client.negotiate_grouped_edit_decisions(
+                        option_ids_by_beat=options_by_beat,
+                        prompt=(
+                            "[protocol=grouped-scoped-semantic-replan-v1] Local "
+                            "measurement found presentation conflicts across the "
+                            "same complete edit route. Choose exactly one immutable "
+                            "option for every affected beat while preserving the full "
+                            "timeline, adjacent shots, hard evidence, and music cue "
+                            "grid. The options are technically feasible. Do not use "
+                            "panel or matte merely to avoid a crop; use one only when "
+                            "its stated semantic relation benefits.\n\n"
+                            + json.dumps(scoped_context, ensure_ascii=False)
+                        ),
+                        policy=autonomous_policy,
+                        run_dir=grouped_dir,
+                        recovery_call=True,
+                    )
+                    selected_option_ids = {
+                        decision.beat_id: decision.selected_option_id
+                        for decision in result.decision.decisions
+                    }
+                    interaction_ids = result.interaction_ids
+                    authority = authorize_decision(
+                        policy=autonomous_policy,
+                        decision_scope="scoped_semantic_replan",
+                        input_artifact_hashes=(
+                            f"sha256:{sha256_file(context_path)}",
+                            f"sha256:{frontier_plan_sha256}",
+                        ),
+                        deterministic_gate_results={
+                            "candidate_frontier_complete": "passed",
+                            "exact_event_locked": "passed",
+                            "geometry_executable": "passed",
+                            "music_context_bound": "passed",
+                        },
+                        decision_codes=(
+                            "grouped_scoped_semantic_replan_selected_"
+                            "immutable_options",
+                        ),
+                        gemini_interaction_ids=interaction_ids,
+                    )
+                    write_json(
+                        decision_path,
+                        {
+                            "contract_version": (
+                                "grouped-scoped-semantic-replan-result-v1"
+                            ),
+                            "context_sha256": sha256_file(context_path),
+                            "policy_reference": autonomous_policy.policy_reference,
+                            "decisions": [
+                                decision.model_dump(mode="json")
+                                for decision in result.decision.decisions
+                            ],
+                            "gemini_interaction_ids": interaction_ids,
+                            "authority": authority.model_dump(mode="json"),
+                            "generated_at": utc_now(),
+                        },
+                    )
+                if set(selected_option_ids) != set(feature_ids):
+                    raise FeatureCutSystemFailure(
+                        "grouped scoped semantic replan did not resolve every "
+                        "affected beat"
+                    )
+                selected: dict[str, tuple[str, str]] = {}
+                for feature_id, option_id in selected_option_ids.items():
+                    row = option_rows.get(option_id)
+                    if row is None or row[0] != feature_id:
+                        raise FeatureCutSystemFailure(
+                            "grouped scoped semantic replan selected an unknown "
+                            "immutable option"
+                        )
+                    _, candidate_id, execution_sha256, geometry_payload = row
+                    selected[feature_id] = (candidate_id, execution_sha256)
+                    frontier_constructed_acceptances[feature_id] = selected[feature_id]
+                    accepted_runtime_execution_by_beat[feature_id] = execution_sha256
+                    selected_local = local_payloads[
+                        _frontier_execution_key(
+                            feature_id, candidate_id, execution_sha256
+                        )
+                    ]
+                    selected_clip = RushClip.model_validate(selected_local["clip"])
+                    frontier_accepted_source_uses.append(
+                        {
+                            "feature_id": feature_id,
+                            "source_clip_id": selected_clip.clip_id,
+                            "source_in_ms": int(selected_local["start_ms"]),
+                            "source_out_ms": int(selected_local["end_ms"]),
+                        }
+                    )
+                    if geometry_payload.get("measured_presentation_mode") == (
+                        "two_panel_layout"
+                    ):
+                        frontier_constructed_runtime["panel_ms"] += round(
+                            chapter_durations[feature_id] * 1000
+                        )
+                scoped_semantic_replan_state["used"] += 1
+                scoped_semantic_replan_state["interaction_ids"].extend(
+                    interaction_ids
+                )
+                return selected
+
             def frontier_grounding_callback(
                 frontier_attempt: RoundRobinFrontierAttempt,
             ) -> str | tuple[str, str] | None:
@@ -23628,9 +24095,7 @@ def _run_feature_cut_experiment_impl(
                 on_candidate_infeasible=(
                     advance_complete_route_after_failure
                 ),
-                resolve_deferred_on_exhaustion=(
-                    accept_deferred_for_beat
-                ),
+                resolve_deferred_batch=accept_deferred_batch,
                 allow_beat_omission=lambda feature_id: (
                     frontier_beat_by_id[feature_id].priority == "optional"
                     and autonomous_policy.editorial

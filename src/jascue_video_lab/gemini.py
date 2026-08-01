@@ -140,6 +140,34 @@ class BoundedSemanticNegotiationResult(FrozenStrictModel):
     automatic_function_calling: Literal[False] = False
 
 
+class GroupedEditDecisionProposal(FrozenStrictModel):
+    """One immutable option choice for every beat in a grouped replan."""
+
+    decisions: tuple[EditDecisionProposal, ...] = Field(
+        min_length=1,
+        max_length=8,
+    )
+
+    @model_validator(mode="after")
+    def validate_distinct_beats(self) -> "GroupedEditDecisionProposal":
+        beat_ids = [decision.beat_id for decision in self.decisions]
+        if len(beat_ids) != len(set(beat_ids)):
+            raise ValueError("grouped edit decisions must have unique beat IDs")
+        return self
+
+
+class BoundedGroupedSemanticNegotiationResult(FrozenStrictModel):
+    """One paid, whole-sequence semantic decision over multiple conflicts."""
+
+    contract_version: Literal["bounded-grouped-semantic-negotiation-v1"] = (
+        "bounded-grouped-semantic-negotiation-v1"
+    )
+    decision: GroupedEditDecisionProposal
+    interaction_ids: tuple[str, ...] = Field(min_length=1, max_length=1)
+    tool_call_ids: tuple[str, ...] = ()
+    automatic_function_calling: Literal[False] = False
+
+
 def canonical_interactions_mime_type(mime_type: str) -> str:
     """Normalize common OS/File API aliases to Interactions API media types."""
 
@@ -1668,6 +1696,175 @@ class GeminiLabClient:
             },
         )
         return uploaded, False
+
+    def negotiate_grouped_edit_decisions(
+        self,
+        *,
+        option_ids_by_beat: Mapping[str, Sequence[str]],
+        prompt: str,
+        policy: AutonomousEditPolicy,
+        run_dir: Path,
+        recovery_call: bool = False,
+    ) -> BoundedGroupedSemanticNegotiationResult:
+        """Make one whole-sequence choice for every deferred beat.
+
+        This deliberately has no inspection/tool loop: all exact evidence and
+        local measurements are supplied in the immutable prompt context.  One
+        grouped call preserves the policy's semantic-replan bound while
+        preventing the first problematic beat from spending the only creative
+        recovery decision before later conflicts have been measured.
+        """
+
+        negotiation = policy.semantic_negotiation
+        if not negotiation.enabled:
+            raise ValueError("semantic negotiation is disabled by policy")
+        if self.budget_ledger is None:
+            raise ValueError(
+                "grouped semantic negotiation requires a BudgetLedger before dispatch"
+            )
+        normalized_options = {
+            beat_id: tuple(dict.fromkeys(option_ids))
+            for beat_id, option_ids in option_ids_by_beat.items()
+        }
+        if not normalized_options or any(
+            not beat_id or not option_ids
+            for beat_id, option_ids in normalized_options.items()
+        ):
+            raise ValueError(
+                "grouped semantic negotiation requires options for every beat"
+            )
+        if any(
+            len(option_ids) != len(option_ids_by_beat[beat_id])
+            for beat_id, option_ids in normalized_options.items()
+        ):
+            raise ValueError(
+                "grouped semantic negotiation option IDs must be unique per beat"
+            )
+        decision_declaration = {
+            "type": "function",
+            "name": "propose_grouped_edit_decisions",
+            "description": (
+                "Choose exactly one immutable, locally executable option for "
+                "every supplied beat. This does not commit or render."
+            ),
+            "parameters": gemini_response_schema(GroupedEditDecisionProposal),
+        }
+        run_dir.mkdir(parents=True, exist_ok=True)
+        request_record: dict[str, Any] = {
+            "model": self.model_id,
+            "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+            "store": True,
+            "input": [
+                {
+                    "type": "text",
+                    "text": (
+                        prompt
+                        + "\n\nImmutable option IDs by beat:\n"
+                        + json.dumps(normalized_options, ensure_ascii=False)
+                        + "\nCall propose_grouped_edit_decisions exactly once."
+                    ),
+                }
+            ],
+            "tools": [decision_declaration],
+            "generation_config": {
+                "thinking_level": (
+                    policy.gemini_limits.semantic_negotiation.thinking_level
+                ),
+                "max_output_tokens": (
+                    policy.gemini_limits.semantic_negotiation.max_output_tokens
+                ),
+                "tool_choice": {
+                    "allowed_tools": {
+                        "mode": "any",
+                        "tools": ["propose_grouped_edit_decisions"],
+                    }
+                },
+            },
+        }
+        write_json(
+            run_dir / "grouped_semantic_negotiation.request.json",
+            request_record,
+        )
+        text_tokens = max(
+            256,
+            len(json.dumps(request_record["input"], ensure_ascii=False)) // 4,
+        )
+        estimate = estimate_paid_call(
+            stage="semantic_negotiation",
+            model_id=self.model_id,
+            text_input_tokens=text_tokens,
+            max_output_tokens=(
+                policy.gemini_limits.semantic_negotiation.max_output_tokens
+            ),
+            thinking_level=(
+                policy.gemini_limits.semantic_negotiation.thinking_level
+            ),
+        )
+        interaction, dispatch = dispatch_paid_interaction(
+            client=self.client,
+            request=request_record,
+            request_record=request_record,
+            journal_dir=run_dir,
+            estimate=estimate,
+            budget_ledger=self.budget_ledger,
+            recovery_call=recovery_call,
+        )
+        raw_interaction, raw_attempt_path = _record_interaction_attempt(
+            run_dir=run_dir,
+            operation="grouped_semantic_negotiation",
+            canonical_filename="grouped_semantic_negotiation.raw_interaction.json",
+            interaction=interaction,
+        )
+        complete_paid_dispatch(
+            handle=dispatch,
+            raw_interaction=raw_interaction,
+            raw_artifact_path=raw_attempt_path,
+            budget_ledger=self.budget_ledger,
+            model_id=self.model_id,
+        )
+        interaction_id = str(getattr(interaction, "id", "") or "")
+        if not interaction_id:
+            raise ValueError("grouped semantic negotiation response has no ID")
+        calls = _interaction_function_calls(interaction)
+        proposals = [
+            call
+            for call in calls
+            if call["name"] == "propose_grouped_edit_decisions"
+        ]
+        if len(calls) != 1 or len(proposals) != 1:
+            raise ValueError(
+                "grouped semantic negotiation must return exactly one declared decision"
+            )
+        proposal = GroupedEditDecisionProposal.model_validate(
+            proposals[0]["arguments"]
+        )
+        decisions_by_beat = {
+            decision.beat_id: decision for decision in proposal.decisions
+        }
+        if set(decisions_by_beat) != set(normalized_options):
+            raise ValueError(
+                "grouped semantic negotiation must decide every and only supplied beat"
+            )
+        for beat_id, decision in decisions_by_beat.items():
+            proposed_ids = (
+                decision.selected_option_id,
+                *decision.fallback_option_ids,
+            )
+            invalid_ids = set(proposed_ids) - set(normalized_options[beat_id])
+            if invalid_ids:
+                raise ValueError(
+                    "grouped semantic decision invented option IDs for "
+                    + beat_id
+                    + ": "
+                    + ", ".join(sorted(invalid_ids))
+                )
+        result = BoundedGroupedSemanticNegotiationResult(
+            decision=proposal,
+            interaction_ids=(interaction_id,),
+            tool_call_ids=(str(proposals[0]["id"]),),
+        )
+        write_json(run_dir / "grouped_semantic_negotiation.json", result)
+        return result
 
     def negotiate_edit_decision(
         self,
