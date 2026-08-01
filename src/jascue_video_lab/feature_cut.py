@@ -22030,32 +22030,14 @@ def _run_feature_cut_experiment_impl(
             if autonomous_profile and render_vertical
             else None
         )
-        # A candidate that is only absent because it lacks *editorial* reuse
-        # authority must not be silently replaced by a locally more convenient
-        # route. Before any paid exact/grounding work, give Gemini one bounded
-        # whole-timeline decision over the already hash-bound candidates and
-        # cue context. The result is rebuilt through the same deterministic
-        # route solver; it never patches an individual selection in place.
+        # Source-reuse authority is an editorial choice, but it must be
+        # considered *after* every immutable candidate has received the same
+        # zero-paid local preparation.  The grouped local-preflight replan
+        # below owns that one Gemini decision.  Spending it here used to leave
+        # a later measured source-motion or safe-interval failure without a
+        # legal creative decision.
         if pre_render_candidate_route is not None:
-            semantic_reuse_affected = {
-                beat_id: bindings
-                for beat_id, bindings in (
-                    pre_render_candidate_route
-                    .semantic_replan_candidate_bindings_by_beat.items()
-                )
-                if bindings
-                and any(
-                    binding.option.candidate_id
-                    == next(
-                        selection.candidate_id
-                        for selection in pre_render_candidate_route.selections
-                        if selection.beat_id == beat_id
-                    )
-                    and "source_reuse_authority_missing"
-                    in binding.replan_required_codes
-                    for binding in bindings
-                )
-            }
+            semantic_reuse_affected: dict[str, Any] = {}
             if semantic_reuse_affected:
                 replan_dir = editorial_dir / "preflight-semantic-replan"
                 semantic_frontier = _semantic_replan_frontier_projection(
@@ -23118,14 +23100,15 @@ def _run_feature_cut_experiment_impl(
                 viable_candidate_ids_by_feature[frontier_feature_id] = [
                     candidate.candidate_id for candidate in viable_candidates
                 ]
-                frontier_beats.append(
-                    RoundRobinFrontierBeat(
-                        beat_id=frontier_feature_id,
-                        story_order=story_order,
-                        priority=frontier_priority,
-                        candidates=tuple(viable_candidates),
+                if viable_candidates:
+                    frontier_beats.append(
+                        RoundRobinFrontierBeat(
+                            beat_id=frontier_feature_id,
+                            story_order=story_order,
+                            priority=frontier_priority,
+                            candidates=tuple(viable_candidates),
+                        )
                     )
-                )
 
             # A local preflight is an observation, never a choice.  If
             # Gemini's currently selected complete route is not available,
