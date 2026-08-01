@@ -1814,17 +1814,14 @@ def canonicalize_direct_video_edit_plan_output(
                 for index in step.get("anchor_entity_indices", [])
                 if isinstance(index, int)
             }
-            # Attention phases describe a crop/tracker path, not a static
-            # scope-preserving fit.  A fit has no virtual camera to anchor;
-            # its required entities remain an explicit composition contract
-            # for the renderer/QA instead.  Treating its intentionally empty
-            # sequence as missing attention incorrectly rewrote a
-            # Gemini-authorised fit into ``unsuitable``.
-            missing_required = (
-                [index for index in required if index not in referenced]
-                if decision.get("strategy") == "tracked_crop"
-                else []
-            )
+            # An attention anchor is the subject the *camera* should hold or
+            # follow, not a declaration that every required target must be an
+            # anchor.  Required entities are independently grounded and
+            # checked for containment by the executor.  For example, Gemini
+            # may correctly ask for a hold on a phone while its owner remains
+            # required context.  Treating those roles as identical used to
+            # discard every candidate before geometry could determine whether
+            # full bleed, a move, a cut, panel, or fit was appropriate.
             if (
                 decision.get("presentation_preference") == "two_panel_layout"
                 and decision.get("coverage_mode") == "sequential"
@@ -1835,14 +1832,6 @@ def canonicalize_direct_video_edit_plan_output(
                     reason_code=(
                         "planner_contract_two_panel_requires_simultaneous_"
                         "or_context_relation"
-                    ),
-                )
-            if missing_required:
-                mark_candidate_unsuitable(
-                    decision,
-                    decision_base=decision_base,
-                    reason_code=(
-                        "planner_contract_required_attention_not_covered"
                     ),
                 )
             if (
@@ -5586,9 +5575,10 @@ model_provenance 必須先原樣回傳：
     - tracked_crop 若 coverage_mode 是 relation_core、primary_with_context 或
       independent_detail，必須同時填 crop_mode=primary_center 與
       allow_controlled_clip=true。
-    - tracked_crop 的每個 required_entity_index 必須至少出現在一個
-      attention_sequence phase；若關係必須同時被看見，請在同一個 hold phase
-      列出所有 required anchor，而非只列其中一個。
+    - attention_sequence 的 anchor 是鏡頭注意力／運鏡主體，不是 required
+      entity 的同義詞。required entity 仍由本機 grounding／geometry 驗證全段
+      可見性；只有你希望鏡頭實際跟隨或切向某主體時才把它列為 anchor。若關係
+      必須同時被看見，可用 hold，但不必把每個 required entity 都偽裝成相機 anchor。
     - fit_with_background 或 two_panel 的 static layout 沒有虛擬相機：
       attention_sequence 必須是 []、allow_controlled_clip 必須是 false；required
       entity 仍照實填寫，表示必須由 scope/layout 保留，而不是由 phase 跟隨。

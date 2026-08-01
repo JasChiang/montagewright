@@ -971,18 +971,14 @@ def test_direct_video_canonicalization_demotes_unexplained_source_motion() -> No
     assert chapter["vertical_alternates"][0]["attention_sequence"][0][
         "anchor_entity_indices"
     ] == [1]
-    assert chapter["vertical_alternates"][0]["aspect_suitability"] == "unsuitable"
-    assert (
-        "planner_contract_required_attention_not_covered"
-        in chapter["vertical_alternates"][0]["suitability_risks"]
-    )
+    assert "aspect_suitability" not in chapter["vertical_alternates"][0]
+    assert "suitability_risks" not in chapter["vertical_alternates"][0]
     assert {
         change["rule"] for change in changes
     } >= {
         "unexplained_source_camera_motion_classification_fails_safe_to_unknown",
         "explicit_controlled_clip_uses_primary_center_representation",
         "entity_role_precedence_required_preferred_sacrificable",
-        "planner_contract_failure_is_typed_not_repaired",
     }
 
 
@@ -1622,7 +1618,7 @@ def test_hard_shortlist_and_selected_snapshot_use_effective_origin() -> None:
     assert selected.effective_observation_sha256 is not None
 
 
-def test_direct_video_canonicalization_fails_safe_for_missing_duration_and_attention() -> None:
+def test_direct_video_canonicalization_keeps_attention_distinct_from_visibility() -> None:
     payload = {
         "chapters": [
             {
@@ -1680,16 +1676,15 @@ def test_direct_video_canonicalization_fails_safe_for_missing_duration_and_atten
         phase["anchor_entity_indices"]
         for phase in chapter["vertical"]["attention_sequence"]
     ] == [[1], [2]]
-    assert chapter["vertical"]["aspect_suitability"] == "unsuitable"
+    assert "aspect_suitability" not in chapter["vertical"]
     assert {
         change["rule"] for change in changes
     } >= {
         "missing_recommended_duration_uses_model_attention_midpoint",
-        "planner_contract_failure_is_typed_not_repaired",
     }
 
 
-def test_direct_video_canonicalization_completes_locked_required_suffix() -> None:
+def test_direct_video_canonicalization_preserves_locked_attention_sequence() -> None:
     payload = {
         "chapters": [
             {
@@ -1743,12 +1738,8 @@ def test_direct_video_canonicalization_completes_locked_required_suffix() -> Non
         phase["anchor_entity_indices"]
         for phase in vertical["attention_sequence"]
     ] == [[1], [2]]
-    assert vertical["aspect_suitability"] == "unsuitable"
-    assert {
-        change["rule"] for change in changes
-    } >= {
-        "planner_contract_failure_is_typed_not_repaired"
-    }
+    assert "aspect_suitability" not in vertical
+    assert not changes
 
 
 def test_unsuitable_direct_candidate_is_bounded_before_schema_validation() -> None:
