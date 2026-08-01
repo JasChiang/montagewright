@@ -1159,7 +1159,7 @@ class SelectedClipCardEvidence(StrictModel):
     events: list[SelectedEvidenceEvent]
 
 
-FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v4"
+FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v5"
 
 
 def fulfillment_observation_from_clip_card(
@@ -1820,25 +1820,12 @@ def canonicalize_direct_video_edit_plan_output(
                         "planner_contract_phase_requires_sequential_attention"
                     ),
                 )
-        reuse_mode = chapter.get("source_reuse_mode")
-        reuse_justification = chapter.get("source_reuse_justification")
-        if reuse_mode not in {None, "none"} and not (
-            isinstance(reuse_justification, str)
-            and reuse_justification.strip()
-        ):
-            chapter["source_reuse_mode"] = "none"
-            chapter["source_reuse_justification"] = None
-            changes.append(
-                {
-                    "json_path": f"chapters[{chapter_index}].source_reuse_mode",
-                    "before": reuse_mode,
-                    "after": "none",
-                    "rule": (
-                        "unjustified_semantic_reuse_loses_authority_instead_"
-                        "of_inventing_a_reason"
-                    ),
-                }
-            )
+        # Reuse authority is an editorial decision.  Do not silently erase an
+        # incomplete Gemini proposal here: the typed model validator must
+        # reject it so the single text-only contract-repair path can ask Gemini
+        # to supply the missing observable rationale.  Clearing the mode would
+        # turn an explicit creative choice into an unexplained local route
+        # rejection much later in the renderer.
         flow = chapter.get("flow_intent")
         if isinstance(flow, dict):
             sync_keys = (
@@ -6081,10 +6068,12 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                         + "\n\n## 前次輸出未通過本機 contract\n"
                         + previous_error[:6000]
                         + "\n請重新產生完整 JSON，不得只回傳修補片段。"
-                        "開場若 full-bleed grounding 上限不足，請依你原先選定的"
-                        "主要 attention anchors，將其餘主體改為 preferred；不得"
-                        "捏造額外 panel。兩台裝置的同時比較在 policy 允許時應用"
-                        " two_panel_layout，不得用已禁止的 solid_matte_fit。"
+                        "每個 non-none source_reuse_mode 都必須有非空的"
+                        "source_reuse_justification，說明可觀察的編輯目的；"
+                        "selection_reason 不能取代這個欄位。若候選對所要求版型"
+                        "不可執行，保留其 unsuitable 狀態，不得捏造 crop、panel、"
+                        "fit 或其他未授權的呈現方式。不得為了通過 contract 改變"
+                        "已選來源、全片順序、音樂 cue 關係或 hard evidence。"
                     )
                     repair_limits = (
                         policy.gemini_limits.text_only_schema_repair

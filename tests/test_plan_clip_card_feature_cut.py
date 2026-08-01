@@ -1106,7 +1106,7 @@ def test_direct_video_canonicalization_repairs_bounded_representation_conflicts(
     )
     chapter = json.loads(canonical)["chapters"][0]
 
-    assert chapter["source_reuse_mode"] == "none"
+    assert chapter["source_reuse_mode"] == "distinct_interval"
     assert chapter["source_reuse_justification"] is None
     assert chapter["vertical"]["presentation_preference"] == "two_panel_layout"
     assert chapter["vertical"]["preferred_entity_indices"] == [3, 4, 5, 6]
@@ -1114,9 +1114,41 @@ def test_direct_video_canonicalization_repairs_bounded_representation_conflicts(
     assert {
         change["rule"] for change in changes
     } >= {
-        "unjustified_semantic_reuse_loses_authority_instead_of_inventing_a_reason",
         "planner_contract_candidate_marked_unsuitable",
     }
+
+
+def test_direct_video_reuse_without_reason_reaches_typed_contract_repair() -> None:
+    """A normalizer must not turn Gemini's reuse decision into local fallback."""
+
+    with pytest.raises(ValidationError, match="observable justification"):
+        DirectVideoChapterDecision.model_validate(
+            {
+                "chapter_index": 1,
+                "evidence_status": "supported",
+                "observed_visual_evidence": "A product is visible.",
+                "selection_reason": "A deliberate return is requested.",
+                "vertical": {
+                    "candidate_rank": 1,
+                    "strategy": "tracked_crop",
+                    "crop_mode": "primary_center",
+                    "coverage_mode": "primary_with_context",
+                    "aspect_suitability": "unsuitable",
+                    "framing_intent": "Keep the product visible.",
+                    "required_entity_indices": [],
+                    "preferred_entity_indices": [],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [],
+                },
+                "recommended_duration_seconds": 4.0,
+                "duration_rationale": "Enough time to read the closing image.",
+                "attention_observation": None,
+                "flow_intent": None,
+                "source_reuse_mode": "editorial_reprise",
+                "source_reuse_justification": None,
+                "confidence": 0.9,
+            }
+        )
 
 
 def test_hard_shortlist_provenance_blocks_prerecorded_playback() -> None:
