@@ -2491,15 +2491,13 @@ def run_feature_delivery_pipeline(
             raise DeliveryPipelineBlocked(
                 "execution profile does not match the autonomous policy"
             )
-        if (
-            policy.budget.max_semantic_replans > 0
-            and autonomous_repair_executor is None
-        ):
-            raise DeliveryPipelineBlocked(
-                "policy authorizes a scoped semantic replan, but this run has "
-                "no bounded semantic-replan executor; disable semantic replan "
-                "or supply the executor before any paid dispatch"
-            )
+        # A scoped semantic replan is executed inside the hash-bound
+        # selected-window production frontier.  It is not the post-render QA
+        # repair executor represented by ``autonomous_repair_executor``.
+        # The former is always available through feature-cut, capped by the
+        # signed policy, and fails closed when its immutable option frontier
+        # is absent; conflating the two used to block a valid run before any
+        # paid dispatch.
         requested = set(policy.requested_aspects)
         aspect_argument = str(feature_cut_kwargs.get("aspect", "both"))
         expected_aspects = (
