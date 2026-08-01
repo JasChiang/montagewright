@@ -35,7 +35,7 @@ def test_ensure_upload_reuses_active_saved_file(tmp_path: Path) -> None:
     assert calls["upload"] == 0
 
 
-def test_ensure_upload_reuploads_only_after_confirmed_404(tmp_path: Path) -> None:
+def test_ensure_upload_reuploads_after_confirmed_file_api_expiry(tmp_path: Path) -> None:
     upload_dir = tmp_path / "upload"
     source = tmp_path / "video.mp4"
     source.write_bytes(b"expired source bytes")
@@ -59,6 +59,34 @@ def test_ensure_upload_reuploads_only_after_confirmed_404(tmp_path: Path) -> Non
     assert result is uploaded
     assert reused is False
     assert list((upload_dir / "history").glob("*/file_upload_initial.json"))
+
+
+def test_ensure_upload_reuploads_after_file_api_403(tmp_path: Path) -> None:
+    upload_dir = tmp_path / "upload"
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"inaccessible cached source bytes")
+    write_json(upload_dir / "file_upload_initial.json", {"name": "files/old"})
+    write_json(
+        upload_dir / "local_source_binding.json",
+        {"sha256": sha256_file(source)},
+    )
+    client = _client_without_network()
+    replacement = SimpleNamespace(name="files/reuploaded")
+
+    class PermissionDeniedError(RuntimeError):
+        code = 403
+
+    client.resume_video_upload = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        PermissionDeniedError("PERMISSION_DENIED for cached File API object")
+    )
+    client.upload_video = lambda *_args, **_kwargs: replacement  # type: ignore[method-assign]
+
+    result, reused = client.ensure_video_upload(source, upload_dir)
+
+    assert result is replacement
+    assert reused is False
+    record = (upload_dir / "file_cache.json").read_text(encoding="utf-8")
+    assert "expired_deleted_or_inaccessible" in record
 
 
 def test_ensure_upload_replaces_noncanonical_audio_mime_alias(

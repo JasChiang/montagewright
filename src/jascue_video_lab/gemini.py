@@ -1464,14 +1464,30 @@ def _record_interaction_attempt(
     return raw_interaction, attempt_path
 
 
-def _is_file_api_not_found(error: BaseException) -> bool:
+def _is_file_api_not_reusable(error: BaseException) -> bool:
+    """Return true only when a saved File API object cannot be reused.
+
+    File API objects can expire and the API reports that state as either 404
+    or 403/PERMISSION_DENIED, depending on the backend and key lineage.  This
+    helper is called only while checking an already source-hash-bound cached
+    object.  Treating that narrow 403 as stale permits exactly one fresh
+    upload; upload failures themselves still propagate and cannot loop.
+    """
+
     values = [
         getattr(error, "code", None),
         getattr(error, "status_code", None),
         getattr(error, "status", None),
     ]
-    text = " ".join(str(value) for value in values if value is not None).upper()
-    return "404" in text or "NOT_FOUND" in text
+    text = " ".join(
+        [str(value) for value in values if value is not None] + [str(error)]
+    ).upper()
+    return (
+        "404" in text
+        or "NOT_FOUND" in text
+        or "403" in text
+        or "PERMISSION_DENIED" in text
+    )
 
 
 class GeminiLabClient:
@@ -1624,9 +1640,9 @@ class GeminiLabClient:
                         )
                         return uploaded, True
                 except Exception as error:
-                    if not _is_file_api_not_found(error):
+                    if not _is_file_api_not_reusable(error):
                         raise
-                    reason = "saved_file_api_object_expired_or_deleted"
+                    reason = "saved_file_api_object_expired_deleted_or_inaccessible"
         else:
             reason = "force_reupload" if force_reupload else "no_saved_file_api_object"
 
