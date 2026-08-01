@@ -4483,6 +4483,16 @@ class FeatureVerticalCandidate(StrictModel):
                     "every hard-core region must appear in the virtual-camera "
                     "proposal: " + ", ".join(missing_required)
                 )
+        if (
+            self.aspect_suitability != "unsuitable"
+            and self.presentation_preference == "phase_virtual_camera"
+        ):
+            proposal = self.virtual_camera_proposal
+            if proposal is None or len(proposal.phases) < 2:
+                raise ValueError(
+                    "phase virtual-camera preference requires at least two "
+                    "Gemini-described phases"
+                )
         return self
 
 

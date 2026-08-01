@@ -10468,25 +10468,33 @@ def _preferred_capability_ids(
 def _normal_acceptable_capability_ids(
     presentation_preference: str,
 ) -> tuple[str, ...]:
-    """Enumerate every natural execution family for local feasibility.
+    """Return the numeric-realization envelope Gemini authorized.
 
-    Gemini's presentation choice is a ranking preference, not authority to
-    suppress a locally executable full-bleed, minimal move, or hard-cut
-    option. Constructed panel/matte modes remain opt-in here and are still
-    deferred until all Top-K natural candidates have been attempted.
+    The planner owns the editorial presentation family.  Local geometry may
+    choose a static versus containment-tracked realization of a full-bleed
+    instruction, but it must not promote that instruction into a phase move,
+    hard cut, panel, or matte.  A phase plan carries its own explicit phase
+    transitions; a whole-window hard-cut rewrite is never an implicit local
+    fallback.
     """
 
-    natural = (
-        "static_full_bleed_crop",
-        "tracked_full_bleed_crop",
-        "phase_virtual_camera",
-        "hard_cut_between_views",
-    )
-    constructed = {
-        "two_panel_layout": "two_panel_layout",
-        "solid_matte_fit": "solid_matte_fit",
-    }.get(presentation_preference)
-    return (*natural, constructed) if constructed is not None else natural
+    return {
+        "static_full_bleed": (
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+        ),
+        "tracked_full_bleed": (
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+        ),
+        "phase_virtual_camera": (
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+            "phase_virtual_camera",
+        ),
+        "two_panel_layout": ("two_panel_layout",),
+        "solid_matte_fit": ("solid_matte_fit",),
+    }.get(presentation_preference, ())
 
 
 def _candidate_capability_boundaries(
@@ -10500,15 +10508,8 @@ def _candidate_capability_boundaries(
     candidate_family = set(
         _normal_acceptable_capability_ids(presentation_preference)
     )
-    if physical_scale_comparison:
-        candidate_family.add("two_panel_layout")
     if semantic_beat is None:
         return tuple(sorted(candidate_family)), ()
-    if (
-        getattr(semantic_beat, "panel_target_groups", ())
-        and "two_panel_layout" in semantic_beat.acceptable_capability_ids
-    ):
-        candidate_family.add("two_panel_layout")
 
     beat_acceptable = set(semantic_beat.acceptable_capability_ids)
     known_capabilities = (
@@ -10580,18 +10581,11 @@ def _semantic_beat_for_runtime_candidate(
         option.get("physical_scale_comparison", False)
     )
     panel_semantically_admissible = (
-        len(visibility_targets) == 2
-        and (
-            physical_scale_comparison
-            or presentation_goal in {"compare", "context_detail"}
-            or presentation_preference == "two_panel_layout"
-        )
+        presentation_preference == "two_panel_layout"
     )
     acceptable = set(
         _normal_acceptable_capability_ids(presentation_preference)
     )
-    if panel_semantically_admissible:
-        acceptable.add("two_panel_layout")
     known = (
         set(semantic_beat.acceptable_capability_ids)
         | set(semantic_beat.forbidden_capability_ids)
@@ -10795,18 +10789,8 @@ def _project_feature_semantic_edit_ir(
         ) or ("static_full_bleed_crop", "tracked_full_bleed_crop")
         panel_semantically_admissible = bool(
             primary is not None
-            and len(visibility_targets) == 2
-            and (
-                primary.physical_scale_comparison
-                or primary.presentation_goal in {"compare", "context_detail"}
-                or primary.presentation_preference == "two_panel_layout"
-            )
+            and primary.presentation_preference == "two_panel_layout"
         )
-        if (
-            panel_semantically_admissible
-            and "two_panel_layout" not in capability_ids
-        ):
-            capability_ids = (*capability_ids, "two_panel_layout")
         panel_target_groups = (
             tuple((target.target_id,) for target in visibility_targets)
             if (
@@ -12003,6 +11987,14 @@ def _vertical_candidate_geometry(
             and autonomous_compilation.mode == "hard_cut_between_views"
             and effective_camera_phases
         ):
+            if not all(
+                phase.cut_admissible
+                for phase in effective_camera_phases[1:]
+            ):
+                raise ValueError(
+                    "hard-cut execution requires Gemini cut_admissible on "
+                    "every post-first phase"
+                )
             cut_phases = [
                 phase.model_copy(
                     update={
@@ -13384,20 +13376,13 @@ def _pre_render_vertical_presentation_mode(
     *,
     policy: AutonomousEditPolicy,
 ) -> str:
-    """Resolve policy-forbidden constructed preferences to a natural family."""
+    """Map the Gemini-selected semantic family without rewriting it.
 
-    if (
-        candidate.presentation_preference == "two_panel_layout"
-        and not policy.presentation.allow_two_panel_layout
-    ) or (
-        candidate.presentation_preference == "solid_matte_fit"
-        and not policy.presentation.allow_solid_matte_fit
-    ):
-        return (
-            "phase_virtual_camera"
-            if candidate.virtual_camera_proposal is not None
-            else "tracked_full_bleed_crop"
-        )
+    A policy may reject a panel/matte instruction during feasibility, but it
+    cannot turn it into a local camera move or crop.  That is a typed plan
+    conflict, not a rendering preference.
+    """
+
     return {
         "static_full_bleed": "static_full_bleed_crop",
         "tracked_full_bleed": "tracked_full_bleed_crop",
@@ -13444,15 +13429,26 @@ def _pre_render_vertical_feasibility(
         candidate,
         policy=policy,
     )
-    order: tuple[PresentationCapability, ...] = (
-        preferred,  # type: ignore[assignment]
-        "static_full_bleed_crop",
-        "tracked_full_bleed_crop",
-        "phase_virtual_camera",
-        "hard_cut_between_views",
-        "two_panel_layout",
-        "solid_matte_fit",
+    authorized = set(
+        _normal_acceptable_capability_ids(candidate.presentation_preference)
     )
+    order: tuple[PresentationCapability, ...] = tuple(
+        mode
+        for mode in (
+            preferred,
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+            "phase_virtual_camera",
+            "hard_cut_between_views",
+            "two_panel_layout",
+            "solid_matte_fit",
+        )
+        if mode in authorized
+    )
+    if not order:
+        raise ValueError(
+            "candidate has no Gemini-authorized presentation capability"
+        )
     unique_order = tuple(dict.fromkeys(order))
     selected = next(
         (

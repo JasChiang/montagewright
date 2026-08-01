@@ -1844,6 +1844,29 @@ def test_candidate_capability_boundary_does_not_inherit_top_k_panel() -> None:
     assert "solid_matte_fit" in forbidden
 
 
+def test_candidate_capability_boundary_does_not_rewrite_panel_to_crop() -> None:
+    semantic_beat = SimpleNamespace(
+        acceptable_capability_ids=(
+            "static_full_bleed_crop",
+            "tracked_full_bleed_crop",
+            "two_panel_layout",
+        ),
+        forbidden_capability_ids=(
+            "solid_matte_fit",
+            "phase_virtual_camera",
+        ),
+    )
+
+    acceptable, forbidden = _candidate_capability_boundaries(
+        presentation_preference="two_panel_layout",
+        semantic_beat=semantic_beat,
+        physical_scale_comparison=True,
+    )
+
+    assert acceptable == ("two_panel_layout",)
+    assert "tracked_full_bleed_crop" in forbidden
+
+
 def test_pre_render_frontier_order_drives_runtime_fallback_sequence() -> None:
     runtime_options = [
         {"candidate_id": "rank-1", "rank": 1},

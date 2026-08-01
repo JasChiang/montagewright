@@ -728,25 +728,22 @@ def test_direct_video_canonicalization_demotes_unexplained_source_motion() -> No
     )
     assert chapter["vertical_alternates"][0]["crop_mode"] == "primary_center"
     assert chapter["vertical_alternates"][0]["sacrificable_entity_indices"] == []
-    assert chapter["vertical_alternates"][0]["coverage_mode"] == "simultaneous"
-    assert chapter["vertical_alternates"][0]["attention_sequence"] == [
-        {
-            "start_progress": 0.0,
-            "end_progress": 1.0,
-            "anchor_entity_indices": [1, 2],
-            "camera_behavior": "hold",
-            "movement_motivation": "none",
-            "cut_admissible": False,
-            "transition_preference": "auto",
-        }
-    ]
+    assert chapter["vertical_alternates"][0]["coverage_mode"] == "relation_core"
+    assert chapter["vertical_alternates"][0]["attention_sequence"][0][
+        "anchor_entity_indices"
+    ] == [1]
+    assert chapter["vertical_alternates"][0]["aspect_suitability"] == "unsuitable"
+    assert (
+        "planner_contract_required_attention_not_covered"
+        in chapter["vertical_alternates"][0]["suitability_risks"]
+    )
     assert {
         change["rule"] for change in changes
     } >= {
         "unexplained_source_camera_motion_classification_fails_safe_to_unknown",
         "explicit_controlled_clip_uses_primary_center_representation",
         "entity_role_precedence_required_preferred_sacrificable",
-        "incomplete_required_attention_fails_safe_to_joint_static_hold",
+        "planner_contract_failure_is_typed_not_repaired",
     }
 
 
@@ -895,21 +892,16 @@ def test_direct_video_canonicalization_repairs_bounded_representation_conflicts(
     )
     chapter = json.loads(canonical)["chapters"][0]
 
-    assert "A second, separate action is visible." in (
-        chapter["source_reuse_justification"]
-    )
-    assert (
-        chapter["vertical"]["presentation_preference"]
-        == "phase_virtual_camera"
-    )
-    assert chapter["vertical"]["preferred_entity_indices"] == [3, 4, 5, 6]
-    assert chapter["vertical"]["sacrificable_entity_indices"] == [7]
+    assert chapter["source_reuse_mode"] == "none"
+    assert chapter["source_reuse_justification"] is None
+    assert chapter["vertical"]["presentation_preference"] == "two_panel_layout"
+    assert chapter["vertical"]["preferred_entity_indices"] == [3, 4, 5, 6, 7]
+    assert chapter["vertical"]["aspect_suitability"] == "unsuitable"
     assert {
         change["rule"] for change in changes
     } >= {
-        "distinct_interval_reuse_uses_existing_observation_and_remains_deterministically_gated",
-        "sequential_attention_uses_declared_phases_instead_of_implying_simultaneity",
-        "preferred_entity_overflow_is_demoted_without_weakening_required_entities",
+        "unjustified_semantic_reuse_loses_authority_instead_of_inventing_a_reason",
+        "planner_contract_candidate_marked_unsuitable",
     }
 
 
@@ -1319,25 +1311,18 @@ def test_direct_video_canonicalization_fails_safe_for_missing_duration_and_atten
     chapter = json.loads(canonical)["chapters"][0]
 
     assert chapter["recommended_duration_seconds"] == 6.0
-    assert chapter["vertical"]["coverage_mode"] == "simultaneous"
-    assert chapter["vertical"]["traversal_policy"] == "no_continuous_traversal"
-    assert chapter["vertical"]["attention_sequence"] == [
-        {
-            "start_progress": 0.0,
-            "end_progress": 1.0,
-            "anchor_entity_indices": [1, 2, 3],
-            "camera_behavior": "hold",
-            "movement_motivation": "none",
-            "cut_admissible": False,
-            "transition_preference": "auto",
-        }
-    ]
+    assert chapter["vertical"]["coverage_mode"] == "sequential"
+    assert chapter["vertical"].get("traversal_policy") is None
+    assert [
+        phase["anchor_entity_indices"]
+        for phase in chapter["vertical"]["attention_sequence"]
+    ] == [[1], [2]]
+    assert chapter["vertical"]["aspect_suitability"] == "unsuitable"
     assert {
         change["rule"] for change in changes
     } >= {
         "missing_recommended_duration_uses_model_attention_midpoint",
-        "incomplete_required_attention_fails_safe_to_joint_static_hold",
-        "joint_static_hold_disables_synthetic_traversal",
+        "planner_contract_failure_is_typed_not_repaired",
     }
 
 
@@ -1394,14 +1379,12 @@ def test_direct_video_canonicalization_completes_locked_required_suffix() -> Non
     assert [
         phase["anchor_entity_indices"]
         for phase in vertical["attention_sequence"]
-    ] == [[1], [2], [3]]
-    assert vertical["attention_sequence"][-1]["camera_behavior"] == "hold"
-    assert vertical["attention_sequence"][-1]["cut_admissible"] is True
-    assert vertical["attention_sequence"][-1]["transition_preference"] == "cut"
+    ] == [[1], [2]]
+    assert vertical["aspect_suitability"] == "unsuitable"
     assert {
         change["rule"] for change in changes
     } >= {
-        "semantic_order_locked_missing_required_suffix_is_completed_without_reordering"
+        "planner_contract_failure_is_typed_not_repaired"
     }
 
 
@@ -1459,6 +1442,22 @@ def test_simultaneous_coverage_cannot_be_split_across_phases() -> None:
                     camera_behavior="hold",
                 ),
             ],
+        )
+
+
+def test_phase_virtual_camera_requires_gemini_described_sequential_phases() -> None:
+    with pytest.raises(ValidationError, match="phase virtual camera requires"):
+        DirectVideoVerticalDecision(
+            candidate_rank=1,
+            strategy="tracked_crop",
+            crop_mode="strict",
+            coverage_mode="simultaneous",
+            presentation_preference="phase_virtual_camera",
+            framing_intent="Hold the one visible subject.",
+            required_entity_indices=[1],
+            preferred_entity_indices=[],
+            sacrificable_entity_indices=[],
+            attention_sequence=[],
         )
 
 

@@ -870,6 +870,12 @@ class DirectVideoVerticalDecision(StrictModel):
             raise ValueError("vertical entity indices must be positive")
         if len(classified) != len(set(classified)):
             raise ValueError("vertical entity roles must be disjoint")
+        # ``unsuitable`` is an explicit planner-contract failure verdict.  It
+        # preserves the model's raw candidate description so the frontier can
+        # try another Gemini-described candidate or report a typed failure;
+        # it must not be locally rewritten into a different presentation.
+        if self.aspect_suitability == "unsuitable":
+            return self
         if self.strategy == "tracked_crop" and not self.required_entity_indices:
             raise ValueError("tracked crop requires a visible required entity")
         if self.strategy == "fit_with_background" and self.attention_sequence:
@@ -887,6 +893,14 @@ class DirectVideoVerticalDecision(StrictModel):
         if self.physical_scale_comparison and self.presentation_goal != "compare":
             raise ValueError(
                 "physical scale comparison requires presentation_goal=compare"
+            )
+        if self.presentation_preference == "phase_virtual_camera" and (
+            self.coverage_mode != "sequential"
+            or len(self.attention_sequence) < 2
+        ):
+            raise ValueError(
+                "phase virtual camera requires sequential attention with at "
+                "least two Gemini-described phases"
             )
         if self.coverage_mode == "simultaneous" and len(self.attention_sequence) > 1:
             raise ValueError(
@@ -1242,6 +1256,30 @@ def validate_direct_video_plan_fulfillment(
         for offset, chapter in enumerate(shortlist.chapters)
     }
     selections: dict[str, EditorialBeatFulfillmentSelection] = {}
+    if "9:16" in requested_aspects:
+        for offset, (shortlist_chapter, direct_chapter) in enumerate(
+            zip(shortlist.chapters, plan.chapters, strict=True)
+        ):
+            if direct_chapter.evidence_status == "not_found":
+                continue
+            bounded_candidates = planning_candidate_slice(
+                shortlist_chapter.candidates,
+                direct_video_evidence=True,
+                depth=candidate_depth,
+            )
+            expected_ranks = set(range(1, len(bounded_candidates) + 1))
+            described_ranks = {
+                direct_chapter.vertical.candidate_rank
+            } | {
+                decision.candidate_rank
+                for decision in direct_chapter.vertical_alternates
+            }
+            if described_ranks != expected_ranks:
+                raise ValueError(
+                    "direct plan must describe every bounded vertical candidate "
+                    f"for {shortlist_chapter.feature_id}: expected "
+                    f"{sorted(expected_ranks)}, got {sorted(described_ranks)}"
+                )
     for contract in contracts:
         if contract.priority != "hard" or contract.feature_id is None:
             continue
@@ -1384,12 +1422,12 @@ def canonicalize_direct_video_edit_plan_output(
 ) -> tuple[str, list[dict[str, Any]]]:
     """Apply conservative, domain-neutral precedence to the compact plan.
 
-    The model chooses ranks, entity roles, and attention intent. Local
-    canonicalization only removes contradictory duplicate classifications and
-    defaults an omitted 16:9 decision to the unmodified source composition.
-    It deliberately preserves phase-local anchors: global coverage means that
-    every required entity must be observed somewhere, not that every entity
-    must remain visible in every phase.
+    The model chooses ranks, entity roles, coverage, presentation and
+    attention. Local canonicalization only makes representation-only repairs
+    or marks a contradictory candidate unsuitable. It never invents a phase,
+    a cut permission, a panel/matte choice, a traversal, or a semantic reuse
+    reason. A marked candidate can only advance to another Gemini-described
+    candidate; it is never locally reauthored into a usable one.
     """
 
     payload = json.loads(output_text)
@@ -1399,6 +1437,39 @@ def canonicalize_direct_video_edit_plan_output(
     if not isinstance(chapters, list):
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), []
     changes: list[dict[str, Any]] = []
+
+    def mark_candidate_unsuitable(
+        decision: dict[str, Any],
+        *,
+        decision_base: str,
+        reason_code: str,
+    ) -> None:
+        """Record a plan-contract failure without changing editorial intent."""
+
+        before_suitability = decision.get("aspect_suitability")
+        if before_suitability != "unsuitable":
+            decision["aspect_suitability"] = "unsuitable"
+            changes.append(
+                {
+                    "json_path": f"{decision_base}.aspect_suitability",
+                    "before": before_suitability,
+                    "after": "unsuitable",
+                    "rule": "planner_contract_candidate_marked_unsuitable",
+                }
+            )
+        before_risks = list(decision.get("suitability_risks") or [])
+        risks = list(before_risks)
+        if reason_code not in risks:
+            risks.append(reason_code)
+            decision["suitability_risks"] = risks
+            changes.append(
+                {
+                    "json_path": f"{decision_base}.suitability_risks",
+                    "before": before_risks,
+                    "after": risks,
+                    "rule": "planner_contract_failure_is_typed_not_repaired",
+                }
+            )
     for chapter_index, chapter in enumerate(chapters):
         if not isinstance(chapter, dict) or chapter.get("evidence_status") == "not_found":
             continue
@@ -1473,22 +1544,6 @@ def canonicalize_direct_video_edit_plan_output(
                         ),
                     }
                 )
-            if (
-                decision.get("presentation_preference") == "two_panel_layout"
-                and decision.get("coverage_mode") == "sequential"
-            ):
-                decision["presentation_preference"] = "phase_virtual_camera"
-                changes.append(
-                    {
-                        "json_path": f"{decision_base}.presentation_preference",
-                        "before": "two_panel_layout",
-                        "after": "phase_virtual_camera",
-                        "rule": (
-                            "sequential_attention_uses_declared_phases_instead_"
-                            "of_implying_simultaneity"
-                        ),
-                    }
-                )
             required_before = list(decision.get("required_entity_indices") or [])
             preferred_before = list(decision.get("preferred_entity_indices") or [])
             sacrificable_before = list(
@@ -1540,94 +1595,81 @@ def canonicalize_direct_video_edit_plan_output(
                 index for index in required if index not in referenced
             ]
             if (
-                sequence
-                and missing_required
-                and decision_path != "vertical"
+                decision.get("presentation_preference") == "two_panel_layout"
+                and decision.get("coverage_mode") == "sequential"
             ):
-                before_sequence = [dict(step) for step in sequence]
-                # Missing required attention is not evidence that a particular
-                # traversal order is safe.  Preserve all hard scope in one
-                # static phase; local geometry can then accept, panel, fit, or
-                # reject it without a fabricated camera path.
-                decision["attention_sequence"] = [
-                    {
-                        "start_progress": 0.0,
-                        "end_progress": 1.0,
-                        "anchor_entity_indices": required,
-                        "camera_behavior": "hold",
-                        "movement_motivation": "none",
-                        "cut_admissible": False,
-                        "transition_preference": "auto",
-                    }
-                ]
-                before_coverage = decision.get("coverage_mode")
-                before_traversal = decision.get("traversal_policy")
-                decision["coverage_mode"] = "simultaneous"
-                decision["traversal_policy"] = "no_continuous_traversal"
-                changes.append(
-                    {
-                        "json_path": f"{decision_base}.attention_sequence",
-                        "before": before_sequence,
-                        "after": decision["attention_sequence"],
-                        "rule": (
-                            "incomplete_required_attention_fails_safe_to_"
-                            "joint_static_hold"
-                        ),
-                    }
+                mark_candidate_unsuitable(
+                    decision,
+                    decision_base=decision_base,
+                    reason_code=(
+                        "planner_contract_two_panel_requires_simultaneous_"
+                        "or_context_relation"
+                    ),
                 )
-                if before_coverage != "simultaneous":
-                    changes.append(
-                        {
-                            "json_path": f"{decision_base}.coverage_mode",
-                            "before": before_coverage,
-                            "after": "simultaneous",
-                            "rule": (
-                                "joint_static_hold_requires_simultaneous_"
-                                "coverage"
-                            ),
-                        }
+            if missing_required:
+                mark_candidate_unsuitable(
+                    decision,
+                    decision_base=decision_base,
+                    reason_code=(
+                        "planner_contract_required_attention_not_covered"
+                    ),
+                )
+            if (
+                decision.get("strategy") == "fit_with_background"
+                and sequence
+            ):
+                mark_candidate_unsuitable(
+                    decision,
+                    decision_base=decision_base,
+                    reason_code="planner_contract_fit_cannot_request_camera_phases",
+                )
+            if (
+                decision.get("traversal_policy") == "spatially_optimizable"
+                and (
+                    decision.get("coverage_mode") != "sequential"
+                    or not sequence
+                    or any(
+                        not isinstance(step, dict)
+                        or len(step.get("anchor_entity_indices") or []) != 1
+                        for step in sequence
                     )
-                if before_traversal != "no_continuous_traversal":
-                    changes.append(
-                        {
-                            "json_path": f"{decision_base}.traversal_policy",
-                            "before": before_traversal,
-                            "after": "no_continuous_traversal",
-                            "rule": (
-                                "joint_static_hold_disables_synthetic_"
-                                "traversal"
-                            ),
-                        }
-                    )
+                )
+            ):
+                mark_candidate_unsuitable(
+                    decision,
+                    decision_base=decision_base,
+                    reason_code=(
+                        "planner_contract_spatial_traversal_requires_"
+                        "single_anchor_sequential_phases"
+                    ),
+                )
+            if len(required) > 4:
+                mark_candidate_unsuitable(
+                    decision,
+                    decision_base=decision_base,
+                    reason_code=(
+                        "planner_contract_required_targets_exceed_grounding_"
+                        "limit"
+                    ),
+                )
+            if (
+                decision.get("presentation_preference")
+                == "phase_virtual_camera"
+                and (
+                    decision.get("coverage_mode") != "sequential"
+                    or len(sequence) < 2
+                )
+            ):
+                mark_candidate_unsuitable(
+                    decision,
+                    decision_base=decision_base,
+                    reason_code=(
+                        "planner_contract_phase_requires_sequential_attention"
+                    ),
+                )
         reuse_mode = chapter.get("source_reuse_mode")
         reuse_justification = chapter.get("source_reuse_justification")
-        if reuse_mode == "distinct_interval" and not (
-            isinstance(reuse_justification, str)
-            and reuse_justification.strip()
-        ):
-            observed = chapter.get("observed_visual_evidence")
-            if isinstance(observed, str) and observed.strip():
-                derived_justification = (
-                    "Distinct-interval authorization remains contingent on the "
-                    "deterministic source-interval audit. Separately observed "
-                    f"beat evidence: {observed.strip()}"
-                )
-                chapter["source_reuse_justification"] = derived_justification
-                changes.append(
-                    {
-                        "json_path": (
-                            f"chapters[{chapter_index}]"
-                            ".source_reuse_justification"
-                        ),
-                        "before": reuse_justification,
-                        "after": derived_justification,
-                        "rule": (
-                            "distinct_interval_reuse_uses_existing_observation_"
-                            "and_remains_deterministically_gated"
-                        ),
-                    }
-                )
-        elif reuse_mode not in {None, "none"} and not (
+        if reuse_mode not in {None, "none"} and not (
             isinstance(reuse_justification, str)
             and reuse_justification.strip()
         ):
@@ -1715,6 +1757,25 @@ def canonicalize_direct_video_edit_plan_output(
                         ),
                     }
                 )
+        horizontal = chapter.get("horizontal")
+        if isinstance(horizontal, dict) and horizontal.get("strategy") == "original":
+            before_horizontal = dict(horizontal)
+            horizontal["zoom_intent"] = "none"
+            horizontal["camera_intent"] = "hold"
+            horizontal["focus_entity_index"] = None
+            if horizontal != before_horizontal:
+                changes.append(
+                    {
+                        "json_path": f"chapters[{chapter_index}].horizontal",
+                        "before": before_horizontal,
+                        "after": dict(horizontal),
+                        "rule": "explicit_original_strategy_disables_motion",
+                    }
+                )
+        # All vertical decisions (primary and alternates) were handled above.
+        # Do not enter the historical primary-only "repair" block below: it
+        # fabricates phase coverage, cut authority and fallback presentation.
+        continue
         vertical = chapter.get("vertical")
         if not isinstance(vertical, dict):
             continue
@@ -1750,39 +1811,6 @@ def canonicalize_direct_video_edit_plan_output(
                         "fit_with_background_preserves_scope_without_"
                         "controlled_clipping"
                     ),
-                }
-            )
-        if (
-            vertical.get("presentation_preference") == "two_panel_layout"
-            and vertical.get("coverage_mode") == "sequential"
-        ):
-            vertical["presentation_preference"] = "phase_virtual_camera"
-            changes.append(
-                {
-                    "json_path": f"{base}.vertical.presentation_preference",
-                    "before": "two_panel_layout",
-                    "after": "phase_virtual_camera",
-                    "rule": (
-                        "sequential_attention_uses_declared_phases_instead_"
-                        "of_implying_simultaneity"
-                    ),
-                }
-            )
-        if not isinstance(chapter.get("horizontal"), dict):
-            fallback_rank = vertical.get("candidate_rank")
-            chapter["horizontal"] = {
-                "candidate_rank": fallback_rank,
-                "strategy": "original",
-                "zoom_intent": "none",
-                "camera_intent": "hold",
-                "focus_entity_index": None,
-            }
-            changes.append(
-                {
-                    "json_path": f"{base}.horizontal",
-                    "before": None,
-                    "after": chapter["horizontal"],
-                    "rule": "missing_horizontal_uses_source_hold",
                 }
             )
         horizontal = chapter.get("horizontal")
@@ -1839,56 +1867,12 @@ def canonicalize_direct_video_edit_plan_output(
         if not isinstance(sequence, list):
             sequence = []
             vertical["attention_sequence"] = sequence
-        if vertical.get("traversal_policy") == "spatially_optimizable":
-            spatially_executable = (
-                vertical.get("coverage_mode") == "sequential"
-                and bool(sequence)
-                and all(
-                    isinstance(step, dict)
-                    and len(step.get("anchor_entity_indices") or []) == 1
-                    for step in sequence
-                )
-            )
-            if not spatially_executable:
-                before_traversal = vertical.get("traversal_policy")
-                vertical["traversal_policy"] = (
-                    "semantic_order_locked"
-                    if vertical.get("coverage_mode") == "sequential"
-                    else "no_continuous_traversal"
-                )
-                changes.append(
-                    {
-                        "json_path": f"{base}.vertical.traversal_policy",
-                        "before": before_traversal,
-                        "after": vertical["traversal_policy"],
-                        "rule": (
-                            "spatial_optimization_requires_executable_"
-                            "single_anchor_sequential_attention"
-                        ),
-                    }
-                )
-        if vertical.get("strategy") == "fit_with_background" and sequence:
-            changes.append(
-                {
-                    "json_path": f"{base}.vertical.attention_sequence",
-                    "before": sequence,
-                    "after": [],
-                    "rule": "fit_with_background_has_no_virtual_camera",
-                }
-            )
-            sequence = []
-            vertical["attention_sequence"] = []
         for step_index, step in enumerate(sequence):
             if not isinstance(step, dict):
                 continue
             anchors_before = list(step.get("anchor_entity_indices") or [])
             anchors = list(dict.fromkeys(anchors_before))
             step["anchor_entity_indices"] = anchors
-            for index in anchors:
-                if index not in required and index not in preferred:
-                    preferred.append(index)
-                if index in sacrificable:
-                    sacrificable.remove(index)
             if anchors != anchors_before:
                 changes.append(
                     {
@@ -2804,6 +2788,11 @@ def project_direct_video_edit_plan(
                     else None
                 )
             vertical_decision = vertical_decision_by_rank.get(rank)
+            if vertical_decision is None:
+                raise ValueError(
+                    "direct-video plan omitted a candidate-scoped vertical "
+                    f"decision for {brief_chapter.feature_id}/rank-{rank:02d}"
+                )
             if vertical_decision is not None:
                 vertical_strategy = vertical_decision.strategy
                 aspect_suitability = (
@@ -2842,11 +2831,12 @@ def project_direct_video_edit_plan(
                     event_id=shortlisted.event_id,
                     indices=vertical_decision.sacrificable_entity_indices,
                 )
-                virtual_camera_proposal = camera_proposal(
-                    vertical_decision,
-                    source_asset_id=shortlisted.source_asset_id,
-                    event_id=shortlisted.event_id,
-                )
+                if vertical_decision.aspect_suitability != "unsuitable":
+                    virtual_camera_proposal = camera_proposal(
+                        vertical_decision,
+                        source_asset_id=shortlisted.source_asset_id,
+                        event_id=shortlisted.event_id,
+                    )
             else:
                 source_camera_motion_role = "unknown"
                 source_camera_motion_reason = None
