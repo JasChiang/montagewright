@@ -22176,7 +22176,6 @@ def _run_feature_cut_experiment_impl(
                     )
                     required_replan_hashes = {
                         f"sha256:{sha256_file(context_path)}",
-                        f"sha256:{route_sha256}",
                         f"sha256:{frontier_plan_sha256}",
                     }
                     if (
@@ -22273,11 +22272,10 @@ def _run_feature_cut_experiment_impl(
                     replan_authority = authorize_decision(
                         policy=autonomous_policy,
                         decision_scope="scoped_semantic_replan",
-                        input_artifact_hashes=(
-                            f"sha256:{sha256_file(context_path)}",
-                            f"sha256:{route_sha256}",
-                            f"sha256:{frontier_plan_sha256}",
-                        ),
+                    input_artifact_hashes=(
+                        f"sha256:{sha256_file(context_path)}",
+                        f"sha256:{frontier_plan_sha256}",
+                    ),
                         deterministic_gate_results={
                             "candidate_frontier_complete": "passed",
                             "exact_event_locked": "passed",
@@ -22885,6 +22883,185 @@ def _run_feature_cut_experiment_impl(
                 resumed_state = RoundRobinFrontierState.model_validate(
                     read_json(frontier_state_path)
                 )
+                # The provider can finish a bounded scoped replan just before
+                # the frontier's state write.  Recover that *already bound*
+                # decision before asking the route solver for a continuation;
+                # otherwise its selected execution is still recorded as the
+                # failed presentation and every compatible route is discarded.
+                # This is an audit-state reconciliation, never a new local
+                # editorial choice or a second provider call.
+                reconciled_beats = list(resumed_state.beats)
+                reconciled_results: list[RoundRobinFrontierAttemptResult] = []
+                reconciliation_records: list[dict[str, Any]] = []
+                for beat_index, persisted_beat in enumerate(reconciled_beats):
+                    if persisted_beat.status == "accepted":
+                        continue
+                    decision_path = (
+                        frontier_root
+                        / "scoped-semantic-replans"
+                        / f"{persisted_beat.beat.beat_id}.decision.json"
+                    )
+                    if not decision_path.is_file():
+                        continue
+                    saved_replan = read_json(decision_path)
+                    selected_candidate_id = str(
+                        saved_replan.get("selected_candidate_id") or ""
+                    )
+                    selected_execution_sha256 = str(
+                        saved_replan.get(
+                            "selected_candidate_execution_sha256"
+                        )
+                        or ""
+                    )
+                    selected_candidates = [
+                        candidate
+                        for candidate in persisted_beat.beat.candidates
+                        if candidate.candidate_id == selected_candidate_id
+                        and candidate.candidate_execution_sha256
+                        == selected_execution_sha256
+                    ]
+                    matching_failure = next(
+                        (
+                            result
+                            for result in resumed_state.attempt_history
+                            if result.attempt.beat_id
+                            == persisted_beat.beat.beat_id
+                            and result.attempt.candidate_execution_sha256
+                            == selected_execution_sha256
+                            and result.outcome == "grounding_failed"
+                            and "primary_presentation_requires_scoped_semantic_replan"
+                            in result.decision_codes
+                        ),
+                        None,
+                    )
+                    context_path = Path(
+                        str(saved_replan.get("context_path") or "")
+                    )
+                    if (
+                        len(selected_candidates) != 1
+                        or matching_failure is None
+                        or not context_path.is_file()
+                        or saved_replan.get("context_sha256")
+                        != sha256_file(context_path)
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "persisted scoped semantic replan cannot reconcile "
+                            "the interrupted frontier state"
+                        )
+                    replan_authority = DecisionAuthorityV2.model_validate(
+                        saved_replan.get("authority")
+                    )
+                    validate_authority_binding(
+                        replan_authority,
+                        autonomous_policy,
+                    )
+                    required_replan_hashes = {
+                        f"sha256:{sha256_file(context_path)}",
+                        f"sha256:{frontier_plan_sha256}",
+                    }
+                    if (
+                        replan_authority.decision_scope
+                        != "scoped_semantic_replan"
+                        or not required_replan_hashes.issubset(
+                            set(replan_authority.input_artifact_hashes)
+                        )
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "persisted scoped semantic replan authority is "
+                            "missing its immutable context binding"
+                        )
+                    reconciled_beats[beat_index] = persisted_beat.model_copy(
+                        update={
+                            "status": "accepted",
+                            "active_candidate_id": None,
+                            "active_candidate_execution_sha256": None,
+                            "accepted_candidate_id": selected_candidate_id,
+                            "accepted_candidate_execution_sha256": (
+                                selected_execution_sha256
+                            ),
+                        }
+                    )
+                    reconciled_results.append(
+                        RoundRobinFrontierAttemptResult(
+                            attempt=matching_failure.attempt,
+                            outcome="grounding_accepted",
+                            accepted_candidate_id=selected_candidate_id,
+                            accepted_candidate_execution_sha256=(
+                                selected_execution_sha256
+                            ),
+                            paid_calls_added=1,
+                            decision_codes=(
+                                "scoped_semantic_replan_reconciled_from_"
+                                "persisted_decision",
+                                "interrupted_state_commit_recovered",
+                            ),
+                        )
+                    )
+                    reconciliation_records.append(
+                        {
+                            "beat_id": persisted_beat.beat.beat_id,
+                            "decision_path": str(decision_path.resolve()),
+                            "decision_sha256": sha256_file(decision_path),
+                            "context_path": str(context_path.resolve()),
+                            "context_sha256": sha256_file(context_path),
+                            "selected_candidate_id": selected_candidate_id,
+                            "selected_candidate_execution_sha256": (
+                                selected_execution_sha256
+                            ),
+                            "gemini_interaction_ids": (
+                                replan_authority.gemini_interaction_ids
+                            ),
+                        }
+                    )
+                if reconciled_results:
+                    if len(reconciled_results) > (
+                        autonomous_policy.budget.max_semantic_replans
+                    ):
+                        raise FeatureCutSystemFailure(
+                            "persisted scoped semantic replans exceed the "
+                            "policy limit"
+                        )
+                    state_before_reconciliation_sha256 = sha256_file(
+                        frontier_state_path
+                    )
+                    resumed_state = resumed_state.model_copy(
+                        update={
+                            "revision": (
+                                resumed_state.revision
+                                + len(reconciled_results)
+                            ),
+                            "beats": tuple(reconciled_beats),
+                            "attempt_history": (
+                                *resumed_state.attempt_history,
+                                *reconciled_results,
+                            ),
+                            "paid_calls_consumed": (
+                                resumed_state.paid_calls_consumed
+                                + len(reconciled_results)
+                            ),
+                        }
+                    )
+                    write_json(frontier_state_path, resumed_state)
+                    write_json(
+                        frontier_root / "state-reconciliation.json",
+                        {
+                            "contract_version": (
+                                "production-frontier-state-reconciliation-v1"
+                            ),
+                            "reason_code": (
+                                "completed_scoped_semantic_replan_missing_"
+                                "frontier_state_commit"
+                            ),
+                            "prior_state_sha256": (
+                                state_before_reconciliation_sha256
+                            ),
+                            "reconciled_state_sha256": sha256_file(
+                                frontier_state_path
+                            ),
+                            "records": reconciliation_records,
+                            "generated_at": utc_now(),
+                        },
+                    )
                 for resumed_beat in resumed_state.beats:
                     resumed_candidate_id = (
                         resumed_beat.accepted_candidate_id
@@ -22970,6 +23147,8 @@ def _run_feature_cut_experiment_impl(
                     if result.outcome.endswith("_failed")
                     and result.attempt.candidate_execution_sha256
                     is not None
+                    and result.attempt.candidate_execution_sha256
+                    not in accepted_runtime_execution_by_beat.values()
                 }
                 persisted_failed_executions = {
                     result.attempt.candidate_execution_sha256
@@ -22979,6 +23158,8 @@ def _run_feature_cut_experiment_impl(
                     is not None
                     and "inactive_complete_route_execution"
                     not in result.decision_codes
+                    and result.attempt.candidate_execution_sha256
+                    not in accepted_runtime_execution_by_beat.values()
                 }
                 failed_runtime_execution_sha256s.update(
                     persisted_failed_executions
