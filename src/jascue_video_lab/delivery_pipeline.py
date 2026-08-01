@@ -2539,6 +2539,18 @@ def _migrate_completed_planning_dispatches(
         path.resolve()
         for path in exclude_existing_raw_interaction_paths
     }
+    # A resumable stage can retain both the original media plan and a later
+    # text-only repair.  The latest orchestration must never re-journal an
+    # already accounted raw interaction under its own stage name.
+    already_journaled_raw_paths: set[Path] = set()
+    for journal_path in stage_dir.glob("*.paid_dispatch.json"):
+        try:
+            journal = read_json(journal_path)
+            raw_value = journal.get("raw_artifact_path")
+            if isinstance(raw_value, str) and raw_value:
+                already_journaled_raw_paths.add(Path(raw_value).resolve())
+        except (OSError, ValueError, TypeError):
+            continue
     for request_path in request_paths:
         raw_path = request_path.with_name(
             request_path.name.removesuffix(".request.json")
@@ -2546,7 +2558,10 @@ def _migrate_completed_planning_dispatches(
         )
         if not raw_path.is_file():
             continue
-        if raw_path.resolve() in excluded:
+        if (
+            raw_path.resolve() in excluded
+            or raw_path.resolve() in already_journaled_raw_paths
+        ):
             continue
         raw_sha256 = sha256_file(raw_path)
         if raw_sha256 in seen_raw_sha256:

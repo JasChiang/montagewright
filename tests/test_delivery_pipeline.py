@@ -194,6 +194,31 @@ def test_budgeted_planning_reconciles_text_only_repair_separately(
     )
 
 
+def test_planning_dispatch_migration_never_relabels_prior_stage_raw(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stage_dir = tmp_path / "planner"
+    raw_path = stage_dir / "attempt-01.raw_interaction.json"
+    request_path = stage_dir / "attempt-01.request.json"
+    write_json(raw_path, {"usage": {}})
+    write_json(request_path, {})
+    write_json(
+        stage_dir / "original.paid_dispatch.json",
+        {"raw_artifact_path": str(raw_path.resolve())},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "migrate_completed_legacy_paid_dispatch",
+        lambda **_kwargs: pytest.fail("a prior raw interaction was relabeled"),
+    )
+
+    assert pipeline._migrate_completed_planning_dispatches(
+        stage_dir=stage_dir,
+        stage="text_repair",
+    ) == ()
+
+
 def test_warm_dispatch_migration_counts_attempt_and_alias_once(
     tmp_path: Path,
 ) -> None:
