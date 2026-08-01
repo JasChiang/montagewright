@@ -22287,6 +22287,7 @@ def _run_feature_cut_experiment_impl(
 
             frontier_state_path = frontier_root / "state.json"
             persisted_semantic_count = 0
+            stale_geometry_state_requires_replay = False
             for persisted_beat in frontier_beats:
                 for persisted_candidate in persisted_beat.candidates:
                     persisted_geometry_path = (
@@ -22322,6 +22323,7 @@ def _run_feature_cut_experiment_impl(
                         ):
                             raise
                         persisted_geometry_stale = True
+                        stale_geometry_state_requires_replay = True
                         # A local compiler revision may stale the geometry
                         # wrapper while its paid grounding response remains
                         # intact. Read only the prior negotiation count here;
@@ -22372,6 +22374,41 @@ def _run_feature_cut_experiment_impl(
                 semantic_negotiation_state.get("global", 0),
                 persisted_semantic_count,
             )
+            if (
+                stale_geometry_state_requires_replay
+                and frontier_state_path.is_file()
+            ):
+                # A frontier state records accepted/rejected execution
+                # outcomes. Once a local geometry contract changes, retaining
+                # that state would skip the explicitly no-provider geometry
+                # recompile and make the old result look authoritative. Keep
+                # the immutable audit record, then replay the scheduler from
+                # the cached local/exact stages.
+                prior_state_sha256 = sha256_file(frontier_state_path)
+                state_archive_path = frontier_root / (
+                    "state.stale-geometry-"
+                    + prior_state_sha256[:16]
+                    + ".json"
+                )
+                if not state_archive_path.is_file():
+                    write_json(
+                        state_archive_path,
+                        read_json(frontier_state_path),
+                    )
+                frontier_state_path.unlink()
+                write_json(
+                    frontier_root / "state-replay.json",
+                    {
+                        "contract_version": "vertical-frontier-state-replay-v1",
+                        "reason_code": "local_geometry_binding_changed",
+                        "archived_state_path": str(
+                            state_archive_path.resolve()
+                        ),
+                        "archived_state_sha256": prior_state_sha256,
+                        "provider_dispatch_permitted": False,
+                        "generated_at": utc_now(),
+                    },
+                )
             if frontier_state_path.is_file():
                 resumed_state = RoundRobinFrontierState.model_validate(
                     read_json(frontier_state_path)
