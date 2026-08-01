@@ -25377,10 +25377,49 @@ def _run_feature_cut_experiment_impl(
                         ).get(frozen_frontier_execution_sha256)
                     )
                     if frozen_execution is None:
-                        raise FeatureCutSystemFailure(
-                            "frozen autonomous frontier execution is absent "
-                            "from the immutable complete-route plan"
+                        # Hydrate an execution admitted by a persisted
+                        # grouped replan.  It remains immutable: all fields
+                        # come from the saved frontier local/geometry stages
+                        # and its accepted state, never a renderer choice.
+                        frozen_key = _frontier_execution_key(
+                            selected.feature_id,
+                            frozen_frontier_candidate_id,
+                            frozen_frontier_execution_sha256,
                         )
+                        frozen_local = local_payloads.get(frozen_key)
+                        frozen_geometry = geometry_payloads.get(frozen_key)
+                        if frozen_local is None or frozen_geometry is None:
+                            raise FeatureCutSystemFailure(
+                                "frozen autonomous frontier execution has no "
+                                "persisted local geometry binding"
+                            )
+                        prior_selection = next(
+                            item
+                            for item in active_runtime_route["route"].selections
+                            if item.beat_id == selected.feature_id
+                        )
+                        frozen_clip = RushClip.model_validate(frozen_local["clip"])
+                        frozen_execution = CandidateRouteSelection(
+                            beat_id=selected.feature_id,
+                            candidate_id=frozen_frontier_candidate_id,
+                            source_asset_id=str(frozen_local["option"]["source_asset_id"]),
+                            event_id=str(frozen_local["option"]["event_id"]),
+                            trim_duration_ms=int(frozen_local["end_ms"]) - int(frozen_local["start_ms"]),
+                            cue_id=prior_selection.cue_id,
+                            cue_aligned=prior_selection.cue_aligned,
+                            presentation_mode=str(frozen_geometry.get("measured_presentation_mode") or prior_selection.presentation_mode),
+                            entry_composition=prior_selection.entry_composition,
+                            exit_composition=prior_selection.exit_composition,
+                            decision_codes=("persisted_grouped_scoped_semantic_replan",),
+                            source_clip_id=frozen_clip.clip_id,
+                            source_in_ms=int(frozen_local["start_ms"]),
+                            source_out_ms=int(frozen_local["end_ms"]),
+                            candidate_execution_sha256=frozen_frontier_execution_sha256,
+                            reuse_mode=str(frozen_local["option"].get("source_reuse_mode") or "none"),
+                        )
+                        pre_render_execution_bindings_by_feature_and_sha.setdefault(
+                            selected.feature_id, {}
+                        )[frozen_frontier_execution_sha256] = frozen_execution
                     if frozen_execution.candidate_id != (
                         frozen_frontier_candidate_id
                     ):
