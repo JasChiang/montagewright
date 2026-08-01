@@ -14857,6 +14857,101 @@ def _apply_pre_render_complete_route_executions(
             },
         )
         executions.append(applied[0])
+    # Beam-search route variants can be dominated by several duration
+    # placements of rank one.  Local preparation must nevertheless measure
+    # every distinct Gemini Top-K candidate at least once; otherwise a clean
+    # rank two/three never reaches the one bounded semantic decision.
+    seen_candidate_ids = {
+        str(row.get("candidate_id")) for row in executions
+    }
+    primary = next(
+        selection
+        for selection in route.selections
+        if selection.beat_id == beat_id
+    )
+    for binding in route.semantic_replan_candidate_bindings_by_beat.get(
+        beat_id, ()
+    ):
+        option = binding.option
+        if option.candidate_id in seen_candidate_ids:
+            continue
+        base = by_id.get(option.candidate_id)
+        if base is None:
+            raise FeatureCutSystemFailure(
+                "semantic candidate is absent from runtime Top-K options"
+            )
+        duration_ms = option.trim_duration_ms
+        if option.fixed_source_in_ms is not None:
+            start_ms = option.fixed_source_in_ms
+            end_ms = option.fixed_source_out_ms
+        else:
+            if not all(
+                value is not None
+                for value in (
+                    option.safe_window_start_ms,
+                    option.safe_window_end_ms,
+                    option.source_anchor_ms,
+                )
+            ):
+                raise FeatureCutSystemFailure(
+                    "semantic candidate has no bounded local preparation interval"
+                )
+            assert option.safe_window_start_ms is not None
+            assert option.safe_window_end_ms is not None
+            assert option.source_anchor_ms is not None
+            start_ms = max(
+                option.safe_window_start_ms,
+                min(
+                    option.source_anchor_ms - duration_ms // 2,
+                    option.safe_window_end_ms - duration_ms,
+                ),
+            )
+            end_ms = start_ms + duration_ms
+        if (
+            start_ms is None
+            or end_ms is None
+            or start_ms >= end_ms
+            or end_ms - start_ms != duration_ms
+        ):
+            raise FeatureCutSystemFailure(
+                "semantic candidate local preparation interval is invalid"
+            )
+        selection = CandidateRouteSelection(
+            beat_id=beat_id,
+            candidate_id=option.candidate_id,
+            source_asset_id=option.source_asset_id,
+            event_id=option.event_id,
+            trim_duration_ms=duration_ms,
+            cue_id=primary.cue_id,
+            cue_aligned=primary.cue_aligned,
+            presentation_mode=option.presentation_mode,
+            entry_composition=option.entry_composition,
+            exit_composition=option.exit_composition,
+            decision_codes=("semantic_candidate_local_preparation",),
+            source_clip_id=option.source_clip_id,
+            source_in_ms=start_ms,
+            source_out_ms=end_ms,
+            candidate_execution_sha256=_stable_fingerprint(
+                {
+                    "contract_version": "semantic-local-preparation-v1",
+                    "option": option.model_dump(mode="json"),
+                    "source_in_ms": start_ms,
+                    "source_out_ms": end_ms,
+                    "cue_id": primary.cue_id,
+                }
+            ),
+            reuse_mode=option.reuse_mode,
+            reuse_justification=option.reuse_justification,
+        )
+        applied = _apply_pre_render_candidate_route(
+            [dict(base)],
+            selected_candidate_id=option.candidate_id,
+            ordered_candidate_ids=(option.candidate_id,),
+            sequence_bindings=sequence_bindings,
+            execution_bindings={option.candidate_id: selection},
+        )
+        executions.append(applied[0])
+        seen_candidate_ids.add(option.candidate_id)
     return executions
 
 
