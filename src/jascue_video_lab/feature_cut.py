@@ -273,7 +273,10 @@ _CONTROLLED_PHASE_MIN_VISIBLE_FRACTION = 2 / 3
 _FEATURE_PLAN_BINDING_VERSION = "feature-plan-binding-v1"
 _EXTERNAL_PROJECTION_SIDECAR_VERSION = "external-feature-plan-projection-v1"
 _EXTERNAL_PROJECTION_POINTER_NAME = "feature-plan.external-projection.json"
-_FRONTIER_LOCAL_BINDING_VERSION = "vertical-frontier-local-input-v4"
+_FRONTIER_LOCAL_BINDING_VERSION = "vertical-frontier-local-input-v3"
+_FRONTIER_GEOMETRY_INTERPRETATION_VERSION = (
+    "gemini-authorized-stable-hold-v1"
+)
 _FRONTIER_EXACT_BINDING_VERSION = "vertical-frontier-exact-input-v2"
 _FRONTIER_GEOMETRY_BINDING_VERSION = "vertical-frontier-geometry-input-v4"
 _FRONTIER_FULFILLMENT_COMPILER_VERSION = (
@@ -22530,6 +22533,9 @@ def _run_feature_cut_experiment_impl(
                 )
                 geometry_candidate_input_sha256 = _stable_fingerprint(
                     {
+                        "geometry_interpretation_version": (
+                            _FRONTIER_GEOMETRY_INTERPRETATION_VERSION
+                        ),
                         "shared_input_sha256": (
                             frontier_shared_geometry_input_sha256
                         ),
@@ -22774,6 +22780,9 @@ def _run_feature_cut_experiment_impl(
                 )
                 geometry_candidate_input_sha256 = _stable_fingerprint(
                     {
+                        "geometry_interpretation_version": (
+                            _FRONTIER_GEOMETRY_INTERPRETATION_VERSION
+                        ),
                         "shared_input_sha256": (
                             frontier_shared_geometry_input_sha256
                         ),
