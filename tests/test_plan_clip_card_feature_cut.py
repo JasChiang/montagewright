@@ -625,6 +625,107 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
     assert '"model_provenance"' not in direct_schema
 
 
+def test_vertical_only_direct_plan_projects_neutral_unrequested_horizontal_shadow() -> None:
+    """A requested 9:16-only plan must not be rejected for omitting 16:9."""
+
+    card = _card()
+    shortlist = FeatureShortlistPlan(
+        project_id="project-1",
+        catalog_id="catalog-1",
+        chapters=[
+            FeatureChapterShortlist(
+                feature_id="feature-1",
+                evidence_status="partial",
+                candidates=[
+                    FeatureShortlistCandidate(
+                        source_asset_id=ASSET_ID,
+                        event_id="demo",
+                        retrieval_reason="Visible demonstration.",
+                    )
+                ],
+            )
+        ],
+        uncertainties=[],
+        model_provenance=_provenance(),
+    )
+    direct = DirectVideoEditPlan(
+        contract_version="direct-video-edit-plan-v2",
+        capability_catalog_sha256=(
+            simple_production_capability_catalog().definition_sha256()
+        ),
+        title="Vertical only",
+        strategy_summary="Use the visible vertical candidate.",
+        chapters=[
+            DirectVideoChapterDecision(
+                chapter_index=1,
+                evidence_status="partial",
+                observed_visual_evidence="A subject is visibly demonstrated.",
+                selection_reason="The action is visible.",
+                horizontal=None,
+                vertical=DirectVideoVerticalDecision(
+                    candidate_rank=1,
+                    strategy="tracked_crop",
+                    crop_mode="primary_center",
+                    coverage_mode="independent_detail",
+                    allow_controlled_clip=True,
+                    framing_intent="Keep the visible subject readable.",
+                    required_entity_indices=[1],
+                    preferred_entity_indices=[],
+                    sacrificable_entity_indices=[],
+                    attention_sequence=[],
+                ),
+                recommended_duration_seconds=4,
+                duration_rationale="Enough time for the visible action.",
+                attention_observation=AttentionObservation(
+                    semantic_novelty=0.6,
+                    action_progress=0.7,
+                    visual_motion=0.3,
+                    composition_change=0.2,
+                    reading_load=0.2,
+                    unresolved_tension=0.1,
+                    emotional_hold_value=0.2,
+                    repetition_pressure=0.1,
+                    music_transition_opportunity=0.5,
+                    minimum_dwell_seconds=3,
+                    maximum_dwell_seconds=6,
+                    rationale="The visible action is brief.",
+                    uncertainties=[],
+                    requires_human_review=True,
+                ),
+                flow_intent=ShotFlowIntent(
+                    narrative_role="proof",
+                    energy_role="low_hold",
+                    relation_to_previous="new_context",
+                    boundary_alignment="phrase_preferred",
+                    visual_sync_event="intentional_hold",
+                    visual_sync_predicate="The visible subject holds briefly.",
+                    music_target="phrase_end",
+                ),
+                confidence=0.8,
+            )
+        ],
+        uncertainties=[],
+    )
+
+    projected = project_direct_video_edit_plan(
+        direct,
+        shortlist=shortlist,
+        candidate_depth=2,
+        brief=_brief(),
+        catalog=_catalog(),
+        cards={ASSET_ID: card},
+        provenance=_provenance(),
+    )
+
+    assert direct.chapters[0].horizontal is None
+    assert projected.chapters[0].vertical_candidate_id == "rank-01"
+    assert projected.chapters[0].horizontal_candidate_id == "rank-01"
+    shadow = projected.chapters[0].candidates[0]
+    assert shadow.horizontal_strategy == "original"
+    assert shadow.horizontal_zoom_intent == "none"
+    assert shadow.horizontal_camera_intent == "hold"
+
+
 def test_direct_source_allocation_requires_explicit_reuse_but_has_no_count_cap() -> None:
     base = DirectVideoChapterDecision(
         chapter_index=1,

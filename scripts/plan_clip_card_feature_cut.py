@@ -1060,8 +1060,7 @@ class DirectVideoChapterDecision(StrictModel):
                 raise ValueError("not-found chapter cannot contain edit decisions")
             return self
         if (
-            self.horizontal is None
-            or self.vertical is None
+            (self.horizontal is None and self.vertical is None)
             or self.recommended_duration_seconds is None
             or not self.duration_rationale
             or self.attention_observation is None
@@ -1086,6 +1085,32 @@ class DirectVideoEditPlan(StrictModel):
     strategy_summary: str
     chapters: list[DirectVideoChapterDecision]
     uncertainties: list[str]
+
+
+def execution_only_horizontal_shadow(
+    chapter: DirectVideoChapterDecision,
+) -> DirectVideoHorizontalDecision:
+    """Supply the legacy projection's unrequested 16:9 slot without inventing art.
+
+    The direct-video contract is aspect-selective: a 9:16-only request must not
+    force Gemini to make a 16:9 editorial decision.  ``ClipCardFeaturePlanV3``
+    predates that contract and still has a required horizontal choice.  This
+    adapter is deliberately neutral and is used only to satisfy that internal
+    representation while rendering the requested vertical output.  It is not a
+    Gemini decision, cannot authorize a 16:9 render, and never selects a new
+    source, crop, movement, or presentation.
+    """
+
+    if chapter.horizontal is not None:
+        return chapter.horizontal
+    if chapter.vertical is None:
+        raise ValueError("supported chapter has no aspect decision to project")
+    return DirectVideoHorizontalDecision(
+        candidate_rank=chapter.vertical.candidate_rank,
+        strategy="original",
+        zoom_intent="none",
+        camera_intent="hold",
+    )
 
 
 class SelectedEvidenceEntity(StrictModel):
@@ -2793,10 +2818,10 @@ def project_direct_video_edit_plan(
                 )
             )
             continue
-        assert direct_chapter.horizontal is not None
         assert direct_chapter.vertical is not None
+        horizontal_decision = execution_only_horizontal_shadow(direct_chapter)
         selected_ranks = {
-            direct_chapter.horizontal.candidate_rank,
+            horizontal_decision.candidate_rank,
             direct_chapter.vertical.candidate_rank,
         }
         if any(rank > len(allowed) for rank in selected_ranks):
@@ -2853,19 +2878,19 @@ def project_direct_video_edit_plan(
                 )
                 if decision is not None
             }
-            if rank == direct_chapter.horizontal.candidate_rank:
-                horizontal_strategy = direct_chapter.horizontal.strategy
-                horizontal_zoom_intent = direct_chapter.horizontal.zoom_intent
-                horizontal_camera_intent = direct_chapter.horizontal.camera_intent
+            if rank == horizontal_decision.candidate_rank:
+                horizontal_strategy = horizontal_decision.strategy
+                horizontal_zoom_intent = horizontal_decision.zoom_intent
+                horizontal_camera_intent = horizontal_decision.camera_intent
                 horizontal_focus_entity_id = (
                     resolve_entity_indices(
                         source_asset_id=shortlisted.source_asset_id,
                         event_id=shortlisted.event_id,
                         indices=[
-                            direct_chapter.horizontal.focus_entity_index
+                            horizontal_decision.focus_entity_index
                         ],
                     )[0]
-                    if direct_chapter.horizontal.focus_entity_index is not None
+                    if horizontal_decision.focus_entity_index is not None
                     else None
                 )
             vertical_decision = vertical_decision_by_rank.get(rank)
@@ -2970,7 +2995,7 @@ def project_direct_video_edit_plan(
                 evidence_status=direct_chapter.evidence_status,
                 candidates=candidates,
                 horizontal_candidate_id=planning_candidate_id(
-                    direct_chapter.horizontal.candidate_rank
+                    horizontal_decision.candidate_rank
                 ),
                 vertical_candidate_id=planning_candidate_id(
                     direct_chapter.vertical.candidate_rank
@@ -4265,7 +4290,8 @@ def reproject_direct_video_edit_plan(
             if derived_chapter.evidence_status != "not_found":
                 raise ValueError("derived plan changed a not-found decision")
             continue
-        assert direct.horizontal is not None and direct.vertical is not None
+        assert direct.vertical is not None
+        horizontal_decision = execution_only_horizontal_shadow(direct)
         allowed = shortlisted.candidates[:depth]
         if len(derived_chapter.candidates) != len(allowed):
             raise ValueError("derived candidate count differs from bounded shortlist")
@@ -4299,16 +4325,16 @@ def reproject_direct_video_edit_plan(
                 or f"sha256:{clip.sha256}" != candidate.source_asset_id
             ):
                 raise ValueError("derived frame does not belong to candidate source")
-        horizontal = by_rank[direct.horizontal.candidate_rank]
+        horizontal = by_rank[horizontal_decision.candidate_rank]
         vertical = by_rank[direct.vertical.candidate_rank]
         if derived_chapter.horizontal_candidate_id != horizontal.candidate_id:
             raise ValueError("derived horizontal rank differs from direct decision")
         if derived_chapter.vertical_candidate_id != vertical.candidate_id:
             raise ValueError("derived vertical rank differs from direct decision")
         expected_horizontal = (
-            direct.horizontal.strategy,
-            direct.horizontal.zoom_intent,
-            direct.horizontal.camera_intent,
+            horizontal_decision.strategy,
+            horizontal_decision.zoom_intent,
+            horizontal_decision.camera_intent,
         )
         actual_horizontal = (
             horizontal.horizontal_strategy,
