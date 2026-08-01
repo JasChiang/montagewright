@@ -22257,6 +22257,9 @@ def _run_feature_cut_experiment_impl(
                             if runtime_semantic_beat is not None
                             else None
                         ),
+                        "bound_editorial_reconstruction_contracts": (
+                            exact_payload.get("bound_contracts")
+                        ),
                         "brief_chapter": brief_by_id[
                             feature_id
                         ].model_dump(mode="json"),
@@ -22302,6 +22305,7 @@ def _run_feature_cut_experiment_impl(
                     )
                     if not persisted_geometry_path.is_file():
                         continue
+                    persisted_geometry_stale = False
                     try:
                         _, _, persisted_geometry_payload = (
                             load_existing_candidate_stage_chain(
