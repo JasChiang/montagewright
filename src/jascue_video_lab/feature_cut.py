@@ -15425,7 +15425,14 @@ def _selected_preflight_local_replan(
     )
     if not decision_path.is_file() and not context_path.is_file():
         return None
-    if not decision_path.is_file() or not context_path.is_file():
+    # A context is deliberately written before the (possibly repaired) typed
+    # decision.  On resume that is an expected pending-negotiation state: the
+    # persistence owner below will verify/migrate the context and reuse its
+    # raw interaction rather than redispatching the original prompt.  Never
+    # parse or apply a context-only artifact as route authority here.
+    if context_path.is_file() and not decision_path.is_file():
+        return None
+    if decision_path.is_file() and not context_path.is_file():
         raise FeatureCutSystemFailure(
             "preflight local infeasibility replan is only partially persisted"
         )

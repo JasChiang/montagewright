@@ -311,6 +311,189 @@ def test_local_preflight_failure_requires_gemini_route_rebuild(
     assert context["affected_beats"][0]["adjacent_sequence_context"]["previous"]["beat_id"] == "opening"
 
 
+def test_local_preflight_context_only_artifact_is_pending_and_cannot_mutate_route(
+    tmp_path: Path,
+) -> None:
+    """Restore leaves an unfinished negotiation for its persistence owner."""
+
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="fold",
+                options=(
+                    _local_replan_option("fold", "fold-1", "a", rank=1),
+                    _local_replan_option("fold", "fold-2", "b", rank=2),
+                ),
+            ),
+        )
+    )
+    artifact_dir = tmp_path / "editorial" / "preflight-local-infeasibility-replan"
+    artifact_dir.mkdir(parents=True)
+    context_path = artifact_dir / "context.json"
+    # This need not be readable by the restore phase: context-only is not
+    # authority, and validation/migration belongs solely to the owner.
+    context_path.write_text('{"unfinished": true}', encoding="utf-8")
+
+    restored = _selected_preflight_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=SimpleNamespace(),
+        plan_path=tmp_path / "plan.json",
+        chapter_durations={"fold": 10.0},
+    )
+
+    assert restored is None
+    assert [selection.candidate_id for selection in route.selections] == ["fold-1"]
+    assert context_path.read_text(encoding="utf-8") == '{"unfinished": true}'
+
+
+def test_local_preflight_decision_only_artifact_remains_fail_closed(
+    tmp_path: Path,
+) -> None:
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="fold",
+                options=(_local_replan_option("fold", "fold-1", "a", rank=1),),
+            ),
+        )
+    )
+    artifact_dir = tmp_path / "editorial" / "preflight-local-infeasibility-replan"
+    artifact_dir.mkdir(parents=True)
+    write_json(artifact_dir / "decision.json", {"authority": {}})
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="preflight local infeasibility replan is only partially persisted",
+    ):
+        _selected_preflight_local_replan(
+            route=route,
+            editorial_dir=tmp_path / "editorial",
+            policy=SimpleNamespace(),
+            plan_path=tmp_path / "plan.json",
+            chapter_durations={"fold": 10.0},
+        )
+
+
+def test_local_preflight_context_only_resume_runs_owner_once_before_typed_apply(
+    tmp_path: Path,
+) -> None:
+    """The actual run order resumes the pending owner before route rebuild."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(_local_replan_option("opening", "open", "a", rank=1),),
+            ),
+            CandidateRouteBeat(
+                beat_id="fold",
+                options=(
+                    _local_replan_option("fold", "fold-1", "b", rank=1),
+                    _local_replan_option("fold", "fold-2", "c", rank=2),
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="ending",
+                options=(_local_replan_option("ending", "end", "d", rank=1),),
+            ),
+        )
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class RepairClient:
+        calls = 0
+
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            self.calls += 1
+            assert kwargs["option_ids_by_beat"] == {"fold": ("fold--fold-2",)}
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "fold",
+                            "selected_option_id": "fold--fold-2",
+                            "fallback_option_ids": [],
+                            "semantic_reason": "preserve_readability",
+                            "unresolved_concern_codes": [],
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    ),
+                )
+            )
+            return SimpleNamespace(
+                decision=decision,
+                interaction_ids=(f"repair-{self.calls}",),
+            )
+
+    client = RepairClient()
+    persistence_kwargs = {
+        "route": route,
+        "local_failures_by_feature": {"fold": ({"candidate_id": "fold-1"},)},
+        "viable_candidate_ids_by_feature": {"fold": ("fold-2",)},
+        "editorial_dir": tmp_path / "editorial",
+        "policy": policy,
+        "client": client,
+        "plan_path": plan_path,
+        "music_supplied": False,
+        "output_timeline_cues": (),
+    }
+    # Simulate the first interrupted process after it wrote its context but
+    # before its typed decision was committed.
+    _persist_preflight_local_infeasibility_replan(**persistence_kwargs)
+    decision_path = (
+        tmp_path
+        / "editorial"
+        / "preflight-local-infeasibility-replan"
+        / "decision.json"
+    )
+    decision_path.unlink()
+    client.calls = 0
+
+    assert _selected_preflight_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"opening": 10.0, "fold": 10.0, "ending": 10.0},
+    ) is None
+    assert [selection.candidate_id for selection in route.selections] == [
+        "open",
+        "fold-1",
+        "end",
+    ]
+
+    _persist_preflight_local_infeasibility_replan(**persistence_kwargs)
+    assert client.calls == 1
+    rebuilt = _selected_preflight_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"opening": 10.0, "fold": 10.0, "ending": 10.0},
+    )
+    assert rebuilt is not None
+    assert [selection.candidate_id for selection in rebuilt.selections] == [
+        "open",
+        "fold-2",
+        "end",
+    ]
+
+
 def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(
     tmp_path: Path,
 ) -> None:
