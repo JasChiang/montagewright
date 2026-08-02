@@ -16899,19 +16899,26 @@ def _restore_preflight_horizontal_local_replan(
         policy=policy,
         plan_path=plan_path,
     )
-    state = _horizontal_replan_effective_execution_state(
-        base_route=recovery["base_route"],
-        decisions=recovery["decisions"],
-        motion_actions_by_option=recovery["motion_actions_by_option"],
-        allowed_reuse_ids_by_option=recovery["allowed_reuse_ids_by_option"],
-        failure_records=recovery["failure_records"],
-        policy=policy,
-    )
     base_route = recovery["base_route"]
-    selected_candidate_ids = state["selected_candidate_ids"]
-    selected_motion_actions = state["selected_actions"]
-    reuse_authorities = state["reuse_authorities"]
-    try:
+    failure_records = list(recovery["failure_records"])
+    restore_pass_cap = _horizontal_recovery_pass_limit(
+        beat_count=len(recovery["decisions"]),
+        attempt_limit=policy.recovery.max_candidate_attempts_per_beat,
+    )
+    for _restore_pass in range(restore_pass_cap):
+        state = _horizontal_replan_effective_execution_state(
+            base_route=base_route,
+            decisions=recovery["decisions"],
+            motion_actions_by_option=recovery["motion_actions_by_option"],
+            allowed_reuse_ids_by_option=recovery[
+                "allowed_reuse_ids_by_option"
+            ],
+            failure_records=failure_records,
+            policy=policy,
+        )
+        selected_candidate_ids = state["selected_candidate_ids"]
+        selected_motion_actions = state["selected_actions"]
+        reuse_authorities = state["reuse_authorities"]
         alternate_executions = _materialize_horizontal_replan_alternate_executions(
             route=base_route,
             selected_candidate_ids=selected_candidate_ids,
@@ -16924,33 +16931,106 @@ def _restore_preflight_horizontal_local_replan(
             selected_candidate_ids=selected_candidate_ids,
             chapter_durations=chapter_durations,
         )
-        rebuilt = rebuild_route_with_semantic_authorities(
-            base_route,
-            selected_candidate_ids_by_beat=selected_candidate_ids,
-            reuse_authorities_by_beat=reuse_authorities,
-            frozen_execution_bindings_by_beat=frozen_executions,
-            minimum_duration_ms=(
-                1
-                if policy.execution_profile == "autonomous_best_effort"
-                else policy.duration.min_ms
-            ),
-            maximum_duration_ms=policy.duration.max_ms,
-            max_panel_runtime_fraction=policy.presentation.max_panel_runtime_fraction,
-            target_duration_ms=base_route.total_duration_ms,
-            max_editorial_reprise_overlap_fraction=(
-                policy.editorial.max_editorial_reprise_overlap_fraction
-            ),
-        )
-        _validate_horizontal_frozen_replan_execution_vector(
-            rebuilt=rebuilt,
-            frozen_executions=frozen_executions,
-            expected_total_duration_ms=base_route.total_duration_ms,
-        )
-    except ValueError as error:
+        try:
+            rebuilt = rebuild_route_with_semantic_authorities(
+                base_route,
+                selected_candidate_ids_by_beat=selected_candidate_ids,
+                reuse_authorities_by_beat=reuse_authorities,
+                frozen_execution_bindings_by_beat=frozen_executions,
+                minimum_duration_ms=(
+                    1
+                    if policy.execution_profile == "autonomous_best_effort"
+                    else policy.duration.min_ms
+                ),
+                maximum_duration_ms=policy.duration.max_ms,
+                max_panel_runtime_fraction=(
+                    policy.presentation.max_panel_runtime_fraction
+                ),
+                target_duration_ms=base_route.total_duration_ms,
+                max_editorial_reprise_overlap_fraction=(
+                    policy.editorial.max_editorial_reprise_overlap_fraction
+                ),
+            )
+            _validate_horizontal_frozen_replan_execution_vector(
+                rebuilt=rebuilt,
+                frozen_executions=frozen_executions,
+                expected_total_duration_ms=base_route.total_duration_ms,
+            )
+        except ValueError as error:
+            current_by_beat = {
+                selection.beat_id: selection for selection in route.selections
+            }
+            changed_beats = [
+                beat_id
+                for beat_id, attempted in frozen_executions.items()
+                if (
+                    beat_id in state["selected_executions"]
+                    and (
+                        current_by_beat.get(beat_id) is None
+                        or current_by_beat[
+                            beat_id
+                        ].candidate_execution_sha256
+                        != attempted.candidate_execution_sha256
+                    )
+                )
+            ]
+            # A single measured execution may become globally infeasible
+            # after its dirty-head rebind (for example, by exceeding an
+            # already-authorized source-reuse overlap).  That is a typed hard
+            # failure of this exact execution, so advance only this beat to
+            # Gemini's next ordered fallback.  Multiple simultaneous changes
+            # would require a new cross-beat semantic choice and remain
+            # fail-closed under the one-replan policy.
+            if len(changed_beats) != 1:
+                raise FeatureCutSystemFailure(
+                    "horizontal preflight selected alternates cannot preserve "
+                    "the complete frozen execution vector"
+                ) from error
+            failed_beat = changed_beats[0]
+            attempted_route = base_route.model_copy(
+                update={
+                    "selections": tuple(
+                        frozen_executions[selection.beat_id]
+                        for selection in base_route.selections
+                    )
+                }
+            )
+            state["failure_records"] = failure_records
+            _append_horizontal_replan_execution_failure_records(
+                route=attempted_route,
+                base_route=base_route,
+                context_path=context_path,
+                decision_path=decision_path,
+                plan_path=plan_path,
+                policy=policy,
+                failure_facts_by_beat={
+                    failed_beat: (
+                        {
+                            "candidate_id": frozen_executions[
+                                failed_beat
+                            ].candidate_id,
+                            "failure_class": (
+                                "typed_global_route_reuse_or_policy_failure"
+                            ),
+                            "reason": str(error),
+                        },
+                    )
+                },
+                state=state,
+            )
+            failure_records = _load_horizontal_replan_execution_failure_records(
+                context_path=context_path,
+                decision_path=decision_path,
+                plan_path=plan_path,
+                policy=policy,
+                option_ids_by_beat=recovery["option_ids_by_beat"],
+            )
+            continue
+        break
+    else:
         raise FeatureCutSystemFailure(
-            "horizontal preflight selected alternate cannot preserve the "
-            "complete frozen execution vector"
-        ) from error
+            "horizontal preflight frozen-route recovery pass cap exhausted"
+        )
     fallback_ids = dict(base_route.fallback_candidate_ids_by_beat)
     for beat_id, candidate_id in selected_candidate_ids.items():
         fallback_ids[beat_id] = (candidate_id,)
@@ -16971,6 +17051,7 @@ def _restore_preflight_horizontal_local_replan(
             ),
         }
     )
+
 
 def _materialize_horizontal_replan_alternate_executions(
     *,
