@@ -247,6 +247,7 @@ from .sequence_optimizer import (
     RoundRobinFrontierState,
     SemanticReplanReuseAuthority,
     build_resolved_timeline,
+    candidate_route_execution_sha256,
     initialize_round_robin_frontier,
     next_round_robin_frontier_attempt,
     record_round_robin_frontier_attempt,
@@ -14400,6 +14401,107 @@ def _pre_render_execution_duration_seconds(
     return duration_ms / 1000
 
 
+def _validate_pre_render_execution_timing_binding(
+    option_data: Mapping[str, Any],
+    *,
+    execution_binding: Mapping[str, Any],
+) -> tuple[CandidateRouteOption, CandidateRouteSelection]:
+    """Validate one runtime execution against its candidate-local timing fact.
+
+    A complete-route execution SHA is meaningful only with the immutable
+    ``CandidateRouteOption`` from which it was derived.  In particular, a
+    candidate ID is not enough to establish source-time authority: the exact
+    timing hash, safe interval, event anchor, source asset, and source clip
+    must all come from that same option.  Reject an incomplete or cross-wired
+    binding before local preflight can measure, spend, or render anything.
+    """
+
+    sequence_binding = option_data.get("_pre_render_sequence_binding")
+    if not isinstance(sequence_binding, Mapping):
+        raise FeatureCutSystemFailure(
+            "pre-render execution has no candidate timing binding"
+        )
+    try:
+        timing_option = CandidateRouteOption.model_validate(sequence_binding)
+        execution = CandidateRouteSelection.model_validate(execution_binding)
+    except (TypeError, ValueError) as error:
+        raise FeatureCutSystemFailure(
+            "pre-render execution has an invalid candidate timing binding"
+        ) from error
+
+    runtime_candidate_id = str(option_data.get("candidate_id") or "")
+    runtime_source_asset_id = str(option_data.get("source_asset_id") or "")
+    runtime_event_id = str(option_data.get("event_id") or "")
+    if not all(
+        (
+            runtime_candidate_id,
+            runtime_source_asset_id,
+            runtime_event_id,
+        )
+    ):
+        raise FeatureCutSystemFailure(
+            "runtime pre-render option has no immutable candidate identity"
+        )
+    if not (
+        runtime_candidate_id
+        == timing_option.candidate_id
+        == execution.candidate_id
+        and runtime_source_asset_id
+        == timing_option.source_asset_id
+        == execution.source_asset_id
+        and runtime_event_id == timing_option.event_id == execution.event_id
+        and timing_option.beat_id == execution.beat_id
+        and timing_option.source_clip_id == execution.source_clip_id
+        and timing_option.cue_id == execution.cue_id
+        and timing_option.cue_aligned == execution.cue_aligned
+        and timing_option.presentation_mode == execution.presentation_mode
+        and timing_option.entry_composition == execution.entry_composition
+        and timing_option.exit_composition == execution.exit_composition
+        and timing_option.reuse_mode == execution.reuse_mode
+        and timing_option.reuse_justification
+        == execution.reuse_justification
+    ):
+        raise FeatureCutSystemFailure(
+            "pre-render execution and candidate timing binding have "
+            "different immutable identities"
+        )
+    if timing_option.candidate_timing_sha256 is None:
+        raise FeatureCutSystemFailure(
+            "pre-render execution timing binding has no candidate timing SHA"
+        )
+    safe_start = timing_option.safe_window_start_ms
+    safe_end = timing_option.safe_window_end_ms
+    source_anchor = timing_option.source_anchor_ms
+    if not (
+        isinstance(safe_start, int)
+        and isinstance(safe_end, int)
+        and isinstance(source_anchor, int)
+        and execution.source_in_ms is not None
+        and execution.source_out_ms is not None
+        and safe_start
+        <= execution.source_in_ms
+        < execution.source_out_ms
+        <= safe_end
+        and execution.source_in_ms <= source_anchor < execution.source_out_ms
+    ):
+        raise FeatureCutSystemFailure(
+            "pre-render execution interval escaped its candidate-local "
+            "quality-safe timing fact"
+        )
+    expected_execution_sha256 = candidate_route_execution_sha256(
+        timing_option,
+        duration_ms=execution.trim_duration_ms,
+        source_in_ms=execution.source_in_ms,
+        source_out_ms=execution.source_out_ms,
+    )
+    if execution.candidate_execution_sha256 != expected_execution_sha256:
+        raise FeatureCutSystemFailure(
+            "pre-render execution is not derived from its candidate timing "
+            "binding"
+        )
+    return timing_option, execution
+
+
 def _pre_render_execution_bindings_by_beat_and_sha(
     route: Any,
 ) -> dict[str, dict[str, Any]]:
@@ -14931,14 +15033,11 @@ def _apply_pre_render_complete_route_executions(
             source_clip_id=option.source_clip_id,
             source_in_ms=start_ms,
             source_out_ms=end_ms,
-            candidate_execution_sha256=_stable_fingerprint(
-                {
-                    "contract_version": "semantic-local-preparation-v1",
-                    "option": option.model_dump(mode="json"),
-                    "source_in_ms": start_ms,
-                    "source_out_ms": end_ms,
-                    "cue_id": primary.cue_id,
-                }
+            candidate_execution_sha256=candidate_route_execution_sha256(
+                option,
+                duration_ms=duration_ms,
+                source_in_ms=start_ms,
+                source_out_ms=end_ms,
             ),
             reuse_mode=option.reuse_mode,
             reuse_justification=option.reuse_justification,
@@ -14947,7 +15046,14 @@ def _apply_pre_render_complete_route_executions(
             [dict(base)],
             selected_candidate_id=option.candidate_id,
             ordered_candidate_ids=(option.candidate_id,),
-            sequence_bindings=sequence_bindings,
+            # These semantic Top-K candidates can be absent from every
+            # complete route (for example when rank-one duration variants
+            # fill the beam).  Bind the locally prepared execution to this
+            # exact immutable option, not to the general route map that may
+            # deliberately omit it.  This only permits local measurement;
+            # it does not promote or render the candidate without Gemini's
+            # bounded semantic replan.
+            sequence_bindings={option.candidate_id: option},
             execution_bindings={option.candidate_id: selection},
         )
         executions.append(applied[0])
@@ -16672,6 +16778,42 @@ def _prepare_autonomous_vertical_candidate(
         option=option_data,
         evidence_events=evidence_events,
     )
+    execution_binding = option_data.get(
+        "_pre_render_execution_binding"
+    )
+    sequence_binding: CandidateRouteOption | None = None
+    bound_execution: CandidateRouteSelection | None = None
+    candidate_execution_sha256: str | None = None
+    if isinstance(execution_binding, Mapping):
+        # Validate all source-time authority before the local preflight reads
+        # source metadata or measures a candidate.  This keeps a cross-wired
+        # frontier artifact from consuming any local work, paid work, or
+        # renderer capacity.
+        sequence_binding, bound_execution = (
+            _validate_pre_render_execution_timing_binding(
+                option_data,
+                execution_binding=execution_binding,
+            )
+        )
+        bound_start = bound_execution.source_in_ms
+        bound_end = bound_execution.source_out_ms
+        bound_duration = bound_execution.trim_duration_ms
+        candidate_execution_sha256 = (
+            bound_execution.candidate_execution_sha256
+        )
+        if not (
+            isinstance(bound_start, int)
+            and isinstance(bound_end, int)
+            and isinstance(bound_duration, int)
+            and bound_start < bound_end
+            and bound_end - bound_start == bound_duration
+            and bound_duration
+            == round(chapter_duration_seconds * 1000)
+        ):
+            raise FeatureCutSystemFailure(
+                "pre-render candidate execution binding is incomplete or "
+                "differs from the frozen chapter duration"
+            )
 
     media = _ensure_runtime_source_metadata(
         clip,
@@ -16706,59 +16848,22 @@ def _prepare_autonomous_vertical_candidate(
         )
     except ValueError as error:
         raise CandidateKnownInfeasible(str(error)) from error
-    execution_binding = option_data.get(
-        "_pre_render_execution_binding"
-    )
-    candidate_execution_sha256: str | None = None
-    if isinstance(execution_binding, Mapping):
-        bound_start = execution_binding.get("source_in_ms")
-        bound_end = execution_binding.get("source_out_ms")
-        bound_duration = execution_binding.get("trim_duration_ms")
-        candidate_execution_sha256 = str(
-            execution_binding.get("candidate_execution_sha256") or ""
-        ) or None
-        if not (
-            isinstance(bound_start, int)
-            and isinstance(bound_end, int)
-            and isinstance(bound_duration, int)
-            and bound_start < bound_end
-            and bound_end - bound_start == bound_duration
-            and bound_duration
-            == round(chapter_duration_seconds * 1000)
-        ):
-            raise FeatureCutSystemFailure(
-                "pre-render candidate execution binding is incomplete or "
-                "differs from the frozen chapter duration"
-            )
-        sequence_binding = option_data.get(
-            "_pre_render_sequence_binding"
-        )
-        if not isinstance(sequence_binding, Mapping):
-            raise FeatureCutSystemFailure(
-                "pre-render execution has no candidate timing binding"
-            )
-        safe_start = sequence_binding.get("safe_window_start_ms")
-        safe_end = sequence_binding.get("safe_window_end_ms")
-        source_anchor = sequence_binding.get("source_anchor_ms")
-        if not (
-            isinstance(safe_start, int)
-            and isinstance(safe_end, int)
-            and isinstance(source_anchor, int)
-            and safe_start <= bound_start < bound_end <= safe_end
-            and bound_start <= source_anchor < bound_end
-        ):
-            raise FeatureCutSystemFailure(
-                "pre-render execution interval escaped its candidate-local "
-                "quality-safe timing fact"
-            )
+    if bound_execution is not None:
+        bound_start = bound_execution.source_in_ms
+        bound_end = bound_execution.source_out_ms
+        bound_duration = bound_execution.trim_duration_ms
+        assert isinstance(sequence_binding, CandidateRouteOption)
+        assert isinstance(bound_start, int)
+        assert isinstance(bound_end, int)
+        assert isinstance(bound_duration, int)
         trim = {
             **dict(trim),
             "trim_method": "pre_render_complete_route_source_interval",
             "locally_centered_source_in_ms": start_ms,
             "locally_centered_source_out_ms": end_ms,
             "resolved_duration_ms": bound_duration,
-            "candidate_timing_sha256": sequence_binding.get(
-                "candidate_timing_sha256"
+            "candidate_timing_sha256": (
+                sequence_binding.candidate_timing_sha256
             ),
             "candidate_execution_sha256": (
                 candidate_execution_sha256

@@ -47,6 +47,7 @@ from jascue_video_lab.feature_cut import (
     _audit_feature_plan_candidate_recall,
     _audit_requested_candidate_recall,
     _attempt_trim_shift_operation,
+    _apply_pre_render_complete_route_executions,
     _apply_pre_render_candidate_route,
     _ensure_runtime_source_metadata,
     _runtime_exact_event_root,
@@ -54,6 +55,7 @@ from jascue_video_lab.feature_cut import (
     _source_interval_duration_seconds,
     _pre_render_execution_bindings_by_beat_and_sha,
     _pre_render_execution_duration_seconds,
+    _validate_pre_render_execution_timing_binding,
     _pre_render_vertical_feasibility,
     _presentation_requires_scoped_semantic_replan,
     _scoped_semantic_replan_reuse_binding,
@@ -167,6 +169,7 @@ from jascue_video_lab.sequence_optimizer import (
     RoundRobinFrontierBeat,
     RoundRobinFrontierCandidate,
     RoundRobinFrontierState,
+    candidate_route_execution_sha256,
     initialize_round_robin_frontier,
     next_round_robin_frontier_attempt,
     optimize_pre_render_candidate_route,
@@ -2401,6 +2404,224 @@ def test_pre_render_frontier_order_drives_runtime_fallback_sequence() -> None:
     assert ordered[0]["_pre_render_execution_binding"][
         "source_in_ms"
     ] == 1_000
+
+
+def _timed_pre_render_option(
+    candidate_id: str,
+    marker: str,
+    *,
+    rank: int,
+    minimum_readable_ms: int = 4_000,
+    preferred_readable_ms: int = 5_000,
+    maximum_readable_ms: int = 6_000,
+) -> CandidateRouteOption:
+    return CandidateRouteOption(
+        beat_id="beat",
+        candidate_id=candidate_id,
+        source_asset_id="sha256:" + marker * 64,
+        event_id=f"event-{candidate_id}",
+        planner_rank=rank,
+        semantic_confidence=0.9,
+        trim_duration_ms=preferred_readable_ms,
+        minimum_readable_ms=minimum_readable_ms,
+        preferred_readable_ms=preferred_readable_ms,
+        maximum_readable_ms=maximum_readable_ms,
+        cue_id="cue",
+        source_clip_id=f"clip-{marker}",
+        safe_capacity_ms=10_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=10_000,
+        source_anchor_ms=5_000,
+        candidate_timing_sha256=marker * 64,
+    )
+
+
+def _timed_pre_render_execution(
+    option: CandidateRouteOption,
+    *,
+    duration_ms: int = 5_000,
+    source_in_ms: int = 2_500,
+) -> CandidateRouteSelection:
+    source_out_ms = source_in_ms + duration_ms
+    return CandidateRouteSelection(
+        beat_id=option.beat_id,
+        candidate_id=option.candidate_id,
+        source_asset_id=option.source_asset_id,
+        event_id=option.event_id,
+        trim_duration_ms=duration_ms,
+        cue_id=option.cue_id,
+        cue_aligned=option.cue_aligned,
+        presentation_mode=option.presentation_mode,
+        entry_composition=option.entry_composition,
+        exit_composition=option.exit_composition,
+        decision_codes=("test",),
+        source_clip_id=option.source_clip_id,
+        source_in_ms=source_in_ms,
+        source_out_ms=source_out_ms,
+        candidate_execution_sha256=candidate_route_execution_sha256(
+            option,
+            duration_ms=duration_ms,
+            source_in_ms=source_in_ms,
+            source_out_ms=source_out_ms,
+        ),
+        reuse_mode=option.reuse_mode,
+        reuse_justification=option.reuse_justification,
+    )
+
+
+def test_semantic_top_k_local_preparation_binds_each_candidate_timing() -> None:
+    """Rank-one duration variants cannot strand Gemini's other Top-K options."""
+
+    rank_one = _timed_pre_render_option("rank-01", "a", rank=1)
+    rank_two = _timed_pre_render_option("rank-02", "b", rank=2)
+    rank_three = _timed_pre_render_option("rank-03", "c", rank=3)
+    support = _timed_pre_render_option("support-01", "d", rank=1).model_copy(
+        update={"beat_id": "support"}
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="beat",
+                options=(rank_one, rank_two, rank_three),
+            ),
+            CandidateRouteBeat(
+                beat_id="support",
+                options=(support,),
+            ),
+        ),
+        target_duration_ms=10_000,
+        max_ranked_routes=2,
+        max_duration_variants_per_route=3,
+    )
+
+    # The saved beam has only rank-one duration variants.  Rank two and rank
+    # three therefore arrive solely through the bounded Gemini replan set.
+    assert [
+        complete_route.selections[0].candidate_id
+        for complete_route in route.ranked_routes
+    ] == ["rank-01", "rank-01"]
+    assert len(
+        {
+            complete_route.selections[0].candidate_execution_sha256
+            for complete_route in route.ranked_routes
+        }
+    ) == 2
+    assert set(route.option_bindings_by_beat["beat"]) == {"rank-01"}
+
+    prepared = _apply_pre_render_complete_route_executions(
+        [
+            {
+                "candidate_id": option.candidate_id,
+                "source_asset_id": option.source_asset_id,
+                "event_id": option.event_id,
+            }
+            for option in (rank_one, rank_two, rank_three)
+        ],
+        beat_id="beat",
+        route=route,
+        sequence_bindings=route.option_bindings_by_beat["beat"],
+    )
+
+    assert [row["candidate_id"] for row in prepared] == [
+        "rank-01",
+        "rank-01",
+        "rank-02",
+        "rank-03",
+    ]
+    bindings_by_candidate = {
+        option.candidate_id: option for option in (rank_one, rank_two, rank_three)
+    }
+    for row in prepared:
+        candidate_id = row["candidate_id"]
+        timing_binding = row["_pre_render_sequence_binding"]
+        execution_binding = row["_pre_render_execution_binding"]
+        assert timing_binding["candidate_id"] == candidate_id
+        assert execution_binding["candidate_id"] == candidate_id
+        assert timing_binding["candidate_timing_sha256"] == (
+            bindings_by_candidate[candidate_id].candidate_timing_sha256
+        )
+        _validate_pre_render_execution_timing_binding(
+            row,
+            execution_binding=execution_binding,
+        )
+
+
+def test_pre_render_execution_requires_own_candidate_timing_binding() -> None:
+    option = _timed_pre_render_option("rank-01", "a", rank=1)
+    execution = _timed_pre_render_execution(option)
+    runtime_option = {
+        "candidate_id": option.candidate_id,
+        "source_asset_id": option.source_asset_id,
+        "event_id": option.event_id,
+    }
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="has no candidate timing binding",
+    ):
+        _validate_pre_render_execution_timing_binding(
+            runtime_option,
+            execution_binding=execution.model_dump(mode="json"),
+        )
+
+
+def test_pre_render_execution_rejects_cross_candidate_or_timing_binding() -> None:
+    option = _timed_pre_render_option("rank-01", "a", rank=1)
+    other_candidate = _timed_pre_render_option("rank-02", "b", rank=2)
+    runtime_option = {
+        "candidate_id": option.candidate_id,
+        "source_asset_id": option.source_asset_id,
+        "event_id": option.event_id,
+        "_pre_render_sequence_binding": option.model_dump(mode="json"),
+    }
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="different immutable identities",
+    ):
+        _validate_pre_render_execution_timing_binding(
+            runtime_option,
+            execution_binding=_timed_pre_render_execution(
+                other_candidate
+            ).model_dump(mode="json"),
+        )
+
+    foreign_timing = option.model_copy(
+        update={"candidate_timing_sha256": "f" * 64}
+    )
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="not derived from its candidate timing binding",
+    ):
+        _validate_pre_render_execution_timing_binding(
+            runtime_option,
+            execution_binding=_timed_pre_render_execution(
+                foreign_timing
+            ).model_dump(mode="json"),
+        )
+
+
+def test_pre_render_execution_rejects_interval_outside_candidate_safe_window() -> None:
+    option = _timed_pre_render_option("rank-01", "a", rank=1)
+    runtime_option = {
+        "candidate_id": option.candidate_id,
+        "source_asset_id": option.source_asset_id,
+        "event_id": option.event_id,
+        "_pre_render_sequence_binding": option.model_dump(mode="json"),
+    }
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="interval escaped its candidate-local quality-safe timing fact",
+    ):
+        _validate_pre_render_execution_timing_binding(
+            runtime_option,
+            execution_binding=_timed_pre_render_execution(
+                option,
+                duration_ms=4_000,
+                source_in_ms=7_000,
+            ).model_dump(mode="json"),
+        )
 
 
 def test_frontier_preflight_uses_each_complete_route_execution_duration() -> None:
