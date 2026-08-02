@@ -4907,6 +4907,151 @@ def test_horizontal_primary_failure_persists_one_grouped_alternate_replan(
         )
 
 
+def test_horizontal_motion_preservation_is_a_distinct_grouped_action_and_restores(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    primary = _local_replan_option("opening", "rank-01", "a", rank=1).model_copy(
+        update={
+            "trim_duration_ms": 30_000,
+            "minimum_readable_ms": 30_000,
+            "preferred_readable_ms": 30_000,
+            "maximum_readable_ms": 30_000,
+            "fixed_source_out_ms": 30_000,
+            "safe_capacity_ms": 30_000,
+            "safe_window_end_ms": 30_000,
+            "source_anchor_ms": 15_000,
+        }
+    )
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="opening", options=(primary,)),),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    ).model_copy(
+        update={
+            "semantic_replan_candidate_bindings_by_beat": {
+                "opening": (SemanticReplanCandidateBinding(option=primary),)
+            }
+        }
+    )
+    selection = route.selections[0]
+    evidence_sha = "d" * 64
+    action_id = feature_cut_module._horizontal_motion_preservation_action_id(
+        beat_id="opening",
+        candidate_id=selection.candidate_id,
+        candidate_execution_sha256=str(selection.candidate_execution_sha256),
+        source_asset_id=selection.source_asset_id,
+        source_in_ms=int(selection.source_in_ms or 0),
+        source_out_ms=int(selection.source_out_ms or 0),
+        source_motion_evidence_sha256=evidence_sha,
+    )
+    action = {
+        "contract_version": "horizontal-motion-preservation-action-v1",
+        "action_id": action_id,
+        "action": "retain_primary_preserve_observed_motion",
+        "beat_id": "opening",
+        "candidate_id": selection.candidate_id,
+        "candidate_execution_sha256": selection.candidate_execution_sha256,
+        "source_asset_id": selection.source_asset_id,
+        "source_clip_id": selection.source_clip_id,
+        "source_in_ms": selection.source_in_ms,
+        "source_out_ms": selection.source_out_ms,
+        "source_motion_evidence_sha256": evidence_sha,
+        "exact_source_interval": {
+            "source_sha256": "a" * 64,
+            "start_pts": 3,
+            "end_pts_exclusive": 33,
+            "start_frame_sha256": "e" * 64,
+            "end_exclusive_frame_sha256": "f" * 64,
+            "source_time_base": "1/30",
+        },
+        "effective_source_camera_motion_role": "editorially_useful",
+        "runtime_handling": "preserve_as_observed_no_synthetic_motion",
+    }
+    reel = tmp_path / "motion-recovery.mp4"
+    reel.write_bytes(b"low-res-reel")
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_build_horizontal_motion_recovery_reel",
+        lambda _actions, *, output_dir: {
+            "contract_version": "horizontal-motion-recovery-reel-v1",
+            "action_ids": [action_id],
+            "reel_path": str(reel),
+            "reel_sha256": hashlib.sha256(reel.read_bytes()).hexdigest(),
+            "reel_duration_ms": 900,
+        },
+    )
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["option_ids_by_beat"] == {"opening": (action_id,)}
+            assert kwargs["motion_recovery_reel_path"] == reel
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "opening",
+                            "selected_option_id": action_id,
+                            "fallback_option_ids": [],
+                                "semantic_reason": "preserve_source_motion",
+                            "unresolved_concern_codes": [],
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    ),
+                )
+            )
+            return SimpleNamespace(decision=decision, interaction_ids=("motion",))
+
+    editorial_dir = tmp_path / "editorial"
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=route,
+        failures_by_beat={
+            "opening": (
+                {
+                    "candidate_id": selection.candidate_id,
+                    "reason": "reliable non-static horizontal source-camera motion needs a Gemini source_camera_motion_role",
+                    "motion_preservation_action": action,
+                },
+            )
+        },
+        editorial_dir=editorial_dir,
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    restored = _restore_preflight_horizontal_local_replan(
+        route=route,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"opening": 30.0},
+    )
+    assert restored is not None
+    assert restored.selections == route.selections
+    assert feature_cut_module._load_horizontal_motion_preservation_authorities(
+        route=restored,
+        editorial_dir=editorial_dir,
+    ) == {"opening": action}
+
+
 def test_horizontal_route_keeps_alternates_only_in_replan_bindings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5143,6 +5288,10 @@ def test_horizontal_replan_context_only_resumes_same_journal_run(
         plan_path=plan_path,
         chapter_durations={"hero": 30.0},
     ) is None
+    assert feature_cut_module._load_horizontal_motion_preservation_authorities(
+        route=route,
+        editorial_dir=editorial_dir,
+    ) == {}
 
     _persist_preflight_horizontal_local_infeasibility_replan(
         route=route,
@@ -5208,8 +5357,8 @@ def test_horizontal_preflight_measures_selected_primary_not_alternate(
     monkeypatch.setattr(
         feature_cut_module,
         "_maskless_source_motion_preflight",
-        lambda **_kwargs: SimpleNamespace(
-            model_dump=lambda **_kwargs: {"classification": "static"}
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("primary preflight must reuse prepared evidence")
         ),
     )
     failures = _preflight_horizontal_route_primaries(
@@ -12569,6 +12718,106 @@ def test_strict_horizontal_source_motion_uses_gemini_role_not_local_intent() -> 
             role="static_or_negligible",
             evidence=moving,
         )
+
+
+def test_horizontal_motion_preservation_allows_only_clean_opening_motion_and_forces_hold() -> None:
+    """The override is semantic-only: dirty/jolt evidence stays in replan."""
+
+    clean = SimpleNamespace(
+        reliable=True,
+        sampling_complete=True,
+        classification="pan_left",
+        dirty_head=False,
+        dirty_tail=False,
+        isolated_jolt_count=0,
+        reversal_count=1,
+    )
+    assert feature_cut_module._horizontal_motion_preservation_is_eligible(
+        evidence=clean,
+        failure_reason=(
+            "reliable non-static horizontal source-camera motion needs a "
+            "Gemini source_camera_motion_role"
+        ),
+    )
+    for rejected in (
+        SimpleNamespace(**{**clean.__dict__, "dirty_head": True}),
+        SimpleNamespace(**{**clean.__dict__, "isolated_jolt_count": 1}),
+        SimpleNamespace(**{**clean.__dict__, "reversal_count": 2}),
+        SimpleNamespace(**{**clean.__dict__, "sampling_complete": False}),
+    ):
+        assert not feature_cut_module._horizontal_motion_preservation_is_eligible(
+            evidence=rejected,
+            failure_reason=(
+                "reliable non-static horizontal source-camera motion needs a "
+                "Gemini source_camera_motion_role"
+            ),
+        )
+
+    selection = CandidateRouteSelection(
+        beat_id="opening",
+        candidate_id="opening-primary",
+        source_asset_id="sha256:" + "a" * 64,
+        source_clip_id="opening-clip",
+        event_id="opening",
+        trim_duration_ms=1_000,
+        cue_id="no-music",
+        cue_aligned=True,
+        presentation_mode="source_hold",
+        entry_composition="unresolved",
+        exit_composition="unresolved",
+        decision_codes=("initial_primary",),
+        source_in_ms=100,
+        source_out_ms=1_100,
+        candidate_execution_sha256="b" * 64,
+    )
+    evidence_sha = "c" * 64
+    action = {
+        "contract_version": "horizontal-motion-preservation-action-v1",
+        "action_id": feature_cut_module._horizontal_motion_preservation_action_id(
+            beat_id="opening",
+            candidate_id="opening-primary",
+            candidate_execution_sha256="b" * 64,
+            source_asset_id="sha256:" + "a" * 64,
+            source_in_ms=100,
+            source_out_ms=1_100,
+            source_motion_evidence_sha256=evidence_sha,
+        ),
+        "action": "retain_primary_preserve_observed_motion",
+        "beat_id": "opening",
+        "candidate_id": "opening-primary",
+        "candidate_execution_sha256": "b" * 64,
+        "source_asset_id": "sha256:" + "a" * 64,
+        "source_clip_id": "opening-clip",
+        "source_in_ms": 100,
+        "source_out_ms": 1_100,
+        "source_motion_evidence_sha256": evidence_sha,
+        "exact_source_interval": {
+            "source_sha256": "a" * 64,
+            "start_pts": 3,
+            "end_pts_exclusive": 33,
+            "start_frame_sha256": "e" * 64,
+            "end_exclusive_frame_sha256": "f" * 64,
+            "source_time_base": "1/30",
+        },
+        "effective_source_camera_motion_role": "editorially_useful",
+        "runtime_handling": "preserve_as_observed_no_synthetic_motion",
+    }
+    applied = feature_cut_module._apply_horizontal_motion_preservation_authority(
+        {
+            "strategy": "tracked_reframe",
+            "zoom_intent": "push_in",
+            "camera_intent": "pan_left",
+            "target_description": "subject",
+        },
+        selection=selection,
+        action=action,
+    )
+    assert applied["strategy"] == "original"
+    assert applied["presentation_mode"] == "source_hold"
+    assert applied["zoom_intent"] == "none"
+    assert applied["camera_intent"] == "hold"
+    assert applied["target_description"] is None
+    assert applied["source_camera_motion_role"] == "editorially_useful"
 
 
 def test_feature_brief_can_disable_titles_and_choose_primary_center_crop() -> None:

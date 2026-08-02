@@ -36,7 +36,7 @@ from .event_lock import (
 )
 from .geometry import native_yxyx_to_canonical_xyxy
 from .identity_checkpoints import IdentityCheckpointModelDecision
-from .media import sha256_file
+from .media import probe_video, sha256_file
 from .music import MusicMapLock
 from .music_cues import SemanticMusicPairingProposal, VisualSyncMap
 from .presentation import (
@@ -2274,6 +2274,7 @@ class GeminiLabClient:
             str, Mapping[str, Mapping[str, Any]]
         ]
         | None = None,
+        motion_recovery_reel_path: Path | None = None,
     ) -> BoundedGroupedSemanticNegotiationResult:
         """Make one whole-sequence choice for every deferred beat.
 
@@ -2611,11 +2612,50 @@ class GeminiLabClient:
             write_json(run_dir / "grouped_semantic_negotiation.json", result)
             return result
 
+        motion_recovery_video_input: list[dict[str, Any]] = []
+        motion_recovery_duration_ms = 0
+        if motion_recovery_reel_path is not None:
+            reel_path = motion_recovery_reel_path.expanduser().resolve(strict=True)
+            reel_sha256 = sha256_file(reel_path)
+            reel_media = probe_video(reel_path)
+            if reel_media.sha256 != reel_sha256:
+                raise ValueError(
+                    "motion recovery reel probe/source SHA mismatch"
+                )
+            uploaded, file_api_reused = self.ensure_video_upload(
+                reel_path,
+                run_dir
+                / "motion-recovery-reel-file-cache"
+                / reel_sha256
+                / "upload",
+            )
+            motion_recovery_duration_ms = reel_media.duration_ms
+            motion_recovery_video_input.append(
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "media_resolution": "low",
+                }
+            )
+            write_json(
+                run_dir / "motion-recovery-reel.binding.json",
+                {
+                    "contract_version": "grouped-motion-recovery-reel-v1",
+                    "reel_path": str(reel_path),
+                    "reel_sha256": reel_sha256,
+                    "reel_duration_ms": reel_media.duration_ms,
+                    "media_resolution": "low",
+                    "file_api_reused": file_api_reused,
+                    "bound_at": utc_now(),
+                },
+            )
         request_record: dict[str, Any] = {
             "model": self.model_id,
             "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
             "store": True,
             "input": [
+                *motion_recovery_video_input,
                 {
                     "type": "text",
                     "text": (
@@ -2677,6 +2717,8 @@ class GeminiLabClient:
         estimate = estimate_paid_call(
             stage="semantic_negotiation",
             model_id=self.model_id,
+            media_duration_ms=motion_recovery_duration_ms,
+            media_resolution="low",
             text_input_tokens=text_tokens,
             max_output_tokens=(
                 policy.gemini_limits.semantic_negotiation.max_output_tokens

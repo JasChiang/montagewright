@@ -84,6 +84,19 @@ def test_source_motion_binding_changes_with_sampling_contract(
     assert source_motion_estimator_binding_sha256() != original
 
 
+def test_source_motion_binding_includes_batch_decoder_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = source_motion_estimator_binding_sha256()
+    monkeypatch.setattr(
+        presentation_module,
+        "_SOURCE_MOTION_DECODER_V1",
+        "bounded-batch-source-pts-test",
+    )
+
+    assert source_motion_estimator_binding_sha256() != original
+
+
 def test_paid_stage_request_bindings_include_model_and_policy() -> None:
     first = GeminiLabClient(
         api_key="test-only",
@@ -454,6 +467,47 @@ def test_existing_source_pan_suppresses_synthetic_camera_motion() -> None:
     assert decision.movement_motivation == "none"
 
 
+def test_source_camera_motion_uses_one_bounded_batch_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_pan_video(tmp_path / "source-pan-batch.mp4")
+    media = probe_video(source)
+    original = presentation_module.extract_frames_bounded
+    calls: list[dict[str, Any]] = []
+
+    def record_batch(*args: Any, **kwargs: Any):
+        calls.append(
+            {
+                "requested_times_ms": tuple(args[1]),
+                "window_start_ms": kwargs["window_start_ms"],
+                "window_end_ms": kwargs["window_end_ms"],
+            }
+        )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        presentation_module,
+        "extract_frames_bounded",
+        record_batch,
+    )
+
+    evidence = measure_source_camera_motion(
+        source_path=source,
+        source_asset_id=media.asset_id,
+        window_start_ms=0,
+        window_end_ms=2_000,
+        subject_tracks=(),
+        output_dir=tmp_path / "motion-batch",
+    )
+
+    assert evidence.reliable is True
+    assert len(calls) == 1
+    assert calls[0]["window_start_ms"] == 0
+    assert calls[0]["window_end_ms"] == 2_000
+    assert len(calls[0]["requested_times_ms"]) >= 8
+
+
 def test_source_camera_pan_is_measured_from_background_geometry(
     tmp_path: Path,
 ) -> None:
@@ -605,15 +659,15 @@ def test_source_motion_reuses_and_supplements_sparse_sam_analysis_frames(
 
     from jascue_video_lab import presentation
 
-    original_extract_frame = presentation.extract_frame
-    decode_times: list[int] = []
+    original_extract_frames_bounded = presentation.extract_frames_bounded
+    decode_batches: list[tuple[int, ...]] = []
 
     def record_decode(*args: Any, **kwargs: Any):
-        decode_times.append(int(args[1]))
-        return original_extract_frame(*args, **kwargs)
+        decode_batches.append(tuple(int(value) for value in args[1]))
+        return original_extract_frames_bounded(*args, **kwargs)
 
     monkeypatch.setattr(
-        "jascue_video_lab.presentation.extract_frame",
+        "jascue_video_lab.presentation.extract_frames_bounded",
         record_decode,
     )
     evidence = measure_source_camera_motion(
@@ -627,8 +681,14 @@ def test_source_motion_reuses_and_supplements_sparse_sam_analysis_frames(
 
     assert evidence.reliable is True
     assert evidence.classification == "static"
-    assert decode_times
-    assert len(decode_times) < len(evidence.sample_frame_pts)
+    assert len(decode_batches) == 1
+    requested_grid = presentation_module._source_motion_sample_times(
+        0,
+        2_000,
+        sample_count=8,
+    )
+    assert len(decode_batches[0]) < len(requested_grid)
+    assert 0 not in decode_batches[0]
     assert evidence.sampling_version == "hybrid-edge-dense-bounded-gap-v2"
     assert evidence.actual_max_sample_gap_ms is not None
     assert (
@@ -653,7 +713,9 @@ def test_edge_dense_sampling_preserves_short_opening_jolt(
     )
 
     assert evidence.contract_version == "source-camera-motion-evidence-v2"
-    assert evidence.estimator_version == "background-gftt-lk-ransac-affine-v2"
+    assert evidence.estimator_version == (
+        "background-gftt-lk-ransac-affine-batch-v3"
+    )
     assert evidence.sampling_version == "hybrid-edge-dense-bounded-gap-v2"
     assert evidence.head_sample_coverage_ms is not None
     assert evidence.head_sample_coverage_ms <= 100

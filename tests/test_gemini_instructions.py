@@ -463,6 +463,7 @@ def test_grouped_semantic_reuse_ids_must_exactly_match_supplied_authority() -> N
 
 def test_grouped_semantic_resume_repairs_invalid_raw_once_without_full_prompt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_dir = tmp_path / "grouped"
     run_dir.mkdir()
@@ -492,6 +493,15 @@ def test_grouped_semantic_resume_repairs_invalid_raw_once_without_full_prompt(
             )
         ]
     )
+    upload_attempts: list[Path] = []
+    monkeypatch.setattr(
+        client,
+        "ensure_video_upload",
+        lambda path, *_args: (
+            upload_attempts.append(path),
+            (_ for _ in ()).throw(AssertionError("resume must not upload media")),
+        )[1],
+    )
 
     result = client.negotiate_grouped_edit_decisions(
         option_ids_by_beat={"fold": ("fold--option-a",)},
@@ -503,6 +513,9 @@ def test_grouped_semantic_resume_repairs_invalid_raw_once_without_full_prompt(
         run_dir=run_dir,
         recovery_call=True,
         retained_reuse_authority_by_option=_retained_grouped_reuse_authority(),
+        # The raw interaction exists, so even a nonexistent reel must never
+        # be opened/uploaded during the text-only repair path.
+        motion_recovery_reel_path=tmp_path / "must-not-be-read.mp4",
     )
 
     assert result.interaction_ids == ("original", "repair")
@@ -533,6 +546,59 @@ def test_grouped_semantic_resume_repairs_invalid_raw_once_without_full_prompt(
     )
     assert audit["repair_limit"] == 1
     assert audit["original_request_redispatched"] is False
+    assert upload_attempts == []
+
+
+def test_grouped_semantic_motion_recovery_reel_uses_low_file_input_and_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reel = tmp_path / "motion-recovery.mp4"
+    reel.write_bytes(b"bounded-low-resolution-reel")
+    client, requests = _grouped_client_with_responses(
+        [
+            _grouped_interaction(
+                "motion-recovery",
+                function_name="propose_grouped_edit_decisions",
+                arguments=_complete_grouped_no_reuse_arguments(),
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        gemini_module,
+        "probe_video",
+        lambda path: SimpleNamespace(
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            duration_ms=900,
+        ),
+    )
+    uploads: list[tuple[Path, Path]] = []
+
+    def ensure(path: Path, cache: Path):
+        uploads.append((path, cache))
+        return SimpleNamespace(uri="files/motion-recovery", mime_type="video/mp4"), True
+
+    monkeypatch.setattr(client, "ensure_video_upload", ensure)
+    client.negotiate_grouped_edit_decisions(
+        option_ids_by_beat={"fold": ("fold--option-a",)},
+        allowed_reuse_of_beat_ids_by_option={
+            "fold": {"fold--option-a": ()}
+        },
+        prompt="bounded action IDs only",
+        policy=_grouped_semantic_policy(),
+        run_dir=tmp_path / "grouped",
+        motion_recovery_reel_path=reel,
+    )
+
+    assert uploads and uploads[0][0] == reel.resolve()
+    assert "motion-recovery-reel-file-cache" in str(uploads[0][1])
+    video = requests[0]["input"][0]
+    assert video == {
+        "type": "video",
+        "uri": "files/motion-recovery",
+        "mime_type": "video/mp4",
+        "media_resolution": "low",
+    }
 
 
 def test_grouped_semantic_resume_canonicalizes_saved_retained_reuse_restatement(

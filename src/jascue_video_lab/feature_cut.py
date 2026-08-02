@@ -1410,16 +1410,41 @@ def _maskless_source_motion_preflight(
         subject_tracks=(),
         output_dir=output_dir,
     )
-    if evidence.reliable and (
-        evidence.isolated_jolt_count > 0
-        or evidence.dirty_head
-        or evidence.dirty_tail
+    _validate_maskless_source_motion_evidence(evidence)
+    return evidence
+
+
+def _validate_maskless_source_motion_evidence(
+    evidence: SourceCameraMotionEvidence | Mapping[str, Any],
+) -> None:
+    """Apply the maskless defect gate to an already measured artifact.
+
+    Horizontal primary preflight already asks
+    ``_prepare_horizontal_runtime_candidate`` for a maskless source-motion
+    measurement.  Re-running the estimator under a second audit directory
+    used to decode every sample twice even though both passes had an empty
+    subject-track set.  Keep this validator separate so the renderer and the
+    primary preflight share the exact dirty-edge/jolt rule without duplicating
+    measurement work.
+    """
+
+    if isinstance(evidence, Mapping):
+        reliable = bool(evidence.get("reliable", False))
+        isolated_jolt_count = int(evidence.get("isolated_jolt_count", 0))
+        dirty_head = bool(evidence.get("dirty_head", False))
+        dirty_tail = bool(evidence.get("dirty_tail", False))
+    else:
+        reliable = evidence.reliable
+        isolated_jolt_count = evidence.isolated_jolt_count
+        dirty_head = evidence.dirty_head
+        dirty_tail = evidence.dirty_tail
+    if reliable and (
+        isolated_jolt_count > 0 or dirty_head or dirty_tail
     ):
         raise CandidateKnownInfeasible(
             "maskless source-motion preflight found an unresolved dirty "
             "edge or isolated camera jolt"
         )
-    return evidence
 
 
 _EXTERNAL_PROJECTION_CONTRACTS = {
@@ -15383,6 +15408,500 @@ def _horizontal_replan_candidate_bindings(
     }
 
 
+def _horizontal_motion_preservation_action_id(
+    *,
+    beat_id: str,
+    candidate_id: str,
+    candidate_execution_sha256: str,
+    source_asset_id: str,
+    source_in_ms: int,
+    source_out_ms: int,
+    source_motion_evidence_sha256: str,
+) -> str:
+    """Return an opaque, finite authority ID for preserving observed motion."""
+
+    digest = _stable_fingerprint(
+        {
+            "contract_version": "horizontal-motion-preservation-action-v1",
+            "beat_id": beat_id,
+            "candidate_id": candidate_id,
+            "candidate_execution_sha256": candidate_execution_sha256,
+            "source_asset_id": source_asset_id,
+            "source_in_ms": source_in_ms,
+            "source_out_ms": source_out_ms,
+            "source_motion_evidence_sha256": source_motion_evidence_sha256,
+        }
+    )
+    return f"{beat_id}--retain-observed-motion--{digest[:20]}"
+
+
+def _horizontal_motion_preservation_is_eligible(
+    *,
+    evidence: SourceCameraMotionEvidence,
+    failure_reason: str,
+) -> bool:
+    """Allow only a clean, measured semantic role collision to retain motion."""
+
+    semantic_mismatch_markers = (
+        "needs a Gemini source_camera_motion_role",
+        "marked horizontal source-camera motion static",
+        "marked measured horizontal source-camera motion incidental",
+    )
+    if not any(marker in failure_reason for marker in semantic_mismatch_markers):
+        return False
+    return bool(
+        evidence.reliable
+        and evidence.sampling_complete
+        and evidence.classification not in {"static", "unreliable"}
+        and not evidence.dirty_head
+        and not evidence.dirty_tail
+        and evidence.isolated_jolt_count == 0
+        and evidence.reversal_count <= 1
+    )
+
+
+def _build_horizontal_motion_preservation_action(
+    *,
+    selection: CandidateRouteSelection,
+    option: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+    failure_reason: str,
+    output_dir: Path,
+) -> dict[str, Any] | None:
+    """Bind the only semantic override to exact photographed motion evidence.
+
+    This deliberately does not alter source time, crop, or candidate.  Its
+    separate action ID authorizes just one runtime handling change: preserve a
+    clean observed move as source-hold with no synthetic camera motion.
+    """
+
+    raw_evidence = prepared.get("geometry", {}).get(
+        "source_camera_motion_evidence"
+    )
+    if not isinstance(raw_evidence, Mapping):
+        return None
+    evidence = SourceCameraMotionEvidence.model_validate(raw_evidence)
+    if not _horizontal_motion_preservation_is_eligible(
+        evidence=evidence,
+        failure_reason=failure_reason,
+    ):
+        return None
+    execution_sha256 = selection.candidate_execution_sha256
+    start_ms = selection.source_in_ms
+    end_ms = selection.source_out_ms
+    if not (
+        isinstance(execution_sha256, str)
+        and isinstance(start_ms, int)
+        and isinstance(end_ms, int)
+        and start_ms < end_ms
+        and selection.source_asset_id == evidence.source_asset_id
+        and evidence.window_start_ms == start_ms
+        and evidence.window_end_ms == end_ms
+    ):
+        raise FeatureCutSystemFailure(
+            "motion-preservation action has no matching immutable execution "
+            "window"
+        )
+    clip = prepared.get("clip")
+    if not isinstance(clip, RushClip):
+        raise FeatureCutSystemFailure(
+            "motion-preservation action has no immutable source clip"
+        )
+    if f"sha256:{clip.sha256}" != selection.source_asset_id:
+        raise FeatureCutSystemFailure(
+            "motion-preservation action source clip differs from route binding"
+        )
+    trim = prepared.get("trim")
+    if not isinstance(trim, Mapping):
+        raise FeatureCutSystemFailure(
+            "motion-preservation action has no immutable trim evidence"
+        )
+    exact_interval = _exact_render_source_interval(
+        source_path=Path(clip.path),
+        source_sha256=clip.sha256,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        trim=trim,
+        output_dir=(
+            output_dir
+            / "horizontal-motion-preservation"
+            / selection.beat_id
+            / selection.candidate_id
+            / execution_sha256
+            / "exact-source-interval"
+        ),
+    )
+    exact_binding = {
+        key: exact_interval[key]
+        for key in (
+            "source_sha256",
+            "start_pts",
+            "end_pts_exclusive",
+            "start_frame_sha256",
+            "end_exclusive_frame_sha256",
+            "source_time_base",
+        )
+    }
+    evidence_sha256 = evidence.definition_sha256
+    action_id = _horizontal_motion_preservation_action_id(
+        beat_id=selection.beat_id,
+        candidate_id=selection.candidate_id,
+        candidate_execution_sha256=execution_sha256,
+        source_asset_id=selection.source_asset_id,
+        source_in_ms=start_ms,
+        source_out_ms=end_ms,
+        source_motion_evidence_sha256=evidence_sha256,
+    )
+    return {
+        "contract_version": "horizontal-motion-preservation-action-v1",
+        "action_id": action_id,
+        "action": "retain_primary_preserve_observed_motion",
+        "beat_id": selection.beat_id,
+        "candidate_id": selection.candidate_id,
+        "candidate_execution_sha256": execution_sha256,
+        "source_asset_id": selection.source_asset_id,
+        "source_clip_id": selection.source_clip_id,
+        "source_in_ms": start_ms,
+        "source_out_ms": end_ms,
+        "source_motion_evidence_sha256": evidence_sha256,
+        "source_motion_sample_frame_pts": list(evidence.sample_frame_pts),
+        "source_motion_sample_frame_hashes": list(evidence.sample_frame_hashes),
+        "source_motion_classification": evidence.classification,
+        "source_motion_reversal_count": evidence.reversal_count,
+        "effective_source_camera_motion_role": "editorially_useful",
+        "runtime_handling": "preserve_as_observed_no_synthetic_motion",
+        "exact_source_interval": exact_binding,
+        "reel_source_path": str(Path(clip.path).expanduser().resolve()),
+        "reel_source_sha256": clip.sha256,
+    }
+
+
+def _validate_horizontal_motion_preservation_action(
+    action: Mapping[str, Any],
+    *,
+    selection: CandidateRouteSelection,
+) -> None:
+    """Reject an action unless it is the route's exact selected execution."""
+
+    required = (
+        "action_id",
+        "candidate_execution_sha256",
+        "source_asset_id",
+        "source_in_ms",
+        "source_out_ms",
+        "source_motion_evidence_sha256",
+        "exact_source_interval",
+    )
+    if any(
+        action.get(field) is None or action.get(field) == ""
+        for field in required
+    ) or not (
+        action.get("contract_version")
+        == "horizontal-motion-preservation-action-v1"
+        and action.get("action")
+        == "retain_primary_preserve_observed_motion"
+        and action.get("runtime_handling")
+        == "preserve_as_observed_no_synthetic_motion"
+        and action.get("effective_source_camera_motion_role")
+        == "editorially_useful"
+        and action.get("beat_id") == selection.beat_id
+        and action.get("candidate_id") == selection.candidate_id
+        and action.get("candidate_execution_sha256")
+        == selection.candidate_execution_sha256
+        and action.get("source_asset_id") == selection.source_asset_id
+        and action.get("source_clip_id") == selection.source_clip_id
+        and action.get("source_in_ms") == selection.source_in_ms
+        and action.get("source_out_ms") == selection.source_out_ms
+    ):
+        raise FeatureCutSystemFailure(
+            "motion-preservation action differs from the selected immutable "
+            "horizontal execution"
+        )
+    exact_interval = action.get("exact_source_interval")
+    exact_fields = (
+        "source_sha256",
+        "start_pts",
+        "end_pts_exclusive",
+        "start_frame_sha256",
+        "end_exclusive_frame_sha256",
+        "source_time_base",
+    )
+    if not isinstance(exact_interval, Mapping) or any(
+        exact_interval.get(field) is None or exact_interval.get(field) == ""
+        for field in exact_fields
+    ):
+        raise FeatureCutSystemFailure(
+            "motion-preservation action has incomplete exact PTS/frame evidence"
+        )
+    expected_action_id = _horizontal_motion_preservation_action_id(
+        beat_id=selection.beat_id,
+        candidate_id=selection.candidate_id,
+        candidate_execution_sha256=str(selection.candidate_execution_sha256),
+        source_asset_id=selection.source_asset_id,
+        source_in_ms=(
+            int(selection.source_in_ms)
+            if isinstance(selection.source_in_ms, int)
+            else -1
+        ),
+        source_out_ms=(
+            int(selection.source_out_ms)
+            if isinstance(selection.source_out_ms, int)
+            else -1
+        ),
+        source_motion_evidence_sha256=str(
+            action.get("source_motion_evidence_sha256")
+        ),
+    )
+    if action.get("action_id") != expected_action_id:
+        raise FeatureCutSystemFailure(
+            "motion-preservation action ID is not derived from its immutable "
+            "execution/evidence binding"
+        )
+
+
+def _apply_horizontal_motion_preservation_authority(
+    option: Mapping[str, Any],
+    *,
+    selection: CandidateRouteSelection,
+    action: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply the narrowly-scoped runtime handling authorised by an action.
+
+    The action deliberately leaves the candidate and its time binding alone.
+    It only makes the observed source move editorially useful and prevents the
+    horizontal compiler from adding a virtual camera move on top of it.
+    """
+
+    _validate_horizontal_motion_preservation_action(action, selection=selection)
+    applied = dict(option)
+    applied.update(
+        {
+            "strategy": "original",
+            "presentation_mode": "source_hold",
+            "zoom_intent": "none",
+            "camera_intent": "hold",
+            "target_description": None,
+            "source_camera_motion_role": "editorially_useful",
+            "source_camera_motion_reason": (
+                "Gemini selected the immutable retain-observed-motion action"
+            ),
+            "_horizontal_motion_preservation_action": dict(action),
+        }
+    )
+    return applied
+
+
+def _validate_horizontal_motion_preservation_runtime_evidence(
+    *,
+    action: Mapping[str, Any],
+    selection: CandidateRouteSelection,
+    evidence: SourceCameraMotionEvidence,
+) -> None:
+    """Keep the recovery authority bound to the exact preflight measurement."""
+
+    _validate_horizontal_motion_preservation_action(action, selection=selection)
+    if not _horizontal_motion_preservation_is_eligible(
+        evidence=evidence,
+        # The action is already permitted only for one of the semantic role
+        # contradictions; preserving it at runtime must still reject dirty or
+        # incomplete/newly-unreliable measurements.
+        failure_reason="needs a Gemini source_camera_motion_role",
+    ):
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority is no longer eligible for the "
+            "measured source motion"
+        )
+    if not (
+        action.get("source_motion_evidence_sha256")
+        == evidence.definition_sha256
+        and action.get("source_motion_sample_frame_pts")
+        == list(evidence.sample_frame_pts)
+        and action.get("source_motion_sample_frame_hashes")
+        == list(evidence.sample_frame_hashes)
+        and action.get("source_motion_classification") == evidence.classification
+        and action.get("source_motion_reversal_count") == evidence.reversal_count
+        and action.get("source_asset_id") == evidence.source_asset_id
+        and action.get("source_in_ms") == evidence.window_start_ms
+        and action.get("source_out_ms") == evidence.window_end_ms
+    ):
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority differs from runtime source-motion "
+            "evidence"
+        )
+
+
+def _validate_horizontal_motion_preservation_render_interval(
+    action: Mapping[str, Any],
+    *,
+    selection: CandidateRouteSelection,
+    source_interval: Mapping[str, Any],
+) -> None:
+    """Verify decoded PTS/frame hashes before the protected segment renders."""
+
+    _validate_horizontal_motion_preservation_action(action, selection=selection)
+    exact = action.get("exact_source_interval")
+    if not isinstance(exact, Mapping):
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority has no exact source interval"
+        )
+    fields = (
+        "source_sha256",
+        "start_pts",
+        "end_pts_exclusive",
+        "start_frame_sha256",
+        "end_exclusive_frame_sha256",
+        "source_time_base",
+    )
+    if any(exact.get(field) != source_interval.get(field) for field in fields):
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority exact PTS/frame hashes differ from "
+            "the runtime render interval"
+        )
+
+
+def _build_horizontal_motion_recovery_reel(
+    actions: Sequence[Mapping[str, Any]],
+    *,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Build one bounded low-resolution, slate-labelled recovery reel.
+
+    The reel is review evidence only.  Selection authority remains the opaque
+    action ID in the finite option set; no frame or candidate identity is ever
+    recovered from Gemini's video response.
+    """
+
+    ordered = tuple(
+        sorted(
+            (dict(action) for action in actions),
+            key=lambda action: (str(action["beat_id"]), str(action["action_id"])),
+        )
+    )
+    if not ordered:
+        raise FeatureCutSystemFailure("motion recovery reel requires an action")
+    reel_root = output_dir / "motion-recovery-reel"
+    reel_path = reel_root / "motion-recovery-reel.mp4"
+    binding_path = reel_root / "motion-recovery-reel.json"
+    identity = {
+        "contract_version": "horizontal-motion-recovery-reel-v1",
+        "action_ids": [str(action["action_id"]) for action in ordered],
+        "actions": [
+            {
+                "action_id": action["action_id"],
+                "beat_id": action["beat_id"],
+                "candidate_id": action["candidate_id"],
+                "source_asset_id": action["source_asset_id"],
+                "source_in_ms": action["source_in_ms"],
+                "source_out_ms": action["source_out_ms"],
+                "reel_source_sha256": action["reel_source_sha256"],
+            }
+            for action in ordered
+        ],
+        "resolution": [640, 360],
+        "fps": 12,
+        "slate_duration_ms": 750,
+        "sequential_concat": True,
+    }
+    if binding_path.is_file() and reel_path.is_file():
+        saved = read_json(binding_path)
+        if isinstance(saved, Mapping) and {
+            key: saved.get(key) for key in identity
+        } == identity:
+            if saved.get("reel_sha256") == sha256_file(reel_path):
+                return {**identity, "reel_path": str(reel_path), "reel_sha256": saved["reel_sha256"], "reel_duration_ms": saved.get("reel_duration_ms")}
+        raise FeatureCutSystemFailure(
+            "motion recovery reel artifact differs from its immutable actions"
+        )
+    if binding_path.is_file() or reel_path.exists():
+        raise FeatureCutSystemFailure(
+            "motion recovery reel artifact is only partially persisted"
+        )
+    reel_root.mkdir(parents=True, exist_ok=True)
+    inputs: list[Path] = []
+    for index, action in enumerate(ordered):
+        source = Path(str(action["reel_source_path"])).expanduser().resolve(
+            strict=True
+        )
+        if sha256_file(source) != action["reel_source_sha256"]:
+            raise FeatureCutSystemFailure(
+                "motion recovery reel source bytes differ from action binding"
+            )
+        slate_path = reel_root / f"{index:02d}-action-slate.png"
+        slate = Image.new("RGB", (640, 360), (10, 14, 20))
+        draw = ImageDraw.Draw(slate)
+        draw.rectangle((0, 0, 12, 360), fill=(29, 196, 96))
+        title = "MOTION RECOVERY ACTION"
+        draw.text((38, 46), title, font=_font(28), fill="white")
+        lines = (
+            f"Beat: {action['beat_id']}",
+            f"Action: {action['action_id']}",
+            "Handling: preserve observed source motion",
+            "No synthetic camera motion",
+        )
+        y = 105
+        for line in lines:
+            for wrapped in _wrap_text(draw, line, _font(20), 555):
+                draw.text((38, y), wrapped, font=_font(20), fill=(220, 231, 225))
+                y += 31
+        slate.save(slate_path)
+        burnin_path = reel_root / f"{index:02d}-action-burnin.png"
+        burnin = Image.new("RGBA", (640, 360), (0, 0, 0, 0))
+        burnin_draw = ImageDraw.Draw(burnin)
+        burnin_draw.rectangle((0, 314, 640, 360), fill=(0, 0, 0, 196))
+        burnin_label = f"{action['beat_id']}  |  {action['action_id']}"
+        burnin_draw.text(
+            (16, 326),
+            burnin_label,
+            font=_font(15),
+            fill=(255, 255, 255, 255),
+        )
+        burnin.save(burnin_path)
+        slate_video = reel_root / f"{index:02d}-slate.mp4"
+        source_video = reel_root / f"{index:02d}-source.mp4"
+        _run_segment_encoder(
+            [
+                "ffmpeg", "-y", "-loop", "1", "-i", str(slate_path),
+                "-t", "0.75", "-r", "12", "-an", "-c:v", "h264_videotoolbox",
+                "-pix_fmt", "yuv420p", str(slate_video),
+            ]
+        )
+        _run_segment_encoder(
+            [
+                "ffmpeg", "-y", "-ss", f"{int(action['source_in_ms']) / 1000:.3f}",
+                "-i", str(source), "-loop", "1", "-i", str(burnin_path),
+                "-t", f"{(int(action['source_out_ms']) - int(action['source_in_ms'])) / 1000:.3f}",
+                "-filter_complex", (
+                    "[0:v]fps=12,scale=640:360:force_original_aspect_ratio="
+                    "decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2:black[base];"
+                    "[1:v]format=rgba[burnin];[base][burnin]overlay=0:0"
+                ),
+                "-an", "-c:v", "h264_videotoolbox", "-pix_fmt", "yuv420p", str(source_video),
+            ]
+        )
+        inputs.extend((slate_video, source_video))
+    command = ["ffmpeg", "-y"]
+    for path in inputs:
+        command.extend(("-i", str(path)))
+    stream_inputs = "".join(f"[{index}:v]" for index in range(len(inputs)))
+    command.extend(
+        (
+            "-filter_complex", f"{stream_inputs}concat=n={len(inputs)}:v=1:a=0[v]",
+            "-map", "[v]", "-r", "12", "-an", "-c:v", "h264_videotoolbox",
+            "-pix_fmt", "yuv420p", str(reel_path),
+        )
+    )
+    _run_segment_encoder(command)
+    media = probe_video(reel_path)
+    binding = {
+        **identity,
+        "reel_path": str(reel_path),
+        "reel_sha256": sha256_file(reel_path),
+        "reel_duration_ms": media.duration_ms,
+    }
+    write_json(binding_path, binding)
+    return binding
+
+
 def _persist_preflight_horizontal_local_infeasibility_replan(
     *,
     route: CandidateRouteResult,
@@ -15423,6 +15942,7 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
     }
     affected_beats: list[dict[str, Any]] = []
     option_ids_by_beat: dict[str, tuple[str, ...]] = {}
+    motion_actions_by_option: dict[str, dict[str, Any]] = {}
     for beat_id, failures in sorted(failures_by_beat.items()):
         selected = selections_by_beat.get(beat_id)
         frontier_row = frontier_by_beat.get(beat_id)
@@ -15436,11 +15956,34 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             raise FeatureCutSystemFailure(
                 "horizontal semantic replan frontier has no candidate bindings"
             )
-        eligible_ids = tuple(
+        alternate_ids = tuple(
             f"{beat_id}--{candidate_id}"
             for candidate_id in candidate_bindings
             if candidate_id != selected.candidate_id
         )
+        actions = {
+            str(row["motion_preservation_action"]["action_id"]): dict(
+                row["motion_preservation_action"]
+            )
+            for row in failures
+            if isinstance(row.get("motion_preservation_action"), Mapping)
+        }
+        if len(actions) > 1:
+            raise FeatureCutSystemFailure(
+                "horizontal preflight has conflicting motion-preservation "
+                "actions for one beat"
+            )
+        for action_id, action in actions.items():
+            _validate_horizontal_motion_preservation_action(
+                action,
+                selection=selected,
+            )
+            if action_id in motion_actions_by_option:
+                raise FeatureCutSystemFailure(
+                    "horizontal motion-preservation action ID is duplicated"
+                )
+            motion_actions_by_option[action_id] = action
+        eligible_ids = alternate_ids + tuple(actions)
         if not eligible_ids:
             failure_root = context_path.parent
             write_json(
@@ -15467,6 +16010,7 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
                 **dict(frontier_row),
                 "failure_facts": [dict(row) for row in failures],
                 "eligible_option_ids": list(eligible_ids),
+                "motion_preservation_actions": list(actions.values()),
             }
         )
         option_ids_by_beat[beat_id] = eligible_ids
@@ -15477,6 +16021,7 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             affected_beats=affected_beats,
             whole_timeline=whole_timeline,
             option_ids_by_beat=option_ids_by_beat,
+            motion_preservation_actions_by_option=motion_actions_by_option,
         )
     )
     retained_reuse_authority_by_option = (
@@ -15484,8 +16029,19 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             affected_beats=affected_beats,
             option_ids_by_beat=option_ids_by_beat,
             policy=policy,
+            motion_preservation_actions_by_option=motion_actions_by_option,
         )
     )
+    if motion_actions_by_option:
+        # A context-only resume must reuse this exact locally-built file.  It
+        # never regenerates or reuploads media while replaying the same
+        # grouped request.
+        reel_binding = _build_horizontal_motion_recovery_reel(
+            tuple(motion_actions_by_option.values()),
+            output_dir=context_path.parent,
+        )
+    else:
+        reel_binding = None
     context = {
         "contract_version": "preflight-horizontal-local-infeasibility-replan-v1",
         "policy_reference": policy.policy_reference,
@@ -15497,6 +16053,7 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
         },
         "whole_resolved_timeline": whole_timeline,
         "reuse_conflict_facts": reuse_conflict_facts,
+        "motion_recovery_reel": reel_binding,
         "music_context": {
             "supplied": music_supplied,
             "output_cues": [
@@ -15507,7 +16064,11 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             ],
         },
         "rules": {
-            "may_change": ["affected_candidate", "explicit_source_reuse_authority"],
+            "may_change": [
+                "affected_candidate",
+                "retain_primary_preserve_observed_motion",
+                "explicit_source_reuse_authority",
+            ],
             "must_preserve": [
                 "brief_order",
                 "immutable_candidate_binding",
@@ -15519,6 +16080,7 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
                 "invented_source_media",
                 "invented_timestamp",
                 "additional_replan_after_cap",
+                "synthetic_motion_on_preserved_source_motion",
             ],
         },
     }
@@ -15574,10 +16136,12 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             "[protocol=preflight-horizontal-local-infeasibility-replan-v1] "
             "Every listed selected 16:9 execution failed a typed, persisted "
             "fulfillment, timing, exact-event, source-motion, SAM, or geometry "
-            "gate. Choose exactly one supplied immutable alternate per affected "
-            "beat using the whole timeline and music context. This is the single "
-            "scoped recovery decision; do not select failed primaries, invent "
-            "media/time, or request a local fallback.\n\n"
+            "gate. Choose exactly one supplied immutable option per affected "
+            "beat using the whole timeline and music context. A "
+            "retain_primary_preserve_observed_motion option is an opaque action "
+            "ID, not a candidate fallback: it keeps the already bound primary "
+            "and permits source-hold only. This is the single scoped recovery "
+            "decision; do not invent media/time or request a local fallback.\n\n"
             + json.dumps(context, ensure_ascii=False)
         ),
         policy=policy,
@@ -15585,6 +16149,11 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
         recovery_call=True,
         allowed_reuse_of_beat_ids_by_option=allowed_reuse_ids_by_option,
         retained_reuse_authority_by_option=retained_reuse_authority_by_option,
+        motion_recovery_reel_path=(
+            Path(str(reel_binding["reel_path"]))
+            if reel_binding is not None
+            else None
+        ),
     )
     decisions = _validate_persisted_grouped_replan_decisions(
         [decision.model_dump(mode="json") for decision in result.decision.decisions],
@@ -15693,15 +16262,39 @@ def _restore_preflight_horizontal_local_replan(
         raise FeatureCutSystemFailure(
             "horizontal preflight semantic replan option IDs are malformed"
         )
+    motion_actions_by_option: dict[str, Mapping[str, Any]] = {}
+    for row in raw_affected:
+        if not isinstance(row, Mapping):
+            raise FeatureCutSystemFailure(
+                "horizontal preflight semantic replan affected beat is malformed"
+            )
+        for raw_action in row.get("motion_preservation_actions", ()):
+            if not isinstance(raw_action, Mapping):
+                raise FeatureCutSystemFailure(
+                    "horizontal motion-preservation action is malformed"
+                )
+            action_id = str(raw_action.get("action_id") or "")
+            if not action_id or action_id in motion_actions_by_option:
+                raise FeatureCutSystemFailure(
+                    "horizontal motion-preservation action IDs are malformed"
+                )
+            motion_actions_by_option[action_id] = raw_action
     reuse_facts, allowed_reuse_ids_by_option = _grouped_replan_reuse_conflict_facts(
         affected_beats=raw_affected,
         whole_timeline=context.get("whole_resolved_timeline", ()),
         option_ids_by_beat=option_ids_by_beat,
+        motion_preservation_actions_by_option=motion_actions_by_option,
     )
     if reuse_facts != context.get("reuse_conflict_facts"):
         raise FeatureCutSystemFailure(
             "horizontal preflight semantic replan reuse facts changed"
         )
+    _grouped_replan_retained_reuse_authority_by_option(
+        affected_beats=raw_affected,
+        option_ids_by_beat=option_ids_by_beat,
+        policy=policy,
+        motion_preservation_actions_by_option=motion_actions_by_option,
+    )
     decisions = _validate_persisted_grouped_replan_decisions(
         decision_payload.get("decisions"),
         option_ids_by_beat=option_ids_by_beat,
@@ -15710,6 +16303,7 @@ def _restore_preflight_horizontal_local_replan(
     )
     current_bindings = _horizontal_replan_candidate_bindings(route)
     selected_candidate_ids: dict[str, str] = {}
+    selected_motion_actions: dict[str, Mapping[str, Any]] = {}
     reuse_authorities: dict[str, SemanticReplanReuseAuthority] = {}
     affected_by_id = {
         str(row.get("beat_id")): row
@@ -15719,6 +16313,26 @@ def _restore_preflight_horizontal_local_replan(
     for decision in decisions:
         beat_id = str(decision["beat_id"])
         option_id = str(decision["selected_option_id"])
+        action = motion_actions_by_option.get(option_id)
+        if action is not None:
+            current_selection = next(
+                (selection for selection in route.selections if selection.beat_id == beat_id),
+                None,
+            )
+            if current_selection is None:
+                raise FeatureCutSystemFailure(
+                    "motion-preservation action has no current route selection"
+                )
+            _validate_horizontal_motion_preservation_action(
+                action,
+                selection=current_selection,
+            )
+            if decision.get("source_reuse_mode") != "none":
+                raise FeatureCutSystemFailure(
+                    "motion-preservation action cannot authorize source reuse"
+                )
+            selected_motion_actions[beat_id] = action
+            continue
         candidate_id = option_id.removeprefix(beat_id + "--")
         saved = affected_by_id.get(beat_id)
         saved_bindings = saved.get("candidate_bindings") if saved else None
@@ -15746,39 +16360,150 @@ def _restore_preflight_horizontal_local_replan(
                 reuse_justification=decision.get("source_reuse_justification"),
                 reuse_of_beat_ids=tuple(decision.get("reuse_of_beat_ids") or ()),
             )
-    try:
-        rebuilt = rebuild_route_with_semantic_authorities(
-            route,
-            selected_candidate_ids_by_beat=selected_candidate_ids,
-            reuse_authorities_by_beat=reuse_authorities,
-            minimum_duration_ms=(
-                1
-                if policy.execution_profile == "autonomous_best_effort"
-                else policy.duration.min_ms
-            ),
-            maximum_duration_ms=policy.duration.max_ms,
-            max_panel_runtime_fraction=policy.presentation.max_panel_runtime_fraction,
-            target_duration_ms=round(sum(chapter_durations.values()) * 1000),
-            max_editorial_reprise_overlap_fraction=(
-                policy.editorial.max_editorial_reprise_overlap_fraction
-            ),
-        )
-    except ValueError as error:
-        raise FeatureCutSystemFailure(
-            "horizontal preflight selected alternate cannot rebuild a complete route"
-        ) from error
+    if selected_candidate_ids:
+        try:
+            rebuilt = rebuild_route_with_semantic_authorities(
+                route,
+                selected_candidate_ids_by_beat=selected_candidate_ids,
+                reuse_authorities_by_beat=reuse_authorities,
+                minimum_duration_ms=(
+                    1
+                    if policy.execution_profile == "autonomous_best_effort"
+                    else policy.duration.min_ms
+                ),
+                maximum_duration_ms=policy.duration.max_ms,
+                max_panel_runtime_fraction=policy.presentation.max_panel_runtime_fraction,
+                target_duration_ms=round(sum(chapter_durations.values()) * 1000),
+                max_editorial_reprise_overlap_fraction=(
+                    policy.editorial.max_editorial_reprise_overlap_fraction
+                ),
+            )
+        except ValueError as error:
+            raise FeatureCutSystemFailure(
+                "horizontal preflight selected alternate cannot rebuild a complete route"
+            ) from error
+        rebuilt_selections = rebuilt.selections
+        rebuilt_routes: tuple[CandidateCompleteRoute, ...] = (rebuilt,)
+    else:
+        rebuilt_selections = route.selections
+        rebuilt_routes = route.ranked_routes
     all_bindings = _horizontal_replan_candidate_bindings(route)
     fallback_ids = dict(route.fallback_candidate_ids_by_beat)
     for beat_id, candidate_id in selected_candidate_ids.items():
         fallback_ids[beat_id] = (candidate_id,)
+    for beat_id in selected_motion_actions:
+        selected = next(
+            selection for selection in route.selections if selection.beat_id == beat_id
+        )
+        fallback_ids[beat_id] = (selected.candidate_id,)
     return route.model_copy(
         update={
-            "selections": rebuilt.selections,
-            "ranked_routes": (rebuilt,),
+            "selections": rebuilt_selections,
+            "ranked_routes": rebuilt_routes,
             "fallback_candidate_ids_by_beat": fallback_ids,
             "option_bindings_by_beat": all_bindings,
         }
     )
+
+
+def _load_horizontal_motion_preservation_authorities(
+    *,
+    route: CandidateRouteResult,
+    editorial_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    """Load only the action IDs selected by the persisted grouped decision."""
+
+    context_path, decision_path = _horizontal_preflight_local_infeasibility_replan_paths(
+        editorial_dir
+    )
+    if not context_path.is_file() and not decision_path.is_file():
+        return {}
+    # Context is durably written before the provider decision.  A crash in
+    # that interval is a pending journal-resume state, not partial authority:
+    # no motion action may apply yet, and the persistence owner will reuse the
+    # same immutable context/run directory.  A decision without its context is
+    # still irrecoverably unbound and must fail closed.
+    if context_path.is_file() and not decision_path.is_file():
+        return {}
+    if decision_path.is_file() and not context_path.is_file():
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority is only partially persisted"
+        )
+    context = read_json(context_path)
+    decision_payload = read_json(decision_path)
+    if not isinstance(context, Mapping) or not isinstance(decision_payload, Mapping):
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority artifacts are malformed"
+        )
+    if (
+        context.get("contract_version")
+        != "preflight-horizontal-local-infeasibility-replan-v1"
+        or decision_payload.get("context_sha256") != sha256_file(context_path)
+    ):
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority context binding is invalid"
+        )
+    actions_by_id: dict[str, Mapping[str, Any]] = {}
+    raw_affected = context.get("affected_beats")
+    if not isinstance(raw_affected, list):
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority has no affected beats"
+        )
+    for row in raw_affected:
+        if not isinstance(row, Mapping):
+            raise FeatureCutSystemFailure(
+                "motion-preservation authority affected beat is malformed"
+            )
+        for action in row.get("motion_preservation_actions", ()):
+            if not isinstance(action, Mapping):
+                raise FeatureCutSystemFailure(
+                    "motion-preservation authority action is malformed"
+                )
+            action_id = str(action.get("action_id") or "")
+            if not action_id or action_id in actions_by_id:
+                raise FeatureCutSystemFailure(
+                    "motion-preservation authority action IDs are ambiguous"
+                )
+            actions_by_id[action_id] = action
+    reel = context.get("motion_recovery_reel")
+    if actions_by_id:
+        if not isinstance(reel, Mapping):
+            raise FeatureCutSystemFailure(
+                "motion-preservation authority has no bound recovery reel"
+            )
+        reel_path = Path(str(reel.get("reel_path") or "")).expanduser()
+        if not reel_path.is_file() or reel.get("reel_sha256") != sha256_file(reel_path):
+            raise FeatureCutSystemFailure(
+                "motion-preservation recovery reel bytes differ from context"
+            )
+        if set(reel.get("action_ids") or ()) != set(actions_by_id):
+            raise FeatureCutSystemFailure(
+                "motion-preservation recovery reel action set differs from context"
+            )
+    decisions = decision_payload.get("decisions")
+    if not isinstance(decisions, list):
+        raise FeatureCutSystemFailure(
+            "motion-preservation authority has no grouped decisions"
+        )
+    selections = {selection.beat_id: selection for selection in route.selections}
+    selected: dict[str, dict[str, Any]] = {}
+    for decision in decisions:
+        if not isinstance(decision, Mapping):
+            raise FeatureCutSystemFailure(
+                "motion-preservation grouped decision is malformed"
+            )
+        action = actions_by_id.get(str(decision.get("selected_option_id") or ""))
+        if action is None:
+            continue
+        beat_id = str(decision.get("beat_id") or "")
+        selection = selections.get(beat_id)
+        if selection is None or decision.get("source_reuse_mode") != "none":
+            raise FeatureCutSystemFailure(
+                "motion-preservation action has invalid route/reuse authority"
+            )
+        _validate_horizontal_motion_preservation_action(action, selection=selection)
+        selected[beat_id] = dict(action)
+    return selected
 
 
 def _prepared_replan_execution_option_id(
@@ -15884,6 +16609,8 @@ def _grouped_replan_reuse_conflict_facts(
     affected_beats: Sequence[Mapping[str, Any]],
     whole_timeline: Sequence[Any],
     option_ids_by_beat: Mapping[str, Sequence[str]],
+    motion_preservation_actions_by_option: Mapping[str, Mapping[str, Any]]
+    | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     dict[str, dict[str, tuple[str, ...]]],
@@ -15947,6 +16674,7 @@ def _grouped_replan_reuse_conflict_facts(
             }
         return {"kind": "interval_not_available_before_execution"}
 
+    motion_actions = dict(motion_preservation_actions_by_option or {})
     affected_by_id: dict[str, Mapping[str, Any]] = {}
     options_by_beat: dict[
         str,
@@ -15981,6 +16709,11 @@ def _grouped_replan_reuse_conflict_facts(
                 raise FeatureCutSystemFailure(
                     "grouped semantic replan option ID has the wrong beat prefix"
                 )
+            action = motion_actions.get(option_id)
+            if action is not None and str(action.get("beat_id") or "") != beat_id:
+                raise FeatureCutSystemFailure(
+                    "motion-preservation action option has the wrong beat binding"
+                )
             prepared_execution = prepared_options_by_id.get(option_id)
             if prepared_options_by_id and prepared_execution is None:
                 raise FeatureCutSystemFailure(
@@ -15990,7 +16723,11 @@ def _grouped_replan_reuse_conflict_facts(
             candidate_id = (
                 prepared_execution.candidate_id
                 if prepared_execution is not None
-                else option_id.removeprefix(prefix)
+                else (
+                    str(action.get("candidate_id") or "")
+                    if action is not None
+                    else option_id.removeprefix(prefix)
+                )
             )
             option = candidate_bindings.get(candidate_id)
             if not isinstance(option, Mapping):
@@ -16040,6 +16777,7 @@ def _grouped_replan_reuse_conflict_facts(
     for beat_id, options in options_by_beat.items():
         allowed_by_beat_and_option[beat_id] = {}
         for option_id, option, prepared_execution in options:
+            action = motion_actions.get(option_id)
             identity = source_identity(
                 prepared_execution.model_dump(mode="json")
                 if prepared_execution is not None
@@ -16051,7 +16789,7 @@ def _grouped_replan_reuse_conflict_facts(
             )
             requires_new_authority = (
                 "source_reuse_authority_missing" in required_codes
-            )
+            ) and action is None
             guaranteed_shared_rows = list(unaffected_by_source.get(identity, ()))
             guaranteed_shared_ids = {
                 str(row["beat_id"]) for row in guaranteed_shared_rows
@@ -16106,6 +16844,15 @@ def _grouped_replan_reuse_conflict_facts(
                     "beat_id": beat_id,
                     "option_id": option_id,
                     "candidate_id": str(option.get("candidate_id") or ""),
+                    **(
+                        {
+                            "recovery_action": (
+                                "retain_primary_preserve_observed_motion"
+                            )
+                        }
+                        if action is not None
+                        else {}
+                    ),
                     "source_identity": {
                         "kind": identity[0],
                         "value": identity[1],
@@ -16139,6 +16886,8 @@ def _grouped_replan_retained_reuse_authority_by_option(
     affected_beats: Sequence[Mapping[str, Any]],
     option_ids_by_beat: Mapping[str, Sequence[str]],
     policy: AutonomousEditPolicy,
+    motion_preservation_actions_by_option: Mapping[str, Mapping[str, Any]]
+    | None = None,
 ) -> dict[str, dict[str, dict[str, str]]]:
     """Project only immutable candidate reuse authority for a grouped call.
 
@@ -16161,6 +16910,7 @@ def _grouped_replan_retained_reuse_authority_by_option(
             "grouped retained reuse authority does not cover affected beats"
         )
 
+    motion_actions = dict(motion_preservation_actions_by_option or {})
     retained_by_beat_and_option: dict[str, dict[str, dict[str, str]]] = {}
     for beat_id, option_ids in option_ids_by_beat.items():
         row = affected_by_id[beat_id]
@@ -16178,6 +16928,21 @@ def _grouped_replan_retained_reuse_authority_by_option(
                     "grouped retained reuse authority option ID has the wrong "
                     "beat prefix"
                 )
+            action = motion_actions.get(option_id)
+            if action is not None:
+                if (
+                    str(action.get("beat_id") or "") != beat_id
+                    or action.get("action")
+                    != "retain_primary_preserve_observed_motion"
+                ):
+                    raise FeatureCutSystemFailure(
+                        "grouped retained reuse authority has an invalid "
+                        "motion-preservation action"
+                    )
+                # This action is a distinct no-reuse recovery authority. It
+                # cannot inherit or mint source reuse while preserving the
+                # exact selected source interval.
+                continue
             prepared_execution = prepared_options_by_id.get(option_id)
             if prepared_options_by_id and prepared_execution is None:
                 raise FeatureCutSystemFailure(
@@ -18718,6 +19483,20 @@ def _prepare_horizontal_runtime_candidate(
         "requires_gemini_review": False,
     }
     filter_graph = _horizontal_original_filter()
+    motion_preservation_action = option.get(
+        "_horizontal_motion_preservation_action"
+    )
+    if motion_preservation_action is not None and not isinstance(
+        motion_preservation_action, Mapping
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal motion-preservation runtime authority is malformed"
+        )
+    if motion_preservation_action is not None and bound_execution is None:
+        raise FeatureCutSystemFailure(
+            "horizontal motion-preservation runtime authority has no exact "
+            "complete-route execution binding"
+        )
     debug: Path | None = None
     track_fingerprint: str | None = None
     source_motion_tracks: list[SegmentationTrack] = []
@@ -18762,6 +19541,18 @@ def _prepare_horizontal_runtime_candidate(
             )
             geometry["source_camera_motion_role"] = source_motion_role
             geometry["source_camera_motion_reason"] = source_motion_reason
+            if motion_preservation_action is not None:
+                _validate_horizontal_motion_preservation_runtime_evidence(
+                    action=motion_preservation_action,
+                    selection=bound_execution,
+                    evidence=source_motion_evidence,
+                )
+                # The override is intentionally source hold, never a second
+                # synthetic zoom/pan layered over the photographed movement.
+                filter_graph = _horizontal_original_filter()
+                geometry["motion_preservation_authority"] = dict(
+                    motion_preservation_action
+                )
             if fail_on_quality_human_review:
                 _validate_horizontal_source_camera_motion_declaration(
                     role=source_motion_role,
@@ -18893,6 +19684,16 @@ def _prepare_horizontal_runtime_candidate(
         )
         geometry["source_camera_motion_role"] = source_motion_role
         geometry["source_camera_motion_reason"] = source_motion_reason
+        if motion_preservation_action is not None:
+            _validate_horizontal_motion_preservation_runtime_evidence(
+                action=motion_preservation_action,
+                selection=bound_execution,
+                evidence=source_motion_evidence,
+            )
+            filter_graph = _horizontal_original_filter()
+            geometry["motion_preservation_authority"] = dict(
+                motion_preservation_action
+            )
         if fail_on_quality_human_review:
             _validate_horizontal_source_camera_motion_declaration(
                 role=source_motion_role,
@@ -18944,6 +19745,7 @@ def _preflight_horizontal_route_primaries(
     candidate_evidence_events: Mapping[
         tuple[str, str], Mapping[str, Any]
     ] | None = None,
+    motion_preservation_authorities: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Measure every selected 16:9 primary before admitting any render.
 
@@ -18989,7 +19791,15 @@ def _preflight_horizontal_route_primaries(
             sequence_bindings=route.option_bindings_by_beat.get(beat_id, {}),
             execution_bindings={selection.candidate_id: selection},
         )[0]
+        action = (motion_preservation_authorities or {}).get(beat_id)
+        if action is not None:
+            option = _apply_horizontal_motion_preservation_authority(
+                option,
+                selection=selection,
+                action=action,
+            )
         prepared: dict[str, Any] | None = None
+        motion_preservation_action: dict[str, Any] | None = None
         try:
             _select_runtime_candidate_fulfillments(
                 tuple(
@@ -19034,34 +19844,46 @@ def _preflight_horizontal_route_primaries(
             # used by the renderer. Run it here so every authorized initial
             # primary has completed all zero-paid source-motion checks before
             # any exact-event or SAM request can be dispatched.
-            maskless_motion = _maskless_source_motion_preflight(
-                source_path=Path(prepared["clip"].path),
-                source_asset_id=prepared["media"].asset_id,
-                window_start_ms=int(prepared["start_ms"]),
-                window_end_ms=int(prepared["end_ms"]),
-                output_dir=(
-                    output_dir
-                    / "candidate-preflight"
-                    / beat_id
-                    / str(option.get("candidate_id") or "candidate")
-                    / "source-camera-motion"
-                ),
+            measured_payload = prepared["geometry"].get(
+                "source_camera_motion_evidence"
             )
-            prepared["geometry"]["maskless_source_camera_motion"] = (
-                maskless_motion.model_dump(mode="json")
+            if not isinstance(measured_payload, Mapping):
+                raise FeatureCutSystemFailure(
+                    "horizontal primary preflight did not persist "
+                    "source-motion evidence"
+                )
+            _validate_maskless_source_motion_evidence(measured_payload)
+            # One immutable maskless evidence artifact owns both the defect
+            # and semantic-role gates.  Retain an explicit audit projection,
+            # but never decode the same source window into a second directory.
+            prepared["geometry"]["maskless_source_camera_motion"] = dict(
+                measured_payload
             )
             if strict:
-                measured = prepared["geometry"].get(
-                    "source_camera_motion_evidence"
-                )
-                if not isinstance(measured, Mapping):
-                    raise FeatureCutSystemFailure(
-                        "horizontal primary preflight did not persist source-motion evidence"
+                try:
+                    _validate_horizontal_source_camera_motion_declaration(
+                        role=str(
+                            option.get("source_camera_motion_role", "unknown")
+                        ),
+                        evidence=SourceCameraMotionEvidence.model_validate(
+                            measured_payload
+                        ),
                     )
-                _validate_horizontal_source_camera_motion_declaration(
-                    role=str(option.get("source_camera_motion_role", "unknown")),
-                    evidence=SourceCameraMotionEvidence.model_validate(measured),
-                )
+                except CandidateKnownInfeasible as error:
+                    # Only a clean, complete semantic role collision gets an
+                    # opaque preserve-motion action. Dirty edge, jolt,
+                    # reversal, and unreliable samples remain hard failures
+                    # which Gemini can solve only by choosing an alternate.
+                    motion_preservation_action = (
+                        _build_horizontal_motion_preservation_action(
+                            selection=selection,
+                            option=option,
+                            prepared=prepared,
+                            failure_reason=str(error),
+                            output_dir=output_dir,
+                        )
+                    )
+                    raise
         except CandidateKnownInfeasible as error:
             geometry = prepared.get("geometry", {}) if prepared is not None else {}
             failure = {
@@ -19088,6 +19910,13 @@ def _preflight_horizontal_route_primaries(
                 ),
                 "source_camera_motion_evidence_sha256": geometry.get(
                     "source_camera_motion_evidence_sha256"
+                ),
+                **(
+                    {
+                        "motion_preservation_action": motion_preservation_action
+                    }
+                    if motion_preservation_action is not None
+                    else {}
                 ),
             }
             failures.setdefault(beat_id, []).append(failure)
@@ -25765,6 +26594,14 @@ def _run_feature_cut_experiment_impl(
             )
             if restored_horizontal_replan is not None:
                 pre_render_horizontal_candidate_route = restored_horizontal_replan
+        horizontal_motion_preservation_authorities: dict[str, dict[str, Any]] = (
+            _load_horizontal_motion_preservation_authorities(
+                route=pre_render_horizontal_candidate_route,
+                editorial_dir=editorial_dir,
+            )
+            if pre_render_horizontal_candidate_route is not None
+            else {}
+        )
         pre_render_horizontal_candidate_route_path = (
             editorial_dir / "pre-render-horizontal-candidate-route.json"
         )
@@ -26078,6 +26915,9 @@ def _run_feature_cut_experiment_impl(
                 ),
                 editorial_contracts=editorial_templates,
                 candidate_evidence_events=candidate_evidence_events,
+                motion_preservation_authorities=(
+                    horizontal_motion_preservation_authorities
+                ),
             )
             if horizontal_primary_failures:
                 _persist_preflight_horizontal_local_infeasibility_replan(
@@ -29807,6 +30647,34 @@ def _run_feature_cut_experiment_impl(
                         # alternate.  Never turn the normal renderer into a
                         # local recovery loop over Top-K.
                         horizontal_options = horizontal_options[:1]
+                    motion_preservation_action = (
+                        horizontal_motion_preservation_authorities.get(
+                            selected.feature_id
+                        )
+                    )
+                    if motion_preservation_action is not None:
+                        if len(horizontal_options) != 1:
+                            raise FeatureCutSystemFailure(
+                                "motion-preservation runtime authority must bind "
+                                "exactly one horizontal execution"
+                            )
+                        binding = (
+                            pre_render_horizontal_execution_bindings_by_feature
+                            .get(selected.feature_id, {})
+                            .get(str(horizontal_options[0].get("candidate_id")))
+                        )
+                        if binding is None:
+                            raise FeatureCutSystemFailure(
+                                "motion-preservation runtime authority has no "
+                                "candidate execution binding"
+                            )
+                        horizontal_options = [
+                            _apply_horizontal_motion_preservation_authority(
+                                horizontal_options[0],
+                                selection=binding,
+                                action=motion_preservation_action,
+                            )
+                        ]
                     for horizontal_option in horizontal_options:
                         horizontal_runtime_stage = "fulfillment"
                         candidate_window: dict[str, Any] | None = None
@@ -30265,6 +31133,18 @@ def _run_feature_cut_experiment_impl(
                         "pre_render_sequence_binding": (
                             horizontal_selected_option or {}
                         ).get("_pre_render_sequence_binding"),
+                        "motion_preservation_action_id": (
+                            (horizontal_selected_option or {}).get(
+                                "_horizontal_motion_preservation_action", {}
+                            ).get("action_id")
+                            if isinstance(
+                                (horizontal_selected_option or {}).get(
+                                    "_horizontal_motion_preservation_action"
+                                ),
+                                Mapping,
+                            )
+                            else None
+                        ),
                         "attempts": horizontal_candidate_attempts,
                     }
                     contextual_fallback_possible = any(
@@ -30293,6 +31173,29 @@ def _run_feature_cut_experiment_impl(
                             / "16x9"
                         ),
                     )
+                    motion_action = horizontal_selected_option.get(
+                        "_horizontal_motion_preservation_action"
+                    )
+                    if motion_action is not None:
+                        if not isinstance(motion_action, Mapping):
+                            raise FeatureCutSystemFailure(
+                                "horizontal motion-preservation action is malformed"
+                            )
+                        execution = (
+                            pre_render_horizontal_execution_bindings_by_feature
+                            .get(selected.feature_id, {})
+                            .get(str(horizontal_selected_option.get("candidate_id")))
+                        )
+                        if execution is None:
+                            raise FeatureCutSystemFailure(
+                                "horizontal motion-preservation action has no "
+                                "execution to validate at render"
+                            )
+                        _validate_horizontal_motion_preservation_render_interval(
+                            motion_action,
+                            selection=execution,
+                            source_interval=horizontal_source_interval,
+                        )
                     horizontal_segment_fingerprint = _segment_variant_fingerprint(
                         source_sha256=horizontal_clip.sha256,
                         start_ms=h_start,

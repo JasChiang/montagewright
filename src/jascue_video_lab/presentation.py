@@ -19,7 +19,7 @@ from pydantic import Field, model_validator
 from .autonomous_policy import AutonomousEditPolicy
 from .editing_capabilities import autonomous_capability_registry_v2
 from .event_lock import ExactEventLockV2
-from .media import extract_frame
+from .media import extract_frames_bounded
 from .models import (
     ExtractedFrame,
     FrozenStrictModel,
@@ -55,6 +55,8 @@ PresentationCapability = Literal[
 
 _SOURCE_MOTION_ESTIMATOR_V1 = "background-gftt-lk-ransac-affine-v1"
 _SOURCE_MOTION_ESTIMATOR_V2 = "background-gftt-lk-ransac-affine-v2"
+_SOURCE_MOTION_ESTIMATOR_V3 = "background-gftt-lk-ransac-affine-batch-v3"
+_SOURCE_MOTION_DECODER_V1 = "bounded-batch-source-pts-v1"
 _SOURCE_MOTION_SAMPLING_V1 = "legacy-uniform-or-sam-v1"
 _SOURCE_MOTION_SAMPLING_V2 = "hybrid-edge-dense-bounded-gap-v2"
 _SOURCE_MOTION_MAX_SAMPLE_GAP_MS = 250
@@ -67,7 +69,8 @@ def source_motion_estimator_binding_sha256() -> str:
     """Fingerprint every implementation constant that changes motion evidence."""
 
     payload = {
-        "estimator": _SOURCE_MOTION_ESTIMATOR_V2,
+        "estimator": _SOURCE_MOTION_ESTIMATOR_V3,
+        "decoder": _SOURCE_MOTION_DECODER_V1,
         "sampling": _SOURCE_MOTION_SAMPLING_V2,
         "maximum_sample_gap_ms": _SOURCE_MOTION_MAX_SAMPLE_GAP_MS,
         "edge_dense_window_ms": _SOURCE_MOTION_EDGE_DENSE_WINDOW_MS,
@@ -773,6 +776,7 @@ class SourceCameraMotionEvidence(FrozenStrictModel):
     estimator_version: Literal[
         "background-gftt-lk-ransac-affine-v1",
         "background-gftt-lk-ransac-affine-v2",
+        "background-gftt-lk-ransac-affine-batch-v3",
     ] = _SOURCE_MOTION_ESTIMATOR_V1
     sampling_version: Literal[
         "legacy-uniform-or-sam-v1",
@@ -2339,7 +2343,8 @@ def measure_source_camera_motion(
     track_facts = _source_motion_track_facts(subject_tracks)
     cache_key = _canonical_payload_sha(
         {
-            "estimator_version": _SOURCE_MOTION_ESTIMATOR_V2,
+            "estimator_version": _SOURCE_MOTION_ESTIMATOR_V3,
+            "decoder_version": _SOURCE_MOTION_DECODER_V1,
             "sampling_version": _SOURCE_MOTION_SAMPLING_V2,
             "requested_max_sample_gap_ms": (
                 _SOURCE_MOTION_MAX_SAMPLE_GAP_MS
@@ -2415,21 +2420,38 @@ def measure_source_camera_motion(
             frame.frame_time_ms
             for frame in extracted_frames
         }
-        for index, requested_ms in enumerate(requested_times):
+        missing_requested_times = []
+        for requested_ms in requested_times:
             if any(
                 abs(requested_ms - reusable_ms)
                 <= _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS // 2
                 for reusable_ms in reusable_times
             ):
                 continue
-            extracted = extract_frame(
+            missing_requested_times.append(requested_ms)
+        if missing_requested_times:
+            decoded = extract_frames_bounded(
                 resolved_source,
-                requested_ms,
-                artifact_dir / "frames" / f"frame-{index:03d}.jpg",
+                missing_requested_times,
+                artifact_dir / "frames",
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
                 max_width=max_width,
             )
-            extracted_frames.append(extracted)
-            reusable_times.add(extracted.frame_time_ms)
+            # Preserve the legacy sequential alias collapse exactly. A prior
+            # request can resolve to a decoded frame close enough to satisfy a
+            # later semantic request even though their requested times were
+            # farther apart. Batch decoding must not turn that later request
+            # into an additional motion pair.
+            for extracted in decoded:
+                if any(
+                    abs(extracted.requested_time_ms - reusable_ms)
+                    <= _SOURCE_MOTION_EDGE_SAMPLE_STEP_MS // 2
+                    for reusable_ms in reusable_times
+                ):
+                    continue
+                extracted_frames.append(extracted)
+                reusable_times.add(extracted.frame_time_ms)
     except Exception as error:
         evidence = _unreliable_source_motion_evidence(
             source_asset_id=source_asset_id,
@@ -2702,7 +2724,7 @@ def measure_source_camera_motion(
     )
     evidence = SourceCameraMotionEvidence(
         contract_version="source-camera-motion-evidence-v2",
-        estimator_version=_SOURCE_MOTION_ESTIMATOR_V2,
+        estimator_version=_SOURCE_MOTION_ESTIMATOR_V3,
         sampling_version=_SOURCE_MOTION_SAMPLING_V2,
         requested_max_sample_gap_ms=_SOURCE_MOTION_MAX_SAMPLE_GAP_MS,
         actual_max_sample_gap_ms=actual_max_sample_gap_ms,
@@ -3424,7 +3446,7 @@ def _unreliable_source_motion_evidence(
     )
     return SourceCameraMotionEvidence(
         contract_version="source-camera-motion-evidence-v2",
-        estimator_version=_SOURCE_MOTION_ESTIMATOR_V2,
+        estimator_version=_SOURCE_MOTION_ESTIMATOR_V3,
         sampling_version=_SOURCE_MOTION_SAMPLING_V2,
         requested_max_sample_gap_ms=_SOURCE_MOTION_MAX_SAMPLE_GAP_MS,
         actual_max_sample_gap_ms=(
