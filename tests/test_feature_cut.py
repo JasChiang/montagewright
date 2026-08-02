@@ -43,6 +43,38 @@ from scripts.plan_clip_card_open_edit import (
     project_feature_contracts,
 )
 
+
+def test_structured_schema_accepts_only_safe_optional_successor_fields() -> None:
+    saved = {
+        "type": "object",
+        "description": "aspect-specific historical description",
+        "properties": {
+            "rank": {"type": "integer"},
+            "role": {"type": "string"},
+        },
+        "required": ["rank", "role"],
+    }
+    current = {
+        "type": "object",
+        "description": "generic current description",
+        "properties": {
+            "rank": {"type": "integer"},
+            "role": {"type": "string"},
+            "execution_status": {"type": "string", "default": "executable"},
+        },
+        "required": ["rank"],
+    }
+
+    assert feature_cut_module._structured_schema_is_backward_compatible(
+        saved, current
+    )
+
+    unsafe = json.loads(json.dumps(current))
+    unsafe["required"].append("execution_status")
+    assert not feature_cut_module._structured_schema_is_backward_compatible(
+        saved, unsafe
+    )
+
 from jascue_video_lab.feature_cut import (
     _chapter_bounds_with_approved_trim,
     _audit_feature_plan_candidate_recall,

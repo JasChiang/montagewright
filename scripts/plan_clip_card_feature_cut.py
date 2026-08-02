@@ -643,16 +643,20 @@ class ClipCardFeatureCandidateV3(StrictModel):
             raise ValueError(
                 "classified source-camera motion requires an observable reason"
             )
-        if self.horizontal_strategy == "tracked_reframe":
-            if self.horizontal_zoom_intent == "none" or not self.horizontal_focus_entity_id:
-                raise ValueError("tracked_reframe requires a focus entity and zoom intent")
-        elif self.horizontal_zoom_intent != "none" or self.horizontal_focus_entity_id:
-            raise ValueError("original horizontal strategy cannot declare a focus entity or zoom")
-        if (
-            self.horizontal_strategy == "original"
-            and self.horizontal_camera_intent != "hold"
-        ):
-            raise ValueError("original horizontal candidate must hold the camera")
+        # An aspect-specific shadow or a fail-closed Gemini candidate is kept
+        # for provenance but must not be forced through executable horizontal
+        # geometry validation.  Routing filters it by horizontal_authorized.
+        if self.horizontal_authorized:
+            if self.horizontal_strategy == "tracked_reframe":
+                if self.horizontal_zoom_intent == "none" or not self.horizontal_focus_entity_id:
+                    raise ValueError("tracked_reframe requires a focus entity and zoom intent")
+            elif self.horizontal_zoom_intent != "none" or self.horizontal_focus_entity_id:
+                raise ValueError("original horizontal strategy cannot declare a focus entity or zoom")
+            if (
+                self.horizontal_strategy == "original"
+                and self.horizontal_camera_intent != "hold"
+            ):
+                raise ValueError("original horizontal candidate must hold the camera")
         if self.vertical_strategy == "tracked_crop" and not self.required_entity_ids:
             raise ValueError("tracked_crop requires at least one required entity")
         if self.allow_controlled_clip and self.vertical_crop_mode != "primary_center":
@@ -849,6 +853,8 @@ class DirectVideoHorizontalDecision(StrictModel):
         "editorial_reprise",
     ] = "none"
     source_reuse_justification: str | None = None
+    execution_status: Literal["executable", "unusable"] = "executable"
+    execution_risks: list[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def validate_horizontal(self) -> "DirectVideoHorizontalDecision":
@@ -871,6 +877,10 @@ class DirectVideoHorizontalDecision(StrictModel):
             raise ValueError(
                 "classified source-camera motion requires an observable reason"
             )
+        if self.execution_status == "unusable":
+            if not self.execution_risks:
+                raise ValueError("unusable horizontal decision requires a typed risk")
+            return self
         if self.strategy == "original":
             if (
                 self.zoom_intent != "none"
@@ -2132,11 +2142,94 @@ def canonicalize_direct_video_edit_plan_output(
             candidate_decisions.append(("horizontal", primary_horizontal))
         horizontal_alternates = chapter.get("horizontal_alternates")
         if isinstance(horizontal_alternates, list):
+            for alternate_index, alternate in enumerate(horizontal_alternates):
+                if not isinstance(alternate, dict):
+                    continue
+                incomplete_tracked_reframe = (
+                    alternate.get("strategy") == "tracked_reframe"
+                    and (
+                        alternate.get("zoom_intent") == "none"
+                        or alternate.get("focus_entity_index") is None
+                    )
+                )
+                if not incomplete_tracked_reframe:
+                    continue
+                # Preserve Gemini's candidate verbatim, but fail it closed as
+                # a non-executable route.  It still counts toward bounded
+                # candidate fulfillment and remains auditable; projection
+                # cannot grant it execution authority.  The same conflict on
+                # the primary remains a hard validation error.
+                before = {
+                    "execution_status": alternate.get("execution_status"),
+                    "execution_risks": alternate.get("execution_risks"),
+                }
+                risk = "planner_contract_tracked_reframe_requires_focus_and_zoom"
+                risks = list(alternate.get("execution_risks") or [])
+                if risk not in risks:
+                    risks.append(risk)
+                alternate["execution_status"] = "unusable"
+                alternate["execution_risks"] = risks
+                changes.append(
+                    {
+                        "json_path": (
+                            f"chapters[{chapter_index}].horizontal_alternates"
+                            f"[{alternate_index}].execution_status"
+                        ),
+                        "before": before,
+                        "after": {
+                            "execution_status": "unusable",
+                            "execution_risks": risks,
+                        },
+                        "rule": (
+                            "incomplete_optional_horizontal_reframe_is_"
+                            "preserved_but_unauthorized"
+                        ),
+                    }
+                )
             candidate_decisions.extend(
                 (f"horizontal_alternates[{alternate_index}]", alternate)
                 for alternate_index, alternate in enumerate(horizontal_alternates)
                 if isinstance(alternate, dict)
             )
+        # Gemini occasionally mirrors vertical-only list fields into a
+        # horizontal decision even though the aspect-specific response schema
+        # forbids them.  Empty lists carry no editorial information, so they
+        # may be removed as a representation-only normalization.  A non-empty
+        # value is deliberately preserved and will fail typed validation; we
+        # must never discard entity or attention instructions silently.
+        horizontal_decisions: list[tuple[str, dict[str, Any]]] = []
+        if isinstance(primary_horizontal, dict):
+            horizontal_decisions.append(("horizontal", primary_horizontal))
+        if isinstance(horizontal_alternates, list):
+            horizontal_decisions.extend(
+                (f"horizontal_alternates[{alternate_index}]", alternate)
+                for alternate_index, alternate in enumerate(horizontal_alternates)
+                if isinstance(alternate, dict)
+            )
+        for decision_path, decision in horizontal_decisions:
+            for vertical_only_field in (
+                "required_entity_indices",
+                "preferred_entity_indices",
+                "sacrificable_entity_indices",
+                "attention_sequence",
+            ):
+                if decision.get(vertical_only_field) != []:
+                    continue
+                decision.pop(vertical_only_field)
+                changes.append(
+                    {
+                        "json_path": (
+                            f"chapters[{chapter_index}].{decision_path}."
+                            f"{vertical_only_field}"
+                        ),
+                        "before": [],
+                        "after": "<removed>",
+                        "rule": (
+                            "empty_vertical_only_field_removed_from_"
+                            "horizontal_decision"
+                        ),
+                    }
+                )
         primary_vertical = chapter.get("vertical")
         if isinstance(primary_vertical, dict):
             candidate_decisions.append(("vertical", primary_vertical))
@@ -2199,6 +2292,11 @@ def canonicalize_direct_video_edit_plan_output(
                         ),
                     }
                 )
+            # The remaining normalization rules describe vertical crop,
+            # entity-role, attention-phase, panel, and traversal semantics.
+            # Horizontal decisions intentionally have none of those fields.
+            if decision_path.startswith("horizontal"):
+                continue
             if (
                 decision.get("strategy") == "tracked_crop"
                 and decision.get("allow_controlled_clip") is True
@@ -3834,7 +3932,11 @@ def project_direct_video_edit_plan(
                     horizontal_source_reuse_justification=(
                         horizontal_source_reuse_justification
                     ),
-                    horizontal_authorized=("16:9" in requested_aspects),
+                    horizontal_authorized=(
+                        "16:9" in requested_aspects
+                        and horizontal_candidate_decision.execution_status
+                        == "executable"
+                    ),
                     vertical_strategy=vertical_strategy,
                     vertical_authorized=("9:16" in requested_aspects),
                     vertical_crop_mode=vertical_crop_mode,

@@ -1269,6 +1269,167 @@ def test_direct_video_canonicalization_preserves_phase_local_anchors() -> None:
     )
 
 
+def test_direct_video_canonicalization_removes_only_empty_vertical_fields_from_horizontal() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                    "required_entity_indices": [],
+                    "preferred_entity_indices": [],
+                    "sacrificable_entity_indices": [],
+                    "attention_sequence": [],
+                },
+                "horizontal_alternates": [
+                    {
+                        "candidate_rank": 2,
+                        "strategy": "original",
+                        "zoom_intent": "none",
+                        "camera_intent": "hold",
+                        "focus_entity_index": None,
+                        "required_entity_indices": [],
+                        "preferred_entity_indices": [],
+                        "sacrificable_entity_indices": [],
+                        "attention_sequence": [],
+                    }
+                ],
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+
+    for decision in (chapter["horizontal"], *chapter["horizontal_alternates"]):
+        assert "required_entity_indices" not in decision
+        assert "preferred_entity_indices" not in decision
+        assert "sacrificable_entity_indices" not in decision
+        assert "attention_sequence" not in decision
+    assert sum(
+        change["rule"]
+        == "empty_vertical_only_field_removed_from_horizontal_decision"
+        for change in changes
+    ) == 8
+
+
+def test_direct_video_canonicalization_preserves_nonempty_vertical_fields_on_horizontal_to_fail_closed() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                    "required_entity_indices": [1],
+                },
+            }
+        ]
+    }
+
+    canonical, _changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    horizontal = json.loads(canonical)["chapters"][0]["horizontal"]
+
+    assert horizontal["required_entity_indices"] == [1]
+    with pytest.raises(ValidationError, match="required_entity_indices"):
+        DirectVideoChapterDecision.model_validate(json.loads(canonical)["chapters"][0])
+
+
+def test_direct_video_canonicalization_preserves_incomplete_optional_horizontal_reframe_as_unauthorized() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "original",
+                    "zoom_intent": "none",
+                    "camera_intent": "hold",
+                    "focus_entity_index": None,
+                },
+                "horizontal_alternates": [
+                    {
+                        "candidate_rank": 2,
+                        "strategy": "tracked_reframe",
+                        "zoom_intent": "subtle",
+                        "camera_intent": "pull_out",
+                        "focus_entity_index": None,
+                    },
+                    {
+                        "candidate_rank": 3,
+                        "strategy": "tracked_reframe",
+                        "zoom_intent": "detail",
+                        "camera_intent": "push_in",
+                        "focus_entity_index": 1,
+                    },
+                ],
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+
+    assert [
+        alternate["candidate_rank"]
+        for alternate in chapter["horizontal_alternates"]
+    ] == [2, 3]
+    assert chapter["horizontal_alternates"][0]["execution_status"] == "unusable"
+    assert chapter["horizontal_alternates"][0]["execution_risks"] == [
+        "planner_contract_tracked_reframe_requires_focus_and_zoom"
+    ]
+    assert any(
+        change["rule"]
+        == "incomplete_optional_horizontal_reframe_is_preserved_but_unauthorized"
+        for change in changes
+    )
+    DirectVideoHorizontalDecision.model_validate(
+        chapter["horizontal_alternates"][0]
+    )
+    DirectVideoHorizontalDecision.model_validate(
+        chapter["horizontal_alternates"][1]
+    )
+
+
+def test_direct_video_canonicalization_keeps_incomplete_primary_horizontal_reframe_to_fail_closed() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "horizontal": {
+                    "candidate_rank": 1,
+                    "strategy": "tracked_reframe",
+                    "zoom_intent": "subtle",
+                    "camera_intent": "pull_out",
+                    "focus_entity_index": None,
+                },
+            }
+        ]
+    }
+
+    canonical, _changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+
+    with pytest.raises(ValidationError, match="tracked horizontal framing"):
+        DirectVideoHorizontalDecision.model_validate(
+            json.loads(canonical)["chapters"][0]["horizontal"]
+        )
+
+
 def test_direct_video_canonicalization_demotes_unexplained_source_motion() -> None:
     payload = {
         "chapters": [

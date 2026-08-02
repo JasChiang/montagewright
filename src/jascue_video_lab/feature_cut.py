@@ -1518,6 +1518,7 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
         "target": "FeatureEditPlan",
         "module": "scripts.plan_clip_card_feature_cut",
         "source_model": "DirectVideoEditPlan",
+        "canonicalizer": "canonicalize_direct_video_edit_plan_output",
         "source_plan_has_model_provenance": False,
         "projector": "reproject_direct_video_edit_plan",
         "raw_output_role": "source_raw_output",
@@ -1659,7 +1660,13 @@ def _structured_schema_is_backward_compatible(
         elif saved_properties != current_properties:
             return False
         return all(
-            key == "properties"
+            key in {"properties", "description", "title"}
+            or (
+                key == "required"
+                and isinstance(value, list)
+                and isinstance(current[key], list)
+                and set(current[key]).issubset(value)
+            )
             or _structured_schema_is_backward_compatible(value, current[key])
             for key, value in saved.items()
         )
@@ -1694,6 +1701,7 @@ def _validate_external_projection_semantics(
         )
     module_name = contract.get("module")
     source_model_name = contract.get("source_model")
+    canonicalizer_name = contract.get("canonicalizer")
     projector_name = contract.get("projector")
     if not all(
         isinstance(value, str)
@@ -1715,6 +1723,11 @@ def _validate_external_projection_semantics(
     module = importlib.import_module(module_name)
     source_model = getattr(module, source_model_name, None)
     projector = getattr(module, projector_name, None)
+    canonicalizer = (
+        getattr(module, canonicalizer_name, None)
+        if isinstance(canonicalizer_name, str)
+        else None
+    )
     if source_model is None or not callable(projector):
         raise ValueError("external projection registry implementation is unavailable")
     source_plan = source_model.model_validate(read_json(source_plan_path))
@@ -1746,7 +1759,11 @@ def _validate_external_projection_semantics(
         output_text = raw_output.get("output_text") if isinstance(raw_output, dict) else None
         if not isinstance(output_text, str):
             raise ValueError("external projection raw output has no output_text")
-        raw_plan = source_model.model_validate_json(output_text)
+        if canonicalizer is not None:
+            canonical_output, _normalization_changes = canonicalizer(output_text)
+        else:
+            canonical_output = output_text
+        raw_plan = source_model.model_validate_json(canonical_output)
         if contract.get("source_plan_has_model_provenance", True):
             source_interaction_id = source_plan.model_provenance.interaction_id
             normalized_raw_plan = raw_plan.model_copy(
