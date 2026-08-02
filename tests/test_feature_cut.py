@@ -68,6 +68,7 @@ from jascue_video_lab.feature_cut import (
     _editorial_reconstruction_capability_ids,
     _external_projection_binding_can_refresh_locally,
     _grouped_replan_reuse_conflict_facts,
+    _grouped_replan_retained_reuse_authority_by_option,
     _semantic_beat_for_runtime_candidate,
     _bind_runtime_candidate_coverage,
     _audit_render_source_reuse,
@@ -763,6 +764,154 @@ def test_grouped_replan_rejects_ambiguous_joint_reuse_authority() -> None:
                 "opening": ("opening--rank-01", "opening--rank-02"),
             },
         )
+
+
+def test_local_replan_preserves_selected_option_retained_reuse_authority(
+    tmp_path: Path,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    retained_justification = "The immutable candidate already carries this reprise."
+    retained_fold_option = _local_replan_option(
+        "fold",
+        "fold-2",
+        "c",
+        rank=2,
+    ).model_copy(
+        update={
+            "reuse_mode": "editorial_reprise",
+            "reuse_justification": retained_justification,
+        }
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(_local_replan_option("opening", "open", "a", rank=1),),
+            ),
+            CandidateRouteBeat(
+                beat_id="fold",
+                options=(
+                    _local_replan_option("fold", "fold-1", "b", rank=1),
+                    retained_fold_option,
+                ),
+            ),
+            CandidateRouteBeat(
+                beat_id="ending",
+                options=(_local_replan_option("ending", "end", "d", rank=1),),
+            ),
+        )
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["allowed_reuse_of_beat_ids_by_option"] == {
+                "fold": {"fold--fold-2": ()}
+            }
+            assert kwargs["retained_reuse_authority_by_option"] == {
+                "fold": {
+                    "fold--fold-2": {
+                        "mode": "editorial_reprise",
+                        "justification": retained_justification,
+                    }
+                }
+            }
+            return SimpleNamespace(
+                decision=SimpleNamespace(
+                    decisions=(
+                        SimpleNamespace(
+                            model_dump=lambda **_kwargs: {
+                                "beat_id": "fold",
+                                "selected_option_id": "fold--fold-2",
+                                "fallback_option_ids": [],
+                                "semantic_reason": "preserve_readability",
+                                "unresolved_concern_codes": [],
+                                # These typed fields authorize no *new* reuse.
+                                "source_reuse_mode": "none",
+                                "source_reuse_justification": None,
+                                "reuse_of_beat_ids": [],
+                            }
+                        ),
+                    )
+                ),
+                interaction_ids=("retained-authority",),
+            )
+
+    _persist_preflight_local_infeasibility_replan(
+        route=route,
+        local_failures_by_feature={"fold": ({"candidate_id": "fold-1"},)},
+        viable_candidate_ids_by_feature={"fold": ("fold-2",)},
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=False,
+        output_timeline_cues=(),
+    )
+    rebuilt = _selected_preflight_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"opening": 10.0, "fold": 10.0, "ending": 10.0},
+    )
+
+    assert rebuilt is not None
+    fold = next(selection for selection in rebuilt.selections if selection.beat_id == "fold")
+    assert fold.candidate_id == "fold-2"
+    assert fold.reuse_mode == "editorial_reprise"
+    assert fold.reuse_justification == retained_justification
+
+
+def test_grouped_replan_retained_reuse_authority_requires_immutable_binding() -> None:
+    option = _local_replan_option("fold", "rank-02", "a", rank=2).model_copy(
+        update={
+            "reuse_mode": "editorial_reprise",
+            "reuse_justification": "Historical immutable authority.",
+        }
+    )
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+
+    retained = _grouped_replan_retained_reuse_authority_by_option(
+        affected_beats=(
+            {
+                "beat_id": "fold",
+                "candidate_bindings": {"rank-02": option.model_dump(mode="json")},
+            },
+        ),
+        option_ids_by_beat={"fold": ("fold--rank-02",)},
+        policy=policy,
+    )
+
+    assert retained == {
+        "fold": {
+            "fold--rank-02": {
+                "mode": "editorial_reprise",
+                "justification": "Historical immutable authority.",
+            }
+        }
+    }
 
 
 def _complete_route_for_execution_compatibility(

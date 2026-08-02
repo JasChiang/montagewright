@@ -15330,6 +15330,92 @@ def _grouped_replan_reuse_conflict_facts(
     return facts, allowed_by_beat_and_option
 
 
+def _grouped_replan_retained_reuse_authority_by_option(
+    *,
+    affected_beats: Sequence[Mapping[str, Any]],
+    option_ids_by_beat: Mapping[str, Sequence[str]],
+    policy: AutonomousEditPolicy,
+) -> dict[str, dict[str, dict[str, str]]]:
+    """Project only immutable candidate reuse authority for a grouped call.
+
+    ``source_reuse_*`` in a grouped decision represents *new* authority.  A
+    selected candidate can instead already carry a historical Gemini reuse
+    mode and justification.  That authority is bound to the immutable option,
+    not recreated by this replan, so expose it by its exact stable option ID.
+    """
+
+    affected_by_id: dict[str, Mapping[str, Any]] = {}
+    for row in affected_beats:
+        beat_id = str(row.get("beat_id") or "")
+        if not beat_id or beat_id in affected_by_id:
+            raise FeatureCutSystemFailure(
+                "grouped retained reuse authority has duplicate or empty beat IDs"
+            )
+        affected_by_id[beat_id] = row
+    if set(affected_by_id) != set(option_ids_by_beat):
+        raise FeatureCutSystemFailure(
+            "grouped retained reuse authority does not cover affected beats"
+        )
+
+    retained_by_beat_and_option: dict[str, dict[str, dict[str, str]]] = {}
+    for beat_id, option_ids in option_ids_by_beat.items():
+        row = affected_by_id[beat_id]
+        candidate_bindings = row.get("candidate_bindings")
+        if not isinstance(candidate_bindings, Mapping):
+            raise FeatureCutSystemFailure(
+                "grouped retained reuse authority has invalid candidate bindings"
+            )
+        retained_by_beat_and_option[beat_id] = {}
+        prefix = beat_id + "--"
+        for option_id in option_ids:
+            if not option_id.startswith(prefix):
+                raise FeatureCutSystemFailure(
+                    "grouped retained reuse authority option ID has the wrong "
+                    "beat prefix"
+                )
+            candidate_id = option_id.removeprefix(prefix)
+            option = candidate_bindings.get(candidate_id)
+            if (
+                not isinstance(option, Mapping)
+                or str(option.get("candidate_id") or "") != candidate_id
+            ):
+                raise FeatureCutSystemFailure(
+                    "grouped retained reuse authority option does not match its "
+                    "immutable binding"
+                )
+            mode = str(option.get("reuse_mode") or "none")
+            justification = option.get("reuse_justification")
+            required_codes = {
+                str(code) for code in option.get("replan_required_codes", ())
+            }
+            if mode == "none":
+                if justification is not None:
+                    raise FeatureCutSystemFailure(
+                        "immutable no-reuse candidate unexpectedly carries a "
+                        "reuse justification"
+                    )
+                continue
+            if "source_reuse_authority_missing" in required_codes:
+                raise FeatureCutSystemFailure(
+                    "candidate cannot retain reuse authority while also requiring "
+                    "new grouped authority"
+                )
+            if (
+                mode not in policy.editorial.allow_source_reuse
+                or not isinstance(justification, str)
+                or not justification.strip()
+            ):
+                raise FeatureCutSystemFailure(
+                    "immutable candidate has invalid or policy-forbidden retained "
+                    "reuse authority"
+                )
+            retained_by_beat_and_option[beat_id][option_id] = {
+                "mode": mode,
+                "justification": justification,
+            }
+    return retained_by_beat_and_option
+
+
 def _validate_persisted_grouped_replan_decisions(
     decisions: Any,
     *,
@@ -15671,6 +15757,13 @@ def _persist_preflight_local_infeasibility_replan(
             option_ids_by_beat=option_ids_by_beat,
         )
     )
+    retained_reuse_authority_by_option = (
+        _grouped_replan_retained_reuse_authority_by_option(
+            affected_beats=affected,
+            option_ids_by_beat=option_ids_by_beat,
+            policy=policy,
+        )
+    )
     context = {
         "contract_version": "preflight-local-infeasibility-replan-v1",
         "policy_reference": policy.policy_reference,
@@ -15764,6 +15857,9 @@ def _persist_preflight_local_infeasibility_replan(
         run_dir=context_path.parent,
         recovery_call=True,
         allowed_reuse_of_beat_ids_by_option=allowed_reuse_ids_by_option,
+        retained_reuse_authority_by_option=(
+            retained_reuse_authority_by_option
+        ),
     )
     decisions = [decision.model_dump(mode="json") for decision in result.decision.decisions]
     selected_ids_by_beat = {
@@ -22606,6 +22702,13 @@ def _run_feature_cut_experiment_impl(
                         option_ids_by_beat=option_ids_by_beat,
                     )
                 )
+                retained_reuse_authority_by_option = (
+                    _grouped_replan_retained_reuse_authority_by_option(
+                        affected_beats=affected_reuse_beats,
+                        option_ids_by_beat=option_ids_by_beat,
+                        policy=autonomous_policy,
+                    )
+                )
                 context = {
                     "contract_version": "preflight-semantic-reuse-replan-v1",
                     "policy_reference": autonomous_policy.policy_reference,
@@ -22700,6 +22803,9 @@ def _run_feature_cut_experiment_impl(
                         recovery_call=True,
                         allowed_reuse_of_beat_ids_by_option=(
                             allowed_reuse_ids_by_option
+                        ),
+                        retained_reuse_authority_by_option=(
+                            retained_reuse_authority_by_option
                         ),
                     )
                     decisions = [

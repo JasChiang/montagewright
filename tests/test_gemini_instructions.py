@@ -202,6 +202,17 @@ def _complete_grouped_no_reuse_arguments() -> dict[str, Any]:
     }
 
 
+def _retained_grouped_reuse_authority() -> dict[str, dict[str, dict[str, str]]]:
+    return {
+        "fold": {
+            "fold--option-a": {
+                "mode": "editorial_reprise",
+                "justification": "The immutable option already carries this reprise.",
+            }
+        }
+    }
+
+
 def _grouped_client_with_responses(
     responses: list[dict[str, Any]] | None = None,
 ) -> tuple[GeminiLabClient, list[dict[str, Any]]]:
@@ -324,6 +335,7 @@ def test_grouped_semantic_resume_repairs_invalid_raw_once_without_full_prompt(
         policy=_grouped_semantic_policy(),
         run_dir=run_dir,
         recovery_call=True,
+        retained_reuse_authority_by_option=_retained_grouped_reuse_authority(),
     )
 
     assert result.interaction_ids == ("original", "repair")
@@ -335,6 +347,18 @@ def test_grouped_semantic_resume_repairs_invalid_raw_once_without_full_prompt(
     repair_text = repair_request["input"][0]["text"]
     assert "FULL-CONTEXT-SENTINEL-MUST-NOT-BE-RESENT" not in repair_text
     assert "whole_resolved_timeline" not in repair_text
+    repair_context = json.loads(repair_text.split("\n\n", 1)[1])
+    action = repair_context["per_option_authority_constraints"]["fold"][
+        "fold--option-a"
+    ]
+    assert action["required_authority_action"] == (
+        "retain_existing_no_new_authority"
+    )
+    assert action["decision_reuse_fields_must_be"] == {
+        "source_reuse_mode": "none",
+        "source_reuse_justification": None,
+        "reuse_of_beat_ids": [],
+    }
     audit = json.loads(
         (
             run_dir / "grouped_semantic_negotiation.schema_repair.audit.json"
@@ -342,6 +366,194 @@ def test_grouped_semantic_resume_repairs_invalid_raw_once_without_full_prompt(
     )
     assert audit["repair_limit"] == 1
     assert audit["original_request_redispatched"] is False
+
+
+def test_grouped_semantic_resume_canonicalizes_saved_retained_reuse_restatement(
+    tmp_path: Path,
+) -> None:
+    """A v31-shaped saved repair is reused without a second provider call."""
+
+    run_dir = tmp_path / "grouped"
+    run_dir.mkdir()
+    retained = _retained_grouped_reuse_authority()
+    original = _complete_grouped_no_reuse_arguments()
+    for key in (
+        "fallback_option_ids",
+        "unresolved_concern_codes",
+        "reuse_of_beat_ids",
+    ):
+        original["decisions"][0].pop(key)
+    raw_path = run_dir / "grouped_semantic_negotiation.raw_interaction.json"
+    raw_path.write_text(
+        json.dumps(
+            _grouped_interaction(
+                "original",
+                function_name="propose_grouped_edit_decisions",
+                arguments=original,
+            )
+        ),
+        encoding="utf-8",
+    )
+    repair = _complete_grouped_no_reuse_arguments()
+    repair["decisions"][0].update(
+        {
+            "source_reuse_mode": retained["fold"]["fold--option-a"]["mode"],
+            "source_reuse_justification": retained["fold"]["fold--option-a"][
+                "justification"
+            ],
+            "reuse_of_beat_ids": [],
+        }
+    )
+    repair_raw_path = (
+        run_dir / "grouped_semantic_negotiation.schema_repair.raw_interaction.json"
+    )
+    repair_raw_path.write_text(
+        json.dumps(
+            _grouped_interaction(
+                "repair",
+                function_name="repair_grouped_edit_decisions",
+                arguments=repair,
+            )
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "grouped_semantic_negotiation.schema_repair.audit.json").write_text(
+        json.dumps(
+            {
+                "original_interaction_id": "original",
+                "original_raw_interaction_sha256": hashlib.sha256(
+                    raw_path.read_bytes()
+                ).hexdigest(),
+                "repair_limit": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    client, requests = _grouped_client_with_responses()
+    kwargs = {
+        "option_ids_by_beat": {"fold": ("fold--option-a",)},
+        "allowed_reuse_of_beat_ids_by_option": {
+            "fold": {"fold--option-a": ()}
+        },
+        "retained_reuse_authority_by_option": retained,
+        "prompt": "must never be resent",
+        "policy": _grouped_semantic_policy(),
+        "run_dir": run_dir,
+        "recovery_call": True,
+    }
+
+    result = client.negotiate_grouped_edit_decisions(**kwargs)
+    resumed = client.negotiate_grouped_edit_decisions(**kwargs)
+
+    assert requests == []
+    assert result.interaction_ids == ("original", "repair")
+    assert resumed.decision.decisions[0].source_reuse_mode == "none"
+    assert resumed.decision.decisions[0].source_reuse_justification is None
+    assert resumed.decision.decisions[0].reuse_of_beat_ids == ()
+    audit = json.loads(
+        (
+            run_dir / "grouped_semantic_negotiation.schema_repair.audit.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert audit["original_raw_interaction_sha256"] == hashlib.sha256(
+        raw_path.read_bytes()
+    ).hexdigest()
+    assert audit["repair_canonicalized_redundant_retained_authority"] == [
+        {
+            "beat_id": "fold",
+            "selected_option_id": "fold--option-a",
+            "retained_reuse_mode": "editorial_reprise",
+            "normalization": (
+                "redundant_retained_authority_to_no_new_authority"
+            ),
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "retained"),
+    (
+        ("source_reuse_mode", "distinct_interval", True),
+        ("source_reuse_justification", "near-match", True),
+        ("reuse_of_beat_ids", ["opening"], True),
+        ("source_reuse_mode", "editorial_reprise", False),
+    ),
+)
+def test_grouped_semantic_rejects_near_match_retained_reuse_restatement(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+    retained: bool,
+) -> None:
+    run_dir = tmp_path / field
+    run_dir.mkdir()
+    original = {"decisions": [{"beat_id": "fold"}]}
+    raw_path = run_dir / "grouped_semantic_negotiation.raw_interaction.json"
+    raw_path.write_text(
+        json.dumps(
+            _grouped_interaction(
+                "original",
+                function_name="propose_grouped_edit_decisions",
+                arguments=original,
+            )
+        ),
+        encoding="utf-8",
+    )
+    repair = _complete_grouped_no_reuse_arguments()
+    retained_authority = _retained_grouped_reuse_authority()
+    repair["decisions"][0].update(
+        {
+            "source_reuse_mode": "editorial_reprise",
+            "source_reuse_justification": retained_authority["fold"][
+                "fold--option-a"
+            ]["justification"],
+            "reuse_of_beat_ids": [],
+            field: value,
+        }
+    )
+    repair_raw_path = (
+        run_dir / "grouped_semantic_negotiation.schema_repair.raw_interaction.json"
+    )
+    repair_raw_path.write_text(
+        json.dumps(
+            _grouped_interaction(
+                "repair",
+                function_name="repair_grouped_edit_decisions",
+                arguments=repair,
+            )
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "grouped_semantic_negotiation.schema_repair.audit.json").write_text(
+        json.dumps(
+            {
+                "original_interaction_id": "original",
+                "original_raw_interaction_sha256": hashlib.sha256(
+                    raw_path.read_bytes()
+                ).hexdigest(),
+                "repair_limit": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    client, requests = _grouped_client_with_responses()
+
+    with pytest.raises(ValueError, match="refusing another repair"):
+        client.negotiate_grouped_edit_decisions(
+            option_ids_by_beat={"fold": ("fold--option-a",)},
+            allowed_reuse_of_beat_ids_by_option={
+                "fold": {"fold--option-a": ()}
+            },
+            retained_reuse_authority_by_option=(
+                retained_authority if retained else None
+            ),
+            prompt="must never be resent",
+            policy=_grouped_semantic_policy(),
+            run_dir=run_dir,
+            recovery_call=True,
+        )
+
+    assert requests == []
 
 
 def test_grouped_semantic_schema_repair_is_single_shot_on_invalid_or_503(

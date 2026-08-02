@@ -1703,6 +1703,196 @@ def _normalize_grouped_reuse_ids(
     return normalized
 
 
+def _normalize_grouped_retained_reuse_authority(
+    *,
+    option_ids_by_beat: Mapping[str, tuple[str, ...]],
+    retained_reuse_authority_by_option: Mapping[
+        str, Mapping[str, Mapping[str, Any]]
+    ]
+    | None,
+    policy: AutonomousEditPolicy,
+) -> dict[str, dict[str, dict[str, str]]]:
+    """Validate immutable, pre-existing reuse authority by stable option ID.
+
+    The grouped decision can grant only *new* reuse authority.  An option may
+    already carry a historical, hash-bound reuse decision; that authority stays
+    on the immutable option and is never copied into this new decision
+    envelope.  Keep the projection finite so a response cannot bind prose or
+    an option that was not supplied to this replan.
+    """
+
+    supplied = dict(retained_reuse_authority_by_option or {})
+    unknown_beats = set(supplied) - set(option_ids_by_beat)
+    if unknown_beats:
+        raise ValueError(
+            "grouped retained reuse authority names unknown beats: "
+            + ", ".join(sorted(unknown_beats))
+        )
+    normalized: dict[str, dict[str, dict[str, str]]] = {}
+    for beat_id, option_ids in option_ids_by_beat.items():
+        raw_by_option = supplied.get(beat_id, {})
+        if not isinstance(raw_by_option, Mapping):
+            raise ValueError(
+                "grouped retained reuse authority must map options by beat: "
+                + beat_id
+            )
+        unknown_options = set(raw_by_option) - set(option_ids)
+        if unknown_options:
+            raise ValueError(
+                "grouped retained reuse authority names unknown options for "
+                + beat_id
+                + ": "
+                + ", ".join(sorted(str(value) for value in unknown_options))
+            )
+        normalized[beat_id] = {}
+        for option_id, raw_authority in raw_by_option.items():
+            if not isinstance(raw_authority, Mapping) or set(raw_authority) != {
+                "mode",
+                "justification",
+            }:
+                raise ValueError(
+                    "grouped retained reuse authority must contain only mode "
+                    "and justification"
+                )
+            mode = raw_authority.get("mode")
+            justification = raw_authority.get("justification")
+            if (
+                not isinstance(mode, str)
+                or mode == "none"
+                or mode not in policy.editorial.allow_source_reuse
+                or not isinstance(justification, str)
+                or not justification.strip()
+            ):
+                raise ValueError(
+                    "grouped retained reuse authority must be a policy-allowed "
+                    "non-none mode with a non-empty justification"
+                )
+            normalized[beat_id][str(option_id)] = {
+                "mode": mode,
+                "justification": justification,
+            }
+    return normalized
+
+
+def _grouped_authority_actions_by_option(
+    *,
+    option_ids_by_beat: Mapping[str, tuple[str, ...]],
+    allowed_reuse_of_beat_ids_by_option: Mapping[
+        str, Mapping[str, tuple[str, ...]]
+    ],
+    retained_reuse_authority_by_option: Mapping[
+        str, Mapping[str, Mapping[str, str]]
+    ],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Describe whether each decision may grant new reuse authority."""
+
+    actions: dict[str, dict[str, dict[str, Any]]] = {}
+    for beat_id, option_ids in option_ids_by_beat.items():
+        actions[beat_id] = {}
+        for option_id in option_ids:
+            allowed_ids = allowed_reuse_of_beat_ids_by_option[beat_id][option_id]
+            retained = retained_reuse_authority_by_option[beat_id].get(option_id)
+            if allowed_ids:
+                actions[beat_id][option_id] = {
+                    "required_authority_action": "explicit_new_authority",
+                    "allowed_new_reuse_of_beat_ids": list(allowed_ids),
+                }
+            elif retained is not None:
+                actions[beat_id][option_id] = {
+                    "required_authority_action": (
+                        "retain_existing_no_new_authority"
+                    ),
+                    "retained_immutable_authority": retained,
+                    "decision_reuse_fields_must_be": {
+                        "source_reuse_mode": "none",
+                        "source_reuse_justification": None,
+                        "reuse_of_beat_ids": [],
+                    },
+                }
+            else:
+                actions[beat_id][option_id] = {
+                    "required_authority_action": "no_new_authority",
+                    "decision_reuse_fields_must_be": {
+                        "source_reuse_mode": "none",
+                        "source_reuse_justification": None,
+                        "reuse_of_beat_ids": [],
+                    },
+                }
+    return actions
+
+
+def _canonicalize_redundant_retained_reuse_authority(
+    arguments: Mapping[str, Any],
+    *,
+    allowed_reuse_of_beat_ids_by_option: Mapping[
+        str, Mapping[str, tuple[str, ...]]
+    ],
+    retained_reuse_authority_by_option: Mapping[
+        str, Mapping[str, Mapping[str, str]]
+    ],
+) -> tuple[dict[str, Any], tuple[dict[str, str], ...]]:
+    """Canonicalize only an exact redundant restatement of retained authority.
+
+    This is not a local editorial choice.  It merely rewrites a response that
+    repeats the selected option's immutable mode and justification in fields
+    reserved for *new* grouped-replan authority.  Anything short of an exact
+    match remains invalid for the regular typed validator to fail closed.
+    """
+
+    canonical = dict(arguments)
+    raw_decisions = arguments.get("decisions")
+    if not isinstance(raw_decisions, (list, tuple)):
+        return canonical, ()
+    canonical_decisions: list[Any] = []
+    canonicalizations: list[dict[str, str]] = []
+    for raw_decision in raw_decisions:
+        if not isinstance(raw_decision, Mapping):
+            canonical_decisions.append(raw_decision)
+            continue
+        decision = dict(raw_decision)
+        beat_id = str(decision.get("beat_id") or "")
+        option_id = str(decision.get("selected_option_id") or "")
+        allowed_ids = (
+            allowed_reuse_of_beat_ids_by_option.get(beat_id, {}).get(
+                option_id,
+                (),
+            )
+        )
+        retained = retained_reuse_authority_by_option.get(beat_id, {}).get(
+            option_id
+        )
+        returned_reuse_ids = decision.get("reuse_of_beat_ids")
+        if (
+            not allowed_ids
+            and retained is not None
+            and decision.get("source_reuse_mode") == retained["mode"]
+            and decision.get("source_reuse_justification")
+            == retained["justification"]
+            and isinstance(returned_reuse_ids, (list, tuple))
+            and not returned_reuse_ids
+        ):
+            decision.update(
+                {
+                    "source_reuse_mode": "none",
+                    "source_reuse_justification": None,
+                    "reuse_of_beat_ids": [],
+                }
+            )
+            canonicalizations.append(
+                {
+                    "beat_id": beat_id,
+                    "selected_option_id": option_id,
+                    "retained_reuse_mode": retained["mode"],
+                    "normalization": (
+                        "redundant_retained_authority_to_no_new_authority"
+                    ),
+                }
+            )
+        canonical_decisions.append(decision)
+    canonical["decisions"] = canonical_decisions
+    return canonical, tuple(canonicalizations)
+
+
 def _validate_grouped_decision_arguments(
     arguments: Mapping[str, Any],
     *,
@@ -1769,6 +1959,9 @@ def _grouped_schema_repair_prompt(
     allowed_reuse_of_beat_ids_by_option: Mapping[
         str, Mapping[str, tuple[str, ...]]
     ],
+    retained_reuse_authority_by_option: Mapping[
+        str, Mapping[str, Mapping[str, str]]
+    ],
     decision_schema: Mapping[str, Any],
 ) -> str:
     """Build a compact, text-only repair request for one invalid response."""
@@ -1788,6 +1981,17 @@ def _grouped_schema_repair_prompt(
         "allowed_reuse_of_beat_ids_by_option": (
             allowed_reuse_of_beat_ids_by_option
         ),
+        "per_option_authority_constraints": (
+            _grouped_authority_actions_by_option(
+                option_ids_by_beat=option_ids_by_beat,
+                allowed_reuse_of_beat_ids_by_option=(
+                    allowed_reuse_of_beat_ids_by_option
+                ),
+                retained_reuse_authority_by_option=(
+                    retained_reuse_authority_by_option
+                ),
+            )
+        ),
         "required_reuse_encoding": {
             "none": {
                 "source_reuse_justification": None,
@@ -1796,6 +2000,10 @@ def _grouped_schema_repair_prompt(
             "reuse": (
                 "source_reuse_justification must be non-empty and "
                 "reuse_of_beat_ids must name exactly the supplied allowed IDs"
+            ),
+            "retained_immutable_authority": (
+                "stays on the selected immutable option; the decision fields "
+                "encode only new grouped-replan authority"
             ),
         },
     }
@@ -2026,6 +2234,10 @@ class GeminiLabClient:
             str, Mapping[str, Sequence[str]]
         ]
         | None = None,
+        retained_reuse_authority_by_option: Mapping[
+            str, Mapping[str, Mapping[str, Any]]
+        ]
+        | None = None,
     ) -> BoundedGroupedSemanticNegotiationResult:
         """Make one whole-sequence choice for every deferred beat.
 
@@ -2067,6 +2279,25 @@ class GeminiLabClient:
                 allowed_reuse_of_beat_ids_by_option
             ),
         )
+        normalized_retained_reuse_authority = (
+            _normalize_grouped_retained_reuse_authority(
+                option_ids_by_beat=normalized_options,
+                retained_reuse_authority_by_option=(
+                    retained_reuse_authority_by_option
+                ),
+                policy=policy,
+            )
+        )
+        if any(
+            normalized_reuse_ids[beat_id][option_id]
+            and option_id in normalized_retained_reuse_authority[beat_id]
+            for beat_id, option_ids in normalized_options.items()
+            for option_id in option_ids
+        ):
+            raise ValueError(
+                "a grouped option cannot retain immutable reuse authority and "
+                "also require new reuse authority"
+            )
         decision_declaration = {
             "type": "function",
             "name": "propose_grouped_edit_decisions",
@@ -2084,12 +2315,27 @@ class GeminiLabClient:
 
         def validate_arguments(
             arguments: Mapping[str, Any],
-        ) -> GroupedEditDecisionProposal:
-            return _validate_grouped_decision_arguments(
-                arguments,
-                option_ids_by_beat=normalized_options,
-                allowed_reuse_of_beat_ids_by_option=normalized_reuse_ids,
-                policy=policy,
+        ) -> tuple[
+            GroupedEditDecisionProposal,
+            tuple[dict[str, str], ...],
+        ]:
+            canonical_arguments, canonicalizations = (
+                _canonicalize_redundant_retained_reuse_authority(
+                    arguments,
+                    allowed_reuse_of_beat_ids_by_option=normalized_reuse_ids,
+                    retained_reuse_authority_by_option=(
+                        normalized_retained_reuse_authority
+                    ),
+                )
+            )
+            return (
+                _validate_grouped_decision_arguments(
+                    canonical_arguments,
+                    option_ids_by_beat=normalized_options,
+                    allowed_reuse_of_beat_ids_by_option=normalized_reuse_ids,
+                    policy=policy,
+                ),
+                canonicalizations,
             )
 
         def repair_invalid_persisted_response(
@@ -2166,6 +2412,9 @@ class GeminiLabClient:
                                 option_ids_by_beat=normalized_options,
                                 allowed_reuse_of_beat_ids_by_option=(
                                     normalized_reuse_ids
+                                ),
+                                retained_reuse_authority_by_option=(
+                                    normalized_retained_reuse_authority
                                 ),
                                 decision_schema=decision_declaration[
                                     "parameters"
@@ -2246,7 +2495,9 @@ class GeminiLabClient:
                     repair_interaction,
                     function_name="repair_grouped_edit_decisions",
                 )
-                proposal = validate_arguments(repair_call["arguments"])
+                proposal, canonicalizations = validate_arguments(
+                    repair_call["arguments"]
+                )
             except ValueError as repair_error:
                 audit.update(
                     {
@@ -2269,6 +2520,9 @@ class GeminiLabClient:
                     "repair_tool_call_id": str(repair_call["id"]),
                     "repair_raw_interaction_sha256": sha256_file(repair_raw_path),
                     "repair_accepted": True,
+                    "repair_canonicalized_redundant_retained_authority": list(
+                        canonicalizations
+                    ),
                 }
             )
             write_json(audit_path, audit)
@@ -2297,7 +2551,7 @@ class GeminiLabClient:
                 function_name="propose_grouped_edit_decisions",
             )
             try:
-                persisted_proposal = validate_arguments(
+                persisted_proposal, _ = validate_arguments(
                     persisted_call["arguments"]
                 )
             except ValueError as validation_error:
@@ -2334,11 +2588,28 @@ class GeminiLabClient:
                         + json.dumps(normalized_options, ensure_ascii=False)
                         + "\n\nImmutable allowed reuse beat IDs by selected option:\n"
                         + json.dumps(normalized_reuse_ids, ensure_ascii=False)
+                        + "\n\nPer-option source-reuse authority actions:\n"
+                        + json.dumps(
+                            _grouped_authority_actions_by_option(
+                                option_ids_by_beat=normalized_options,
+                                allowed_reuse_of_beat_ids_by_option=(
+                                    normalized_reuse_ids
+                                ),
+                                retained_reuse_authority_by_option=(
+                                    normalized_retained_reuse_authority
+                                ),
+                            ),
+                            ensure_ascii=False,
+                        )
                         + "\nEvery decision must explicitly include "
                         "fallback_option_ids, unresolved_concern_codes, "
                         "source_reuse_mode, source_reuse_justification, and "
-                        "reuse_of_beat_ids. For source_reuse_mode=none use [], "
-                        "null, []; otherwise name exactly the allowed reuse IDs."
+                        "reuse_of_beat_ids. These decision reuse fields encode "
+                        "only new grouped-replan authority: follow each option's "
+                        "required_authority_action. Retained immutable authority "
+                        "stays in the selected option, so encode it as none, null, "
+                        "[] here. Explicit new authority must be non-none and name "
+                        "exactly the allowed reuse IDs."
                         + "\nCall propose_grouped_edit_decisions exactly once."
                     ),
                 }
@@ -2408,7 +2679,7 @@ class GeminiLabClient:
             function_name="propose_grouped_edit_decisions",
         )
         try:
-            proposal = validate_arguments(proposal_call["arguments"])
+            proposal, _ = validate_arguments(proposal_call["arguments"])
         except ValueError as validation_error:
             return repair_invalid_persisted_response(
                 original_interaction=interaction,
