@@ -4920,6 +4920,205 @@ def test_horizontal_primary_failure_persists_one_grouped_alternate_replan(
     ]
 
 
+def test_horizontal_initial_distinct_interval_conflict_uses_grouped_replan(
+    tmp_path: Path,
+) -> None:
+    """A primary-route capacity conflict cannot locally promote rank two."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+
+    def candidate(
+        beat_id: str,
+        candidate_id: str,
+        rank: int,
+        source_marker: str,
+        *,
+        reuse_mode: str = "none",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            candidate_id=candidate_id,
+            rank=rank,
+            source_asset_id="sha256:" + source_marker * 64,
+            event_id=f"event-{beat_id}-{candidate_id}",
+            confidence=0.9,
+            strategy="original",
+            camera_intent="hold",
+            target_description=None,
+            quality_risks=[],
+            source_reuse_mode=reuse_mode,
+            source_reuse_justification=(
+                "separate observed interval" if reuse_mode != "none" else None
+            ),
+        )
+
+    chapters = [
+        SimpleNamespace(
+            feature_id="fold8_ultra_camera",
+            horizontal_candidates=[
+                candidate(
+                    "fold8_ultra_camera",
+                    "rank-01",
+                    1,
+                    "a",
+                    reuse_mode="distinct_interval",
+                ),
+                candidate("fold8_ultra_camera", "rank-02", 2, "b"),
+                candidate("fold8_ultra_camera", "rank-03", 3, "c"),
+            ],
+        ),
+        SimpleNamespace(
+            feature_id="fold8_camera",
+            horizontal_candidates=[
+                candidate(
+                    "fold8_camera",
+                    "rank-01",
+                    1,
+                    "a",
+                    reuse_mode="distinct_interval",
+                ),
+                candidate("fold8_camera", "rank-02", 2, "d"),
+                candidate("fold8_camera", "rank-03", 3, "e"),
+            ],
+        ),
+    ]
+    plan = SimpleNamespace(chapters=chapters)
+    rhythm = SimpleNamespace(
+        chapters=[
+            SimpleNamespace(
+                feature_id=chapter.feature_id,
+                minimum_duration_seconds=15,
+                preferred_duration_seconds=15,
+                maximum_duration_seconds=15,
+            )
+            for chapter in chapters
+        ]
+    )
+    timing_facts: dict[tuple[str, str], dict[str, object]] = {}
+    for chapter in chapters:
+        for item in chapter.horizontal_candidates:
+            capacity = 12_000 if item.candidate_id == "rank-03" else 20_000
+            timing_facts[(chapter.feature_id, item.candidate_id)] = {
+                "candidate_timing_sha256": item.source_asset_id.removeprefix(
+                    "sha256:"
+                ),
+                "source_clip_id": (
+                    "shared-fold8"
+                    if item.candidate_id == "rank-01"
+                    else chapter.feature_id + "-" + item.candidate_id
+                ),
+                "safe_capacity_ms": capacity,
+                "safe_window_start_ms": 0,
+                "safe_window_end_ms": capacity,
+                "source_anchor_ms": capacity // 2,
+                "fixed_source_in_ms": None,
+                "fixed_source_out_ms": None,
+            }
+
+    with pytest.raises(feature_cut_module.InitialHorizontalRouteConflict) as error:
+        feature_cut_module._build_pre_render_horizontal_candidate_route(
+            plan,
+            chapter_durations={
+                "fold8_ultra_camera": 15.0,
+                "fold8_camera": 15.0,
+            },
+            rhythm_plan=rhythm,
+            duration_audit={},
+            policy=policy,
+            candidate_timing_facts=timing_facts,
+        )
+    conflict = error.value
+    # The already-bound earlier beat remains unchanged.  Only the later beat
+    # whose distinct-interval authority cannot be satisfied is replanned.
+    assert set(conflict.failures_by_beat) == {"fold8_camera"}
+    assert {selection.candidate_id for selection in conflict.frontier.selections} == {
+        "rank-01"
+    }
+    facts = conflict.failures_by_beat["fold8_camera"]
+    assert facts[0]["failure_class"] == (
+        "typed_horizontal_initial_route_distinct_interval_capacity_conflict"
+    )
+    assert facts[0]["candidate_id"] == "rank-01"
+    assert facts[0]["other_beat_id"] == "fold8_ultra_camera"
+    assert facts[0]["required_distinct_interval_ms"] == 30_000
+    assert facts[0]["safe_capacity_ms"] == 20_000
+    assert {
+        binding.option.candidate_id
+        for binding in conflict.frontier.semantic_replan_candidate_bindings_by_beat[
+            "fold8_ultra_camera"
+        ]
+    } == {"rank-01", "rank-02"}
+
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["option_ids_by_beat"] == {
+                "fold8_camera": ("fold8_camera--rank-02",),
+            }
+            return SimpleNamespace(
+                decision=SimpleNamespace(
+                    decisions=tuple(
+                        SimpleNamespace(
+                            model_dump=lambda beat_id=beat_id, **_kwargs: {
+                                "beat_id": beat_id,
+                                "selected_option_id": beat_id + "--rank-02",
+                                "fallback_option_ids": [],
+                                "semantic_reason": "preserve_readability",
+                                "unresolved_concern_codes": [],
+                                "source_reuse_mode": "none",
+                                "source_reuse_justification": None,
+                                "reuse_of_beat_ids": [],
+                            }
+                        )
+                        for beat_id in ("fold8_camera",)
+                    )
+                ),
+                interaction_ids=("initial-conflict",),
+            )
+
+    editorial_dir = tmp_path / "editorial"
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=conflict.frontier,
+        failures_by_beat=conflict.failures_by_beat,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    restored = _restore_preflight_horizontal_local_replan(
+        route=conflict.frontier,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={
+            "fold8_ultra_camera": 15.0,
+            "fold8_camera": 15.0,
+        },
+    )
+    assert restored is not None
+    assert {
+        selection.beat_id: selection.candidate_id
+        for selection in restored.selections
+    } == {
+        "fold8_ultra_camera": "rank-01",
+        "fold8_camera": "rank-02",
+    }
+    assert restored.total_duration_ms == 30_000
+
+
 def test_horizontal_primary_clean_recovery_rebinds_same_candidate_before_replan(
     tmp_path: Path,
 ) -> None:

@@ -328,6 +328,23 @@ class PreflightSemanticReplanReady(FeatureCutSystemFailure):
     """
 
 
+class InitialHorizontalRouteConflict(CandidateKnownInfeasible):
+    """Primary-only 16:9 route needs Gemini to resolve a typed reuse conflict."""
+
+    def __init__(
+        self,
+        *,
+        frontier: CandidateRouteResult,
+        failures_by_beat: Mapping[str, Sequence[Mapping[str, Any]]],
+    ) -> None:
+        super().__init__(
+            "initial horizontal primary route has no capacity-feasible "
+            "distinct-interval source route"
+        )
+        self.frontier = frontier
+        self.failures_by_beat = failures_by_beat
+
+
 def _frontier_execution_key(
     beat_id: str,
     candidate_id: str,
@@ -14238,6 +14255,284 @@ def _build_pre_render_vertical_candidate_route(
     )
 
 
+def _initial_horizontal_primary_route_conflict_frontier(
+    *,
+    options_by_beat: Mapping[str, tuple[CandidateRouteOption, ...]],
+) -> tuple[CandidateRouteResult, dict[str, tuple[dict[str, Any], ...]]] | None:
+    """Project an infeasible primary vector into a Gemini-only route frontier.
+
+    The projection is intentionally not an executable route.  Its primary
+    selections exist solely to bind the observed conflict and the immutable
+    music/candidate timings in a grouped replan context.  Renderer-visible
+    fallbacks remain primary-only until Gemini chooses and the normal rebuild
+    proves an exact complete route.
+    """
+
+    selections: list[CandidateRouteSelection] = []
+    primary_options: list[CandidateRouteOption] = []
+    bindings: dict[str, tuple[SemanticReplanCandidateBinding, ...]] = {}
+    failures: dict[str, list[dict[str, Any]]] = {}
+    for beat_id, options in options_by_beat.items():
+        if not options:
+            return None
+        primary = options[0]
+        if (
+            primary.fixed_source_in_ms is not None
+            and primary.fixed_source_out_ms is not None
+        ):
+            source_in_ms = primary.fixed_source_in_ms
+            source_out_ms = primary.fixed_source_out_ms
+        else:
+            if not all(
+                value is not None
+                for value in (
+                    primary.safe_window_start_ms,
+                    primary.safe_window_end_ms,
+                    primary.source_anchor_ms,
+                )
+            ):
+                return None
+            assert primary.safe_window_start_ms is not None
+            assert primary.safe_window_end_ms is not None
+            assert primary.source_anchor_ms is not None
+            duration_ms = primary.trim_duration_ms
+            minimum_start_ms = max(
+                primary.safe_window_start_ms,
+                primary.source_anchor_ms - duration_ms + 1,
+            )
+            maximum_start_ms = min(
+                primary.source_anchor_ms,
+                primary.safe_window_end_ms - duration_ms,
+            )
+            if minimum_start_ms > maximum_start_ms:
+                # This interval is diagnostic-only and can never reach the
+                # renderer.  Bind a stable attempted window so the one scoped
+                # Gemini replan can replace every initially infeasible primary
+                # in the same grouped decision instead of discovering them one
+                # process at a time.
+                source_in_ms = max(
+                    0,
+                    primary.safe_window_end_ms - duration_ms,
+                )
+                failures.setdefault(beat_id, []).append(
+                    {
+                        "failure_class": (
+                            "typed_horizontal_initial_candidate_capacity_conflict"
+                        ),
+                        "candidate_id": primary.candidate_id,
+                        "source_identity": {
+                            "source_clip_id": primary.source_clip_id,
+                            "source_asset_id": primary.source_asset_id,
+                        },
+                        "source_window_ms": {
+                            "start": source_in_ms,
+                            "end": source_in_ms + duration_ms,
+                        },
+                        "safe_window_ms": {
+                            "start": primary.safe_window_start_ms,
+                            "end": primary.safe_window_end_ms,
+                        },
+                        "safe_capacity_ms": primary.safe_capacity_ms,
+                        "required_duration_ms": duration_ms,
+                        "preflight_hard_failures": list(
+                            primary.preflight_hard_failures
+                        ),
+                        "reason": (
+                            "initial primary duration exceeds its immutable "
+                            "quality-safe source interval"
+                        ),
+                    }
+                )
+            else:
+                source_in_ms = min(
+                    max(
+                        minimum_start_ms,
+                        primary.source_anchor_ms - duration_ms // 2,
+                    ),
+                    maximum_start_ms,
+                )
+            source_out_ms = source_in_ms + duration_ms
+        if source_out_ms - source_in_ms != primary.trim_duration_ms:
+            return None
+        selections.append(
+            CandidateRouteSelection(
+                beat_id=beat_id,
+                candidate_id=primary.candidate_id,
+                source_asset_id=primary.source_asset_id,
+                event_id=primary.event_id,
+                trim_duration_ms=primary.trim_duration_ms,
+                cue_id=primary.cue_id,
+                cue_aligned=primary.cue_aligned,
+                presentation_mode=primary.presentation_mode,
+                entry_composition=primary.entry_composition,
+                exit_composition=primary.exit_composition,
+                decision_codes=("initial_horizontal_route_conflict_seed",),
+                source_clip_id=primary.source_clip_id,
+                source_in_ms=source_in_ms,
+                source_out_ms=source_out_ms,
+                candidate_execution_sha256=candidate_route_execution_sha256(
+                    primary,
+                    duration_ms=primary.trim_duration_ms,
+                    source_in_ms=source_in_ms,
+                    source_out_ms=source_out_ms,
+                ),
+                reuse_mode=primary.reuse_mode,
+                reuse_justification=primary.reuse_justification,
+            )
+        )
+        primary_options.append(primary)
+        bindings[beat_id] = tuple(
+            SemanticReplanCandidateBinding(option=option)
+            for option in options
+            if not option.preflight_hard_failures
+        )
+
+    for later_index, (later_option, later_selection) in enumerate(
+        zip(primary_options, selections, strict=True)
+    ):
+        if later_option.reuse_mode != "distinct_interval":
+            continue
+        later_source = later_option.source_clip_id or later_option.source_asset_id
+        for earlier_option, earlier_selection in zip(
+            primary_options[:later_index],
+            selections[:later_index],
+            strict=True,
+        ):
+            earlier_source = (
+                earlier_option.source_clip_id or earlier_option.source_asset_id
+            )
+            if later_source != earlier_source:
+                continue
+            def start_range(
+                option: CandidateRouteOption,
+                selection: CandidateRouteSelection,
+            ) -> tuple[int, int] | None:
+                if (
+                    option.fixed_source_in_ms is not None
+                    and option.fixed_source_out_ms is not None
+                ):
+                    return (
+                        option.fixed_source_in_ms,
+                        option.fixed_source_in_ms,
+                    )
+                if not all(
+                    value is not None
+                    for value in (
+                        option.safe_window_start_ms,
+                        option.safe_window_end_ms,
+                        option.source_anchor_ms,
+                    )
+                ):
+                    return None
+                assert option.safe_window_start_ms is not None
+                assert option.safe_window_end_ms is not None
+                assert option.source_anchor_ms is not None
+                return (
+                    max(
+                        option.safe_window_start_ms,
+                        option.source_anchor_ms
+                        - selection.trim_duration_ms
+                        + 1,
+                    ),
+                    min(
+                        option.source_anchor_ms,
+                        option.safe_window_end_ms
+                        - selection.trim_duration_ms,
+                    ),
+                )
+
+            earlier_start_range = start_range(earlier_option, earlier_selection)
+            later_start_range = start_range(later_option, later_selection)
+            if earlier_start_range is None or later_start_range is None:
+                continue
+            earlier_min_start, earlier_max_start = earlier_start_range
+            later_min_start, later_max_start = later_start_range
+            can_place_earlier_first = (
+                earlier_min_start + earlier_selection.trim_duration_ms
+                <= later_max_start
+            )
+            can_place_later_first = (
+                later_min_start + later_selection.trim_duration_ms
+                <= earlier_max_start
+            )
+            if can_place_earlier_first or can_place_later_first:
+                continue
+            overlap_ms = max(
+                0,
+                min(
+                    int(later_selection.source_out_ms or 0),
+                    int(earlier_selection.source_out_ms or 0),
+                )
+                - max(
+                    int(later_selection.source_in_ms or 0),
+                    int(earlier_selection.source_in_ms or 0),
+                ),
+            )
+            shared = {
+                "failure_class": (
+                    "typed_horizontal_initial_route_distinct_interval_capacity_conflict"
+                ),
+                "source_identity": {
+                    "source_clip_id": later_option.source_clip_id,
+                    "source_asset_id": later_option.source_asset_id,
+                },
+                "other_beat_id": earlier_selection.beat_id,
+                "other_candidate_id": earlier_selection.candidate_id,
+                "other_source_window_ms": {
+                    "start": earlier_selection.source_in_ms,
+                    "end": earlier_selection.source_out_ms,
+                },
+                "other_safe_capacity_ms": earlier_option.safe_capacity_ms,
+                "required_distinct_interval_ms": (
+                    earlier_selection.trim_duration_ms
+                    + later_selection.trim_duration_ms
+                ),
+                "centered_overlap_ms": overlap_ms,
+                "reason": (
+                    "initial primary route cannot satisfy distinct_interval "
+                    "reuse within the measured source capacity"
+                ),
+            }
+            failures.setdefault(later_selection.beat_id, []).append(
+                {
+                    **shared,
+                    "candidate_id": later_selection.candidate_id,
+                    "source_window_ms": {
+                        "start": later_selection.source_in_ms,
+                        "end": later_selection.source_out_ms,
+                    },
+                    "safe_capacity_ms": later_option.safe_capacity_ms,
+                }
+            )
+    if not failures:
+        return None
+    total_duration_ms = sum(selection.trim_duration_ms for selection in selections)
+    frontier = CandidateRouteResult(
+        selections=tuple(selections),
+        fallback_candidate_ids_by_beat={
+            selection.beat_id: (selection.candidate_id,)
+            for selection in selections
+        },
+        option_bindings_by_beat={
+            selection.beat_id: {
+                selection.candidate_id: option
+            }
+            for selection, option in zip(selections, primary_options, strict=True)
+        },
+        objective_score=0.0,
+        beam_width=1,
+        total_duration_ms=total_duration_ms,
+        # The seed is intentionally not advertised as a complete route.  Its
+        # selections bind the immutable primary vector for the scoped replan;
+        # only the post-Gemini rebuild may populate ``ranked_routes``.
+        ranked_routes=(),
+        semantic_replan_candidate_bindings_by_beat=bindings,
+    )
+    return frontier, {
+        beat_id: tuple(rows) for beat_id, rows in failures.items()
+    }
+
+
 def _build_pre_render_horizontal_candidate_route(
     plan: FeatureEditPlan,
     *,
@@ -14267,6 +14562,7 @@ def _build_pre_render_horizontal_candidate_route(
         duration_audit=duration_audit,
     )
     beats: list[CandidateRouteBeat] = []
+    all_options_by_beat: dict[str, tuple[CandidateRouteOption, ...]] = {}
     recovery_bindings: dict[
         str, tuple[SemanticReplanCandidateBinding, ...]
     ] = {}
@@ -14417,6 +14713,7 @@ def _build_pre_render_horizontal_candidate_route(
         )
         if not all_options:
             continue
+        all_options_by_beat[chapter.feature_id] = all_options
         # Only Gemini's rank-one horizontal decision enters the initial
         # optimizer route.  Every retained Top-K choice is deliberately
         # parked in a non-renderable semantic-replan binding: it can be
@@ -14435,22 +14732,41 @@ def _build_pre_render_horizontal_candidate_route(
         )
     if not beats:
         return None
-    route = optimize_pre_render_candidate_route(
-        beats,
-        minimum_duration_ms=(
-            1
-            if policy.execution_profile
-            == "autonomous_best_effort"
-            else policy.duration.min_ms
-        ),
-        maximum_duration_ms=policy.duration.max_ms,
-        max_panel_runtime_fraction=(
-            policy.presentation.max_panel_runtime_fraction
-        ),
-        max_editorial_reprise_overlap_fraction=(
-            policy.editorial.max_editorial_reprise_overlap_fraction
-        ),
-    )
+    try:
+        route = optimize_pre_render_candidate_route(
+            beats,
+            minimum_duration_ms=(
+                1
+                if policy.execution_profile
+                == "autonomous_best_effort"
+                else policy.duration.min_ms
+            ),
+            maximum_duration_ms=policy.duration.max_ms,
+            max_panel_runtime_fraction=(
+                policy.presentation.max_panel_runtime_fraction
+            ),
+            max_editorial_reprise_overlap_fraction=(
+                policy.editorial.max_editorial_reprise_overlap_fraction
+            ),
+        )
+    except ValueError as error:
+        if not str(error).startswith(
+            (
+                "candidate route has no options for beat ",
+                "pre-render sequence frontier has no hard-safe option for ",
+            )
+        ):
+            raise
+        conflict = _initial_horizontal_primary_route_conflict_frontier(
+            options_by_beat=all_options_by_beat,
+        )
+        if conflict is None:
+            raise
+        frontier, failures_by_beat = conflict
+        raise InitialHorizontalRouteConflict(
+            frontier=frontier,
+            failures_by_beat=failures_by_beat,
+        ) from None
     # Test seams and legacy adapters may return a non-route sentinel.  The
     # production optimizer returns CandidateRouteResult and carries these
     # recovery-only bindings into the persisted replan frontier.
@@ -15954,6 +16270,110 @@ def _horizontal_replan_effective_execution_state(
         "selected_executions": selected_executions,
         "selected_actions": selected_actions,
         "reuse_authorities": reuse_authorities,
+    }
+
+
+def _horizontal_infeasible_frozen_execution_conflicts(
+    *,
+    base_route: CandidateRouteResult,
+    state: Mapping[str, Any],
+    max_editorial_reprise_overlap_fraction: float,
+) -> tuple[CandidateRouteResult, dict[str, tuple[dict[str, Any], ...]]]:
+    """Diagnose only hard reuse conflicts in Gemini's frozen option vector.
+
+    The returned route is not render authority.  It mirrors the exact active
+    executions solely so the append-only failure journal can exhaust the
+    conflicting option and advance to Gemini's own ordered fallback.
+    """
+
+    selected_executions = state.get("selected_executions", {})
+    if not isinstance(selected_executions, Mapping):
+        raise FeatureCutSystemFailure(
+            "horizontal recovery state has no selected execution map"
+        )
+    active = tuple(
+        selected_executions.get(selection.beat_id, selection)
+        for selection in base_route.selections
+    )
+    if not all(isinstance(selection, CandidateRouteSelection) for selection in active):
+        raise FeatureCutSystemFailure(
+            "horizontal recovery state contains a malformed execution"
+        )
+    failures: dict[str, list[dict[str, Any]]] = {}
+    for later_index, later in enumerate(active):
+        later_source = later.source_clip_id or later.source_asset_id
+        for earlier in active[:later_index]:
+            earlier_source = earlier.source_clip_id or earlier.source_asset_id
+            if later_source != earlier_source:
+                continue
+            if not all(
+                value is not None
+                for value in (
+                    earlier.source_in_ms,
+                    earlier.source_out_ms,
+                    later.source_in_ms,
+                    later.source_out_ms,
+                )
+            ):
+                raise FeatureCutSystemFailure(
+                    "horizontal frozen reuse check lacks exact source intervals"
+                )
+            assert earlier.source_in_ms is not None
+            assert earlier.source_out_ms is not None
+            assert later.source_in_ms is not None
+            assert later.source_out_ms is not None
+            overlap_ms = max(
+                0,
+                min(earlier.source_out_ms, later.source_out_ms)
+                - max(earlier.source_in_ms, later.source_in_ms),
+            )
+            failure_code: str | None = None
+            if later.reuse_mode == "none":
+                failure_code = "source_reuse_authority_missing"
+            elif later.reuse_mode == "distinct_interval" and overlap_ms:
+                failure_code = "distinct_interval_reuse_overlaps"
+            elif later.reuse_mode == "editorial_reprise":
+                overlap_fraction = overlap_ms / max(later.trim_duration_ms, 1)
+                if (
+                    overlap_fraction
+                    > max_editorial_reprise_overlap_fraction + 1e-9
+                ):
+                    failure_code = "editorial_reprise_overlap_exceeded"
+            if failure_code is None:
+                continue
+            failures.setdefault(later.beat_id, []).append(
+                {
+                    "candidate_id": later.candidate_id,
+                    "candidate_execution_sha256": (
+                        later.candidate_execution_sha256
+                    ),
+                    "failure_class": (
+                        "typed_horizontal_frozen_execution_reuse_conflict"
+                    ),
+                    "reason": failure_code,
+                    "source_identity": {
+                        "source_clip_id": later.source_clip_id,
+                        "source_asset_id": later.source_asset_id,
+                    },
+                    "source_window_ms": {
+                        "start": later.source_in_ms,
+                        "end": later.source_out_ms,
+                    },
+                    "other_beat_id": earlier.beat_id,
+                    "other_candidate_id": earlier.candidate_id,
+                    "other_candidate_execution_sha256": (
+                        earlier.candidate_execution_sha256
+                    ),
+                    "other_source_window_ms": {
+                        "start": earlier.source_in_ms,
+                        "end": earlier.source_out_ms,
+                    },
+                    "overlap_ms": overlap_ms,
+                }
+            )
+    active_route = base_route.model_copy(update={"selections": active})
+    return active_route, {
+        beat_id: tuple(rows) for beat_id, rows in failures.items()
     }
 
 
@@ -20849,6 +21269,7 @@ def _preflight_horizontal_route_primaries(
         tuple[str, str], Mapping[str, Any]
     ] | None = None,
     motion_preservation_authorities: Mapping[str, Mapping[str, Any]] | None = None,
+    skip_typed_infeasible_beat_ids: Collection[str] = (),
 ) -> dict[str, list[dict[str, Any]]]:
     """Measure every selected 16:9 primary before admitting any render.
 
@@ -20864,6 +21285,19 @@ def _preflight_horizontal_route_primaries(
     failures: dict[str, list[dict[str, Any]]] = {}
     summary_rows: list[dict[str, Any]] = []
     for beat_id, selection in selected_by_beat.items():
+        if beat_id in skip_typed_infeasible_beat_ids:
+            summary_rows.append(
+                {
+                    "beat_id": beat_id,
+                    "candidate_id": selection.candidate_id,
+                    "status": "skipped_already_typed_infeasible",
+                    "reason": (
+                        "candidate-local timing already proves that the "
+                        "immutable execution cannot fit its quality-safe window"
+                    ),
+                }
+            )
+            continue
         selected = plan_by_beat.get(beat_id)
         if selected is None:
             raise FeatureCutSystemFailure(
@@ -27670,33 +28104,119 @@ def _run_feature_cut_experiment_impl(
                     pre_render_candidate_route
                 )
             )
-        pre_render_horizontal_candidate_route = (
-            _build_pre_render_horizontal_candidate_route(
-                plan,
-                chapter_durations=chapter_durations,
-                rhythm_plan=rhythm_plan,
-                duration_audit=duration_audit,
-                policy=autonomous_policy,
-                candidate_timing_facts=horizontal_candidate_timing_facts,
-            )
-            if autonomous_profile and render_horizontal
-            else None
-        )
+        pre_render_horizontal_candidate_route: CandidateRouteResult | None = None
+        initial_horizontal_route_failures: dict[
+            str, tuple[dict[str, Any], ...]
+        ] = {}
+        if autonomous_profile and render_horizontal:
+            try:
+                pre_render_horizontal_candidate_route = (
+                    _build_pre_render_horizontal_candidate_route(
+                        plan,
+                        chapter_durations=chapter_durations,
+                        rhythm_plan=rhythm_plan,
+                        duration_audit=duration_audit,
+                        policy=autonomous_policy,
+                        candidate_timing_facts=horizontal_candidate_timing_facts,
+                    )
+                )
+            except InitialHorizontalRouteConflict as conflict:
+                # Do not spend the one semantic recovery yet.  The diagnostic
+                # primary vector first passes through every zero-paid local
+                # source-motion/quality/exact gate below.  Those observations
+                # are merged with these route-capacity facts so Gemini receives
+                # one complete grouped problem, never a succession of partial
+                # replans.
+                pre_render_horizontal_candidate_route = conflict.frontier
+                initial_horizontal_route_failures = {
+                    beat_id: tuple(dict(row) for row in rows)
+                    for beat_id, rows in conflict.failures_by_beat.items()
+                }
         if (
             pre_render_horizontal_candidate_route is not None
             and autonomous_policy is not None
         ):
-            restored_horizontal_replan = (
-                _restore_preflight_horizontal_local_replan(
-                    route=pre_render_horizontal_candidate_route,
-                    editorial_dir=editorial_dir,
-                    policy=autonomous_policy,
-                    plan_path=plan_path,
-                    chapter_durations=chapter_durations,
-                )
+            restore_pass_cap = _horizontal_recovery_pass_limit(
+                beat_count=len(pre_render_horizontal_candidate_route.selections),
+                attempt_limit=(
+                    autonomous_policy.recovery.max_candidate_attempts_per_beat
+                ),
             )
+            for _restore_pass in range(restore_pass_cap):
+                try:
+                    restored_horizontal_replan = (
+                        _restore_preflight_horizontal_local_replan(
+                            route=pre_render_horizontal_candidate_route,
+                            editorial_dir=editorial_dir,
+                            policy=autonomous_policy,
+                            plan_path=plan_path,
+                            chapter_durations=chapter_durations,
+                        )
+                    )
+                    break
+                except FeatureCutSystemFailure as error:
+                    if (
+                        str(error)
+                        != "horizontal preflight selected alternates cannot preserve "
+                        "the complete frozen execution vector"
+                    ):
+                        raise
+                    context_path, decision_path = (
+                        _horizontal_preflight_local_infeasibility_replan_paths(
+                            editorial_dir
+                        )
+                    )
+                    if not context_path.is_file() or not decision_path.is_file():
+                        raise
+                    recovery = _load_horizontal_replan_recovery_authority(
+                        route=pre_render_horizontal_candidate_route,
+                        context_path=context_path,
+                        decision_path=decision_path,
+                        policy=autonomous_policy,
+                        plan_path=plan_path,
+                    )
+                    state = _horizontal_replan_effective_execution_state(
+                        base_route=recovery["base_route"],
+                        decisions=recovery["decisions"],
+                        motion_actions_by_option=recovery[
+                            "motion_actions_by_option"
+                        ],
+                        allowed_reuse_ids_by_option=recovery[
+                            "allowed_reuse_ids_by_option"
+                        ],
+                        failure_records=recovery["failure_records"],
+                        policy=autonomous_policy,
+                    )
+                    active_route, frozen_conflicts = (
+                        _horizontal_infeasible_frozen_execution_conflicts(
+                            base_route=recovery["base_route"],
+                            state=state,
+                            max_editorial_reprise_overlap_fraction=(
+                                autonomous_policy.editorial
+                                .max_editorial_reprise_overlap_fraction
+                            ),
+                        )
+                    )
+                    if not frozen_conflicts:
+                        raise
+                    _persist_preflight_horizontal_local_infeasibility_replan(
+                        route=active_route,
+                        failures_by_beat=frozen_conflicts,
+                        editorial_dir=editorial_dir,
+                        policy=autonomous_policy,
+                        client=client,
+                        plan_path=plan_path,
+                        music_supplied=music_lock is not None,
+                        output_timeline_cues=output_timeline_cues or (),
+                    )
+            else:
+                raise CandidateKnownInfeasible(
+                    "horizontal Gemini fallback combinations exhausted before "
+                    "a globally feasible frozen route"
+                )
             if restored_horizontal_replan is not None:
                 pre_render_horizontal_candidate_route = restored_horizontal_replan
+                initial_horizontal_route_failures = {}
         horizontal_motion_preservation_authorities: dict[str, dict[str, Any]] = (
             _load_horizontal_motion_preservation_authorities(
                 route=pre_render_horizontal_candidate_route,
@@ -28040,7 +28560,29 @@ def _run_feature_cut_experiment_impl(
                     motion_preservation_authorities=(
                         horizontal_motion_preservation_authorities
                     ),
+                    skip_typed_infeasible_beat_ids={
+                        beat_id
+                        for beat_id, rows in initial_horizontal_route_failures.items()
+                        if any(
+                            row.get("failure_class")
+                            == "typed_horizontal_initial_candidate_capacity_conflict"
+                            for row in rows
+                        )
+                    },
                 )
+                if initial_horizontal_route_failures:
+                    merged_failures = {
+                        beat_id: [dict(row) for row in rows]
+                        for beat_id, rows in horizontal_primary_failures.items()
+                    }
+                    for beat_id, rows in initial_horizontal_route_failures.items():
+                        merged_failures.setdefault(beat_id, []).extend(
+                            dict(row) for row in rows
+                        )
+                    horizontal_primary_failures = {
+                        beat_id: tuple(rows)
+                        for beat_id, rows in merged_failures.items()
+                    }
                 if not horizontal_primary_failures:
                     break
                 # Before spending the sole semantic replan, repair one
@@ -28076,6 +28618,7 @@ def _run_feature_cut_experiment_impl(
                     music_supplied=music_lock is not None,
                     output_timeline_cues=output_timeline_cues or (),
                 )
+                initial_horizontal_route_failures = {}
                 restored_horizontal_replan = _restore_preflight_horizontal_local_replan(
                     route=pre_render_horizontal_candidate_route,
                     editorial_dir=editorial_dir,
