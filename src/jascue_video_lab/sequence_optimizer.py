@@ -2075,6 +2075,68 @@ def materialize_selected_candidate_execution(
     return selection
 
 
+def rebind_selected_candidate_execution(
+    frontier: CandidateRouteResult,
+    *,
+    beat_id: str,
+    candidate_id: str,
+    duration_ms: int,
+    source_in_ms: int,
+    reuse_authority: SemanticReplanReuseAuthority | None = None,
+) -> CandidateRouteSelection:
+    """Bind one selected candidate to a verified alternative safe-window start.
+
+    This is deliberately narrower than route optimization: duration, cue and
+    semantic candidate remain fixed, while a caller may move only the source
+    interval inside the already measured safe window.  It is intended for a
+    typed source-motion recovery after an execution-local dirty edge.
+    """
+
+    materialized = materialize_selected_candidate_execution(
+        frontier,
+        beat_id=beat_id,
+        candidate_id=candidate_id,
+        duration_ms=duration_ms,
+        reuse_authority=reuse_authority,
+    )
+    bindings = frontier.semantic_replan_candidate_bindings_by_beat[beat_id]
+    binding = next(
+        row for row in bindings if row.option.candidate_id == candidate_id
+    )
+    option = binding.option
+    if reuse_authority is not None:
+        option = option.model_copy(
+            update={
+                "reuse_mode": reuse_authority.reuse_mode,
+                "reuse_justification": reuse_authority.reuse_justification,
+            }
+        )
+    feasible = _candidate_source_start_range(option, duration_ms=duration_ms)
+    if feasible is None:
+        raise ValueError(
+            "semantic replan candidate has no movable timing-safe interval"
+        )
+    minimum_start_ms, maximum_start_ms, _ = feasible
+    if not minimum_start_ms <= source_in_ms <= maximum_start_ms:
+        raise ValueError(
+            "semantic replan source rebind lies outside its immutable safe "
+            "window/anchor bounds"
+        )
+    rebound = _candidate_route_selection(
+        option,
+        duration_ms=duration_ms,
+        decision_codes=("deterministic_source_motion_trim_rebind",),
+        source_interval=(source_in_ms, source_in_ms + duration_ms),
+    )
+    if (
+        rebound.cue_id != materialized.cue_id
+        or rebound.cue_aligned != materialized.cue_aligned
+        or rebound.trim_duration_ms != materialized.trim_duration_ms
+    ):
+        raise ValueError("semantic replan source rebind changed immutable timing")
+    return rebound
+
+
 def _source_identity(option: CandidateRouteOption) -> str:
     return option.source_clip_id or option.source_asset_id
 

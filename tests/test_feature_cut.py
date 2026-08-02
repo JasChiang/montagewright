@@ -4892,7 +4892,7 @@ def test_horizontal_primary_failure_persists_one_grouped_alternate_replan(
     ]
     assert restored.fallback_candidate_ids_by_beat["hero"] == ("rank-02",)
     assert (tmp_path / "editorial" / "preflight-horizontal-local-infeasibility-replan" / "failures.json").is_file()
-    with pytest.raises(CandidateKnownInfeasible, match="cap exhausted"):
+    with pytest.raises(CandidateKnownInfeasible, match="Gemini-authorized recovery options exhausted"):
         _persist_preflight_horizontal_local_infeasibility_replan(
             route=restored,
             failures_by_beat={
@@ -4905,6 +4905,19 @@ def test_horizontal_primary_failure_persists_one_grouped_alternate_replan(
             music_supplied=True,
             output_timeline_cues=(),
         )
+    journal_root = (
+        tmp_path
+        / "editorial"
+        / "preflight-horizontal-local-infeasibility-replan"
+        / "execution-failure-journal"
+        / "hero"
+    )
+    records = [read_json(path) for path in journal_root.glob("*.json")]
+    assert len(records) == 1
+    assert records[0]["selected_option_id"] == "hero--rank-02"
+    assert records[0]["typed_failure_classes"] == [
+        "typed_horizontal_execution_failure"
+    ]
 
 
 def test_horizontal_motion_preservation_is_a_distinct_grouped_action_and_restores(
@@ -5050,6 +5063,264 @@ def test_horizontal_motion_preservation_is_a_distinct_grouped_action_and_restore
         route=restored,
         editorial_dir=editorial_dir,
     ) == {"opening": action}
+
+
+def test_horizontal_recovery_journal_rebinds_then_uses_only_gemini_fallbacks(
+    tmp_path: Path,
+) -> None:
+    """Dirty-head retries are execution-local; candidate promotion is Gemini-only."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    movable = {
+        "trim_duration_ms": 30_000,
+        "minimum_readable_ms": 30_000,
+        "preferred_readable_ms": 30_000,
+        "maximum_readable_ms": 30_000,
+        "fixed_source_in_ms": None,
+        "fixed_source_out_ms": None,
+        "safe_capacity_ms": 60_000,
+        "safe_window_start_ms": 0,
+        "safe_window_end_ms": 60_000,
+        "source_anchor_ms": 30_000,
+    }
+    primary = _local_replan_option("hero", "rank-01", "a", rank=1).model_copy(
+        update=movable
+    )
+    rank_02 = _local_replan_option("hero", "rank-02", "b", rank=2).model_copy(
+        update=movable
+    )
+    rank_03 = _local_replan_option("hero", "rank-03", "c", rank=3).model_copy(
+        update=movable
+    )
+    # This candidate is deliberately outside the persisted two-alternate
+    # frontier. It must never become a local fallback after rank-03 fails.
+    rank_04 = _local_replan_option("hero", "rank-04", "d", rank=4).model_copy(
+        update=movable
+    )
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="hero", options=(primary,)),),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    ).model_copy(
+        update={
+            "semantic_replan_candidate_bindings_by_beat": {
+                "hero": tuple(
+                    SemanticReplanCandidateBinding(option=option)
+                    for option in (primary, rank_02, rank_03, rank_04)
+                )
+            }
+        }
+    )
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+    calls = 0
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            assert kwargs["option_ids_by_beat"] == {
+                "hero": ("hero--rank-02", "hero--rank-03")
+            }
+            return SimpleNamespace(
+                decision=SimpleNamespace(
+                    decisions=(
+                        SimpleNamespace(
+                            model_dump=lambda **_kwargs: {
+                                "beat_id": "hero",
+                                "selected_option_id": "hero--rank-02",
+                                "fallback_option_ids": ["hero--rank-03"],
+                                "semantic_reason": "preserve_readability",
+                                "unresolved_concern_codes": [],
+                                "source_reuse_mode": "none",
+                                "source_reuse_justification": None,
+                                "reuse_of_beat_ids": [],
+                            }
+                        ),
+                    )
+                ),
+                interaction_ids=("ordered-fallback",),
+            )
+
+    editorial_dir = tmp_path / "editorial"
+    client = FakeClient()
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=route,
+        failures_by_beat={
+            "hero": (
+                {
+                    "candidate_id": "rank-01",
+                    "failure_class": "typed_horizontal_exact_event_failure",
+                    "reason": "primary exact-event failure",
+                },
+            )
+        },
+        editorial_dir=editorial_dir,
+        policy=policy,
+        client=client,
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    selected = _restore_preflight_horizontal_local_replan(
+        route=route,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"hero": 30.0},
+    )
+    assert selected is not None
+    initial_selected = selected.selections[0]
+    assert initial_selected.candidate_id == "rank-02"
+
+    dirty_head_failure = {
+        "candidate_id": "rank-02",
+        "failure_class": "typed_source_motion_quality_or_fulfillment_gate",
+        "reason": "dirty head",
+        "source_window_ms": {
+            "start": initial_selected.source_in_ms,
+            "end": initial_selected.source_out_ms,
+        },
+        "source_camera_motion_evidence": {
+            "reliable": True,
+            "dirty_head": True,
+            "clean_head_start_ms": 16_200,
+        },
+    }
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=selected,
+        failures_by_beat={"hero": (dirty_head_failure,)},
+        editorial_dir=editorial_dir,
+        policy=policy,
+        client=client,
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    journal_paths = sorted(
+        (
+            editorial_dir
+            / "preflight-horizontal-local-infeasibility-replan"
+            / "execution-failure-journal"
+            / "hero"
+        ).glob("*.json")
+    )
+    journal_bytes = [path.read_bytes() for path in journal_paths]
+    # Crash-boundary replay does not append another attempt or overwrite it.
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=selected,
+        failures_by_beat={"hero": (dirty_head_failure,)},
+        editorial_dir=editorial_dir,
+        policy=policy,
+        client=client,
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    assert [path.read_bytes() for path in journal_paths] == journal_bytes
+
+    rebound = _restore_preflight_horizontal_local_replan(
+        route=route,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"hero": 30.0},
+    )
+    assert rebound is not None
+    rebound_selection = rebound.selections[0]
+    assert rebound_selection.candidate_id == "rank-02"
+    assert rebound_selection.source_in_ms == 16_200
+    assert rebound_selection.candidate_execution_sha256 != (
+        initial_selected.candidate_execution_sha256
+    )
+    assert rebound_selection.trim_duration_ms == initial_selected.trim_duration_ms
+    assert rebound.total_duration_ms == route.total_duration_ms
+    assert rebound_selection.cue_id == initial_selected.cue_id
+
+    # A non-rebindable selected execution advances only to the next Gemini
+    # ID. It cannot inspect or choose rank-04 from the local frontier.
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=rebound,
+        failures_by_beat={
+            "hero": (
+                {
+                    "candidate_id": "rank-02",
+                    "failure_class": "typed_horizontal_exact_event_failure",
+                    "reason": "rank-02 exact-event failure",
+                },
+            )
+        },
+        editorial_dir=editorial_dir,
+        policy=policy,
+        client=client,
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    fallback = _restore_preflight_horizontal_local_replan(
+        route=route,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"hero": 30.0},
+    )
+    assert fallback is not None
+    assert fallback.selections[0].candidate_id == "rank-03"
+    assert calls == 1
+
+    with pytest.raises(CandidateKnownInfeasible, match="Gemini-authorized recovery options exhausted"):
+        _persist_preflight_horizontal_local_infeasibility_replan(
+            route=fallback,
+            failures_by_beat={
+                "hero": (
+                    {
+                        "candidate_id": "rank-03",
+                        "failure_class": "typed_horizontal_exact_event_failure",
+                        "reason": "rank-03 exact-event failure",
+                    },
+                )
+            },
+            editorial_dir=editorial_dir,
+            policy=policy,
+            client=client,
+            plan_path=plan_path,
+            music_supplied=True,
+            output_timeline_cues=(),
+        )
+    assert all(
+        record["candidate_id"] != "rank-04"
+        for record in (
+            read_json(path)
+            for path in (
+                editorial_dir
+                / "preflight-horizontal-local-infeasibility-replan"
+                / "execution-failure-journal"
+                / "hero"
+            ).glob("*.json")
+        )
+    )
+
+
+def test_horizontal_recovery_pass_limit_includes_last_authorized_execution() -> None:
+    assert feature_cut_module._horizontal_recovery_pass_limit(
+        beat_count=1,
+        attempt_limit=3,
+    ) == 13
+    assert feature_cut_module._horizontal_recovery_pass_limit(
+        beat_count=2,
+        attempt_limit=3,
+    ) == 26
 
 def test_horizontal_mixed_replan_freezes_retain_execution_while_selecting_alternate(
     tmp_path: Path,
