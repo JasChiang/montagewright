@@ -4920,6 +4920,98 @@ def test_horizontal_primary_failure_persists_one_grouped_alternate_replan(
     ]
 
 
+def test_horizontal_primary_clean_recovery_rebinds_same_candidate_before_replan(
+    tmp_path: Path,
+) -> None:
+    """A reliable dirty head moves the execution, never its Gemini candidate."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    primary = _local_replan_option("hero", "rank-01", "a", rank=1).model_copy(
+        update={
+            "fixed_source_in_ms": None,
+            "fixed_source_out_ms": None,
+            "trim_duration_ms": 30_000,
+            "minimum_readable_ms": 30_000,
+            "preferred_readable_ms": 30_000,
+            "maximum_readable_ms": 30_000,
+            "safe_capacity_ms": 60_000,
+            "safe_window_start_ms": 0,
+            "safe_window_end_ms": 60_000,
+            "source_anchor_ms": 30_000,
+        }
+    )
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="hero", options=(primary,)),),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    )
+    original = route.selections[0]
+    assert original.source_in_ms == 15_000
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    recovered = feature_cut_module._attempt_horizontal_primary_clean_window_recovery(
+        route=route,
+        failures_by_beat={
+            "hero": (
+                {
+                    "candidate_id": "rank-01",
+                    "failure_class": "typed_source_motion_quality_or_fulfillment_gate",
+                    "reason": "reliable dirty head",
+                    "source_camera_motion_evidence_sha256": "e" * 64,
+                    "source_camera_motion_evidence": {
+                        "reliable": True,
+                        "dirty_head": True,
+                        "clean_head_start_ms": 16_200,
+                    },
+                },
+            )
+        },
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"hero": 30.0},
+    )
+
+    assert recovered is not None
+    rebound = recovered.selections[0]
+    assert rebound.candidate_id == original.candidate_id
+    assert rebound.cue_id == original.cue_id
+    assert rebound.cue_aligned == original.cue_aligned
+    assert rebound.trim_duration_ms == original.trim_duration_ms
+    assert rebound.source_in_ms == 16_200
+    assert rebound.source_out_ms == 46_200
+    assert rebound.candidate_execution_sha256 != original.candidate_execution_sha256
+    assert recovered.total_duration_ms == route.total_duration_ms
+    assert not (
+        tmp_path
+        / "editorial"
+        / "preflight-horizontal-local-infeasibility-replan"
+        / "decision.json"
+    ).exists()
+    records = list(
+        (
+            tmp_path / "editorial" / "horizontal-primary-clean-recovery" / "records" / "hero"
+        ).glob("*.json")
+    )
+    assert len(records) == 1
+    record = read_json(records[0])
+    assert record["before_execution_sha256"] == original.candidate_execution_sha256
+    assert record["after_execution_sha256"] == rebound.candidate_execution_sha256
+    assert record["source_motion_evidence_sha256s"] == ["e" * 64]
+
+
 def test_horizontal_motion_preservation_is_a_distinct_grouped_action_and_restores(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

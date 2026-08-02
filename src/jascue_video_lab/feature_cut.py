@@ -15476,6 +15476,246 @@ def _horizontal_replan_failure_clean_head_ms(
     return max(clean_heads) if clean_heads else None
 
 
+def _horizontal_primary_clean_recovery_root(editorial_dir: Path) -> Path:
+    """Namespace zero-paid primary trim repairs apart from Gemini authority."""
+
+    return editorial_dir / "horizontal-primary-clean-recovery"
+
+
+def _horizontal_primary_clean_recovery_records(
+    *,
+    editorial_dir: Path,
+    beat_id: str,
+    policy: AutonomousEditPolicy,
+    plan_path: Path,
+) -> list[dict[str, Any]]:
+    """Load immutable same-candidate trim attempts for one initial primary."""
+
+    records_root = _horizontal_primary_clean_recovery_root(editorial_dir) / "records"
+    beat_root = records_root / beat_id
+    if not beat_root.exists():
+        return []
+    if not beat_root.is_dir():
+        raise FeatureCutSystemFailure(
+            "horizontal primary clean recovery records are not a directory"
+        )
+    records: list[dict[str, Any]] = []
+    for path in sorted(beat_root.glob("*.json")):
+        payload = read_json(path)
+        if not isinstance(payload, Mapping):
+            raise FeatureCutSystemFailure(
+                "horizontal primary clean recovery record is malformed"
+            )
+        record = dict(payload)
+        if (
+            record.get("contract_version")
+            != "horizontal-primary-clean-recovery-v1"
+            or record.get("policy_reference") != policy.policy_reference
+            or record.get("plan_sha256") != sha256_file(plan_path)
+            or record.get("beat_id") != beat_id
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(record.get("before_execution_sha256") or "")
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(record.get("after_execution_sha256") or "")
+            )
+            or not isinstance(record.get("failure_facts"), list)
+            or not record["failure_facts"]
+            or path.stem != _stable_fingerprint(record)
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal primary clean recovery record binding changed"
+            )
+        records.append(record)
+    return records
+
+
+def _freeze_horizontal_primary_clean_recovery_execution_vector(
+    *,
+    route: CandidateRouteResult,
+    beat_id: str,
+    rebound_execution: CandidateRouteSelection,
+    chapter_durations: Mapping[str, float],
+) -> dict[str, CandidateRouteSelection]:
+    """Replace exactly one primary interval without moving any project beat."""
+
+    frozen = {selection.beat_id: selection for selection in route.selections}
+    original = frozen.get(beat_id)
+    if original is None or set(frozen) != set(
+        route.semantic_replan_candidate_bindings_by_beat
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal primary clean recovery cannot form a complete route"
+        )
+    if (
+        rebound_execution.candidate_id != original.candidate_id
+        or rebound_execution.trim_duration_ms != original.trim_duration_ms
+        or rebound_execution.cue_id != original.cue_id
+        or rebound_execution.cue_aligned != original.cue_aligned
+        or rebound_execution.source_in_ms is None
+        or rebound_execution.source_out_ms is None
+        or rebound_execution.candidate_execution_sha256 is None
+        or rebound_execution.trim_duration_ms
+        != round(chapter_durations[beat_id] * 1000)
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal primary clean recovery changed candidate/cue/duration"
+        )
+    frozen[beat_id] = rebound_execution
+    if (
+        sum(selection.trim_duration_ms for selection in frozen.values())
+        != route.total_duration_ms
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal primary clean recovery changed total duration"
+        )
+    return frozen
+
+
+def _attempt_horizontal_primary_clean_window_recovery(
+    *,
+    route: CandidateRouteResult,
+    failures_by_beat: Mapping[str, Sequence[Mapping[str, Any]]],
+    editorial_dir: Path,
+    policy: AutonomousEditPolicy,
+    plan_path: Path,
+    chapter_durations: Mapping[str, float],
+) -> CandidateRouteResult | None:
+    """Repair one reliable dirty-head primary before asking Gemini to substitute.
+
+    This is not a semantic fallback.  It may only move the active candidate's
+    source interval forward inside its pre-measured safe window while keeping
+    the source anchor, cue and duration fixed.  Any other preflight failure
+    proceeds to the existing bounded Gemini replan unchanged.
+    """
+
+    _, decision_path = _horizontal_preflight_local_infeasibility_replan_paths(
+        editorial_dir
+    )
+    if decision_path.is_file():
+        return None
+    selections = {selection.beat_id: selection for selection in route.selections}
+    for beat_id, raw_facts in sorted(failures_by_beat.items()):
+        selection = selections.get(beat_id)
+        facts = [dict(row) for row in raw_facts]
+        if selection is None or not facts:
+            continue
+        if any(str(row.get("candidate_id") or "") != selection.candidate_id for row in facts):
+            raise FeatureCutSystemFailure(
+                "horizontal primary clean recovery failure is not bound to its "
+                "selected candidate"
+            )
+        clean_head_ms = _horizontal_replan_failure_clean_head_ms(facts)
+        if clean_head_ms is None or selection.source_in_ms is None:
+            continue
+        prior_records = _horizontal_primary_clean_recovery_records(
+            editorial_dir=editorial_dir,
+            beat_id=beat_id,
+            policy=policy,
+            plan_path=plan_path,
+        )
+        if len(prior_records) >= policy.recovery.max_candidate_attempts_per_beat:
+            continue
+        next_start_ms = max(selection.source_in_ms + 1, clean_head_ms)
+        try:
+            rebound = rebind_selected_candidate_execution(
+                route,
+                beat_id=beat_id,
+                candidate_id=selection.candidate_id,
+                duration_ms=selection.trim_duration_ms,
+                source_in_ms=next_start_ms,
+            )
+            frozen = _freeze_horizontal_primary_clean_recovery_execution_vector(
+                route=route,
+                beat_id=beat_id,
+                rebound_execution=rebound,
+                chapter_durations=chapter_durations,
+            )
+            rebuilt = rebuild_route_with_semantic_authorities(
+                route,
+                selected_candidate_ids_by_beat={},
+                reuse_authorities_by_beat={},
+                frozen_execution_bindings_by_beat=frozen,
+                minimum_duration_ms=(
+                    1
+                    if policy.execution_profile == "autonomous_best_effort"
+                    else policy.duration.min_ms
+                ),
+                maximum_duration_ms=policy.duration.max_ms,
+                max_panel_runtime_fraction=(
+                    policy.presentation.max_panel_runtime_fraction
+                ),
+                target_duration_ms=route.total_duration_ms,
+                max_editorial_reprise_overlap_fraction=(
+                    policy.editorial.max_editorial_reprise_overlap_fraction
+                ),
+            )
+            _validate_horizontal_frozen_replan_execution_vector(
+                rebuilt=rebuilt,
+                frozen_executions=frozen,
+                expected_total_duration_ms=route.total_duration_ms,
+            )
+        except ValueError:
+            continue
+        evidence_hashes = sorted(
+            {
+                str(row.get("source_camera_motion_evidence_sha256"))
+                for row in facts
+                if re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(row.get("source_camera_motion_evidence_sha256") or ""),
+                )
+            }
+        )
+        record = {
+            "contract_version": "horizontal-primary-clean-recovery-v1",
+            "policy_reference": policy.policy_reference,
+            "plan_sha256": sha256_file(plan_path),
+            "route_definition_sha256_before": _pre_render_route_definition_sha256(route),
+            "beat_id": beat_id,
+            "candidate_id": selection.candidate_id,
+            "before_execution_sha256": selection.candidate_execution_sha256,
+            "after_execution_sha256": rebound.candidate_execution_sha256,
+            "before_source_window_ms": {
+                "start": selection.source_in_ms,
+                "end": selection.source_out_ms,
+            },
+            "after_source_window_ms": {
+                "start": rebound.source_in_ms,
+                "end": rebound.source_out_ms,
+            },
+            "cue_id": selection.cue_id,
+            "trim_duration_ms": selection.trim_duration_ms,
+            "clean_head_start_ms": clean_head_ms,
+            "source_motion_evidence_sha256s": evidence_hashes,
+            "failure_facts": facts,
+        }
+        record_path = (
+            _horizontal_primary_clean_recovery_root(editorial_dir)
+            / "records"
+            / beat_id
+            / f"{_stable_fingerprint(record)}.json"
+        )
+        if record_path.exists():
+            if read_json(record_path) != record:
+                raise FeatureCutSystemFailure(
+                    "horizontal primary clean recovery would overwrite evidence"
+                )
+        else:
+            write_json(record_path, record)
+        return route.model_copy(
+            update={
+                "selections": rebuilt.selections,
+                "ranked_routes": (rebuilt,),
+                "fallback_candidate_ids_by_beat": dict(
+                    route.fallback_candidate_ids_by_beat
+                ),
+                "option_bindings_by_beat": dict(route.option_bindings_by_beat),
+            }
+        )
+    return None
+
+
 def _load_horizontal_replan_execution_failure_records(
     *,
     context_path: Path,
@@ -27803,6 +28043,29 @@ def _run_feature_cut_experiment_impl(
                 )
                 if not horizontal_primary_failures:
                     break
+                # Before spending the sole semantic replan, repair one
+                # execution-local dirty head on the already selected primary.
+                # A successful repair keeps the same candidate and immediately
+                # re-enters this zero-paid preflight loop.
+                if not _horizontal_preflight_local_infeasibility_replan_paths(
+                    editorial_dir
+                )[1].is_file():
+                    primary_clean_recovery = (
+                        _attempt_horizontal_primary_clean_window_recovery(
+                            route=pre_render_horizontal_candidate_route,
+                            failures_by_beat=horizontal_primary_failures,
+                            editorial_dir=editorial_dir,
+                            policy=autonomous_policy,
+                            plan_path=plan_path,
+                            chapter_durations=chapter_durations,
+                        )
+                    )
+                    if primary_clean_recovery is not None:
+                        pre_render_horizontal_candidate_route = (
+                            primary_clean_recovery
+                        )
+                        horizontal_motion_preservation_authorities = {}
+                        continue
                 _persist_preflight_horizontal_local_infeasibility_replan(
                     route=pre_render_horizontal_candidate_route,
                     failures_by_beat=horizontal_primary_failures,
