@@ -97,6 +97,8 @@ from jascue_video_lab.feature_cut import (
     _migrate_legacy_feature_plan_binding,
     _piecewise_expression,
     _project_autonomous_executable_feature_plan,
+    _project_feature_semantic_edit_ir,
+    _project_hash_bound_selected_candidate_coverage,
     _project_locked_cues_to_music_output,
     _production_review_preflight_failures,
     _prompt_binds_sha256,
@@ -5259,6 +5261,250 @@ def test_trim_recompile_reuses_only_paid_grounding_not_stale_tracks(
         / "bbox-key"
         / "attempts"
     ).exists()
+
+
+def _fold_comparison_coverage_plan(
+    *,
+    regions: list[FramingRegionIntent] | None = None,
+) -> FeatureEditPlan:
+    source_asset_id = "sha256:" + "a" * 64
+    chapter = FeatureChapterSelect(
+        feature_id="fold_comparison",
+        evidence_status="supported",
+        horizontal_frame_id="RF000001",
+        vertical_frame_id="RF000001",
+        observed_visual_evidence="Two unfolded foldable devices are visible side by side.",
+        selection_reason="The physical size relation is directly observable.",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_strategy="fit_with_background",
+        vertical_target_description="left unfolded device | right unfolded device",
+        vertical_coverage_intent="simultaneous_relation",
+        vertical_coverage_target_descriptions=[
+            "left unfolded device",
+            "right unfolded device",
+        ],
+        vertical_candidates=[
+            FeatureVerticalCandidate(
+                candidate_id="rank-01",
+                rank=1,
+                source_asset_id=source_asset_id,
+                event_id="fold-event",
+                frame_id="RF000001",
+                observed_visual_evidence=(
+                    "Two unfolded foldable devices remain visible together."
+                ),
+                selection_reason=(
+                    "The source proves their side-by-side physical comparison."
+                ),
+                strategy="fit_with_background",
+                coverage_mode="simultaneous",
+                presentation_preference="two_panel_layout",
+                presentation_goal="compare",
+                physical_scale_comparison=True,
+                target_description=(
+                    "left unfolded device | right unfolded device"
+                ),
+                regions=regions or [],
+                confidence=0.95,
+            )
+        ],
+        quality_risks=[],
+        confidence=0.95,
+    )
+    return FeatureEditPlan(
+        project_id="fold-coverage-projection",
+        catalog_id="catalog",
+        title="Fold coverage projection",
+        chapters=[chapter],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+
+
+def _fold_comparison_evidence_event() -> dict[str, object]:
+    return {
+        "required_entity_ids": ["device-left", "device-right"],
+        "primary_entity_ids": ["device-left", "device-right"],
+        "entities": [
+            {
+                "entity_id": "device-left",
+                "kind": "device",
+                "label": "Left unfolded device",
+            },
+            {
+                "entity_id": "device-right",
+                "kind": "device",
+                "label": "Right unfolded device",
+            },
+        ],
+        "grounding_targets": [
+            {
+                "entity_id": "device-left",
+                "target_description": "left unfolded device",
+            },
+            {
+                "entity_id": "device-right",
+                "target_description": "right unfolded device",
+            },
+        ],
+    }
+
+
+def _fold_comparison_coverage_policy() -> AutonomousEditPolicy:
+    return AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=60_000,
+            min_ms=55_000,
+            max_ms=70_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+        ),
+    )
+
+
+def test_candidate_coverage_projection_enables_two_panel_pre_render_and_ir() -> None:
+    source_plan = _fold_comparison_coverage_plan()
+    source_candidate = source_plan.chapters[0].vertical_candidates[0]
+    projected, coverage_projection = (
+        _project_hash_bound_selected_candidate_coverage(
+            source_plan,
+            candidate_evidence_events={
+                (source_candidate.source_asset_id, source_candidate.event_id): (
+                    _fold_comparison_evidence_event()
+                )
+            },
+            source_feature_plan_sha256="b" * 64,
+            selected_evidence_sha256="c" * 64,
+        )
+    )
+
+    # The source plan is the immutable Gemini decision; only the executable
+    # projection gains direct Clip Card identity bindings.
+    assert source_candidate.regions == []
+    candidate = projected.chapters[0].vertical_candidates[0]
+    assert [region.entity_id for region in candidate.regions] == [
+        "device-left",
+        "device-right",
+    ]
+    assert coverage_projection["candidate_bindings"][0]["binding_status"] == (
+        "bound_from_selected_clip_card_event"
+    )
+    assert coverage_projection["source_feature_plan_sha256"] == "sha256:" + "b" * 64
+    assert coverage_projection["selected_clip_card_evidence_sha256"] == (
+        "sha256:" + "c" * 64
+    )
+
+    brief = FeatureEditBrief(
+        project_id=projected.project_id,
+        title="Fold comparison",
+        target_duration_seconds=60,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id="fold_comparison",
+                title="Compare foldables",
+                detail_lines=["Keep both devices visible for the comparison."],
+                target_duration_seconds=6,
+            )
+        ],
+    )
+    policy = _fold_comparison_coverage_policy()
+    semantic_ir = _project_feature_semantic_edit_ir(
+        brief=brief,
+        plan=projected,
+        policy=policy,
+        catalog_sha256="d" * 64,
+        music_present=False,
+    )
+    beat = semantic_ir.beats[0]
+    assert [target.target_id for target in beat.visibility_contract.targets] == [
+        "device-left",
+        "device-right",
+    ]
+    assert beat.visibility_contract.preserve_relative_scale is True
+    assert beat.panel_target_groups == (
+        ("device-left",),
+        ("device-right",),
+    )
+
+    mode, hard_failures, deferred_gates = _pre_render_vertical_feasibility(
+        candidate,
+        policy=policy,
+    )
+    assert mode == "two_panel_layout"
+    assert hard_failures == ()
+    assert deferred_gates == (
+        "two_panel_layout:needs_exact_event:relative_scale_and_same_pts_unresolved",
+    )
+
+
+def test_candidate_coverage_projection_requires_exact_event_pair() -> None:
+    source_plan = _fold_comparison_coverage_plan()
+    candidate = source_plan.chapters[0].vertical_candidates[0]
+    projected, coverage_projection = (
+        _project_hash_bound_selected_candidate_coverage(
+            source_plan,
+            candidate_evidence_events={
+                ("sha256:" + "e" * 64, candidate.event_id): (
+                    _fold_comparison_evidence_event()
+                )
+            },
+            source_feature_plan_sha256="b" * 64,
+            selected_evidence_sha256="c" * 64,
+        )
+    )
+
+    assert projected.chapters[0].vertical_candidates[0].regions == []
+    binding = coverage_projection["candidate_bindings"][0]
+    assert binding["binding_status"] == "no_exact_selected_clip_card_event"
+    assert binding["selected_event_sha256"] is None
+
+
+def test_candidate_coverage_projection_preserves_nonempty_gemini_regions() -> None:
+    source_plan = _fold_comparison_coverage_plan(
+        regions=[
+            FramingRegionIntent(
+                region_id="gemini-authored-region",
+                entity_id="gemini-device",
+                target_description="Gemini's explicitly required device",
+                role="required",
+            )
+        ]
+    )
+    candidate = source_plan.chapters[0].vertical_candidates[0]
+    projected, coverage_projection = (
+        _project_hash_bound_selected_candidate_coverage(
+            source_plan,
+            candidate_evidence_events={
+                (candidate.source_asset_id, candidate.event_id): (
+                    _fold_comparison_evidence_event()
+                )
+            },
+            source_feature_plan_sha256="b" * 64,
+            selected_evidence_sha256="c" * 64,
+        )
+    )
+
+    projected_candidate = projected.chapters[0].vertical_candidates[0]
+    assert [region.entity_id for region in projected_candidate.regions] == [
+        "gemini-device"
+    ]
+    binding = coverage_projection["candidate_bindings"][0]
+    assert binding["binding_status"] == "gemini_regions_preserved"
+    assert binding["source_regions_sha256"] == binding["projected_regions_sha256"]
 
 
 def test_relation_core_preserves_all_clip_card_required_entities() -> None:

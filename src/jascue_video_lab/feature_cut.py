@@ -13612,6 +13612,7 @@ def _vertical_runtime_candidate_options(
     candidate_evidence_events: Mapping[
         tuple[str, str], Mapping[str, Any]
     ] | None = None,
+    coverage_prebound: bool = False,
     max_candidates: int = 4,
 ) -> list[dict[str, Any]]:
     """Return immutable auto options or one legacy/human-reviewed selection.
@@ -13621,6 +13622,10 @@ def _vertical_runtime_candidate_options(
     brief-specific crop contract, locally validated Clip Card entity IDs seed
     its own conservative contract before the selected-clip Gemini pass.  This
     prevents a fallback take from inheriting unrelated subjects from rank one.
+    Autonomous execution supplies ``coverage_prebound=True`` after making one
+    shared typed projection for semantic IR and pre-render routing. In that
+    case this adapter retains the projected regions and does not read selected
+    Clip Card evidence a second time.
     """
 
     if max_candidates < 1:
@@ -13635,7 +13640,9 @@ def _vertical_runtime_candidate_options(
                 option,
                 selected=selected,
                 evidence_event=(
-                    (candidate_evidence_events or {}).get(
+                    None
+                    if coverage_prebound
+                    else (candidate_evidence_events or {}).get(
                         (candidate.source_asset_id, candidate.event_id)
                     )
                 ),
@@ -17311,6 +17318,123 @@ def _bind_runtime_candidate_coverage(
         bound["coverage_intent"] = "single_primary"
         bound["coverage_target_descriptions"] = []
     return bound
+
+
+def _project_hash_bound_selected_candidate_coverage(
+    plan: FeatureEditPlan,
+    *,
+    candidate_evidence_events: Mapping[
+        tuple[str, str], Mapping[str, Any]
+    ],
+    source_feature_plan_sha256: str,
+    selected_evidence_sha256: str | None,
+) -> tuple[FeatureEditPlan, dict[str, Any]]:
+    """Create the executable portrait coverage projection from saved evidence.
+
+    Gemini's FeatureEditPlan remains the immutable editorial decision.  The
+    selected Clip Card snapshot is the separately hash-bound source for
+    candidate entity identities.  This adapter only fills a candidate whose
+    Gemini-authored ``regions`` are empty, and only from the event with the
+    exact saved ``(source_asset_id, event_id)`` pair.  The resulting typed plan
+    is the one shared by semantic IR, pre-render routing, and the runtime
+    frontier so those stages cannot derive competing target topologies.
+    """
+
+    if not re.fullmatch(r"[0-9a-f]{64}", source_feature_plan_sha256):
+        raise ValueError("candidate coverage projection requires source plan SHA-256")
+    if selected_evidence_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", selected_evidence_sha256
+    ):
+        raise ValueError(
+            "candidate coverage projection requires selected evidence SHA-256"
+        )
+
+    chapters: list[FeatureChapterSelect] = []
+    bindings: list[dict[str, Any]] = []
+    candidate_fields = set(FeatureVerticalCandidate.model_fields)
+    for chapter in plan.chapters:
+        projected_candidates: list[FeatureVerticalCandidate] = []
+        for candidate in chapter.vertical_candidates:
+            evidence_event = candidate_evidence_events.get(
+                (candidate.source_asset_id, candidate.event_id)
+            )
+            source_regions = [
+                region.model_dump(mode="json") for region in candidate.regions
+            ]
+            bound = _bind_runtime_candidate_coverage(
+                candidate.model_dump(mode="python"),
+                selected=chapter,
+                evidence_event=evidence_event,
+            )
+            # Runtime coverage adds convenience metadata which intentionally is
+            # not part of the immutable candidate schema.  Validate the typed
+            # candidate portion before incorporating it in the executable plan.
+            projected_candidate = FeatureVerticalCandidate.model_validate(
+                {
+                    field: value
+                    for field, value in bound.items()
+                    if field in candidate_fields
+                }
+            )
+            projected_candidates.append(projected_candidate)
+            projected_regions = [
+                region.model_dump(mode="json")
+                for region in projected_candidate.regions
+            ]
+            if source_regions:
+                status = "gemini_regions_preserved"
+            elif projected_regions:
+                status = "bound_from_selected_clip_card_event"
+            elif evidence_event is None:
+                status = "no_exact_selected_clip_card_event"
+            else:
+                status = "selected_clip_card_event_has_no_bindable_entities"
+            bindings.append(
+                {
+                    "feature_id": chapter.feature_id,
+                    "candidate_id": candidate.candidate_id,
+                    "source_asset_id": candidate.source_asset_id,
+                    "event_id": candidate.event_id,
+                    "binding_status": status,
+                    "selected_event_sha256": (
+                        "sha256:" + _stable_fingerprint(dict(evidence_event))
+                        if evidence_event is not None
+                        else None
+                    ),
+                    "source_regions_sha256": "sha256:"
+                    + _stable_fingerprint({"regions": source_regions}),
+                    "projected_regions_sha256": "sha256:"
+                    + _stable_fingerprint({"regions": projected_regions}),
+                    "projected_required_target_ids": [
+                        region.entity_id or region.region_id
+                        for region in projected_candidate.regions
+                        if region.execution_role == "hard_core"
+                    ],
+                }
+            )
+        chapters.append(
+            chapter.model_copy(
+                update={"vertical_candidates": projected_candidates}
+            )
+        )
+
+    projected_plan = plan.model_copy(update={"chapters": chapters})
+    projection = {
+        "contract_version": (
+            "selected-clip-card-candidate-coverage-projection-v1"
+        ),
+        "source_feature_plan_sha256": "sha256:" + source_feature_plan_sha256,
+        "selected_clip_card_evidence_sha256": (
+            "sha256:" + selected_evidence_sha256
+            if selected_evidence_sha256 is not None
+            else None
+        ),
+        "candidate_bindings": bindings,
+    }
+    projection["definition_sha256"] = "sha256:" + _stable_fingerprint(
+        projection
+    )
+    return projected_plan, projection
 
 
 def _validate_runtime_selected_evidence_v3_event(
@@ -23705,6 +23829,33 @@ def _run_feature_cut_experiment_impl(
             )
             write_json(plan_binding_path, binding)
             plan_reused = False
+        candidate_evidence_path = (
+            plan_dir / "selected-clip-card-evidence.json"
+        )
+        candidate_evidence_events = _load_runtime_candidate_evidence_events(
+            plan_dir,
+            require_provenance=autonomous_profile,
+        )
+        candidate_coverage_projection: dict[str, Any] | None = None
+        source_feature_plan_sha256 = sha256_file(plan_path)
+        if autonomous_policy is not None:
+            # Resolve evidence-backed entity coverage before any autonomous
+            # compiler consumes the plan.  The immutable plan file is never
+            # rewritten; this is a local executable projection whose evidence
+            # lineage is persisted with the existing execution projection.
+            plan, candidate_coverage_projection = (
+                _project_hash_bound_selected_candidate_coverage(
+                    plan,
+                    candidate_evidence_events=candidate_evidence_events,
+                    source_feature_plan_sha256=source_feature_plan_sha256,
+                    selected_evidence_sha256=(
+                        sha256_file(candidate_evidence_path)
+                        if candidate_evidence_path.is_file()
+                        else None
+                    ),
+                )
+            )
+
         pre_execution_degradations: tuple[DegradationRecord, ...] = ()
         execution_plan_path: Path | None = None
         if autonomous_policy is not None:
@@ -23714,7 +23865,7 @@ def _run_feature_cut_experiment_impl(
                     plan=plan,
                     contracts=editorial_templates,
                     policy=autonomous_policy,
-                    source_plan_sha256=sha256_file(plan_path),
+                    source_plan_sha256=source_feature_plan_sha256,
                     contracts_sha256=sha256_file(
                         editorial_beat_contracts_path.expanduser().resolve(
                             strict=True
@@ -23729,6 +23880,9 @@ def _run_feature_cut_experiment_impl(
                 execution_plan_path,
                 {
                     **execution_plan_projection,
+                    "candidate_coverage_projection": (
+                        candidate_coverage_projection
+                    ),
                     "projected_plan": plan.model_dump(mode="json"),
                     "generated_at": utc_now(),
                 },
@@ -23757,16 +23911,24 @@ def _run_feature_cut_experiment_impl(
                         if execution_plan_path is not None
                         else None
                     ),
+                    "candidate_coverage_projection_sha256": (
+                        candidate_coverage_projection["definition_sha256"]
+                        if candidate_coverage_projection is not None
+                        else None
+                    ),
+                    "selected_clip_card_evidence_sha256": (
+                        candidate_coverage_projection[
+                            "selected_clip_card_evidence_sha256"
+                        ]
+                        if candidate_coverage_projection is not None
+                        else None
+                    ),
                     "brief_sha256": sha256_file(brief_path),
                     "catalog_sha256": sha256_file(catalog_path),
                     "policy_reference": autonomous_policy.policy_reference,
                     "generated_at": utc_now(),
                 },
             )
-        candidate_evidence_events = _load_runtime_candidate_evidence_events(
-            plan_dir,
-            require_provenance=autonomous_profile,
-        )
         if autonomous_profile and final_delivery_qa:
             _validate_hard_exact_event_candidate_provenance(
                 plan,
@@ -25027,6 +25189,7 @@ def _run_feature_cut_experiment_impl(
                     frontier_selected,
                     human_policy_binding_present=False,
                     candidate_evidence_events=candidate_evidence_events,
+                    coverage_prebound=True,
                     max_candidates=(
                         autonomous_policy.recovery
                         .max_candidate_attempts_per_beat
@@ -29107,6 +29270,7 @@ def _run_feature_cut_experiment_impl(
                     selected,
                     human_policy_binding_present=human_reframe_policy_requested,
                     candidate_evidence_events=candidate_evidence_events,
+                    coverage_prebound=autonomous_policy is not None,
                     max_candidates=4,
                 )
                 vertical_options = vertical_options[
