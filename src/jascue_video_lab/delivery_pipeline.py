@@ -1479,12 +1479,14 @@ def _prepare_fresh_autonomous_direct_plan(
         60_000,
         len(shortlist_path.read_text(encoding="utf-8")) * 3 + 30_000,
     )
+    plan_limits = policy.gemini_limits.candidate_reel_plan
+    repair_limits = policy.gemini_limits.text_only_schema_repair
     maximum_candidate_video_ms = _maximum_candidate_video_budget_ms(
         budget_ledger=budget_ledger,
         music_duration_ms=music_duration_ms,
         estimated_text_tokens=direct_plan_text_tokens,
-        max_output_tokens=24_576,
-        thinking_level="low",
+        max_output_tokens=plan_limits.max_output_tokens,
+        thinking_level=plan_limits.thinking_level,
     )
     plan_command = [
         sys.executable,
@@ -1494,7 +1496,7 @@ def _prepare_fresh_autonomous_direct_plan(
         str(library),
         str(plan_dir),
         "--thinking-level",
-        "low",
+        plan_limits.thinking_level,
         "--repair-attempts",
         # The initial multimodal planner is one dispatch.  An authorized
         # text-only repair, if its typed contract fails, is launched as a
@@ -1556,7 +1558,8 @@ def _prepare_fresh_autonomous_direct_plan(
             media_duration_ms=(
                 maximum_candidate_video_ms + music_duration_ms
             ),
-            max_output_tokens=24_576,
+            max_output_tokens=plan_limits.max_output_tokens,
+            thinking_level=plan_limits.thinking_level,
             raise_on_subprocess_error=False,
         )
         if not all(path.is_file() for path in required):
@@ -1597,8 +1600,8 @@ def _prepare_fresh_autonomous_direct_plan(
                 # the contract diagnostic as text.  Price that retained
                 # evidence rather than the candidate reel a second time.
                 estimated_text_tokens=direct_plan_text_tokens,
-                max_output_tokens=24_576,
-                thinking_level="minimal",
+                max_output_tokens=repair_limits.max_output_tokens,
+                thinking_level=repair_limits.thinking_level,
                 exclude_existing_raw_interaction_paths=initial_raw_paths,
             )
             planning_usage = {

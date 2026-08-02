@@ -5492,7 +5492,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--thinking-level",
-        choices=["low", "high"],
+        choices=["minimal", "low", "medium", "high"],
         default="low",
         help=(
             "Use low for the large Top-K Structured Output so reasoning does "

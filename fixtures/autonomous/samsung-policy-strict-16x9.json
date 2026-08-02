@@ -20,11 +20,11 @@
   },
   "gemini_limits": {
     "candidate_reel_plan": {
-      "max_output_tokens": 24576,
+      "max_output_tokens": 16384,
       "thinking_level": "low"
     },
     "text_only_schema_repair": {
-      "max_output_tokens": 24576,
+      "max_output_tokens": 16384,
       "thinking_level": "minimal"
     }
   },

@@ -2001,12 +2001,12 @@ def test_fresh_autonomous_planning_uses_shortlist_then_direct_video_projection(
         "_archive_stale_clip_card_supplements",
         lambda **_kwargs: (),
     )
-    stages: list[tuple[str, list[str]]] = []
+    stages: list[tuple[str, list[str], dict]] = []
 
     def fake_stage(**kwargs):
         stage = kwargs["stage"]
         command = kwargs["command"]
-        stages.append((stage, command))
+        stages.append((stage, command, kwargs))
         if stage == "autonomous_clip_card_shortlist":
             write_json(
                 tmp_path
@@ -2049,15 +2049,22 @@ def test_fresh_autonomous_planning_uses_shortlist_then_direct_video_projection(
         budget_ledger=ledger,
     )
 
-    assert [stage for stage, _ in stages] == [
+    assert [stage for stage, _, _ in stages] == [
         "autonomous_clip_card_shortlist",
         "autonomous_direct_video_edit_plan",
     ]
     direct_command = stages[1][1]
+    direct_kwargs = stages[1][2]
     assert "--candidate-video-evidence" in direct_command
     assert "--repair-attempts" in direct_command
     assert direct_command[direct_command.index("--repair-attempts") + 1] == "0"
     assert "--music" in direct_command
+    limits = _autonomous_policy().gemini_limits.candidate_reel_plan
+    assert direct_command[direct_command.index("--thinking-level") + 1] == (
+        limits.thinking_level
+    )
+    assert direct_kwargs["max_output_tokens"] == limits.max_output_tokens
+    assert direct_kwargs["thinking_level"] == limits.thinking_level
     maximum_index = direct_command.index("--maximum-candidate-video-seconds")
     assert float(direct_command[maximum_index + 1]) > 360.0
     assert result["plan_dir"].endswith("picture/gemini-plan")
