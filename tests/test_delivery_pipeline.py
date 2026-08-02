@@ -260,6 +260,14 @@ def test_warm_dispatch_migration_counts_attempt_and_alias_once(
         allowed_top_level={"picture"},
     )
     assert len(migrated) == 1
+    # A warm resume sees both the attempted request/raw pair and the planner's
+    # canonical root aliases. The raw bytes were already journaled under the
+    # attempt's request address, so the alias must not regenerate that journal
+    # with a different absolute request lineage.
+    assert pipeline._migrate_completed_warm_dispatches(
+        root=tmp_path,
+        allowed_top_level={"picture"},
+    ) == ()
 
     ledger = BudgetLedger(max_cost_usd=1.25, max_interactions=25)
     adopted, raw_paths = (

@@ -2540,8 +2540,11 @@ def _migrate_completed_planning_dispatches(
         for path in exclude_existing_raw_interaction_paths
     }
     # A resumable stage can retain both the original media plan and a later
-    # text-only repair.  The latest orchestration must never re-journal an
-    # already accounted raw interaction under its own stage name.
+    # text-only repair. The latest orchestration must never re-journal an
+    # already accounted raw interaction under its own stage name. A planner
+    # also writes canonical root aliases of completed attempt files; preserve
+    # the raw byte identity as well as the exact path so an alias cannot try
+    # to regenerate the attempt's request-addressed migration journal.
     already_journaled_raw_paths: set[Path] = set()
     for journal_path in stage_dir.glob("*.paid_dispatch.json"):
         try:
@@ -2551,6 +2554,14 @@ def _migrate_completed_planning_dispatches(
                 already_journaled_raw_paths.add(Path(raw_value).resolve())
         except (OSError, ValueError, TypeError):
             continue
+    known_completed_raw_paths = (
+        excluded | already_journaled_raw_paths
+    )
+    known_completed_raw_sha256 = {
+        sha256_file(path)
+        for path in known_completed_raw_paths
+        if path.is_file()
+    }
     for request_path in request_paths:
         raw_path = request_path.with_name(
             request_path.name.removesuffix(".request.json")
@@ -2558,13 +2569,12 @@ def _migrate_completed_planning_dispatches(
         )
         if not raw_path.is_file():
             continue
-        if (
-            raw_path.resolve() in excluded
-            or raw_path.resolve() in already_journaled_raw_paths
-        ):
-            continue
         raw_sha256 = sha256_file(raw_path)
-        if raw_sha256 in seen_raw_sha256:
+        if (
+            raw_path.resolve() in known_completed_raw_paths
+            or raw_sha256 in known_completed_raw_sha256
+            or raw_sha256 in seen_raw_sha256
+        ):
             continue
         migrated.append(
             migrate_completed_legacy_paid_dispatch(
