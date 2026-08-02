@@ -16362,7 +16362,12 @@ def _restore_preflight_horizontal_local_replan(
             )
     if selected_candidate_ids:
         try:
-            rebuilt = rebuild_route_with_semantic_authorities(
+            # Resolve an exact execution for a selected alternate once, then
+            # immediately freeze the entire vector.  The provisional solve is
+            # not route authority: without the second frozen solve it may
+            # redistribute an unchanged/retain beat's duration or source
+            # window, invalidating the action's immutable execution hash.
+            provisional = rebuild_route_with_semantic_authorities(
                 route,
                 selected_candidate_ids_by_beat=selected_candidate_ids,
                 reuse_authorities_by_beat=reuse_authorities,
@@ -16373,14 +16378,45 @@ def _restore_preflight_horizontal_local_replan(
                 ),
                 maximum_duration_ms=policy.duration.max_ms,
                 max_panel_runtime_fraction=policy.presentation.max_panel_runtime_fraction,
-                target_duration_ms=round(sum(chapter_durations.values()) * 1000),
+                target_duration_ms=route.total_duration_ms,
                 max_editorial_reprise_overlap_fraction=(
                     policy.editorial.max_editorial_reprise_overlap_fraction
                 ),
             )
+            frozen_executions = _freeze_horizontal_replan_execution_vector(
+                route=route,
+                provisional=provisional,
+                selected_candidate_ids=selected_candidate_ids,
+                chapter_durations=chapter_durations,
+            )
+            rebuilt = rebuild_route_with_semantic_authorities(
+                route,
+                selected_candidate_ids_by_beat=selected_candidate_ids,
+                reuse_authorities_by_beat=reuse_authorities,
+                frozen_execution_bindings_by_beat=frozen_executions,
+                minimum_duration_ms=(
+                    1
+                    if policy.execution_profile == "autonomous_best_effort"
+                    else policy.duration.min_ms
+                ),
+                maximum_duration_ms=policy.duration.max_ms,
+                max_panel_runtime_fraction=(
+                    policy.presentation.max_panel_runtime_fraction
+                ),
+                target_duration_ms=route.total_duration_ms,
+                max_editorial_reprise_overlap_fraction=(
+                    policy.editorial.max_editorial_reprise_overlap_fraction
+                ),
+            )
+            _validate_horizontal_frozen_replan_execution_vector(
+                rebuilt=rebuilt,
+                frozen_executions=frozen_executions,
+                expected_total_duration_ms=route.total_duration_ms,
+            )
         except ValueError as error:
             raise FeatureCutSystemFailure(
-                "horizontal preflight selected alternate cannot rebuild a complete route"
+                "horizontal preflight selected alternate cannot preserve the "
+                "complete frozen execution vector"
             ) from error
         rebuilt_selections = rebuilt.selections
         rebuilt_routes: tuple[CandidateCompleteRoute, ...] = (rebuilt,)
@@ -16404,6 +16440,127 @@ def _restore_preflight_horizontal_local_replan(
             "option_bindings_by_beat": all_bindings,
         }
     )
+
+
+def _freeze_horizontal_replan_execution_vector(
+    *,
+    route: CandidateRouteResult,
+    provisional: CandidateCompleteRoute,
+    selected_candidate_ids: Mapping[str, str],
+    chapter_durations: Mapping[str, float],
+) -> dict[str, CandidateRouteSelection]:
+    """Keep every non-alternate 16:9 execution immutable during recovery.
+
+    The preliminary rebuild may be needed to discover an alternate's exact
+    source interval, but it is never allowed to move a retained
+    preserve-motion beat (or any unrelated beat).  All source windows, cue
+    bindings and durations are then supplied as one frozen vector to the
+    authoritative rebuild.
+    """
+
+    original = {selection.beat_id: selection for selection in route.selections}
+    provisional_by_beat = {
+        selection.beat_id: selection for selection in provisional.selections
+    }
+    known_beats = set(route.semantic_replan_candidate_bindings_by_beat)
+    if (
+        set(original) != known_beats
+        or set(provisional_by_beat) != known_beats
+        or not known_beats.issubset(chapter_durations)
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal replan cannot form a complete frozen execution vector"
+        )
+    expected_total_duration_ms = round(
+        sum(chapter_durations[beat_id] for beat_id in known_beats) * 1000
+    )
+    if expected_total_duration_ms != route.total_duration_ms:
+        raise FeatureCutSystemFailure(
+            "horizontal replan chapter-duration total differs from the "
+            "immutable route"
+        )
+
+    frozen: dict[str, CandidateRouteSelection] = {}
+    for beat_id, original_execution in original.items():
+        requested_candidate_id = selected_candidate_ids.get(
+            beat_id,
+            original_execution.candidate_id,
+        )
+        provisional_execution = provisional_by_beat[beat_id]
+        if provisional_execution.candidate_id != requested_candidate_id:
+            raise FeatureCutSystemFailure(
+                "horizontal replan provisional execution selected the wrong "
+                "candidate: " + beat_id
+            )
+        alternate_selected = requested_candidate_id != original_execution.candidate_id
+        execution = provisional_execution if alternate_selected else original_execution
+        # A scoped candidate substitution may change source bytes/interval,
+        # but never the frozen project cue or temporal allocation.  This also
+        # prevents a provisional route from borrowing duration from a retain
+        # action in order to make an alternate fit.
+        if not (
+            execution.cue_id == original_execution.cue_id
+            and execution.cue_aligned == original_execution.cue_aligned
+            and execution.trim_duration_ms == original_execution.trim_duration_ms
+            and execution.trim_duration_ms
+            == round(chapter_durations[beat_id] * 1000)
+            and execution.source_in_ms is not None
+            and execution.source_out_ms is not None
+            and execution.candidate_execution_sha256 is not None
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal replan alternate cannot preserve the immutable "
+                "cue/duration execution vector: " + beat_id
+            )
+        frozen[beat_id] = execution
+    if sum(selection.trim_duration_ms for selection in frozen.values()) != (
+        route.total_duration_ms
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal replan frozen execution vector changed total duration"
+        )
+    return frozen
+
+
+def _validate_horizontal_frozen_replan_execution_vector(
+    *,
+    rebuilt: CandidateCompleteRoute,
+    frozen_executions: Mapping[str, CandidateRouteSelection],
+    expected_total_duration_ms: int,
+) -> None:
+    """Ensure the authoritative rebuild returned precisely the frozen vector."""
+
+    rebuilt_by_beat = {selection.beat_id: selection for selection in rebuilt.selections}
+    if (
+        set(rebuilt_by_beat) != set(frozen_executions)
+        or rebuilt.total_duration_ms != expected_total_duration_ms
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal replan rebuilt an incomplete or duration-shifted "
+            "execution vector"
+        )
+    fields = (
+        "candidate_id",
+        "source_asset_id",
+        "source_clip_id",
+        "source_in_ms",
+        "source_out_ms",
+        "trim_duration_ms",
+        "cue_id",
+        "cue_aligned",
+        "presentation_mode",
+        "candidate_execution_sha256",
+    )
+    for beat_id, frozen in frozen_executions.items():
+        rebuilt_execution = rebuilt_by_beat[beat_id]
+        if any(
+            getattr(rebuilt_execution, field) != getattr(frozen, field)
+            for field in fields
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal replan rebuild did not preserve the frozen "
+                "execution: " + beat_id
+            )
 
 
 def _load_horizontal_motion_preservation_authorities(

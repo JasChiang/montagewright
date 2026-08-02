@@ -5051,6 +5051,220 @@ def test_horizontal_motion_preservation_is_a_distinct_grouped_action_and_restore
         editorial_dir=editorial_dir,
     ) == {"opening": action}
 
+def test_horizontal_mixed_replan_freezes_retain_execution_while_selecting_alternate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provisional alternate solve cannot move a selected retain beat."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    duration_update = {
+        "trim_duration_ms": 15_000,
+        "minimum_readable_ms": 15_000,
+        "preferred_readable_ms": 15_000,
+        "maximum_readable_ms": 15_000,
+        "fixed_source_out_ms": 15_000,
+        "safe_capacity_ms": 15_000,
+        "safe_window_end_ms": 15_000,
+        "source_anchor_ms": 7_500,
+    }
+    opening = _local_replan_option("opening", "opening-01", "a", rank=1).model_copy(
+        update=duration_update
+    )
+    hero_primary = _local_replan_option("hero", "hero-01", "b", rank=1).model_copy(
+        update=duration_update
+    )
+    hero_alternate = _local_replan_option("hero", "hero-02", "c", rank=2).model_copy(
+        update=duration_update
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(opening,)),
+            CandidateRouteBeat(beat_id="hero", options=(hero_primary,)),
+        ),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    ).model_copy(
+        update={
+            "semantic_replan_candidate_bindings_by_beat": {
+                "opening": (SemanticReplanCandidateBinding(option=opening),),
+                "hero": (
+                    SemanticReplanCandidateBinding(option=hero_primary),
+                    SemanticReplanCandidateBinding(option=hero_alternate),
+                ),
+            }
+        }
+    )
+    opening_selection = next(
+        selection for selection in route.selections if selection.beat_id == "opening"
+    )
+    evidence_sha = "d" * 64
+    action_id = feature_cut_module._horizontal_motion_preservation_action_id(
+        beat_id="opening",
+        candidate_id=opening_selection.candidate_id,
+        candidate_execution_sha256=str(
+            opening_selection.candidate_execution_sha256
+        ),
+        source_asset_id=opening_selection.source_asset_id,
+        source_in_ms=int(opening_selection.source_in_ms or 0),
+        source_out_ms=int(opening_selection.source_out_ms or 0),
+        source_motion_evidence_sha256=evidence_sha,
+    )
+    action = {
+        "contract_version": "horizontal-motion-preservation-action-v1",
+        "action_id": action_id,
+        "action": "retain_primary_preserve_observed_motion",
+        "beat_id": "opening",
+        "candidate_id": opening_selection.candidate_id,
+        "candidate_execution_sha256": opening_selection.candidate_execution_sha256,
+        "source_asset_id": opening_selection.source_asset_id,
+        "source_clip_id": opening_selection.source_clip_id,
+        "source_in_ms": opening_selection.source_in_ms,
+        "source_out_ms": opening_selection.source_out_ms,
+        "source_motion_evidence_sha256": evidence_sha,
+        "exact_source_interval": {
+            "source_sha256": "a" * 64,
+            "start_pts": 0,
+            "end_pts_exclusive": 300,
+            "start_frame_sha256": "e" * 64,
+            "end_exclusive_frame_sha256": "f" * 64,
+            "source_time_base": "1/30",
+        },
+        "effective_source_camera_motion_role": "editorially_useful",
+        "runtime_handling": "preserve_as_observed_no_synthetic_motion",
+    }
+    reel = tmp_path / "motion-recovery.mp4"
+    reel.write_bytes(b"low-res-reel")
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_build_horizontal_motion_recovery_reel",
+        lambda _actions, *, output_dir: {
+            "contract_version": "horizontal-motion-recovery-reel-v1",
+            "action_ids": [action_id],
+            "reel_path": str(reel),
+            "reel_sha256": hashlib.sha256(reel.read_bytes()).hexdigest(),
+            "reel_duration_ms": 900,
+        },
+    )
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["option_ids_by_beat"] == {
+                "hero": ("hero--hero-02",),
+                "opening": (action_id,),
+            }
+            decisions = (
+                ("opening", action_id, "preserve_source_motion"),
+                ("hero", "hero--hero-02", "preserve_readability"),
+            )
+            return SimpleNamespace(
+                decision=SimpleNamespace(
+                    decisions=tuple(
+                        SimpleNamespace(
+                            model_dump=lambda beat_id=beat_id, option_id=option_id, reason=reason, **_kwargs: {
+                                "beat_id": beat_id,
+                                "selected_option_id": option_id,
+                                "fallback_option_ids": [],
+                                "semantic_reason": reason,
+                                "unresolved_concern_codes": [],
+                                "source_reuse_mode": "none",
+                                "source_reuse_justification": None,
+                                "reuse_of_beat_ids": [],
+                            }
+                        )
+                        for beat_id, option_id, reason in decisions
+                    )
+                ),
+                interaction_ids=("mixed",),
+            )
+
+    editorial_dir = tmp_path / "editorial"
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=route,
+        failures_by_beat={
+            "opening": (
+                {
+                    "candidate_id": opening_selection.candidate_id,
+                    "reason": "reliable non-static horizontal source-camera motion needs a Gemini source_camera_motion_role",
+                    "motion_preservation_action": action,
+                },
+            ),
+            "hero": (
+                {
+                    "candidate_id": "hero-01",
+                    "reason": "exact event could not be bound",
+                },
+            ),
+        },
+        editorial_dir=editorial_dir,
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+
+    real_rebuild = feature_cut_module.rebuild_route_with_semantic_authorities
+    calls: list[bool] = []
+
+    def provisional_reallocates_retain(*args, **kwargs):
+        calls.append(kwargs.get("frozen_execution_bindings_by_beat") is not None)
+        rebuilt = real_rebuild(*args, **kwargs)
+        if kwargs.get("frozen_execution_bindings_by_beat") is None:
+            selections = list(rebuilt.selections)
+            opening_index = next(
+                index
+                for index, selection in enumerate(selections)
+                if selection.beat_id == "opening"
+            )
+            # This models the production failure: an unfrozen provisional
+            # optimization changes the primary's exact interval/hash.
+            selections[opening_index] = selections[opening_index].model_copy(
+                update={
+                    "source_in_ms": 1,
+                    "source_out_ms": 15_001,
+                    "candidate_execution_sha256": "9" * 64,
+                }
+            )
+            return rebuilt.model_copy(update={"selections": tuple(selections)})
+        return rebuilt
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "rebuild_route_with_semantic_authorities",
+        provisional_reallocates_retain,
+    )
+    restored = _restore_preflight_horizontal_local_replan(
+        route=route,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"opening": 15.0, "hero": 15.0},
+    )
+
+    assert restored is not None
+    restored_by_beat = {selection.beat_id: selection for selection in restored.selections}
+    assert restored_by_beat["opening"] == opening_selection
+    assert restored_by_beat["hero"].candidate_id == "hero-02"
+    assert calls == [False, True]
+    assert feature_cut_module._load_horizontal_motion_preservation_authorities(
+        route=restored,
+        editorial_dir=editorial_dir,
+    ) == {"opening": action}
+
 
 def test_horizontal_route_keeps_alternates_only_in_replan_bindings(
     monkeypatch: pytest.MonkeyPatch,
