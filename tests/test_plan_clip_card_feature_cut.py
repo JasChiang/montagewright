@@ -111,7 +111,9 @@ from scripts.plan_clip_card_feature_cut import (
     validate_candidate_video_budget,
     validate_autonomous_planner_requested_aspects,
     direct_video_aspect_contract_instructions,
+    direct_video_horizontal_only_prompt_instructions,
     direct_video_response_schema,
+    project_direct_video_prompt_payload,
     validate_direct_video_aspect_contract,
     validate_direct_video_plan_fulfillment,
     validate_direct_video_source_allocation,
@@ -946,6 +948,58 @@ def test_direct_video_aspect_contract_is_required_nullable_and_fail_closed() -> 
     )
 
 
+def test_horizontal_only_prompt_projects_out_inactive_aspect_context() -> None:
+    projected_brief = project_direct_video_prompt_payload(
+        _brief().model_dump(mode="json"),
+        requested_aspects=("16:9",),
+    )
+    chapter = projected_brief["chapters"][0]
+    assert "vertical_primary_target_description" not in chapter
+    instructions = direct_video_horizontal_only_prompt_instructions().lower()
+    assert "vertical" not in instructions
+    assert "9:16" not in instructions
+    assert "two_panel" not in instructions
+    assert "horizontal_alternates" in instructions
+
+
+def test_horizontal_decision_keeps_motion_and_reuse_authority_candidate_scoped() -> None:
+    with pytest.raises(ValidationError, match="observable reason"):
+        DirectVideoHorizontalDecision(
+            candidate_rank=1,
+            strategy="original",
+            zoom_intent="none",
+            camera_intent="hold",
+            source_camera_motion_role="editorially_useful",
+        )
+    decision = DirectVideoHorizontalDecision(
+        candidate_rank=1,
+        strategy="original",
+        zoom_intent="none",
+        camera_intent="hold",
+        source_camera_motion_role="incidental_or_unwanted",
+        source_camera_motion_reason="The bounded take visibly starts with a shake.",
+        source_reuse_mode="alternate_presentation",
+        source_reuse_justification="The alternate wide take has a distinct reading purpose.",
+    )
+    assert decision.source_camera_motion_role == "incidental_or_unwanted"
+    assert decision.source_reuse_mode == "alternate_presentation"
+
+
+def test_direct_video_response_schema_requires_candidate_semantic_authority() -> None:
+    schema = direct_video_response_schema(("16:9",))
+    for decision_name in (
+        "DirectVideoHorizontalDecision",
+        "DirectVideoVerticalDecision",
+    ):
+        required = set(schema["$defs"][decision_name]["required"])
+        assert {
+            "source_camera_motion_role",
+            "source_camera_motion_reason",
+            "source_reuse_mode",
+            "source_reuse_justification",
+        } <= required
+
+
 def test_horizontal_only_projection_keeps_vertical_shadow_inactive() -> None:
     horizontal = DirectVideoHorizontalDecision(
         candidate_rank=1,
@@ -1011,6 +1065,38 @@ def test_horizontal_only_projection_keeps_vertical_shadow_inactive() -> None:
     assert len(chapter.horizontal_candidates) == 1
     assert chapter.vertical_candidates == []
     assert "unrequested_9_16_projection_shadow" not in chapter.quality_risks
+
+
+def test_active_aspect_confidence_ignores_inactive_shadow_primary() -> None:
+    plan = _v3_plan()
+    chapter = plan.chapters[0]
+    plan = plan.model_copy(
+        update={
+            "chapters": [
+                chapter.model_copy(
+                    update={
+                        "candidates": [
+                            candidate.model_copy(
+                                update={"vertical_authorized": False}
+                            )
+                            for candidate in chapter.candidates
+                        ]
+                    }
+                )
+            ]
+        }
+    )
+    executable = project_feature_contracts_v3(
+        plan,
+        brief=_brief(),
+        catalog=_catalog(),
+        selected_evidence=build_selected_clip_card_evidence(
+            plan,
+            cards={ASSET_ID: _card()},
+        ),
+    )
+    assert executable.chapters[0].inactive_aspects == ["9:16"]
+    assert executable.chapters[0].confidence == 0.8
 
 
 def test_direct_source_allocation_requires_explicit_reuse_but_has_no_count_cap() -> None:

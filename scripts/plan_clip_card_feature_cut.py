@@ -528,6 +528,23 @@ class ClipCardFeatureCandidateV3(StrictModel):
     horizontal_zoom_intent: Literal["none", "subtle", "detail"]
     horizontal_camera_intent: VirtualCameraIntent = "hold"
     horizontal_focus_entity_id: str | None = None
+    horizontal_source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = "unknown"
+    horizontal_source_camera_motion_reason: str | None = Field(
+        default=None,
+        max_length=300,
+    )
+    horizontal_source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    horizontal_source_reuse_justification: str | None = None
     # A legacy dual-aspect representation retains both field sets even for
     # single-aspect delivery.  These flags prevent those neutral shadows from
     # becoming executable candidate frontiers for the unrequested aspect.
@@ -595,6 +612,25 @@ class ClipCardFeatureCandidateV3(StrictModel):
 
     @model_validator(mode="after")
     def validate_candidate(self) -> "ClipCardFeatureCandidateV3":
+        if self.horizontal_source_reuse_mode == "none":
+            if self.horizontal_source_reuse_justification is not None:
+                raise ValueError(
+                    "horizontal candidate reuse justification requires a typed reuse mode"
+                )
+        elif not (
+            self.horizontal_source_reuse_justification
+            and self.horizontal_source_reuse_justification.strip()
+        ):
+            raise ValueError(
+                "horizontal candidate reuse requires an observable justification"
+            )
+        if (
+            self.horizontal_source_camera_motion_role != "unknown"
+            and not (self.horizontal_source_camera_motion_reason or "").strip()
+        ):
+            raise ValueError(
+                "classified horizontal source-camera motion requires an observable reason"
+            )
         if self.source_reuse_mode == "none":
             if self.source_reuse_justification is not None:
                 raise ValueError("candidate reuse justification requires a typed reuse mode")
@@ -795,9 +831,46 @@ class DirectVideoHorizontalDecision(StrictModel):
     zoom_intent: Literal["none", "subtle", "detail"]
     camera_intent: VirtualCameraIntent
     focus_entity_index: int | None = Field(default=None, ge=1)
+    # Gemini declares the editorial meaning of photographed motion; local
+    # analysis only measures it.  Keeping this symmetric with the vertical
+    # decision prevents a horizontal route from silently treating a pan as a
+    # static take or inventing a motivation for it.
+    source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = "unknown"
+    source_camera_motion_reason: str | None = Field(default=None, max_length=300)
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
 
     @model_validator(mode="after")
     def validate_horizontal(self) -> "DirectVideoHorizontalDecision":
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "horizontal reuse justification requires a typed reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError(
+                "horizontal reuse requires an observable justification"
+            )
+        if (
+            self.source_camera_motion_role != "unknown"
+            and not (self.source_camera_motion_reason or "").strip()
+        ):
+            raise ValueError(
+                "classified source-camera motion requires an observable reason"
+            )
         if self.strategy == "original":
             if (
                 self.zoom_intent != "none"
@@ -1137,13 +1210,18 @@ class DirectVideoChapterDecision(StrictModel):
         # The legacy chapter fields remain an audit mirror for the selected
         # primary.  Alternates must carry their own authority and never
         # inherit this value implicitly.
-        if self.vertical is not None and "source_reuse_mode" in self.vertical.model_fields_set and (
-            self.vertical.source_reuse_mode != self.source_reuse_mode
-            or self.vertical.source_reuse_justification
-            != self.source_reuse_justification
+        primary_audit_decision = self.vertical or self.horizontal
+        if (
+            primary_audit_decision is not None
+            and "source_reuse_mode" in primary_audit_decision.model_fields_set
+            and (
+                primary_audit_decision.source_reuse_mode != self.source_reuse_mode
+                or primary_audit_decision.source_reuse_justification
+                != self.source_reuse_justification
+            )
         ):
             raise ValueError(
-                "primary vertical reuse authority must match the chapter audit mirror"
+                "selected primary reuse authority must match the chapter audit mirror"
             )
         if self.evidence_status == "not_found":
             if (
@@ -1243,6 +1321,69 @@ def direct_video_aspect_contract_instructions(
     )
 
 
+def project_direct_video_prompt_payload(
+    payload: Any,
+    *,
+    requested_aspects: tuple[str, ...] | list[str] | frozenset[str],
+) -> Any:
+    """Remove inactive-aspect fields before the Gemini planning prompt.
+
+    The persisted models retain legacy mirrors for both outputs, but a
+    single-aspect planner must not be distracted by a second aspect's brief
+    requirements.  This only projects prompt context; it never changes the
+    persisted brief or candidate evidence.
+    """
+
+    requested = normalize_direct_video_requested_aspects(requested_aspects)
+    if "9:16" in requested:
+        return payload
+    if isinstance(payload, dict):
+        return {
+            key: project_direct_video_prompt_payload(
+                value,
+                requested_aspects=requested,
+            )
+            for key, value in payload.items()
+            if "vertical" not in key.lower()
+        }
+    if isinstance(payload, list):
+        return [
+            project_direct_video_prompt_payload(
+                value,
+                requested_aspects=requested,
+            )
+            for value in payload
+        ]
+    return payload
+
+
+def direct_video_horizontal_only_prompt_instructions() -> str:
+    """Return the compact prompt contract for an exclusive 16:9 delivery."""
+
+    return """## 已簽署 16:9 planning contract（最高優先）
+本次只規劃 16:9。每個 supported／partial chapter 必須回傳一個非 null
+`horizontal` primary，並在 `horizontal_alternates` 逐一描述所有其餘附有
+bounded candidate video 的 rank。每個 not_found chapter 沒有剪輯決定。
+所有 schema 的 required nullable keys 都必須明確帶齊 null 或 []，不得省略。
+
+每個 `horizontal` 與其 alternates 都必須填寫：
+- `strategy`、`zoom_intent`、`camera_intent` 和必要時的可見
+  `focus_entity_index`；original 必須保持原構圖與 hold，tracked_reframe 才能
+  對單一可見主體做有目的的推近或跟隨。
+- `source_camera_motion_role`、`source_camera_motion_reason`：這是對原始素材
+  已存在鏡頭運動的觀察，不授權增加運鏡。畫面可見穩定 hold 時選
+  static_or_negligible；可見移動必須判斷為 editorially useful 或 incidental /
+  unwanted，無法判定才可用 unknown。本機只會量測，strict delivery 會拒絕
+  可靠量到非微小運動卻仍標 unknown 的未決語意。
+- `source_reuse_mode`、`source_reuse_justification`：每個 candidate 的重用權限
+  都是獨立的。若 source 已被前章 primary 使用，只能用明確 typed mode 和可觀察
+  的編輯理由；不得假設本機會自動放行。
+
+primary 是本次唯一初始路由；`horizontal_alternates` 僅能在一個有界的 Gemini
+scoped replan 中使用，不能讓本機依分數、時長或風險自行換片。不要輸出座標、
+bbox、mask、精確時間、倍率、速度或 easing。"""
+
+
 def direct_video_response_schema(
     requested_aspects: tuple[str, ...] | list[str] | frozenset[str],
 ) -> dict[str, Any]:
@@ -1288,6 +1429,26 @@ def direct_video_response_schema(
             else "Must be an empty array because 9:16 is not requested."
         )
     )
+    # These conditional semantic authorities must be explicit in provider
+    # output even though the persisted Pydantic models retain defaults for
+    # backwards-compatible artifact replay.  Otherwise a schema-minimizing
+    # response silently becomes ``unknown``/``none`` and only fails much
+    # later, after selected-window work has already started.
+    for decision_name in (
+        "DirectVideoHorizontalDecision",
+        "DirectVideoVerticalDecision",
+    ):
+        decision_schema = schema["$defs"][decision_name]
+        required = list(decision_schema.get("required", []))
+        for field_name in (
+            "source_camera_motion_role",
+            "source_camera_motion_reason",
+            "source_reuse_mode",
+            "source_reuse_justification",
+        ):
+            if field_name not in required:
+                required.append(field_name)
+        decision_schema["required"] = required
     return schema
 
 
@@ -1770,8 +1931,18 @@ def validate_direct_video_source_allocation(
                 )
             candidate = candidates[decision.candidate_rank - 1]
             source_rows = seen.setdefault(candidate.source_asset_id, [])
+            reuse_mode = (
+                decision.source_reuse_mode
+                if "source_reuse_mode" in decision.model_fields_set
+                else direct_chapter.source_reuse_mode
+            )
+            reuse_justification = (
+                decision.source_reuse_justification
+                if "source_reuse_mode" in decision.model_fields_set
+                else direct_chapter.source_reuse_justification
+            )
             if source_rows:
-                if direct_chapter.source_reuse_mode == "none":
+                if reuse_mode == "none":
                     raise ValueError(
                         "direct plan repeats a primary source without Gemini "
                         f"reuse authority for {aspect}: "
@@ -1780,20 +1951,20 @@ def validate_direct_video_source_allocation(
                     )
                 if (
                     policy is not None
-                    and direct_chapter.source_reuse_mode
+                    and reuse_mode
                     not in policy.editorial.allow_source_reuse
                 ):
                     raise ValueError(
                         "direct plan uses a source-reuse mode forbidden by "
                         f"the autonomous policy for {aspect}: "
-                        f"{direct_chapter.source_reuse_mode}"
+                        f"{reuse_mode}"
                     )
             source_rows.append(
                 (
                     shortlist_chapter.feature_id,
                     candidate.event_id,
-                    direct_chapter.source_reuse_mode,
-                    direct_chapter.source_reuse_justification,
+                    reuse_mode,
+                    reuse_justification,
                 )
             )
 
@@ -1955,18 +2126,28 @@ def canonicalize_direct_video_edit_plan_output(
                 )
         if chapter.get("evidence_status") == "not_found":
             continue
-        vertical_decisions: list[tuple[str, dict[str, Any]]] = []
+        candidate_decisions: list[tuple[str, dict[str, Any]]] = []
+        primary_horizontal = chapter.get("horizontal")
+        if isinstance(primary_horizontal, dict):
+            candidate_decisions.append(("horizontal", primary_horizontal))
+        horizontal_alternates = chapter.get("horizontal_alternates")
+        if isinstance(horizontal_alternates, list):
+            candidate_decisions.extend(
+                (f"horizontal_alternates[{alternate_index}]", alternate)
+                for alternate_index, alternate in enumerate(horizontal_alternates)
+                if isinstance(alternate, dict)
+            )
         primary_vertical = chapter.get("vertical")
         if isinstance(primary_vertical, dict):
-            vertical_decisions.append(("vertical", primary_vertical))
+            candidate_decisions.append(("vertical", primary_vertical))
         alternates = chapter.get("vertical_alternates")
         if isinstance(alternates, list):
-            vertical_decisions.extend(
+            candidate_decisions.extend(
                 (f"vertical_alternates[{alternate_index}]", alternate)
                 for alternate_index, alternate in enumerate(alternates)
                 if isinstance(alternate, dict)
             )
-        for decision_path, decision in vertical_decisions:
+        for decision_path, decision in candidate_decisions:
             decision_base = f"chapters[{chapter_index}].{decision_path}"
             source_motion_role = decision.get("source_camera_motion_role")
             source_motion_reason = decision.get("source_camera_motion_reason")
@@ -2257,9 +2438,19 @@ def canonicalize_direct_video_edit_plan_output(
         # truth.  The chapter field exists solely for old render/audit
         # compatibility, so synchronize the mirror deterministically rather
         # than allowing an alternate to inherit it.
-        if isinstance(primary_vertical, dict) and "source_reuse_mode" in primary_vertical:
-            primary_reuse_mode = primary_vertical.get("source_reuse_mode")
-            primary_reuse_reason = primary_vertical.get("source_reuse_justification")
+        primary_audit_decision = (
+            primary_vertical
+            if isinstance(primary_vertical, dict)
+            else primary_horizontal
+        )
+        if (
+            isinstance(primary_audit_decision, dict)
+            and "source_reuse_mode" in primary_audit_decision
+        ):
+            primary_reuse_mode = primary_audit_decision.get("source_reuse_mode")
+            primary_reuse_reason = primary_audit_decision.get(
+                "source_reuse_justification"
+            )
             before_primary_mirror = {
                 "source_reuse_mode": chapter.get("source_reuse_mode"),
                 "source_reuse_justification": chapter.get("source_reuse_justification"),
@@ -3469,6 +3660,20 @@ def project_direct_video_edit_plan(
             horizontal_zoom_intent: Literal["none", "subtle", "detail"] = "none"
             horizontal_camera_intent: VirtualCameraIntent = "hold"
             horizontal_focus_entity_id: str | None = None
+            horizontal_source_camera_motion_role: Literal[
+                "static_or_negligible",
+                "editorially_useful",
+                "incidental_or_unwanted",
+                "unknown",
+            ] = "unknown"
+            horizontal_source_camera_motion_reason: str | None = None
+            horizontal_source_reuse_mode: Literal[
+                "none",
+                "distinct_interval",
+                "alternate_presentation",
+                "editorial_reprise",
+            ] = "none"
+            horizontal_source_reuse_justification: str | None = None
             vertical_strategy: Literal[
                 "tracked_crop", "fit_with_background"
             ] = "fit_with_background"
@@ -3527,6 +3732,18 @@ def project_direct_video_edit_plan(
                 horizontal_strategy = horizontal_candidate_decision.strategy
                 horizontal_zoom_intent = horizontal_candidate_decision.zoom_intent
                 horizontal_camera_intent = horizontal_candidate_decision.camera_intent
+                horizontal_source_camera_motion_role = (
+                    horizontal_candidate_decision.source_camera_motion_role
+                )
+                horizontal_source_camera_motion_reason = (
+                    horizontal_candidate_decision.source_camera_motion_reason
+                )
+                horizontal_source_reuse_mode = (
+                    horizontal_candidate_decision.source_reuse_mode
+                )
+                horizontal_source_reuse_justification = (
+                    horizontal_candidate_decision.source_reuse_justification
+                )
                 horizontal_focus_entity_id = (
                     resolve_entity_indices(
                         source_asset_id=shortlisted.source_asset_id,
@@ -3607,6 +3824,16 @@ def project_direct_video_edit_plan(
                     horizontal_zoom_intent=horizontal_zoom_intent,
                     horizontal_camera_intent=horizontal_camera_intent,
                     horizontal_focus_entity_id=horizontal_focus_entity_id,
+                    horizontal_source_camera_motion_role=(
+                        horizontal_source_camera_motion_role
+                    ),
+                    horizontal_source_camera_motion_reason=(
+                        horizontal_source_camera_motion_reason
+                    ),
+                    horizontal_source_reuse_mode=horizontal_source_reuse_mode,
+                    horizontal_source_reuse_justification=(
+                        horizontal_source_reuse_justification
+                    ),
                     horizontal_authorized=("16:9" in requested_aspects),
                     vertical_strategy=vertical_strategy,
                     vertical_authorized=("9:16" in requested_aspects),
@@ -3659,6 +3886,7 @@ def project_direct_video_edit_plan(
                     confidence=direct_chapter.confidence,
                 )
             )
+        audit_primary = vertical_primary if "9:16" in requested_aspects else horizontal_decision
         chapters.append(
             ClipCardFeatureSelectV3(
                 feature_id=brief_chapter.feature_id,
@@ -3681,9 +3909,15 @@ def project_direct_video_edit_plan(
                 ),
                 attention_observation=direct_chapter.attention_observation,
                 flow_intent=direct_chapter.flow_intent,
-                source_reuse_mode=direct_chapter.source_reuse_mode,
+                source_reuse_mode=(
+                    audit_primary.source_reuse_mode
+                    if "source_reuse_mode" in audit_primary.model_fields_set
+                    else direct_chapter.source_reuse_mode
+                ),
                 source_reuse_justification=(
-                    direct_chapter.source_reuse_justification
+                    audit_primary.source_reuse_justification
+                    if "source_reuse_mode" in audit_primary.model_fields_set
+                    else direct_chapter.source_reuse_justification
                 ),
             )
         )
@@ -4636,7 +4870,7 @@ def project_feature_contracts_v3(
                     for entity_id in vertical_primary.required_entity_ids
                 ],
                 quality_risks=quality_risks,
-                confidence=min(horizontal_primary.confidence, vertical_primary.confidence),
+                confidence=min(primary.confidence for primary in active_primaries),
                 recommended_duration_seconds=(
                     chapter.recommended_duration_seconds
                 ),
@@ -4663,6 +4897,18 @@ def project_feature_contracts_v3(
                         zoom_intent=candidate.horizontal_zoom_intent,
                         camera_intent=candidate.horizontal_camera_intent,
                         target_description=horizontal_target(candidate),
+                        source_camera_motion_role=(
+                            candidate.horizontal_source_camera_motion_role
+                        ),
+                        source_camera_motion_reason=(
+                            candidate.horizontal_source_camera_motion_reason
+                        ),
+                        source_reuse_mode=(
+                            candidate.horizontal_source_reuse_mode
+                        ),
+                        source_reuse_justification=(
+                            candidate.horizontal_source_reuse_justification
+                        ),
                         quality_risks=candidate.quality_risks,
                         confidence=candidate.confidence,
                     )
@@ -5488,6 +5734,10 @@ def main() -> int:
     direct_video_aspect_instruction = direct_video_aspect_contract_instructions(
         requested_direct_video_aspects
     )
+    direct_video_prompt_brief = project_direct_video_prompt_payload(
+        brief.model_dump(mode="json"),
+        requested_aspects=requested_direct_video_aspects,
+    )
     planning_media_resolution = (
         policy.media_resolution.candidate_reel_plan
         if policy is not None
@@ -5987,6 +6237,10 @@ reuse a saved feature plan implicitly. Rank candidates from the evidence and
 {"the actual music in this request" if music_path is not None else "the visible cadence, action completeness, and narrative flow; no music was supplied"}.
 """.strip()
     )
+    direct_video_prompt_evidence = project_direct_video_prompt_payload(
+        evidence,
+        requested_aspects=requested_direct_video_aspects,
+    )
     prompt = f"""
 你是 evidence-bound 的資深短影音挑帶剪輯師。請使用完整 Clip Card library，為使用者 brief 的每個 chapter 保留有排序的候選 take，再分別選出橫式與直式代表。你只能引用輸入列出的 source_asset_id、event_id、entity_id 與 RF frame_id。
 
@@ -6183,7 +6437,46 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
 {alternate_edit_rules}
 
 ## 每章可選的 bounded candidate 索引
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
+{json.dumps(direct_video_prompt_evidence, ensure_ascii=False, indent=2)}
+""".strip()
+        if requested_direct_video_aspects == ("16:9",):
+            # Do not merely prepend a high-priority warning to the dual-aspect
+            # prompt: lengthy 9:16 construction rules were still an active
+            # distraction for the model.  This is a genuine 16:9 projection.
+            prompt = f"""
+你是 evidence-bound 的資深短影音剪輯師。閱讀 brief、精簡候選索引，並觀看
+每個有 feature_id 與 candidate_rank 標籤的 bounded candidate video。
+{"並實際聆聽最後附上的完整音樂" if music_path is not None else "本次沒有附音樂；請依可見動作、資訊閱讀與敘事能量規劃視覺節奏，不得捏造節拍"}。
+你的任務是提出精簡剪輯意圖，不是產生剪點、座標或追蹤結果。
+
+{direct_video_horizontal_only_prompt_instructions()}
+
+每個 supported／partial chapter 也必須回傳選擇理由、直接可見的證據、風險、
+recommended_duration_seconds、duration_rationale、attention_observation 與
+flow_intent。依可見資訊、動作完整性、閱讀需求、情緒停留、重複壓力與音樂角色
+決定停留；所有 supported／partial chapters 的 maximum dwell 合計必須能覆蓋已簽署
+的全片最低時長。不要為湊秒而凍結、無理由重複或截斷未完成動作。
+
+候選 rank 必須直接複製該章候選索引中的整數，並保留 brief 的章節順序。不得輸出
+project_id、catalog_id、feature_id、asset/event/frame/candidate/entity ID、model
+provenance、MM:SS 以外時間、bbox、mask、crop center 或運鏡數值。
+
+contract_version 必須原樣回傳：direct-video-edit-plan-v2
+capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
+
+## 已簽署的成片時長範圍
+{policy.duration.model_dump_json(indent=2) if policy is not None else json.dumps({"target_seconds": brief.target_duration_seconds}, ensure_ascii=False)}
+
+## 使用者 brief
+{json.dumps(direct_video_prompt_brief, ensure_ascii=False, indent=2)}
+
+## Illustrative coverage authority
+{illustrative_coverage_instruction}
+
+{exact_event_selection_rules}
+
+## 每章可選的 bounded candidate 索引
+{json.dumps(direct_video_prompt_evidence, ensure_ascii=False, indent=2)}
 """.strip()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

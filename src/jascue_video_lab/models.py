@@ -4320,11 +4320,42 @@ class FeatureHorizontalCandidate(StrictModel):
     zoom_intent: Literal["none", "subtle", "detail"]
     camera_intent: VirtualCameraIntent = "hold"
     target_description: str | None = None
+    source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = "unknown"
+    source_camera_motion_reason: str | None = Field(default=None, max_length=300)
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
     quality_risks: list[str] = Field(default_factory=list)
     confidence: Confidence
 
     @model_validator(mode="after")
     def validate_geometry_intent(self) -> "FeatureHorizontalCandidate":
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "candidate reuse justification requires a non-none reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError("candidate reuse requires an observable justification")
+        if (
+            self.source_camera_motion_role != "unknown"
+            and not (self.source_camera_motion_reason or "").strip()
+        ):
+            raise ValueError(
+                "classified source-camera motion requires an observable reason"
+            )
         if self.strategy == "tracked_reframe":
             if self.zoom_intent == "none" or not self.target_description:
                 raise ValueError("tracked_reframe candidate requires zoom intent and target")

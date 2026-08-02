@@ -17977,6 +17977,49 @@ def _should_refine_selected_vertical_candidate(
     )
 
 
+def _validate_horizontal_source_camera_motion_declaration(
+    *,
+    role: str,
+    evidence: SourceCameraMotionEvidence,
+) -> None:
+    """Fail closed on a strict semantic/metered-motion contradiction.
+
+    The local estimator reports only photographed geometry.  It cannot decide
+    whether a move is useful storytelling or incidental shake, so a reliable
+    non-static measurement needs Gemini's explicit role before strict delivery
+    may proceed.  Conversely, it must not accept a declared useful/incidental
+    move when the measured take is reliably static.  This is a compatibility
+    check, not a local rewrite of the planner's intent.
+    """
+
+    if not evidence.reliable:
+        return
+    measured_non_negligible = evidence.classification != "static"
+    if measured_non_negligible and role == "unknown":
+        raise CandidateKnownInfeasible(
+            "reliable non-static horizontal source-camera motion needs a "
+            "Gemini source_camera_motion_role"
+        )
+    if measured_non_negligible and role == "static_or_negligible":
+        raise CandidateKnownInfeasible(
+            "Gemini marked horizontal source-camera motion static but local "
+            "measurement found a non-static move"
+        )
+    if measured_non_negligible and role == "incidental_or_unwanted":
+        raise CandidateKnownInfeasible(
+            "Gemini marked measured horizontal source-camera motion "
+            "incidental or unwanted"
+        )
+    if (
+        not measured_non_negligible
+        and role in {"editorially_useful", "incidental_or_unwanted"}
+    ):
+        raise CandidateKnownInfeasible(
+            "Gemini declared horizontal source-camera motion but reliable "
+            "local measurement found a static take"
+        )
+
+
 def _prepare_horizontal_runtime_candidate(
     *,
     option: Mapping[str, Any],
@@ -18160,6 +18203,10 @@ def _prepare_horizontal_runtime_candidate(
             )
         debug = track_root / "grounding-debug.png"
     if audit_source_motion:
+        source_motion_role = str(
+            option.get("source_camera_motion_role", "unknown")
+        )
+        source_motion_reason = option.get("source_camera_motion_reason")
         source_motion_evidence = measure_source_camera_motion(
             source_path=Path(clip.path),
             source_asset_id=f"sha256:{clip.sha256}",
@@ -18188,6 +18235,13 @@ def _prepare_horizontal_runtime_candidate(
         geometry["source_camera_motion_evidence_sha256"] = (
             source_motion_evidence.definition_sha256
         )
+        geometry["source_camera_motion_role"] = source_motion_role
+        geometry["source_camera_motion_reason"] = source_motion_reason
+        if fail_on_quality_human_review:
+            _validate_horizontal_source_camera_motion_declaration(
+                role=source_motion_role,
+                evidence=source_motion_evidence,
+            )
     return {
         "option": dict(option),
         "frame": frame,

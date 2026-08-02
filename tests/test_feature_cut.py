@@ -76,6 +76,7 @@ from jascue_video_lab.feature_cut import (
     _runtime_candidate_reuse_violation,
     _source_reservation_precedes_candidate,
     _source_motion_delivery_failure,
+    _validate_horizontal_source_camera_motion_declaration,
     _source_motion_requirement_audited,
     _whole_source_fit_recovery_allowed,
     _candidate_asset_reference_matches,
@@ -11860,6 +11861,29 @@ def test_maskless_source_motion_preflight_rejects_only_reliable_jolt(
             window_start_ms=0,
             window_end_ms=1_000,
             output_dir=tmp_path / "jolt",
+        )
+
+
+def test_strict_horizontal_source_motion_uses_gemini_role_not_local_intent() -> None:
+    moving = SimpleNamespace(reliable=True, classification="pan_left")
+    _validate_horizontal_source_camera_motion_declaration(
+        role="editorially_useful",
+        evidence=moving,
+    )
+    with pytest.raises(CandidateKnownInfeasible, match="incidental or unwanted"):
+        _validate_horizontal_source_camera_motion_declaration(
+            role="incidental_or_unwanted",
+            evidence=moving,
+        )
+    with pytest.raises(CandidateKnownInfeasible, match="needs a Gemini"):
+        _validate_horizontal_source_camera_motion_declaration(
+            role="unknown",
+            evidence=moving,
+        )
+    with pytest.raises(CandidateKnownInfeasible, match="marked horizontal"):
+        _validate_horizontal_source_camera_motion_declaration(
+            role="static_or_negligible",
+            evidence=moving,
         )
 
 
