@@ -212,6 +212,35 @@ def test_shortlist_reuse_binding_changes_with_effective_evidence() -> None:
     ]
 
 
+def test_illustrative_coverage_policy_is_opt_in_and_binds_shortlist_input() -> None:
+    disabled = _brief()
+    enabled = disabled.model_copy(
+        update={
+            "illustrative_coverage_policy": (
+                "related_product_or_environment_when_direct_absent"
+            )
+        }
+    )
+    disabled_dump = disabled.model_dump(mode="json")
+    enabled_dump = enabled.model_dump(mode="json")
+
+    assert "illustrative_coverage_policy" not in disabled_dump
+    assert enabled_dump["illustrative_coverage_policy"] == (
+        "related_product_or_environment_when_direct_absent"
+    )
+    assert "illustrative_coverage_policy" in enabled.model_dump_json()
+    common = {
+        "catalog": _catalog(),
+        "editorial_contracts": (),
+        "evidence": [{"event_id": "demo"}],
+        "thinking_level": "low",
+    }
+    disabled_binding = _shortlist_input_binding(brief=disabled, **common)
+    enabled_binding = _shortlist_input_binding(brief=enabled, **common)
+
+    assert disabled_binding["brief_sha256"] != enabled_binding["brief_sha256"]
+
+
 def test_autonomous_planner_catalog_exposes_policy_gated_presentations() -> None:
     policy = AutonomousEditPolicy(
         execution_profile="autonomous_strict",

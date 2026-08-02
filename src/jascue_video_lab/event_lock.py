@@ -20,6 +20,7 @@ from .models import (
     DenseFrameCatalog,
     FeatureEvidenceProvenance,
     FrozenStrictModel,
+    IllustrativeCoveragePolicy,
     TrimIntentDecision,
 )
 from .media import sha256_file
@@ -372,6 +373,80 @@ class EditorialBeatContract(FrozenStrictModel):
                 visual_events=self.visual_events,
             ),
         )
+
+
+def compile_illustrative_coverage_contracts(
+    contracts: Sequence[EditorialBeatContract],
+    *,
+    policy: IllustrativeCoveragePolicy | None,
+) -> tuple[EditorialBeatContract, ...]:
+    """Compile an opted-in brief policy into bounded contextual fallbacks.
+
+    This is deliberately a contract compilation step instead of a planner-only
+    prompt hint: retrieval, global planning, and local execution therefore use
+    the same fulfillment floor.  The policy never weakens a hard beat.  A
+    preferred or optional beat retains every stronger existing alternative and
+    only gains a ``context_only`` illustrative fallback when it had none.
+    """
+
+    if policy is None:
+        return tuple(contracts)
+    if policy != "related_product_or_environment_when_direct_absent":
+        raise ValueError(f"unsupported illustrative coverage policy: {policy}")
+
+    compiled: list[EditorialBeatContract] = []
+    for contract in contracts:
+        if contract.priority == "hard" or any(
+            alternative.fulfillment_level == "contextual_identity"
+            for alternative in contract.effective_fulfillment_alternatives
+        ):
+            compiled.append(contract)
+            continue
+        compiled.append(
+            contract.model_copy(
+                update={
+                    "minimum_fulfillment_level": "contextual_identity",
+                    "fulfillment_alternatives": (
+                        *contract.effective_fulfillment_alternatives,
+                        EvidenceFulfillmentAlternative(
+                            fulfillment_level="contextual_identity",
+                            accepted_evidence_provenance=("context_only",),
+                            claim_support_level="illustrative_only",
+                            exact_event_requirement="none",
+                            degradation_codes=(
+                                "direct_evidence_unavailable",
+                                "contextual_visual_substitution",
+                            ),
+                            copy_suppression_codes=(
+                                "specific_claim_copy_suppressed",
+                            ),
+                        ),
+                    ),
+                }
+            )
+        )
+    return tuple(compiled)
+
+
+def illustrative_coverage_planning_instruction(
+    policy: IllustrativeCoveragePolicy | None,
+) -> str:
+    """State the typed fallback authority in retrieval and planning prompts."""
+
+    if policy is None:
+        return (
+            "本 brief 未授權以產品或環境空景替代直接畫面；空景只能作為不滿足 "
+            "任何 EditorialBeatContract 的非 claim 過場。"
+        )
+    if policy != "related_product_or_environment_when_direct_absent":
+        raise ValueError(f"unsupported illustrative coverage policy: {policy}")
+    return (
+        "本 brief 授權：只有沒有直接對應畫面時，才可使用與該 chapter 主體或情境 "
+        "相關的產品空景或環境空景作 illustrative coverage。它只能滿足已編譯的 "
+        "preferred/optional contextual_identity alternative；不得冒充直接功能證據、"
+        "動作、狀態轉換或結果，不得取代 hard evidence。選到此 tier 時必須保留 "
+        "contextual_visual_substitution 與 specific_claim_copy_suppressed。"
+    )
 
 
 def select_strongest_evidence_fulfillment(

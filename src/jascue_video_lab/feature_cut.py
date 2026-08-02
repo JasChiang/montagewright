@@ -63,6 +63,7 @@ from .event_lock import (
     bind_grouped_event_lock_ids,
     bind_selected_fulfillment,
     build_cue_alignment_evidence,
+    compile_illustrative_coverage_contracts,
     exact_event_resolver_binding_sha256,
     hard_exact_event_requirements_satisfied,
     load_editorial_beat_contracts,
@@ -23478,6 +23479,10 @@ def _run_feature_cut_experiment_impl(
             raise ValueError("autonomous policy profile differs from feature-cut")
         editorial_templates = load_editorial_beat_contracts(
             editorial_beat_contracts_path
+        )
+        editorial_templates = compile_illustrative_coverage_contracts(
+            editorial_templates,
+            policy=brief.illustrative_coverage_policy,
         )
         for contract in editorial_templates:
             policy_tolerance = sync_tolerance_for_priority(

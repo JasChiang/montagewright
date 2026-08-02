@@ -29,6 +29,8 @@ from jascue_video_lab.gemini import MODEL_ID, _raw_dump
 from jascue_video_lab.event_lock import (
     EditorialBeatContract,
     EvidenceFulfillmentObservation,
+    compile_illustrative_coverage_contracts,
+    illustrative_coverage_planning_instruction,
     load_editorial_beat_contracts,
     select_strongest_evidence_fulfillment,
 )
@@ -187,6 +189,15 @@ def main() -> int:
         if args.editorial_beat_contracts is not None
         else ()
     )
+    editorial_contracts = compile_illustrative_coverage_contracts(
+        editorial_contracts,
+        policy=brief.illustrative_coverage_policy,
+    )
+    illustrative_coverage_instruction = (
+        illustrative_coverage_planning_instruction(
+            brief.illustrative_coverage_policy
+        )
+    )
     cards: dict[str, FullClipCard] = {}
     for clip in catalog.clips:
         card_path = (
@@ -247,6 +258,7 @@ frame、bbox、crop、剪點或最終排名。
    合法 alternative 時才能滿足該 tier。retrieval_reason 必須標明它是 illustrative
    evidence、缺少哪些 predicate，以及禁止哪些具體 claim。只有所有候選都低於
    minimum_fulfillment_level 時，hard beat 才是 not_found。
+10. {illustrative_coverage_instruction}
 
 contract_version 必須原樣回傳：clip-card-feature-shortlist-v1
 project_id 必須原樣回傳：{brief.project_id}

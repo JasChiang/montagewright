@@ -58,6 +58,8 @@ from jascue_video_lab.event_lock import (
     EditorialBeatContract,
     EditorialBeatFulfillmentSelection,
     EvidenceFulfillmentObservation,
+    compile_illustrative_coverage_contracts,
+    illustrative_coverage_planning_instruction,
     load_editorial_beat_contracts,
     select_strongest_evidence_fulfillment,
 )
@@ -4940,6 +4942,15 @@ def main() -> int:
         if editorial_contracts_path is not None
         else ()
     )
+    editorial_contracts = compile_illustrative_coverage_contracts(
+        editorial_contracts,
+        policy=brief.illustrative_coverage_policy,
+    )
+    illustrative_coverage_instruction = (
+        illustrative_coverage_planning_instruction(
+            brief.illustrative_coverage_policy
+        )
+    )
     hard_protected_feature_ids = frozenset(
         contract.feature_id
         for contract in editorial_contracts
@@ -5516,6 +5527,9 @@ model_provenance 必須先原樣回傳：
 ## 使用者 brief
 {brief.model_dump_json(indent=2)}
 
+## Illustrative coverage authority
+{illustrative_coverage_instruction}
+
 {exact_event_selection_rules}
 
 ## {evidence_heading}
@@ -5661,6 +5675,9 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
 
 ## 使用者 brief
 {brief.model_dump_json(indent=2)}
+
+## Illustrative coverage authority
+{illustrative_coverage_instruction}
 
 {exact_event_selection_rules}
 

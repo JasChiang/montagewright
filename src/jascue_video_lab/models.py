@@ -23,6 +23,9 @@ FeatureEvidenceProvenance = Literal[
     "context_only",
     "unknown",
 ]
+IllustrativeCoveragePolicy = Literal[
+    "related_product_or_environment_when_direct_absent",
+]
 EvidenceRelation = Literal[
     "direct_source_event",
     "mediated_depiction",
@@ -4657,6 +4660,10 @@ class FeatureEditBrief(StrictModel):
     render_title_overlays: bool = True
     vertical_fallback_strategy: Literal["fit_with_background", "center_crop"] = (
         "center_crop"
+    )
+    illustrative_coverage_policy: IllustrativeCoveragePolicy | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
     )
     reframe_policy_binding: ReframePolicyBinding | None = None
     chapters: list[FeatureChapterBrief] = Field(min_length=1, max_length=16)

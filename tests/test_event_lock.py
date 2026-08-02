@@ -24,8 +24,10 @@ from jascue_video_lab.event_lock import (
     bind_editorial_contract_to_selected_evidence,
     bind_grouped_event_lock_ids,
     bind_selected_fulfillment,
+    compile_illustrative_coverage_contracts,
     exact_event_resolver_binding_sha256,
     hard_exact_event_requirements_satisfied,
+    illustrative_coverage_planning_instruction,
     load_editorial_beat_contracts,
     resolve_exact_event_locks,
     select_strongest_evidence_fulfillment,
@@ -607,6 +609,93 @@ def test_legacy_editorial_contract_remains_direct_exact_compatible() -> None:
     assert selected.fulfillment_level == "direct_demonstration"
     assert selected.exact_event_required is True
     assert selected.visual_events == beat.visual_events
+
+
+def test_illustrative_policy_compiles_only_preferred_contextual_fallbacks() -> None:
+    def legacy_contract(priority: str) -> EditorialBeatContract:
+        return EditorialBeatContract.model_validate(
+            {
+                "beat_id": f"{priority}-camera",
+                "feature_id": f"{priority}-feature",
+                "priority": priority,
+                "evidence_query_lock_sha256": "1" * 64,
+                "required_target_ids": ["product"],
+                "allowed_evidence_provenance": ["direct_physical_action"],
+                "narrative_function": "feature_evidence",
+                "visual_events": [
+                    {
+                        "event_type": "camera_gesture_apex",
+                        "cue_relation": "accent",
+                        "tolerance_frames": 2,
+                    }
+                ],
+                "duration": {
+                    "minimum_readable_frames": 12,
+                    "preferred_frames": 24,
+                    "maximum_frames": 48,
+                },
+                "relation_mode": "single_subject",
+                "allowed_reconstruction": ["continuous", "solid_fit"],
+            }
+        )
+
+    hard = legacy_contract("hard")
+    preferred = legacy_contract("preferred")
+    compiled = compile_illustrative_coverage_contracts(
+        (hard, preferred),
+        policy="related_product_or_environment_when_direct_absent",
+    )
+
+    assert compiled[0] is hard
+    assert compiled[1].minimum_fulfillment_level == "contextual_identity"
+    direct_selection = select_strongest_evidence_fulfillment(
+        compiled[1],
+        [
+            EvidenceFulfillmentObservation(
+                candidate_id="related-product-empty-shot",
+                evidence_provenance="context_only",
+                available_visual_event_types=(),
+            ),
+            EvidenceFulfillmentObservation(
+                candidate_id="direct-camera-gesture",
+                evidence_provenance="direct_physical_action",
+                available_visual_event_types=("camera_gesture_apex",),
+            ),
+        ],
+    )
+    assert direct_selection.candidate_id == "direct-camera-gesture"
+    assert direct_selection.fulfillment_level == "direct_demonstration"
+    selection = select_strongest_evidence_fulfillment(
+        compiled[1],
+        [
+            EvidenceFulfillmentObservation(
+                candidate_id="related-product-empty-shot",
+                evidence_provenance="context_only",
+                available_visual_event_types=(),
+            )
+        ],
+    )
+    assert selection.fulfillment_level == "contextual_identity"
+    assert selection.claim_support_level == "illustrative_only"
+    assert "contextual_visual_substitution" in selection.degradation_codes
+    assert "specific_claim_copy_suppressed" in selection.copy_suppression_codes
+    with pytest.raises(ValueError, match="hard-camera/direct_demonstration"):
+        select_strongest_evidence_fulfillment(
+            compiled[0],
+            [
+                EvidenceFulfillmentObservation(
+                    candidate_id="related-product-empty-shot",
+                    evidence_provenance="context_only",
+                    available_visual_event_types=(),
+                )
+            ],
+        )
+
+    instruction = illustrative_coverage_planning_instruction(
+        "related_product_or_environment_when_direct_absent"
+    )
+    assert "產品空景或環境空景" in instruction
+    assert "不得取代 hard evidence" in instruction
 
 
 def test_fulfillment_chooses_direct_before_contextual_fallback() -> None:
