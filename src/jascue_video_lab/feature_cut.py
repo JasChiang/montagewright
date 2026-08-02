@@ -14218,6 +14218,9 @@ def _build_pre_render_horizontal_candidate_route(
     rhythm_plan: RhythmPlan,
     duration_audit: Mapping[str, Any],
     policy: AutonomousEditPolicy,
+    candidate_timing_facts: Mapping[
+        tuple[str, str], Mapping[str, Any]
+    ],
 ) -> Any | None:
     """Bind the Gemini 16:9 primary; alternates require a scoped replan.
 
@@ -14247,8 +14250,48 @@ def _build_pre_render_horizontal_candidate_route(
         trim_duration_ms = round(
             chapter_durations[chapter.feature_id] * 1000
         )
-        all_options = tuple(
-            CandidateRouteOption(
+        def route_option(candidate: Any) -> CandidateRouteOption:
+            timing = candidate_timing_facts.get(
+                (chapter.feature_id, candidate.candidate_id),
+                {},
+            )
+            hard_failures: list[str] = []
+            timing_failure = timing.get("hard_failure")
+            if timing_failure is not None:
+                hard_failures.append(str(timing_failure))
+            if not timing:
+                hard_failures.append("missing_candidate_local_timing_fact")
+            elif timing_failure is None:
+                required_timing_fields = (
+                    "candidate_timing_sha256",
+                    "safe_window_start_ms",
+                    "safe_window_end_ms",
+                    "source_anchor_ms",
+                )
+                missing_timing_fields = tuple(
+                    field
+                    for field in required_timing_fields
+                    if timing.get(field) is None
+                )
+                if missing_timing_fields:
+                    hard_failures.append(
+                        "incomplete_candidate_local_timing_fact:"
+                        + ",".join(missing_timing_fields)
+                    )
+            safe_capacity_ms = (
+                int(timing["safe_capacity_ms"])
+                if timing.get("safe_capacity_ms") is not None
+                else None
+            )
+            if (
+                safe_capacity_ms is not None
+                and trim_duration_ms > safe_capacity_ms
+            ):
+                hard_failures.append(
+                    "candidate_capacity_below_resolved:"
+                    f"{safe_capacity_ms}<{trim_duration_ms}"
+                )
+            return CandidateRouteOption(
                 beat_id=chapter.feature_id,
                 candidate_id=candidate.candidate_id,
                 source_asset_id=candidate.source_asset_id,
@@ -14294,13 +14337,52 @@ def _build_pre_render_horizontal_candidate_route(
                     0.0,
                     1.0 - len(candidate.quality_risks) * 0.06,
                 ),
+                preflight_hard_failures=tuple(dict.fromkeys(hard_failures)),
+                source_clip_id=(
+                    str(timing["source_clip_id"])
+                    if timing.get("source_clip_id") is not None
+                    else None
+                ),
+                safe_capacity_ms=safe_capacity_ms,
+                safe_window_start_ms=(
+                    int(timing["safe_window_start_ms"])
+                    if timing.get("safe_window_start_ms") is not None
+                    else None
+                ),
+                safe_window_end_ms=(
+                    int(timing["safe_window_end_ms"])
+                    if timing.get("safe_window_end_ms") is not None
+                    else None
+                ),
+                source_anchor_ms=(
+                    int(timing["source_anchor_ms"])
+                    if timing.get("source_anchor_ms") is not None
+                    else None
+                ),
+                fixed_source_in_ms=(
+                    int(timing["fixed_source_in_ms"])
+                    if timing.get("fixed_source_in_ms") is not None
+                    else None
+                ),
+                fixed_source_out_ms=(
+                    int(timing["fixed_source_out_ms"])
+                    if timing.get("fixed_source_out_ms") is not None
+                    else None
+                ),
                 reuse_mode=getattr(candidate, "source_reuse_mode", "none"),
                 reuse_justification=getattr(
                     candidate,
                     "source_reuse_justification",
                     None,
                 ),
+                candidate_timing_sha256=(
+                    str(timing["candidate_timing_sha256"])
+                    if timing.get("candidate_timing_sha256") is not None
+                    else None
+                ),
             )
+        all_options = tuple(
+            route_option(candidate)
             for candidate in sorted(
                 chapter.horizontal_candidates,
                 key=lambda item: item.rank,
@@ -14316,6 +14398,7 @@ def _build_pre_render_horizontal_candidate_route(
         recovery_bindings[chapter.feature_id] = tuple(
             SemanticReplanCandidateBinding(option=option)
             for option in all_options
+            if not option.preflight_hard_failures
         )
         beats.append(
             CandidateRouteBeat(
@@ -22496,9 +22579,10 @@ def _selected_source_capacity_seconds(
     return capacities
 
 
-def _vertical_candidate_timing_facts(
+def _candidate_local_timing_facts(
     plan: FeatureEditPlan,
     *,
+    aspect: Literal["16:9", "9:16"],
     frames: Mapping[str, RushFrame],
     clips: Mapping[str, RushClip],
     shot_cache: dict[str, ShotManifest],
@@ -22508,7 +22592,7 @@ def _vertical_candidate_timing_facts(
     quality_maps: Sequence[tuple[Path, ShotQualityMap]],
     strict_quality: bool,
 ) -> dict[tuple[str, str], Mapping[str, Any]]:
-    """Measure every vertical Top-K candidate before paid execution.
+    """Measure every requested aspect's Top-K candidate before paid work.
 
     The result is candidate-local: unlike the legacy beat-capacity projection,
     no fallback inherits another take's duration.  Source interval and reuse
@@ -22517,6 +22601,9 @@ def _vertical_candidate_timing_facts(
     """
 
     facts: dict[tuple[str, str], Mapping[str, Any]] = {}
+    candidate_attribute = (
+        "horizontal_candidates" if aspect == "16:9" else "vertical_candidates"
+    )
     for selected in plan.chapters:
         minimum_duration_ms = max(
             1,
@@ -22529,7 +22616,7 @@ def _vertical_candidate_timing_facts(
                 * 1000
             ),
         )
-        for candidate in selected.vertical_candidates:
+        for candidate in getattr(selected, candidate_attribute):
             key = (selected.feature_id, candidate.candidate_id)
             try:
                 frame = frames[candidate.frame_id]
@@ -22686,6 +22773,7 @@ def _vertical_candidate_timing_facts(
                 continue
             definition = {
                 "contract_version": "candidate-local-timing-fact-v1",
+                "aspect": aspect,
                 "beat_id": selected.feature_id,
                 "candidate_id": candidate.candidate_id,
                 "source_asset_id": source_asset_id,
@@ -24869,8 +24957,9 @@ def _run_feature_cut_experiment_impl(
             output_dir / "vertical-candidate-timing-facts.json"
         )
         vertical_candidate_timing_facts = (
-            _vertical_candidate_timing_facts(
+            _candidate_local_timing_facts(
                 plan,
+                aspect="9:16",
                 frames=frames,
                 clips=clips,
                 shot_cache=shot_cache,
@@ -24885,6 +24974,29 @@ def _run_feature_cut_experiment_impl(
                 ),
             )
             if autonomous_profile and render_vertical
+            else {}
+        )
+        horizontal_candidate_timing_facts_path = (
+            output_dir / "horizontal-candidate-timing-facts.json"
+        )
+        horizontal_candidate_timing_facts = (
+            _candidate_local_timing_facts(
+                plan,
+                aspect="16:9",
+                frames=frames,
+                clips=clips,
+                shot_cache=shot_cache,
+                shots_dir=shots_dir,
+                scdet_threshold=scdet_threshold,
+                approved_decisions=trim_decisions,
+                quality_maps=shot_quality_maps,
+                strict_quality=(
+                    autonomous_policy is not None
+                    and autonomous_policy.execution_profile
+                    == "autonomous_strict"
+                ),
+            )
+            if autonomous_profile and render_horizontal
             else {}
         )
         if vertical_candidate_timing_facts:
@@ -24905,6 +25017,29 @@ def _run_feature_cut_experiment_impl(
                             candidate_id,
                         ), fact in sorted(
                             vertical_candidate_timing_facts.items()
+                        )
+                    ],
+                    "generated_at": utc_now(),
+                },
+            )
+        if horizontal_candidate_timing_facts:
+            write_json(
+                horizontal_candidate_timing_facts_path,
+                {
+                    "contract_version": (
+                        "horizontal-candidate-timing-facts-v1"
+                    ),
+                    "candidates": [
+                        {
+                            "feature_id": feature_id,
+                            "candidate_id": candidate_id,
+                            **dict(fact),
+                        }
+                        for (
+                            feature_id,
+                            candidate_id,
+                        ), fact in sorted(
+                            horizontal_candidate_timing_facts.items()
                         )
                     ],
                     "generated_at": utc_now(),
@@ -24944,6 +25079,30 @@ def _run_feature_cut_experiment_impl(
                         vertical_capacity,
                     ),
                     vertical_capacity,
+                )
+        if horizontal_candidate_timing_facts:
+            horizontal_capacity_by_feature: dict[str, float] = {}
+            for (feature_id, _candidate_id), fact in (
+                horizontal_candidate_timing_facts.items()
+            ):
+                if fact.get("hard_failure") is not None:
+                    continue
+                capacity_ms = fact.get("safe_capacity_ms")
+                if capacity_ms is None:
+                    continue
+                horizontal_capacity_by_feature[feature_id] = max(
+                    horizontal_capacity_by_feature.get(feature_id, 0.0),
+                    int(capacity_ms) / 1000,
+                )
+            for feature_id, horizontal_capacity in (
+                horizontal_capacity_by_feature.items()
+            ):
+                source_capacity_seconds[feature_id] = min(
+                    source_capacity_seconds.get(
+                        feature_id,
+                        horizontal_capacity,
+                    ),
+                    horizontal_capacity,
                 )
         fixed_duration_seconds = _selected_fixed_trim_durations_seconds(
             plan,
@@ -25586,6 +25745,7 @@ def _run_feature_cut_experiment_impl(
                 rhythm_plan=rhythm_plan,
                 duration_audit=duration_audit,
                 policy=autonomous_policy,
+                candidate_timing_facts=horizontal_candidate_timing_facts,
             )
             if autonomous_profile and render_horizontal
             else None
@@ -25622,6 +25782,18 @@ def _run_feature_cut_experiment_impl(
                     ),
                     "feature_plan_sha256": sha256_file(plan_path),
                     "aspect": "16:9",
+                    "candidate_timing_facts_sha256": (
+                        sha256_file(horizontal_candidate_timing_facts_path)
+                        if horizontal_candidate_timing_facts_path.is_file()
+                        else None
+                    ),
+                    "interpretation": (
+                        "Every initial primary and recovery-only alternate "
+                        "carries its own pre-render quality-safe source "
+                        "timing fact. Runtime must validate the bound "
+                        "candidate timing/execution SHA and may not recenter "
+                        "or locally promote an alternate."
+                    ),
                     "generated_at": utc_now(),
                 },
             )

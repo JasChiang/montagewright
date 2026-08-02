@@ -4749,6 +4749,28 @@ def test_horizontal_pre_render_route_locks_gemini_primary(
                 max_editorial_reprise_overlap_fraction=0.2
             ),
         ),
+        candidate_timing_facts={
+            ("feature-1", "rank-01"): {
+                "candidate_timing_sha256": "a" * 64,
+                "source_clip_id": "clip-01",
+                "safe_capacity_ms": 6_000,
+                "safe_window_start_ms": 0,
+                "safe_window_end_ms": 6_000,
+                "source_anchor_ms": 3_000,
+                "fixed_source_in_ms": None,
+                "fixed_source_out_ms": None,
+            },
+            ("feature-1", "rank-02"): {
+                "candidate_timing_sha256": "b" * 64,
+                "source_clip_id": "clip-02",
+                "safe_capacity_ms": 6_000,
+                "safe_window_start_ms": 0,
+                "safe_window_end_ms": 6_000,
+                "source_anchor_ms": 3_000,
+                "fixed_source_in_ms": None,
+                "fixed_source_out_ms": None,
+            },
+        },
     ) == "primary-only-route"
     beats = captured["beats"]
     assert len(beats[0].options) == 1
@@ -4965,6 +4987,28 @@ def test_horizontal_route_keeps_alternates_only_in_replan_bindings(
                 max_editorial_reprise_overlap_fraction=0.2
             ),
         ),
+        candidate_timing_facts={
+            ("feature-1", "rank-01"): {
+                "candidate_timing_sha256": "a" * 64,
+                "source_clip_id": "clip-01",
+                "safe_capacity_ms": 6_000,
+                "safe_window_start_ms": 0,
+                "safe_window_end_ms": 6_000,
+                "source_anchor_ms": 3_000,
+                "fixed_source_in_ms": None,
+                "fixed_source_out_ms": None,
+            },
+            ("feature-1", "rank-02"): {
+                "candidate_timing_sha256": "b" * 64,
+                "source_clip_id": "clip-02",
+                "safe_capacity_ms": 6_000,
+                "safe_window_start_ms": 0,
+                "safe_window_end_ms": 6_000,
+                "source_anchor_ms": 3_000,
+                "fixed_source_in_ms": None,
+                "fixed_source_out_ms": None,
+            },
+        },
     )
 
     assert route.fallback_candidate_ids_by_beat["feature-1"] == ("rank-01",)
@@ -4973,6 +5017,19 @@ def test_horizontal_route_keeps_alternates_only_in_replan_bindings(
         binding.option.candidate_id
         for binding in route.semantic_replan_candidate_bindings_by_beat["feature-1"]
     ] == ["rank-01", "rank-02"]
+    assert route.option_bindings_by_beat["feature-1"][
+        "rank-01"
+    ].candidate_timing_sha256 == "a" * 64
+    assert [
+        binding.option.candidate_timing_sha256
+        for binding in route.semantic_replan_candidate_bindings_by_beat["feature-1"]
+    ] == ["a" * 64, "b" * 64]
+    assert all(
+        binding.option.safe_window_start_ms is not None
+        and binding.option.safe_window_end_ms is not None
+        and binding.option.source_anchor_ms is not None
+        for binding in route.semantic_replan_candidate_bindings_by_beat["feature-1"]
+    )
 
 
 def test_horizontal_replan_context_only_resumes_same_journal_run(
@@ -5192,6 +5249,87 @@ def test_horizontal_preflight_measures_selected_primary_not_alternate(
     summary = read_json(tmp_path / "horizontal-primary-preflight" / "summary.json")
     assert summary["alternates_prepared"] is False
     assert summary["all_selected_primaries_checked_before_render"] is True
+
+
+def test_generic_candidate_timing_facts_bind_horizontal_top_k_before_route(
+    tmp_path: Path,
+) -> None:
+    """Horizontal candidates use the same source-time fact extractor as 9:16."""
+
+    clip = RushClip(
+        clip_id="clip-1",
+        path="/tmp/source.mp4",
+        sha256="a" * 64,
+        duration_ms=10_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=1,
+    )
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id=clip.clip_id,
+        requested_time_ms=5_000,
+        image_path="/tmp/frame.jpg",
+    )
+    candidate = SimpleNamespace(
+        candidate_id="rank-01",
+        frame_id=frame.frame_id,
+        source_asset_id=f"sha256:{clip.sha256}",
+        event_id="event-1",
+    )
+    plan = SimpleNamespace(
+        chapters=(
+            SimpleNamespace(
+                feature_id="hero",
+                attention_observation=None,
+                horizontal_candidates=(candidate,),
+                vertical_candidates=(),
+            ),
+        )
+    )
+    shot_cache = {
+        clip.clip_id: ShotManifest(
+            video_path=clip.path,
+            duration_ms=clip.duration_ms,
+            detector="test",
+            threshold=4.0,
+            generated_at="2026-08-02T00:00:00Z",
+            boundaries=[],
+            shots=[
+                ShotSegment(
+                    shot_id="shot-0001",
+                    start_time_ms=0,
+                    end_time_ms=10_000,
+                    start_frame_pts=0,
+                    boundary_source="video_start",
+                    boundary_score=None,
+                )
+            ],
+        )
+    }
+
+    facts = feature_cut_module._candidate_local_timing_facts(
+        plan,
+        aspect="16:9",
+        frames={frame.frame_id: frame},
+        clips={clip.clip_id: clip},
+        shot_cache=shot_cache,
+        shots_dir=tmp_path / "shots",
+        scdet_threshold=4.0,
+        approved_decisions=(),
+        quality_maps=(),
+        strict_quality=True,
+    )
+
+    fact = facts[("hero", "rank-01")]
+    assert fact["aspect"] == "16:9"
+    assert fact["source_clip_id"] == clip.clip_id
+    assert fact["safe_window_start_ms"] == 0
+    assert fact["safe_window_end_ms"] == 10_000
+    assert fact["source_anchor_ms"] == 5_000
+    assert isinstance(fact["candidate_timing_sha256"], str)
+    assert len(fact["candidate_timing_sha256"]) == 64
 
 
 def test_horizontal_preflight_collects_hard_fulfillment_failure(
