@@ -15,6 +15,7 @@ from jascue_video_lab.autonomous_policy import (
     DurationPolicy,
 )
 from jascue_video_lab.billing import (
+    BudgetExceeded,
     BudgetLedger,
     PaidDispatchAlreadyRecorded,
     summarize_usage_and_list_price,
@@ -213,6 +214,19 @@ def _retained_grouped_reuse_authority() -> dict[str, dict[str, dict[str, str]]]:
     }
 
 
+def _legacy_execution_binding_arguments(
+    option_id: str,
+) -> dict[str, Any]:
+    return {
+        "decisions": [
+            {
+                "beat_id": "fold",
+                "selected_execution_option_id": option_id,
+            }
+        ]
+    }
+
+
 def _grouped_client_with_responses(
     responses: list[dict[str, Any]] | None = None,
 ) -> tuple[GeminiLabClient, list[dict[str, Any]]]:
@@ -232,6 +246,159 @@ def _grouped_client_with_responses(
     )
     client.client = SimpleNamespace(interactions=SimpleNamespace(create=create))
     return client, requests
+
+
+def test_legacy_execution_binding_repair_is_text_only_and_reuses_raw(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "legacy-execution-binding-repair"
+    option_a = "fold--fold-2--execution-" + "a" * 64
+    option_b = "fold--fold-2--execution-" + "b" * 64
+    client, requests = _grouped_client_with_responses(
+        [
+            _grouped_interaction(
+                "legacy-binding",
+                function_name="bind_legacy_execution_options",
+                arguments=_legacy_execution_binding_arguments(option_b),
+            )
+        ]
+    )
+    kwargs = {
+        "option_ids_by_beat": {"fold": (option_a, option_b)},
+        "prompt": (
+            "TEXT-ONLY-CONTEXT: source timestamps and local preflight facts; "
+            "do not request visual inputs."
+        ),
+        "policy": _grouped_semantic_policy(),
+        "run_dir": run_dir,
+    }
+
+    result = client.repair_legacy_execution_bindings(**kwargs)
+    resumed = client.repair_legacy_execution_bindings(**kwargs)
+
+    assert result.interaction_ids == ("legacy-binding",)
+    assert resumed.decision.decisions[0].selected_execution_option_id == option_b
+    assert len(requests) == 1
+    request = requests[0]
+    assert [item["type"] for item in request["input"]] == ["text"]
+    assert request["tools"][0]["name"] == "bind_legacy_execution_options"
+    assert request["input"][0]["text"].count(option_a) == 1
+    assert request["input"][0]["text"].count(option_b) == 1
+    assert "image" not in request["input"][0]
+    assert "video" not in request["input"][0]
+    accounting = client.budget_ledger.report()["stages"][
+        "legacy_execution_binding_repair"
+    ]
+    assert accounting["reserved_interactions"] == 1
+    assert accounting["actual_cost_usd"] > 0
+
+
+def test_legacy_execution_binding_repair_rejects_unknown_without_retry(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "unknown-binding"
+    option = "fold--fold-2--execution-" + "a" * 64
+    client, requests = _grouped_client_with_responses(
+        [
+            _grouped_interaction(
+                "unknown-binding",
+                function_name="bind_legacy_execution_options",
+                arguments=_legacy_execution_binding_arguments(
+                    "fold--fold-2--execution-" + "f" * 64
+                ),
+            )
+        ]
+    )
+    kwargs = {
+        "option_ids_by_beat": {"fold": (option,)},
+        "prompt": "text only",
+        "policy": _grouped_semantic_policy(),
+        "run_dir": run_dir,
+    }
+
+    with pytest.raises(ValueError, match="refusing a second provider call"):
+        client.repair_legacy_execution_bindings(**kwargs)
+    with pytest.raises(ValueError, match="refusing a second provider call"):
+        client.repair_legacy_execution_bindings(**kwargs)
+
+    assert len(requests) == 1
+    invalid = json.loads(
+        (run_dir / "legacy_execution_binding_repair.invalid.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert invalid["provider_follow_up_dispatched"] is False
+
+
+def test_legacy_execution_binding_repair_has_no_fixed_beat_cap(
+    tmp_path: Path,
+) -> None:
+    options = {
+        f"beat-{index}": (f"beat-{index}--candidate--execution-{index:064x}",)
+        for index in range(9)
+    }
+    arguments = {
+        "decisions": [
+            {
+                "beat_id": beat_id,
+                "selected_execution_option_id": option_ids[0],
+            }
+            for beat_id, option_ids in options.items()
+        ]
+    }
+    client, requests = _grouped_client_with_responses(
+        [
+            _grouped_interaction(
+                "nine-legacy-bindings",
+                function_name="bind_legacy_execution_options",
+                arguments=arguments,
+            )
+        ]
+    )
+
+    result = client.repair_legacy_execution_bindings(
+        option_ids_by_beat=options,
+        prompt="text-only exact execution bindings",
+        policy=_grouped_semantic_policy(),
+        run_dir=tmp_path / "many-bindings",
+    )
+
+    assert len(result.decision.decisions) == 9
+    assert len(requests) == 1
+
+
+def test_legacy_execution_binding_repair_is_bounded_by_budget_and_dispatch_journal(
+    tmp_path: Path,
+) -> None:
+    option = "fold--fold-2--execution-" + "a" * 64
+    kwargs = {
+        "option_ids_by_beat": {"fold": (option,)},
+        "prompt": "text only",
+        "policy": _grouped_semantic_policy(),
+    }
+
+    budget_client, budget_requests = _grouped_client_with_responses()
+    budget_client.budget_ledger = BudgetLedger(
+        max_cost_usd=0.00000001,
+        max_interactions=10,
+    )
+    with pytest.raises(BudgetExceeded, match="blocked before request"):
+        budget_client.repair_legacy_execution_bindings(
+            **kwargs,
+            run_dir=tmp_path / "budget-blocked",
+        )
+    assert budget_requests == []
+
+    unavailable_client, unavailable_requests = _grouped_client_with_responses()
+    unavailable_kwargs = {
+        **kwargs,
+        "run_dir": tmp_path / "service-unavailable",
+    }
+    with pytest.raises(RuntimeError, match="503"):
+        unavailable_client.repair_legacy_execution_bindings(**unavailable_kwargs)
+    with pytest.raises(PaidDispatchAlreadyRecorded):
+        unavailable_client.repair_legacy_execution_bindings(**unavailable_kwargs)
+    assert len(unavailable_requests) == 1
 
 
 def test_grouped_semantic_tool_schema_requires_explicit_reuse_fields() -> None:

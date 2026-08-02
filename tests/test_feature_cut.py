@@ -15,6 +15,7 @@ from jascue_video_lab.autonomous_policy import (
     AutonomousEditPolicy,
     BudgetPolicy,
     DurationPolicy,
+    authorize_decision,
 )
 from jascue_video_lab.billing import BudgetExceeded
 from jascue_video_lab.clip_card_observations import (
@@ -252,6 +253,47 @@ def _local_replan_option_id(
         if binding.option.candidate_id == candidate_id
     )
     return _prepared_replan_execution_option_id(_local_replan_execution(option))
+
+
+def _write_legacy_local_preflight_execution(
+    *,
+    editorial_dir: Path,
+    execution: CandidateRouteSelection,
+) -> Path:
+    path = (
+        editorial_dir.parent
+        / "production-frontier"
+        / "9x16"
+        / execution.beat_id
+        / execution.candidate_id
+        / f"execution-{execution.candidate_execution_sha256}"
+        / "local.json"
+    )
+    write_json(
+        path,
+        {
+            "contract_version": "vertical-frontier-stage-artifact-v1",
+            "beat_id": execution.beat_id,
+            "candidate_id": execution.candidate_id,
+            "candidate_execution_sha256": execution.candidate_execution_sha256,
+            "stage": "local_preflight",
+            "definition_sha256": "d" * 64,
+            "binding_sha256": "b" * 64,
+            "payload": {
+                "candidate_execution_sha256": (
+                    execution.candidate_execution_sha256
+                ),
+                "source_motion_definition_sha256": "m" * 64,
+                "query_lock_definition_sha256": "q" * 64,
+                "option": {
+                    "_pre_render_execution_binding": execution.model_dump(
+                        mode="json"
+                    )
+                },
+            },
+        },
+    )
+    return path
 
 
 def test_local_preflight_failure_requires_gemini_route_rebuild(
@@ -777,6 +819,242 @@ def test_local_replan_selects_one_of_multiple_prepared_executions_for_candidate(
             plan_path=plan_path,
             chapter_durations={"opening": 13.25, "fold": 6.0, "ending": 13.25},
         )
+
+
+def test_legacy_local_replan_repairs_ambiguous_execution_binding_once(
+    tmp_path: Path,
+) -> None:
+    """A v1 candidate decision may be repaired only by selecting local facts."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    fold = CandidateRouteOption(
+        beat_id="fold",
+        candidate_id="fold-2",
+        source_asset_id="sha256:" + "c" * 64,
+        source_clip_id="clip-c",
+        event_id="event-fold-2",
+        planner_rank=2,
+        semantic_confidence=0.9,
+        trim_duration_ms=10_000,
+        minimum_readable_ms=10_000,
+        preferred_readable_ms=10_000,
+        maximum_readable_ms=10_000,
+        safe_capacity_ms=20_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=20_000,
+        source_anchor_ms=10_000,
+        candidate_timing_sha256="c" * 64,
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(
+                beat_id="opening",
+                options=(_local_replan_option("opening", "open", "a", rank=1),),
+            ),
+            CandidateRouteBeat(beat_id="fold", options=(fold,)),
+            CandidateRouteBeat(
+                beat_id="ending",
+                options=(_local_replan_option("ending", "end", "d", rank=1),),
+            ),
+        ),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    )
+
+    def execution(source_in_ms: int) -> CandidateRouteSelection:
+        return CandidateRouteSelection(
+            beat_id=fold.beat_id,
+            candidate_id=fold.candidate_id,
+            source_asset_id=fold.source_asset_id,
+            event_id=fold.event_id,
+            trim_duration_ms=10_000,
+            cue_id=fold.cue_id,
+            cue_aligned=fold.cue_aligned,
+            presentation_mode=fold.presentation_mode,
+            entry_composition=fold.entry_composition,
+            exit_composition=fold.exit_composition,
+            decision_codes=("legacy-local-preflight",),
+            source_clip_id=fold.source_clip_id,
+            source_in_ms=source_in_ms,
+            source_out_ms=source_in_ms + 10_000,
+            candidate_execution_sha256=candidate_route_execution_sha256(
+                fold,
+                duration_ms=10_000,
+                source_in_ms=source_in_ms,
+                source_out_ms=source_in_ms + 10_000,
+            ),
+        )
+
+    first = execution(2_000)
+    selected = execution(5_000)
+    first_option_id = _prepared_replan_execution_option_id(first)
+    selected_option_id = _prepared_replan_execution_option_id(selected)
+    editorial_dir = tmp_path / "editorial"
+    _write_legacy_local_preflight_execution(
+        editorial_dir=editorial_dir,
+        execution=first,
+    )
+    _write_legacy_local_preflight_execution(
+        editorial_dir=editorial_dir,
+        execution=selected,
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+    replan_root = editorial_dir / "preflight-local-infeasibility-replan"
+    context_path = replan_root / "context.json"
+    fold_binding = next(
+        binding.option
+        for binding in route.semantic_replan_candidate_bindings_by_beat["fold"]
+        if binding.option.candidate_id == "fold-2"
+    )
+    context = {
+        "contract_version": "preflight-local-infeasibility-replan-v1",
+        "policy_reference": policy.policy_reference,
+        "affected_beats": [
+            {
+                "beat_id": "fold",
+                "candidate_bindings": {
+                    "fold-2": {
+                        **fold_binding.model_dump(mode="json"),
+                        "replan_required_codes": [],
+                    }
+                },
+                "prepared_viable_candidate_ids": ["fold-2"],
+            }
+        ],
+        "whole_resolved_timeline": [
+            selection.model_dump(mode="json") for selection in route.selections
+        ],
+        "reuse_conflict_facts": [],
+        "music_context": {"supplied": False, "output_cues": []},
+    }
+    write_json(context_path, context)
+    original_authority = authorize_decision(
+        policy=policy,
+        decision_scope="scoped_semantic_replan",
+        input_artifact_hashes=(
+            "sha256:" + hashlib.sha256(context_path.read_bytes()).hexdigest(),
+            "sha256:" + hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+        ),
+        deterministic_gate_results={"legacy_candidate_choice": "passed"},
+        decision_codes=("legacy_candidate_choice",),
+        gemini_interaction_ids=("legacy-grouped-choice",),
+    )
+    write_json(
+        replan_root / "decision.json",
+        {
+            "contract_version": "preflight-local-infeasibility-replan-result-v1",
+            "context_sha256": hashlib.sha256(context_path.read_bytes()).hexdigest(),
+            "decisions": [
+                {
+                    "beat_id": "fold",
+                    "selected_option_id": "fold--fold-2",
+                    "fallback_option_ids": [],
+                    "semantic_reason": "preserve_readability",
+                    "unresolved_concern_codes": [],
+                    "source_reuse_mode": "none",
+                    "source_reuse_justification": None,
+                    "reuse_of_beat_ids": [],
+                }
+            ],
+            "gemini_interaction_ids": ["legacy-grouped-choice"],
+            "authority": original_authority.model_dump(mode="json"),
+        },
+    )
+
+    class RepairClient:
+        calls = 0
+
+        def repair_legacy_execution_bindings(self, **kwargs):
+            self.calls += 1
+            assert kwargs["option_ids_by_beat"] == {
+                "fold": tuple(sorted((first_option_id, selected_option_id)))
+            }
+            assert "no media inspection is authorized" in kwargs["prompt"]
+            repair_context = json.loads(kwargs["prompt"].split("\n\n", 1)[1])
+            projections = repair_context["ambiguous_selected_candidates"][0][
+                "execution_options"
+            ]
+            assert {row["option_id"] for row in projections} == {
+                first_option_id,
+                selected_option_id,
+            }
+            assert {row["execution"]["source_in_ms"] for row in projections} == {
+                2_000,
+                5_000,
+            }
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        beat_id="fold",
+                        selected_execution_option_id=selected_option_id,
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "fold",
+                            "selected_execution_option_id": selected_option_id,
+                        },
+                    ),
+                )
+            )
+            return SimpleNamespace(
+                decision=decision,
+                interaction_ids=("legacy-execution-repair",),
+            )
+
+    client = RepairClient()
+    kwargs = {
+        "route": route,
+        "editorial_dir": editorial_dir,
+        "policy": policy,
+        "plan_path": plan_path,
+        "chapter_durations": {"opening": 10.0, "fold": 10.0, "ending": 10.0},
+        "client": client,
+    }
+    rebuilt = _selected_preflight_local_replan(**kwargs)
+    assert rebuilt is not None
+    rebuilt_fold = next(
+        selection for selection in rebuilt.selections if selection.beat_id == "fold"
+    )
+    assert rebuilt_fold.candidate_execution_sha256 == selected.candidate_execution_sha256
+    assert (rebuilt_fold.source_in_ms, rebuilt_fold.source_out_ms) == (5_000, 15_000)
+    assert client.calls == 1
+
+    repair_root = replan_root / "legacy-execution-binding-repair"
+    repair_audit = read_json(repair_root / "audit.json")
+    assert repair_audit["provider_dispatch_added"] is True
+    assert repair_audit["provider_call_count"] == 1
+    assert repair_audit["provider_call_limit"] == 1
+    assert repair_audit["gemini_interaction_ids"] == ["legacy-execution-repair"]
+    assert read_json(repair_root / "decision.json")["authority"][
+        "decision_scope"
+    ] == "execution_binding_repair"
+
+    resumed = _selected_preflight_local_replan(**kwargs)
+    assert resumed is not None
+    assert client.calls == 1
+
+    repair_decision_path = repair_root / "decision.json"
+    invalid = read_json(repair_decision_path)
+    invalid["decisions"][0]["selected_execution_option_id"] = (
+        "fold--fold-2--execution-" + "f" * 64
+    )
+    write_json(repair_decision_path, invalid)
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="selected an unknown execution option",
+    ):
+        _selected_preflight_local_replan(**kwargs)
+    assert client.calls == 1
 
 
 def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(

@@ -92,6 +92,7 @@ from .gemini import (
     FunctionToolDeclaration,
     GeminiLabClient,
     GroupedEditDecisionProposal,
+    LegacyExecutionBindingRepairProposal,
     GroundingIdentityReference,
     MODEL_ID,
     SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION,
@@ -15662,6 +15663,7 @@ def _selected_preflight_local_replan(
     policy: AutonomousEditPolicy,
     plan_path: Path,
     chapter_durations: Mapping[str, float],
+    client: GeminiLabClient | None = None,
 ) -> Any | None:
     """Restore a persisted Gemini choice by rebuilding the entire route.
 
@@ -15836,6 +15838,21 @@ def _selected_preflight_local_replan(
         raise FeatureCutSystemFailure(
             "preflight local infeasibility replan did not resolve every beat"
         )
+    selected_prepared_executions_by_beat.update(
+        _resolve_legacy_execution_binding_repair(
+            route=route,
+            context=context,
+            context_path=context_path,
+            decision_path=decision_path,
+            selected_candidate_ids=selected_candidate_ids,
+            selected_prepared_executions_by_beat=(
+                selected_prepared_executions_by_beat
+            ),
+            editorial_dir=editorial_dir,
+            policy=policy,
+            client=client,
+        )
+    )
     frozen_executions = _frozen_preflight_local_replan_executions(
         route=route,
         context=context,
@@ -15927,21 +15944,14 @@ def _validate_prepared_replan_execution(
     return execution
 
 
-def _discover_legacy_prepared_replan_execution(
+def _legacy_validated_local_preflight_executions(
     *,
     editorial_dir: Path,
     beat_id: str,
     candidate_id: str,
     candidate_binding: Mapping[str, Any],
-) -> tuple[CandidateRouteSelection, dict[str, str]]:
-    """Recover one uniquely proven local execution from an old context.
-
-    Older replan contexts recorded only a viable candidate ID.  They must not
-    trigger a fresh duration solve on resume.  A locally successful frontier
-    artifact is acceptable only when it names the exact candidate execution
-    and validates against the immutable timing binding; zero or multiple such
-    artifacts remain fail-closed.
-    """
+) -> list[tuple[CandidateRouteSelection, Path]]:
+    """List exact successful local executions for one legacy candidate."""
 
     candidate_root = (
         editorial_dir.parent
@@ -15984,6 +15994,32 @@ def _discover_legacy_prepared_replan_execution(
         ):
             continue
         matches.append((execution, local_path))
+    return matches
+
+
+def _discover_legacy_prepared_replan_execution(
+    *,
+    editorial_dir: Path,
+    beat_id: str,
+    candidate_id: str,
+    candidate_binding: Mapping[str, Any],
+) -> tuple[CandidateRouteSelection, dict[str, str]]:
+    """Recover one uniquely proven local execution from an old context.
+
+    Older replan contexts recorded only a viable candidate ID.  They must not
+    trigger a fresh duration solve on resume.  A locally successful frontier
+    artifact is acceptable only when it names the exact candidate execution
+    and validates against the immutable timing binding; zero or multiple such
+    artifacts remain fail-closed unless the bounded text-only binding repair
+    below records an exact selection.
+    """
+
+    matches = _legacy_validated_local_preflight_executions(
+        editorial_dir=editorial_dir,
+        beat_id=beat_id,
+        candidate_id=candidate_id,
+        candidate_binding=candidate_binding,
+    )
     if len(matches) != 1:
         raise FeatureCutSystemFailure(
             "legacy local infeasibility replan does not have one uniquely "
@@ -15994,6 +16030,358 @@ def _discover_legacy_prepared_replan_execution(
         "artifact_path": str(local_path.resolve()),
         "artifact_sha256": sha256_file(local_path),
     }
+
+
+def _legacy_execution_binding_repair_paths(
+    editorial_dir: Path,
+) -> tuple[Path, Path, Path]:
+    root = editorial_dir / "preflight-local-infeasibility-replan"
+    repair_root = root / "legacy-execution-binding-repair"
+    return repair_root, repair_root / "context.json", repair_root / "decision.json"
+
+
+def _legacy_execution_local_option_projection(
+    *,
+    execution: CandidateRouteSelection,
+    artifact_path: Path,
+) -> dict[str, Any]:
+    """Project only immutable text facts from a successful local artifact."""
+
+    artifact = read_json(artifact_path)
+    payload = artifact.get("payload") if isinstance(artifact, Mapping) else None
+    if not isinstance(payload, Mapping):
+        raise FeatureCutSystemFailure(
+            "legacy local execution artifact has no payload"
+        )
+    return {
+        "option_id": _prepared_replan_execution_option_id(execution),
+        "execution": execution.model_dump(mode="json"),
+        "local_preflight": {
+            "result": "passed",
+            "artifact_path": str(artifact_path.resolve()),
+            "artifact_sha256": sha256_file(artifact_path),
+            "definition_sha256": artifact.get("definition_sha256"),
+            "binding_sha256": artifact.get("binding_sha256"),
+            "candidate_execution_sha256": artifact.get(
+                "candidate_execution_sha256"
+            ),
+            "source_motion_definition_sha256": payload.get(
+                "source_motion_definition_sha256"
+            ),
+            "query_lock_definition_sha256": payload.get(
+                "query_lock_definition_sha256"
+            ),
+        },
+    }
+
+
+def _legacy_execution_binding_repair_budget_context(
+    client: GeminiLabClient,
+    *,
+    policy: AutonomousEditPolicy,
+) -> dict[str, Any]:
+    """Expose policy limits and current ledger headroom without estimating free work."""
+
+    ledger = getattr(client, "budget_ledger", None)
+    report = getattr(ledger, "report", None)
+    return {
+        "policy_budget": policy.budget.model_dump(mode="json"),
+        "ledger_remaining_before_request": (
+            report() if callable(report) else "enforced_by_client_before_dispatch"
+        ),
+        "provider_call_limit": 1,
+        "provider_follow_up_allowed": False,
+    }
+
+
+def _resolve_legacy_execution_binding_repair(
+    *,
+    route: Any,
+    context: Mapping[str, Any],
+    context_path: Path,
+    decision_path: Path,
+    selected_candidate_ids: Mapping[str, str],
+    selected_prepared_executions_by_beat: Mapping[
+        str, CandidateRouteSelection
+    ],
+    editorial_dir: Path,
+    policy: AutonomousEditPolicy,
+    client: GeminiLabClient | None,
+) -> dict[str, CandidateRouteSelection]:
+    """Bind only legacy candidate decisions that have several valid timings.
+
+    A v2 context already gives Gemini exact execution IDs.  This one-time
+    migration is reserved for a v1 candidate-only decision whose selected
+    candidate has more than one successful local-preflight execution.  It may
+    choose among those executions but cannot revise any creative authority.
+    """
+
+    if context.get("contract_version") != "preflight-local-infeasibility-replan-v1":
+        return {}
+    current_bindings = route.semantic_replan_candidate_bindings_by_beat
+    ambiguous_options_by_beat: dict[str, list[dict[str, Any]]] = {}
+    options_by_beat: dict[str, dict[str, CandidateRouteSelection]] = {}
+    artifact_hashes: set[str] = set()
+    for beat_id, candidate_id in selected_candidate_ids.items():
+        if beat_id in selected_prepared_executions_by_beat:
+            continue
+        candidate_binding = next(
+            (
+                binding.option.model_dump(mode="json")
+                for binding in current_bindings.get(beat_id, ())
+                if binding.option.candidate_id == candidate_id
+            ),
+            None,
+        )
+        if candidate_binding is None:
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair has no current immutable "
+                "candidate binding"
+            )
+        matches = _legacy_validated_local_preflight_executions(
+            editorial_dir=editorial_dir,
+            beat_id=beat_id,
+            candidate_id=candidate_id,
+            candidate_binding=candidate_binding,
+        )
+        if len(matches) < 2:
+            continue
+        projections = [
+            _legacy_execution_local_option_projection(
+                execution=execution,
+                artifact_path=artifact_path,
+            )
+            for execution, artifact_path in matches
+        ]
+        projections.sort(key=lambda row: str(row["option_id"]))
+        option_map = {
+            str(row["option_id"]): CandidateRouteSelection.model_validate(
+                row["execution"]
+            )
+            for row in projections
+        }
+        if len(option_map) != len(projections):
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair has duplicate execution options"
+            )
+        ambiguous_options_by_beat[beat_id] = projections
+        options_by_beat[beat_id] = option_map
+        artifact_hashes.update(
+            "sha256:" + str(row["local_preflight"]["artifact_sha256"])
+            for row in projections
+        )
+    if not ambiguous_options_by_beat:
+        return {}
+    if client is None:
+        raise FeatureCutSystemFailure(
+            "legacy execution binding repair requires a Gemini client"
+        )
+
+    repair_root, repair_context_path, repair_decision_path = (
+        _legacy_execution_binding_repair_paths(editorial_dir)
+    )
+    repair_root.mkdir(parents=True, exist_ok=True)
+    original_decision = read_json(decision_path)
+    repair_context = {
+        "contract_version": "legacy-execution-binding-repair-v1",
+        "legacy_context_sha256": sha256_file(context_path),
+        "legacy_decision_sha256": sha256_file(decision_path),
+        "legacy_typed_grouped_decisions": original_decision.get("decisions"),
+        "policy_reference": policy.policy_reference,
+        "ambiguous_selected_candidates": [
+            {
+                "beat_id": beat_id,
+                "selected_candidate_id": selected_candidate_ids[beat_id],
+                "execution_options": ambiguous_options_by_beat[beat_id],
+            }
+            for beat_id in sorted(ambiguous_options_by_beat)
+        ],
+        "whole_resolved_timeline": context.get("whole_resolved_timeline"),
+        "music_context": context.get("music_context"),
+        "remaining_budget_context": _legacy_execution_binding_repair_budget_context(
+            client,
+            policy=policy,
+        ),
+        "rules": {
+            "may_change": ["exact_execution_option_for_ambiguous_legacy_beat"],
+            "must_preserve": [
+                "legacy_selected_candidate_id",
+                "presentation_mode",
+                "source_reuse_authority",
+                "all_unaffected_beats",
+                "whole_resolved_timeline",
+            ],
+            "forbidden": [
+                "candidate_substitution",
+                "timestamp_invention",
+                "execution_option_not_listed",
+                "presentation_change",
+                "source_reuse_change",
+                "media_input",
+            ],
+        },
+    }
+    if repair_context_path.is_file():
+        saved_repair_context = read_json(repair_context_path)
+        if not isinstance(saved_repair_context, Mapping) or not isinstance(
+            saved_repair_context.get("remaining_budget_context"),
+            Mapping,
+        ):
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair context is malformed"
+            )
+        # Budget headroom is a pre-dispatch observation.  It must remain in
+        # the repair's immutable prompt even though the one paid call itself
+        # changes the live ledger before a later resume.
+        repair_context["remaining_budget_context"] = dict(
+            saved_repair_context["remaining_budget_context"]
+        )
+        if saved_repair_context != repair_context:
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair context changed on resume"
+            )
+    else:
+        write_json(repair_context_path, repair_context)
+
+    required_hashes = {
+        "sha256:" + sha256_file(context_path),
+        "sha256:" + sha256_file(decision_path),
+        "sha256:" + sha256_file(repair_context_path),
+        *artifact_hashes,
+    }
+    if repair_decision_path.is_file():
+        persisted = read_json(repair_decision_path)
+        if not isinstance(persisted, Mapping) or (
+            persisted.get("context_sha256") != sha256_file(repair_context_path)
+            or persisted.get("legacy_context_sha256") != sha256_file(context_path)
+            or persisted.get("legacy_decision_sha256") != sha256_file(decision_path)
+        ):
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair does not match its source "
+                "artifacts"
+            )
+        try:
+            authority = DecisionAuthorityV2.model_validate(persisted.get("authority"))
+            validate_authority_binding(authority, policy)
+            proposal = LegacyExecutionBindingRepairProposal.model_validate(
+                {"decisions": persisted.get("decisions")}
+            )
+        except (TypeError, ValueError) as error:
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair has an invalid typed decision"
+            ) from error
+        if (
+            authority.decision_scope != "execution_binding_repair"
+            or not required_hashes.issubset(authority.input_artifact_hashes)
+        ):
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair authority is incomplete"
+            )
+    else:
+        result = client.repair_legacy_execution_bindings(
+            option_ids_by_beat={
+                beat_id: tuple(options_by_beat[beat_id])
+                for beat_id in sorted(options_by_beat)
+            },
+            prompt=(
+                "[protocol=legacy-execution-binding-repair-v1] A legacy grouped "
+                "decision already selected the candidate for every listed beat, "
+                "but that candidate has multiple successful locally measured exact "
+                "executions. Select exactly one listed execution option for each "
+                "ambiguous beat. Do not change candidate, presentation, source reuse, "
+                "or any other beat. This request contains text facts only; no media "
+                "inspection is authorized.\n\n"
+                + json.dumps(repair_context, ensure_ascii=False)
+            ),
+            policy=policy,
+            run_dir=repair_root,
+        )
+        proposal = result.decision
+        authority = authorize_decision(
+            policy=policy,
+            decision_scope="execution_binding_repair",
+            input_artifact_hashes=tuple(sorted(required_hashes)),
+            deterministic_gate_results={
+                "legacy_candidate_selection_preserved": "passed",
+                "execution_options_locally_preflight_passed": "passed",
+                "execution_options_immutable_and_hash_bound": "passed",
+                "text_only_repair_without_media": "passed",
+            },
+            decision_codes=(
+                "legacy_execution_binding_repair",
+                "legacy_execution_ambiguity_superseded",
+                "creative_selection_unchanged",
+            ),
+            gemini_interaction_ids=result.interaction_ids,
+        )
+        write_json(
+            repair_decision_path,
+            {
+                "contract_version": "legacy-execution-binding-repair-result-v1",
+                "context_sha256": sha256_file(repair_context_path),
+                "legacy_context_sha256": sha256_file(context_path),
+                "legacy_decision_sha256": sha256_file(decision_path),
+                "decisions": [
+                    decision.model_dump(mode="json")
+                    for decision in proposal.decisions
+                ],
+                "gemini_interaction_ids": result.interaction_ids,
+                "authority": authority.model_dump(mode="json"),
+                "generated_at": utc_now(),
+            },
+        )
+        write_json(
+            repair_root / "audit.json",
+            {
+                "contract_version": "legacy-execution-binding-repair-audit-v1",
+                "superseded_legacy_ambiguity": True,
+                "provider_dispatch_added": True,
+                "provider_call_count": len(result.interaction_ids),
+                "provider_call_limit": 1,
+                "legacy_context_sha256": sha256_file(context_path),
+                "legacy_decision_sha256": sha256_file(decision_path),
+                "repair_context_sha256": sha256_file(repair_context_path),
+                "execution_artifact_hashes": sorted(artifact_hashes),
+                "gemini_interaction_ids": result.interaction_ids,
+                "budget_ledger_accounting": (
+                    getattr(client.budget_ledger, "report")()
+                    if callable(
+                        getattr(
+                            getattr(client, "budget_ledger", None),
+                            "report",
+                            None,
+                        )
+                    )
+                    else {
+                        "status": "enforced_by_client_before_dispatch",
+                        "paid_interaction_count": len(result.interaction_ids),
+                    }
+                ),
+            },
+        )
+
+    choices = {
+        decision.beat_id: decision.selected_execution_option_id
+        for decision in proposal.decisions
+    }
+    if set(choices) != set(options_by_beat):
+        raise FeatureCutSystemFailure(
+            "legacy execution binding repair did not resolve every ambiguous beat"
+        )
+    selected: dict[str, CandidateRouteSelection] = {}
+    for beat_id, option_id in choices.items():
+        execution = options_by_beat[beat_id].get(option_id)
+        if execution is None:
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair selected an unknown execution "
+                "option"
+            )
+        if execution.candidate_id != selected_candidate_ids[beat_id]:
+            raise FeatureCutSystemFailure(
+                "legacy execution binding repair changed the selected candidate"
+            )
+        selected[beat_id] = execution
+    return selected
 
 
 def _frozen_preflight_local_replan_executions(
@@ -23470,6 +23858,7 @@ def _run_feature_cut_experiment_impl(
                 policy=autonomous_policy,
                 plan_path=plan_path,
                 chapter_durations=chapter_durations,
+                client=client,
             )
             if restored_local_replan is not None:
                 pre_render_candidate_route = restored_local_replan

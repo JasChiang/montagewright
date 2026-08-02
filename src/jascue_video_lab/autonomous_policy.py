@@ -302,6 +302,7 @@ class DecisionAuthorityV2(FrozenStrictModel):
         "trim_intent",
         "reframe",
         "scoped_semantic_replan",
+        "execution_binding_repair",
         "feature_cut",
         "final_delivery",
     ]
@@ -415,6 +416,7 @@ def authorize_decision(
         "trim_intent",
         "reframe",
         "scoped_semantic_replan",
+        "execution_binding_repair",
         "feature_cut",
         "final_delivery",
     ],

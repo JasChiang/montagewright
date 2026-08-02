@@ -290,6 +290,42 @@ class BoundedGroupedSemanticNegotiationResult(FrozenStrictModel):
         return self
 
 
+class LegacyExecutionBindingDecision(FrozenStrictModel):
+    """Bind one legacy candidate decision to one existing local execution."""
+
+    beat_id: str = Field(min_length=1)
+    selected_execution_option_id: str = Field(min_length=1)
+
+
+class LegacyExecutionBindingRepairProposal(FrozenStrictModel):
+    """One exact execution choice for every legacy-ambiguous beat."""
+
+    decisions: tuple[LegacyExecutionBindingDecision, ...] = Field(
+        min_length=1,
+    )
+
+    @model_validator(mode="after")
+    def validate_distinct_beats(self) -> "LegacyExecutionBindingRepairProposal":
+        beat_ids = [decision.beat_id for decision in self.decisions]
+        if len(beat_ids) != len(set(beat_ids)):
+            raise ValueError(
+                "legacy execution binding decisions must have unique beat IDs"
+            )
+        return self
+
+
+class BoundedLegacyExecutionBindingRepairResult(FrozenStrictModel):
+    """The one permitted text-only repair for a legacy timing ambiguity."""
+
+    contract_version: Literal["legacy-execution-binding-repair-v1"] = (
+        "legacy-execution-binding-repair-v1"
+    )
+    decision: LegacyExecutionBindingRepairProposal
+    interaction_ids: tuple[str, ...] = Field(min_length=1, max_length=1)
+    tool_call_ids: tuple[str, ...] = Field(min_length=1, max_length=1)
+    automatic_function_calling: Literal[False] = False
+
+
 def canonical_interactions_mime_type(mime_type: str) -> str:
     """Normalize common OS/File API aliases to Interactions API media types."""
 
@@ -2692,6 +2728,206 @@ class GeminiLabClient:
             tool_call_ids=(str(proposal_call["id"]),),
         )
         write_json(run_dir / "grouped_semantic_negotiation.json", result)
+        return result
+
+    def repair_legacy_execution_bindings(
+        self,
+        *,
+        option_ids_by_beat: Mapping[str, Sequence[str]],
+        prompt: str,
+        policy: AutonomousEditPolicy,
+        run_dir: Path,
+    ) -> BoundedLegacyExecutionBindingRepairResult:
+        """Make one text-only choice over already measured legacy executions.
+
+        This is not a second creative replan.  It exists only for old
+        candidate-level decisions that cannot safely distinguish two locally
+        successful timing bindings.  The dispatch journal enforces one
+        provider request across crashes, quota errors, and resumes; invalid
+        structured output is rejected without a schema-repair follow-up.
+        """
+
+        if self.budget_ledger is None:
+            raise ValueError(
+                "legacy execution binding repair requires a BudgetLedger before "
+                "dispatch"
+            )
+        normalized_options = {
+            beat_id: tuple(dict.fromkeys(option_ids))
+            for beat_id, option_ids in option_ids_by_beat.items()
+        }
+        if not normalized_options or any(
+            not beat_id or not option_ids
+            for beat_id, option_ids in normalized_options.items()
+        ):
+            raise ValueError(
+                "legacy execution binding repair requires options for every "
+                "ambiguous beat"
+            )
+        if any(
+            len(option_ids) != len(option_ids_by_beat[beat_id])
+            for beat_id, option_ids in normalized_options.items()
+        ):
+            raise ValueError(
+                "legacy execution binding repair option IDs must be unique per "
+                "beat"
+            )
+        def validate_arguments(
+            arguments: Mapping[str, Any],
+        ) -> LegacyExecutionBindingRepairProposal:
+            proposal = LegacyExecutionBindingRepairProposal.model_validate(
+                arguments
+            )
+            selected_by_beat = {
+                decision.beat_id: decision.selected_execution_option_id
+                for decision in proposal.decisions
+            }
+            if set(selected_by_beat) != set(normalized_options):
+                raise ValueError(
+                    "legacy execution binding repair must decide every and only "
+                    "ambiguous beat"
+                )
+            for beat_id, option_id in selected_by_beat.items():
+                if option_id not in normalized_options[beat_id]:
+                    raise ValueError(
+                        "legacy execution binding repair selected an unknown "
+                        "execution option for " + beat_id
+                    )
+            return proposal
+
+        declaration = {
+            "type": "function",
+            "name": "bind_legacy_execution_options",
+            "description": (
+                "For every supplied ambiguous beat, choose exactly one existing "
+                "execution option ID. Do not alter candidate, presentation, reuse, "
+                "or any other beat."
+            ),
+            "parameters": gemini_response_schema(
+                LegacyExecutionBindingRepairProposal
+            ),
+        }
+        run_dir.mkdir(parents=True, exist_ok=True)
+        request = {
+            "model": self.model_id,
+            "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+            "store": True,
+            "input": [
+                {
+                    "type": "text",
+                    "text": (
+                        prompt
+                        + "\n\nExact immutable execution option IDs by beat:\n"
+                        + json.dumps(normalized_options, ensure_ascii=False)
+                        + "\nChoose only these IDs. Call "
+                        "bind_legacy_execution_options exactly once."
+                    ),
+                }
+            ],
+            "tools": [declaration],
+            "generation_config": {
+                "thinking_level": (
+                    policy.gemini_limits.text_only_schema_repair.thinking_level
+                ),
+                "max_output_tokens": (
+                    policy.gemini_limits.text_only_schema_repair.max_output_tokens
+                ),
+                "tool_choice": {
+                    "allowed_tools": {
+                        "mode": "any",
+                        "tools": ["bind_legacy_execution_options"],
+                    }
+                },
+            },
+        }
+        request_path = run_dir / "legacy_execution_binding_repair.request.json"
+        if request_path.is_file() and read_json(request_path) != request:
+            raise ValueError(
+                "legacy execution binding repair request changed on resume"
+            )
+        write_json(request_path, request)
+        raw_path = run_dir / "legacy_execution_binding_repair.raw_interaction.json"
+
+        def parse_interaction(
+            interaction: Any,
+        ) -> tuple[LegacyExecutionBindingRepairProposal, str, str]:
+            try:
+                interaction_id = _grouped_interaction_id(interaction)
+                if not interaction_id:
+                    raise ValueError(
+                        "legacy execution binding repair response has no ID"
+                    )
+                call = _grouped_decision_function_call(
+                    interaction,
+                    function_name="bind_legacy_execution_options",
+                )
+                proposal = validate_arguments(call["arguments"])
+                tool_call_id = str(call["id"])
+            except (KeyError, TypeError, ValueError) as error:
+                write_json(
+                    run_dir / "legacy_execution_binding_repair.invalid.json",
+                    {
+                        "contract_version": "legacy-execution-binding-repair-v1",
+                        "raw_interaction_sha256": sha256_file(raw_path),
+                        "validation_error": str(error),
+                        "provider_follow_up_dispatched": False,
+                        "interpretation": (
+                            "invalid response is fail-closed; this bounded "
+                            "repair never sends a second provider call"
+                        ),
+                    },
+                )
+                raise ValueError(
+                    "legacy execution binding repair response is invalid; "
+                    "refusing a second provider call"
+                ) from error
+            return proposal, interaction_id, tool_call_id
+
+        if raw_path.is_file():
+            interaction = read_json(raw_path)
+            proposal, interaction_id, tool_call_id = parse_interaction(interaction)
+        else:
+            text_tokens = max(
+                256,
+                len(json.dumps(request["input"], ensure_ascii=False)) // 4,
+            )
+            estimate = estimate_paid_call(
+                stage="legacy_execution_binding_repair",
+                model_id=self.model_id,
+                text_input_tokens=text_tokens,
+                max_output_tokens=request["generation_config"]["max_output_tokens"],
+                thinking_level=request["generation_config"]["thinking_level"],
+            )
+            interaction, dispatch = dispatch_paid_interaction(
+                client=self.client,
+                request=request,
+                request_record=request,
+                journal_dir=run_dir,
+                estimate=estimate,
+                budget_ledger=self.budget_ledger,
+                recovery_call=True,
+            )
+            raw_interaction, raw_attempt_path = _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="legacy_execution_binding_repair",
+                canonical_filename="legacy_execution_binding_repair.raw_interaction.json",
+                interaction=interaction,
+            )
+            complete_paid_dispatch(
+                handle=dispatch,
+                raw_interaction=raw_interaction,
+                raw_artifact_path=raw_attempt_path,
+                budget_ledger=self.budget_ledger,
+                model_id=self.model_id,
+            )
+            proposal, interaction_id, tool_call_id = parse_interaction(interaction)
+
+        result = BoundedLegacyExecutionBindingRepairResult(
+            decision=proposal,
+            interaction_ids=(interaction_id,),
+            tool_call_ids=(tool_call_id,),
+        )
+        write_json(run_dir / "legacy_execution_binding_repair.json", result)
         return result
 
     def negotiate_edit_decision(
