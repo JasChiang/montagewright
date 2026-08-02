@@ -238,6 +238,7 @@ from .sequence_optimizer import (
     CandidateCompleteRoute,
     CandidateRouteBeat,
     CandidateRouteOption,
+    CandidateRouteResult,
     CandidateRouteSelection,
     MusicBoundaryCue,
     MusicBoundarySpec,
@@ -250,6 +251,7 @@ from .sequence_optimizer import (
     RoundRobinFrontierCandidate,
     RoundRobinFrontierState,
     SemanticReplanReuseAuthority,
+    SemanticReplanCandidateBinding,
     build_resolved_timeline,
     candidate_route_execution_sha256,
     initialize_round_robin_frontier,
@@ -14235,6 +14237,9 @@ def _build_pre_render_horizontal_candidate_route(
         duration_audit=duration_audit,
     )
     beats: list[CandidateRouteBeat] = []
+    recovery_bindings: dict[
+        str, tuple[SemanticReplanCandidateBinding, ...]
+    ] = {}
     for chapter in plan.chapters:
         if not chapter.horizontal_candidates:
             continue
@@ -14242,69 +14247,85 @@ def _build_pre_render_horizontal_candidate_route(
         trim_duration_ms = round(
             chapter_durations[chapter.feature_id] * 1000
         )
+        all_options = tuple(
+            CandidateRouteOption(
+                beat_id=chapter.feature_id,
+                candidate_id=candidate.candidate_id,
+                source_asset_id=candidate.source_asset_id,
+                event_id=candidate.event_id,
+                planner_rank=candidate.rank,
+                semantic_confidence=float(candidate.confidence),
+                presentation_intrusion_rank=(
+                    0
+                    if (
+                        candidate.strategy == "original"
+                        and candidate.camera_intent == "hold"
+                    )
+                    else 1
+                    if candidate.strategy == "original"
+                    else 2
+                ),
+                trim_duration_ms=trim_duration_ms,
+                minimum_readable_ms=round(
+                    rhythm.minimum_duration_seconds * 1000
+                ),
+                preferred_readable_ms=round(
+                    rhythm.preferred_duration_seconds * 1000
+                ),
+                maximum_readable_ms=round(
+                    rhythm.maximum_duration_seconds * 1000
+                ),
+                cue_id=cue_by_id[chapter.feature_id]["cue_id"],
+                cue_aligned=cue_by_id[chapter.feature_id]["cue_aligned"],
+                presentation_mode=(
+                    "source_hold"
+                    if candidate.strategy == "original"
+                    else "tracked_full_bleed_crop"
+                ),
+                entry_composition=(
+                    f"{candidate.camera_intent}:"
+                    f"{candidate.target_description or 'source-frame'}"
+                ),
+                exit_composition=(
+                    f"{candidate.camera_intent}:"
+                    f"{candidate.target_description or 'source-frame'}"
+                ),
+                technical_quality=max(
+                    0.0,
+                    1.0 - len(candidate.quality_risks) * 0.06,
+                ),
+                reuse_mode=getattr(candidate, "source_reuse_mode", "none"),
+                reuse_justification=getattr(
+                    candidate,
+                    "source_reuse_justification",
+                    None,
+                ),
+            )
+            for candidate in sorted(
+                chapter.horizontal_candidates,
+                key=lambda item: item.rank,
+            )
+        )
+        if not all_options:
+            continue
+        # Only Gemini's rank-one horizontal decision enters the initial
+        # optimizer route.  Every retained Top-K choice is deliberately
+        # parked in a non-renderable semantic-replan binding: it can be
+        # selected once after a measured primary failure, never by local
+        # duration/quality/reuse scoring.
+        recovery_bindings[chapter.feature_id] = tuple(
+            SemanticReplanCandidateBinding(option=option)
+            for option in all_options
+        )
         beats.append(
             CandidateRouteBeat(
                 beat_id=chapter.feature_id,
-                options=tuple(
-                    CandidateRouteOption(
-                        beat_id=chapter.feature_id,
-                        candidate_id=candidate.candidate_id,
-                        source_asset_id=candidate.source_asset_id,
-                        event_id=candidate.event_id,
-                        planner_rank=candidate.rank,
-                        semantic_confidence=float(candidate.confidence),
-                        presentation_intrusion_rank=(
-                            0
-                            if (
-                                candidate.strategy == "original"
-                                and candidate.camera_intent == "hold"
-                            )
-                            else 1
-                            if candidate.strategy == "original"
-                            else 2
-                        ),
-                        trim_duration_ms=trim_duration_ms,
-                        minimum_readable_ms=round(
-                            rhythm.minimum_duration_seconds * 1000
-                        ),
-                        preferred_readable_ms=round(
-                            rhythm.preferred_duration_seconds * 1000
-                        ),
-                        maximum_readable_ms=round(
-                            rhythm.maximum_duration_seconds * 1000
-                        ),
-                        cue_id=cue_by_id[chapter.feature_id]["cue_id"],
-                        cue_aligned=cue_by_id[chapter.feature_id][
-                            "cue_aligned"
-                        ],
-                        presentation_mode=(
-                            "source_hold"
-                            if candidate.strategy == "original"
-                            else "tracked_full_bleed_crop"
-                        ),
-                        entry_composition=(
-                            f"{candidate.camera_intent}:"
-                            f"{candidate.target_description or 'source-frame'}"
-                        ),
-                        exit_composition=(
-                            f"{candidate.camera_intent}:"
-                            f"{candidate.target_description or 'source-frame'}"
-                        ),
-                        technical_quality=max(
-                            0.0,
-                            1.0 - len(candidate.quality_risks) * 0.06,
-                        ),
-                    )
-                    for candidate in sorted(
-                        chapter.horizontal_candidates,
-                        key=lambda item: item.rank,
-                    )[:1]
-                ),
+                options=(all_options[0],),
             )
         )
     if not beats:
         return None
-    return optimize_pre_render_candidate_route(
+    route = optimize_pre_render_candidate_route(
         beats,
         minimum_duration_ms=(
             1
@@ -14319,6 +14340,14 @@ def _build_pre_render_horizontal_candidate_route(
         max_editorial_reprise_overlap_fraction=(
             policy.editorial.max_editorial_reprise_overlap_fraction
         ),
+    )
+    # Test seams and legacy adapters may return a non-route sentinel.  The
+    # production optimizer returns CandidateRouteResult and carries these
+    # recovery-only bindings into the persisted replan frontier.
+    if not isinstance(route, CandidateRouteResult):
+        return route
+    return route.model_copy(
+        update={"semantic_replan_candidate_bindings_by_beat": recovery_bindings}
     )
 
 
@@ -15246,6 +15275,427 @@ def _preflight_local_infeasibility_replan_paths(
 ) -> tuple[Path, Path]:
     root = editorial_dir / "preflight-local-infeasibility-replan"
     return root / "context.json", root / "decision.json"
+
+
+def _horizontal_preflight_local_infeasibility_replan_paths(
+    editorial_dir: Path,
+) -> tuple[Path, Path]:
+    """Keep the 16:9 recovery authority separate from the 9:16 frontier."""
+
+    root = editorial_dir / "preflight-horizontal-local-infeasibility-replan"
+    return root / "context.json", root / "decision.json"
+
+
+def _horizontal_replan_candidate_bindings(
+    route: CandidateRouteResult,
+) -> dict[str, dict[str, CandidateRouteOption]]:
+    """Return all Gemini-authorised horizontal choices, never a local route."""
+
+    return {
+        beat_id: {
+            binding.option.candidate_id: binding.option
+            for binding in bindings
+        }
+        for beat_id, bindings in route.semantic_replan_candidate_bindings_by_beat.items()
+    }
+
+
+def _persist_preflight_horizontal_local_infeasibility_replan(
+    *,
+    route: CandidateRouteResult,
+    failures_by_beat: Mapping[str, Sequence[Mapping[str, Any]]],
+    editorial_dir: Path,
+    policy: AutonomousEditPolicy,
+    client: GeminiLabClient,
+    plan_path: Path,
+    music_supplied: bool,
+    output_timeline_cues: Sequence[Any],
+) -> None:
+    """Persist one grouped 16:9 recovery choice, then require a restart.
+
+    Horizontal alternates are intentionally *not* pre-rendered or locally
+    ranked. A typed deterministic preflight failure, or a typed exact-event /
+    SAM / geometry failure while executing the selected primary, may spend one
+    grouped decision over the immutable alternates. The next run reconstructs
+    that Gemini-selected route before admitting normal preparation or render.
+    """
+
+    context_path, decision_path = _horizontal_preflight_local_infeasibility_replan_paths(
+        editorial_dir
+    )
+    if decision_path.is_file():
+        raise CandidateKnownInfeasible(
+            "horizontal scoped semantic replan cap exhausted after a selected "
+            "alternate failed local preflight"
+        )
+
+    semantic_frontier = _semantic_replan_frontier_projection(route)
+    frontier_by_beat = {
+        str(row.get("beat_id")): row
+        for row in semantic_frontier["beats"]
+        if isinstance(row, Mapping)
+    }
+    selections_by_beat = {
+        selection.beat_id: selection for selection in route.selections
+    }
+    affected_beats: list[dict[str, Any]] = []
+    option_ids_by_beat: dict[str, tuple[str, ...]] = {}
+    for beat_id, failures in sorted(failures_by_beat.items()):
+        selected = selections_by_beat.get(beat_id)
+        frontier_row = frontier_by_beat.get(beat_id)
+        if selected is None or not isinstance(frontier_row, Mapping):
+            raise FeatureCutSystemFailure(
+                "horizontal preflight failure is not bound to the initial route: "
+                + beat_id
+            )
+        candidate_bindings = frontier_row.get("candidate_bindings")
+        if not isinstance(candidate_bindings, Mapping):
+            raise FeatureCutSystemFailure(
+                "horizontal semantic replan frontier has no candidate bindings"
+            )
+        eligible_ids = tuple(
+            f"{beat_id}--{candidate_id}"
+            for candidate_id in candidate_bindings
+            if candidate_id != selected.candidate_id
+        )
+        if not eligible_ids:
+            failure_root = context_path.parent
+            write_json(
+                failure_root / "failures.json",
+                {
+                    "contract_version": "horizontal-primary-preflight-failures-v1",
+                    "route_definition_sha256": _pre_render_route_definition_sha256(
+                        route
+                    ),
+                    "failures_by_beat": {
+                        key: [dict(row) for row in value]
+                        for key, value in failures_by_beat.items()
+                    },
+                    "reason": "no_gemini_authorised_horizontal_alternate",
+                    "generated_at": utc_now(),
+                },
+            )
+            raise CandidateKnownInfeasible(
+                "failed horizontal primary has no Gemini-authorised alternate: "
+                + beat_id
+            )
+        affected_beats.append(
+            {
+                **dict(frontier_row),
+                "failure_facts": [dict(row) for row in failures],
+                "eligible_option_ids": list(eligible_ids),
+            }
+        )
+        option_ids_by_beat[beat_id] = eligible_ids
+
+    whole_timeline = [selection.model_dump(mode="json") for selection in route.selections]
+    reuse_conflict_facts, allowed_reuse_ids_by_option = (
+        _grouped_replan_reuse_conflict_facts(
+            affected_beats=affected_beats,
+            whole_timeline=whole_timeline,
+            option_ids_by_beat=option_ids_by_beat,
+        )
+    )
+    retained_reuse_authority_by_option = (
+        _grouped_replan_retained_reuse_authority_by_option(
+            affected_beats=affected_beats,
+            option_ids_by_beat=option_ids_by_beat,
+            policy=policy,
+        )
+    )
+    context = {
+        "contract_version": "preflight-horizontal-local-infeasibility-replan-v1",
+        "policy_reference": policy.policy_reference,
+        "route_definition_sha256": _pre_render_route_definition_sha256(route),
+        "affected_beats": affected_beats,
+        "option_ids_by_beat": {
+            beat_id: list(option_ids)
+            for beat_id, option_ids in option_ids_by_beat.items()
+        },
+        "whole_resolved_timeline": whole_timeline,
+        "reuse_conflict_facts": reuse_conflict_facts,
+        "music_context": {
+            "supplied": music_supplied,
+            "output_cues": [
+                cue.model_dump(mode="json")
+                if hasattr(cue, "model_dump")
+                else dict(cue)
+                for cue in output_timeline_cues
+            ],
+        },
+        "rules": {
+            "may_change": ["affected_candidate", "explicit_source_reuse_authority"],
+            "must_preserve": [
+                "brief_order",
+                "immutable_candidate_binding",
+                "resolved_music_cue_grid",
+                "horizontal_initial_primary_only",
+            ],
+            "forbidden": [
+                "local_alternate_selection",
+                "invented_source_media",
+                "invented_timestamp",
+                "additional_replan_after_cap",
+            ],
+        },
+    }
+    # The context is the immutable identity of the one recovery request.  A
+    # process can stop after it is written but before ``decision.json`` is
+    # committed (including after the provider has returned its raw response).
+    # In that state GeminiLabClient's request/raw-response journal is the
+    # recovery cache: re-enter it with the exact same run directory and prompt
+    # so it validates/reuses the durable interaction rather than dispatching a
+    # second grouped decision.
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    if context_path.is_file():
+        saved_context = read_json(context_path)
+        if not isinstance(saved_context, Mapping) or dict(saved_context) != context:
+            raise FeatureCutSystemFailure(
+                "interrupted horizontal semantic replan context differs from "
+                "the current immutable failure context"
+            )
+    if policy.budget.max_semantic_replans < 1:
+        write_json(
+            context_path.parent / "failures.json",
+            {
+                "contract_version": "horizontal-primary-preflight-failures-v1",
+                "route_definition_sha256": context["route_definition_sha256"],
+                "failures_by_beat": {
+                    key: [dict(row) for row in value]
+                    for key, value in failures_by_beat.items()
+                },
+                "reason": "scoped_semantic_replan_not_authorized",
+                "generated_at": utc_now(),
+            },
+        )
+        raise CandidateKnownInfeasible(
+            "preflight_horizontal_local_infeasibility_replan_limit_reached"
+        )
+    if not context_path.is_file():
+        write_json(context_path, context)
+    write_json(
+        context_path.parent / "failures.json",
+        {
+            "contract_version": "horizontal-primary-preflight-failures-v1",
+            "route_definition_sha256": context["route_definition_sha256"],
+            "failures_by_beat": {
+                key: [dict(row) for row in value]
+                for key, value in failures_by_beat.items()
+            },
+            "generated_at": utc_now(),
+        },
+    )
+    result = client.negotiate_grouped_edit_decisions(
+        option_ids_by_beat=option_ids_by_beat,
+        prompt=(
+            "[protocol=preflight-horizontal-local-infeasibility-replan-v1] "
+            "Every listed selected 16:9 execution failed a typed, persisted "
+            "fulfillment, timing, exact-event, source-motion, SAM, or geometry "
+            "gate. Choose exactly one supplied immutable alternate per affected "
+            "beat using the whole timeline and music context. This is the single "
+            "scoped recovery decision; do not select failed primaries, invent "
+            "media/time, or request a local fallback.\n\n"
+            + json.dumps(context, ensure_ascii=False)
+        ),
+        policy=policy,
+        run_dir=context_path.parent,
+        recovery_call=True,
+        allowed_reuse_of_beat_ids_by_option=allowed_reuse_ids_by_option,
+        retained_reuse_authority_by_option=retained_reuse_authority_by_option,
+    )
+    decisions = _validate_persisted_grouped_replan_decisions(
+        [decision.model_dump(mode="json") for decision in result.decision.decisions],
+        option_ids_by_beat=option_ids_by_beat,
+        allowed_reuse_ids_by_option=allowed_reuse_ids_by_option,
+        policy=policy,
+    )
+    authority = authorize_decision(
+        policy=policy,
+        decision_scope="scoped_semantic_replan",
+        input_artifact_hashes=(
+            f"sha256:{sha256_file(context_path)}",
+            f"sha256:{sha256_file(plan_path)}",
+        ),
+        deterministic_gate_results={
+            "horizontal_selected_execution_failure_observed": "passed",
+            "whole_timeline_bound": "passed",
+            "music_context_bound": "passed",
+            "alternate_bindings_bounded": "passed",
+        },
+        decision_codes=("gemini_horizontal_selected_execution_replan",),
+        gemini_interaction_ids=result.interaction_ids,
+    )
+    write_json(
+        decision_path,
+        {
+            "contract_version": "preflight-horizontal-local-infeasibility-replan-result-v1",
+            "context_sha256": sha256_file(context_path),
+            "decisions": decisions,
+            "gemini_interaction_ids": result.interaction_ids,
+            "authority": authority.model_dump(mode="json"),
+            "generated_at": utc_now(),
+        },
+    )
+
+
+def _restore_preflight_horizontal_local_replan(
+    *,
+    route: CandidateRouteResult,
+    editorial_dir: Path,
+    policy: AutonomousEditPolicy,
+    plan_path: Path,
+    chapter_durations: Mapping[str, float],
+) -> CandidateRouteResult | None:
+    """Validate and restore the one persisted 16:9 grouped decision."""
+
+    context_path, decision_path = _horizontal_preflight_local_infeasibility_replan_paths(
+        editorial_dir
+    )
+    if not context_path.is_file() and not decision_path.is_file():
+        return None
+    if context_path.is_file() and not decision_path.is_file():
+        # This is an expected crash boundary.  The primary preflight will
+        # deterministically recreate the identical failure context and hand it
+        # back to the grouped negotiation's raw-response/dispatch journal.
+        # A context alone never authorizes a route selection.
+        return None
+    if not context_path.is_file() or not decision_path.is_file():
+        raise FeatureCutSystemFailure(
+            "horizontal preflight semantic replan is only partially persisted"
+        )
+    context = read_json(context_path)
+    decision_payload = read_json(decision_path)
+    if not isinstance(context, Mapping) or not isinstance(decision_payload, Mapping):
+        raise FeatureCutSystemFailure(
+            "horizontal preflight semantic replan artifacts are malformed"
+        )
+    if (
+        context.get("contract_version")
+        != "preflight-horizontal-local-infeasibility-replan-v1"
+        or decision_payload.get("contract_version")
+        != "preflight-horizontal-local-infeasibility-replan-result-v1"
+        or decision_payload.get("context_sha256") != sha256_file(context_path)
+        or context.get("policy_reference") != policy.policy_reference
+        or context.get("route_definition_sha256")
+        != _pre_render_route_definition_sha256(route)
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal preflight semantic replan does not match current route/context"
+        )
+    authority = DecisionAuthorityV2.model_validate(decision_payload.get("authority"))
+    validate_authority_binding(authority, policy)
+    required_hashes = {
+        f"sha256:{sha256_file(context_path)}",
+        f"sha256:{sha256_file(plan_path)}",
+    }
+    if (
+        authority.decision_scope != "scoped_semantic_replan"
+        or not required_hashes.issubset(authority.input_artifact_hashes)
+    ):
+        raise FeatureCutSystemFailure(
+            "horizontal preflight semantic replan authority is incomplete"
+        )
+    raw_affected = context.get("affected_beats")
+    raw_options = context.get("option_ids_by_beat")
+    if not isinstance(raw_affected, list) or not isinstance(raw_options, Mapping):
+        raise FeatureCutSystemFailure(
+            "horizontal preflight semantic replan has no bounded options"
+        )
+    option_ids_by_beat = {
+        str(beat_id): tuple(str(option_id) for option_id in option_ids)
+        for beat_id, option_ids in raw_options.items()
+        if isinstance(option_ids, list)
+    }
+    if not option_ids_by_beat or len(option_ids_by_beat) != len(raw_options):
+        raise FeatureCutSystemFailure(
+            "horizontal preflight semantic replan option IDs are malformed"
+        )
+    reuse_facts, allowed_reuse_ids_by_option = _grouped_replan_reuse_conflict_facts(
+        affected_beats=raw_affected,
+        whole_timeline=context.get("whole_resolved_timeline", ()),
+        option_ids_by_beat=option_ids_by_beat,
+    )
+    if reuse_facts != context.get("reuse_conflict_facts"):
+        raise FeatureCutSystemFailure(
+            "horizontal preflight semantic replan reuse facts changed"
+        )
+    decisions = _validate_persisted_grouped_replan_decisions(
+        decision_payload.get("decisions"),
+        option_ids_by_beat=option_ids_by_beat,
+        allowed_reuse_ids_by_option=allowed_reuse_ids_by_option,
+        policy=policy,
+    )
+    current_bindings = _horizontal_replan_candidate_bindings(route)
+    selected_candidate_ids: dict[str, str] = {}
+    reuse_authorities: dict[str, SemanticReplanReuseAuthority] = {}
+    affected_by_id = {
+        str(row.get("beat_id")): row
+        for row in raw_affected
+        if isinstance(row, Mapping)
+    }
+    for decision in decisions:
+        beat_id = str(decision["beat_id"])
+        option_id = str(decision["selected_option_id"])
+        candidate_id = option_id.removeprefix(beat_id + "--")
+        saved = affected_by_id.get(beat_id)
+        saved_bindings = saved.get("candidate_bindings") if saved else None
+        current = current_bindings.get(beat_id, {}).get(candidate_id)
+        if (
+            not isinstance(saved_bindings, Mapping)
+            or candidate_id not in saved_bindings
+            or current is None
+            or current.model_dump(mode="json")
+            != {
+                key: value
+                for key, value in saved_bindings[candidate_id].items()
+                if key != "replan_required_codes"
+            }
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal preflight selected alternate binding changed"
+            )
+        selected_candidate_ids[beat_id] = candidate_id
+        if decision.get("source_reuse_mode") != "none":
+            reuse_authorities[beat_id] = SemanticReplanReuseAuthority(
+                beat_id=beat_id,
+                candidate_id=candidate_id,
+                reuse_mode=decision["source_reuse_mode"],
+                reuse_justification=decision.get("source_reuse_justification"),
+                reuse_of_beat_ids=tuple(decision.get("reuse_of_beat_ids") or ()),
+            )
+    try:
+        rebuilt = rebuild_route_with_semantic_authorities(
+            route,
+            selected_candidate_ids_by_beat=selected_candidate_ids,
+            reuse_authorities_by_beat=reuse_authorities,
+            minimum_duration_ms=(
+                1
+                if policy.execution_profile == "autonomous_best_effort"
+                else policy.duration.min_ms
+            ),
+            maximum_duration_ms=policy.duration.max_ms,
+            max_panel_runtime_fraction=policy.presentation.max_panel_runtime_fraction,
+            target_duration_ms=round(sum(chapter_durations.values()) * 1000),
+            max_editorial_reprise_overlap_fraction=(
+                policy.editorial.max_editorial_reprise_overlap_fraction
+            ),
+        )
+    except ValueError as error:
+        raise FeatureCutSystemFailure(
+            "horizontal preflight selected alternate cannot rebuild a complete route"
+        ) from error
+    all_bindings = _horizontal_replan_candidate_bindings(route)
+    fallback_ids = dict(route.fallback_candidate_ids_by_beat)
+    for beat_id, candidate_id in selected_candidate_ids.items():
+        fallback_ids[beat_id] = (candidate_id,)
+    return route.model_copy(
+        update={
+            "selections": rebuilt.selections,
+            "ranked_routes": (rebuilt,),
+            "fallback_candidate_ids_by_beat": fallback_ids,
+            "option_bindings_by_beat": all_bindings,
+        }
+    )
 
 
 def _prepared_replan_execution_option_id(
@@ -18068,6 +18518,33 @@ def _prepare_horizontal_runtime_candidate(
     immutable_window: Mapping[str, Any] | None = None,
     grounding_frame: RushFrame | None = None,
 ) -> dict[str, Any]:
+    # Autonomous 16:9 execution is bound to one complete-route selection in
+    # exactly the same way as the vertical frontier.  Candidate IDs are not
+    # timing authority: an alternate can legally occur in more than one source
+    # interval, so validate the option/selection pair before inspecting media
+    # or rebuilding any local trim.
+    sequence_binding: CandidateRouteOption | None = None
+    bound_execution: CandidateRouteSelection | None = None
+    execution_binding = option.get("_pre_render_execution_binding")
+    if execution_binding is not None:
+        if not isinstance(execution_binding, Mapping):
+            raise FeatureCutSystemFailure(
+                "horizontal runtime candidate has a malformed complete-route "
+                "execution binding"
+            )
+        sequence_binding, bound_execution = (
+            _validate_pre_render_execution_timing_binding(
+                option,
+                execution_binding=execution_binding,
+            )
+        )
+        if bound_execution.trim_duration_ms != round(
+            chapter_duration_seconds * 1000
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal complete-route execution duration differs from "
+                "the frozen chapter duration"
+            )
     frame_id = option.get("frame_id")
     if not isinstance(frame_id, str) or frame_id not in frames:
         raise ValueError("horizontal candidate references an unknown frame")
@@ -18102,6 +18579,40 @@ def _prepare_horizontal_runtime_candidate(
         end_ms = int(immutable_window["end_ms"])
         shot_id = str(immutable_window["shot_id"])
         trim = dict(immutable_window["trim"])
+    if bound_execution is not None:
+        bound_start = bound_execution.source_in_ms
+        bound_end = bound_execution.source_out_ms
+        if not (
+            isinstance(bound_start, int)
+            and isinstance(bound_end, int)
+            and bound_start < bound_end
+            and bound_end - bound_start == bound_execution.trim_duration_ms
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal complete-route execution has no immutable source "
+                "interval"
+            )
+        if immutable_window is not None and (
+            start_ms != bound_start or end_ms != bound_end
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal runtime immutable window differs from its "
+                "complete-route execution binding"
+            )
+        # Keep the local quality decision as evidence, but never let its
+        # centered interval replace the route-selected source execution.
+        trim = {
+            **trim,
+            "trim_method": "pre_render_complete_route_source_interval",
+            "locally_centered_source_in_ms": start_ms,
+            "locally_centered_source_out_ms": end_ms,
+            "resolved_duration_ms": bound_execution.trim_duration_ms,
+            "candidate_timing_sha256": sequence_binding.candidate_timing_sha256,
+            "candidate_execution_sha256": (
+                bound_execution.candidate_execution_sha256
+            ),
+        }
+        start_ms, end_ms = bound_start, bound_end
     source_audio_cache.setdefault(
         clip.sha256,
         has_audio_stream(Path(clip.path)),
@@ -18128,6 +18639,51 @@ def _prepare_horizontal_runtime_candidate(
     track_fingerprint: str | None = None
     source_motion_tracks: list[SegmentationTrack] = []
     if not compile_geometry:
+        # Production preflight deliberately measures only source motion and
+        # quality-safe timing for the currently selected primary.  It must not
+        # spend grounding work or compile a crop for an unselected alternate,
+        # yet a strict route still needs the same reliable motion-role gate
+        # before any segment is rendered.
+        if audit_source_motion:
+            source_motion_role = str(
+                option.get("source_camera_motion_role", "unknown")
+            )
+            source_motion_reason = option.get("source_camera_motion_reason")
+            source_motion_evidence = measure_source_camera_motion(
+                source_path=Path(clip.path),
+                source_asset_id=f"sha256:{clip.sha256}",
+                window_start_ms=start_ms,
+                window_end_ms=end_ms,
+                subject_tracks=source_motion_tracks,
+                output_dir=(
+                    output_dir
+                    / "geometry"
+                    / selected.feature_id
+                    / "horizontal"
+                    / str(option.get("candidate_id") or "candidate")
+                    / "source-camera-motion"
+                ),
+            )
+            geometry["source_camera_motion_evidence"] = (
+                source_motion_evidence.model_dump(mode="json")
+            )
+            geometry["source_camera_motion_measured"] = True
+            geometry["source_camera_motion_detected"] = (
+                source_motion_evidence.classification
+            )
+            geometry["source_camera_motion_reliable"] = (
+                source_motion_evidence.reliable
+            )
+            geometry["source_camera_motion_evidence_sha256"] = (
+                source_motion_evidence.definition_sha256
+            )
+            geometry["source_camera_motion_role"] = source_motion_role
+            geometry["source_camera_motion_reason"] = source_motion_reason
+            if fail_on_quality_human_review:
+                _validate_horizontal_source_camera_motion_declaration(
+                    role=source_motion_role,
+                    evidence=source_motion_evidence,
+                )
         return {
             "option": dict(option),
             "frame": frame,
@@ -18274,6 +18830,224 @@ def _prepare_horizontal_runtime_candidate(
         "debug": debug,
         "track_fingerprint": track_fingerprint,
     }
+
+
+def _preflight_horizontal_route_primaries(
+    *,
+    route: CandidateRouteResult,
+    plan: FeatureEditPlan,
+    brief_by_id: Mapping[str, FeatureChapterBrief],
+    frames: Mapping[str, RushFrame],
+    clips: Mapping[str, RushClip],
+    shot_cache: dict[str, ShotManifest],
+    shots_dir: Path,
+    scdet_threshold: float,
+    trim_decisions: Sequence[tuple[Path, TrimIntentDecision]],
+    shot_quality_maps: Sequence[tuple[Path, ShotQualityMap]],
+    source_audio_cache: dict[str, bool],
+    source_media_cache: dict[str, MediaInfo],
+    track_cache: dict[
+        tuple[str, str, int, int],
+        tuple[GroundingProposal, SegmentationTrack, Path],
+    ],
+    client: GeminiLabClient,
+    checkpoint_path: Path,
+    grounding_prompt: str,
+    output_dir: Path,
+    sam_analysis_fps: float,
+    model_request_block_reason: str | None,
+    strict: bool,
+    editorial_contracts: Sequence[EditorialBeatContract] = (),
+    candidate_evidence_events: Mapping[
+        tuple[str, str], Mapping[str, Any]
+    ] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Measure every selected 16:9 primary before admitting any render.
+
+    This intentionally uses ``compile_geometry=False``: zero-paid preflight
+    checks hard fulfillment, quality-safe timing, and photographed source
+    motion only. It does not ground, crop, or measure an alternate, preserving
+    Gemini's exclusive scoped-replan authority over every retained Top-K
+    fallback.
+    """
+
+    selected_by_beat = {selection.beat_id: selection for selection in route.selections}
+    plan_by_beat = {chapter.feature_id: chapter for chapter in plan.chapters}
+    failures: dict[str, list[dict[str, Any]]] = {}
+    summary_rows: list[dict[str, Any]] = []
+    for beat_id, selection in selected_by_beat.items():
+        selected = plan_by_beat.get(beat_id)
+        if selected is None:
+            raise FeatureCutSystemFailure(
+                "horizontal preflight route references an unknown feature: " + beat_id
+            )
+        options = _horizontal_runtime_candidate_options(selected, max_candidates=4)
+        raw_option = next(
+            (
+                candidate
+                for candidate in options
+                if candidate.get("candidate_id") == selection.candidate_id
+            ),
+            None,
+        )
+        if raw_option is None:
+            raise FeatureCutSystemFailure(
+                "horizontal preflight selection is absent from its immutable "
+                "candidate frontier: " + beat_id
+            )
+        # Bind the selected source interval before the zero-paid gate.  The
+        # initial route contains only rank one, while a restored replan route
+        # contains only Gemini's selected alternate; neither case can quietly
+        # recenter or promote an unbound candidate here.
+        option = _apply_pre_render_candidate_route(
+            [dict(raw_option)],
+            selected_candidate_id=selection.candidate_id,
+            ordered_candidate_ids=(selection.candidate_id,),
+            sequence_bindings=route.option_bindings_by_beat.get(beat_id, {}),
+            execution_bindings={selection.candidate_id: selection},
+        )[0]
+        prepared: dict[str, Any] | None = None
+        try:
+            _select_runtime_candidate_fulfillments(
+                tuple(
+                    contract
+                    for contract in editorial_contracts
+                    if (
+                        contract.feature_id == beat_id
+                        and contract.priority == "hard"
+                    )
+                ),
+                option=option,
+                evidence_events=candidate_evidence_events or {},
+            )
+            prepared = _prepare_horizontal_runtime_candidate(
+                option=option,
+                selected=selected,
+                brief_chapter=brief_by_id[beat_id],
+                chapter_duration_seconds=selection.trim_duration_ms / 1000,
+                frames=frames,
+                clips=clips,
+                shot_cache=shot_cache,
+                shots_dir=shots_dir,
+                scdet_threshold=scdet_threshold,
+                trim_decisions=trim_decisions,
+                shot_quality_maps=shot_quality_maps,
+                source_audio_cache=source_audio_cache,
+                source_media_cache=source_media_cache,
+                track_cache=track_cache,
+                client=client,
+                checkpoint_path=checkpoint_path,
+                grounding_prompt=grounding_prompt,
+                output_dir=output_dir,
+                sam_analysis_fps=sam_analysis_fps,
+                model_request_block_reason=model_request_block_reason,
+                audit_source_motion=True,
+                # Validate after preparation so a strict conflict can retain
+                # the exact measured evidence in the grouped replan context.
+                fail_on_quality_human_review=False,
+                compile_geometry=False,
+            )
+            # This is the same deterministic dirty-edge / isolated-jolt gate
+            # used by the renderer. Run it here so every authorized initial
+            # primary has completed all zero-paid source-motion checks before
+            # any exact-event or SAM request can be dispatched.
+            maskless_motion = _maskless_source_motion_preflight(
+                source_path=Path(prepared["clip"].path),
+                source_asset_id=prepared["media"].asset_id,
+                window_start_ms=int(prepared["start_ms"]),
+                window_end_ms=int(prepared["end_ms"]),
+                output_dir=(
+                    output_dir
+                    / "candidate-preflight"
+                    / beat_id
+                    / str(option.get("candidate_id") or "candidate")
+                    / "source-camera-motion"
+                ),
+            )
+            prepared["geometry"]["maskless_source_camera_motion"] = (
+                maskless_motion.model_dump(mode="json")
+            )
+            if strict:
+                measured = prepared["geometry"].get(
+                    "source_camera_motion_evidence"
+                )
+                if not isinstance(measured, Mapping):
+                    raise FeatureCutSystemFailure(
+                        "horizontal primary preflight did not persist source-motion evidence"
+                    )
+                _validate_horizontal_source_camera_motion_declaration(
+                    role=str(option.get("source_camera_motion_role", "unknown")),
+                    evidence=SourceCameraMotionEvidence.model_validate(measured),
+                )
+        except CandidateKnownInfeasible as error:
+            geometry = prepared.get("geometry", {}) if prepared is not None else {}
+            failure = {
+                "candidate_id": selection.candidate_id,
+                "candidate_rank": option.get("rank"),
+                "failure_class": "typed_source_motion_quality_or_fulfillment_gate",
+                "reason": str(error),
+                "planner_source_camera_motion_role": option.get(
+                    "source_camera_motion_role", "unknown"
+                ),
+                "planner_source_camera_motion_reason": option.get(
+                    "source_camera_motion_reason"
+                ),
+                "source_window_ms": (
+                    {
+                        "start": prepared.get("start_ms"),
+                        "end": prepared.get("end_ms"),
+                    }
+                    if prepared is not None
+                    else None
+                ),
+                "source_camera_motion_evidence": geometry.get(
+                    "source_camera_motion_evidence"
+                ),
+                "source_camera_motion_evidence_sha256": geometry.get(
+                    "source_camera_motion_evidence_sha256"
+                ),
+            }
+            failures.setdefault(beat_id, []).append(failure)
+            summary_rows.append({"beat_id": beat_id, "status": "failed", **failure})
+            continue
+        except ValueError as error:
+            _require_candidate_scoped_failure(error)
+            failure = {
+                "candidate_id": selection.candidate_id,
+                "candidate_rank": option.get("rank"),
+                "failure_class": "typed_quality_timing_or_fulfillment_gate",
+                "reason": str(error),
+            }
+            failures.setdefault(beat_id, []).append(failure)
+            summary_rows.append({"beat_id": beat_id, "status": "failed", **failure})
+            continue
+        geometry = prepared["geometry"]
+        summary_rows.append(
+            {
+                "beat_id": beat_id,
+                "candidate_id": selection.candidate_id,
+                "candidate_rank": option.get("rank"),
+                "status": "passed",
+                "source_camera_motion": geometry.get(
+                    "source_camera_motion_evidence"
+                ),
+                "source_camera_motion_role": geometry.get(
+                    "source_camera_motion_role"
+                ),
+            }
+        )
+    write_json(
+        output_dir / "horizontal-primary-preflight" / "summary.json",
+        {
+            "contract_version": "horizontal-primary-preflight-v1",
+            "route_definition_sha256": _pre_render_route_definition_sha256(route),
+            "rows": summary_rows,
+            "all_selected_primaries_checked_before_render": True,
+            "alternates_prepared": False,
+            "generated_at": utc_now(),
+        },
+    )
+    return failures
 
 
 def _resolve_selected_window_grouped_exact_event_locks(
@@ -24816,6 +25590,21 @@ def _run_feature_cut_experiment_impl(
             if autonomous_profile and render_horizontal
             else None
         )
+        if (
+            pre_render_horizontal_candidate_route is not None
+            and autonomous_policy is not None
+        ):
+            restored_horizontal_replan = (
+                _restore_preflight_horizontal_local_replan(
+                    route=pre_render_horizontal_candidate_route,
+                    editorial_dir=editorial_dir,
+                    policy=autonomous_policy,
+                    plan_path=plan_path,
+                    chapter_durations=chapter_durations,
+                )
+            )
+            if restored_horizontal_replan is not None:
+                pre_render_horizontal_candidate_route = restored_horizontal_replan
         pre_render_horizontal_candidate_route_path = (
             editorial_dir / "pre-render-horizontal-candidate-route.json"
         )
@@ -24860,6 +25649,15 @@ def _run_feature_cut_experiment_impl(
             if pre_render_horizontal_candidate_route is not None
             else {}
         )
+        pre_render_horizontal_execution_bindings_by_feature: dict[
+            str, dict[str, CandidateRouteSelection]
+        ] = {}
+        if pre_render_horizontal_candidate_route is not None:
+            for selection in pre_render_horizontal_candidate_route.selections:
+                pre_render_horizontal_execution_bindings_by_feature.setdefault(
+                    selection.beat_id,
+                    {},
+                )[selection.candidate_id] = selection
         horizontal_segments: list[Path] = []
         vertical_segments: list[Path] = []
         deferred_vertical_render_tasks: list[dict[str, Any]] = []
@@ -25076,6 +25874,56 @@ def _run_feature_cut_experiment_impl(
         }
         source_audio_cache: dict[str, bool] = {}
         source_media_cache: dict[str, MediaInfo] = {}
+        if (
+            autonomous_profile
+            and render_horizontal
+            and pre_render_horizontal_candidate_route is not None
+            and autonomous_policy is not None
+        ):
+            horizontal_primary_failures = _preflight_horizontal_route_primaries(
+                route=pre_render_horizontal_candidate_route,
+                plan=plan,
+                brief_by_id=brief_by_id,
+                frames=frames,
+                clips=clips,
+                shot_cache=shot_cache,
+                shots_dir=shots_dir,
+                scdet_threshold=scdet_threshold,
+                trim_decisions=trim_decisions,
+                shot_quality_maps=shot_quality_maps,
+                source_audio_cache=source_audio_cache,
+                source_media_cache=source_media_cache,
+                track_cache=track_cache,
+                client=client,
+                checkpoint_path=checkpoint_path,
+                grounding_prompt=grounding_prompt,
+                output_dir=output_dir,
+                sam_analysis_fps=sam_analysis_fps,
+                model_request_block_reason=gemini_geometry_block_reason,
+                strict=(
+                    autonomous_policy.execution_profile
+                    == "autonomous_strict"
+                ),
+                editorial_contracts=editorial_templates,
+                candidate_evidence_events=candidate_evidence_events,
+            )
+            if horizontal_primary_failures:
+                _persist_preflight_horizontal_local_infeasibility_replan(
+                    route=pre_render_horizontal_candidate_route,
+                    failures_by_beat=horizontal_primary_failures,
+                    editorial_dir=editorial_dir,
+                    policy=autonomous_policy,
+                    client=client,
+                    plan_path=plan_path,
+                    music_supplied=music_lock is not None,
+                    output_timeline_cues=output_timeline_cues or (),
+                )
+                raise PreflightSemanticReplanReady(
+                    "Gemini's selected 16:9 primaries failed zero-paid "
+                    "source-motion or quality preflight; one grouped "
+                    "prepared-alternate decision was persisted and a clean "
+                    "restart is required"
+                )
         exact_event_source_reservations = (
             _autonomous_exact_event_source_reservations(
                 plan,
@@ -28774,13 +29622,22 @@ def _run_feature_cut_experiment_impl(
                                 {},
                             )
                         ),
+                        execution_bindings=(
+                            pre_render_horizontal_execution_bindings_by_feature.get(
+                                selected.feature_id,
+                                {},
+                            )
+                        ),
                     )
-                    if autonomous_policy is not None:
-                        horizontal_options = horizontal_options[
-                            : autonomous_policy.recovery
-                            .max_candidate_attempts_per_beat
-                        ]
+                    if autonomous_profile:
+                        # The initial route has only Gemini's primary and a
+                        # restored route has only Gemini's one scoped-replan
+                        # alternate.  Never turn the normal renderer into a
+                        # local recovery loop over Top-K.
+                        horizontal_options = horizontal_options[:1]
                     for horizontal_option in horizontal_options:
+                        horizontal_runtime_stage = "fulfillment"
+                        candidate_window: dict[str, Any] | None = None
                         try:
                             _select_runtime_candidate_fulfillments(
                                 tuple(
@@ -28795,6 +29652,7 @@ def _run_feature_cut_experiment_impl(
                                 option=horizontal_option,
                                 evidence_events=candidate_evidence_events,
                             )
+                            horizontal_runtime_stage = "timing_quality"
                             candidate_window = (
                                 _prepare_horizontal_runtime_candidate(
                                     option=horizontal_option,
@@ -28835,6 +29693,7 @@ def _run_feature_cut_experiment_impl(
                             if autonomous_profile:
                                 assert autonomous_policy is not None
                                 assert editorial_beat_contracts_path is not None
+                                horizontal_runtime_stage = "source_motion"
                                 maskless_motion = (
                                     _maskless_source_motion_preflight(
                                         source_path=Path(
@@ -28865,6 +29724,7 @@ def _run_feature_cut_experiment_impl(
                                 candidate_window[
                                     "maskless_source_camera_motion"
                                 ] = maskless_motion.model_dump(mode="json")
+                                horizontal_runtime_stage = "exact_event"
                                 candidate_exact_resolution = (
                                     _resolve_horizontal_grouped_exact_event_locks(
                                         client=client,
@@ -28930,6 +29790,7 @@ def _run_feature_cut_experiment_impl(
                                             ),
                                         )
                                     )
+                                horizontal_runtime_stage = "exact_trim_authorization"
                                 authorized_trim, authorized = (
                                     _authorize_runtime_selected_window_trim(
                                         policy=autonomous_policy,
@@ -28987,6 +29848,7 @@ def _run_feature_cut_experiment_impl(
                                         dense_catalog=dense_catalog,
                                     )
                                 )
+                                horizontal_runtime_stage = "sam_grounding_geometry"
                                 prepared_horizontal = (
                                     _prepare_horizontal_runtime_candidate(
                                         option=horizontal_option,
@@ -29061,6 +29923,79 @@ def _run_feature_cut_experiment_impl(
                                     ),
                                 }
                             )
+                            if (
+                                autonomous_profile
+                                and autonomous_policy is not None
+                                and pre_render_horizontal_candidate_route
+                                is not None
+                            ):
+                                horizontal_replan_decision = (
+                                    _horizontal_preflight_local_infeasibility_replan_paths(
+                                        editorial_dir
+                                    )[1]
+                                )
+                                if horizontal_replan_decision.is_file():
+                                    raise CandidateKnownInfeasible(
+                                        "selected horizontal scoped-replan "
+                                        "alternate failed after the single "
+                                        "replan cap was consumed"
+                                    ) from error
+                                failure_facts = {
+                                    selected.feature_id: (
+                                        {
+                                            "candidate_id": str(
+                                                horizontal_option.get(
+                                                    "candidate_id"
+                                                )
+                                                or ""
+                                            ),
+                                            "candidate_rank": (
+                                                horizontal_option.get("rank")
+                                            ),
+                                            "failure_class": (
+                                                "typed_horizontal_"
+                                                + horizontal_runtime_stage
+                                                + "_failure"
+                                            ),
+                                            "error_type": type(error).__name__,
+                                            "reason": str(error),
+                                            "candidate_execution_binding": (
+                                                horizontal_option.get(
+                                                    "_pre_render_execution_binding"
+                                                )
+                                            ),
+                                            "source_window_ms": (
+                                                {
+                                                    "start": candidate_window.get(
+                                                        "start_ms"
+                                                    ),
+                                                    "end": candidate_window.get(
+                                                        "end_ms"
+                                                    ),
+                                                }
+                                                if candidate_window is not None
+                                                else None
+                                            ),
+                                        },
+                                    )
+                                }
+                                _persist_preflight_horizontal_local_infeasibility_replan(
+                                    route=pre_render_horizontal_candidate_route,
+                                    failures_by_beat=failure_facts,
+                                    editorial_dir=editorial_dir,
+                                    policy=autonomous_policy,
+                                    client=client,
+                                    plan_path=plan_path,
+                                    music_supplied=music_lock is not None,
+                                    output_timeline_cues=output_timeline_cues
+                                    or (),
+                                )
+                                raise PreflightSemanticReplanReady(
+                                    "Gemini's selected 16:9 primary failed "
+                                    "typed runtime exact-event, SAM, or geometry "
+                                    "validation; one grouped scoped replan was "
+                                    "persisted and a clean restart is required"
+                                ) from error
                             continue
                         horizontal_selected_option = dict(horizontal_option)
                         horizontal_candidate_attempts.append(
@@ -29078,6 +30013,16 @@ def _run_feature_cut_experiment_impl(
                         prepared_horizontal is None
                         or horizontal_selected_option is None
                     ):
+                        horizontal_replan_decision = (
+                            _horizontal_preflight_local_infeasibility_replan_paths(
+                                editorial_dir
+                            )[1]
+                        )
+                        if horizontal_replan_decision.is_file():
+                            raise CandidateKnownInfeasible(
+                                "selected horizontal scoped-replan alternate "
+                                "failed after the single replan cap was consumed"
+                            )
                         raise ValueError(
                             "all 16:9 candidates failed quality, capacity, "
                             "geometry or lineage preflight"

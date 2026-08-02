@@ -164,6 +164,9 @@ from jascue_video_lab.feature_cut import (
     _semantic_replan_frontier_projection,
     _prepared_replan_execution_option_id,
     _persist_preflight_local_infeasibility_replan,
+    _persist_preflight_horizontal_local_infeasibility_replan,
+    _preflight_horizontal_route_primaries,
+    _restore_preflight_horizontal_local_replan,
     _selected_preflight_local_replan,
     _source_motion_clean_recovery_window,
     _should_refine_selected_vertical_candidate,
@@ -205,7 +208,9 @@ from jascue_video_lab.sequence_optimizer import CandidateRouteOption
 from jascue_video_lab.sequence_optimizer import (
     CandidateCompleteRoute,
     CandidateRouteBeat,
+    CandidateRouteResult,
     CandidateRouteSelection,
+    SemanticReplanCandidateBinding,
     RoundRobinFrontierBeat,
     RoundRobinFrontierCandidate,
     RoundRobinFrontierState,
@@ -4755,6 +4760,515 @@ def test_horizontal_pre_render_route_locks_gemini_primary(
             "static_full_bleed_crop",
             "tracked_full_bleed_crop",
         ),
+    )
+
+
+def test_horizontal_primary_failure_persists_one_grouped_alternate_replan(
+    tmp_path: Path,
+) -> None:
+    """A measured primary failure never promotes the alternate locally."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    duration_update = {
+        "trim_duration_ms": 30_000,
+        "minimum_readable_ms": 30_000,
+        "preferred_readable_ms": 30_000,
+        "maximum_readable_ms": 30_000,
+        "fixed_source_out_ms": 30_000,
+        "safe_capacity_ms": 30_000,
+        "safe_window_end_ms": 30_000,
+        "source_anchor_ms": 15_000,
+    }
+    primary = _local_replan_option("hero", "rank-01", "a", rank=1).model_copy(
+        update=duration_update
+    )
+    alternate = _local_replan_option("hero", "rank-02", "b", rank=2).model_copy(
+        update=duration_update
+    )
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="hero", options=(primary,)),),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    ).model_copy(
+        update={
+            "semantic_replan_candidate_bindings_by_beat": {
+                "hero": (
+                    SemanticReplanCandidateBinding(option=primary),
+                    SemanticReplanCandidateBinding(option=alternate),
+                )
+            }
+        }
+    )
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["option_ids_by_beat"] == {"hero": ("hero--rank-02",)}
+            context = json.loads(kwargs["prompt"].split("\n\n", 1)[1])
+            assert context["affected_beats"][0]["failure_facts"][0][
+                "failure_class"
+            ] == "typed_horizontal_exact_event_failure"
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "hero",
+                            "selected_option_id": "hero--rank-02",
+                            "fallback_option_ids": [],
+                            "semantic_reason": "preserve_readability",
+                            "unresolved_concern_codes": [],
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    ),
+                )
+            )
+            return SimpleNamespace(decision=decision, interaction_ids=("int-h",))
+
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=route,
+        failures_by_beat={
+            "hero": (
+                {
+                    "candidate_id": "rank-01",
+                    "failure_class": "typed_horizontal_exact_event_failure",
+                    "reason": "exact event could not be bound to hard evidence",
+                },
+            )
+        },
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    restored = _restore_preflight_horizontal_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"hero": 30.0},
+    )
+
+    assert restored is not None
+    assert [selection.candidate_id for selection in restored.selections] == [
+        "rank-02"
+    ]
+    assert restored.fallback_candidate_ids_by_beat["hero"] == ("rank-02",)
+    assert (tmp_path / "editorial" / "preflight-horizontal-local-infeasibility-replan" / "failures.json").is_file()
+    with pytest.raises(CandidateKnownInfeasible, match="cap exhausted"):
+        _persist_preflight_horizontal_local_infeasibility_replan(
+            route=restored,
+            failures_by_beat={
+                "hero": ({"candidate_id": "rank-02", "reason": "later failure"},)
+            },
+            editorial_dir=tmp_path / "editorial",
+            policy=policy,
+            client=FakeClient(),
+            plan_path=plan_path,
+            music_supplied=True,
+            output_timeline_cues=(),
+        )
+
+
+def test_horizontal_route_keeps_alternates_only_in_replan_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def build_initial_route(beats, **_kwargs):
+        option = beats[0].options[0]
+        selection = CandidateRouteSelection(
+            beat_id=option.beat_id,
+            candidate_id=option.candidate_id,
+            source_asset_id=option.source_asset_id,
+            event_id=option.event_id,
+            trim_duration_ms=option.trim_duration_ms,
+            cue_id=option.cue_id,
+            cue_aligned=option.cue_aligned,
+            presentation_mode=option.presentation_mode,
+            entry_composition=option.entry_composition,
+            exit_composition=option.exit_composition,
+            decision_codes=("initial_primary",),
+        )
+        captured["option"] = option
+        return CandidateRouteResult(
+            selections=(selection,),
+            fallback_candidate_ids_by_beat={option.beat_id: (option.candidate_id,)},
+            option_bindings_by_beat={option.beat_id: {option.candidate_id: option}},
+            objective_score=1.0,
+            beam_width=1,
+            total_duration_ms=option.trim_duration_ms,
+        )
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "optimize_pre_render_candidate_route",
+        build_initial_route,
+    )
+    candidate = lambda candidate_id, rank: SimpleNamespace(
+        candidate_id=candidate_id,
+        rank=rank,
+        source_asset_id="sha256:" + candidate_id[-1] * 64,
+        event_id=f"event-{candidate_id}",
+        confidence=0.9,
+        strategy="original",
+        camera_intent="hold",
+        target_description=None,
+        quality_risks=[],
+        source_reuse_mode="none",
+        source_reuse_justification=None,
+    )
+    route = feature_cut_module._build_pre_render_horizontal_candidate_route(
+        SimpleNamespace(
+            chapters=[
+                SimpleNamespace(
+                    feature_id="feature-1",
+                    horizontal_candidates=[
+                        candidate("rank-01", 1),
+                        candidate("rank-02", 2),
+                    ],
+                )
+            ]
+        ),
+        chapter_durations={"feature-1": 4.0},
+        rhythm_plan=SimpleNamespace(
+            chapters=[
+                SimpleNamespace(
+                    feature_id="feature-1",
+                    minimum_duration_seconds=3.0,
+                    preferred_duration_seconds=4.0,
+                    maximum_duration_seconds=6.0,
+                )
+            ]
+        ),
+        duration_audit={},
+        policy=SimpleNamespace(
+            execution_profile="autonomous_strict",
+            duration=SimpleNamespace(min_ms=3_000, max_ms=6_000),
+            presentation=SimpleNamespace(max_panel_runtime_fraction=0.25),
+            editorial=SimpleNamespace(
+                max_editorial_reprise_overlap_fraction=0.2
+            ),
+        ),
+    )
+
+    assert route.fallback_candidate_ids_by_beat["feature-1"] == ("rank-01",)
+    assert tuple(route.option_bindings_by_beat["feature-1"]) == ("rank-01",)
+    assert [
+        binding.option.candidate_id
+        for binding in route.semantic_replan_candidate_bindings_by_beat["feature-1"]
+    ] == ["rank-01", "rank-02"]
+
+
+def test_horizontal_replan_context_only_resumes_same_journal_run(
+    tmp_path: Path,
+) -> None:
+    """A crash after context persistence reuses, rather than replaces, it."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    duration_update = {
+        "trim_duration_ms": 30_000,
+        "minimum_readable_ms": 30_000,
+        "preferred_readable_ms": 30_000,
+        "maximum_readable_ms": 30_000,
+        "fixed_source_out_ms": 30_000,
+        "safe_capacity_ms": 30_000,
+        "safe_window_end_ms": 30_000,
+        "source_anchor_ms": 15_000,
+    }
+    primary = _local_replan_option("hero", "rank-01", "a", rank=1).model_copy(
+        update=duration_update
+    )
+    alternate = _local_replan_option("hero", "rank-02", "b", rank=2).model_copy(
+        update=duration_update
+    )
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="hero", options=(primary,)),),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    ).model_copy(
+        update={
+            "semantic_replan_candidate_bindings_by_beat": {
+                "hero": (
+                    SemanticReplanCandidateBinding(option=primary),
+                    SemanticReplanCandidateBinding(option=alternate),
+                )
+            }
+        }
+    )
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class CachedJournalClient:
+        def __init__(self) -> None:
+            self.run_dirs: list[Path] = []
+
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            self.run_dirs.append(kwargs["run_dir"])
+            if len(self.run_dirs) == 1:
+                raise RuntimeError("interrupted after durable paid response")
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "hero",
+                            "selected_option_id": "hero--rank-02",
+                            "fallback_option_ids": [],
+                            "semantic_reason": "preserve_readability",
+                            "unresolved_concern_codes": [],
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    ),
+                )
+            )
+            return SimpleNamespace(decision=decision, interaction_ids=("cached",))
+
+    client = CachedJournalClient()
+    failures = {
+        "hero": (
+            {
+                "candidate_id": "rank-01",
+                "failure_class": "typed_horizontal_sam_grounding_geometry_failure",
+                "reason": "SAM target track could not satisfy hard geometry",
+            },
+        )
+    }
+    editorial_dir = tmp_path / "editorial"
+    with pytest.raises(RuntimeError, match="interrupted"):
+        _persist_preflight_horizontal_local_infeasibility_replan(
+            route=route,
+            failures_by_beat=failures,
+            editorial_dir=editorial_dir,
+            policy=policy,
+            client=client,
+            plan_path=plan_path,
+            music_supplied=True,
+            output_timeline_cues=(),
+        )
+    context_path = (
+        editorial_dir
+        / "preflight-horizontal-local-infeasibility-replan"
+        / "context.json"
+    )
+    persisted_context = context_path.read_bytes()
+    assert _restore_preflight_horizontal_local_replan(
+        route=route,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"hero": 30.0},
+    ) is None
+
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=route,
+        failures_by_beat=failures,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        client=client,
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+
+    assert context_path.read_bytes() == persisted_context
+    assert client.run_dirs == [context_path.parent, context_path.parent]
+    assert context_path.with_name("decision.json").is_file()
+
+
+def test_horizontal_preflight_measures_selected_primary_not_alternate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _local_replan_option("hero", "rank-01", "a", rank=1)
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="hero", options=(primary,)),),
+        minimum_duration_ms=10_000,
+        maximum_duration_ms=10_000,
+        target_duration_ms=10_000,
+    )
+    observed: list[tuple[str, dict[str, object] | None]] = []
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_horizontal_runtime_candidate_options",
+        lambda *_args, **_kwargs: [
+            {"candidate_id": "rank-01", "rank": 1},
+            {"candidate_id": "rank-02", "rank": 2},
+        ],
+    )
+
+    def prepared(*, option, **_kwargs):
+        binding = option.get("_pre_render_execution_binding")
+        observed.append(
+            (
+                option["candidate_id"],
+                dict(binding) if isinstance(binding, dict) else None,
+            )
+        )
+        return {
+            "clip": SimpleNamespace(path=tmp_path / "source.mov"),
+            "media": SimpleNamespace(asset_id="sha256:" + "a" * 64),
+            "start_ms": 0,
+            "end_ms": 10_000,
+            "geometry": {
+                "source_camera_motion_evidence": {"classification": "static"},
+                "source_camera_motion_role": "static_or_negligible",
+            }
+        }
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_prepare_horizontal_runtime_candidate",
+        prepared,
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_maskless_source_motion_preflight",
+        lambda **_kwargs: SimpleNamespace(
+            model_dump=lambda **_kwargs: {"classification": "static"}
+        ),
+    )
+    failures = _preflight_horizontal_route_primaries(
+        route=route,
+        plan=SimpleNamespace(
+            chapters=[SimpleNamespace(feature_id="hero")]
+        ),
+        brief_by_id={"hero": SimpleNamespace()},
+        frames={},
+        clips={},
+        shot_cache={},
+        shots_dir=tmp_path / "shots",
+        scdet_threshold=4.0,
+        trim_decisions=(),
+        shot_quality_maps=(),
+        source_audio_cache={},
+        source_media_cache={},
+        track_cache={},
+        client=SimpleNamespace(),
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        grounding_prompt="unused",
+        output_dir=tmp_path,
+        sam_analysis_fps=2.0,
+        model_request_block_reason=None,
+        # This test only proves that preflight measures the selected primary
+        # and never prepares an alternate.  Source-motion declaration
+        # compatibility is covered separately with complete evidence.
+        strict=False,
+    )
+
+    assert failures == {}
+    assert [candidate_id for candidate_id, _ in observed] == ["rank-01"]
+    assert observed[0][1] is not None
+    assert observed[0][1]["candidate_execution_sha256"] == (
+        route.selections[0].candidate_execution_sha256
+    )
+    summary = read_json(tmp_path / "horizontal-primary-preflight" / "summary.json")
+    assert summary["alternates_prepared"] is False
+    assert summary["all_selected_primaries_checked_before_render"] is True
+
+
+def test_horizontal_preflight_collects_hard_fulfillment_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _local_replan_option("hero", "rank-01", "a", rank=1)
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="hero", options=(primary,)),),
+        minimum_duration_ms=10_000,
+        maximum_duration_ms=10_000,
+        target_duration_ms=10_000,
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_horizontal_runtime_candidate_options",
+        lambda *_args, **_kwargs: [
+            {
+                "candidate_id": "rank-01",
+                "rank": 1,
+                "source_asset_id": primary.source_asset_id,
+                "event_id": primary.event_id,
+            }
+        ],
+    )
+    prepared_called = False
+
+    def reject_hard_fulfillment(contracts, **_kwargs):
+        assert len(contracts) == 1
+        raise ValueError("hard visual obligation cannot be fulfilled")
+
+    def prepared(**_kwargs):
+        nonlocal prepared_called
+        prepared_called = True
+        pytest.fail("failed fulfillment must stop before timing/motion work")
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_select_runtime_candidate_fulfillments",
+        reject_hard_fulfillment,
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_prepare_horizontal_runtime_candidate",
+        prepared,
+    )
+
+    failures = _preflight_horizontal_route_primaries(
+        route=route,
+        plan=SimpleNamespace(chapters=[SimpleNamespace(feature_id="hero")]),
+        brief_by_id={"hero": SimpleNamespace()},
+        frames={},
+        clips={},
+        shot_cache={},
+        shots_dir=tmp_path / "shots",
+        scdet_threshold=4.0,
+        trim_decisions=(),
+        shot_quality_maps=(),
+        source_audio_cache={},
+        source_media_cache={},
+        track_cache={},
+        client=SimpleNamespace(),
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        grounding_prompt="unused",
+        output_dir=tmp_path,
+        sam_analysis_fps=2.0,
+        model_request_block_reason=None,
+        strict=False,
+        editorial_contracts=(
+            SimpleNamespace(feature_id="hero", priority="hard"),
+        ),
+        candidate_evidence_events={},
+    )
+
+    assert prepared_called is False
+    assert failures["hero"][0]["failure_class"] == (
+        "typed_quality_timing_or_fulfillment_gate"
     )
 
 
