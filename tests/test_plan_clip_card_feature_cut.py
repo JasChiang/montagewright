@@ -63,6 +63,7 @@ from jascue_video_lab.media import sha256_file
 from jascue_video_lab.schema import gemini_response_schema
 from jascue_video_lab.storage import write_json
 from scripts.plan_clip_card_feature_cut import (
+    CandidateVideoBudgetPreflightError,
     ClipCardFeatureCandidate,
     ClipCardFeatureCandidateV3,
     ClipCardVirtualCameraPhaseV1,
@@ -401,6 +402,69 @@ def test_candidate_video_budget_reduces_context_before_omitting_evidence() -> No
     assert total_ms == 7_000
     assert rows[0]["start_ms"] == 1_500
     assert rows[0]["end_ms"] == 8_500
+
+
+def test_candidate_video_budget_fits_363_seconds_to_exact_cap() -> None:
+    card = _card()
+    event = card.events[0].model_copy(
+        update={"start_mmss": "00:02", "end_mmss": "00:37"}
+    )
+    card = card.model_copy(update={"duration_ms": 40_000, "events": [event]})
+    rows = [
+        {"source_asset_id": ASSET_ID, "event_id": event.event_id}
+        for _ in range(10)
+    ]
+
+    context_ms, total_ms = fit_candidate_video_windows_to_budget(
+        rows=rows,
+        cards={ASSET_ID: card},
+        requested_context_ms=650,
+        maximum_total_ms=360_000,
+    )
+
+    assert context_ms == 500
+    assert total_ms == 360_000
+    assert all(row["duration_ms"] == 36_000 for row in rows)
+
+
+def test_candidate_video_budget_reports_irreducible_window_minima() -> None:
+    card = _card()
+    event = card.events[0].model_copy(
+        update={"start_mmss": "00:00", "end_mmss": "06:03"}
+    )
+    card = card.model_copy(update={"duration_ms": 363_000, "events": [event]})
+    rows = [
+        {
+            "source_asset_id": ASSET_ID,
+            "event_id": event.event_id,
+            "references": [{"feature_id": "feature-1", "rank": 1}],
+        }
+    ]
+
+    with pytest.raises(CandidateVideoBudgetPreflightError) as raised:
+        fit_candidate_video_windows_to_budget(
+            rows=rows,
+            cards={ASSET_ID: card},
+            requested_context_ms=1_000,
+            maximum_total_ms=360_000,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic["reason_code"] == (
+        "candidate_video_budget_irreducible_minimum"
+    )
+    assert diagnostic["minimum_total_ms"] == 363_000
+    assert diagnostic["maximum_total_ms"] == 360_000
+    assert diagnostic["per_window_minima"] == [
+        {
+            "source_asset_id": ASSET_ID,
+            "event_id": event.event_id,
+            "minimum_start_ms": 0,
+            "minimum_end_ms": 363_000,
+            "minimum_duration_ms": 363_000,
+            "references": [{"feature_id": "feature-1", "rank": 1}],
+        }
+    ]
 
 
 def test_alternate_edit_freshness_changes_only_substitutable_events() -> None:

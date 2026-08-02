@@ -10,7 +10,7 @@ import uuid
 from time import monotonic
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Callable, Collection, Mapping, Sequence
+from typing import Any, Callable, Collection, Literal, Mapping, Sequence
 
 from .autonomous_policy import (
     AutonomousDegradationManifest,
@@ -730,6 +730,81 @@ def _run_budgeted_planning_stage(
     return usage
 
 
+def _maximum_candidate_video_budget_ms(
+    *,
+    budget_ledger: BudgetLedger,
+    music_duration_ms: int,
+    estimated_text_tokens: int,
+    max_output_tokens: int,
+    thinking_level: Literal["minimal", "low", "medium", "high"],
+) -> int:
+    """Derive the planner's media cap from the current worst-case reserve.
+
+    A fixed media cap is not an editorial constraint.  This cap is the largest
+    whole-second candidate reel that the signed policy and all current ledger
+    holds can reserve alongside the supplied music and planner text.
+    """
+
+    def fits(candidate_video_ms: int) -> bool:
+        return budget_ledger.can_reserve(
+            estimate_paid_call(
+                stage="autonomous_direct_video_edit_plan",
+                model_id=MODEL_ID,
+                media_duration_ms=candidate_video_ms + music_duration_ms,
+                media_resolution="low",
+                text_input_tokens=estimated_text_tokens,
+                max_output_tokens=max_output_tokens,
+                thinking_level=thinking_level,
+                retry_allowance=0,
+            )
+        )
+
+    if not fits(0):
+        raise DeliveryPipelineBlocked(
+            "autonomous direct-video planning cannot reserve even its "
+            "text-and-music-only worst-case call"
+        )
+    low = 0
+    high = 1_000
+    while fits(high):
+        low = high
+        high *= 2
+    while low < high:
+        candidate = ((low + high + 1) // 2) // 1_000 * 1_000
+        if candidate <= low:
+            break
+        if fits(candidate):
+            low = candidate
+        else:
+            high = candidate - 1_000
+    return low
+
+
+def _direct_planning_preflight_block(
+    plan_dir: Path,
+) -> dict[str, Any] | None:
+    """Load the typed zero-paid preflight blocker, if planning wrote one."""
+
+    path = plan_dir / "candidate-video-budget-preflight.json"
+    if not path.is_file():
+        return None
+    payload = read_json(path)
+    if not isinstance(payload, dict):
+        raise DeliveryPipelineBlocked(
+            "direct-video local planning preflight artifact is not an object"
+        )
+    if (
+        payload.get("contract_version")
+        != "candidate-video-budget-preflight-v1"
+        or payload.get("status") != "blocked"
+        or not isinstance(payload.get("reason_code"), str)
+    ):
+        raise DeliveryPipelineBlocked(
+            "direct-video local planning preflight artifact is invalid"
+        )
+    return payload
+
+
 def _refresh_stale_clip_cards(
     *,
     catalog_path: Path,
@@ -1400,6 +1475,17 @@ def _prepare_fresh_autonomous_direct_plan(
         raise DeliveryPipelineBlocked(
             "autonomous shortlist completed without its typed artifact"
         )
+    direct_plan_text_tokens = max(
+        60_000,
+        len(shortlist_path.read_text(encoding="utf-8")) * 3 + 30_000,
+    )
+    maximum_candidate_video_ms = _maximum_candidate_video_budget_ms(
+        budget_ledger=budget_ledger,
+        music_duration_ms=music_duration_ms,
+        estimated_text_tokens=direct_plan_text_tokens,
+        max_output_tokens=24_576,
+        thinking_level="low",
+    )
     plan_command = [
         sys.executable,
         str(project_root / "scripts/plan_clip_card_feature_cut.py"),
@@ -1424,7 +1510,7 @@ def _prepare_fresh_autonomous_direct_plan(
         "--candidate-video-depth",
         "3",
         "--maximum-candidate-video-seconds",
-        "360",
+        str(maximum_candidate_video_ms / 1000),
         *supplement_args,
     ]
     if music_path is not None:
@@ -1466,16 +1552,21 @@ def _prepare_fresh_autonomous_direct_plan(
             stage="autonomous_direct_video_edit_plan",
             stage_dir=plan_dir,
             budget_ledger=budget_ledger,
-            estimated_text_tokens=max(
-                60_000,
-                len(shortlist_path.read_text(encoding="utf-8")) * 3
-                + 30_000,
+            estimated_text_tokens=direct_plan_text_tokens,
+            media_duration_ms=(
+                maximum_candidate_video_ms + music_duration_ms
             ),
-            media_duration_ms=360_000 + music_duration_ms,
             max_output_tokens=24_576,
             raise_on_subprocess_error=False,
         )
         if not all(path.is_file() for path in required):
+            preflight_block = _direct_planning_preflight_block(plan_dir)
+            if preflight_block is not None:
+                raise DeliveryPipelineBlocked(
+                    "direct-video local planning preflight blocked: "
+                    f"{preflight_block['reason_code']}; inspect "
+                    f"{(plan_dir / 'candidate-video-budget-preflight.json').resolve()}"
+                )
             initial_validation_path = (
                 plan_dir
                 / "clip-card-feature-plan.attempt-01.schema-validation.json"
@@ -1505,11 +1596,7 @@ def _prepare_fresh_autonomous_direct_plan(
                 # The repair carries the original prompt, the failed JSON and
                 # the contract diagnostic as text.  Price that retained
                 # evidence rather than the candidate reel a second time.
-                estimated_text_tokens=max(
-                    60_000,
-                    len(shortlist_path.read_text(encoding="utf-8")) * 3
-                    + 30_000,
-                ),
+                estimated_text_tokens=direct_plan_text_tokens,
                 max_output_tokens=24_576,
                 thinking_level="minimal",
                 exclude_existing_raw_interaction_paths=initial_raw_paths,

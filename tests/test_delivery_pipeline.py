@@ -2058,6 +2058,8 @@ def test_fresh_autonomous_planning_uses_shortlist_then_direct_video_projection(
     assert "--repair-attempts" in direct_command
     assert direct_command[direct_command.index("--repair-attempts") + 1] == "0"
     assert "--music" in direct_command
+    maximum_index = direct_command.index("--maximum-candidate-video-seconds")
+    assert float(direct_command[maximum_index + 1]) > 360.0
     assert result["plan_dir"].endswith("picture/gemini-plan")
 
 
@@ -2137,6 +2139,81 @@ def test_fresh_autonomous_planning_budgets_text_repair_after_typed_failure(
     repair_command = stages[2][1]
     assert "--resume-failed-plan" in repair_command
     assert result["planning_usage"]["request_count"] == 2
+
+
+def test_fresh_autonomous_planning_surfaces_local_budget_preflight(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    catalog = tmp_path / "catalog.json"
+    brief = tmp_path / "brief.json"
+    policy_path = tmp_path / "policy.json"
+    contracts = tmp_path / "contracts.json"
+    music = tmp_path / "music.wav"
+    library = tmp_path / "clip-cards"
+    for path in (catalog, brief, policy_path, contracts):
+        write_json(path, {})
+    write_json(policy_path, _autonomous_policy())
+    music.write_bytes(b"music")
+    library.mkdir()
+    monkeypatch.setattr(
+        pipeline,
+        "_resolve_prepared_clip_card_library",
+        lambda **_kwargs: (library, SimpleNamespace(), (), 1_000),
+    )
+    monkeypatch.setattr(pipeline, "_refresh_stale_clip_cards", lambda **_kwargs: ())
+    monkeypatch.setattr(
+        pipeline,
+        "_archive_stale_clip_card_supplements",
+        lambda **_kwargs: (),
+    )
+    stages: list[str] = []
+
+    def fake_stage(**kwargs):
+        stage = kwargs["stage"]
+        stages.append(stage)
+        delivery = tmp_path / "delivery"
+        if stage == "autonomous_clip_card_shortlist":
+            write_json(delivery / "retrieval" / "feature-shortlist.json", {})
+        else:
+            write_json(
+                delivery
+                / "picture"
+                / "gemini-plan"
+                / "candidate-video-budget-preflight.json",
+                {
+                    "contract_version": "candidate-video-budget-preflight-v1",
+                    "status": "blocked",
+                    "reason_code": "candidate_video_budget_irreducible_minimum",
+                    "minimum_total_ms": 363_000,
+                    "maximum_total_ms": 360_000,
+                    "per_window_minima": [],
+                },
+            )
+        return {"request_count": 0}
+
+    monkeypatch.setattr(pipeline, "_run_budgeted_planning_stage", fake_stage)
+
+    with pytest.raises(
+        pipeline.DeliveryPipelineBlocked,
+        match="candidate_video_budget_irreducible_minimum",
+    ):
+        pipeline._prepare_fresh_autonomous_direct_plan(
+            catalog_path=catalog,
+            brief_path=brief,
+            music_path=music,
+            music_duration_ms=90_000,
+            policy_path=policy_path,
+            editorial_contracts_path=contracts,
+            prepared_library_path=library,
+            output_dir=tmp_path / "delivery",
+            budget_ledger=BudgetLedger(max_cost_usd=1.25, max_interactions=25),
+        )
+
+    assert stages == [
+        "autonomous_clip_card_shortlist",
+        "autonomous_direct_video_edit_plan",
+    ]
 
 
 def test_prepared_clip_card_stale_model_blocks_before_paid_planning(

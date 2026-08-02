@@ -1127,12 +1127,14 @@ class BudgetLedger:
         )
         return self.max_interactions - self.interaction_guard - remaining_holds
 
-    def reserve(
+    def _reserve_failure_messages(
         self,
         estimate: PaidCallEstimate,
         *,
-        recovery_call: bool = False,
-    ) -> BudgetReservation:
+        recovery_call: bool,
+    ) -> list[str]:
+        """Return the exact pre-dispatch reserve failures without mutation."""
+
         projected_cost = (
             self.actual_cost_usd
             + self.reserved_cost_usd
@@ -1151,9 +1153,7 @@ class BudgetLedger:
             stage=estimate.stage,
             cost_usd=estimate.worst_case_cost_usd,
         )
-        completion_cost_limit = (
-            self.max_cost_usd - remaining_mandatory_cost
-        )
+        completion_cost_limit = self.max_cost_usd - remaining_mandatory_cost
         cost_limit = min(coarse_cost_limit, completion_cost_limit)
         interaction_limit = self._interaction_limit_after(
             stage=estimate.stage,
@@ -1169,6 +1169,31 @@ class BudgetLedger:
                 "interaction reserve "
                 f"{projected_interactions} exceeds {interaction_limit}"
             )
+        return failures
+
+    def can_reserve(
+        self,
+        estimate: PaidCallEstimate,
+        *,
+        recovery_call: bool = False,
+    ) -> bool:
+        """Check whether a worst-case call fits without creating a reservation."""
+
+        return not self._reserve_failure_messages(
+            estimate,
+            recovery_call=recovery_call,
+        )
+
+    def reserve(
+        self,
+        estimate: PaidCallEstimate,
+        *,
+        recovery_call: bool = False,
+    ) -> BudgetReservation:
+        failures = self._reserve_failure_messages(
+            estimate,
+            recovery_call=recovery_call,
+        )
         if failures:
             raise BudgetExceeded(
                 f"paid call blocked before request ({estimate.stage}): "

@@ -2786,6 +2786,37 @@ def validate_candidate_video_budget(
         )
 
 
+class CandidateVideoBudgetPreflightError(ValueError):
+    """No context-only reduction can fit every immutable candidate window."""
+
+    def __init__(
+        self,
+        *,
+        requested_context_ms: int,
+        requested_total_ms: int,
+        minimum_total_ms: int,
+        maximum_total_ms: int,
+        minimum_windows: list[dict[str, Any]],
+    ) -> None:
+        self.diagnostic = {
+            "contract_version": "candidate-video-budget-preflight-v1",
+            "status": "blocked",
+            "failure_policy": "fail_closed_before_upload_or_paid_planning",
+            "reason_code": "candidate_video_budget_irreducible_minimum",
+            "requested_context_ms": requested_context_ms,
+            "requested_total_ms": requested_total_ms,
+            "minimum_total_ms": minimum_total_ms,
+            "maximum_total_ms": maximum_total_ms,
+            "overflow_ms": minimum_total_ms - maximum_total_ms,
+            "per_window_minima": minimum_windows,
+        }
+        super().__init__(
+            "candidate direct-video budget has an irreducible minimum before "
+            f"upload or paid planning: {minimum_total_ms / 1000:.1f}s > "
+            f"{maximum_total_ms / 1000:.1f}s"
+        )
+
+
 def fit_candidate_video_windows_to_budget(
     *,
     rows: list[dict[str, Any]],
@@ -2828,10 +2859,24 @@ def fit_candidate_video_windows_to_budget(
         return requested_context_ms, requested_total_ms
 
     minimum_total_ms = apply_context(0)
-    validate_candidate_video_budget(
-        total_duration_ms=minimum_total_ms,
-        maximum_duration_ms=maximum_total_ms,
-    )
+    if minimum_total_ms > maximum_total_ms:
+        raise CandidateVideoBudgetPreflightError(
+            requested_context_ms=requested_context_ms,
+            requested_total_ms=requested_total_ms,
+            minimum_total_ms=minimum_total_ms,
+            maximum_total_ms=maximum_total_ms,
+            minimum_windows=[
+                {
+                    "source_asset_id": str(row["source_asset_id"]),
+                    "event_id": str(row["event_id"]),
+                    "minimum_start_ms": int(row["start_ms"]),
+                    "minimum_end_ms": int(row["end_ms"]),
+                    "minimum_duration_ms": int(row["duration_ms"]),
+                    "references": list(row.get("references", [])),
+                }
+                for row in rows
+            ],
+        )
     low = 0
     high = requested_context_ms
     while low < high:
@@ -2841,10 +2886,10 @@ def fit_candidate_video_windows_to_budget(
         else:
             high = candidate - 1
     fitted_total_ms = apply_context(low)
-    validate_candidate_video_budget(
-        total_duration_ms=fitted_total_ms,
-        maximum_duration_ms=maximum_total_ms,
-    )
+    if fitted_total_ms > maximum_total_ms:
+        raise AssertionError(
+            "candidate-video context fit exceeded its verified maximum"
+        )
     return low, fitted_total_ms
 
 
@@ -5731,12 +5776,19 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
             args.maximum_candidate_video_seconds * 1000
         )
         requested_context_ms = context_ms
-        context_ms, total_evidence_ms = fit_candidate_video_windows_to_budget(
-            rows=list(selected_direct_evidence.values()),
-            cards=cards,
-            requested_context_ms=requested_context_ms,
-            maximum_total_ms=maximum_evidence_ms,
-        )
+        try:
+            context_ms, total_evidence_ms = fit_candidate_video_windows_to_budget(
+                rows=list(selected_direct_evidence.values()),
+                cards=cards,
+                requested_context_ms=requested_context_ms,
+                maximum_total_ms=maximum_evidence_ms,
+            )
+        except CandidateVideoBudgetPreflightError as error:
+            write_json(
+                args.output_dir / "candidate-video-budget-preflight.json",
+                {**error.diagnostic, "generated_at": utc_now()},
+            )
+            raise
         file_cache_root = (
             args.file_cache_root.expanduser().resolve()
             if args.file_cache_root is not None
