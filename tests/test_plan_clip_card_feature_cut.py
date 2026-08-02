@@ -110,6 +110,9 @@ from scripts.plan_clip_card_feature_cut import (
     project_direct_video_edit_plan,
     validate_candidate_video_budget,
     validate_autonomous_planner_requested_aspects,
+    direct_video_aspect_contract_instructions,
+    direct_video_response_schema,
+    validate_direct_video_aspect_contract,
     validate_direct_video_plan_fulfillment,
     validate_direct_video_source_allocation,
     validate_hard_shortlist_provenance,
@@ -585,6 +588,7 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
                     zoom_intent="none",
                     camera_intent="hold",
                 ),
+                horizontal_alternates=[],
                 vertical=DirectVideoVerticalDecision(
                     candidate_rank=1,
                     strategy="tracked_crop",
@@ -617,6 +621,7 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
                             ),
                     ],
                 ),
+                vertical_alternates=[],
                 recommended_duration_seconds=6,
                 duration_rationale="Allow the complete action to read.",
                 attention_observation=AttentionObservation(
@@ -755,6 +760,7 @@ def test_vertical_only_direct_plan_projects_neutral_unrequested_horizontal_shado
                 observed_visual_evidence="A subject is visibly demonstrated.",
                 selection_reason="The action is visible.",
                 horizontal=None,
+                horizontal_alternates=[],
                 vertical=DirectVideoVerticalDecision(
                     candidate_rank=1,
                     strategy="tracked_crop",
@@ -767,6 +773,7 @@ def test_vertical_only_direct_plan_projects_neutral_unrequested_horizontal_shado
                     sacrificable_entity_indices=[],
                     attention_sequence=[],
                 ),
+                vertical_alternates=[],
                 recommended_duration_seconds=4,
                 duration_rationale="Enough time for the visible action.",
                 attention_observation=AttentionObservation(
@@ -844,6 +851,168 @@ def test_vertical_only_direct_plan_projects_neutral_unrequested_horizontal_shado
     assert shadow.horizontal_camera_intent == "hold"
 
 
+def test_direct_video_aspect_contract_is_required_nullable_and_fail_closed() -> None:
+    horizontal = DirectVideoHorizontalDecision(
+        candidate_rank=1,
+        strategy="original",
+        zoom_intent="none",
+        camera_intent="hold",
+    )
+    vertical = DirectVideoVerticalDecision(
+        candidate_rank=1,
+        strategy="tracked_crop",
+        crop_mode="primary_center",
+        coverage_mode="independent_detail",
+        allow_controlled_clip=True,
+        framing_intent="Keep the visible subject readable.",
+        required_entity_indices=[1],
+        preferred_entity_indices=[],
+        sacrificable_entity_indices=[],
+        attention_sequence=[],
+    )
+    horizontal_only = DirectVideoEditPlan(
+        contract_version="direct-video-edit-plan-v2",
+        capability_catalog_sha256=(
+            simple_production_capability_catalog().definition_sha256()
+        ),
+        title="Horizontal only",
+        strategy_summary="Use the verified landscape take.",
+        chapters=[
+            _direct_chapter_for_aspects(horizontal=horizontal, vertical=None)
+        ],
+        uncertainties=[],
+    )
+    assert validate_direct_video_aspect_contract(
+        horizontal_only,
+        requested_aspects=("16:9",),
+    ) == ("16:9",)
+    with pytest.raises(ValueError, match="omitted requested aspect 9:16"):
+        validate_direct_video_aspect_contract(
+            horizontal_only,
+            requested_aspects=("9:16",),
+        )
+
+    vertical_only = horizontal_only.model_copy(
+        update={
+            "chapters": [
+                _direct_chapter_for_aspects(horizontal=None, vertical=vertical)
+            ]
+        }
+    )
+    assert validate_direct_video_aspect_contract(
+        vertical_only,
+        requested_aspects=("9:16",),
+    ) == ("9:16",)
+    with pytest.raises(ValueError, match="supplied unrequested aspect 9:16"):
+        validate_direct_video_aspect_contract(
+            horizontal_only.model_copy(
+                update={
+                    "chapters": [
+                        _direct_chapter_for_aspects(
+                            horizontal=horizontal,
+                            vertical=vertical,
+                        )
+                    ]
+                }
+            ),
+            requested_aspects=("16:9",),
+        )
+
+    chapter_schema = direct_video_response_schema(("16:9",))["$defs"][
+        "DirectVideoChapterDecision"
+    ]
+    assert {
+        "horizontal",
+        "horizontal_alternates",
+        "vertical",
+        "vertical_alternates",
+        "recommended_duration_seconds",
+        "duration_rationale",
+        "attention_observation",
+        "flow_intent",
+    }.issubset(chapter_schema["required"])
+    assert "Must be null because 9:16 is not requested." in chapter_schema[
+        "properties"
+    ]["vertical"]["description"]
+    assert "non-null 9:16 primary" in direct_video_response_schema(("9:16",))["$defs"][
+        "DirectVideoChapterDecision"
+    ]["properties"]["vertical"]["description"]
+    assert "只要求：16:9" in direct_video_aspect_contract_instructions(("16:9",))
+    assert "horizontal_alternates` 必須是 []" in (
+        direct_video_aspect_contract_instructions(("9:16",))
+    )
+    assert "horizontal_alternates` 與 `vertical_alternates`" in (
+        direct_video_aspect_contract_instructions(("16:9", "9:16"))
+    )
+
+
+def test_horizontal_only_projection_keeps_vertical_shadow_inactive() -> None:
+    horizontal = DirectVideoHorizontalDecision(
+        candidate_rank=1,
+        strategy="original",
+        zoom_intent="none",
+        camera_intent="hold",
+    )
+    direct = DirectVideoEditPlan(
+        contract_version="direct-video-edit-plan-v2",
+        capability_catalog_sha256=(
+            simple_production_capability_catalog().definition_sha256()
+        ),
+        title="Horizontal only",
+        strategy_summary="Use the verified landscape take.",
+        chapters=[
+            _direct_chapter_for_aspects(horizontal=horizontal, vertical=None)
+        ],
+        uncertainties=[],
+    )
+    shortlist = FeatureShortlistPlan(
+        project_id="project-1",
+        catalog_id="catalog-1",
+        chapters=[
+            FeatureChapterShortlist(
+                feature_id="feature-1",
+                evidence_status="partial",
+                candidates=[
+                    FeatureShortlistCandidate(
+                        source_asset_id=ASSET_ID,
+                        event_id="demo",
+                        retrieval_reason="The action is visible.",
+                    )
+                ],
+            )
+        ],
+        uncertainties=[],
+        model_provenance=_provenance(),
+    )
+    projected = project_direct_video_edit_plan(
+        direct,
+        shortlist=shortlist,
+        candidate_depth=1,
+        brief=_brief(),
+        catalog=_catalog(),
+        cards={ASSET_ID: _card()},
+        provenance=_provenance(),
+        requested_aspects=("16:9",),
+    )
+    candidate = projected.chapters[0].candidates[0]
+    assert candidate.horizontal_authorized is True
+    assert candidate.vertical_authorized is False
+    executable = project_feature_contracts_v3(
+        projected,
+        brief=_brief(),
+        catalog=_catalog(),
+        selected_evidence=build_selected_clip_card_evidence(
+            projected,
+            cards={ASSET_ID: _card()},
+        ),
+    )
+    chapter = executable.chapters[0]
+    assert chapter.inactive_aspects == ["9:16"]
+    assert len(chapter.horizontal_candidates) == 1
+    assert chapter.vertical_candidates == []
+    assert "unrequested_9_16_projection_shadow" not in chapter.quality_risks
+
+
 def test_direct_source_allocation_requires_explicit_reuse_but_has_no_count_cap() -> None:
     base = DirectVideoChapterDecision(
         chapter_index=1,
@@ -856,6 +1025,7 @@ def test_direct_source_allocation_requires_explicit_reuse_but_has_no_count_cap()
             zoom_intent="none",
             camera_intent="hold",
         ),
+        horizontal_alternates=[],
         vertical=DirectVideoVerticalDecision(
             candidate_rank=1,
             strategy="tracked_crop",
@@ -868,6 +1038,7 @@ def test_direct_source_allocation_requires_explicit_reuse_but_has_no_count_cap()
             sacrificable_entity_indices=[],
             attention_sequence=[],
         ),
+        vertical_alternates=[],
         recommended_duration_seconds=4,
         duration_rationale="The product detail remains readable.",
         attention_observation=AttentionObservation(
@@ -1310,8 +1481,10 @@ def test_direct_video_reuse_without_reason_removes_unproven_authority() -> None:
                 "chapter_index": 1,
                 "evidence_status": "supported",
                 "observed_visual_evidence": "A product is visible.",
-                "selection_reason": "A deliberate return is requested.",
-                "vertical": {
+                    "selection_reason": "A deliberate return is requested.",
+                    "horizontal": None,
+                    "horizontal_alternates": [],
+                    "vertical": {
                     "candidate_rank": 1,
                     "strategy": "tracked_crop",
                     "crop_mode": "primary_center",
@@ -1321,8 +1494,9 @@ def test_direct_video_reuse_without_reason_removes_unproven_authority() -> None:
                     "required_entity_indices": [],
                     "preferred_entity_indices": [],
                     "sacrificable_entity_indices": [],
-                    "attention_sequence": [],
-                },
+                        "attention_sequence": [],
+                    },
+                    "vertical_alternates": [],
                 "recommended_duration_seconds": 4.0,
                 "duration_rationale": "Enough time to read the closing image.",
                 "attention_observation": None,
@@ -1556,9 +1730,15 @@ def test_direct_video_plan_cannot_drop_hard_fulfillment_chapter() -> None:
             DirectVideoChapterDecision(
                 chapter_index=1,
                 evidence_status="not_found",
-                observed_visual_evidence="",
-                selection_reason="No selection.",
-                attention_observation=None,
+                    observed_visual_evidence="",
+                    selection_reason="No selection.",
+                    horizontal=None,
+                    horizontal_alternates=[],
+                    vertical=None,
+                    vertical_alternates=[],
+                    recommended_duration_seconds=None,
+                    duration_rationale=None,
+                    attention_observation=None,
                 flow_intent=None,
                 confidence=0.0,
             )
@@ -1832,7 +2012,9 @@ def test_direct_video_canonicalization_preserves_locked_attention_sequence() -> 
         for phase in vertical["attention_sequence"]
     ] == [[1], [2]]
     assert "aspect_suitability" not in vertical
-    assert not changes
+    assert {
+        change["rule"] for change in changes
+    } == {"missing_required_nullable_key_is_explicit"}
 
 
 def test_unsuitable_direct_candidate_is_bounded_before_schema_validation() -> None:
@@ -2129,6 +2311,51 @@ def _brief() -> FeatureEditBrief:
                 vertical_primary_target_description="the visible subject",
             )
         ],
+    )
+
+
+def _direct_chapter_for_aspects(
+    *,
+    horizontal: DirectVideoHorizontalDecision | None,
+    vertical: DirectVideoVerticalDecision | None,
+    horizontal_alternates: list[DirectVideoHorizontalDecision] | None = None,
+    vertical_alternates: list[DirectVideoVerticalDecision] | None = None,
+) -> DirectVideoChapterDecision:
+    return DirectVideoChapterDecision(
+        chapter_index=1,
+        evidence_status="partial",
+        observed_visual_evidence="The visible subject completes a demonstration.",
+        selection_reason="The bounded evidence shows the requested action.",
+        quality_risks=[],
+        horizontal=horizontal,
+        horizontal_alternates=horizontal_alternates or [],
+        vertical=vertical,
+        vertical_alternates=vertical_alternates or [],
+        recommended_duration_seconds=4,
+        duration_rationale="A short hold preserves the observable action.",
+        attention_observation=AttentionObservation(
+            semantic_novelty=0.6,
+            action_progress=0.8,
+            visual_motion=0.2,
+            composition_change=0.1,
+            reading_load=0.2,
+            unresolved_tension=0.1,
+            emotional_hold_value=0.2,
+            repetition_pressure=0.1,
+            music_transition_opportunity=0.3,
+            minimum_dwell_seconds=3,
+            maximum_dwell_seconds=6,
+            rationale="The action reads within a short bounded hold.",
+            uncertainties=[],
+            requires_human_review=True,
+        ),
+        flow_intent=ShotFlowIntent(
+            narrative_role="proof",
+            energy_role="low_hold",
+            relation_to_previous="new_context",
+            boundary_alignment="phrase_preferred",
+        ),
+        confidence=0.8,
     )
 
 

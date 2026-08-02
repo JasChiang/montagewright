@@ -2562,6 +2562,74 @@ def test_stale_planning_stage_moves_out_of_active_namespace(
     assert record["reason_code"] == "clip_card_lineage_changed"
 
 
+def test_archived_planning_lineage_is_adopted_without_counting_cold_ingest(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "delivery"
+    stage_dir = output_dir / "picture" / "gemini-plan"
+    write_json(
+        stage_dir / "orchestration.json",
+        {
+            "contract_version": "autonomous-planning-orchestration-v1",
+            "stage": "autonomous_direct_video_edit_plan",
+        },
+    )
+    request = {
+        "model": "gemini-3.6-flash",
+        "input": [{"type": "text", "text": "plan"}],
+        "generation_config": {"max_output_tokens": 512, "thinking_level": "low"},
+    }
+    raw = {
+        "id": "archived-plan-interaction",
+        "model": "gemini-3.6-flash",
+        "usage": {
+            "total_input_tokens": 100,
+            "total_cached_tokens": 0,
+            "total_output_tokens": 20,
+            "total_thought_tokens": 4,
+        },
+    }
+    write_json(stage_dir / "clip-card-feature-plan.request.json", request)
+    write_json(stage_dir / "clip-card-feature-plan.raw_interaction.json", raw)
+    archived = pipeline._archive_stale_planning_stage(
+        stage_dir,
+        output_dir=output_dir,
+        reason_code="aspect_contract_changed",
+    )
+    assert archived is not None
+    assert pipeline._migrate_completed_warm_dispatches(
+        root=output_dir,
+        allowed_top_level={"picture"},
+        include_archived_planning_lineage=True,
+    )
+
+    cold_raw = output_dir / "cold-ingest" / "ignored.raw_interaction.json"
+    write_json(cold_raw, raw)
+    ledger = BudgetLedger(max_cost_usd=1.25, max_interactions=25)
+    adopted, raw_paths = pipeline.adopt_paid_dispatch_journal_state(
+        budget_ledger=ledger,
+        root=output_dir,
+        allowed_top_level={"picture"},
+        allowed_relative_path=lambda relative: pipeline._is_warm_paid_relative_path(
+            relative,
+            allowed_top_level={"picture"},
+            include_archived_planning_lineage=True,
+        ),
+    )
+    assert len(adopted) == 1
+    assert adopted[0]["path"].startswith("archive/planning-lineage/")
+    assert ledger.committed_interactions == 1
+    assert raw_paths == {
+        archived / "clip-card-feature-plan.raw_interaction.json"
+    }
+    assert not pipeline._find_unjournaled_warm_paid_artifacts(
+        root=output_dir,
+        allowed_top_level={"picture"},
+        journaled_raw_paths=raw_paths,
+        include_archived_planning_lineage=True,
+    )
+
+
 def test_review_delivery_api_still_rejects_missing_music(
     tmp_path: Path,
 ) -> None:

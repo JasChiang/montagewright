@@ -4647,6 +4647,74 @@ def test_local_presentation_change_requires_scoped_semantic_replan() -> None:
         requested_mode="tracked_full_bleed",
         measured_mode="tracked_crop",
     )
+
+
+def test_horizontal_pre_render_route_locks_gemini_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Top-K alternates are scoped-replan material, never local route choices."""
+
+    captured: dict[str, object] = {}
+
+    def capture_route(beats, **_kwargs):
+        captured["beats"] = beats
+        return "primary-only-route"
+
+    monkeypatch.setattr(
+        feature_cut_module,
+        "optimize_pre_render_candidate_route",
+        capture_route,
+    )
+    candidate = lambda candidate_id, rank: SimpleNamespace(
+        candidate_id=candidate_id,
+        rank=rank,
+        source_asset_id="sha256:" + candidate_id[-1] * 64,
+        event_id=f"event-{candidate_id}",
+        confidence=0.9,
+        strategy="original",
+        camera_intent="hold",
+        target_description=None,
+        quality_risks=[],
+    )
+    plan = SimpleNamespace(
+        chapters=[
+            SimpleNamespace(
+                feature_id="feature-1",
+                horizontal_candidates=[
+                    candidate("rank-01", 1),
+                    candidate("rank-02", 2),
+                ],
+            )
+        ]
+    )
+    rhythm = SimpleNamespace(
+        chapters=[
+            SimpleNamespace(
+                feature_id="feature-1",
+                minimum_duration_seconds=3,
+                preferred_duration_seconds=4,
+                maximum_duration_seconds=6,
+            )
+        ]
+    )
+
+    assert feature_cut_module._build_pre_render_horizontal_candidate_route(
+        plan,
+        chapter_durations={"feature-1": 4},
+        rhythm_plan=rhythm,
+        duration_audit={},
+        policy=SimpleNamespace(
+            execution_profile="autonomous_strict",
+            duration=SimpleNamespace(min_ms=3_000, max_ms=6_000),
+            presentation=SimpleNamespace(max_panel_runtime_fraction=0.25),
+            editorial=SimpleNamespace(
+                max_editorial_reprise_overlap_fraction=0.2
+            ),
+        ),
+    ) == "primary-only-route"
+    beats = captured["beats"]
+    assert len(beats[0].options) == 1
+    assert beats[0].options[0].candidate_id == "rank-01"
     assert not _presentation_requires_scoped_semantic_replan(
         requested_mode="tracked_full_bleed",
         measured_mode="static_full_bleed_crop",

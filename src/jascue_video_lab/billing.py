@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 import uuid
 
 from .storage import read_json, utc_now, write_json
@@ -783,6 +783,7 @@ def adopt_paid_dispatch_journal_state(
     budget_ledger: "BudgetLedger",
     root: Path,
     allowed_top_level: set[str] | frozenset[str] | None = None,
+    allowed_relative_path: Callable[[Path], bool] | None = None,
 ) -> tuple[list[dict[str, Any]], frozenset[Path]]:
     """Adopt paid nodes by journal identity, never by artifact path naming."""
 
@@ -796,13 +797,15 @@ def adopt_paid_dispatch_journal_state(
         resolved_root.rglob("*.paid_dispatch.json")
     ):
         relative = journal_path.relative_to(resolved_root)
-        if (
-            allowed_top_level is not None
-            and (
-                not relative.parts
-                or relative.parts[0] not in allowed_top_level
+        if allowed_relative_path is not None:
+            allowed = allowed_relative_path(relative)
+        elif allowed_top_level is not None:
+            allowed = bool(
+                relative.parts and relative.parts[0] in allowed_top_level
             )
-        ):
+        else:
+            allowed = True
+        if not allowed:
             continue
         payload = read_json(journal_path)
         if not isinstance(payload, Mapping):

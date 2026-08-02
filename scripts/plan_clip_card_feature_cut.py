@@ -528,7 +528,12 @@ class ClipCardFeatureCandidateV3(StrictModel):
     horizontal_zoom_intent: Literal["none", "subtle", "detail"]
     horizontal_camera_intent: VirtualCameraIntent = "hold"
     horizontal_focus_entity_id: str | None = None
+    # A legacy dual-aspect representation retains both field sets even for
+    # single-aspect delivery.  These flags prevent those neutral shadows from
+    # becoming executable candidate frontiers for the unrequested aspect.
+    horizontal_authorized: bool = True
     vertical_strategy: Literal["tracked_crop", "fit_with_background"]
+    vertical_authorized: bool = True
     vertical_crop_mode: Literal["strict", "primary_center"] = "strict"
     coverage_mode: Literal[
         "simultaneous",
@@ -1020,24 +1025,66 @@ class DirectVideoChapterDecision(StrictModel):
     observed_visual_evidence: str
     selection_reason: str
     quality_risks: list[str] = Field(default_factory=list, max_length=8)
-    horizontal: DirectVideoHorizontalDecision | None = None
-    vertical: DirectVideoVerticalDecision | None = None
-    vertical_alternates: list[DirectVideoVerticalDecision] = Field(
-        default_factory=list,
+    # These keys are intentionally required even when their value is null.
+    # Gemini otherwise tends to omit optional fields wholesale, which leaves
+    # the JSON schema permissive while the chapter-level contract fails only
+    # after parsing.  The signed requested-aspect contract below determines
+    # which nullable decision must be populated for a given run.
+    horizontal: DirectVideoHorizontalDecision | None = Field(
+        description=(
+            "Required key. Non-null exactly when the signed requested-aspect "
+            "contract includes 16:9; otherwise null."
+        )
+    )
+    horizontal_alternates: list[DirectVideoHorizontalDecision] = Field(
         max_length=3,
         description=(
-            "Candidate-scoped semantic presentation decisions for retained "
-            "Top-K fallbacks. They are evaluated in the same planning call."
+            "Required key. Candidate-scoped 16:9 fallback decisions for "
+            "bounded Top-K ranks; must be [] when 16:9 is not requested. "
+            "They are finite Gemini-authorised scoped-replan options, not "
+            "permission for local initial-route substitution."
+        ),
+    )
+    vertical: DirectVideoVerticalDecision | None = Field(
+        description=(
+            "Required key. Non-null exactly when the signed requested-aspect "
+            "contract includes 9:16; otherwise null."
+        )
+    )
+    vertical_alternates: list[DirectVideoVerticalDecision] = Field(
+        max_length=3,
+        description=(
+            "Required key. Candidate-scoped semantic presentation decisions "
+            "for retained 9:16 Top-K fallbacks; must be [] when 9:16 is not "
+            "requested."
         ),
     )
     recommended_duration_seconds: float | None = Field(
-        default=None,
         ge=1.0,
         le=15.0,
+        description=(
+            "Required key. Non-null for supported/partial chapters and null "
+            "for not_found chapters."
+        ),
     )
-    duration_rationale: str | None = None
-    attention_observation: AttentionObservation | None
-    flow_intent: ShotFlowIntent | None
+    duration_rationale: str | None = Field(
+        description=(
+            "Required key. Non-null for supported/partial chapters and null "
+            "for not_found chapters."
+        )
+    )
+    attention_observation: AttentionObservation | None = Field(
+        description=(
+            "Required key. Non-null for supported/partial chapters and null "
+            "for not_found chapters."
+        )
+    )
+    flow_intent: ShotFlowIntent | None = Field(
+        description=(
+            "Required key. Non-null for supported/partial chapters and null "
+            "for not_found chapters."
+        )
+    )
     source_reuse_mode: Literal[
         "none",
         "distinct_interval",
@@ -1049,6 +1096,19 @@ class DirectVideoChapterDecision(StrictModel):
 
     @model_validator(mode="after")
     def validate_chapter(self) -> "DirectVideoChapterDecision":
+        horizontal_alternate_ranks = [
+            decision.candidate_rank
+            for decision in self.horizontal_alternates
+        ]
+        if len(horizontal_alternate_ranks) != len(set(horizontal_alternate_ranks)):
+            raise ValueError("horizontal alternate candidate ranks must be unique")
+        if (
+            self.horizontal is not None
+            and self.horizontal.candidate_rank in horizontal_alternate_ranks
+        ):
+            raise ValueError(
+                "primary horizontal candidate cannot repeat as an alternate"
+            )
         alternate_ranks = [
             decision.candidate_rank
             for decision in self.vertical_alternates
@@ -1088,6 +1148,7 @@ class DirectVideoChapterDecision(StrictModel):
         if self.evidence_status == "not_found":
             if (
                 self.horizontal is not None
+                or self.horizontal_alternates
                 or self.vertical is not None
                 or self.vertical_alternates
                 or self.recommended_duration_seconds is not None
@@ -1097,8 +1158,7 @@ class DirectVideoChapterDecision(StrictModel):
                 raise ValueError("not-found chapter cannot contain edit decisions")
             return self
         if (
-            (self.horizontal is None and self.vertical is None)
-            or self.recommended_duration_seconds is None
+            self.recommended_duration_seconds is None
             or not self.duration_rationale
             or self.attention_observation is None
             or self.flow_intent is None
@@ -1124,8 +1184,165 @@ class DirectVideoEditPlan(StrictModel):
     uncertainties: list[str]
 
 
+DIRECT_VIDEO_ASPECT_ORDER = ("16:9", "9:16")
+
+
+def normalize_direct_video_requested_aspects(
+    requested_aspects: tuple[str, ...] | list[str] | frozenset[str],
+) -> tuple[str, ...]:
+    """Return the supported signed delivery aspects in deterministic order."""
+
+    requested = frozenset(requested_aspects)
+    if requested not in {
+        frozenset({"16:9"}),
+        frozenset({"9:16"}),
+        frozenset({"16:9", "9:16"}),
+    }:
+        raise ValueError(
+            "direct-video planner requires one or both supported delivery aspects"
+        )
+    return tuple(aspect for aspect in DIRECT_VIDEO_ASPECT_ORDER if aspect in requested)
+
+
+def direct_video_aspect_contract_instructions(
+    requested_aspects: tuple[str, ...] | list[str] | frozenset[str],
+) -> str:
+    """State the signed aspect contract once for prompt, repair, and schema."""
+
+    requested = normalize_direct_video_requested_aspects(requested_aspects)
+    requested_label = ", ".join(requested)
+    if requested == ("16:9",):
+        decision_rules = (
+            "每個 supported／partial chapter 的 `horizontal` 必須是非 null 決定；"
+            "`horizontal_alternates` 必須逐一涵蓋所有其餘附帶 bounded candidate "
+            "video 的 rank；`vertical` 必須是 null，`vertical_alternates` 必須是 []。"
+        )
+    elif requested == ("9:16",):
+        decision_rules = (
+            "每個 supported／partial chapter 的 `horizontal` 必須是 null；"
+            "`horizontal_alternates` 必須是 []；"
+            "`vertical` 必須是非 null primary，且 `vertical_alternates` 必須逐一"
+            "涵蓋所有其餘附帶 bounded candidate video 的 rank。"
+        )
+    else:
+        decision_rules = (
+            "每個 supported／partial chapter 的 `horizontal` 與 `vertical` 都必須"
+            "是非 null 決定；`horizontal_alternates` 與 `vertical_alternates` 都必須"
+            "逐一涵蓋各自 aspect 的所有其餘附帶 bounded candidate video rank。"
+        )
+    return (
+        "## 已簽署 requested-aspect contract（最高優先）\n"
+        f"本次只要求：{requested_label}。{decision_rules}\n"
+        "每個 `not_found` chapter 必須明確回傳 `horizontal: null`、"
+        "`horizontal_alternates: []`、`vertical: null`、`vertical_alternates: []`，"
+        "並將 duration、rationale、"
+        "attention_observation、flow_intent 都明確回傳 null。\n"
+        "所有 chapter 都必須帶齊上述 nullable keys；不得因未要求某版型而省略 key。"
+        "下方任何泛用的 9:16 或 16:9 說明，僅在該 aspect 已簽署要求時適用，"
+        "不得覆蓋此 contract。"
+    )
+
+
+def direct_video_response_schema(
+    requested_aspects: tuple[str, ...] | list[str] | frozenset[str],
+) -> dict[str, Any]:
+    """Bind the generic nullable schema to this request's signed aspects."""
+
+    requested = normalize_direct_video_requested_aspects(requested_aspects)
+    schema = gemini_response_schema(DirectVideoEditPlan)
+    # ``gemini_response_schema`` returns a fresh JSON-compatible dict, but
+    # copy defensively because callers may retain it for durable requests.
+    schema = json.loads(json.dumps(schema))
+    chapter_schema = schema["$defs"]["DirectVideoChapterDecision"]
+    properties = chapter_schema["properties"]
+    properties["horizontal"]["description"] = (
+        "Required key. "
+        + (
+            "Must be a non-null 16:9 decision for supported/partial chapters."
+            if "16:9" in requested
+            else "Must be null because 16:9 is not requested."
+        )
+    )
+    properties["vertical"]["description"] = (
+        "Required key. "
+        + (
+            "Must be a non-null 9:16 primary decision for supported/partial chapters."
+            if "9:16" in requested
+            else "Must be null because 9:16 is not requested."
+        )
+    )
+    properties["horizontal_alternates"]["description"] = (
+        "Required key. "
+        + (
+            "Must describe every retained non-primary 16:9 candidate rank; "
+            "these are scoped-replan options, not local initial-route authority."
+            if "16:9" in requested
+            else "Must be an empty array because 16:9 is not requested."
+        )
+    )
+    properties["vertical_alternates"]["description"] = (
+        "Required key. "
+        + (
+            "Must describe every retained non-primary 9:16 candidate rank."
+            if "9:16" in requested
+            else "Must be an empty array because 9:16 is not requested."
+        )
+    )
+    return schema
+
+
+def validate_direct_video_aspect_contract(
+    plan: DirectVideoEditPlan,
+    *,
+    requested_aspects: tuple[str, ...] | list[str] | frozenset[str],
+) -> tuple[str, ...]:
+    """Reject omitted or extra aspect authority before local projection."""
+
+    requested = normalize_direct_video_requested_aspects(requested_aspects)
+    failures: list[str] = []
+    for chapter in plan.chapters:
+        if chapter.evidence_status == "not_found":
+            continue
+        label = f"chapter {chapter.chapter_index}"
+        if "16:9" in requested:
+            if chapter.horizontal is None:
+                failures.append(
+                    f"{label} omitted requested aspect 16:9: horizontal must be non-null"
+                )
+        else:
+            if chapter.horizontal is not None:
+                failures.append(
+                    f"{label} supplied unrequested aspect 16:9: horizontal must be null"
+                )
+            if chapter.horizontal_alternates:
+                failures.append(
+                    f"{label} supplied unrequested aspect 16:9: "
+                    "horizontal_alternates must be []"
+                )
+        if "9:16" in requested:
+            if chapter.vertical is None:
+                failures.append(
+                    f"{label} omitted requested aspect 9:16: vertical must be non-null"
+                )
+        else:
+            if chapter.vertical is not None:
+                failures.append(
+                    f"{label} supplied unrequested aspect 9:16: vertical must be null"
+                )
+            if chapter.vertical_alternates:
+                failures.append(
+                    f"{label} supplied unrequested aspect 9:16: "
+                    "vertical_alternates must be []"
+                )
+    if failures:
+        raise ValueError("direct-video requested-aspect contract failed: " + "; ".join(failures))
+    return requested
+
+
 def execution_only_horizontal_shadow(
     chapter: DirectVideoChapterDecision,
+    *,
+    candidate_rank: int | None = None,
 ) -> DirectVideoHorizontalDecision:
     """Supply the legacy projection's unrequested 16:9 slot without inventing art.
 
@@ -1143,10 +1360,54 @@ def execution_only_horizontal_shadow(
     if chapter.vertical is None:
         raise ValueError("supported chapter has no aspect decision to project")
     return DirectVideoHorizontalDecision(
-        candidate_rank=chapter.vertical.candidate_rank,
+        candidate_rank=(
+            candidate_rank
+            if candidate_rank is not None
+            else chapter.vertical.candidate_rank
+        ),
         strategy="original",
         zoom_intent="none",
         camera_intent="hold",
+    )
+
+
+def execution_only_vertical_shadow(
+    chapter: DirectVideoChapterDecision,
+    *,
+    candidate_rank: int,
+) -> DirectVideoVerticalDecision:
+    """Supply the legacy projection's unrequested 9:16 slot without authority.
+
+    ``ClipCardFeaturePlanV3`` still has mandatory vertical candidate fields.
+    For a signed 16:9-only delivery this inert, explicitly unsuitable record
+    only preserves that legacy representation; it is never a Gemini decision,
+    cannot authorize a 9:16 render, and cannot advance through the execution
+    frontier.  A shadow is created for every retained rank because the old
+    schema also requires candidate-scoped vertical metadata.
+    """
+
+    if chapter.vertical is not None:
+        return chapter.vertical
+    if chapter.horizontal is None:
+        raise ValueError("supported chapter has no aspect decision to project")
+    return DirectVideoVerticalDecision(
+        candidate_rank=candidate_rank,
+        strategy="fit_with_background",
+        crop_mode="strict",
+        coverage_mode="simultaneous",
+        aspect_suitability="unsuitable",
+        suitability_risks=["unrequested_9_16_projection_shadow"],
+        presentation_preference="solid_matte_fit",
+        presentation_goal="hold",
+        source_camera_motion_role="unknown",
+        framing_intent=(
+            "Unrequested 9:16 projection shadow; no Gemini 9:16 decision "
+            "or render authority."
+        ),
+        required_entity_indices=[],
+        preferred_entity_indices=[],
+        sacrificable_entity_indices=[],
+        attention_sequence=[],
     )
 
 
@@ -1308,16 +1569,45 @@ def validate_direct_video_plan_fulfillment(
     contracts: tuple[EditorialBeatContract, ...],
     candidate_depth: int,
     supplements: dict[str, list[ClipObservationSupplement]] | None = None,
-    requested_aspects: tuple[str, ...] = ("9:16",),
+    requested_aspects: tuple[str, ...] = ("16:9", "9:16"),
 ) -> dict[str, EditorialBeatFulfillmentSelection]:
     """Verify every requested aspect's selection against immutable minima."""
 
+    requested_aspects = validate_direct_video_aspect_contract(
+        plan,
+        requested_aspects=requested_aspects,
+    )
     supplements = supplements or {}
     chapter_by_feature = {
         chapter.feature_id: (offset, chapter)
         for offset, chapter in enumerate(shortlist.chapters)
     }
     selections: dict[str, EditorialBeatFulfillmentSelection] = {}
+    if "16:9" in requested_aspects:
+        for shortlist_chapter, direct_chapter in zip(
+            shortlist.chapters, plan.chapters, strict=True
+        ):
+            if direct_chapter.evidence_status == "not_found":
+                continue
+            assert direct_chapter.horizontal is not None
+            bounded_candidates = planning_candidate_slice(
+                shortlist_chapter.candidates,
+                direct_video_evidence=True,
+                depth=candidate_depth,
+            )
+            expected_ranks = set(range(1, len(bounded_candidates) + 1))
+            described_ranks = {
+                direct_chapter.horizontal.candidate_rank
+            } | {
+                decision.candidate_rank
+                for decision in direct_chapter.horizontal_alternates
+            }
+            if described_ranks != expected_ranks:
+                raise ValueError(
+                    "direct plan must describe every bounded horizontal candidate "
+                    f"for {shortlist_chapter.feature_id}: expected "
+                    f"{sorted(expected_ranks)}, got {sorted(described_ranks)}"
+                )
     if "9:16" in requested_aspects:
         for offset, (shortlist_chapter, direct_chapter) in enumerate(
             zip(shortlist.chapters, plan.chapters, strict=True)
@@ -1330,6 +1620,7 @@ def validate_direct_video_plan_fulfillment(
                 depth=candidate_depth,
             )
             expected_ranks = set(range(1, len(bounded_candidates) + 1))
+            assert direct_chapter.vertical is not None
             described_ranks = {
                 direct_chapter.vertical.candidate_rank
             } | {
@@ -1428,7 +1719,7 @@ def validate_direct_video_source_allocation(
     shortlist: FeatureShortlistPlan,
     candidate_depth: int,
     policy: AutonomousEditPolicy | None = None,
-    requested_aspects: tuple[str, ...] = ("9:16",),
+    requested_aspects: tuple[str, ...] = ("16:9", "9:16"),
 ) -> None:
     """Fail a semantic plan that cannot honour its own source-use intent.
 
@@ -1441,6 +1732,10 @@ def validate_direct_video_source_allocation(
     it is never an unannounced local hard limit.
     """
 
+    requested_aspects = validate_direct_video_aspect_contract(
+        plan,
+        requested_aspects=requested_aspects,
+    )
     if len(plan.chapters) != len(shortlist.chapters):
         raise ValueError("direct plan chapter count differs from shortlist")
 
@@ -1632,7 +1927,33 @@ def canonicalize_direct_video_edit_plan_output(
                 }
             )
     for chapter_index, chapter in enumerate(chapters):
-        if not isinstance(chapter, dict) or chapter.get("evidence_status") == "not_found":
+        if not isinstance(chapter, dict):
+            continue
+        # Required-but-nullable chapter keys make optional-field minimization
+        # visible to the aspect-aware post-validator.  This is a
+        # representation-only normalization: null/[] carries no editorial
+        # decision and therefore cannot manufacture a requested-aspect plan.
+        for field_name, explicit_empty_value in (
+            ("horizontal", None),
+            ("horizontal_alternates", []),
+            ("vertical", None),
+            ("vertical_alternates", []),
+            ("recommended_duration_seconds", None),
+            ("duration_rationale", None),
+            ("attention_observation", None),
+            ("flow_intent", None),
+        ):
+            if field_name not in chapter:
+                chapter[field_name] = explicit_empty_value
+                changes.append(
+                    {
+                        "json_path": f"chapters[{chapter_index}].{field_name}",
+                        "before": "<missing>",
+                        "after": explicit_empty_value,
+                        "rule": "missing_required_nullable_key_is_explicit",
+                    }
+                )
+        if chapter.get("evidence_status") == "not_found":
             continue
         vertical_decisions: list[tuple[str, dict[str, Any]]] = []
         primary_vertical = chapter.get("vertical")
@@ -2903,6 +3224,7 @@ def project_direct_video_edit_plan(
     cards: dict[str, FullClipCard],
     provenance: ModelProvenance,
     capability_catalog: EditingCapabilityCatalog | None = None,
+    requested_aspects: tuple[str, ...] | list[str] | frozenset[str] | None = None,
 ) -> ClipCardFeaturePlanV3:
     """Resolve integer candidate ranks into the existing local renderer plan.
 
@@ -2913,6 +3235,24 @@ def project_direct_video_edit_plan(
 
     capability_catalog = (
         capability_catalog or simple_production_capability_catalog()
+    )
+    if requested_aspects is None:
+        # Legacy reprojection artifacts predate a persisted policy pointer.
+        # Their non-null direct decisions are still enough to infer the exact
+        # aspect shape without manufacturing an unrequested decision.
+        inferred = frozenset(
+            aspect
+            for aspect, field_name in (("16:9", "horizontal"), ("9:16", "vertical"))
+            if any(
+                getattr(chapter, field_name) is not None
+                for chapter in plan.chapters
+                if chapter.evidence_status != "not_found"
+            )
+        )
+        requested_aspects = inferred
+    requested_aspects = validate_direct_video_aspect_contract(
+        plan,
+        requested_aspects=requested_aspects,
     )
     if plan.capability_catalog_sha256 != capability_catalog.definition_sha256():
         raise ValueError(
@@ -3084,11 +3424,18 @@ def project_direct_video_edit_plan(
                 )
             )
             continue
-        assert direct_chapter.vertical is not None
         horizontal_decision = execution_only_horizontal_shadow(direct_chapter)
+        vertical_primary = (
+            direct_chapter.vertical
+            if direct_chapter.vertical is not None
+            else execution_only_vertical_shadow(
+                direct_chapter,
+                candidate_rank=horizontal_decision.candidate_rank,
+            )
+        )
         selected_ranks = {
             horizontal_decision.candidate_rank,
-            direct_chapter.vertical.candidate_rank,
+            vertical_primary.candidate_rank,
         }
         if any(rank > len(allowed) for rank in selected_ranks):
             raise ValueError(
@@ -3096,6 +3443,23 @@ def project_direct_video_edit_plan(
                 f"{brief_chapter.feature_id}: {sorted(selected_ranks)}"
             )
         candidates: list[ClipCardFeatureCandidateV3] = []
+        horizontal_decision_by_rank = (
+            {
+                decision.candidate_rank: decision
+                for decision in (
+                    [horizontal_decision]
+                    + list(direct_chapter.horizontal_alternates)
+                )
+            }
+            if "16:9" in requested_aspects
+            else {
+                candidate_rank: execution_only_horizontal_shadow(
+                    direct_chapter,
+                    candidate_rank=candidate_rank,
+                )
+                for candidate_rank in range(1, len(allowed) + 1)
+            }
+        )
         for rank, shortlisted in enumerate(allowed, start=1):
             card = cards[shortlisted.source_asset_id]
             event = next(
@@ -3136,27 +3500,42 @@ def project_direct_video_edit_plan(
             preferred_entity_ids: list[str] = []
             sacrificable_entity_ids: list[str] = []
             virtual_camera_proposal = None
-            vertical_decision_by_rank = {
-                decision.candidate_rank: decision
-                for decision in (
-                    [direct_chapter.vertical]
-                    + list(direct_chapter.vertical_alternates)
+            vertical_decision_by_rank = (
+                {
+                    decision.candidate_rank: decision
+                    for decision in (
+                        [vertical_primary]
+                        + list(direct_chapter.vertical_alternates)
+                    )
+                }
+                if "9:16" in requested_aspects
+                else {
+                    candidate_rank: execution_only_vertical_shadow(
+                        direct_chapter,
+                        candidate_rank=candidate_rank,
+                    )
+                    for candidate_rank in range(1, len(allowed) + 1)
+                }
+            )
+            horizontal_candidate_decision = horizontal_decision_by_rank.get(rank)
+            if horizontal_candidate_decision is None:
+                raise ValueError(
+                    "direct-video plan omitted a candidate-scoped horizontal "
+                    f"decision for {brief_chapter.feature_id}/rank-{rank:02d}"
                 )
-                if decision is not None
-            }
-            if rank == horizontal_decision.candidate_rank:
-                horizontal_strategy = horizontal_decision.strategy
-                horizontal_zoom_intent = horizontal_decision.zoom_intent
-                horizontal_camera_intent = horizontal_decision.camera_intent
+            if horizontal_candidate_decision is not None:
+                horizontal_strategy = horizontal_candidate_decision.strategy
+                horizontal_zoom_intent = horizontal_candidate_decision.zoom_intent
+                horizontal_camera_intent = horizontal_candidate_decision.camera_intent
                 horizontal_focus_entity_id = (
                     resolve_entity_indices(
                         source_asset_id=shortlisted.source_asset_id,
                         event_id=shortlisted.event_id,
                         indices=[
-                            horizontal_decision.focus_entity_index
+                            horizontal_candidate_decision.focus_entity_index
                         ],
                     )[0]
-                    if horizontal_decision.focus_entity_index is not None
+                    if horizontal_candidate_decision.focus_entity_index is not None
                     else None
                 )
             vertical_decision = vertical_decision_by_rank.get(rank)
@@ -3228,7 +3607,9 @@ def project_direct_video_edit_plan(
                     horizontal_zoom_intent=horizontal_zoom_intent,
                     horizontal_camera_intent=horizontal_camera_intent,
                     horizontal_focus_entity_id=horizontal_focus_entity_id,
+                    horizontal_authorized=("16:9" in requested_aspects),
                     vertical_strategy=vertical_strategy,
+                    vertical_authorized=("9:16" in requested_aspects),
                     vertical_crop_mode=vertical_crop_mode,
                     coverage_mode=(
                         vertical_decision.coverage_mode
@@ -3261,7 +3642,7 @@ def project_direct_video_edit_plan(
                         and "source_reuse_mode" in vertical_decision.model_fields_set
                         else (
                             direct_chapter.source_reuse_mode
-                            if rank == direct_chapter.vertical.candidate_rank
+                            if rank == vertical_primary.candidate_rank
                             else "none"
                         )
                     ),
@@ -3271,7 +3652,7 @@ def project_direct_video_edit_plan(
                         and "source_reuse_mode" in vertical_decision.model_fields_set
                         else (
                             direct_chapter.source_reuse_justification
-                            if rank == direct_chapter.vertical.candidate_rank
+                            if rank == vertical_primary.candidate_rank
                             else None
                         )
                     ),
@@ -3287,7 +3668,7 @@ def project_direct_video_edit_plan(
                     horizontal_decision.candidate_rank
                 ),
                 vertical_candidate_id=planning_candidate_id(
-                    direct_chapter.vertical.candidate_rank
+                    vertical_primary.candidate_rank
                 ),
                 recommended_duration_seconds=(
                     direct_chapter.recommended_duration_seconds
@@ -4075,14 +4456,36 @@ def project_feature_contracts_v3(
                 )
             )
             continue
-        horizontal_options = _selected_first_candidates_v3(
+        all_horizontal_options = _selected_first_candidates_v3(
             chapter, chapter.horizontal_candidate_id
         )
-        vertical_options = _selected_first_candidates_v3(
+        all_vertical_options = _selected_first_candidates_v3(
             chapter, chapter.vertical_candidate_id
         )
-        horizontal_primary = horizontal_options[0]
-        vertical_primary = vertical_options[0]
+        horizontal_options = [
+            candidate
+            for candidate in all_horizontal_options
+            if candidate.horizontal_authorized
+        ]
+        vertical_options = [
+            candidate
+            for candidate in all_vertical_options
+            if candidate.vertical_authorized
+        ]
+        # The v3/FeatureEditPlan legacy mirror still requires both primary
+        # frame fields.  An unrequested aspect may therefore retain a neutral
+        # shadow frame, but its empty candidate list and inactive marker make
+        # it unavailable to routing, scoring, risk, and execution.
+        horizontal_primary = (
+            horizontal_options[0]
+            if horizontal_options
+            else all_horizontal_options[0]
+        )
+        vertical_primary = (
+            vertical_options[0]
+            if vertical_options
+            else all_vertical_options[0]
+        )
 
         def evidence_event(candidate: ClipCardFeatureCandidateV3) -> SelectedEvidenceEvent:
             event = index.get((candidate.source_asset_id, candidate.event_id))
@@ -4162,15 +4565,30 @@ def project_feature_contracts_v3(
 
         horizontal_primary_target = horizontal_target(horizontal_primary)
         vertical_primary_target = vertical_target(vertical_primary)
-        observed = horizontal_primary.observed_visual_evidence
-        reason = horizontal_primary.selection_reason
-        if horizontal_primary.candidate_id != vertical_primary.candidate_id:
+        active_primaries = [
+            primary
+            for primary, options in (
+                (horizontal_primary, horizontal_options),
+                (vertical_primary, vertical_options),
+            )
+            if options
+        ]
+        authoritative_primary = active_primaries[0]
+        observed = authoritative_primary.observed_visual_evidence
+        reason = authoritative_primary.selection_reason
+        if len(active_primaries) == 2 and (
+            horizontal_primary.candidate_id != vertical_primary.candidate_id
+        ):
             observed = (
                 f"16:9: {observed} 9:16: {vertical_primary.observed_visual_evidence}"
             )
             reason = f"16:9: {reason} 9:16: {vertical_primary.selection_reason}"
         quality_risks = list(
-            dict.fromkeys(horizontal_primary.quality_risks + vertical_primary.quality_risks)
+            dict.fromkeys(
+                risk
+                for primary in active_primaries
+                for risk in primary.quality_risks
+            )
         )
         if vertical_primary.coverage_mode == "sequential":
             vertical_coverage_intent = "sequential_attention"
@@ -4197,9 +4615,9 @@ def project_feature_contracts_v3(
                 horizontal_frame_id=horizontal_primary.frame_id,
                 vertical_frame_id=vertical_primary.frame_id,
                 observed_visual_evidence=observed,
-                evidence_provenance=(
-                    evidence_event(vertical_primary).evidence_provenance
-                ),
+                evidence_provenance=evidence_event(
+                    authoritative_primary
+                ).evidence_provenance,
                 selection_reason=reason,
                 horizontal_strategy=horizontal_primary.horizontal_strategy,
                 horizontal_zoom_intent=horizontal_primary.horizontal_zoom_intent,
@@ -4253,6 +4671,10 @@ def project_feature_contracts_v3(
                 vertical_candidates=[
                     projected_vertical_candidate(candidate, rank)
                     for rank, candidate in enumerate(vertical_options, start=1)
+                ],
+                inactive_aspects=[
+                    *([] if horizontal_options else ["16:9"]),
+                    *([] if vertical_options else ["9:16"]),
                 ],
             )
         )
@@ -4551,6 +4973,19 @@ def reproject_direct_video_edit_plan(
     shortlist = FeatureShortlistPlan.model_validate(read_json(shortlist_path))
     manifest = read_json(manifest_path)
     depth = int(manifest["selection_policy"]["rank_depth_per_chapter"])
+    inferred_requested_aspects = frozenset(
+        aspect
+        for aspect, field_name in (("16:9", "horizontal"), ("9:16", "vertical"))
+        if any(
+            getattr(chapter, field_name) is not None
+            for chapter in source_plan.chapters
+            if chapter.evidence_status != "not_found"
+        )
+    )
+    requested_aspects = validate_direct_video_aspect_contract(
+        source_plan,
+        requested_aspects=inferred_requested_aspects,
+    )
     if len(source_plan.chapters) != len(brief.chapters):
         raise ValueError("direct-video plan chapter count differs from brief")
     if len(derived.chapters) != len(brief.chapters):
@@ -4583,8 +5018,15 @@ def reproject_direct_video_edit_plan(
             if derived_chapter.evidence_status != "not_found":
                 raise ValueError("derived plan changed a not-found decision")
             continue
-        assert direct.vertical is not None
         horizontal_decision = execution_only_horizontal_shadow(direct)
+        vertical_primary = (
+            direct.vertical
+            if direct.vertical is not None
+            else execution_only_vertical_shadow(
+                direct,
+                candidate_rank=horizontal_decision.candidate_rank,
+            )
+        )
         allowed = shortlisted.candidates[:depth]
         if len(derived_chapter.candidates) != len(allowed):
             raise ValueError("derived candidate count differs from bounded shortlist")
@@ -4619,7 +5061,7 @@ def reproject_direct_video_edit_plan(
             ):
                 raise ValueError("derived frame does not belong to candidate source")
         horizontal = by_rank[horizontal_decision.candidate_rank]
-        vertical = by_rank[direct.vertical.candidate_rank]
+        vertical = by_rank[vertical_primary.candidate_rank]
         if derived_chapter.horizontal_candidate_id != horizontal.candidate_id:
             raise ValueError("derived horizontal rank differs from direct decision")
         if derived_chapter.vertical_candidate_id != vertical.candidate_id:
@@ -4643,11 +5085,11 @@ def reproject_direct_video_edit_plan(
             vertical.allow_controlled_clip,
             vertical.framing_intent,
         ) != (
-            direct.vertical.strategy,
-            direct.vertical.crop_mode,
-            direct.vertical.coverage_mode,
-            direct.vertical.allow_controlled_clip,
-            direct.vertical.framing_intent,
+            vertical_primary.strategy,
+            vertical_primary.crop_mode,
+            vertical_primary.coverage_mode,
+            vertical_primary.allow_controlled_clip,
+            vertical_primary.framing_intent,
         ):
             raise ValueError("derived vertical intent differs from direct decision")
         if (
@@ -4675,18 +5117,18 @@ def reproject_direct_video_edit_plan(
         ):
             raise ValueError("derived entity resolution escaped selected evidence")
         proposal = vertical.virtual_camera_proposal
-        if direct.vertical.aspect_suitability == "unsuitable":
+        if vertical_primary.aspect_suitability == "unsuitable":
             if proposal is not None:
                 raise ValueError(
                     "derived unsuitable candidate must not compile a camera proposal"
                 )
-        elif direct.vertical.attention_sequence:
+        elif vertical_primary.attention_sequence:
             if proposal is None or len(proposal.phases) != len(
-                direct.vertical.attention_sequence
+                vertical_primary.attention_sequence
             ):
                 raise ValueError("derived attention sequence is missing or changed")
             for step, phase in zip(
-                direct.vertical.attention_sequence,
+                vertical_primary.attention_sequence,
                 proposal.phases,
                 strict=True,
             ):
@@ -5038,6 +5480,14 @@ def main() -> int:
                         f"policy for {contract.beat_id}: "
                         f"{visual_event.tolerance_frames} > {policy_tolerance}"
                     )
+    requested_direct_video_aspects = (
+        normalize_direct_video_requested_aspects(policy.requested_aspects)
+        if policy is not None
+        else ("16:9", "9:16")
+    )
+    direct_video_aspect_instruction = direct_video_aspect_contract_instructions(
+        requested_direct_video_aspects
+    )
     planning_media_resolution = (
         policy.media_resolution.candidate_reel_plan
         if policy is not None
@@ -5595,11 +6045,13 @@ model_provenance 必須先原樣回傳：
 ## 已簽署的成片時長範圍
 {policy.duration.model_dump_json(indent=2) if policy is not None else json.dumps({"target_seconds": brief.target_duration_seconds}, ensure_ascii=False)}
 
+{direct_video_aspect_instruction}
+
 只能回傳：
-1. 每個 chapter_index 的橫式與直式各選哪一個 candidate_rank；並為該章其餘
-   所有附帶直式影片的候選，在 `vertical_alternates` 提供各自獨立的直式決定。
-   備選不是套用首選的裁切或關係：每一個候選都要判斷其本身是否適合 9:16、
-   應滿版、虛擬鏡頭、two-panel、solid fit，或根本不適合。
+1. 每個 chapter_index 都依上方 requested-aspect contract 回傳 primary 與必要的
+   candidate-scoped alternates。`horizontal_alternates`／`vertical_alternates`
+   是一次 scoped Gemini replan 的有限選項，不是本機可依分數、時長或風險自行
+   改選初始 primary 的授權。
 2. 選擇理由、直接可見的證據、風險與建議停留秒數。
 3. 橫式是否保持原構圖，或對一個可見 entity 做有目的的推近／跟隨。
 4. 直式 coverage_mode、是否允許 controlled semantic clip，以及全段必須曾被
@@ -5652,8 +6104,8 @@ model_provenance 必須先原樣回傳：
     音樂 exit 決定。穩定但仍有閱讀、情緒或產品觀察價值的畫面可分配合理 hold。
     若素材確實不能滿足，必須如實以 evidence_status 與 risks 表示缺口，不能捏造
     補秒方式。
-7. 全片要有素材與視覺狀態的多樣性。每一個直式 decision（primary 與每個
-   `vertical_alternates`）都要各自填 `source_reuse_mode` 與
+7. 全片要有素材與視覺狀態的多樣性。每一個 requested-aspect decision（primary
+   與其 alternates）都要各自填 `source_reuse_mode` 與
    `source_reuse_justification`；它們不會繼承 chapter primary 的值。若該候選的
    source 已被前章選用，應先選不同 take；只有不同 interval 提供新的 hard
    evidence、alternate presentation 有新的閱讀目的，或明確 editorial reprise 時
@@ -5701,9 +6153,11 @@ model_provenance 必須先原樣回傳：
   cut_admissible 才可為 true；本機 motion gate 也只能在此條件下改成 cut。
 - 沒有可見注意力轉移時，sequence 可以是空陣列；不得為了看起來有運鏡而發明移動。
 - candidate_rank 必須直接複製該章候選索引中的整數，不得引用未附影片的 rank。
-- `vertical_alternates` 必須恰好涵蓋該章所有非首選、且附有 bounded candidate
-  video 的 candidate_rank；不得重複首選 rank。若某備選不適合 9:16，仍必須以
-  `aspect_suitability=unsuitable` 如實回傳，不得省略它或假裝可用。
+- `horizontal_alternates`／`vertical_alternates` 只在對應 aspect 已簽署要求時，
+  才必須恰好涵蓋該章所有非首選、且附有 bounded candidate video 的 candidate_rank；
+  不得重複首選 rank。未要求的 aspect 必須明確為 null／[]，不得輸出其 alternates。
+  若 9:16 備選不適合，仍必須以 `aspect_suitability=unsuitable` 如實回傳，不得
+  省略它或假裝可用。
 - 9:16 primary 必須同時考慮此候選在全片的敘事功能、可讀性與已簽署的呈現能力。
   若存在 natural 或 reconstructable 的候選可完成章節證據，不得把 unsuitable 候選
   當 primary，再假設本機會用未宣告的裁切來拯救它。unsuitable 候選只能作為
@@ -5995,6 +6449,11 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         if args.candidate_video_evidence
         else ClipCardFeaturePlanV3
     )
+    response_schema = (
+        direct_video_response_schema(requested_direct_video_aspects)
+        if args.candidate_video_evidence
+        else gemini_response_schema(response_model)
+    )
     request = {
         "model": MODEL_ID,
         "system_instruction": (
@@ -6021,7 +6480,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
         "response_format": {
             "type": "text",
             "mime_type": "application/json",
-            "schema": gemini_response_schema(response_model),
+            "schema": response_schema,
         },
     }
     plan: ClipCardFeaturePlanV3 | None = None
@@ -6244,11 +6703,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                 contracts=tuple(editorial_contracts),
                 candidate_depth=args.candidate_video_depth,
                 supplements=supplements,
-                requested_aspects=(
-                    tuple(policy.requested_aspects)
-                    if policy is not None
-                    else ("16:9", "9:16")
-                ),
+                requested_aspects=requested_direct_video_aspects,
             )
             plan = project_direct_video_edit_plan(
                 direct_video_plan,
@@ -6259,6 +6714,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                 cards=cards,
                 provenance=provenance,
                 capability_catalog=capability_catalog,
+                requested_aspects=requested_direct_video_aspects,
             )
             write_json(
                 args.output_dir / "direct-video-edit-plan.json",
@@ -6363,7 +6819,15 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                         + "\n\n## 本次是純文字 contract repair\n"
                         "不得假裝重新觀看影片或音樂；只能依前次已觀察結果"
                         "修正 JSON 契約。保留所有已通過欄位與語意選擇。\n"
-                        "以下最新能力目錄取代原 prompt 內的能力目錄；不得選擇"
+                        + (
+                            direct_video_aspect_instruction
+                            + "\n若前次錯誤提到 omitted requested aspect，必須補回"
+                            "該 signed aspect 的非 null primary；不得把未要求 aspect "
+                            "補成決定，也不得省略 required-but-nullable keys。\n"
+                            if args.candidate_video_evidence
+                            else ""
+                        )
+                        + "以下最新能力目錄取代原 prompt 內的能力目錄；不得選擇"
                         "未列出的 presentation：\n"
                         + capability_catalog.model_dump_json(indent=2)
                         + "\n最新能力目錄 SHA256："
@@ -6399,7 +6863,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                         "response_format": {
                             "type": "text",
                             "mime_type": "application/json",
-                            "schema": gemini_response_schema(response_model),
+                            "schema": response_schema,
                         },
                         "generation_config": {
                             "thinking_level": (
@@ -6447,22 +6911,14 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                             contracts=tuple(editorial_contracts),
                             candidate_depth=args.candidate_video_depth,
                             supplements=supplements,
-                            requested_aspects=(
-                                tuple(policy.requested_aspects)
-                                if policy is not None
-                                else ("16:9", "9:16")
-                            ),
+                            requested_aspects=requested_direct_video_aspects,
                         )
                         validate_direct_video_source_allocation(
                             direct_video_plan,
                             shortlist=shortlist,
                             candidate_depth=args.candidate_video_depth,
                             policy=policy,
-                            requested_aspects=(
-                                tuple(policy.requested_aspects)
-                                if policy is not None
-                                else ("16:9", "9:16")
-                            ),
+                            requested_aspects=requested_direct_video_aspects,
                         )
                         plan = project_direct_video_edit_plan(
                             direct_video_plan,
@@ -6473,6 +6929,7 @@ capability_catalog_sha256 必須原樣回傳：{capability_catalog_sha256}
                             cards=cards,
                             provenance=provenance,
                             capability_catalog=capability_catalog,
+                            requested_aspects=requested_direct_video_aspects,
                         )
                     else:
                         plan = ClipCardFeaturePlanV3.model_validate_json(

@@ -13631,6 +13631,8 @@ def _vertical_runtime_candidate_options(
 
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
+    if "9:16" in selected.inactive_aspects:
+        return []
     if selected.vertical_candidates and not human_policy_binding_present:
         options = []
         for candidate in sorted(
@@ -14198,7 +14200,15 @@ def _build_pre_render_horizontal_candidate_route(
     duration_audit: Mapping[str, Any],
     policy: AutonomousEditPolicy,
 ) -> Any | None:
-    """Resolve the 16:9 candidate/trim/cue/presentation frontier."""
+    """Bind the Gemini 16:9 primary; alternates require a scoped replan.
+
+    A direct-video plan's rank-one horizontal candidate is Gemini's initial
+    editorial choice.  Its retained Top-K alternates are evidence-bound
+    recovery material, not a local optimizer frontier: selecting one based on
+    duration, quality, or reuse scoring would silently rewrite the paid
+    creative decision.  A failed primary therefore blocks or defers to the bounded
+    semantic-replan path instead of locally advancing to an alternate.
+    """
 
     rhythm_by_id = {
         chapter.feature_id: chapter for chapter in rhythm_plan.chapters
@@ -14268,7 +14278,10 @@ def _build_pre_render_horizontal_candidate_route(
                             1.0 - len(candidate.quality_risks) * 0.06,
                         ),
                     )
-                    for candidate in chapter.horizontal_candidates
+                    for candidate in sorted(
+                        chapter.horizontal_candidates,
+                        key=lambda item: item.rank,
+                    )[:1]
                 ),
             )
         )
@@ -17906,6 +17919,8 @@ def _horizontal_runtime_candidate_options(
 
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
+    if "16:9" in selected.inactive_aspects:
+        return []
     if selected.horizontal_candidates:
         return [
             candidate.model_dump(mode="python")

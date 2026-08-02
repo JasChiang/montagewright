@@ -4768,9 +4768,27 @@ class FeatureChapterSelect(StrictModel):
     vertical_candidates: list[FeatureVerticalCandidate] = Field(
         default_factory=list, max_length=4
     )
+    inactive_aspects: list[Literal["16:9", "9:16"]] = Field(
+        default_factory=list,
+        max_length=1,
+        description=(
+            "Legacy frame mirrors may remain populated for an unrequested "
+            "aspect, but that aspect has no executable candidate frontier."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_evidence(self) -> "FeatureChapterSelect":
+        if len(self.inactive_aspects) != len(set(self.inactive_aspects)):
+            raise ValueError("inactive aspects must be unique")
+        if "16:9" in self.inactive_aspects and self.horizontal_candidates:
+            raise ValueError(
+                "inactive 16:9 aspect cannot retain executable horizontal candidates"
+            )
+        if "9:16" in self.inactive_aspects and self.vertical_candidates:
+            raise ValueError(
+                "inactive 9:16 aspect cannot retain executable vertical candidates"
+            )
         if self.source_reuse_mode == "none":
             if self.source_reuse_justification is not None:
                 raise ValueError(

@@ -2674,17 +2674,43 @@ def _migrate_completed_planning_dispatches(
     return tuple(migrated)
 
 
+def _is_warm_paid_relative_path(
+    relative: Path,
+    *,
+    allowed_top_level: Collection[str],
+    include_archived_planning_lineage: bool,
+) -> bool:
+    """Allow active warm stages plus their same-output archived lineage only."""
+
+    return bool(
+        (
+            relative.parts
+            and relative.parts[0] in allowed_top_level
+        )
+        or (
+            include_archived_planning_lineage
+            and len(relative.parts) >= 2
+            and relative.parts[:2] == ("archive", "planning-lineage")
+        )
+    )
+
+
 def _migrate_completed_warm_dispatches(
     *,
     root: Path,
     allowed_top_level: Collection[str],
+    include_archived_planning_lineage: bool = False,
 ) -> tuple[Path, ...]:
     """Migrate only explicitly orchestrated warm-run planning stages."""
 
     migrated: list[Path] = []
     for orchestration_path in sorted(root.rglob("orchestration.json")):
         relative = orchestration_path.relative_to(root)
-        if not relative.parts or relative.parts[0] not in allowed_top_level:
+        if not _is_warm_paid_relative_path(
+            relative,
+            allowed_top_level=allowed_top_level,
+            include_archived_planning_lineage=include_archived_planning_lineage,
+        ):
             continue
         payload = read_json(orchestration_path)
         if (
@@ -2708,6 +2734,7 @@ def _find_unjournaled_warm_paid_artifacts(
     root: Path,
     allowed_top_level: Collection[str],
     journaled_raw_paths: Collection[Path],
+    include_archived_planning_lineage: bool = False,
 ) -> tuple[Path, ...]:
     """Find raw evidence not covered by a journal or exact byte alias."""
 
@@ -2723,8 +2750,11 @@ def _find_unjournaled_warm_paid_artifacts(
         path
         for path in root.rglob("*raw_interaction.json")
         if (
-            path.relative_to(root).parts
-            and path.relative_to(root).parts[0] in allowed_top_level
+            _is_warm_paid_relative_path(
+                path.relative_to(root),
+                allowed_top_level=allowed_top_level,
+                include_archived_planning_lineage=include_archived_planning_lineage,
+            )
             and path.resolve() not in resolved_journaled
             and sha256_file(path) not in journaled_sha256
         )
@@ -2880,6 +2910,7 @@ def run_feature_delivery_pipeline(
         _migrate_completed_warm_dispatches(
             root=resolved_output,
             allowed_top_level=warm_paid_namespaces,
+            include_archived_planning_lineage=True,
         )
         (
             adopted_dispatch_journals,
@@ -2888,6 +2919,11 @@ def run_feature_delivery_pipeline(
             budget_ledger=budget_ledger,
             root=resolved_output,
             allowed_top_level=warm_paid_namespaces,
+            allowed_relative_path=lambda relative: _is_warm_paid_relative_path(
+                relative,
+                allowed_top_level=warm_paid_namespaces,
+                include_archived_planning_lineage=True,
+            ),
         )
         conservative_dispatches = [
             node
@@ -2899,6 +2935,7 @@ def run_feature_delivery_pipeline(
                 root=resolved_output,
                 allowed_top_level=warm_paid_namespaces,
                 journaled_raw_paths=journaled_raw_paths,
+                include_archived_planning_lineage=True,
             )
         )
         if unjournaled_warm_paid_artifacts:
