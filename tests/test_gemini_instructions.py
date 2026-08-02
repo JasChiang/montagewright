@@ -9,11 +9,21 @@ from typing import Any, Callable
 import pytest
 
 import jascue_video_lab.gemini as gemini_module
-from jascue_video_lab.billing import summarize_usage_and_list_price
+from jascue_video_lab.autonomous_policy import (
+    AutonomousEditPolicy,
+    BudgetPolicy,
+    DurationPolicy,
+)
+from jascue_video_lab.billing import (
+    BudgetLedger,
+    PaidDispatchAlreadyRecorded,
+    summarize_usage_and_list_price,
+)
 
 from jascue_video_lab.gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
     GroundingIdentityReference,
+    GroupedEditDecisionProposal,
     GroupedSemanticReplanDecision,
     MODEL_ID,
     SEMANTIC_IDENTITY_GENERATION_CONFIG,
@@ -24,6 +34,7 @@ from jascue_video_lab.gemini import (
     canonicalize_selected_vertical_framing_output,
     normalize_full_clip_card_output_text,
 )
+from jascue_video_lab.schema import gemini_response_schema
 from jascue_video_lab.models import (
     ContentMap,
     FeatureChapterBrief,
@@ -100,26 +111,291 @@ def test_grouped_semantic_replan_reuse_authority_is_typed() -> None:
         GroupedSemanticReplanDecision(
             beat_id="fold",
             selected_option_id="fold--candidate-a",
+            fallback_option_ids=(),
             semantic_reason="preserve_readability",
+            unresolved_concern_codes=(),
             source_reuse_mode="distinct_interval",
+            source_reuse_justification=None,
             reuse_of_beat_ids=("opening",),
         )
     with pytest.raises(ValueError, match="none source reuse"):
         GroupedSemanticReplanDecision(
             beat_id="fold",
             selected_option_id="fold--candidate-a",
+            fallback_option_ids=(),
             semantic_reason="preserve_readability",
+            unresolved_concern_codes=(),
+            source_reuse_mode="none",
             source_reuse_justification="not allowed",
+            reuse_of_beat_ids=(),
         )
     accepted = GroupedSemanticReplanDecision(
         beat_id="fold",
         selected_option_id="fold--candidate-a",
+        fallback_option_ids=(),
         semantic_reason="preserve_readability",
+        unresolved_concern_codes=(),
         source_reuse_mode="distinct_interval",
         source_reuse_justification="The later interval shows a different state.",
         reuse_of_beat_ids=("opening",),
     )
     assert accepted.reuse_of_beat_ids == ("opening",)
+
+
+def _grouped_semantic_policy() -> AutonomousEditPolicy:
+    return AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=30_000,
+            min_ms=30_000,
+            max_ms=30_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=5.0,
+            max_paid_interactions=10,
+            max_semantic_replans=1,
+        ),
+    )
+
+
+def _grouped_interaction(
+    interaction_id: str,
+    *,
+    function_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": interaction_id,
+        "model": MODEL_ID,
+        "usage": {
+            "total_input_tokens": 10,
+            "total_output_tokens": 10,
+            "total_thought_tokens": 0,
+        },
+        "steps": [
+            {
+                "type": "function_call",
+                "id": f"call-{interaction_id}",
+                "name": function_name,
+                "arguments": arguments,
+            }
+        ],
+    }
+
+
+def _complete_grouped_no_reuse_arguments() -> dict[str, Any]:
+    return {
+        "decisions": [
+            {
+                "beat_id": "fold",
+                "selected_option_id": "fold--option-a",
+                "fallback_option_ids": [],
+                "semantic_reason": "preserve_readability",
+                "unresolved_concern_codes": [],
+                "source_reuse_mode": "none",
+                "source_reuse_justification": None,
+                "reuse_of_beat_ids": [],
+            }
+        ]
+    }
+
+
+def _grouped_client_with_responses(
+    responses: list[dict[str, Any]] | None = None,
+) -> tuple[GeminiLabClient, list[dict[str, Any]]]:
+    requests: list[dict[str, Any]] = []
+
+    def create(**request: Any) -> dict[str, Any]:
+        requests.append(request)
+        if not responses:
+            raise RuntimeError("503 service unavailable")
+        return responses.pop(0)
+
+    client = object.__new__(GeminiLabClient)
+    client.model_id = MODEL_ID
+    client.budget_ledger = BudgetLedger(
+        max_cost_usd=5.0,
+        max_interactions=10,
+    )
+    client.client = SimpleNamespace(interactions=SimpleNamespace(create=create))
+    return client, requests
+
+
+def test_grouped_semantic_tool_schema_requires_explicit_reuse_fields() -> None:
+    schema = gemini_response_schema(GroupedEditDecisionProposal)
+    required = set(schema["$defs"]["GroupedSemanticReplanDecision"]["required"])
+
+    assert {
+        "fallback_option_ids",
+        "unresolved_concern_codes",
+        "source_reuse_mode",
+        "source_reuse_justification",
+        "reuse_of_beat_ids",
+    }.issubset(required)
+    assert GroupedSemanticReplanDecision(
+        beat_id="fold",
+        selected_option_id="fold--option-a",
+        fallback_option_ids=(),
+        semantic_reason="preserve_readability",
+        unresolved_concern_codes=(),
+        source_reuse_mode="none",
+        source_reuse_justification=None,
+        reuse_of_beat_ids=(),
+    ).source_reuse_mode == "none"
+
+
+def test_grouped_semantic_reuse_ids_must_exactly_match_supplied_authority() -> None:
+    policy = _grouped_semantic_policy()
+    options = {"fold": ("fold--option-a",)}
+    allowed = {"fold": {"fold--option-a": ("opening",)}}
+    valid = _complete_grouped_no_reuse_arguments()
+    valid["decisions"][0].update(
+        {
+            "source_reuse_mode": "distinct_interval",
+            "source_reuse_justification": "A later independent interval.",
+            "reuse_of_beat_ids": ["opening"],
+        }
+    )
+    assert gemini_module._validate_grouped_decision_arguments(
+        valid,
+        option_ids_by_beat=options,
+        allowed_reuse_of_beat_ids_by_option=allowed,
+        policy=policy,
+    ).decisions[0].reuse_of_beat_ids == ("opening",)
+
+    for invalid_ids in ([], ["invented"], ["fold"]):
+        invalid = _complete_grouped_no_reuse_arguments()
+        invalid["decisions"][0].update(
+            {
+                "source_reuse_mode": "distinct_interval",
+                "source_reuse_justification": "A later independent interval.",
+                "reuse_of_beat_ids": invalid_ids,
+            }
+        )
+        with pytest.raises(ValueError):
+            gemini_module._validate_grouped_decision_arguments(
+                invalid,
+                option_ids_by_beat=options,
+                allowed_reuse_of_beat_ids_by_option=allowed,
+                policy=policy,
+            )
+
+
+def test_grouped_semantic_resume_repairs_invalid_raw_once_without_full_prompt(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "grouped"
+    run_dir.mkdir()
+    original = _complete_grouped_no_reuse_arguments()
+    for key in (
+        "fallback_option_ids",
+        "unresolved_concern_codes",
+        "reuse_of_beat_ids",
+    ):
+        original["decisions"][0].pop(key)
+    (run_dir / "grouped_semantic_negotiation.raw_interaction.json").write_text(
+        json.dumps(
+            _grouped_interaction(
+                "original",
+                function_name="propose_grouped_edit_decisions",
+                arguments=original,
+            )
+        ),
+        encoding="utf-8",
+    )
+    client, requests = _grouped_client_with_responses(
+        [
+            _grouped_interaction(
+                "repair",
+                function_name="repair_grouped_edit_decisions",
+                arguments=_complete_grouped_no_reuse_arguments(),
+            )
+        ]
+    )
+
+    result = client.negotiate_grouped_edit_decisions(
+        option_ids_by_beat={"fold": ("fold--option-a",)},
+        allowed_reuse_of_beat_ids_by_option={
+            "fold": {"fold--option-a": ()}
+        },
+        prompt="FULL-CONTEXT-SENTINEL-MUST-NOT-BE-RESENT",
+        policy=_grouped_semantic_policy(),
+        run_dir=run_dir,
+        recovery_call=True,
+    )
+
+    assert result.interaction_ids == ("original", "repair")
+    assert result.schema_repair_interaction_ids == ("repair",)
+    assert len(requests) == 1
+    repair_request = requests[0]
+    assert repair_request["tools"][0]["name"] == "repair_grouped_edit_decisions"
+    assert [item["type"] for item in repair_request["input"]] == ["text"]
+    repair_text = repair_request["input"][0]["text"]
+    assert "FULL-CONTEXT-SENTINEL-MUST-NOT-BE-RESENT" not in repair_text
+    assert "whole_resolved_timeline" not in repair_text
+    audit = json.loads(
+        (
+            run_dir / "grouped_semantic_negotiation.schema_repair.audit.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert audit["repair_limit"] == 1
+    assert audit["original_request_redispatched"] is False
+
+
+def test_grouped_semantic_schema_repair_is_single_shot_on_invalid_or_503(
+    tmp_path: Path,
+) -> None:
+    def write_invalid_original(run_dir: Path) -> None:
+        run_dir.mkdir()
+        (run_dir / "grouped_semantic_negotiation.raw_interaction.json").write_text(
+            json.dumps(
+                _grouped_interaction(
+                    "original",
+                    function_name="propose_grouped_edit_decisions",
+                    arguments={"decisions": [{"beat_id": "fold"}]},
+                )
+            ),
+            encoding="utf-8",
+        )
+
+    invalid_repair_dir = tmp_path / "invalid-repair"
+    write_invalid_original(invalid_repair_dir)
+    client, requests = _grouped_client_with_responses(
+        [
+            _grouped_interaction(
+                "repair-invalid",
+                function_name="repair_grouped_edit_decisions",
+                arguments={"decisions": [{"beat_id": "fold"}]},
+            )
+        ]
+    )
+    kwargs = {
+        "option_ids_by_beat": {"fold": ("fold--option-a",)},
+        "allowed_reuse_of_beat_ids_by_option": {
+            "fold": {"fold--option-a": ()}
+        },
+        "prompt": "not sent on resume",
+        "policy": _grouped_semantic_policy(),
+        "run_dir": invalid_repair_dir,
+        "recovery_call": True,
+    }
+    with pytest.raises(ValueError, match="refusing another repair"):
+        client.negotiate_grouped_edit_decisions(**kwargs)
+    with pytest.raises(ValueError, match="refusing another repair"):
+        client.negotiate_grouped_edit_decisions(**kwargs)
+    assert len(requests) == 1
+
+    unavailable_dir = tmp_path / "repair-503"
+    write_invalid_original(unavailable_dir)
+    unavailable_client, unavailable_requests = _grouped_client_with_responses()
+    unavailable_kwargs = {**kwargs, "run_dir": unavailable_dir}
+    with pytest.raises(RuntimeError, match="503"):
+        unavailable_client.negotiate_grouped_edit_decisions(**unavailable_kwargs)
+    with pytest.raises(PaidDispatchAlreadyRecorded):
+        unavailable_client.negotiate_grouped_edit_decisions(**unavailable_kwargs)
+    assert len(unavailable_requests) == 1
 
 
 def test_interactions_mime_type_normalizes_common_audio_aliases() -> None:

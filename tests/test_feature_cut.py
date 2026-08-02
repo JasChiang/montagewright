@@ -67,6 +67,7 @@ from jascue_video_lab.feature_cut import (
     _candidate_capability_boundaries,
     _editorial_reconstruction_capability_ids,
     _external_projection_binding_can_refresh_locally,
+    _grouped_replan_reuse_conflict_facts,
     _semantic_beat_for_runtime_candidate,
     _bind_runtime_candidate_coverage,
     _audit_render_source_reuse,
@@ -245,12 +246,22 @@ def test_local_preflight_failure_requires_gemini_route_rebuild(
             assert kwargs["option_ids_by_beat"] == {
                 "fold": ("fold--fold-2",)
             }
+            assert kwargs["allowed_reuse_of_beat_ids_by_option"] == {
+                "fold": {"fold--fold-2": ()}
+            }
+            context = json.loads(kwargs["prompt"].split("\n\n", 1)[1])
+            assert context["reuse_conflict_facts"][0]["option_id"] == (
+                "fold--fold-2"
+            )
             decision = SimpleNamespace(
                 decisions=(
                     SimpleNamespace(
                         model_dump=lambda **_kwargs: {
-                            "beat_id": "fold",
-                            "selected_option_id": "fold--fold-2",
+                                "beat_id": "fold",
+                                "selected_option_id": "fold--fold-2",
+                                "fallback_option_ids": [],
+                                "semantic_reason": "preserve_readability",
+                                "unresolved_concern_codes": [],
                             "source_reuse_mode": "none",
                             "source_reuse_justification": None,
                             "reuse_of_beat_ids": [],
@@ -354,13 +365,20 @@ def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(
                 "camera": ("camera--camera-2",),
                 "fold": ("fold--fold-2",),
             }
+            assert kwargs["allowed_reuse_of_beat_ids_by_option"] == {
+                "camera": {"camera--camera-2": ()},
+                "fold": {"fold--fold-2": ()},
+            }
             decisions = []
             for beat_id, candidate_id in (("camera", "camera-2"), ("fold", "fold-2")):
                 decisions.append(
                     SimpleNamespace(
                         model_dump=lambda beat_id=beat_id, candidate_id=candidate_id, **_kwargs: {
-                            "beat_id": beat_id,
-                            "selected_option_id": f"{beat_id}--{candidate_id}",
+                                "beat_id": beat_id,
+                                "selected_option_id": f"{beat_id}--{candidate_id}",
+                                "fallback_option_ids": [],
+                                "semantic_reason": "preserve_readability",
+                                "unresolved_concern_codes": [],
                             "source_reuse_mode": "none",
                             "source_reuse_justification": None,
                             "reuse_of_beat_ids": [],
@@ -456,6 +474,111 @@ def test_local_preflight_without_a_viable_candidate_does_not_call_gemini(
             plan_path=plan_path,
             music_supplied=False,
             output_timeline_cues=(),
+        )
+
+
+def test_grouped_replan_context_projects_exact_reuse_conflict_facts() -> None:
+    option = _local_replan_option("closing", "rank-02", "a", rank=2).model_copy(
+        update={"source_clip_id": "shared-clip"}
+    )
+    facts, allowed = _grouped_replan_reuse_conflict_facts(
+        affected_beats=(
+            {
+                "beat_id": "closing",
+                "candidate_bindings": {
+                    "rank-02": {
+                        **option.model_dump(mode="json"),
+                        "replan_required_codes": [
+                            "source_reuse_authority_missing"
+                        ],
+                    }
+                },
+            },
+        ),
+        whole_timeline=(
+            {
+                "beat_id": "opening",
+                "source_clip_id": "shared-clip",
+                "source_asset_id": "sha256:" + "a" * 64,
+                "source_in_ms": 1_000,
+                "source_out_ms": 6_000,
+            },
+        ),
+        option_ids_by_beat={"closing": ("closing--rank-02",)},
+    )
+
+    assert allowed == {"closing": {"closing--rank-02": ("opening",)}}
+    assert facts == [
+        {
+            "beat_id": "closing",
+            "option_id": "closing--rank-02",
+            "candidate_id": "rank-02",
+            "source_identity": {
+                "kind": "source_clip_id",
+                "value": "shared-clip",
+            },
+            "candidate_interval": {
+                "kind": "fixed_source_interval",
+                "source_in_ms": 0,
+                "source_out_ms": 10_000,
+            },
+            "shared_source_beats": [
+                {
+                    "beat_id": "opening",
+                    "source_interval": {
+                        "kind": "resolved_source_interval",
+                        "source_in_ms": 1_000,
+                        "source_out_ms": 6_000,
+                    },
+                }
+            ],
+            "replan_reuse_authority_required": True,
+            "allowed_reuse_of_beat_ids": ["opening"],
+        }
+    ]
+
+
+def test_grouped_replan_rejects_ambiguous_joint_reuse_authority() -> None:
+    closing = _local_replan_option("closing", "rank-02", "a", rank=2).model_copy(
+        update={"source_clip_id": "shared-clip"}
+    )
+    opening_shared = _local_replan_option(
+        "opening", "rank-01", "b", rank=1
+    ).model_copy(update={"source_clip_id": "shared-clip"})
+    opening_other = _local_replan_option(
+        "opening", "rank-02", "c", rank=2
+    )
+
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="ambiguous reuse authority across jointly affected beats",
+    ):
+        _grouped_replan_reuse_conflict_facts(
+            affected_beats=(
+                {
+                    "beat_id": "closing",
+                    "candidate_bindings": {
+                        "rank-02": {
+                            **closing.model_dump(mode="json"),
+                            "replan_required_codes": [
+                                "source_reuse_authority_missing"
+                            ],
+                        }
+                    },
+                },
+                {
+                    "beat_id": "opening",
+                    "candidate_bindings": {
+                        "rank-01": opening_shared.model_dump(mode="json"),
+                        "rank-02": opening_other.model_dump(mode="json"),
+                    },
+                },
+            ),
+            whole_timeline=(),
+            option_ids_by_beat={
+                "closing": ("closing--rank-02",),
+                "opening": ("opening--rank-01", "opening--rank-02"),
+            },
         )
 
 

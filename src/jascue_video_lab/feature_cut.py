@@ -91,6 +91,7 @@ from .gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
     FunctionToolDeclaration,
     GeminiLabClient,
+    GroupedEditDecisionProposal,
     GroundingIdentityReference,
     MODEL_ID,
     SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION,
@@ -15131,6 +15132,277 @@ def _preflight_local_infeasibility_replan_paths(
     return root / "context.json", root / "decision.json"
 
 
+def _grouped_replan_reuse_conflict_facts(
+    *,
+    affected_beats: Sequence[Mapping[str, Any]],
+    whole_timeline: Sequence[Any],
+    option_ids_by_beat: Mapping[str, Sequence[str]],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, dict[str, tuple[str, ...]]],
+]:
+    """Project finite, deterministic source-reuse authority for one replan.
+
+    Local code may identify identical immutable source clips and their known
+    intervals, but it must not decide whether reuse is editorially desirable.
+    A decision can name reuse IDs only when their complete set is invariant
+    across every jointly affected beat's finite option set.  Otherwise the
+    grouped choice would make the authority depend on an unchosen sibling
+    option, so fail before asking Gemini rather than guessing locally.
+    """
+
+    def source_identity(row: Mapping[str, Any]) -> tuple[str, str]:
+        source_clip_id = row.get("source_clip_id")
+        source_asset_id = row.get("source_asset_id")
+        if source_clip_id is not None and str(source_clip_id):
+            return "source_clip_id", str(source_clip_id)
+        if source_asset_id is not None and str(source_asset_id):
+            return "source_asset_id", str(source_asset_id)
+        raise FeatureCutSystemFailure(
+            "grouped semantic replan option has no immutable source identity"
+        )
+
+    def interval_fact(row: Mapping[str, Any]) -> dict[str, Any]:
+        fixed_start = row.get("fixed_source_in_ms")
+        fixed_end = row.get("fixed_source_out_ms")
+        if isinstance(fixed_start, int) and isinstance(fixed_end, int):
+            return {
+                "kind": "fixed_source_interval",
+                "source_in_ms": fixed_start,
+                "source_out_ms": fixed_end,
+            }
+        safe_start = row.get("safe_window_start_ms")
+        safe_end = row.get("safe_window_end_ms")
+        source_anchor = row.get("source_anchor_ms")
+        if (
+            isinstance(safe_start, int)
+            and isinstance(safe_end, int)
+            and isinstance(source_anchor, int)
+        ):
+            return {
+                "kind": "candidate_safe_window",
+                "safe_window_start_ms": safe_start,
+                "safe_window_end_ms": safe_end,
+                "source_anchor_ms": source_anchor,
+            }
+        return {"kind": "interval_not_available_before_execution"}
+
+    affected_by_id: dict[str, Mapping[str, Any]] = {}
+    options_by_beat: dict[str, tuple[tuple[str, Mapping[str, Any]], ...]] = {}
+    for row in affected_beats:
+        beat_id = str(row.get("beat_id") or "")
+        if not beat_id or beat_id in affected_by_id:
+            raise FeatureCutSystemFailure(
+                "grouped semantic replan has duplicate or empty affected beat IDs"
+            )
+        candidate_bindings = row.get("candidate_bindings")
+        expected_option_ids = tuple(option_ids_by_beat.get(beat_id, ()))
+        if not isinstance(candidate_bindings, Mapping) or not expected_option_ids:
+            raise FeatureCutSystemFailure(
+                "grouped semantic replan has incomplete immutable option bindings"
+            )
+        options: list[tuple[str, Mapping[str, Any]]] = []
+        prefix = beat_id + "--"
+        for option_id in expected_option_ids:
+            if not option_id.startswith(prefix):
+                raise FeatureCutSystemFailure(
+                    "grouped semantic replan option ID has the wrong beat prefix"
+                )
+            candidate_id = option_id.removeprefix(prefix)
+            option = candidate_bindings.get(candidate_id)
+            if not isinstance(option, Mapping):
+                raise FeatureCutSystemFailure(
+                    "grouped semantic replan option has no immutable binding"
+                )
+            if str(option.get("candidate_id") or "") != candidate_id:
+                raise FeatureCutSystemFailure(
+                    "grouped semantic replan option ID does not match its binding"
+                )
+            options.append((option_id, option))
+        affected_by_id[beat_id] = row
+        options_by_beat[beat_id] = tuple(options)
+
+    if set(affected_by_id) != set(option_ids_by_beat):
+        raise FeatureCutSystemFailure(
+            "grouped semantic replan option IDs do not cover affected beats"
+        )
+    unaffected_by_source: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for selection in whole_timeline:
+        payload = (
+            selection.model_dump(mode="json")
+            if hasattr(selection, "model_dump")
+            else dict(selection)
+        )
+        beat_id = str(payload.get("beat_id") or "")
+        if not beat_id:
+            raise FeatureCutSystemFailure(
+                "grouped semantic replan timeline has no stable beat ID"
+            )
+        if beat_id in affected_by_id:
+            continue
+        identity = source_identity(payload)
+        unaffected_by_source.setdefault(identity, []).append(
+            {
+                "beat_id": beat_id,
+                "source_interval": {
+                    "kind": "resolved_source_interval",
+                    "source_in_ms": payload.get("source_in_ms"),
+                    "source_out_ms": payload.get("source_out_ms"),
+                },
+            }
+        )
+
+    facts: list[dict[str, Any]] = []
+    allowed_by_beat_and_option: dict[str, dict[str, tuple[str, ...]]] = {}
+    for beat_id, options in options_by_beat.items():
+        allowed_by_beat_and_option[beat_id] = {}
+        for option_id, option in options:
+            identity = source_identity(option)
+            required_codes = tuple(
+                str(code)
+                for code in option.get("replan_required_codes", ())
+            )
+            requires_new_authority = (
+                "source_reuse_authority_missing" in required_codes
+            )
+            guaranteed_shared_rows = list(unaffected_by_source.get(identity, ()))
+            guaranteed_shared_ids = {
+                str(row["beat_id"]) for row in guaranteed_shared_rows
+            }
+            if requires_new_authority:
+                for other_beat_id, other_options in options_by_beat.items():
+                    if other_beat_id == beat_id:
+                        continue
+                    matching = [
+                        other_option
+                        for _, other_option in other_options
+                        if source_identity(other_option) == identity
+                    ]
+                    if not matching:
+                        continue
+                    if len(matching) != len(other_options):
+                        raise FeatureCutSystemFailure(
+                            "grouped semantic replan has ambiguous reuse "
+                            "authority across jointly affected beats: "
+                            + beat_id
+                            + "/"
+                            + other_beat_id
+                        )
+                    guaranteed_shared_ids.add(other_beat_id)
+                    guaranteed_shared_rows.append(
+                        {
+                            "beat_id": other_beat_id,
+                            "source_interval": {
+                                "kind": "selected_from_joint_immutable_option_set"
+                            },
+                        }
+                    )
+                if not guaranteed_shared_ids:
+                    raise FeatureCutSystemFailure(
+                        "grouped semantic replan candidate requires source "
+                        "reuse authority but has no deterministic reused beat"
+                    )
+                allowed_ids = tuple(sorted(guaranteed_shared_ids))
+            else:
+                # An existing immutable candidate may itself carry a historical
+                # Gemini reuse justification.  Do not ask the replan to copy or
+                # re-authorize it; only a missing authority is mutable here.
+                allowed_ids = ()
+            allowed_by_beat_and_option[beat_id][option_id] = allowed_ids
+            facts.append(
+                {
+                    "beat_id": beat_id,
+                    "option_id": option_id,
+                    "candidate_id": str(option.get("candidate_id") or ""),
+                    "source_identity": {
+                        "kind": identity[0],
+                        "value": identity[1],
+                    },
+                    "candidate_interval": interval_fact(option),
+                    "shared_source_beats": sorted(
+                        guaranteed_shared_rows,
+                        key=lambda row: str(row["beat_id"]),
+                    ),
+                    "replan_reuse_authority_required": requires_new_authority,
+                    "allowed_reuse_of_beat_ids": list(allowed_ids),
+                }
+            )
+    return facts, allowed_by_beat_and_option
+
+
+def _validate_persisted_grouped_replan_decisions(
+    decisions: Any,
+    *,
+    option_ids_by_beat: Mapping[str, Sequence[str]],
+    allowed_reuse_ids_by_option: Mapping[
+        str, Mapping[str, Sequence[str]]
+    ],
+    policy: AutonomousEditPolicy,
+) -> list[dict[str, Any]]:
+    """Fail closed before a persisted grouped authority can rebuild a route."""
+
+    if not isinstance(decisions, list):
+        raise FeatureCutSystemFailure(
+            "persisted grouped semantic replan has no decision list"
+        )
+    try:
+        proposal = GroupedEditDecisionProposal.model_validate(
+            {"decisions": decisions}
+        )
+    except (TypeError, ValueError) as error:
+        raise FeatureCutSystemFailure(
+            "persisted grouped semantic replan has incomplete typed decisions"
+        ) from error
+    normalized_options = {
+        beat_id: tuple(option_ids)
+        for beat_id, option_ids in option_ids_by_beat.items()
+    }
+    decisions_by_beat = {
+        decision.beat_id: decision for decision in proposal.decisions
+    }
+    if set(decisions_by_beat) != set(normalized_options):
+        raise FeatureCutSystemFailure(
+            "persisted grouped semantic replan did not resolve every affected beat"
+        )
+    for beat_id, decision in decisions_by_beat.items():
+        option_ids = normalized_options[beat_id]
+        proposed_ids = (
+            decision.selected_option_id,
+            *decision.fallback_option_ids,
+        )
+        if set(proposed_ids) - set(option_ids):
+            raise FeatureCutSystemFailure(
+                "persisted grouped semantic replan selected an unknown option"
+            )
+        allowed_ids = tuple(
+            sorted(
+                str(value)
+                for value in allowed_reuse_ids_by_option.get(beat_id, {}).get(
+                    decision.selected_option_id,
+                    (),
+                )
+            )
+        )
+        if decision.source_reuse_mode == "none":
+            if allowed_ids:
+                raise FeatureCutSystemFailure(
+                    "persisted grouped semantic replan omitted required reuse "
+                    "authority"
+                )
+            continue
+        if decision.source_reuse_mode not in policy.editorial.allow_source_reuse:
+            raise FeatureCutSystemFailure(
+                "persisted grouped semantic replan selected policy-forbidden "
+                "source reuse"
+            )
+        if tuple(sorted(decision.reuse_of_beat_ids)) != allowed_ids:
+            raise FeatureCutSystemFailure(
+                "persisted grouped semantic replan invented, omitted, or "
+                "misbound reused beat IDs"
+            )
+    return [decision.model_dump(mode="json") for decision in proposal.decisions]
+
+
 def _selected_preflight_local_replan(
     *,
     route: Any,
@@ -15200,6 +15472,28 @@ def _selected_preflight_local_replan(
         raise FeatureCutSystemFailure(
             "preflight local infeasibility replan has no affected beats"
         )
+    persisted_option_ids_by_beat: dict[str, tuple[str, ...]] = {}
+    for beat_id, row in affected_by_id.items():
+        candidate_bindings = row.get("candidate_bindings")
+        if not isinstance(candidate_bindings, Mapping):
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan has invalid candidate bindings"
+            )
+        persisted_option_ids_by_beat[beat_id] = tuple(
+            f"{beat_id}--{candidate_id}"
+            for candidate_id in candidate_bindings
+        )
+    _, allowed_reuse_ids_by_option = _grouped_replan_reuse_conflict_facts(
+        affected_beats=list(affected_by_id.values()),
+        whole_timeline=context.get("whole_resolved_timeline", ()),
+        option_ids_by_beat=persisted_option_ids_by_beat,
+    )
+    decisions = _validate_persisted_grouped_replan_decisions(
+        decisions,
+        option_ids_by_beat=persisted_option_ids_by_beat,
+        allowed_reuse_ids_by_option=allowed_reuse_ids_by_option,
+        policy=policy,
+    )
     selected_candidate_ids: dict[str, str] = {}
     reuse_authorities: dict[str, SemanticReplanReuseAuthority] = {}
     current_bindings = route.semantic_replan_candidate_bindings_by_beat
@@ -15360,13 +15654,22 @@ def _persist_preflight_local_infeasibility_replan(
         option_ids_by_beat[feature_id] = tuple(
             f"{feature_id}--{candidate_id}" for candidate_id in viable_ids
         )
+    whole_timeline = [
+        selection.model_dump(mode="json") for selection in route.selections
+    ]
+    reuse_conflict_facts, allowed_reuse_ids_by_option = (
+        _grouped_replan_reuse_conflict_facts(
+            affected_beats=affected,
+            whole_timeline=whole_timeline,
+            option_ids_by_beat=option_ids_by_beat,
+        )
+    )
     context = {
         "contract_version": "preflight-local-infeasibility-replan-v1",
         "policy_reference": policy.policy_reference,
         "affected_beats": affected,
-        "whole_resolved_timeline": [
-            selection.model_dump(mode="json") for selection in route.selections
-        ],
+        "whole_resolved_timeline": whole_timeline,
+        "reuse_conflict_facts": reuse_conflict_facts,
         "music_context": {
             "supplied": music_supplied,
             "output_cues": [
@@ -15404,6 +15707,33 @@ def _persist_preflight_local_infeasibility_replan(
                 "saved local infeasibility replan does not match measured context"
             )
         return
+    if context_path.is_file() and not decision_path.is_file():
+        saved_context = read_json(context_path)
+        if saved_context != context:
+            if not isinstance(saved_context, Mapping):
+                raise FeatureCutSystemFailure(
+                    "saved local infeasibility replan context is malformed"
+                )
+            prior_without_reuse_facts = dict(saved_context)
+            current_without_reuse_facts = dict(context)
+            prior_without_reuse_facts.pop("reuse_conflict_facts", None)
+            current_without_reuse_facts.pop("reuse_conflict_facts", None)
+            if prior_without_reuse_facts != current_without_reuse_facts:
+                raise FeatureCutSystemFailure(
+                    "saved local infeasibility replan does not match measured context"
+                )
+            # A prior run may have completed the original paid response before
+            # this typed reuse projection existed.  Its raw arguments remain
+            # immutable; add only deterministic local conflict facts so the
+            # one text-only schema repair can resume without redispatching the
+            # original media-free but large grouped prompt.
+            write_json(
+                context_path.with_name(
+                    "context.pre-reuse-conflict-facts.json"
+                ),
+                saved_context,
+            )
+            write_json(context_path, context)
     if policy.budget.max_semantic_replans < 1:
         raise CandidateKnownInfeasible(
             "preflight_local_infeasibility_replan_limit_reached"
@@ -15419,11 +15749,14 @@ def _persist_preflight_local_infeasibility_replan(
             "and failure reports. This is a creative decision: do not make a local "
             "fallback, invent media/time/crop, or change unaffected beats. Preserve "
             "the brief and hard evidence; choose source reuse only with typed "
-            "authority.\n\n" + json.dumps(context, ensure_ascii=False)
+            "authority. Every decision must explicitly encode empty no-reuse "
+            "fields as [], null, [] and name exactly the allowed stable beat IDs "
+            "when reuse is required.\n\n" + json.dumps(context, ensure_ascii=False)
         ),
         policy=policy,
         run_dir=context_path.parent,
         recovery_call=True,
+        allowed_reuse_of_beat_ids_by_option=allowed_reuse_ids_by_option,
     )
     decisions = [decision.model_dump(mode="json") for decision in result.decision.decisions]
     selected_ids_by_beat = {
@@ -22250,18 +22583,28 @@ def _run_feature_cut_experiment_impl(
                     )
                     for beat_id, bindings in semantic_reuse_affected.items()
                 }
+                affected_reuse_beats = [
+                    row
+                    for row in semantic_frontier["beats"]
+                    if row["beat_id"] in semantic_reuse_affected
+                ]
+                whole_reuse_timeline = [
+                    selection.model_dump(mode="json")
+                    for selection in pre_render_candidate_route.selections
+                ]
+                reuse_conflict_facts, allowed_reuse_ids_by_option = (
+                    _grouped_replan_reuse_conflict_facts(
+                        affected_beats=affected_reuse_beats,
+                        whole_timeline=whole_reuse_timeline,
+                        option_ids_by_beat=option_ids_by_beat,
+                    )
+                )
                 context = {
                     "contract_version": "preflight-semantic-reuse-replan-v1",
                     "policy_reference": autonomous_policy.policy_reference,
-                    "affected_beats": [
-                        row
-                        for row in semantic_frontier["beats"]
-                        if row["beat_id"] in semantic_reuse_affected
-                    ],
-                    "whole_resolved_timeline": [
-                        selection.model_dump(mode="json")
-                        for selection in pre_render_candidate_route.selections
-                    ],
+                    "affected_beats": affected_reuse_beats,
+                    "whole_resolved_timeline": whole_reuse_timeline,
+                    "reuse_conflict_facts": reuse_conflict_facts,
                     "music_context": {
                         "supplied": music_lock is not None,
                         "output_cues": [
@@ -22348,6 +22691,9 @@ def _run_feature_cut_experiment_impl(
                         policy=autonomous_policy,
                         run_dir=replan_dir,
                         recovery_call=True,
+                        allowed_reuse_of_beat_ids_by_option=(
+                            allowed_reuse_ids_by_option
+                        ),
                     )
                     decisions = [
                         decision.model_dump(mode="json")
@@ -22388,6 +22734,14 @@ def _run_feature_cut_experiment_impl(
                     raise FeatureCutSystemFailure(
                         "preflight semantic reuse replan has no decisions"
                     )
+                decisions = _validate_persisted_grouped_replan_decisions(
+                    decisions,
+                    option_ids_by_beat=option_ids_by_beat,
+                    allowed_reuse_ids_by_option=(
+                        allowed_reuse_ids_by_option
+                    ),
+                    policy=autonomous_policy,
+                )
                 selected_candidate_ids: dict[str, str] = {}
                 reuse_authorities: dict[str, SemanticReplanReuseAuthority] = {}
                 for decision in decisions:
@@ -24610,6 +24964,18 @@ def _run_feature_cut_experiment_impl(
                         raise FeatureCutSystemFailure(
                             "saved grouped scoped semantic replan has no decisions"
                         )
+                    decisions = _validate_persisted_grouped_replan_decisions(
+                        decisions,
+                        option_ids_by_beat=options_by_beat,
+                        allowed_reuse_ids_by_option={
+                            beat_id: {
+                                option_id: ()
+                                for option_id in option_ids
+                            }
+                            for beat_id, option_ids in options_by_beat.items()
+                        },
+                        policy=autonomous_policy,
+                    )
                     selected_option_ids = {
                         str(row.get("beat_id")): str(row.get("selected_option_id"))
                         for row in decisions

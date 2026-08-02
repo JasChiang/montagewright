@@ -220,14 +220,20 @@ class GroupedEditDecisionProposal(FrozenStrictModel):
 class GroupedSemanticReplanDecision(EditDecisionProposal):
     """A bounded whole-route choice, optionally authorizing source reuse."""
 
+    # These fields are deliberately required even when their legal value is
+    # empty or null.  A grouped replan is an executable authority envelope,
+    # not a sparse preference patch: omitted defaults made it impossible to
+    # distinguish Gemini's explicit "no reuse" from a missing decision.
+    fallback_option_ids: tuple[str, ...] = Field(max_length=2)
+    unresolved_concern_codes: tuple[str, ...]
     source_reuse_mode: Literal[
         "none",
         "distinct_interval",
         "alternate_presentation",
         "editorial_reprise",
-    ] = "none"
-    source_reuse_justification: str | None = None
-    reuse_of_beat_ids: tuple[str, ...] = ()
+    ]
+    source_reuse_justification: str | None
+    reuse_of_beat_ids: tuple[str, ...]
 
     @model_validator(mode="after")
     def validate_reuse_authority(self) -> "GroupedSemanticReplanDecision":
@@ -258,9 +264,30 @@ class BoundedGroupedSemanticNegotiationResult(FrozenStrictModel):
         "bounded-grouped-semantic-negotiation-v1"
     )
     decision: GroupedEditDecisionProposal
-    interaction_ids: tuple[str, ...] = Field(min_length=1, max_length=1)
+    interaction_ids: tuple[str, ...] = Field(min_length=1, max_length=2)
     tool_call_ids: tuple[str, ...] = ()
+    schema_repair_interaction_ids: tuple[str, ...] = Field(
+        default=(),
+        max_length=1,
+    )
     automatic_function_calling: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_schema_repair_audit(
+        self,
+    ) -> "BoundedGroupedSemanticNegotiationResult":
+        if self.schema_repair_interaction_ids and (
+            self.interaction_ids[-1] != self.schema_repair_interaction_ids[0]
+            or len(self.interaction_ids) != 2
+        ):
+            raise ValueError(
+                "grouped schema repair must be one recorded follow-up interaction"
+            )
+        if not self.schema_repair_interaction_ids and len(self.interaction_ids) != 1:
+            raise ValueError(
+                "grouped negotiation can have two interactions only for schema repair"
+            )
+        return self
 
 
 def canonical_interactions_mime_type(mime_type: str) -> str:
@@ -1512,7 +1539,12 @@ def _interaction_function_calls(
     """Extract typed custom calls without accepting unknown executable data."""
 
     calls: list[dict[str, Any]] = []
-    for step in getattr(interaction, "steps", None) or []:
+    steps = (
+        interaction.get("steps")
+        if isinstance(interaction, Mapping)
+        else getattr(interaction, "steps", None)
+    )
+    for step in steps or []:
         if isinstance(step, Mapping):
             step_type = step.get("type")
             call_id = step.get("id")
@@ -1556,7 +1588,14 @@ def _record_interaction_attempt(
     """
 
     raw_interaction = _raw_dump(interaction)
-    raw_id = str(getattr(interaction, "id", "") or "unknown")
+    raw_id = str(
+        (
+            interaction.get("id")
+            if isinstance(interaction, Mapping)
+            else getattr(interaction, "id", "")
+        )
+        or "unknown"
+    )
     safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_id).strip("-") or "unknown"
     safe_operation = re.sub(r"[^A-Za-z0-9._-]+", "-", operation).strip("-")
     attempt_path = (
@@ -1585,6 +1624,188 @@ def _record_interaction_attempt(
             },
         )
     return raw_interaction, attempt_path
+
+
+def _grouped_interaction_id(interaction: Any) -> str:
+    return str(
+        (
+            interaction.get("id")
+            if isinstance(interaction, Mapping)
+            else getattr(interaction, "id", "")
+        )
+        or ""
+    )
+
+
+def _grouped_decision_function_call(
+    interaction: Any,
+    *,
+    function_name: str,
+) -> dict[str, Any]:
+    calls = _interaction_function_calls(interaction)
+    proposals = [call for call in calls if call["name"] == function_name]
+    if len(calls) != 1 or len(proposals) != 1:
+        raise ValueError(
+            "grouped semantic negotiation must return exactly one declared decision"
+        )
+    return proposals[0]
+
+
+def _normalize_grouped_reuse_ids(
+    *,
+    option_ids_by_beat: Mapping[str, tuple[str, ...]],
+    allowed_reuse_of_beat_ids_by_option: Mapping[
+        str, Mapping[str, Sequence[str]]
+    ]
+    | None,
+) -> dict[str, dict[str, tuple[str, ...]]]:
+    """Normalize the finite reuse-ID authority offered to a grouped call."""
+
+    supplied = dict(allowed_reuse_of_beat_ids_by_option or {})
+    unknown_beats = set(supplied) - set(option_ids_by_beat)
+    if unknown_beats:
+        raise ValueError(
+            "grouped semantic reuse authority names unknown beats: "
+            + ", ".join(sorted(unknown_beats))
+        )
+    normalized: dict[str, dict[str, tuple[str, ...]]] = {}
+    for beat_id, option_ids in option_ids_by_beat.items():
+        raw_by_option = supplied.get(beat_id, {})
+        if not isinstance(raw_by_option, Mapping):
+            raise ValueError(
+                "grouped semantic reuse authority must map options by beat: "
+                + beat_id
+            )
+        unknown_options = set(raw_by_option) - set(option_ids)
+        if unknown_options:
+            raise ValueError(
+                "grouped semantic reuse authority names unknown options for "
+                + beat_id
+                + ": "
+                + ", ".join(sorted(str(value) for value in unknown_options))
+            )
+        normalized[beat_id] = {}
+        for option_id in option_ids:
+            values = tuple(str(value) for value in raw_by_option.get(option_id, ()))
+            if any(not value for value in values):
+                raise ValueError(
+                    "grouped semantic reuse authority contains an empty beat ID"
+                )
+            if len(values) != len(set(values)):
+                raise ValueError(
+                    "grouped semantic reuse authority beat IDs must be unique"
+                )
+            if beat_id in values:
+                raise ValueError(
+                    "grouped semantic reuse authority cannot reference its own beat"
+                )
+            normalized[beat_id][option_id] = tuple(sorted(values))
+    return normalized
+
+
+def _validate_grouped_decision_arguments(
+    arguments: Mapping[str, Any],
+    *,
+    option_ids_by_beat: Mapping[str, tuple[str, ...]],
+    allowed_reuse_of_beat_ids_by_option: Mapping[
+        str, Mapping[str, tuple[str, ...]]
+    ],
+    policy: AutonomousEditPolicy,
+) -> GroupedEditDecisionProposal:
+    proposal = GroupedEditDecisionProposal.model_validate(arguments)
+    decisions_by_beat = {
+        decision.beat_id: decision for decision in proposal.decisions
+    }
+    if set(decisions_by_beat) != set(option_ids_by_beat):
+        raise ValueError(
+            "grouped semantic negotiation must decide every and only supplied beat"
+        )
+    for beat_id, decision in decisions_by_beat.items():
+        proposed_ids = (
+            decision.selected_option_id,
+            *decision.fallback_option_ids,
+        )
+        invalid_ids = set(proposed_ids) - set(option_ids_by_beat[beat_id])
+        if invalid_ids:
+            raise ValueError(
+                "grouped semantic decision invented option IDs for "
+                + beat_id
+                + ": "
+                + ", ".join(sorted(invalid_ids))
+            )
+        allowed_reuse_ids = allowed_reuse_of_beat_ids_by_option[beat_id][
+            decision.selected_option_id
+        ]
+        if decision.source_reuse_mode == "none":
+            if allowed_reuse_ids:
+                raise ValueError(
+                    "grouped semantic decision omitted required source reuse "
+                    "authority for " + beat_id
+                )
+            continue
+        if decision.source_reuse_mode not in policy.editorial.allow_source_reuse:
+            raise ValueError(
+                "grouped semantic decision selected a source reuse mode "
+                "forbidden by policy: " + decision.source_reuse_mode
+            )
+        if not allowed_reuse_ids:
+            raise ValueError(
+                "grouped semantic decision supplied source reuse without an "
+                "immutable reuse-conflict authority for " + beat_id
+            )
+        if tuple(sorted(decision.reuse_of_beat_ids)) != allowed_reuse_ids:
+            raise ValueError(
+                "grouped semantic decision must name exactly the allowed "
+                "reused beat IDs for " + beat_id
+            )
+    return proposal
+
+
+def _grouped_schema_repair_prompt(
+    *,
+    original_arguments: Mapping[str, Any],
+    validation_error: ValueError,
+    option_ids_by_beat: Mapping[str, tuple[str, ...]],
+    allowed_reuse_of_beat_ids_by_option: Mapping[
+        str, Mapping[str, tuple[str, ...]]
+    ],
+    decision_schema: Mapping[str, Any],
+) -> str:
+    """Build a compact, text-only repair request for one invalid response."""
+
+    repair_context = {
+        "contract_version": "grouped-semantic-schema-repair-v1",
+        "task": (
+            "Repair the supplied function arguments into one complete typed "
+            "decision. Do not introduce media, timestamps, crops, new option "
+            "IDs, or new beat IDs. Preserve the original creative selections "
+            "where they are valid; fill every required field explicitly."
+        ),
+        "validation_error": str(validation_error),
+        "original_function_arguments": dict(original_arguments),
+        "function_arguments_schema": dict(decision_schema),
+        "allowed_option_ids_by_beat": option_ids_by_beat,
+        "allowed_reuse_of_beat_ids_by_option": (
+            allowed_reuse_of_beat_ids_by_option
+        ),
+        "required_reuse_encoding": {
+            "none": {
+                "source_reuse_justification": None,
+                "reuse_of_beat_ids": [],
+            },
+            "reuse": (
+                "source_reuse_justification must be non-empty and "
+                "reuse_of_beat_ids must name exactly the supplied allowed IDs"
+            ),
+        },
+    }
+    return (
+        "[protocol=grouped-semantic-schema-repair-v1] This is one bounded "
+        "text-only function-argument repair for a previously paid response; "
+        "it is not a new creative replan. Call repair_grouped_edit_decisions "
+        "exactly once.\n\n"
+        + json.dumps(repair_context, ensure_ascii=False)
+    )
 
 
 def _is_file_api_not_reusable(error: BaseException) -> bool:
@@ -1801,6 +2022,10 @@ class GeminiLabClient:
         policy: AutonomousEditPolicy,
         run_dir: Path,
         recovery_call: bool = False,
+        allowed_reuse_of_beat_ids_by_option: Mapping[
+            str, Mapping[str, Sequence[str]]
+        ]
+        | None = None,
     ) -> BoundedGroupedSemanticNegotiationResult:
         """Make one whole-sequence choice for every deferred beat.
 
@@ -1836,6 +2061,12 @@ class GeminiLabClient:
             raise ValueError(
                 "grouped semantic negotiation option IDs must be unique per beat"
             )
+        normalized_reuse_ids = _normalize_grouped_reuse_ids(
+            option_ids_by_beat=normalized_options,
+            allowed_reuse_of_beat_ids_by_option=(
+                allowed_reuse_of_beat_ids_by_option
+            ),
+        )
         decision_declaration = {
             "type": "function",
             "name": "propose_grouped_edit_decisions",
@@ -1846,6 +2077,250 @@ class GeminiLabClient:
             "parameters": gemini_response_schema(GroupedEditDecisionProposal),
         }
         run_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = run_dir / "grouped_semantic_negotiation.raw_interaction.json"
+        repair_raw_path = (
+            run_dir / "grouped_semantic_negotiation.schema_repair.raw_interaction.json"
+        )
+
+        def validate_arguments(
+            arguments: Mapping[str, Any],
+        ) -> GroupedEditDecisionProposal:
+            return _validate_grouped_decision_arguments(
+                arguments,
+                option_ids_by_beat=normalized_options,
+                allowed_reuse_of_beat_ids_by_option=normalized_reuse_ids,
+                policy=policy,
+            )
+
+        def repair_invalid_persisted_response(
+            *,
+            original_interaction: Any,
+            original_call: Mapping[str, Any],
+            validation_error: ValueError,
+        ) -> BoundedGroupedSemanticNegotiationResult:
+            """Use one compact paid repair; never re-dispatch the full prompt."""
+
+            original_interaction_id = _grouped_interaction_id(
+                original_interaction
+            )
+            if not original_interaction_id:
+                raise ValueError(
+                    "grouped semantic negotiation response has no ID"
+                )
+            audit_path = (
+                run_dir / "grouped_semantic_negotiation.schema_repair.audit.json"
+            )
+            original_raw_sha256 = (
+                sha256_file(raw_path) if raw_path.is_file() else None
+            )
+            if repair_raw_path.is_file():
+                saved_audit = read_json(audit_path) if audit_path.is_file() else None
+                if not isinstance(saved_audit, Mapping) or (
+                    saved_audit.get("original_interaction_id")
+                    != original_interaction_id
+                    or saved_audit.get("original_raw_interaction_sha256")
+                    != original_raw_sha256
+                    or saved_audit.get("repair_limit") != 1
+                ):
+                    raise ValueError(
+                        "persisted grouped semantic schema repair does not bind "
+                        "its original invalid response"
+                    )
+            audit = {
+                "contract_version": "grouped-semantic-schema-repair-v1",
+                "original_interaction_id": original_interaction_id,
+                "original_tool_call_id": str(original_call["id"]),
+                "original_raw_interaction_sha256": original_raw_sha256,
+                "validation_error": str(validation_error),
+                "repair_limit": 1,
+                "repair_input": "text_only_raw_arguments_and_compact_constraints",
+                "original_request_redispatched": False,
+            }
+            write_json(audit_path, audit)
+            if repair_raw_path.is_file():
+                repair_interaction = read_json(repair_raw_path)
+            else:
+                if negotiation.max_repair_negotiations < 1:
+                    raise ValueError(
+                        "grouped semantic schema repair is disabled by policy"
+                    )
+                repair_declaration = {
+                    "type": "function",
+                    "name": "repair_grouped_edit_decisions",
+                    "description": (
+                        "Repair one invalid grouped decision argument object "
+                        "using only the supplied compact typed constraints."
+                    ),
+                    "parameters": decision_declaration["parameters"],
+                }
+                repair_request = {
+                    "model": self.model_id,
+                    "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+                    "store": True,
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": _grouped_schema_repair_prompt(
+                                original_arguments=original_call["arguments"],
+                                validation_error=validation_error,
+                                option_ids_by_beat=normalized_options,
+                                allowed_reuse_of_beat_ids_by_option=(
+                                    normalized_reuse_ids
+                                ),
+                                decision_schema=decision_declaration[
+                                    "parameters"
+                                ],
+                            ),
+                        }
+                    ],
+                    "tools": [repair_declaration],
+                    "generation_config": {
+                        "thinking_level": (
+                            policy.gemini_limits.text_only_schema_repair.thinking_level
+                        ),
+                        "max_output_tokens": (
+                            policy.gemini_limits.text_only_schema_repair.max_output_tokens
+                        ),
+                        "tool_choice": {
+                            "allowed_tools": {
+                                "mode": "any",
+                                "tools": ["repair_grouped_edit_decisions"],
+                            }
+                        },
+                    },
+                }
+                write_json(
+                    run_dir / "grouped_semantic_negotiation.schema_repair.request.json",
+                    repair_request,
+                )
+                repair_text_tokens = max(
+                    256,
+                    len(json.dumps(repair_request["input"], ensure_ascii=False))
+                    // 4,
+                )
+                repair_estimate = estimate_paid_call(
+                    stage="semantic_negotiation_schema_repair",
+                    model_id=self.model_id,
+                    text_input_tokens=repair_text_tokens,
+                    max_output_tokens=repair_request["generation_config"][
+                        "max_output_tokens"
+                    ],
+                    thinking_level=repair_request["generation_config"][
+                        "thinking_level"
+                    ],
+                )
+                repair_interaction, repair_dispatch = dispatch_paid_interaction(
+                    client=self.client,
+                    request=repair_request,
+                    request_record=repair_request,
+                    journal_dir=run_dir,
+                    estimate=repair_estimate,
+                    budget_ledger=self.budget_ledger,
+                    recovery_call=True,
+                )
+                repair_raw_interaction, repair_attempt_path = (
+                    _record_interaction_attempt(
+                        run_dir=run_dir,
+                        operation="grouped_semantic_negotiation_schema_repair",
+                        canonical_filename=(
+                            "grouped_semantic_negotiation.schema_repair."
+                            "raw_interaction.json"
+                        ),
+                        interaction=repair_interaction,
+                    )
+                )
+                complete_paid_dispatch(
+                    handle=repair_dispatch,
+                    raw_interaction=repair_raw_interaction,
+                    raw_artifact_path=repair_attempt_path,
+                    budget_ledger=self.budget_ledger,
+                    model_id=self.model_id,
+                )
+            repair_interaction_id = _grouped_interaction_id(repair_interaction)
+            if not repair_interaction_id:
+                raise ValueError(
+                    "grouped semantic schema repair response has no ID"
+                )
+            try:
+                repair_call = _grouped_decision_function_call(
+                    repair_interaction,
+                    function_name="repair_grouped_edit_decisions",
+                )
+                proposal = validate_arguments(repair_call["arguments"])
+            except ValueError as repair_error:
+                audit.update(
+                    {
+                        "repair_interaction_id": repair_interaction_id,
+                        "repair_raw_interaction_sha256": sha256_file(
+                            repair_raw_path
+                        ),
+                        "repair_validation_error": str(repair_error),
+                        "repair_accepted": False,
+                    }
+                )
+                write_json(audit_path, audit)
+                raise ValueError(
+                    "grouped semantic schema repair remained invalid; "
+                    "refusing another repair"
+                ) from repair_error
+            audit.update(
+                {
+                    "repair_interaction_id": repair_interaction_id,
+                    "repair_tool_call_id": str(repair_call["id"]),
+                    "repair_raw_interaction_sha256": sha256_file(repair_raw_path),
+                    "repair_accepted": True,
+                }
+            )
+            write_json(audit_path, audit)
+            result = BoundedGroupedSemanticNegotiationResult(
+                decision=proposal,
+                interaction_ids=(
+                    original_interaction_id,
+                    repair_interaction_id,
+                ),
+                tool_call_ids=(
+                    str(original_call["id"]),
+                    str(repair_call["id"]),
+                ),
+                schema_repair_interaction_ids=(repair_interaction_id,),
+            )
+            write_json(run_dir / "grouped_semantic_negotiation.json", result)
+            return result
+
+        if raw_path.is_file():
+            # A resume never sends the old prompt again.  Re-validate the
+            # durable response with today's stricter contract; if it is a
+            # schema failure, only the bounded text repair below may proceed.
+            persisted_interaction = read_json(raw_path)
+            persisted_call = _grouped_decision_function_call(
+                persisted_interaction,
+                function_name="propose_grouped_edit_decisions",
+            )
+            try:
+                persisted_proposal = validate_arguments(
+                    persisted_call["arguments"]
+                )
+            except ValueError as validation_error:
+                return repair_invalid_persisted_response(
+                    original_interaction=persisted_interaction,
+                    original_call=persisted_call,
+                    validation_error=validation_error,
+                )
+            persisted_interaction_id = _grouped_interaction_id(
+                persisted_interaction
+            )
+            if not persisted_interaction_id:
+                raise ValueError(
+                    "grouped semantic negotiation response has no ID"
+                )
+            result = BoundedGroupedSemanticNegotiationResult(
+                decision=persisted_proposal,
+                interaction_ids=(persisted_interaction_id,),
+                tool_call_ids=(str(persisted_call["id"]),),
+            )
+            write_json(run_dir / "grouped_semantic_negotiation.json", result)
+            return result
+
         request_record: dict[str, Any] = {
             "model": self.model_id,
             "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
@@ -1857,6 +2332,13 @@ class GeminiLabClient:
                         prompt
                         + "\n\nImmutable option IDs by beat:\n"
                         + json.dumps(normalized_options, ensure_ascii=False)
+                        + "\n\nImmutable allowed reuse beat IDs by selected option:\n"
+                        + json.dumps(normalized_reuse_ids, ensure_ascii=False)
+                        + "\nEvery decision must explicitly include "
+                        "fallback_option_ids, unresolved_concern_codes, "
+                        "source_reuse_mode, source_reuse_justification, and "
+                        "reuse_of_beat_ids. For source_reuse_mode=none use [], "
+                        "null, []; otherwise name exactly the allowed reuse IDs."
                         + "\nCall propose_grouped_edit_decisions exactly once."
                     ),
                 }
@@ -1918,55 +2400,25 @@ class GeminiLabClient:
             budget_ledger=self.budget_ledger,
             model_id=self.model_id,
         )
-        interaction_id = str(getattr(interaction, "id", "") or "")
+        interaction_id = _grouped_interaction_id(interaction)
         if not interaction_id:
             raise ValueError("grouped semantic negotiation response has no ID")
-        calls = _interaction_function_calls(interaction)
-        proposals = [
-            call
-            for call in calls
-            if call["name"] == "propose_grouped_edit_decisions"
-        ]
-        if len(calls) != 1 or len(proposals) != 1:
-            raise ValueError(
-                "grouped semantic negotiation must return exactly one declared decision"
-            )
-        proposal = GroupedEditDecisionProposal.model_validate(
-            proposals[0]["arguments"]
+        proposal_call = _grouped_decision_function_call(
+            interaction,
+            function_name="propose_grouped_edit_decisions",
         )
-        decisions_by_beat = {
-            decision.beat_id: decision for decision in proposal.decisions
-        }
-        if set(decisions_by_beat) != set(normalized_options):
-            raise ValueError(
-                "grouped semantic negotiation must decide every and only supplied beat"
+        try:
+            proposal = validate_arguments(proposal_call["arguments"])
+        except ValueError as validation_error:
+            return repair_invalid_persisted_response(
+                original_interaction=interaction,
+                original_call=proposal_call,
+                validation_error=validation_error,
             )
-        for beat_id, decision in decisions_by_beat.items():
-            proposed_ids = (
-                decision.selected_option_id,
-                *decision.fallback_option_ids,
-            )
-            invalid_ids = set(proposed_ids) - set(normalized_options[beat_id])
-            if invalid_ids:
-                raise ValueError(
-                    "grouped semantic decision invented option IDs for "
-                    + beat_id
-                    + ": "
-                    + ", ".join(sorted(invalid_ids))
-                )
-            if (
-                decision.source_reuse_mode != "none"
-                and decision.source_reuse_mode
-                not in policy.editorial.allow_source_reuse
-            ):
-                raise ValueError(
-                    "grouped semantic decision selected a source reuse mode "
-                    "forbidden by policy: " + decision.source_reuse_mode
-                )
         result = BoundedGroupedSemanticNegotiationResult(
             decision=proposal,
             interaction_ids=(interaction_id,),
-            tool_call_ids=(str(proposals[0]["id"]),),
+            tool_call_ids=(str(proposal_call["id"]),),
         )
         write_json(run_dir / "grouped_semantic_negotiation.json", result)
         return result
