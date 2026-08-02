@@ -15132,6 +15132,104 @@ def _preflight_local_infeasibility_replan_paths(
     return root / "context.json", root / "decision.json"
 
 
+def _prepared_replan_execution_option_id(
+    execution: CandidateRouteSelection,
+) -> str:
+    """Name one Gemini-selectable local execution, never just its candidate.
+
+    A semantic candidate can appear in several complete routes with different
+    legal durations or source intervals.  Candidate IDs are therefore not
+    sufficient decision authority once zero-paid preflight has measured those
+    executions.  The option ID is deliberately opaque to Gemini but stable
+    across resume and binds the beat, semantic candidate and execution hash.
+    """
+
+    execution_sha256 = execution.candidate_execution_sha256
+    if execution_sha256 is None:
+        raise FeatureCutSystemFailure(
+            "prepared local replan execution has no execution SHA"
+        )
+    return (
+        f"{execution.beat_id}--{execution.candidate_id}--execution-"
+        f"{execution_sha256}"
+    )
+
+
+def _prepared_replan_execution_options_by_id(
+    row: Mapping[str, Any],
+) -> dict[str, CandidateRouteSelection]:
+    """Decode the new exact-execution option set in one persisted context.
+
+    Contexts that predate ``prepared_viable_option_ids`` deliberately return
+    an empty mapping here.  Their candidate-only decision is a legacy format:
+    restore must use the one-artifact recovery path and may never infer one of
+    several prepared timings.
+    """
+
+    raw_option_ids = row.get("prepared_viable_option_ids")
+    if raw_option_ids is None:
+        return {}
+    raw_executions = row.get("prepared_viable_executions")
+    candidate_bindings = row.get("candidate_bindings")
+    viable_candidate_ids = row.get("prepared_viable_candidate_ids")
+    if not (
+        isinstance(raw_option_ids, list)
+        and raw_option_ids
+        and all(isinstance(option_id, str) and option_id for option_id in raw_option_ids)
+        and len(raw_option_ids) == len(set(raw_option_ids))
+        and isinstance(raw_executions, list)
+        and raw_executions
+        and isinstance(candidate_bindings, Mapping)
+        and isinstance(viable_candidate_ids, list)
+        and viable_candidate_ids
+    ):
+        raise FeatureCutSystemFailure(
+            "prepared local replan execution option set is malformed"
+        )
+    if len(viable_candidate_ids) != len(
+        {str(candidate_id) for candidate_id in viable_candidate_ids}
+    ):
+        raise FeatureCutSystemFailure(
+            "prepared local replan viable candidate IDs are ambiguous"
+        )
+
+    options_by_id: dict[str, CandidateRouteSelection] = {}
+    for raw_execution in raw_executions:
+        if not isinstance(raw_execution, Mapping):
+            raise FeatureCutSystemFailure(
+                "prepared local replan execution option is malformed"
+            )
+        candidate_id = str(raw_execution.get("candidate_id") or "")
+        candidate_binding = candidate_bindings.get(candidate_id)
+        if not isinstance(candidate_binding, Mapping):
+            raise FeatureCutSystemFailure(
+                "prepared local replan execution has no immutable candidate binding"
+            )
+        execution = _validate_prepared_replan_execution(
+            execution_payload=raw_execution,
+            candidate_binding=candidate_binding,
+        )
+        option_id = _prepared_replan_execution_option_id(execution)
+        if option_id in options_by_id:
+            raise FeatureCutSystemFailure(
+                "prepared local replan execution option is duplicated"
+            )
+        options_by_id[option_id] = execution
+    if list(options_by_id) != raw_option_ids:
+        raise FeatureCutSystemFailure(
+            "prepared local replan execution option IDs do not bind their "
+            "prepared executions"
+        )
+    if {
+        execution.candidate_id for execution in options_by_id.values()
+    } != {str(candidate_id) for candidate_id in viable_candidate_ids}:
+        raise FeatureCutSystemFailure(
+            "prepared local replan execution options do not cover every "
+            "viable candidate"
+        )
+    return options_by_id
+
+
 def _grouped_replan_reuse_conflict_facts(
     *,
     affected_beats: Sequence[Mapping[str, Any]],
@@ -15162,7 +15260,20 @@ def _grouped_replan_reuse_conflict_facts(
             "grouped semantic replan option has no immutable source identity"
         )
 
-    def interval_fact(row: Mapping[str, Any]) -> dict[str, Any]:
+    def interval_fact(
+        row: Mapping[str, Any],
+        prepared_execution: CandidateRouteSelection | None = None,
+    ) -> dict[str, Any]:
+        if prepared_execution is not None:
+            return {
+                "kind": "prepared_execution_interval",
+                "candidate_execution_sha256": (
+                    prepared_execution.candidate_execution_sha256
+                ),
+                "source_in_ms": prepared_execution.source_in_ms,
+                "source_out_ms": prepared_execution.source_out_ms,
+                "trim_duration_ms": prepared_execution.trim_duration_ms,
+            }
         fixed_start = row.get("fixed_source_in_ms")
         fixed_end = row.get("fixed_source_out_ms")
         if isinstance(fixed_start, int) and isinstance(fixed_end, int):
@@ -15188,7 +15299,17 @@ def _grouped_replan_reuse_conflict_facts(
         return {"kind": "interval_not_available_before_execution"}
 
     affected_by_id: dict[str, Mapping[str, Any]] = {}
-    options_by_beat: dict[str, tuple[tuple[str, Mapping[str, Any]], ...]] = {}
+    options_by_beat: dict[
+        str,
+        tuple[
+            tuple[
+                str,
+                Mapping[str, Any],
+                CandidateRouteSelection | None,
+            ],
+            ...,
+        ],
+    ] = {}
     for row in affected_beats:
         beat_id = str(row.get("beat_id") or "")
         if not beat_id or beat_id in affected_by_id:
@@ -15201,14 +15322,27 @@ def _grouped_replan_reuse_conflict_facts(
             raise FeatureCutSystemFailure(
                 "grouped semantic replan has incomplete immutable option bindings"
             )
-        options: list[tuple[str, Mapping[str, Any]]] = []
+        prepared_options_by_id = _prepared_replan_execution_options_by_id(row)
+        options: list[
+            tuple[str, Mapping[str, Any], CandidateRouteSelection | None]
+        ] = []
         prefix = beat_id + "--"
         for option_id in expected_option_ids:
             if not option_id.startswith(prefix):
                 raise FeatureCutSystemFailure(
                     "grouped semantic replan option ID has the wrong beat prefix"
                 )
-            candidate_id = option_id.removeprefix(prefix)
+            prepared_execution = prepared_options_by_id.get(option_id)
+            if prepared_options_by_id and prepared_execution is None:
+                raise FeatureCutSystemFailure(
+                    "grouped semantic replan option ID is not a prepared "
+                    "execution identity"
+                )
+            candidate_id = (
+                prepared_execution.candidate_id
+                if prepared_execution is not None
+                else option_id.removeprefix(prefix)
+            )
             option = candidate_bindings.get(candidate_id)
             if not isinstance(option, Mapping):
                 raise FeatureCutSystemFailure(
@@ -15218,7 +15352,7 @@ def _grouped_replan_reuse_conflict_facts(
                 raise FeatureCutSystemFailure(
                     "grouped semantic replan option ID does not match its binding"
                 )
-            options.append((option_id, option))
+            options.append((option_id, option, prepared_execution))
         affected_by_id[beat_id] = row
         options_by_beat[beat_id] = tuple(options)
 
@@ -15256,8 +15390,12 @@ def _grouped_replan_reuse_conflict_facts(
     allowed_by_beat_and_option: dict[str, dict[str, tuple[str, ...]]] = {}
     for beat_id, options in options_by_beat.items():
         allowed_by_beat_and_option[beat_id] = {}
-        for option_id, option in options:
-            identity = source_identity(option)
+        for option_id, option, prepared_execution in options:
+            identity = source_identity(
+                prepared_execution.model_dump(mode="json")
+                if prepared_execution is not None
+                else option
+            )
             required_codes = tuple(
                 str(code)
                 for code in option.get("replan_required_codes", ())
@@ -15275,8 +15413,13 @@ def _grouped_replan_reuse_conflict_facts(
                         continue
                     matching = [
                         other_option
-                        for _, other_option in other_options
-                        if source_identity(other_option) == identity
+                        for _, other_option, other_prepared_execution in other_options
+                        if source_identity(
+                            other_prepared_execution.model_dump(mode="json")
+                            if other_prepared_execution is not None
+                            else other_option
+                        )
+                        == identity
                     ]
                     if not matching:
                         continue
@@ -15318,7 +15461,19 @@ def _grouped_replan_reuse_conflict_facts(
                         "kind": identity[0],
                         "value": identity[1],
                     },
-                    "candidate_interval": interval_fact(option),
+                    "candidate_interval": interval_fact(
+                        option,
+                        prepared_execution,
+                    ),
+                    **(
+                        {
+                            "candidate_execution_sha256": (
+                                prepared_execution.candidate_execution_sha256
+                            )
+                        }
+                        if prepared_execution is not None
+                        else {}
+                    ),
                     "shared_source_beats": sorted(
                         guaranteed_shared_rows,
                         key=lambda row: str(row["beat_id"]),
@@ -15365,6 +15520,7 @@ def _grouped_replan_retained_reuse_authority_by_option(
             raise FeatureCutSystemFailure(
                 "grouped retained reuse authority has invalid candidate bindings"
             )
+        prepared_options_by_id = _prepared_replan_execution_options_by_id(row)
         retained_by_beat_and_option[beat_id] = {}
         prefix = beat_id + "--"
         for option_id in option_ids:
@@ -15373,7 +15529,17 @@ def _grouped_replan_retained_reuse_authority_by_option(
                     "grouped retained reuse authority option ID has the wrong "
                     "beat prefix"
                 )
-            candidate_id = option_id.removeprefix(prefix)
+            prepared_execution = prepared_options_by_id.get(option_id)
+            if prepared_options_by_id and prepared_execution is None:
+                raise FeatureCutSystemFailure(
+                    "grouped retained reuse authority option ID is not a "
+                    "prepared execution identity"
+                )
+            candidate_id = (
+                prepared_execution.candidate_id
+                if prepared_execution is not None
+                else option_id.removeprefix(prefix)
+            )
             option = candidate_bindings.get(candidate_id)
             if (
                 not isinstance(option, Mapping)
@@ -15530,7 +15696,10 @@ def _selected_preflight_local_replan(
         )
     if (
         context.get("contract_version")
-        != "preflight-local-infeasibility-replan-v1"
+        not in {
+            "preflight-local-infeasibility-replan-v1",
+            "preflight-local-infeasibility-replan-v2",
+        }
         or decision_payload.get("context_sha256") != sha256_file(context_path)
         or context.get("policy_reference") != policy.policy_reference
     ):
@@ -15566,15 +15735,33 @@ def _selected_preflight_local_replan(
             "preflight local infeasibility replan has no affected beats"
         )
     persisted_option_ids_by_beat: dict[str, tuple[str, ...]] = {}
+    prepared_options_by_beat: dict[
+        str, dict[str, CandidateRouteSelection]
+    ] = {}
     for beat_id, row in affected_by_id.items():
         candidate_bindings = row.get("candidate_bindings")
         if not isinstance(candidate_bindings, Mapping):
             raise FeatureCutSystemFailure(
                 "preflight local infeasibility replan has invalid candidate bindings"
             )
-        persisted_option_ids_by_beat[beat_id] = tuple(
-            f"{beat_id}--{candidate_id}"
-            for candidate_id in candidate_bindings
+        prepared_options = _prepared_replan_execution_options_by_id(row)
+        if (
+            context.get("contract_version")
+            == "preflight-local-infeasibility-replan-v2"
+            and not prepared_options
+        ):
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan v2 has no prepared "
+                "execution option identities"
+            )
+        prepared_options_by_beat[beat_id] = prepared_options
+        persisted_option_ids_by_beat[beat_id] = (
+            tuple(prepared_options)
+            if prepared_options
+            else tuple(
+                f"{beat_id}--{candidate_id}"
+                for candidate_id in candidate_bindings
+            )
         )
     _, allowed_reuse_ids_by_option = _grouped_replan_reuse_conflict_facts(
         affected_beats=list(affected_by_id.values()),
@@ -15588,6 +15775,9 @@ def _selected_preflight_local_replan(
         policy=policy,
     )
     selected_candidate_ids: dict[str, str] = {}
+    selected_prepared_executions_by_beat: dict[
+        str, CandidateRouteSelection
+    ] = {}
     reuse_authorities: dict[str, SemanticReplanReuseAuthority] = {}
     current_bindings = route.semantic_replan_candidate_bindings_by_beat
     for decision in decisions:
@@ -15603,7 +15793,17 @@ def _selected_preflight_local_replan(
             raise FeatureCutSystemFailure(
                 "preflight local infeasibility replan selected an unknown beat"
             )
-        candidate_id = option_id.removeprefix(prefix)
+        prepared_execution = prepared_options_by_beat[beat_id].get(option_id)
+        if prepared_options_by_beat[beat_id] and prepared_execution is None:
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan selected an unknown "
+                "prepared execution option"
+            )
+        candidate_id = (
+            prepared_execution.candidate_id
+            if prepared_execution is not None
+            else option_id.removeprefix(prefix)
+        )
         saved_options = saved_beat.get("candidate_bindings")
         current_options = {
             binding.option.candidate_id: {
@@ -15621,6 +15821,8 @@ def _selected_preflight_local_replan(
                 "preflight local infeasibility replan option binding changed"
             )
         selected_candidate_ids[beat_id] = candidate_id
+        if prepared_execution is not None:
+            selected_prepared_executions_by_beat[beat_id] = prepared_execution
         reuse_mode = str(decision.get("source_reuse_mode") or "none")
         if reuse_mode != "none":
             reuse_authorities[beat_id] = SemanticReplanReuseAuthority(
@@ -15634,22 +15836,40 @@ def _selected_preflight_local_replan(
         raise FeatureCutSystemFailure(
             "preflight local infeasibility replan did not resolve every beat"
         )
-    rebuilt = rebuild_route_with_semantic_authorities(
-        route,
-        selected_candidate_ids_by_beat=selected_candidate_ids,
-        reuse_authorities_by_beat=reuse_authorities,
-        minimum_duration_ms=(
-            1
-            if policy.execution_profile == "autonomous_best_effort"
-            else policy.duration.min_ms
+    frozen_executions = _frozen_preflight_local_replan_executions(
+        route=route,
+        context=context,
+        selected_candidate_ids=selected_candidate_ids,
+        selected_prepared_executions_by_beat=(
+            selected_prepared_executions_by_beat
         ),
-        maximum_duration_ms=policy.duration.max_ms,
-        max_panel_runtime_fraction=policy.presentation.max_panel_runtime_fraction,
-        target_duration_ms=round(sum(chapter_durations.values()) * 1000),
-        max_editorial_reprise_overlap_fraction=(
-            policy.editorial.max_editorial_reprise_overlap_fraction
-        ),
+        editorial_dir=editorial_dir,
     )
+    try:
+        rebuilt = rebuild_route_with_semantic_authorities(
+            route,
+            selected_candidate_ids_by_beat=selected_candidate_ids,
+            reuse_authorities_by_beat=reuse_authorities,
+            frozen_execution_bindings_by_beat=frozen_executions,
+            minimum_duration_ms=(
+                1
+                if policy.execution_profile == "autonomous_best_effort"
+                else policy.duration.min_ms
+            ),
+            maximum_duration_ms=policy.duration.max_ms,
+            max_panel_runtime_fraction=(
+                policy.presentation.max_panel_runtime_fraction
+            ),
+            target_duration_ms=round(sum(chapter_durations.values()) * 1000),
+            max_editorial_reprise_overlap_fraction=(
+                policy.editorial.max_editorial_reprise_overlap_fraction
+            ),
+        )
+    except ValueError as error:
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan frozen executions are not "
+            "globally policy-feasible"
+        ) from error
     merged_bindings = {
         beat_id: {
             binding.option.candidate_id: binding.option
@@ -15668,6 +15888,238 @@ def _selected_preflight_local_replan(
     )
 
 
+def _validate_prepared_replan_execution(
+    *,
+    execution_payload: Any,
+    candidate_binding: Mapping[str, Any],
+) -> CandidateRouteSelection:
+    """Bind a prepared local execution to its exact immutable candidate."""
+
+    try:
+        execution = (
+            execution_payload
+            if isinstance(execution_payload, CandidateRouteSelection)
+            else CandidateRouteSelection.model_validate(execution_payload)
+        )
+        timing_option = CandidateRouteOption.model_validate(
+            {
+                key: value
+                for key, value in candidate_binding.items()
+                if key != "replan_required_codes"
+            }
+        )
+        _validate_pre_render_execution_timing_binding(
+            {
+                "candidate_id": execution.candidate_id,
+                "source_asset_id": execution.source_asset_id,
+                "event_id": execution.event_id,
+                "_pre_render_sequence_binding": timing_option.model_dump(
+                    mode="json"
+                ),
+            },
+            execution_binding=execution.model_dump(mode="json"),
+        )
+    except (TypeError, ValueError) as error:
+        raise FeatureCutSystemFailure(
+            "prepared local replan execution does not match its immutable "
+            "candidate timing binding"
+        ) from error
+    return execution
+
+
+def _discover_legacy_prepared_replan_execution(
+    *,
+    editorial_dir: Path,
+    beat_id: str,
+    candidate_id: str,
+    candidate_binding: Mapping[str, Any],
+) -> tuple[CandidateRouteSelection, dict[str, str]]:
+    """Recover one uniquely proven local execution from an old context.
+
+    Older replan contexts recorded only a viable candidate ID.  They must not
+    trigger a fresh duration solve on resume.  A locally successful frontier
+    artifact is acceptable only when it names the exact candidate execution
+    and validates against the immutable timing binding; zero or multiple such
+    artifacts remain fail-closed.
+    """
+
+    candidate_root = (
+        editorial_dir.parent
+        / "production-frontier"
+        / "9x16"
+        / beat_id
+        / candidate_id
+    )
+    matches: list[tuple[CandidateRouteSelection, Path]] = []
+    for local_path in sorted(candidate_root.glob("execution-*/local.json")):
+        artifact = read_json(local_path)
+        payload = artifact.get("payload") if isinstance(artifact, Mapping) else None
+        if not (
+            isinstance(payload, Mapping)
+            and artifact.get("beat_id") == beat_id
+            and artifact.get("candidate_id") == candidate_id
+            and artifact.get("stage") == "local_preflight"
+        ):
+            continue
+        option = payload.get("option")
+        execution_payload = (
+            option.get("_pre_render_execution_binding")
+            if isinstance(option, Mapping)
+            else None
+        )
+        if not isinstance(execution_payload, Mapping):
+            continue
+        try:
+            execution = _validate_prepared_replan_execution(
+                execution_payload=execution_payload,
+                candidate_binding=candidate_binding,
+            )
+        except FeatureCutSystemFailure:
+            continue
+        if (
+            artifact.get("candidate_execution_sha256")
+            != execution.candidate_execution_sha256
+            or payload.get("candidate_execution_sha256")
+            != execution.candidate_execution_sha256
+        ):
+            continue
+        matches.append((execution, local_path))
+    if len(matches) != 1:
+        raise FeatureCutSystemFailure(
+            "legacy local infeasibility replan does not have one uniquely "
+            "validated prepared execution for " + beat_id + "/" + candidate_id
+        )
+    execution, local_path = matches[0]
+    return execution, {
+        "artifact_path": str(local_path.resolve()),
+        "artifact_sha256": sha256_file(local_path),
+    }
+
+
+def _frozen_preflight_local_replan_executions(
+    *,
+    route: Any,
+    context: Mapping[str, Any],
+    selected_candidate_ids: Mapping[str, str],
+    selected_prepared_executions_by_beat: Mapping[
+        str, CandidateRouteSelection
+    ],
+    editorial_dir: Path,
+) -> dict[str, CandidateRouteSelection]:
+    """Return the decision's complete, measured execution vector.
+
+    Every selected affected candidate is represented by the exact zero-paid
+    execution Gemini saw.  Every unaffected beat comes from the saved whole
+    timeline.  This is an identity binding, not a local route optimization.
+    """
+
+    raw_timeline = context.get("whole_resolved_timeline")
+    if not isinstance(raw_timeline, list):
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan has no whole execution timeline"
+        )
+    timeline_by_beat: dict[str, CandidateRouteSelection] = {}
+    for raw_selection in raw_timeline:
+        try:
+            selection = CandidateRouteSelection.model_validate(raw_selection)
+        except (TypeError, ValueError) as error:
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan has an invalid whole "
+                "timeline execution"
+            ) from error
+        if selection.beat_id in timeline_by_beat:
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan has duplicate whole "
+                "timeline beats"
+            )
+        timeline_by_beat[selection.beat_id] = selection
+    candidate_bindings_by_beat = route.semantic_replan_candidate_bindings_by_beat
+    if set(timeline_by_beat) != set(candidate_bindings_by_beat):
+        raise FeatureCutSystemFailure(
+            "preflight local infeasibility replan whole timeline no longer "
+            "covers the immutable route"
+        )
+
+    frozen: dict[str, CandidateRouteSelection] = {}
+    legacy_migrations: list[dict[str, str]] = []
+    for beat_id, bindings in candidate_bindings_by_beat.items():
+        selected_candidate_id = selected_candidate_ids.get(beat_id)
+        if selected_candidate_id is None:
+            selection = timeline_by_beat[beat_id]
+            candidate_id = selection.candidate_id
+        else:
+            candidate_id = selected_candidate_id
+        candidate_binding = next(
+            (
+                binding.option.model_dump(mode="json")
+                for binding in bindings
+                if binding.option.candidate_id == candidate_id
+            ),
+            None,
+        )
+        if candidate_binding is None:
+            raise FeatureCutSystemFailure(
+                "preflight local infeasibility replan execution has no current "
+                "immutable candidate binding"
+            )
+        if selected_candidate_id is None:
+            frozen[beat_id] = _validate_prepared_replan_execution(
+                execution_payload=timeline_by_beat[beat_id],
+                candidate_binding=candidate_binding,
+            )
+            continue
+
+        prepared_execution = selected_prepared_executions_by_beat.get(beat_id)
+        if prepared_execution is not None:
+            if prepared_execution.candidate_id != selected_candidate_id:
+                raise FeatureCutSystemFailure(
+                    "preflight local infeasibility replan selected prepared "
+                    "execution does not match its candidate"
+                )
+            frozen[beat_id] = _validate_prepared_replan_execution(
+                execution_payload=prepared_execution,
+                candidate_binding=candidate_binding,
+            )
+            continue
+        execution, migration = _discover_legacy_prepared_replan_execution(
+            editorial_dir=editorial_dir,
+            beat_id=beat_id,
+            candidate_id=selected_candidate_id,
+            candidate_binding=candidate_binding,
+        )
+        frozen[beat_id] = execution
+        legacy_migrations.append(
+            {
+                "beat_id": beat_id,
+                "candidate_id": selected_candidate_id,
+                "candidate_execution_sha256": (
+                    execution.candidate_execution_sha256 or ""
+                ),
+                **migration,
+            }
+        )
+    if legacy_migrations:
+        write_json(
+            editorial_dir
+            / "preflight-local-infeasibility-replan"
+            / "prepared-execution-binding-migration.json",
+            {
+                "contract_version": (
+                    "preflight-local-infeasibility-prepared-execution-"
+                    "migration-v1"
+                ),
+                "context_sha256": _stable_fingerprint(dict(context)),
+                "migrations": legacy_migrations,
+                "interpretation": (
+                    "legacy context did not permit timing re-optimization; "
+                    "one existing successful local execution per selected "
+                    "candidate was recovered by immutable identity"
+                ),
+            },
+        )
+    return frozen
+
+
 def _persist_preflight_local_infeasibility_replan(
     *,
     route: Any,
@@ -15679,14 +16131,18 @@ def _persist_preflight_local_infeasibility_replan(
     plan_path: Path,
     music_supplied: bool,
     output_timeline_cues: Sequence[Any],
+    viable_candidate_execution_bindings_by_feature: Mapping[
+        str, Sequence[Any]
+    ]
+    | None = None,
 ) -> None:
     """Ask Gemini once after every bounded option has the same local evidence.
 
     This is deliberately a *grouped* recovery decision.  The local layer may
     enumerate and measure every immutable Top-K execution, but it must never
-    advance to the first viable alternative.  Gemini receives only candidates
-    that passed that same zero-paid preparation, together with all rejected
-    candidates and the whole music/sequence context.
+    advance to the first viable alternative.  Gemini receives only exact
+    candidate executions that passed that same zero-paid preparation, together
+    with all rejected candidates and the whole music/sequence context.
     """
 
     frontier = _semantic_replan_frontier_projection(route)
@@ -15702,6 +16158,9 @@ def _persist_preflight_local_infeasibility_replan(
     }
     affected: list[dict[str, Any]] = []
     option_ids_by_beat: dict[str, tuple[str, ...]] = {}
+    prepared_executions_by_feature = (
+        viable_candidate_execution_bindings_by_feature or {}
+    )
     for feature_id in affected_ids:
         row = frontier_by_beat.get(feature_id)
         if row is None:
@@ -15728,6 +16187,69 @@ def _persist_preflight_local_infeasibility_replan(
             raise FeatureCutSystemFailure(
                 "local infeasibility replan received an unbound viable candidate"
             )
+        raw_prepared_executions = prepared_executions_by_feature.get(feature_id)
+        if raw_prepared_executions is None:
+            raise FeatureCutSystemFailure(
+                "local infeasibility replan has no prepared immutable execution "
+                "bindings for " + feature_id
+            )
+        prepared_by_option_id: dict[str, CandidateRouteSelection] = {}
+        for raw_execution in raw_prepared_executions:
+            try:
+                candidate_id = str(
+                    (
+                        raw_execution.candidate_id
+                        if isinstance(raw_execution, CandidateRouteSelection)
+                        else raw_execution.get("candidate_id")
+                    )
+                    or ""
+                )
+            except AttributeError as error:
+                raise FeatureCutSystemFailure(
+                    "local infeasibility replan has malformed prepared "
+                    "execution bindings"
+                ) from error
+            candidate_binding = candidate_bindings.get(candidate_id)
+            if candidate_id not in viable_ids or not isinstance(
+                candidate_binding, Mapping
+            ):
+                raise FeatureCutSystemFailure(
+                    "local infeasibility replan prepared execution names an "
+                    "unbound candidate"
+                )
+            prepared_execution = _validate_prepared_replan_execution(
+                execution_payload=raw_execution,
+                candidate_binding=candidate_binding,
+            )
+            option_id = _prepared_replan_execution_option_id(prepared_execution)
+            if option_id in prepared_by_option_id:
+                raise FeatureCutSystemFailure(
+                    "local infeasibility replan prepared execution identity is "
+                    "duplicated"
+                )
+            prepared_by_option_id[option_id] = prepared_execution
+        if {
+            execution.candidate_id
+            for execution in prepared_by_option_id.values()
+        } != set(viable_ids):
+            raise FeatureCutSystemFailure(
+                "local infeasibility replan prepared executions do not cover "
+                "every viable candidate"
+            )
+        candidate_order = {
+            candidate_id: index for index, candidate_id in enumerate(viable_ids)
+        }
+        ordered_prepared_executions = sorted(
+            prepared_by_option_id.values(),
+            key=lambda execution: (
+                candidate_order[execution.candidate_id],
+                execution.candidate_execution_sha256 or "",
+            ),
+        )
+        prepared_option_ids = tuple(
+            _prepared_replan_execution_option_id(execution)
+            for execution in ordered_prepared_executions
+        )
         affected.append(
             {
                 **dict(row),
@@ -15742,11 +16264,14 @@ def _persist_preflight_local_infeasibility_replan(
                 },
                 "selected_candidate_id": row.get("selected_candidate_id"),
                 "prepared_viable_candidate_ids": list(viable_ids),
+                "prepared_viable_executions": [
+                    execution.model_dump(mode="json")
+                    for execution in ordered_prepared_executions
+                ],
+                "prepared_viable_option_ids": list(prepared_option_ids),
             }
         )
-        option_ids_by_beat[feature_id] = tuple(
-            f"{feature_id}--{candidate_id}" for candidate_id in viable_ids
-        )
+        option_ids_by_beat[feature_id] = prepared_option_ids
     whole_timeline = [
         selection.model_dump(mode="json") for selection in route.selections
     ]
@@ -15765,7 +16290,7 @@ def _persist_preflight_local_infeasibility_replan(
         )
     )
     context = {
-        "contract_version": "preflight-local-infeasibility-replan-v1",
+        "contract_version": "preflight-local-infeasibility-replan-v2",
         "policy_reference": policy.policy_reference,
         "affected_beats": affected,
         "whole_resolved_timeline": whole_timeline,
@@ -15781,7 +16306,10 @@ def _persist_preflight_local_infeasibility_replan(
             for feature_id in affected_ids
         },
         "rules": {
-            "may_change": ["affected_candidate", "explicit_source_reuse_authority"],
+            "may_change": [
+                "affected_prepared_execution",
+                "explicit_source_reuse_authority",
+            ],
             "must_preserve": [
                 "brief_order",
                 "all_unaffected_beats",
@@ -15842,14 +16370,16 @@ def _persist_preflight_local_infeasibility_replan(
     result = client.negotiate_grouped_edit_decisions(
         option_ids_by_beat=option_ids_by_beat,
         prompt=(
-            "[protocol=preflight-local-infeasibility-replan-v1] Every initial "
+            "[protocol=preflight-local-infeasibility-replan-v2] Every initial "
             "candidate execution for this one beat failed a zero-paid local "
-            "measurement. Choose exactly one of the supplied immutable source "
-            "candidates using the whole sequence, adjacent shots, music cue grid, "
-            "and failure reports. This is a creative decision: do not make a local "
-            "fallback, invent media/time/crop, or change unaffected beats. Preserve "
-            "the brief and hard evidence; choose source reuse only with typed "
-            "authority. Every decision must explicitly encode empty no-reuse "
+            "measurement. Choose exactly one supplied immutable, locally measured "
+            "execution option using the whole sequence, adjacent shots, music cue "
+            "grid, and failure reports. Each option ID binds its semantic candidate, "
+            "trim duration, and source interval together; do not select only a "
+            "candidate and do not recombine timing from another option. This is a "
+            "creative decision: do not make a local fallback, invent media/time/crop, "
+            "or change unaffected beats. Preserve the brief and hard evidence; choose "
+            "source reuse only with typed authority. Every decision must explicitly encode empty no-reuse "
             "fields as [], null, [] and name exactly the allowed stable beat IDs "
             "when reuse is required.\n\n" + json.dumps(context, ensure_ascii=False)
         ),
@@ -15900,7 +16430,7 @@ def _persist_preflight_local_infeasibility_replan(
     write_json(
         decision_path,
         {
-            "contract_version": "preflight-local-infeasibility-replan-result-v1",
+            "contract_version": "preflight-local-infeasibility-replan-result-v2",
             "context_sha256": sha256_file(context_path),
             "decisions": decisions,
             "gemini_interaction_ids": result.interaction_ids,
@@ -23480,6 +24010,9 @@ def _run_feature_cut_experiment_impl(
                 str, list[dict[str, Any]]
             ] = {}
             viable_candidate_ids_by_feature: dict[str, list[str]] = {}
+            viable_candidate_execution_bindings_by_feature: dict[
+                str, list[CandidateRouteSelection]
+            ] = {}
 
             # Round zero is deliberately complete before the scheduler may
             # admit a single paid exact-event or grounding operation.
@@ -23730,6 +24263,14 @@ def _run_feature_cut_experiment_impl(
                             ),
                         )
                     )
+                    viable_candidate_execution_bindings_by_feature.setdefault(
+                        frontier_feature_id,
+                        [],
+                    ).append(
+                        CandidateRouteSelection.model_validate(
+                            frontier_execution_binding
+                        )
+                    )
                 write_json(
                     frontier_root
                     / frontier_feature_id
@@ -23809,6 +24350,15 @@ def _run_feature_cut_experiment_impl(
                     viable_candidate_ids_by_feature={
                         feature_id: viable_candidate_ids_by_feature.get(
                             feature_id, []
+                        )
+                        for feature_id in selected_local_failures_by_feature
+                    },
+                    viable_candidate_execution_bindings_by_feature={
+                        feature_id: (
+                            viable_candidate_execution_bindings_by_feature.get(
+                                feature_id,
+                                [],
+                            )
                         )
                         for feature_id in selected_local_failures_by_feature
                     },

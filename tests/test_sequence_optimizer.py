@@ -15,6 +15,7 @@ from jascue_video_lab.sequence_optimizer import (
     BeatOptionSet,
     CandidateRouteBeat,
     CandidateRouteOption,
+    CandidateRouteSelection,
     MusicBoundaryCue,
     MusicBoundarySpec,
     RoundRobinFrontierAttemptResult,
@@ -979,6 +980,101 @@ def test_semantic_replan_rebuilds_full_route_after_gemini_reuse_authority() -> N
     assert rebuilt.selections[1].reuse_mode == "distinct_interval"
     assert rebuilt.selections[1].candidate_execution_sha256 != (
         frontier.selections[1].candidate_execution_sha256
+    )
+
+
+def test_local_preflight_replan_freezes_prepared_execution_vector() -> None:
+    """A grouped choice cannot stretch a clean execution on a later resume."""
+
+    def movable(beat_id: str, candidate_id: str, marker: str) -> CandidateRouteOption:
+        return CandidateRouteOption(
+            beat_id=beat_id,
+            candidate_id=candidate_id,
+            source_asset_id="sha256:" + marker * 64,
+            source_clip_id=f"clip-{marker}",
+            event_id=f"event-{candidate_id}",
+            planner_rank=1,
+            semantic_confidence=0.9,
+            trim_duration_ms=6_000,
+            minimum_readable_ms=3_500,
+            preferred_readable_ms=6_000,
+            maximum_readable_ms=6_500,
+            safe_capacity_ms=11_045,
+            safe_window_start_ms=0,
+            safe_window_end_ms=11_045,
+            source_anchor_ms=4_000,
+            candidate_timing_sha256=marker * 64,
+        )
+
+    unchanged = movable("unchanged", "unchanged-a", "a")
+    affected = movable("affected", "affected-a", "b")
+    frontier = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="unchanged", options=(unchanged,)),
+            CandidateRouteBeat(beat_id="affected", options=(affected,)),
+        ),
+        target_duration_ms=12_000,
+    )
+    assert [selection.trim_duration_ms for selection in frontier.selections] == [
+        6_000,
+        6_000,
+    ]
+
+    def execution(
+        option: CandidateRouteOption,
+        *,
+        start_ms: int,
+        duration_ms: int,
+    ) -> CandidateRouteSelection:
+        return CandidateRouteSelection(
+            beat_id=option.beat_id,
+            candidate_id=option.candidate_id,
+            source_asset_id=option.source_asset_id,
+            event_id=option.event_id,
+            trim_duration_ms=duration_ms,
+            cue_id=option.cue_id,
+            cue_aligned=option.cue_aligned,
+            presentation_mode=option.presentation_mode,
+            entry_composition=option.entry_composition,
+            exit_composition=option.exit_composition,
+            decision_codes=("measured",),
+            source_clip_id=option.source_clip_id,
+            source_in_ms=start_ms,
+            source_out_ms=start_ms + duration_ms,
+            candidate_execution_sha256=candidate_route_execution_sha256(
+                option,
+                duration_ms=duration_ms,
+                source_in_ms=start_ms,
+                source_out_ms=start_ms + duration_ms,
+            ),
+        )
+
+    prepared_clean = execution(affected, start_ms=2_250, duration_ms=3_500)
+    preserved_unaffected = execution(unchanged, start_ms=1_000, duration_ms=6_000)
+    rebuilt = rebuild_route_with_semantic_authorities(
+        frontier,
+        # The selected candidate is unchanged; the new authority is the
+        # prepared execution identity, not another optimizer duration pass.
+        selected_candidate_ids_by_beat={"affected": "affected-a"},
+        reuse_authorities_by_beat={},
+        frozen_execution_bindings_by_beat={
+            "unchanged": preserved_unaffected,
+            "affected": prepared_clean,
+        },
+        minimum_duration_ms=9_000,
+        maximum_duration_ms=13_000,
+        target_duration_ms=12_000,
+    )
+
+    by_beat = {selection.beat_id: selection for selection in rebuilt.selections}
+    assert by_beat["affected"].trim_duration_ms == 3_500
+    assert by_beat["affected"].source_in_ms == 2_250
+    assert by_beat["affected"].source_out_ms == 5_750
+    assert by_beat["affected"].candidate_execution_sha256 == (
+        prepared_clean.candidate_execution_sha256
+    )
+    assert by_beat["unchanged"].candidate_execution_sha256 == (
+        preserved_unaffected.candidate_execution_sha256
     )
 
 

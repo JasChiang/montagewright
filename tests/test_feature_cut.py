@@ -125,6 +125,7 @@ from jascue_video_lab.feature_cut import (
     _segment_variant_fingerprint,
     _selected_source_capacity_seconds,
     _semantic_replan_frontier_projection,
+    _prepared_replan_execution_option_id,
     _persist_preflight_local_infeasibility_replan,
     _selected_preflight_local_replan,
     _source_motion_clean_recovery_window,
@@ -200,8 +201,57 @@ def _local_replan_option(
         maximum_readable_ms=10_000,
         fixed_source_in_ms=0,
         fixed_source_out_ms=10_000,
+        safe_capacity_ms=10_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=10_000,
+        source_anchor_ms=5_000,
         candidate_timing_sha256=source_marker * 64,
     )
+
+
+def _local_replan_execution(
+    option: CandidateRouteOption,
+) -> CandidateRouteSelection:
+    assert option.fixed_source_in_ms is not None
+    assert option.fixed_source_out_ms is not None
+    return CandidateRouteSelection(
+        beat_id=option.beat_id,
+        candidate_id=option.candidate_id,
+        source_asset_id=option.source_asset_id,
+        event_id=option.event_id,
+        trim_duration_ms=option.trim_duration_ms,
+        cue_id=option.cue_id,
+        cue_aligned=option.cue_aligned,
+        presentation_mode=option.presentation_mode,
+        entry_composition=option.entry_composition,
+        exit_composition=option.exit_composition,
+        decision_codes=("prepared-local-test-execution",),
+        source_clip_id=option.source_clip_id,
+        source_in_ms=option.fixed_source_in_ms,
+        source_out_ms=option.fixed_source_out_ms,
+        candidate_execution_sha256=candidate_route_execution_sha256(
+            option,
+            duration_ms=option.trim_duration_ms,
+            source_in_ms=option.fixed_source_in_ms,
+            source_out_ms=option.fixed_source_out_ms,
+        ),
+        reuse_mode=option.reuse_mode,
+        reuse_justification=option.reuse_justification,
+    )
+
+
+def _local_replan_option_id(
+    route,
+    *,
+    beat_id: str,
+    candidate_id: str,
+) -> str:
+    option = next(
+        binding.option
+        for binding in route.semantic_replan_candidate_bindings_by_beat[beat_id]
+        if binding.option.candidate_id == candidate_id
+    )
+    return _prepared_replan_execution_option_id(_local_replan_execution(option))
 
 
 def test_local_preflight_failure_requires_gemini_route_rebuild(
@@ -239,27 +289,32 @@ def test_local_preflight_failure_requires_gemini_route_rebuild(
             ),
         )
     )
+    fold_option_id = _local_replan_option_id(
+        route,
+        beat_id="fold",
+        candidate_id="fold-2",
+    )
     plan_path = tmp_path / "plan.json"
     plan_path.write_text("{}", encoding="utf-8")
 
     class FakeClient:
         def negotiate_grouped_edit_decisions(self, **kwargs):
             assert kwargs["option_ids_by_beat"] == {
-                "fold": ("fold--fold-2",)
+                "fold": (fold_option_id,)
             }
             assert kwargs["allowed_reuse_of_beat_ids_by_option"] == {
-                "fold": {"fold--fold-2": ()}
+                "fold": {fold_option_id: ()}
             }
             context = json.loads(kwargs["prompt"].split("\n\n", 1)[1])
             assert context["reuse_conflict_facts"][0]["option_id"] == (
-                "fold--fold-2"
+                fold_option_id
             )
             decision = SimpleNamespace(
                 decisions=(
                     SimpleNamespace(
                         model_dump=lambda **_kwargs: {
                                 "beat_id": "fold",
-                                "selected_option_id": "fold--fold-2",
+                                "selected_option_id": fold_option_id,
                                 "fallback_option_ids": [],
                                 "semantic_reason": "preserve_readability",
                                 "unresolved_concern_codes": [],
@@ -284,6 +339,19 @@ def test_local_preflight_failure_requires_gemini_route_rebuild(
             )
         },
         viable_candidate_ids_by_feature={"fold": ("fold-2",)},
+        viable_candidate_execution_bindings_by_feature={
+            "fold": (
+                _local_replan_execution(
+                    next(
+                        binding.option
+                        for binding in route.semantic_replan_candidate_bindings_by_beat[
+                            "fold"
+                        ]
+                        if binding.option.candidate_id == "fold-2"
+                    )
+                ),
+            )
+        },
         editorial_dir=tmp_path / "editorial",
         policy=policy,
         client=FakeClient(),
@@ -411,6 +479,11 @@ def test_local_preflight_context_only_resume_runs_owner_once_before_typed_apply(
             ),
         )
     )
+    fold_option_id = _local_replan_option_id(
+        route,
+        beat_id="fold",
+        candidate_id="fold-2",
+    )
     plan_path = tmp_path / "plan.json"
     plan_path.write_text("{}", encoding="utf-8")
 
@@ -419,13 +492,13 @@ def test_local_preflight_context_only_resume_runs_owner_once_before_typed_apply(
 
         def negotiate_grouped_edit_decisions(self, **kwargs):
             self.calls += 1
-            assert kwargs["option_ids_by_beat"] == {"fold": ("fold--fold-2",)}
+            assert kwargs["option_ids_by_beat"] == {"fold": (fold_option_id,)}
             decision = SimpleNamespace(
                 decisions=(
                     SimpleNamespace(
                         model_dump=lambda **_kwargs: {
                             "beat_id": "fold",
-                            "selected_option_id": "fold--fold-2",
+                            "selected_option_id": fold_option_id,
                             "fallback_option_ids": [],
                             "semantic_reason": "preserve_readability",
                             "unresolved_concern_codes": [],
@@ -446,6 +519,19 @@ def test_local_preflight_context_only_resume_runs_owner_once_before_typed_apply(
         "route": route,
         "local_failures_by_feature": {"fold": ({"candidate_id": "fold-1"},)},
         "viable_candidate_ids_by_feature": {"fold": ("fold-2",)},
+        "viable_candidate_execution_bindings_by_feature": {
+            "fold": (
+                _local_replan_execution(
+                    next(
+                        binding.option
+                        for binding in route.semantic_replan_candidate_bindings_by_beat[
+                            "fold"
+                        ]
+                        if binding.option.candidate_id == "fold-2"
+                    )
+                ),
+            )
+        },
         "editorial_dir": tmp_path / "editorial",
         "policy": policy,
         "client": client,
@@ -495,6 +581,204 @@ def test_local_preflight_context_only_resume_runs_owner_once_before_typed_apply(
     ]
 
 
+def test_local_replan_selects_one_of_multiple_prepared_executions_for_candidate(
+    tmp_path: Path,
+) -> None:
+    """Gemini chooses an exact viable timing; local code never breaks the tie."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(
+            target_ms=32_500,
+            min_ms=30_000,
+            max_ms=35_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    option = CandidateRouteOption(
+        beat_id="fold",
+        candidate_id="fold-2",
+        source_asset_id="sha256:" + "c" * 64,
+        source_clip_id="clip-c",
+        event_id="event-fold-2",
+        planner_rank=2,
+        semantic_confidence=0.9,
+        trim_duration_ms=6_000,
+        minimum_readable_ms=3_500,
+        preferred_readable_ms=6_000,
+        maximum_readable_ms=6_500,
+        safe_capacity_ms=11_045,
+        safe_window_start_ms=0,
+        safe_window_end_ms=11_045,
+        source_anchor_ms=4_000,
+        candidate_timing_sha256="c" * 64,
+    )
+    def fixed_boundary(
+        beat_id: str,
+        marker: str,
+    ) -> CandidateRouteOption:
+        return CandidateRouteOption(
+            beat_id=beat_id,
+            candidate_id=f"{beat_id}-1",
+            source_asset_id="sha256:" + marker * 64,
+            source_clip_id=f"clip-{marker}",
+            event_id=f"event-{beat_id}-1",
+            planner_rank=1,
+            semantic_confidence=0.9,
+            trim_duration_ms=13_250,
+            minimum_readable_ms=13_250,
+            preferred_readable_ms=13_250,
+            maximum_readable_ms=13_250,
+            safe_capacity_ms=13_250,
+            safe_window_start_ms=0,
+            safe_window_end_ms=13_250,
+            source_anchor_ms=6_625,
+            fixed_source_in_ms=0,
+            fixed_source_out_ms=13_250,
+            candidate_timing_sha256=marker * 64,
+        )
+
+    opening = fixed_boundary("opening", "a")
+    ending = fixed_boundary("ending", "b")
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(opening,)),
+            CandidateRouteBeat(beat_id="fold", options=(option,)),
+            CandidateRouteBeat(beat_id="ending", options=(ending,)),
+        ),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=35_000,
+        target_duration_ms=32_500,
+    )
+
+    def prepared_execution(
+        *,
+        source_in_ms: int,
+        duration_ms: int,
+    ) -> CandidateRouteSelection:
+        return CandidateRouteSelection(
+            beat_id=option.beat_id,
+            candidate_id=option.candidate_id,
+            source_asset_id=option.source_asset_id,
+            event_id=option.event_id,
+            trim_duration_ms=duration_ms,
+            cue_id=option.cue_id,
+            cue_aligned=option.cue_aligned,
+            presentation_mode=option.presentation_mode,
+            entry_composition=option.entry_composition,
+            exit_composition=option.exit_composition,
+            decision_codes=("prepared-local-test-execution",),
+            source_clip_id=option.source_clip_id,
+            source_in_ms=source_in_ms,
+            source_out_ms=source_in_ms + duration_ms,
+            candidate_execution_sha256=candidate_route_execution_sha256(
+                option,
+                duration_ms=duration_ms,
+                source_in_ms=source_in_ms,
+                source_out_ms=source_in_ms + duration_ms,
+            ),
+        )
+
+    short_execution = prepared_execution(source_in_ms=2_250, duration_ms=3_500)
+    selected_execution = prepared_execution(source_in_ms=1_000, duration_ms=6_000)
+    short_option_id = _prepared_replan_execution_option_id(short_execution)
+    selected_option_id = _prepared_replan_execution_option_id(selected_execution)
+    expected_option_ids = tuple(sorted((short_option_id, selected_option_id)))
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        calls = 0
+
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            self.calls += 1
+            assert kwargs["option_ids_by_beat"] == {"fold": expected_option_ids}
+            assert kwargs["allowed_reuse_of_beat_ids_by_option"] == {
+                "fold": {option_id: () for option_id in expected_option_ids}
+            }
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "fold",
+                            "selected_option_id": selected_option_id,
+                            # Fallbacks are exact execution IDs too, so an
+                            # unchosen timing cannot be silently substituted.
+                            "fallback_option_ids": [short_option_id],
+                            "semantic_reason": "preserve_readability",
+                            "unresolved_concern_codes": [],
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    ),
+                )
+            )
+            return SimpleNamespace(
+                decision=decision,
+                interaction_ids=("multiple-executions",),
+            )
+
+    _persist_preflight_local_infeasibility_replan(
+        route=route,
+        local_failures_by_feature={"fold": ({"candidate_id": "fold-1"},)},
+        viable_candidate_ids_by_feature={"fold": ("fold-2",)},
+        viable_candidate_execution_bindings_by_feature={
+            "fold": (short_execution, selected_execution)
+        },
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=False,
+        output_timeline_cues=(),
+    )
+    rebuilt = _selected_preflight_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"opening": 13.25, "fold": 6.0, "ending": 13.25},
+    )
+    assert rebuilt is not None
+    rebuilt_fold = next(
+        selection for selection in rebuilt.selections if selection.beat_id == "fold"
+    )
+    assert rebuilt_fold.candidate_execution_sha256 == (
+        selected_execution.candidate_execution_sha256
+    )
+    assert (rebuilt_fold.source_in_ms, rebuilt_fold.source_out_ms) == (1_000, 7_000)
+
+    decision_path = (
+        tmp_path
+        / "editorial"
+        / "preflight-local-infeasibility-replan"
+        / "decision.json"
+    )
+    stale_decision = read_json(decision_path)
+    stale_decision["decisions"][0]["selected_option_id"] = (
+        "fold--fold-2--execution-" + "f" * 64
+    )
+    write_json(decision_path, stale_decision)
+    with pytest.raises(
+        FeatureCutSystemFailure,
+        match="selected an unknown option",
+    ):
+        _selected_preflight_local_replan(
+            route=route,
+            editorial_dir=tmp_path / "editorial",
+            policy=policy,
+            plan_path=plan_path,
+            chapter_durations={"opening": 13.25, "fold": 6.0, "ending": 13.25},
+        )
+
+
 def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(
     tmp_path: Path,
 ) -> None:
@@ -537,6 +821,17 @@ def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(
             ),
         )
     )
+    option_id_by_beat = {
+        beat_id: _local_replan_option_id(
+            route,
+            beat_id=beat_id,
+            candidate_id=candidate_id,
+        )
+        for beat_id, candidate_id in (
+            ("fold", "fold-2"),
+            ("camera", "camera-2"),
+        )
+    }
     plan_path = tmp_path / "plan.json"
     plan_path.write_text("{}", encoding="utf-8")
 
@@ -546,12 +841,12 @@ def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(
         def negotiate_grouped_edit_decisions(self, **kwargs):
             self.calls += 1
             assert kwargs["option_ids_by_beat"] == {
-                "camera": ("camera--camera-2",),
-                "fold": ("fold--fold-2",),
+                "camera": (option_id_by_beat["camera"],),
+                "fold": (option_id_by_beat["fold"],),
             }
             assert kwargs["allowed_reuse_of_beat_ids_by_option"] == {
-                "camera": {"camera--camera-2": ()},
-                "fold": {"fold--fold-2": ()},
+                "camera": {option_id_by_beat["camera"]: ()},
+                "fold": {option_id_by_beat["fold"]: ()},
             }
             decisions = []
             for beat_id, candidate_id in (("camera", "camera-2"), ("fold", "fold-2")):
@@ -559,7 +854,7 @@ def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(
                     SimpleNamespace(
                         model_dump=lambda beat_id=beat_id, candidate_id=candidate_id, **_kwargs: {
                                 "beat_id": beat_id,
-                                "selected_option_id": f"{beat_id}--{candidate_id}",
+                                "selected_option_id": option_id_by_beat[beat_id],
                                 "fallback_option_ids": [],
                                 "semantic_reason": "preserve_readability",
                                 "unresolved_concern_codes": [],
@@ -584,6 +879,23 @@ def test_local_preflight_groups_all_failed_primary_beats_before_one_choice(
         viable_candidate_ids_by_feature={
             "fold": ("fold-2",),
             "camera": ("camera-2",),
+        },
+        viable_candidate_execution_bindings_by_feature={
+            beat_id: (
+                _local_replan_execution(
+                    next(
+                        binding.option
+                        for binding in route.semantic_replan_candidate_bindings_by_beat[
+                            beat_id
+                        ]
+                        if binding.option.candidate_id == candidate_id
+                    )
+                ),
+            )
+            for beat_id, candidate_id in (
+                ("fold", "fold-2"),
+                ("camera", "camera-2"),
+            )
         },
         editorial_dir=tmp_path / "editorial",
         policy=policy,
@@ -811,17 +1123,22 @@ def test_local_replan_preserves_selected_option_retained_reuse_authority(
             ),
         )
     )
+    fold_option_id = _local_replan_option_id(
+        route,
+        beat_id="fold",
+        candidate_id="fold-2",
+    )
     plan_path = tmp_path / "plan.json"
     plan_path.write_text("{}", encoding="utf-8")
 
     class FakeClient:
         def negotiate_grouped_edit_decisions(self, **kwargs):
             assert kwargs["allowed_reuse_of_beat_ids_by_option"] == {
-                "fold": {"fold--fold-2": ()}
+                "fold": {fold_option_id: ()}
             }
             assert kwargs["retained_reuse_authority_by_option"] == {
                 "fold": {
-                    "fold--fold-2": {
+                    fold_option_id: {
                         "mode": "editorial_reprise",
                         "justification": retained_justification,
                     }
@@ -833,7 +1150,7 @@ def test_local_replan_preserves_selected_option_retained_reuse_authority(
                         SimpleNamespace(
                             model_dump=lambda **_kwargs: {
                                 "beat_id": "fold",
-                                "selected_option_id": "fold--fold-2",
+                                "selected_option_id": fold_option_id,
                                 "fallback_option_ids": [],
                                 "semantic_reason": "preserve_readability",
                                 "unresolved_concern_codes": [],
@@ -852,6 +1169,19 @@ def test_local_replan_preserves_selected_option_retained_reuse_authority(
         route=route,
         local_failures_by_feature={"fold": ({"candidate_id": "fold-1"},)},
         viable_candidate_ids_by_feature={"fold": ("fold-2",)},
+        viable_candidate_execution_bindings_by_feature={
+            "fold": (
+                _local_replan_execution(
+                    next(
+                        binding.option
+                        for binding in route.semantic_replan_candidate_bindings_by_beat[
+                            "fold"
+                        ]
+                        if binding.option.candidate_id == "fold-2"
+                    )
+                ),
+            )
+        },
         editorial_dir=tmp_path / "editorial",
         policy=policy,
         client=FakeClient(),

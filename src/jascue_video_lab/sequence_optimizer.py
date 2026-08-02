@@ -2542,6 +2542,10 @@ def rebuild_route_with_semantic_authorities(
     *,
     selected_candidate_ids_by_beat: Mapping[str, str],
     reuse_authorities_by_beat: Mapping[str, SemanticReplanReuseAuthority],
+    frozen_execution_bindings_by_beat: Mapping[
+        str, CandidateRouteSelection
+    ]
+    | None = None,
     minimum_duration_ms: int | None = None,
     maximum_duration_ms: int | None = None,
     max_panel_runtime_fraction: float | None = None,
@@ -2552,9 +2556,13 @@ def rebuild_route_with_semantic_authorities(
 
     No existing ``CandidateRouteSelection`` is patched.  Gemini may select
     only one retained candidate per affected beat and may add a typed reuse
-    authority for that exact candidate.  The whole route is then re-solved so
-    timing, source intervals, panel runtime and reuse constraints are proved
-    together before any paid exact-event or grounding stage is admitted.
+    authority for that exact candidate.  Normal semantic replans re-solve the
+    whole route so timing, source intervals, panel runtime and reuse
+    constraints are proved together before any paid exact-event or grounding
+    stage is admitted.  A local-preflight replan can instead supply a complete
+    frozen execution map: those source intervals and durations were already
+    measured, so this function verifies them without silently re-optimising an
+    unaffected beat (or a selected candidate's prepared execution).
     """
 
     known_beats = tuple(frontier.semantic_replan_candidate_bindings_by_beat)
@@ -2562,6 +2570,11 @@ def rebuild_route_with_semantic_authorities(
         raise ValueError("semantic replan selected an unknown beat")
     if set(reuse_authorities_by_beat) - set(known_beats):
         raise ValueError("semantic replan reuse authority references an unknown beat")
+    frozen_executions = dict(frozen_execution_bindings_by_beat or {})
+    if frozen_executions and set(frozen_executions) != set(known_beats):
+        raise ValueError(
+            "frozen semantic replan executions must cover every route beat"
+        )
 
     primary_by_beat = {
         selection.beat_id: selection.candidate_id
@@ -2625,6 +2638,51 @@ def rebuild_route_with_semantic_authorities(
                 "semantic replan selected a candidate that requires explicit "
                 "reuse authority"
             )
+        frozen_execution = frozen_executions.get(beat_id)
+        if frozen_execution is not None:
+            if (
+                frozen_execution.beat_id != beat_id
+                or frozen_execution.candidate_id != candidate_id
+                or frozen_execution.source_asset_id != option.source_asset_id
+                or frozen_execution.event_id != option.event_id
+                or frozen_execution.source_clip_id != option.source_clip_id
+                or frozen_execution.cue_id != option.cue_id
+                or frozen_execution.cue_aligned != option.cue_aligned
+                or frozen_execution.presentation_mode != option.presentation_mode
+                or frozen_execution.entry_composition != option.entry_composition
+                or frozen_execution.exit_composition != option.exit_composition
+                or frozen_execution.source_in_ms is None
+                or frozen_execution.source_out_ms is None
+            ):
+                raise ValueError(
+                    "frozen semantic replan execution does not match its "
+                    "immutable candidate binding"
+                )
+            if authority is None:
+                expected_execution_sha256 = candidate_route_execution_sha256(
+                    option,
+                    duration_ms=frozen_execution.trim_duration_ms,
+                    source_in_ms=frozen_execution.source_in_ms,
+                    source_out_ms=frozen_execution.source_out_ms,
+                )
+                if (
+                    frozen_execution.candidate_execution_sha256
+                    != expected_execution_sha256
+                ):
+                    raise ValueError(
+                        "frozen semantic replan execution is not derived from "
+                        "its immutable candidate timing binding"
+                    )
+            option = option.model_copy(
+                update={
+                    "trim_duration_ms": frozen_execution.trim_duration_ms,
+                    "minimum_readable_ms": frozen_execution.trim_duration_ms,
+                    "preferred_readable_ms": frozen_execution.trim_duration_ms,
+                    "maximum_readable_ms": frozen_execution.trim_duration_ms,
+                    "fixed_source_in_ms": frozen_execution.source_in_ms,
+                    "fixed_source_out_ms": frozen_execution.source_out_ms,
+                }
+            )
         rebuilt_beats.append(
             CandidateRouteBeat(beat_id=beat_id, options=(option,))
         )
@@ -2635,7 +2693,11 @@ def rebuild_route_with_semantic_authorities(
         minimum_duration_ms=minimum_duration_ms,
         maximum_duration_ms=maximum_duration_ms,
         max_panel_runtime_fraction=max_panel_runtime_fraction,
-        target_duration_ms=target_duration_ms,
+        # Frozen local-preflight executions are a complete measured vector,
+        # not inputs to another duration allocation.  Policy bounds and reuse
+        # constraints still run below, but no unaffected beat may absorb a
+        # delta introduced by the scoped semantic decision.
+        target_duration_ms=(None if frozen_executions else target_duration_ms),
         max_editorial_reprise_overlap_fraction=(
             max_editorial_reprise_overlap_fraction
         ),
