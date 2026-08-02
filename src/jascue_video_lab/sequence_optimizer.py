@@ -1991,6 +1991,90 @@ def _candidate_route_selection(
     )
 
 
+def materialize_selected_candidate_execution(
+    frontier: CandidateRouteResult,
+    *,
+    beat_id: str,
+    candidate_id: str,
+    duration_ms: int,
+    reuse_authority: SemanticReplanReuseAuthority | None = None,
+) -> CandidateRouteSelection:
+    """Materialize one bound candidate at an immutable requested duration.
+
+    This is intentionally beat-local: it proves the candidate's own
+    readability and timing-safe source interval, but does not reallocate any
+    neighbouring beat.  Callers that need a whole route must pass the result
+    together with every retained execution to ``rebuild_route_with_semantic_authorities``.
+    """
+
+    if duration_ms < 1:
+        raise ValueError("materialized candidate duration must be positive")
+    bindings = frontier.semantic_replan_candidate_bindings_by_beat.get(beat_id)
+    if not bindings:
+        raise ValueError("semantic replan selected an unknown beat: " + beat_id)
+    binding = next(
+        (row for row in bindings if row.option.candidate_id == candidate_id),
+        None,
+    )
+    if binding is None:
+        raise ValueError(
+            "semantic replan selected a candidate outside its immutable "
+            "candidate bindings: " + beat_id + ":" + candidate_id
+        )
+    if binding.replan_required_codes and any(
+        code != "source_reuse_authority_missing"
+        for code in binding.replan_required_codes
+    ):
+        raise ValueError(
+            "semantic replan candidate retains a non-authorizable hard "
+            "conflict: " + ",".join(binding.replan_required_codes)
+        )
+    option = binding.option
+    if reuse_authority is not None:
+        if "source_reuse_authority_missing" not in binding.replan_required_codes:
+            raise ValueError(
+                "semantic reuse authority was supplied for a candidate "
+                "without a measured reuse-authority requirement"
+            )
+        if (
+            reuse_authority.beat_id != beat_id
+            or reuse_authority.candidate_id != candidate_id
+            or option.reuse_mode != "none"
+        ):
+            raise ValueError(
+                "semantic reuse authority does not bind the materialized "
+                "candidate"
+            )
+        option = option.model_copy(
+            update={
+                "reuse_mode": reuse_authority.reuse_mode,
+                "reuse_justification": reuse_authority.reuse_justification,
+            }
+        )
+    elif "source_reuse_authority_missing" in binding.replan_required_codes:
+        raise ValueError(
+            "semantic replan selected a candidate that requires explicit "
+            "reuse authority"
+        )
+    bounds = _candidate_duration_bounds(option)
+    if bounds is None or not bounds[0] <= duration_ms <= bounds[2]:
+        raise ValueError(
+            "semantic replan candidate cannot support the immutable "
+            "requested duration"
+        )
+    selection = _candidate_route_selection(
+        option,
+        duration_ms=duration_ms,
+        decision_codes=("materialized_selected_candidate_execution",),
+    )
+    if selection.source_in_ms is None or selection.source_out_ms is None:
+        raise ValueError(
+            "semantic replan candidate has no timing-safe interval at the "
+            "immutable requested duration"
+        )
+    return selection
+
+
 def _source_identity(option: CandidateRouteOption) -> str:
     return option.source_clip_id or option.source_asset_id
 

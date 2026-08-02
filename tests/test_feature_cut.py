@@ -5220,7 +5220,7 @@ def test_horizontal_mixed_replan_freezes_retain_execution_while_selecting_altern
     real_rebuild = feature_cut_module.rebuild_route_with_semantic_authorities
     calls: list[bool] = []
 
-    def provisional_reallocates_retain(*args, **kwargs):
+    def whole_route_reallocator(*args, **kwargs):
         calls.append(kwargs.get("frozen_execution_bindings_by_beat") is not None)
         rebuilt = real_rebuild(*args, **kwargs)
         if kwargs.get("frozen_execution_bindings_by_beat") is None:
@@ -5230,7 +5230,7 @@ def test_horizontal_mixed_replan_freezes_retain_execution_while_selecting_altern
                 for index, selection in enumerate(selections)
                 if selection.beat_id == "opening"
             )
-            # This models the production failure: an unfrozen provisional
+            # This models the production failure: an unfrozen whole-route
             # optimization changes the primary's exact interval/hash.
             selections[opening_index] = selections[opening_index].model_copy(
                 update={
@@ -5245,7 +5245,7 @@ def test_horizontal_mixed_replan_freezes_retain_execution_while_selecting_altern
     monkeypatch.setattr(
         feature_cut_module,
         "rebuild_route_with_semantic_authorities",
-        provisional_reallocates_retain,
+        whole_route_reallocator,
     )
     restored = _restore_preflight_horizontal_local_replan(
         route=route,
@@ -5259,7 +5259,10 @@ def test_horizontal_mixed_replan_freezes_retain_execution_while_selecting_altern
     restored_by_beat = {selection.beat_id: selection for selection in restored.selections}
     assert restored_by_beat["opening"] == opening_selection
     assert restored_by_beat["hero"].candidate_id == "hero-02"
-    assert calls == [False, True]
+    # The alternate execution is materialized beat-locally; only the frozen
+    # authoritative rebuild is allowed, so no whole-route provisional solve
+    # can move the retained opening execution.
+    assert calls == [True]
     assert feature_cut_module._load_horizontal_motion_preservation_authorities(
         route=restored,
         editorial_dir=editorial_dir,
