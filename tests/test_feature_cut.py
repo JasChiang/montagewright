@@ -111,6 +111,7 @@ from jascue_video_lab.feature_cut import (
     _runtime_panel_budget_allows,
     _load_or_create_frontier_stage_artifact,
     _load_existing_frontier_stage_artifact,
+    _load_frontier_replan_authorities_by_execution,
     _compile_autonomous_vertical_candidate_geometry,
     _run_persisted_production_frontier,
     _validate_all_vertical_finalizers_ready,
@@ -796,6 +797,18 @@ def test_local_replan_selects_one_of_multiple_prepared_executions_for_candidate(
         selected_execution.candidate_execution_sha256
     )
     assert (rebuilt_fold.source_in_ms, rebuilt_fold.source_out_ms) == (1_000, 7_000)
+    # The typed decision's fallback is still a locally-proven immutable
+    # execution.  Restore must retain it for a later grouped presentation
+    # decision instead of collapsing the whole route beam to the first choice.
+    assert {
+        selection.candidate_execution_sha256
+        for complete_route in rebuilt.ranked_routes
+        for selection in complete_route.selections
+        if selection.beat_id == "fold"
+    } == {
+        short_execution.candidate_execution_sha256,
+        selected_execution.candidate_execution_sha256,
+    }
 
     decision_path = (
         tmp_path
@@ -819,6 +832,174 @@ def test_local_replan_selects_one_of_multiple_prepared_executions_for_candidate(
             plan_path=plan_path,
             chapter_durations={"opening": 13.25, "fold": 6.0, "ending": 13.25},
         )
+
+
+def test_local_replan_retains_cartesian_product_of_exact_fallback_routes(
+    tmp_path: Path,
+) -> None:
+    """Two Gemini-listed fallback timings remain jointly route-compatible."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+
+    def option(beat_id: str, marker: str) -> CandidateRouteOption:
+        return CandidateRouteOption(
+            beat_id=beat_id,
+            candidate_id=f"{beat_id}-candidate",
+            source_asset_id="sha256:" + marker * 64,
+            source_clip_id=f"clip-{marker}",
+            event_id=f"event-{beat_id}",
+            planner_rank=1,
+            semantic_confidence=0.9,
+            trim_duration_ms=15_000,
+            minimum_readable_ms=15_000,
+            preferred_readable_ms=15_000,
+            maximum_readable_ms=15_000,
+            safe_capacity_ms=32_000,
+            safe_window_start_ms=0,
+            safe_window_end_ms=32_000,
+            source_anchor_ms=8_000,
+            candidate_timing_sha256=marker * 64,
+        )
+
+    alpha, beta = option("alpha", "a"), option("beta", "b")
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="alpha", options=(alpha,)),
+            CandidateRouteBeat(beat_id="beta", options=(beta,)),
+        ),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    )
+
+    def execution(
+        source_option: CandidateRouteOption,
+        source_in_ms: int,
+    ) -> CandidateRouteSelection:
+        return CandidateRouteSelection(
+            beat_id=source_option.beat_id,
+            candidate_id=source_option.candidate_id,
+            source_asset_id=source_option.source_asset_id,
+            event_id=source_option.event_id,
+            trim_duration_ms=15_000,
+            cue_id=source_option.cue_id,
+            cue_aligned=source_option.cue_aligned,
+            presentation_mode=source_option.presentation_mode,
+            entry_composition=source_option.entry_composition,
+            exit_composition=source_option.exit_composition,
+            decision_codes=("prepared-local-test-execution",),
+            source_clip_id=source_option.source_clip_id,
+            source_in_ms=source_in_ms,
+            source_out_ms=source_in_ms + 15_000,
+            candidate_execution_sha256=candidate_route_execution_sha256(
+                source_option,
+                duration_ms=15_000,
+                source_in_ms=source_in_ms,
+                source_out_ms=source_in_ms + 15_000,
+            ),
+        )
+
+    selected = {"alpha": execution(alpha, 1_000), "beta": execution(beta, 1_000)}
+    fallback = {"alpha": execution(alpha, 2_000), "beta": execution(beta, 2_000)}
+    selected_option_ids = {
+        beat_id: _prepared_replan_execution_option_id(value)
+        for beat_id, value in selected.items()
+    }
+    fallback_option_ids = {
+        beat_id: _prepared_replan_execution_option_id(value)
+        for beat_id, value in fallback.items()
+    }
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["option_ids_by_beat"] == {
+                "alpha": tuple(
+                    sorted(
+                        (
+                            selected_option_ids["alpha"],
+                            fallback_option_ids["alpha"],
+                        )
+                    )
+                ),
+                "beta": tuple(
+                    sorted(
+                        (
+                            selected_option_ids["beta"],
+                            fallback_option_ids["beta"],
+                        )
+                    )
+                ),
+            }
+            decisions = tuple(
+                SimpleNamespace(
+                    model_dump=lambda beat_id=beat_id, **_kwargs: {
+                        "beat_id": beat_id,
+                        "selected_option_id": selected_option_ids[beat_id],
+                        "fallback_option_ids": [fallback_option_ids[beat_id]],
+                        "semantic_reason": "preserve_readability",
+                        "unresolved_concern_codes": [],
+                        "source_reuse_mode": "none",
+                        "source_reuse_justification": None,
+                        "reuse_of_beat_ids": [],
+                    }
+                )
+                for beat_id in ("alpha", "beta")
+            )
+            return SimpleNamespace(
+                decision=SimpleNamespace(decisions=decisions),
+                interaction_ids=("cartesian-fallbacks",),
+            )
+
+    _persist_preflight_local_infeasibility_replan(
+        route=route,
+        local_failures_by_feature={
+            "alpha": ({"candidate_id": "old-alpha"},),
+            "beta": ({"candidate_id": "old-beta"},),
+        },
+        viable_candidate_ids_by_feature={
+            "alpha": (alpha.candidate_id,),
+            "beta": (beta.candidate_id,),
+        },
+        viable_candidate_execution_bindings_by_feature={
+            "alpha": (selected["alpha"], fallback["alpha"]),
+            "beta": (selected["beta"], fallback["beta"]),
+        },
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=False,
+        output_timeline_cues=(),
+    )
+
+    rebuilt = _selected_preflight_local_replan(
+        route=route,
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"alpha": 15.0, "beta": 15.0},
+    )
+
+    assert rebuilt is not None
+    assert {
+        tuple(
+            selection.source_in_ms
+            for selection in complete_route.selections
+        )
+        for complete_route in rebuilt.ranked_routes
+    } == {(1_000, 1_000), (1_000, 2_000), (2_000, 1_000), (2_000, 2_000)}
 
 
 def test_legacy_local_replan_repairs_ambiguous_execution_binding_once(
@@ -1984,6 +2165,129 @@ def test_autonomous_vertical_geometry_plain_value_error_is_system_failure(
             titles_rendered=False,
             semantic_negotiation_state={},
         )
+
+
+def test_semantic_boundary_deferred_options_are_presentation_level_and_hash_bound() -> None:
+    """Three locally executable presentation choices remain Gemini-only facts."""
+
+    variants: list[dict[str, object]] = []
+    for option_id, mode in (
+        ("solid-fit", "solid_matte_fit"),
+        ("tracked", "tracked_full_bleed_crop"),
+        ("panel", "two_panel_layout"),
+    ):
+        filter_graph = f"[{mode}]"
+        definition: dict[str, object] = {
+            "presentation_option_id": option_id,
+            "presentation_option_payload_sha256": "a" * 64,
+            "presentation_mode": mode,
+            "filter_graph": filter_graph,
+            "filter_graph_sha256": hashlib.sha256(
+                filter_graph.encode("utf-8")
+            ).hexdigest(),
+            "geometry": {"applied_strategy": mode},
+            "debug_paths": [],
+            "track_fingerprint": "track-" + option_id,
+            "hard_constraint_results": [
+                {
+                    "constraint_id": "semantic_capability_boundary",
+                    "level": "hard",
+                    "status": "fail",
+                }
+            ],
+            "semantic_boundary_only": True,
+        }
+        variants.append(
+            {
+                **definition,
+                "presentation_execution_sha256": (
+                    feature_cut_module._stable_fingerprint(definition)
+                ),
+            }
+        )
+    payload = {
+        "classification": "deferred_semantic_replan",
+        "semantic_boundary_deferred_options": variants,
+        # This deliberately unusable parent geometry must never become the
+        # renderer's implicit fallback.
+        "geometry": {"applied_strategy": "blocked_geometry"},
+        "filter_graph": "blocked",
+    }
+
+    expanded = feature_cut_module._expanded_deferred_semantic_payloads(payload)
+
+    assert [row["measured_presentation_mode"] for row in expanded] == [
+        "solid_matte_fit",
+        "tracked_full_bleed_crop",
+        "two_panel_layout",
+    ]
+    for row, variant in zip(expanded, variants, strict=True):
+        assert row["presentation_execution"] == variant
+        assert row["filter_graph"] == variant["filter_graph"]
+        assert row["geometry"] == variant["geometry"]
+        feature_cut_module._validate_bound_deferred_presentation_execution(
+            geometry_payload=payload,
+            presentation_execution=row["presentation_execution"],
+        )
+
+    tampered = dict(expanded[0]["presentation_execution"])
+    tampered["filter_graph"] = "[invented-filter]"
+    with pytest.raises(FeatureCutSystemFailure, match="filter hash"):
+        feature_cut_module._validate_bound_deferred_presentation_execution(
+            geometry_payload=payload,
+            presentation_execution=tampered,
+        )
+
+
+def test_nonsemantic_hard_presentation_failure_never_enters_deferred_options() -> None:
+    """Unmotivated source motion and other hard geometry failures stay local."""
+
+    options = feature_cut_module._semantic_boundary_only_presentation_options(
+        client=SimpleNamespace(),
+        feature_id="opening",
+        local_artifact={"option": {"candidate_id": "opening-a"}},
+        exact_artifact={},
+        brief_chapter=SimpleNamespace(),
+        checkpoint_path=Path("/not-used"),
+        grounding_prompt="not-used",
+        analysis_fps=1.0,
+        scdet_threshold=1.0,
+        track_cache={},
+        policy=SimpleNamespace(),
+        semantic_beat=None,
+        titles_rendered=False,
+        model_request_block_reason="test",
+        blocked_geometry={
+            "presentation_compilation": {
+                "option_set": {
+                    "options": [
+                        {
+                            "option": {
+                                "option_id": "bad-source-motion",
+                                "capability_id": "solid_matte_fit",
+                                "constraints": [
+                                    {
+                                        "constraint_id": "source_camera_motion",
+                                        "level": "hard",
+                                        "status": "fail",
+                                    },
+                                    {
+                                        "constraint_id": (
+                                            "semantic_capability_boundary"
+                                        ),
+                                        "level": "hard",
+                                        "status": "fail",
+                                    },
+                                ],
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    assert options == []
 
 
 def _frontier_stage_artifact_kwargs(
@@ -3883,6 +4187,275 @@ def test_resolved_frontier_route_reads_committed_stage_chain(
     assert bindings["opening"]["e" * 64].source_in_ms == 120
     assert bindings["opening"]["e" * 64].trim_duration_ms == 960
     assert (frontier_root / "resolved-route.json").is_file()
+
+
+def _write_deferred_materialize_fixture(
+    tmp_path: Path,
+) -> tuple[CandidateCompleteRoute, dict[str, tuple[str, str]], Path, dict[str, object]]:
+    execution_sha256 = "e" * 64
+    candidate_id = "candidate-opening"
+    frontier_root = tmp_path / "frontier"
+    candidate_root = (
+        frontier_root / "opening" / candidate_id / f"execution-{execution_sha256}"
+    )
+    candidate_root.mkdir(parents=True)
+    base_route = _complete_route_for_execution_compatibility(
+        "d", {"opening": execution_sha256}
+    )
+    policy_reference = "sha256:" + "2" * 64
+    clip = RushClip(
+        clip_id="clip-opening",
+        path="/opening.mp4",
+        sha256="a" * 64,
+        duration_ms=5_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=1,
+    )
+    shared = {
+        "beat_id": "opening",
+        "candidate_id": candidate_id,
+        "candidate_execution_sha256": execution_sha256,
+        "route_sha256": "legacy-artifact-envelope-hash",
+        "policy_reference": policy_reference,
+    }
+    write_json(
+        candidate_root / "local.json",
+        {
+            **shared,
+            "stage": "local_preflight",
+            "payload": {
+                "option": {
+                    "source_asset_id": "sha256:" + "a" * 64,
+                    "event_id": "event-opening",
+                },
+                "clip": clip.model_dump(mode="json"),
+                "start_ms": 100,
+                "end_ms": 1_100,
+            },
+        },
+    )
+    write_json(
+        candidate_root / "exact.json",
+        {
+            **shared,
+            "candidate_execution_sha256": None,
+            "stage": "exact_event",
+            "payload": {
+                "authorized_trim": {
+                    "authorized_source_interval": {
+                        "start_ms_display": 120,
+                        "end_ms_display": 1_080,
+                    }
+                }
+            },
+        },
+    )
+    filter_graph = "[0:v]crop=540:960[selected]"
+    definition: dict[str, object] = {
+        "presentation_option_id": "solid-fit-option",
+        "presentation_option_payload_sha256": "b" * 64,
+        "presentation_mode": "solid_matte_fit",
+        "filter_graph": filter_graph,
+        "filter_graph_sha256": hashlib.sha256(
+            filter_graph.encode("utf-8")
+        ).hexdigest(),
+        "geometry": {"applied_strategy": "solid_matte_fit"},
+        "debug_paths": [],
+        "track_fingerprint": "track-solid",
+        "hard_constraint_results": [],
+        "semantic_boundary_only": True,
+    }
+    presentation_execution = {
+        **definition,
+        "presentation_execution_sha256": feature_cut_module._stable_fingerprint(
+            definition
+        ),
+    }
+    write_json(
+        candidate_root / "geometry.json",
+        {
+            **shared,
+            "stage": "geometry",
+            "payload": {
+                "classification": "deferred_semantic_replan",
+                "geometry": {"applied_strategy": "blocked_geometry"},
+                "filter_graph": "blocked",
+                "semantic_boundary_deferred_options": [presentation_execution],
+            },
+        },
+    )
+    return (
+        base_route,
+        {"opening": (candidate_id, execution_sha256)},
+        frontier_root,
+        presentation_execution,
+    )
+
+
+def test_materialize_uses_exact_gemini_selected_presentation_execution(
+    tmp_path: Path,
+) -> None:
+    base_route, selected, frontier_root, presentation_execution = (
+        _write_deferred_materialize_fixture(tmp_path)
+    )
+    execution_sha256 = selected["opening"][1]
+
+    resolved, _ = _materialize_resolved_frontier_route(
+        base_route=base_route,
+        selected_executions_by_beat=selected,
+        frontier_root=frontier_root,
+        route_sha256="1" * 64,
+        policy_reference="sha256:" + "2" * 64,
+        replan_authority_by_execution={
+            ("opening", "candidate-opening", execution_sha256): {
+                "authority": SimpleNamespace(
+                    model_dump=lambda **_kwargs: {"decision_scope": "test"}
+                ),
+                "selected_option_id": "opening--replan-01",
+                "presentation_execution": presentation_execution,
+            }
+        },
+    )
+
+    assert resolved.selections[0].presentation_mode == "solid_matte_fit"
+    materialized = read_json(frontier_root / "resolved-route.json")
+    assert materialized["stage_artifacts"][0][
+        "selected_presentation_execution_sha256"
+    ] == presentation_execution["presentation_execution_sha256"]
+
+
+def test_materialize_rejects_deferred_presentation_without_authority(
+    tmp_path: Path,
+) -> None:
+    base_route, selected, frontier_root, _ = _write_deferred_materialize_fixture(
+        tmp_path
+    )
+
+    with pytest.raises(FeatureCutSystemFailure, match="no Gemini replan authority"):
+        _materialize_resolved_frontier_route(
+            base_route=base_route,
+            selected_executions_by_beat=selected,
+            frontier_root=frontier_root,
+            route_sha256="1" * 64,
+            policy_reference="sha256:" + "2" * 64,
+            replan_authority_by_execution={},
+        )
+
+
+def test_materialize_rejects_tampered_selected_presentation_filter_hash(
+    tmp_path: Path,
+) -> None:
+    base_route, selected, frontier_root, presentation_execution = (
+        _write_deferred_materialize_fixture(tmp_path)
+    )
+    tampered = {**presentation_execution, "filter_graph": "[invented]"}
+
+    with pytest.raises(FeatureCutSystemFailure, match="filter hash"):
+        _materialize_resolved_frontier_route(
+            base_route=base_route,
+            selected_executions_by_beat=selected,
+            frontier_root=frontier_root,
+            route_sha256="1" * 64,
+            policy_reference="sha256:" + "2" * 64,
+            replan_authority_by_execution={
+                ("opening", "candidate-opening", selected["opening"][1]): {
+                    "authority": SimpleNamespace(
+                        model_dump=lambda **_kwargs: {"decision_scope": "test"}
+                    ),
+                    "selected_option_id": "opening--replan-01",
+                    "presentation_execution": tampered,
+                }
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("context_contract", "context has an unsupported contract version"),
+        ("context_policy", "context does not match the active policy"),
+        ("decision_contract", "decision has an unsupported contract version"),
+        ("decision_policy", "decision does not match the active policy"),
+    ),
+)
+def test_grouped_replan_authority_loader_rejects_contract_or_policy_mismatch(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("9:16",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    plan_sha256 = "3" * 64
+    grouped_root = tmp_path / "frontier" / "scoped-semantic-replans" / "grouped"
+    context_path = grouped_root / "context.json"
+    context = {
+        "contract_version": "grouped-scoped-semantic-replan-context-v1",
+        "policy_reference": policy.policy_reference,
+        "affected_beats": [
+            {
+                "feature_id": "opening",
+                "immutable_options": [
+                    {
+                        "option_id": "opening--replan-01",
+                        "candidate_id": "candidate-opening",
+                        "candidate_execution_sha256": "e" * 64,
+                        "presentation_execution": None,
+                    }
+                ],
+            }
+        ],
+    }
+    if mutation == "context_contract":
+        context["contract_version"] = "wrong-context-contract"
+    if mutation == "context_policy":
+        context["policy_reference"] = "sha256:" + "f" * 64
+    write_json(context_path, context)
+    authority = authorize_decision(
+        policy=policy,
+        decision_scope="scoped_semantic_replan",
+        input_artifact_hashes=(
+            "sha256:" + sha256_file(context_path),
+            "sha256:" + plan_sha256,
+        ),
+        deterministic_gate_results={"test": "passed"},
+        decision_codes=("test",),
+        gemini_interaction_ids=("test-loader",),
+    )
+    decision = {
+        "contract_version": "grouped-scoped-semantic-replan-result-v1",
+        "context_sha256": sha256_file(context_path),
+        "policy_reference": policy.policy_reference,
+        "decisions": [
+            {
+                "beat_id": "opening",
+                "selected_option_id": "opening--replan-01",
+            }
+        ],
+        "authority": authority.model_dump(mode="json"),
+    }
+    if mutation == "decision_contract":
+        decision["contract_version"] = "wrong-decision-contract"
+    if mutation == "decision_policy":
+        decision["policy_reference"] = "sha256:" + "e" * 64
+    write_json(grouped_root / "decision.json", decision)
+
+    with pytest.raises(FeatureCutSystemFailure, match=message):
+        _load_frontier_replan_authorities_by_execution(
+            frontier_root=tmp_path / "frontier",
+            autonomous_policy=policy,
+            frontier_plan_sha256=plan_sha256,
+        )
 
 
 def test_source_interval_duration_uses_pts_not_nominal_window() -> None:
