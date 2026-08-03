@@ -1233,12 +1233,34 @@ def canonicalize_feature_edit_plan_output(
                 ),
                 None,
             )
-            if rank_one is None or any(
-                candidate_key not in rank_one
-                for candidate_key in mirrors.values()
-            ):
+            if rank_one is None:
                 continue
             for legacy_key, candidate_key in mirrors.items():
+                if candidate_key not in rank_one:
+                    # The candidate is authoritative for what it states, not
+                    # for what it leaves out.  A key it never wrote makes the
+                    # chapter's value the only statement in the response, so
+                    # completing the candidate keeps the pair consistent.
+                    # Bailing out of the whole chapter here instead used to
+                    # strand every other mirror it did state.
+                    chapter_value = chapter.get(legacy_key)
+                    if chapter_value is None:
+                        continue
+                    rank_one[candidate_key] = chapter_value
+                    changes.append(
+                        {
+                            "json_path": (
+                                f"$.chapters[{chapter_index}]"
+                                f".{candidate_field}[rank=1].{candidate_key}"
+                            ),
+                            "before": None,
+                            "after": chapter_value,
+                            "rule": (
+                                "chapter_completes_unstated_rank_one_mirror"
+                            ),
+                        }
+                    )
+                    continue
                 candidate_value = rank_one[candidate_key]
                 if chapter.get(legacy_key) == candidate_value:
                     continue

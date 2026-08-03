@@ -1299,6 +1299,97 @@ def test_feature_plan_rank_one_candidate_repairs_redundant_legacy_projection() -
     } == {"rank_one_candidate_is_authoritative_legacy_projection"}
 
 
+def test_feature_plan_chapter_completes_an_unstated_rank_one_mirror() -> None:
+    """One unwritten mirror key must not strand the keys that were written.
+
+    The model states a chapter's target description and leaves the same field
+    off its rank-1 candidate.  Skipping the whole chapter's repair there left
+    every other mirror it did state disagreeing, so a paid plan failed local
+    mirror validation.
+    """
+
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "horizontal_frame_id": "RF000001",
+                        "vertical_frame_id": "RF000002",
+                        "horizontal_strategy": "original",
+                        "horizontal_zoom_intent": "none",
+                        "horizontal_camera_intent": "hold",
+                        "horizontal_target_description": "the folded handset",
+                        "horizontal_candidates": [
+                            {
+                                "rank": 1,
+                                "frame_id": "RF000101",
+                                "strategy": "tracked_reframe",
+                                "zoom_intent": "detail",
+                                "camera_intent": "push_in",
+                            },
+                            {
+                                "rank": 2,
+                                "frame_id": "RF000102",
+                                "strategy": "original",
+                                "zoom_intent": "none",
+                                "camera_intent": "hold",
+                                "target_description": "a wider take",
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+    rank_one = chapter["horizontal_candidates"][0]
+
+    # The stated keys still follow the candidate.
+    assert chapter["horizontal_frame_id"] == "RF000101"
+    assert chapter["horizontal_strategy"] == "tracked_reframe"
+    assert chapter["horizontal_zoom_intent"] == "detail"
+    assert chapter["horizontal_camera_intent"] == "push_in"
+    # The unstated one is completed from the chapter, so the pair agrees.
+    assert rank_one["target_description"] == "the folded handset"
+    assert chapter["horizontal_target_description"] == "the folded handset"
+    assert {change["rule"] for change in changes} == {
+        "rank_one_candidate_is_authoritative_legacy_projection",
+        "chapter_completes_unstated_rank_one_mirror",
+    }
+
+
+def test_feature_plan_leaves_a_doubly_unstated_mirror_alone() -> None:
+    """Nothing is invented when neither side states the field."""
+
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "horizontal_frame_id": "RF000001",
+                        "vertical_frame_id": "RF000002",
+                        "horizontal_target_description": None,
+                        "horizontal_candidates": [
+                            {"rank": 1, "frame_id": "RF000001"},
+                            {"rank": 2, "frame_id": "RF000009"},
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+    assert chapter["horizontal_target_description"] is None
+    assert "target_description" not in chapter["horizontal_candidates"][0]
+    assert not [
+        change
+        for change in changes
+        if change["rule"] == "chapter_completes_unstated_rank_one_mirror"
+    ]
+
+
 class _RejectingInteractions:
     def __init__(self) -> None:
         self.request: dict[str, Any] | None = None
