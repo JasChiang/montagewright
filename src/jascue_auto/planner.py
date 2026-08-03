@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -153,11 +154,33 @@ def _describe_clips(edl: EDL) -> str:
     return "\n".join(lines)
 
 
+def upload_music(path: Path, client: Any) -> Any:
+    """Put the track where the model can hear it.
+
+    A measured description carries a track's shape -- tempo, metre, where the
+    sections turn -- but not its character, and character is what decides how
+    a cut should feel. Two tracks at 117 BPM with the same section map want
+    opposite edits if one is a club record and the other is a guitar and a
+    room. Sending the audio is the difference between reasoning about music
+    and listening to it.
+    """
+
+    uploaded = client.files.upload(file=str(path))
+    while getattr(uploaded.state, "name", str(uploaded.state)) == "PROCESSING":
+        time.sleep(2.0)
+        uploaded = client.files.get(name=uploaded.name)
+    state = getattr(uploaded.state, "name", str(uploaded.state))
+    if state != "ACTIVE":
+        raise PlannerError(f"music upload ended in state {state}")
+    return uploaded
+
+
 def decide_rhythm(
     edl: EDL,
     grid: BeatGrid,
     *,
     intent: str,
+    music: Path | None = None,
     client: Any | None = None,
 ) -> tuple[EDL, Usage]:
     """Return the EDL with each clip's rhythm decided by the model.
@@ -165,6 +188,10 @@ def decide_rhythm(
     The returned clips keep their in-points and carry the model's judgement in
     `music_sync` plus an out-point reflecting the hold it asked for. Grounding
     turns that into frames.
+
+    Pass `music` to let the model hear the track rather than only read its
+    measurements. The grid still owns every timestamp either way; hearing it
+    changes what the model asks for, not where local code puts it.
     """
 
     if client is None:
@@ -172,19 +199,34 @@ def decide_rhythm(
 
     clip_ids = [clip.clip_id for clip in edl.clips]
     prompt = (PROMPTS / "rhythm_zh-TW.txt").read_text(encoding="utf-8")
+
+    heard = "你會實際聽到這首音樂。" if music is not None else (
+        "這次只提供音樂的量測結果，沒有音檔。"
+    )
+    request_input: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                f"{prompt}\n\n## 這支片要傳達什麼\n\n{intent}\n\n"
+                f"## 音樂\n\n{heard}\n{_describe_music(grid)}\n\n"
+                f"## 畫面（依序）\n\n{_describe_clips(edl)}\n"
+            ),
+        }
+    ]
+    if music is not None:
+        uploaded = upload_music(music, client)
+        request_input.append(
+            {
+                "type": "audio",
+                "mime_type": "audio/mpeg",
+                "uri": uploaded.uri,
+            }
+        )
+
     request = {
         "model": MODEL_ID,
         "store": False,
-        "input": [
-            {
-                "type": "text",
-                "text": (
-                    f"{prompt}\n\n## 這支片要傳達什麼\n\n{intent}\n\n"
-                    f"## 音樂\n\n{_describe_music(grid)}\n\n"
-                    f"## 畫面（依序）\n\n{_describe_clips(edl)}\n"
-                ),
-            }
-        ],
+        "input": request_input,
         "generation_config": {
             "thinking_level": THINKING_HIGH,
             "max_output_tokens": 8192,
