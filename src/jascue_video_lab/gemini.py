@@ -1572,6 +1572,15 @@ def _relax_nested_candidate_enums(schema: dict[str, Any]) -> int:
                     key: value for key, value in node.items() if key != "enum"
                 }
                 remainder["type"] = "string"
+                # Carry the vocabulary in prose.  A description costs almost
+                # nothing in the decoding grammar, and without it the model
+                # invents its own wording and burns a schema repair round on
+                # every run.
+                allowed = ", ".join(str(value) for value in node["enum"])
+                description = str(remainder.get("description", "")).strip()
+                remainder["description"] = (
+                    f"{description} Allowed values: {allowed}."
+                ).strip()
                 return remainder
             return {key: relax(value) for key, value in node.items()}
         if isinstance(node, list):

@@ -3665,7 +3665,17 @@ class FramingRegionIntent(StrictModel):
             "example a text or UI state. Atomic regions are treated as hard cores."
         ),
     )
-    minimum_visible_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+    minimum_visible_fraction: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Smallest readable share of a non-atomic region. Leave this unset "
+            "when atomic is true: an atomic region is fully visible by "
+            "definition, so any fraction below 1.0 contradicts it and is "
+            "rejected."
+        ),
+    )
     observable_relations: list[str] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
 
@@ -4355,7 +4365,16 @@ class FeatureHorizontalCandidate(StrictModel):
         "incidental_or_unwanted",
         "unknown",
     ] = "unknown"
-    source_camera_motion_reason: str | None = Field(default=None, max_length=300)
+    source_camera_motion_reason: str | None = Field(
+        default=None,
+        max_length=300,
+        description=(
+            "What was actually seen that supports the motion role. Required "
+            "whenever source_camera_motion_role is anything other than "
+            "'unknown'; a classified role without an observable reason is "
+            "rejected."
+        ),
+    )
     visual_event_support: list[CandidateVisualEventSupport] | None = Field(
         default=None,
         max_length=8,
@@ -4471,6 +4490,12 @@ class FeatureVerticalCandidate(StrictModel):
     source_camera_motion_reason: str | None = Field(
         default=None,
         max_length=300,
+        description=(
+            "What was actually seen that supports the motion role. Required "
+            "whenever source_camera_motion_role is anything other than "
+            "'unknown'; a classified role without an observable reason is "
+            "rejected."
+        ),
     )
     visual_event_support: list[CandidateVisualEventSupport] | None = Field(
         default=None,

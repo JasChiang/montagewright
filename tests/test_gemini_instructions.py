@@ -1573,6 +1573,19 @@ def test_feature_plan_nested_candidate_vocabularies_leave_the_schema() -> None:
                 f"{definition}.{field_name} reintroduced a nested enum"
             )
 
+    # A relaxed vocabulary the model cannot see is a vocabulary it invents, so
+    # the allowed values have to survive in prose.
+    motion_role = schema["$defs"]["FeatureHorizontalCandidate"]["properties"][
+        "source_camera_motion_role"
+    ]
+    for value in (
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ):
+        assert value in motion_role["description"]
+
     # The catalog binding is the one vocabulary local validation cannot
     # reproduce, so it has to survive the relaxation.
     for definition in ("FeatureHorizontalCandidate", "FeatureVerticalCandidate"):
