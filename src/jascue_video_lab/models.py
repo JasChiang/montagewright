@@ -4851,7 +4851,13 @@ class FeatureChapterSelect(StrictModel):
         max_length=8,
         description=(
             "Distinct visible subjects or regions whose coverage carries the "
-            "chapter meaning. This is editorial identity, not geometry."
+            "chapter meaning. This is editorial identity, not geometry. Any "
+            "vertical_coverage_intent other than single_primary needs at "
+            "least two entries here, named one subject per entry: a brief "
+            "line like 'the two handsets side by side' describes a group in "
+            "one phrase, and re-using it whole leaves the coverage claim "
+            "unsupported. Name each subject separately, or say "
+            "single_primary."
         ),
     )
     quality_risks: list[str]

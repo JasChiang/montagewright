@@ -1359,6 +1359,48 @@ def test_feature_plan_chapter_completes_an_unstated_rank_one_mirror() -> None:
     }
 
 
+def test_feature_plan_repairs_a_null_rank_one_mirror() -> None:
+    """An explicit null states nothing, exactly like an omitted key.
+
+    The model wrote evidence_provenance on the chapter and null on its rank-1
+    vertical candidate for every chapter of a paid plan, and the repair map
+    did not cover that field at all, so the disagreement reached the mirror
+    validator untouched.
+    """
+
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "horizontal_frame_id": "RF000001",
+                        "vertical_frame_id": "RF000002",
+                        "evidence_provenance": "direct_physical_action",
+                        "vertical_candidates": [
+                            {
+                                "rank": 1,
+                                "frame_id": "RF000002",
+                                "evidence_provenance": None,
+                            },
+                            {"rank": 2, "frame_id": "RF000003"},
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    chapter = json.loads(canonical)["chapters"][0]
+    assert chapter["vertical_candidates"][0]["evidence_provenance"] == (
+        "direct_physical_action"
+    )
+    assert chapter["evidence_provenance"] == "direct_physical_action"
+    assert any(
+        change["rule"] == "chapter_completes_unstated_rank_one_mirror"
+        for change in changes
+    )
+
+
 def test_feature_plan_leaves_a_doubly_unstated_mirror_alone() -> None:
     """Nothing is invented when neither side states the field."""
 

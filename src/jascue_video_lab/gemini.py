@@ -1219,6 +1219,10 @@ def canonicalize_feature_edit_plan_output(
                 "vertical_frame_id": "frame_id",
                 "vertical_strategy": "strategy",
                 "vertical_target_description": "target_description",
+                # FeatureChapterSelect compares this against its rank-1
+                # vertical candidate too, so leaving it out of the repair map
+                # let a disagreement the validator rejects survive untouched.
+                "evidence_provenance": "evidence_provenance",
             },
         }
         for candidate_field, mirrors in candidate_mirrors.items():
@@ -1236,13 +1240,14 @@ def canonicalize_feature_edit_plan_output(
             if rank_one is None:
                 continue
             for legacy_key, candidate_key in mirrors.items():
-                if candidate_key not in rank_one:
+                if rank_one.get(candidate_key) is None:
                     # The candidate is authoritative for what it states, not
-                    # for what it leaves out.  A key it never wrote makes the
-                    # chapter's value the only statement in the response, so
-                    # completing the candidate keeps the pair consistent.
-                    # Bailing out of the whole chapter here instead used to
-                    # strand every other mirror it did state.
+                    # for what it leaves out.  A key it omitted, or wrote as
+                    # an explicit null, makes the chapter's value the only
+                    # statement in the response, so completing the candidate
+                    # keeps the pair consistent.  Bailing out of the whole
+                    # chapter here instead used to strand every other mirror
+                    # it did state.
                     chapter_value = chapter.get(legacy_key)
                     if chapter_value is None:
                         continue
