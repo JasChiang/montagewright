@@ -3661,8 +3661,14 @@ class FramingRegionIntent(StrictModel):
     atomic: bool = Field(
         default=False,
         description=(
-            "True when partial clipping changes the meaning of the region, for "
-            "example a text or UI state. Atomic regions are treated as hard cores."
+            "True only when partial clipping destroys the meaning of the "
+            "region, so that no crop is better than a tight one: rendered "
+            "text, a UI state, a logo, a readout. Atomic regions are hard "
+            "cores demanding full visibility, and an aspect where every "
+            "candidate declares one is abandoned rather than cropped. A "
+            "subject that still reads when its edges leave frame -- a person, "
+            "a held product, a face in a group -- is not atomic. Say that with "
+            "atomic false and a minimum_visible_fraction instead."
         ),
     )
     minimum_visible_fraction: float | None = Field(
@@ -3670,10 +3676,14 @@ class FramingRegionIntent(StrictModel):
         gt=0.0,
         le=1.0,
         description=(
-            "Smallest readable share of a non-atomic region. Leave this unset "
-            "when atomic is true: an atomic region is fully visible by "
-            "definition, so any fraction below 1.0 contradicts it and is "
-            "rejected."
+            "Smallest share of the region that still carries its meaning, for "
+            "a region that survives partial clipping. This is the normal way "
+            "to express importance: prefer atomic false with a fraction here "
+            "over declaring a region atomic, because a fraction lets the crop "
+            "be planned while an atomic region can only be honoured or "
+            "abandoned. Leave unset only when atomic is true, where full "
+            "visibility is already implied and any fraction below 1.0 "
+            "contradicts it."
         ),
     )
     observable_relations: list[str] = Field(default_factory=list)
