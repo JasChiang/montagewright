@@ -33,6 +33,7 @@ from jascue_auto.reframe import (
     build_handoff_path,
     build_sweep_path,
     build_zoom_path,
+    observations_from_sam,
 )
 from jascue_auto.renderer import RenderResult, render
 from jascue_auto.schema import EDL, DegradationStep
@@ -41,6 +42,11 @@ from jascue_auto.schema import EDL, DegradationStep
 # costs a fraction of a cent. Interpolation covers the gaps; SAM propagation
 # replaces this when per-frame accuracy starts to matter.
 SUBJECT_SAMPLES = 5
+
+# Analysis rate for mask propagation. Four a second catches a gesture starting
+# and finishing; the cost is roughly ten seconds of wall time per shot, which
+# is worth it against interpolating between samples 0.6 seconds apart.
+TRACK_FPS = 4.0
 
 
 @dataclass
@@ -124,12 +130,58 @@ def _sample_frames(
     return frames, times
 
 
+def _track_subject(
+    source: Source,
+    clip,
+    subject_description: str,
+    seed_box: list[int],
+    checkpoint: Path,
+    work: Path,
+) -> tuple[list[Observation], dict[str, int]]:
+    """Propagate a Gemini seed across every analysed frame of the shot."""
+
+    from jascue_video_lab.sam_tracking import track_bbox_sam21
+
+    track = track_bbox_sam21(
+        video_path=source.path,
+        checkpoint_path=checkpoint,
+        seed_time_ms=int(clip.approx_in_seconds * 1000) + 100,
+        seed_box_2d=seed_box,
+        target_description=subject_description,
+        output_dir=work / f"sam-{clip.clip_id}",
+        seed_source="gemini_frame_grounding",
+        analysis_fps=TRACK_FPS,
+        max_side=960,
+        allowed_start_ms=int(clip.approx_in_seconds * 1000),
+        allowed_end_ms=int(clip.approx_out_seconds * 1000),
+    )
+    return observations_from_sam(
+        track, clip_start_seconds=clip.approx_in_seconds
+    )
+
+
+def _seed_box(box: dict[str, Any]) -> list[int]:
+    """Gemini's centre-and-size answer as the tracker's x-first 0..1000 box."""
+
+    half_w = float(box["width"]) / 2.0
+    half_h = float(box["height"]) / 2.0
+    centre_x = float(box["centre_x"])
+    centre_y = float(box["centre_y"])
+    return [
+        int(max(0.0, centre_x - half_w) * 1000),
+        int(max(0.0, centre_y - half_h) * 1000),
+        int(min(1.0, centre_x + half_w) * 1000),
+        int(min(1.0, centre_y + half_h) * 1000),
+    ]
+
+
 def follow_subjects(
     edl: EDL,
     sources: dict[str, Source],
     *,
     target_aspect: float,
     report: Report,
+    checkpoint: Path | None = None,
     client: Any | None = None,
 ) -> dict[str, CropPath]:
     """Build a crop path per shot that names a subject.
@@ -189,11 +241,42 @@ def follow_subjects(
                 continue
 
             if move in {"push_in", "pull_out"}:
+                # Push toward the subject, not toward the middle of the frame.
+                # Zooming on the geometric centre put a coin-against-a-hinge
+                # shot in the bottom third with 40% of the frame empty above
+                # it -- and a zoom is the only move that can change vertical
+                # framing at all when the crop is otherwise full height, so
+                # aiming it blindly wastes the one chance the shot has.
+                centre_x, centre_y = 0.5, 0.5
+                if reframe.subject is not None:
+                    frames, _ = _sample_frames(
+                        source,
+                        clip.approx_in_seconds,
+                        clip.approx_out_seconds,
+                        work,
+                    )
+                    boxes, usage = locate_subject(
+                        frames, reframe.subject.description, client=client
+                    )
+                    report.usages.append(usage)
+                    seen = [
+                        (float(b["centre_x"]), float(b["centre_y"]))
+                        for b in boxes
+                        if b.get("present") and b.get("centre_x") is not None
+                    ]
+                    if seen:
+                        centre_x = sum(x for x, _ in seen) / len(seen)
+                        centre_y = sum(y for _, y in seen) / len(seen)
+                        report.subject_notes[clip.clip_id] = (
+                            f"{move} on ({centre_x:.3f}, {centre_y:.3f})"
+                        )
                 paths[clip.clip_id] = build_zoom_path(
                     source_aspect=source.aspect_ratio,
                     target_aspect=target_aspect,
                     duration_seconds=duration,
                     direction=move,
+                    centre_x=centre_x,
+                    centre_y=centre_y,
                     energy=reframe.camera_energy,
                 )
                 report.following_shots += 1
@@ -264,12 +347,48 @@ def follow_subjects(
             if note:
                 report.subject_notes[clip.clip_id] = note
 
+            # Gemini said which subject; the tracker says where it goes. When
+            # a checkpoint is available the trajectory is measured per frame
+            # rather than interpolated between five samples.
+            if checkpoint is not None and boxes:
+                seed = next(
+                    (
+                        box
+                        for box in boxes
+                        if box.get("present")
+                        and box.get("centre_x") is not None
+                    ),
+                    None,
+                )
+                if seed is not None:
+                    try:
+                        tracked, states = _track_subject(
+                            source,
+                            clip,
+                            reframe.subject.description,
+                            _seed_box(seed),
+                            checkpoint,
+                            work,
+                        )
+                    except Exception as error:  # tracking is an optimisation
+                        report.subject_notes[clip.clip_id] = (
+                            f"tracking unavailable, using sampled positions: "
+                            f"{type(error).__name__}"
+                        )
+                    else:
+                        if tracked:
+                            observations = tracked
+                            report.subject_notes[clip.clip_id] = (
+                                f"tracked {states}"
+                            )
+
             path = build_crop_path(
                 observations,
                 source_aspect=source.aspect_ratio,
                 target_aspect=target_aspect,
                 energy=reframe.camera_energy,
                 clip_id=clip.clip_id,
+                min_visible=reframe.subject.min_visible,
                 degradations=report.degradations,
             )
             paths[clip.clip_id] = path
@@ -328,6 +447,7 @@ def run(
     target_aspect: float,
     intent: str,
     music: Path | None = None,
+    checkpoint: Path | None = None,
     decide_rhythm_first: bool = True,
     client: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
@@ -358,6 +478,7 @@ def run(
         sources,
         target_aspect=target_aspect,
         report=report,
+        checkpoint=checkpoint,
         client=client,
     )
 

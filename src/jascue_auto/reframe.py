@@ -660,37 +660,44 @@ def ffmpeg_crop_expression(
 
 
 def observations_from_sam(
-    track: dict,
+    track,
     *,
     clip_start_seconds: float,
-) -> list[Observation]:
-    """Read a SAM propagation result as subject observations.
+    accept_states: frozenset[str] = frozenset({"tracked"}),
+) -> tuple[list[Observation], dict[str, int]]:
+    """Read a propagated track as subject observations.
 
-    Sampling five frames and interpolating between them, which is what this
-    replaces, describes a three-second shot at one point every 0.6 seconds and
-    guesses the rest. A subject that crosses the frame and comes back inside
-    one sample interval is invisible to that, and so is the moment a hand
-    enters and takes the subject with it.
+    Sampling five frames and interpolating, which this replaces, describes a
+    three-second shot at one point every 0.6 seconds and guesses the rest. A
+    subject that crosses the frame and returns inside one sample interval is
+    invisible to that.
 
-    SAM propagates a single seed box across every analysed frame, so the
-    trajectory is measured rather than inferred. The seed still comes from
-    Gemini, because knowing which of two similar handsets is meant is not
-    something a tracker can answer.
+    Samples the tracker itself flagged as lost are dropped rather than
+    averaged in. A mask that has drifted onto the background still reports a
+    box, and feeding that to the crop is how a camera ends up following the
+    wrong thing confidently. The counts come back so the caller can say how
+    much of the shot was actually tracked.
+
+    The seed still comes from Gemini: which of two similar handsets is meant
+    is not a question a tracker can answer.
     """
 
     observations: list[Observation] = []
-    for sample in track.get("samples", []):
-        geometry = sample.get("geometry") or {}
-        box = geometry.get("normalized_box_xyxy") or sample.get("box_2d")
+    states: dict[str, int] = {}
+    for sample in getattr(track, "samples", []) or []:
+        state = getattr(sample.tracking_state, "value", str(sample.tracking_state))
+        states[state] = states.get(state, 0) + 1
+        if state not in accept_states:
+            continue
+        box = sample.derived_tracking_box
         if not box or len(box) != 4:
             continue
-        # The old package reports normalised boxes in 0..1000.
-        scale = 1000.0 if max(box) > 1.0 else 1.0
-        x0, y0, x1, y1 = (value / scale for value in box)
+        # The old package reports boxes as x-first 0..1000.
+        x0, y0, x1, y1 = (value / 1000.0 for value in box)
         width, height = abs(x1 - x0), abs(y1 - y0)
         if width <= 0 or height <= 0:
             continue
-        at = float(sample.get("timeline_ms", 0)) / 1000.0 - clip_start_seconds
+        at = sample.analysis_sample_time_ms / 1000.0 - clip_start_seconds
         if at < 0:
             continue
         try:
@@ -704,7 +711,5 @@ def observations_from_sam(
                 )
             )
         except OutOfFrame:
-            # A mask that left the frame is not a reason to discard the rest
-            # of a measured track.
             continue
-    return observations
+    return observations, states
