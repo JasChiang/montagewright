@@ -98,6 +98,12 @@ SDK_NAME = "google-genai"
 _REQUEST_TIMEOUT_MS = int(
     os.environ.get("JASCUE_GEMINI_TIMEOUT_MS", str(10 * 60 * 1000))
 )
+# Output budget for the feature edit plan and its text-only repair. Sized to
+# clear a verbose 12-chapter Top-K answer with room to spare, because a plan
+# that runs past the ceiling is discarded whole rather than repaired.
+_PLAN_MAX_OUTPUT_TOKENS = int(
+    os.environ.get("JASCUE_PLAN_MAX_OUTPUT_TOKENS", str(49152))
+)
 SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION = (
     "selected-vertical-framing-normalization-v3"
 )
@@ -6330,7 +6336,13 @@ model_provenance (return it unchanged with interaction_id=null):
                     # truncated JSON document is not safely repairable from
                     # text because its missing chapters are editorial
                     # decisions, not representation errors.
-                    "max_output_tokens": 24576,
+                    #
+                    # Measured: the same 12-chapter brief answered in 17.4k
+                    # tokens on one run and hit 24559 of a 24576 ceiling on
+                    # the next, losing the whole paid plan mid-string. The
+                    # budget has to clear the verbose end of that spread, not
+                    # sit on its median.
+                    "max_output_tokens": _PLAN_MAX_OUTPUT_TOKENS,
                 },
                 "response_format": {
                     "type": "text",
@@ -6418,7 +6430,7 @@ model_provenance (return it unchanged with interaction_id=null):
                     **request_record,
                     "generation_config": {
                         "thinking_level": "minimal",
-                        "max_output_tokens": 24576,
+                        "max_output_tokens": _PLAN_MAX_OUTPUT_TOKENS,
                     },
                 }
                 repair_record["input"] = [
