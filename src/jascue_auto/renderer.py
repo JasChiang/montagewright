@@ -104,8 +104,18 @@ def _render_segment(
     """Cut one shot, cropping if the plan asked for it."""
 
     filters: list[str] = []
-    if segment.crop is not None:
-        source = segment.source
+    source = segment.source
+    if segment.crop_path is not None and not segment.crop_path.is_static:
+        # A following camera. The x expression is evaluated per frame, so the
+        # motion lives in the same filter as the crop rather than in a
+        # separate command stream.
+        from jascue_auto.reframe import ffmpeg_crop_expression
+
+        x_expr, y_expr, width, height = ffmpeg_crop_expression(
+            segment.crop_path, source.width, source.height
+        )
+        filters.append(f"crop={width}:{height}:'{x_expr}':{y_expr}")
+    elif segment.crop is not None:
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)
         filters.append(f"crop={width}:{height}:{x}:{y}")
 

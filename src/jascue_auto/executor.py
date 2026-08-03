@@ -23,7 +23,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 from jascue_auto.schema import EDL, Clip, DegradationStep
+
+if TYPE_CHECKING:  # a runtime import would make the two modules circular
+    from jascue_auto.reframe import CropPath
 
 # One safety margin, applied once, at the end. The old code added a little
 # padding at detection, a little more at tracking, and more again at
@@ -95,6 +100,9 @@ class Segment:
     in_seconds: float
     out_seconds: float
     crop: CropBox | None = None
+    # Set when the camera follows a subject. `crop` stays populated with the
+    # opening position so anything reading a single box still works.
+    crop_path: "CropPath | None" = None
 
     @property
     def duration_seconds(self) -> float:
@@ -177,6 +185,7 @@ def plan_render(
     sources: dict[str, Source],
     *,
     target_aspect: float | None = None,
+    crop_paths: "dict[str, CropPath] | None" = None,
 ) -> RenderPlan:
     """Compile an EDL into segments. Never returns fewer than it was given.
 
@@ -202,7 +211,14 @@ def plan_render(
             clip, source, degradations, notes
         )
         crop = None
-        if target_aspect is not None:
+        path = (crop_paths or {}).get(clip.clip_id)
+        if path is not None:
+            # A followed subject supersedes the coarse anchor: the path was
+            # built from where the subject actually was, not from a nine-box
+            # guess. `crop` keeps the opening position so a caller reading one
+            # box still sees something sensible.
+            crop = path.keyframes[0].crop
+        elif target_aspect is not None:
             crop = _resolve_crop(
                 clip, source, target_aspect, degradations
             )
@@ -213,6 +229,7 @@ def plan_render(
                 in_seconds=in_seconds,
                 out_seconds=out_seconds,
                 crop=crop,
+                crop_path=path,
             )
         )
 
