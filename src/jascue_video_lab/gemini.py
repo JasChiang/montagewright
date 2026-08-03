@@ -92,6 +92,12 @@ from .storage import append_error, read_json, utc_now, write_json
 MODEL_ID = os.environ.get("JASCUE_GEMINI_MODEL", "gemini-3.6-flash")
 API_NAME = "gemini_interactions"
 SDK_NAME = "google-genai"
+# Bounded per-request read timeout. Generation calls normally settle well
+# inside this window; the cap only exists so a stalled response surfaces as a
+# failed request the caller can retry rather than blocking a batch forever.
+_REQUEST_TIMEOUT_MS = int(
+    os.environ.get("JASCUE_GEMINI_TIMEOUT_MS", str(10 * 60 * 1000))
+)
 SELECTED_VERTICAL_FRAMING_NORMALIZATION_VERSION = (
     "selected-vertical-framing-normalization-v3"
 )
@@ -2094,10 +2100,14 @@ class GeminiLabClient:
             raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required for live Gemini calls")
         # Keep paid request cardinality explicit. Candidate routing owns any
         # later user-initiated retry; the SDK must not hide extra attempts.
+        # A bounded read timeout keeps a silently stalled response an
+        # observable error instead of an unbounded hang; long batch runs
+        # otherwise block forever on a connection the server never answers.
         self.client = genai.Client(
             api_key=resolved_key,
             http_options=types.HttpOptions(
-                retry_options=types.HttpRetryOptions(attempts=1)
+                timeout=_REQUEST_TIMEOUT_MS,
+                retry_options=types.HttpRetryOptions(attempts=1),
             ),
         )
         self.model_id = model_id
