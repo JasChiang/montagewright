@@ -189,6 +189,14 @@ class Reframe(ModelFacing):
         default="",
         description="The move in words: hold, follow, ease in on the hands.",
     )
+    then_subject: Subject | None = Field(
+        default=None,
+        description=(
+            "A second subject this shot hands over to. The pipeline splits "
+            "the shot in two rather than changing target mid-move, so both "
+            "halves get a frame that commits to one thing."
+        ),
+    )
     camera_energy: CameraEnergy = Field(
         default="calm",
         description=(

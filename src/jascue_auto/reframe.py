@@ -38,6 +38,13 @@ ENERGY_LIMITS: dict[CameraEnergy, dict[str, float]] = {
 # Movement below this is invisible and only adds jitter, so the camera holds.
 DEADBAND = 0.02
 
+# How much of a subject's travel has to end up as net displacement before the
+# camera commits to following it. A subject that steps out and comes back
+# inside one short shot has gone nowhere; an operator watching that holds the
+# frame, and a camera that chases each swing reads as a wobble rather than a
+# move. Below this the shot is framed on where the subject spent its time.
+MIN_DIRECTNESS = 0.6
+
 
 class OutOfFrame(ValueError):
     """An observation that is not in normalised coordinates.
@@ -222,15 +229,51 @@ def build_crop_path(
         # right answer, so no degradation is recorded.
         return CropPath([Keyframe(observations[0].seconds, crop_at(_percentile(centres, 0.5)))])
 
+    wandered = sum(
+        abs(later.centre_x - earlier.centre_x)
+        for earlier, later in zip(observations, observations[1:])
+    )
+    net = abs(centres[-1] - centres[0])
+    directness = net / wandered if wandered > 1e-9 else 0.0
+    if directness < MIN_DIRECTNESS:
+        # The subject moved but did not go anywhere. Hold on where it spent
+        # its time rather than retracing each swing. This is a framing
+        # decision, not a fallback, so nothing is recorded as degraded.
+        return CropPath(
+            [
+                Keyframe(
+                    observations[0].seconds,
+                    crop_at(_percentile(centres, 0.5)),
+                )
+            ]
+        )
+
     raw: list[Keyframe] = []
     for index, observation in enumerate(observations):
         # Lead the subject in its direction of travel so it is not pinned to
-        # the trailing edge of the frame.
+        # the trailing edge of the frame. The size of that lead scales with
+        # how fast the subject is actually going.
+        #
+        # Taking only the sign of the drift, as this did first, gives a
+        # subject creeping by a thousandth of a frame the same full-magnitude
+        # lead as one crossing it -- and then swings the crop by twice that
+        # the moment the subject pauses or drifts back. A shot of a nearly
+        # still product measured a subject travel of 0.100 and a crop travel
+        # of 0.158, reversing once on the way. It reads as the camera
+        # wobbling, because that is what it is.
         if index + 1 < len(observations):
-            drift = observations[index + 1].centre_x - observation.centre_x
+            neighbour = observations[index + 1]
         else:
-            drift = observation.centre_x - observations[index - 1].centre_x
-        lead = limits["lead"] * crop_width * (1.0 if drift > 0 else -1.0)
+            neighbour = observations[index - 1]
+        span = max(abs(neighbour.seconds - observation.seconds), 1e-6)
+        drift = neighbour.centre_x - observation.centre_x
+        if index + 1 >= len(observations):
+            drift = -drift  # looking backwards; the direction of travel flips
+        speed = drift / span
+        # Full lead at the energy's top speed, proportionally less below it,
+        # and nothing at all when the subject is effectively parked.
+        share = max(-1.0, min(1.0, speed / limits["max_speed"]))
+        lead = limits["lead"] * crop_width * share
         raw.append(Keyframe(observation.seconds, crop_at(observation.centre_x, lead)))
 
     limited, peak_speed = _limit_speed(raw, limits)

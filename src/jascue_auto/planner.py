@@ -653,6 +653,28 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                             "enum": ["low", "medium", "high"],
                         },
                         "why": {"type": "string"},
+                        "then_subject": {
+                            "type": "string",
+                            "description": (
+                                "When the shot should carry the eye from one "
+                                "subject to a second one -- two handsets "
+                                "compared, a row of models introduced in turn "
+                                "-- name the second subject here, described "
+                                "so it can be told from the first. Local code "
+                                "splits the shot in two and frames each half "
+                                "on its own subject, because a camera that "
+                                "changes target mid-move loses both. Omit "
+                                "when one subject carries the whole shot."
+                            ),
+                        },
+                        "then_subject_position": {
+                            "type": "string",
+                            "enum": [
+                                "top_left", "top_center", "top_right",
+                                "mid_left", "center", "mid_right",
+                                "bottom_left", "bottom_center", "bottom_right",
+                            ],
+                        },
                     },
                 },
             },

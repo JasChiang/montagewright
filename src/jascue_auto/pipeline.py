@@ -264,3 +264,42 @@ def run(
 
     result = render(plan, output_dir, music=music, keep_segments=False)
     return result, plan, report, edl
+
+
+def split_handoffs(edl: EDL) -> EDL:
+    """Turn a two-subject shot into two shots, each with one subject.
+
+    A camera cannot follow one thing and then another inside a single move
+    without losing both: the first subject is abandoned mid-gesture and the
+    second is arrived at late. Splitting at the plan layer gives each half its
+    own frame and its own follow, and the join between them is a cut, which is
+    how an editor carries the eye from one thing to the next anyway.
+
+    Each half keeps the parent's rhythm decision, halved, so a handoff costs
+    the same screen time it was given.
+    """
+
+    rewritten: list[Any] = []
+    for clip in edl.clips:
+        reframe = clip.reframe
+        second = getattr(reframe, "then_subject", None) if reframe else None
+        if reframe is None or second is None:
+            rewritten.append(clip)
+            continue
+
+        midpoint = (clip.approx_in_seconds + clip.approx_out_seconds) / 2.0
+        first_half = clip.model_copy(
+            update={
+                "clip_id": f"{clip.clip_id}a",
+                "approx_out_seconds": midpoint,
+            }
+        )
+        second_half = clip.model_copy(
+            update={
+                "clip_id": f"{clip.clip_id}b",
+                "approx_in_seconds": midpoint,
+                "reframe": reframe.model_copy(update={"subject": second}),
+            }
+        )
+        rewritten += [first_half, second_half]
+    return edl.model_copy(update={"clips": rewritten})
