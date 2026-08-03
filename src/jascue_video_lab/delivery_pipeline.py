@@ -1481,12 +1481,31 @@ def _prepare_fresh_autonomous_direct_plan(
     )
     plan_limits = policy.gemini_limits.candidate_reel_plan
     repair_limits = policy.gemini_limits.text_only_schema_repair
-    maximum_candidate_video_ms = _maximum_candidate_video_budget_ms(
-        budget_ledger=budget_ledger,
-        music_duration_ms=music_duration_ms,
-        estimated_text_tokens=direct_plan_text_tokens,
-        max_output_tokens=plan_limits.max_output_tokens,
-        thinking_level=plan_limits.thinking_level,
+    required = (
+        plan_dir / "feature_edit_plan.json",
+        plan_dir / "selected-clip-card-evidence.json",
+        plan_dir / "feature-plan.external-projection.json",
+    )
+    reuse_existing_direct_plan = all(path.is_file() for path in required) and (
+        _direct_plan_binds_current_shortlist(
+            plan_dir=plan_dir,
+            shortlist_path=shortlist_path,
+        )
+    )
+    # A completed hash-bound plan is a zero-paid resume input.  Determine that
+    # before asking the ledger whether it can reserve a hypothetical new
+    # multimodal call; otherwise a run that failed after planning could become
+    # impossible to resume even though no new dispatch was needed.
+    maximum_candidate_video_ms = (
+        0
+        if reuse_existing_direct_plan
+        else _maximum_candidate_video_budget_ms(
+            budget_ledger=budget_ledger,
+            music_duration_ms=music_duration_ms,
+            estimated_text_tokens=direct_plan_text_tokens,
+            max_output_tokens=plan_limits.max_output_tokens,
+            thinking_level=plan_limits.thinking_level,
+        )
     )
     plan_command = [
         sys.executable,
@@ -1522,17 +1541,7 @@ def _prepare_fresh_autonomous_direct_plan(
                 str(music_path.expanduser().resolve(strict=True)),
             ]
         )
-    required = (
-        plan_dir / "feature_edit_plan.json",
-        plan_dir / "selected-clip-card-evidence.json",
-        plan_dir / "feature-plan.external-projection.json",
-    )
-    if all(path.is_file() for path in required) and (
-        _direct_plan_binds_current_shortlist(
-            plan_dir=plan_dir,
-            shortlist_path=shortlist_path,
-        )
-    ):
+    if reuse_existing_direct_plan:
         planning_usage = {
             "request_count": 0,
             "reuse_status": "validated_existing_direct_plan_artifacts",

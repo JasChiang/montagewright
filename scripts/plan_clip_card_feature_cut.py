@@ -73,6 +73,7 @@ from jascue_video_lab.gemini import (
 from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
     AttentionObservation,
+    CandidateVisualEventSupport,
     EvidenceOriginObservation,
     FeatureChapterSelect,
     FeatureEditBrief,
@@ -545,6 +546,16 @@ class ClipCardFeatureCandidateV3(StrictModel):
         "editorial_reprise",
     ] = "none"
     horizontal_source_reuse_justification: str | None = None
+    visual_event_support: list[CandidateVisualEventSupport] | None = Field(
+        default=None,
+        max_length=8,
+    )
+    editorial_fulfillment_intent: Literal[
+        "contextual_identity",
+        "visible_state",
+        "visible_result",
+        "direct_demonstration",
+    ] | None = None
     # A legacy dual-aspect representation retains both field sets even for
     # single-aspect delivery.  These flags prevent those neutral shadows from
     # becoming executable candidate frontiers for the unrequested aspect.
@@ -612,6 +623,10 @@ class ClipCardFeatureCandidateV3(StrictModel):
 
     @model_validator(mode="after")
     def validate_candidate(self) -> "ClipCardFeatureCandidateV3":
+        if self.visual_event_support is not None:
+            event_types = [row.event_type for row in self.visual_event_support]
+            if len(event_types) != len(set(event_types)):
+                raise ValueError("candidate visual-event support must be unique")
         if self.horizontal_source_reuse_mode == "none":
             if self.horizontal_source_reuse_justification is not None:
                 raise ValueError(
@@ -835,6 +850,16 @@ class DirectVideoHorizontalDecision(StrictModel):
     zoom_intent: Literal["none", "subtle", "detail"]
     camera_intent: VirtualCameraIntent
     focus_entity_index: int | None = Field(default=None, ge=1)
+    visual_event_support: list[CandidateVisualEventSupport] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+    editorial_fulfillment_intent: Literal[
+        "contextual_identity",
+        "visible_state",
+        "visible_result",
+        "direct_demonstration",
+    ] | None = None
     # Gemini declares the editorial meaning of photographed motion; local
     # analysis only measures it.  Keeping this symmetric with the vertical
     # decision prevents a horizontal route from silently treating a pan as a
@@ -858,6 +883,9 @@ class DirectVideoHorizontalDecision(StrictModel):
 
     @model_validator(mode="after")
     def validate_horizontal(self) -> "DirectVideoHorizontalDecision":
+        event_types = [row.event_type for row in self.visual_event_support]
+        if len(event_types) != len(set(event_types)):
+            raise ValueError("horizontal visual-event support must be unique")
         if self.source_reuse_mode == "none":
             if self.source_reuse_justification is not None:
                 raise ValueError(
@@ -929,6 +957,16 @@ class DirectVideoVerticalDecision(StrictModel):
         "context_detail",
         "emphasize",
     ] = "hold"
+    visual_event_support: list[CandidateVisualEventSupport] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+    editorial_fulfillment_intent: Literal[
+        "contextual_identity",
+        "visible_state",
+        "visible_result",
+        "direct_demonstration",
+    ] | None = None
     source_camera_motion_role: Literal[
         "static_or_negligible",
         "editorially_useful",
@@ -963,6 +1001,9 @@ class DirectVideoVerticalDecision(StrictModel):
 
     @model_validator(mode="after")
     def validate_vertical(self) -> "DirectVideoVerticalDecision":
+        event_types = [row.event_type for row in self.visual_event_support]
+        if len(event_types) != len(set(event_types)):
+            raise ValueError("vertical visual-event support must be unique")
         if self.source_reuse_mode == "none":
             if self.source_reuse_justification is not None:
                 raise ValueError("vertical reuse justification requires a typed reuse mode")
@@ -1439,18 +1480,71 @@ def direct_video_response_schema(
             else "Must be an empty array because 9:16 is not requested."
         )
     )
+    # A single-aspect request must not pay the provider's structured-output
+    # complexity budget for an executor schema that is contractually null.
+    # Keep the required null/empty keys on each chapter, but remove the
+    # unreachable object definition and its nested refs.  Persisted artifacts
+    # still use the full dual-aspect model after provider validation.
+    active_decision_names: tuple[str, ...]
+    if requested == ("16:9",):
+        properties["vertical"] = {
+            "type": "null",
+            "description": "Required key. Must be null because 9:16 is not requested.",
+        }
+        properties["vertical_alternates"] = {
+            "type": "array",
+            "items": {"type": "null"},
+            "description": "Required key. Must be empty because 9:16 is not requested.",
+        }
+        schema["$defs"].pop("DirectVideoVerticalDecision", None)
+        schema["$defs"].pop("DirectVideoAttentionStep", None)
+        active_decision_names = ("DirectVideoHorizontalDecision",)
+    elif requested == ("9:16",):
+        properties["horizontal"] = {
+            "type": "null",
+            "description": "Required key. Must be null because 16:9 is not requested.",
+        }
+        properties["horizontal_alternates"] = {
+            "type": "array",
+            "items": {"type": "null"},
+            "description": "Required key. Must be empty because 16:9 is not requested.",
+        }
+        schema["$defs"].pop("DirectVideoHorizontalDecision", None)
+        active_decision_names = ("DirectVideoVerticalDecision",)
+    else:
+        active_decision_names = (
+            "DirectVideoHorizontalDecision",
+            "DirectVideoVerticalDecision",
+        )
     # These conditional semantic authorities must be explicit in provider
     # output even though the persisted Pydantic models retain defaults for
     # backwards-compatible artifact replay.  Otherwise a schema-minimizing
     # response silently becomes ``unknown``/``none`` and only fails much
     # later, after selected-window work has already started.
-    for decision_name in (
-        "DirectVideoHorizontalDecision",
-        "DirectVideoVerticalDecision",
-    ):
+    for decision_name in active_decision_names:
         decision_schema = schema["$defs"][decision_name]
+        fulfillment_schema = decision_schema["properties"][
+            "editorial_fulfillment_intent"
+        ]
+        fulfillment_variants = fulfillment_schema.get("anyOf")
+        if isinstance(fulfillment_variants, list):
+            non_null_variants = [
+                variant
+                for variant in fulfillment_variants
+                if variant.get("type") != "null"
+            ]
+            if len(non_null_variants) != 1:
+                raise AssertionError(
+                    "editorial fulfillment response schema must have one "
+                    "non-null variant"
+                )
+            decision_schema["properties"][
+                "editorial_fulfillment_intent"
+            ] = non_null_variants[0]
         required = list(decision_schema.get("required", []))
         for field_name in (
+            "visual_event_support",
+            "editorial_fulfillment_intent",
             "source_camera_motion_role",
             "source_camera_motion_reason",
             "source_reuse_mode",
@@ -1754,6 +1848,12 @@ def validate_direct_video_plan_fulfillment(
         for offset, chapter in enumerate(shortlist.chapters)
     }
     selections: dict[str, EditorialBeatFulfillmentSelection] = {}
+    contracts_by_feature: dict[str, list[EditorialBeatContract]] = {}
+    for contract in contracts:
+        if contract.feature_id is not None:
+            contracts_by_feature.setdefault(contract.feature_id, []).append(
+                contract
+            )
     if "16:9" in requested_aspects:
         for shortlist_chapter, direct_chapter in zip(
             shortlist.chapters, plan.chapters, strict=True
@@ -1822,6 +1922,55 @@ def validate_direct_video_plan_fulfillment(
                     "direct plan has no Gemini-authorised executable 9:16 "
                     f"candidate for {shortlist_chapter.feature_id}"
                 )
+    for shortlist_chapter, direct_chapter in zip(
+        shortlist.chapters, plan.chapters, strict=True
+    ):
+        if direct_chapter.evidence_status == "not_found":
+            continue
+        requested_event_types = {
+            event.event_type
+            for contract in contracts_by_feature.get(
+                shortlist_chapter.feature_id, ()
+            )
+            for alternative in contract.effective_fulfillment_alternatives
+            for event in alternative.visual_events
+        }
+        if not requested_event_types:
+            continue
+        aspect_decisions = {
+            "16:9": (
+                (direct_chapter.horizontal,)
+                + tuple(direct_chapter.horizontal_alternates)
+            ),
+            "9:16": (
+                (direct_chapter.vertical,)
+                + tuple(direct_chapter.vertical_alternates)
+            ),
+        }
+        for aspect in requested_aspects:
+            for decision in aspect_decisions[aspect]:
+                if decision is None:
+                    continue
+                assessed = (
+                    {
+                        row.event_type
+                        for row in decision.visual_event_support
+                    }
+                    if decision.visual_event_support is not None
+                    else set()
+                )
+                missing = sorted(requested_event_types - assessed)
+                if missing or decision.editorial_fulfillment_intent is None:
+                    raise ValueError(
+                        "direct plan omitted candidate event/fulfillment support: "
+                        f"{shortlist_chapter.feature_id}/{aspect}/"
+                        f"rank-{decision.candidate_rank:02d}:"
+                        + (
+                            ",".join(missing)
+                            if missing
+                            else "editorial_fulfillment_intent"
+                        )
+                    )
     for contract in contracts:
         if contract.priority != "hard" or contract.feature_id is None:
             continue
@@ -2207,6 +2356,39 @@ def canonicalize_direct_video_edit_plan_output(
                 if isinstance(alternate, dict)
             )
         for decision_path, decision in horizontal_decisions:
+            if decision.get("strategy") == "original":
+                for field_name, normalized_value, rule in (
+                    (
+                        "zoom_intent",
+                        "none",
+                        "explicit_original_strategy_disables_zoom",
+                    ),
+                    (
+                        "camera_intent",
+                        "hold",
+                        "explicit_original_strategy_holds_virtual_camera",
+                    ),
+                    (
+                        "focus_entity_index",
+                        None,
+                        "explicit_original_strategy_has_no_focus_entity",
+                    ),
+                ):
+                    before = decision.get(field_name)
+                    if before == normalized_value:
+                        continue
+                    decision[field_name] = normalized_value
+                    changes.append(
+                        {
+                            "json_path": (
+                                f"chapters[{chapter_index}].{decision_path}."
+                                f"{field_name}"
+                            ),
+                            "before": before,
+                            "after": normalized_value,
+                            "rule": rule,
+                        }
+                    )
             for vertical_only_field in (
                 "required_entity_indices",
                 "preferred_entity_indices",
@@ -3772,6 +3954,8 @@ def project_direct_video_edit_plan(
                 "editorial_reprise",
             ] = "none"
             horizontal_source_reuse_justification: str | None = None
+            visual_event_support: list[CandidateVisualEventSupport] | None = None
+            editorial_fulfillment_intent: str | None = None
             vertical_strategy: Literal[
                 "tracked_crop", "fit_with_background"
             ] = "fit_with_background"
@@ -3842,6 +4026,13 @@ def project_direct_video_edit_plan(
                 horizontal_source_reuse_justification = (
                     horizontal_candidate_decision.source_reuse_justification
                 )
+                if "16:9" in requested_aspects:
+                    visual_event_support = list(
+                        horizontal_candidate_decision.visual_event_support
+                    )
+                    editorial_fulfillment_intent = (
+                        horizontal_candidate_decision.editorial_fulfillment_intent
+                    )
                 horizontal_focus_entity_id = (
                     resolve_entity_indices(
                         source_asset_id=shortlisted.source_asset_id,
@@ -3860,6 +4051,35 @@ def project_direct_video_edit_plan(
                     f"decision for {brief_chapter.feature_id}/rank-{rank:02d}"
                 )
             if vertical_decision is not None:
+                if "9:16" in requested_aspects:
+                    if (
+                        visual_event_support is not None
+                        and visual_event_support
+                        != list(vertical_decision.visual_event_support)
+                    ):
+                        raise ValueError(
+                            "direct-video aspect decisions disagree about candidate "
+                            "visual-event support"
+                        )
+                    if visual_event_support is None:
+                        visual_event_support = list(
+                            vertical_decision.visual_event_support
+                        )
+                    if (
+                        editorial_fulfillment_intent is not None
+                        and vertical_decision.editorial_fulfillment_intent
+                        is not None
+                        and editorial_fulfillment_intent
+                        != vertical_decision.editorial_fulfillment_intent
+                    ):
+                        raise ValueError(
+                            "direct-video aspect decisions disagree about candidate "
+                            "editorial fulfillment intent"
+                        )
+                    if editorial_fulfillment_intent is None:
+                        editorial_fulfillment_intent = (
+                            vertical_decision.editorial_fulfillment_intent
+                        )
                 vertical_strategy = vertical_decision.strategy
                 aspect_suitability = (
                     vertical_decision.aspect_suitability
@@ -3931,6 +4151,10 @@ def project_direct_video_edit_plan(
                     horizontal_source_reuse_mode=horizontal_source_reuse_mode,
                     horizontal_source_reuse_justification=(
                         horizontal_source_reuse_justification
+                    ),
+                    visual_event_support=visual_event_support,
+                    editorial_fulfillment_intent=(
+                        editorial_fulfillment_intent
                     ),
                     horizontal_authorized=(
                         "16:9" in requested_aspects
@@ -4881,6 +5105,10 @@ def project_feature_contracts_v3(
                 source_camera_motion_reason=(
                     candidate.source_camera_motion_reason
                 ),
+                visual_event_support=candidate.visual_event_support,
+                editorial_fulfillment_intent=(
+                    candidate.editorial_fulfillment_intent
+                ),
                 physical_scale_comparison=(
                     candidate.physical_scale_comparison
                 ),
@@ -5004,6 +5232,10 @@ def project_feature_contracts_v3(
                         ),
                         source_camera_motion_reason=(
                             candidate.horizontal_source_camera_motion_reason
+                        ),
+                        visual_event_support=candidate.visual_event_support,
+                        editorial_fulfillment_intent=(
+                            candidate.editorial_fulfillment_intent
                         ),
                         source_reuse_mode=(
                             candidate.horizontal_source_reuse_mode
@@ -6304,6 +6536,21 @@ illustrative, must preserve the listed degradation/copy-suppression limits,
 and must not claim an exact transition or direct function result. Preserve
 immutable candidate IDs. Return not_found only when no candidate reaches the
 minimum tier. Exact frame IDs are resolved downstream.
+
+For every requested-aspect primary and alternate, `visual_event_support` must
+contain one row for every visual event type named by that chapter's contracts.
+Use `observed_present` only when the bounded candidate video directly shows
+that event; a static person, product, UI, or result does not prove an action
+apex, state change, result start, or reaction peak. Use `observed_absent` when
+the bounded video visibly lacks it and `uncertain` when sampling/evidence is
+insufficient. These are coarse semantic observations, not timestamps; local
+exact-frame resolution remains mandatory for any selected present event.
+Also set `editorial_fulfillment_intent` to the one contract alternative this
+candidate is meant to fulfill. A related product/environment empty shot may
+use `contextual_identity` only when the compiled contract/policy offers that
+alternative; it remains illustrative and cannot claim a specific action,
+transition, or result. Do not label static product presence as
+`direct_demonstration` merely because it is physically in front of the camera.
 
 """
         + json.dumps(

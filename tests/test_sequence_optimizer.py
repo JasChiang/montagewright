@@ -43,6 +43,7 @@ from jascue_video_lab.sequence_optimizer import (
     select_next_compatible_route,
     solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
+    validate_cumulative_music_boundary_bindings,
 )
 
 
@@ -1425,6 +1426,101 @@ def test_ranked_routes_include_bounded_duration_recovery_execution() -> None:
             assert selection.candidate_id in result.option_bindings_by_beat[
                 selection.beat_id
             ]
+
+
+def test_pre_render_duration_variant_rejects_internal_music_boundary_drift() -> None:
+    """Equal total runtime is insufficient when an internal cue is bound."""
+
+    opening = CandidateRouteOption(
+        beat_id="opening",
+        candidate_id="opening-a",
+        source_asset_id="sha256:" + "a" * 64,
+        source_clip_id="clip-a",
+        event_id="opening-event",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=6_500,
+        minimum_readable_ms=5_000,
+        preferred_readable_ms=6_500,
+        maximum_readable_ms=8_000,
+        safe_capacity_ms=10_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=10_000,
+        source_anchor_ms=5_000,
+        candidate_timing_sha256="a" * 64,
+        cue_id="downbeat-06500",
+        cue_aligned=True,
+        exit_cue_time_ms=6_500,
+    )
+    closing = CandidateRouteOption(
+        beat_id="closing",
+        candidate_id="closing-a",
+        source_asset_id="sha256:" + "b" * 64,
+        source_clip_id="clip-b",
+        event_id="closing-event",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=3_500,
+        minimum_readable_ms=2_000,
+        preferred_readable_ms=3_500,
+        maximum_readable_ms=3_500,
+        safe_capacity_ms=9_000,
+        safe_window_start_ms=0,
+        safe_window_end_ms=9_000,
+        source_anchor_ms=0,
+        candidate_timing_sha256="b" * 64,
+        cue_id="ending-10000",
+        cue_aligned=True,
+        exit_cue_time_ms=10_000,
+    )
+
+    result = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(opening,)),
+            CandidateRouteBeat(beat_id="closing", options=(closing,)),
+        ),
+        target_duration_ms=10_000,
+        cue_tolerance_ms=0,
+    )
+
+    assert {
+        tuple(selection.trim_duration_ms for selection in route.selections)
+        for route in result.ranked_routes
+    } == {(6_500, 3_500)}
+
+
+def test_pre_render_cumulative_music_boundary_binding_accepts_exact_vector() -> None:
+    option = CandidateRouteOption(
+        beat_id="payoff",
+        candidate_id="payoff-a",
+        source_asset_id="sha256:" + "c" * 64,
+        source_clip_id="clip-c",
+        event_id="payoff-event",
+        planner_rank=1,
+        semantic_confidence=0.9,
+        trim_duration_ms=4_000,
+        minimum_readable_ms=4_000,
+        preferred_readable_ms=4_000,
+        maximum_readable_ms=4_000,
+        fixed_source_in_ms=0,
+        fixed_source_out_ms=4_000,
+        candidate_timing_sha256="c" * 64,
+        cue_id="ending-04000",
+        cue_aligned=True,
+        exit_cue_time_ms=4_000,
+    )
+
+    result = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="payoff", options=(option,)),),
+        target_duration_ms=4_000,
+        cue_tolerance_ms=0,
+    )
+
+    validate_cumulative_music_boundary_bindings(
+        result.selections,
+        cue_tolerance_ms=0,
+    )
+    assert result.selections[0].exit_cue_time_ms == 4_000
 
 
 def test_duration_recovery_frontier_is_locally_bounded() -> None:

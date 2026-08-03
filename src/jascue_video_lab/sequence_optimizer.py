@@ -11,7 +11,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from .autonomous_policy import AutonomousEditPolicy
-from .models import FrozenStrictModel
+from .models import CandidateVisualEventSupport, FrozenStrictModel
 
 
 BeatPriority = Literal["hard", "preferred", "optional"]
@@ -593,12 +593,25 @@ class CandidateRouteOption(FrozenStrictModel):
     maximum_readable_ms: int = Field(default=1, gt=0)
     cue_id: str = Field(default="no-music", min_length=1)
     cue_aligned: bool = True
+    # ``cue_id`` identifies the editorial exit, but a name alone cannot prove
+    # that a later duration redistribution still lands on that exit.  When a
+    # production music boundary is available, bind its output-timeline time as
+    # part of the immutable candidate option.  Legacy/no-music callers may
+    # leave this unset without changing their previous behavior.
+    exit_cue_time_ms: int | None = Field(default=None, ge=0)
     presentation_mode: PresentationMode = "source_hold"
     entry_composition: str = Field(default="unresolved", min_length=1)
     exit_composition: str = Field(default="unresolved", min_length=1)
     technical_quality: float = Field(default=0.5, ge=0.0, le=1.0)
     preflight_hard_failures: tuple[str, ...] = ()
     preflight_deferred_gates: tuple[str, ...] = ()
+    visual_event_support: tuple[CandidateVisualEventSupport, ...] | None = None
+    editorial_fulfillment_intent: Literal[
+        "contextual_identity",
+        "visible_state",
+        "visible_result",
+        "direct_demonstration",
+    ] | None = None
     source_clip_id: str | None = Field(default=None, min_length=1)
     safe_capacity_ms: int | None = Field(default=None, gt=0)
     safe_window_start_ms: int | None = Field(default=None, ge=0)
@@ -615,12 +628,20 @@ class CandidateRouteOption(FrozenStrictModel):
 
     @model_validator(mode="after")
     def validate_editorial_bounds(self) -> "CandidateRouteOption":
+        if self.visual_event_support is not None:
+            event_types = [row.event_type for row in self.visual_event_support]
+            if len(event_types) != len(set(event_types)):
+                raise ValueError("candidate visual-event support must be unique")
         if not (
             self.minimum_readable_ms
             <= self.preferred_readable_ms
             <= self.maximum_readable_ms
         ):
             raise ValueError("pre-render readability bounds must be ordered")
+        if self.exit_cue_time_ms is not None and not self.cue_aligned:
+            raise ValueError(
+                "an exit cue time requires a cue-aligned candidate option"
+            )
         if not (
             self.minimum_readable_ms
             <= self.trim_duration_ms
@@ -707,6 +728,7 @@ class CandidateRouteSelection(FrozenStrictModel):
     trim_duration_ms: int = Field(gt=0)
     cue_id: str
     cue_aligned: bool
+    exit_cue_time_ms: int | None = Field(default=None, ge=0)
     presentation_mode: PresentationMode
     entry_composition: str
     exit_composition: str
@@ -723,6 +745,10 @@ class CandidateRouteSelection(FrozenStrictModel):
 
     @model_validator(mode="after")
     def validate_source_interval(self) -> "CandidateRouteSelection":
+        if self.exit_cue_time_ms is not None and not self.cue_aligned:
+            raise ValueError(
+                "an exit cue time requires a cue-aligned candidate selection"
+            )
         boundaries = (self.source_in_ms, self.source_out_ms)
         if any(value is not None for value in boundaries):
             if any(value is None for value in boundaries):
@@ -736,6 +762,48 @@ class CandidateRouteSelection(FrozenStrictModel):
                     "candidate source interval must match trim duration"
                 )
         return self
+
+
+def validate_cumulative_music_boundary_bindings(
+    selections: Sequence[CandidateRouteSelection],
+    *,
+    cue_tolerance_ms: int,
+) -> None:
+    """Prove that every bound music exit survives duration allocation.
+
+    Candidate selection happens before render, but candidate-duration variants
+    can move an internal cut while preserving the same total project length.
+    A cue ID is not enough to protect against that drift.  This shared
+    validator checks the cumulative project end of each cue-bound beat against
+    its immutable output-timeline cue time.  It is deliberately reusable by
+    pre-render optimization, semantic rebuild, and post-render reconciliation.
+
+    A missing ``exit_cue_time_ms`` retains compatibility for legacy/no-music
+    selections.  Production callers that set a concrete cue time receive a
+    fail-closed check even when their total duration is unchanged.
+    """
+
+    if cue_tolerance_ms < 0:
+        raise ValueError("cue tolerance must be non-negative")
+    cursor_ms = 0
+    failures: list[str] = []
+    for selection in selections:
+        cursor_ms += selection.trim_duration_ms
+        if (
+            not selection.cue_aligned
+            or selection.exit_cue_time_ms is None
+        ):
+            continue
+        delta_ms = cursor_ms - selection.exit_cue_time_ms
+        if abs(delta_ms) > cue_tolerance_ms:
+            failures.append(
+                f"{selection.beat_id}:music_boundary_cue_miss:"
+                f"{selection.cue_id}:expected={selection.exit_cue_time_ms}:"
+                f"actual={cursor_ms}:delta={delta_ms}:"
+                f"tolerance={cue_tolerance_ms}"
+            )
+    if failures:
+        raise ValueError(";".join(failures))
 
 
 class CandidateCompleteRoute(FrozenStrictModel):
@@ -1405,6 +1473,24 @@ def _allocate_candidate_route_durations(
         ):
             return None
         return durations
+    # The upstream semantic rhythm solver already owns the editorial dwell
+    # vector.  When that exact vector reaches the requested project length,
+    # preserve it as the primary allocation.  Rebuilding from minima here
+    # used to move internal music boundaries even though the total duration
+    # stayed unchanged.
+    resolved = tuple(option.trim_duration_ms for option in options)
+    if (
+        sum(resolved) == target_duration_ms
+        and all(
+            minimum <= duration <= maximum
+            for duration, (minimum, _, maximum) in zip(
+                resolved,
+                resolved_bounds,
+                strict=True,
+            )
+        )
+    ):
+        return resolved
     minimum_total = sum(item[0] for item in resolved_bounds)
     maximum_total = sum(item[2] for item in resolved_bounds)
     if not minimum_total <= target_duration_ms <= maximum_total:
@@ -1931,10 +2017,17 @@ def candidate_route_execution_sha256(
         "source_clip_id": option.source_clip_id,
         "event_id": option.event_id,
         "candidate_timing_sha256": option.candidate_timing_sha256,
+        "visual_event_support": (
+            [row.model_dump(mode="json") for row in option.visual_event_support]
+            if option.visual_event_support is not None
+            else None
+        ),
+        "editorial_fulfillment_intent": option.editorial_fulfillment_intent,
         "duration_ms": duration_ms,
         "source_in_ms": source_in_ms,
         "source_out_ms": source_out_ms,
         "cue_id": option.cue_id,
+        "exit_cue_time_ms": option.exit_cue_time_ms,
         "presentation_mode": option.presentation_mode,
         "reuse_mode": option.reuse_mode,
         "reuse_justification": option.reuse_justification,
@@ -1973,6 +2066,7 @@ def _candidate_route_selection(
         trim_duration_ms=duration_ms,
         cue_id=option.cue_id,
         cue_aligned=option.cue_aligned,
+        exit_cue_time_ms=option.exit_cue_time_ms,
         presentation_mode=option.presentation_mode,
         entry_composition=option.entry_composition,
         exit_composition=option.exit_composition,
@@ -2189,6 +2283,7 @@ def _candidate_complete_route(
     target_duration_ms: int | None,
     max_panel_runtime_fraction: float | None,
     max_editorial_reprise_overlap_fraction: float,
+    cue_tolerance_ms: int | None = None,
     durations_ms: Sequence[int] | None = None,
     primary_durations_ms: Sequence[int] | None = None,
 ) -> CandidateCompleteRoute | None:
@@ -2259,6 +2354,16 @@ def _candidate_complete_route(
         > max_panel_runtime_fraction + 1e-9
     ):
         return None
+    if cue_tolerance_ms is not None:
+        try:
+            validate_cumulative_music_boundary_bindings(
+                selections,
+                cue_tolerance_ms=cue_tolerance_ms,
+            )
+        except ValueError:
+            # A route that preserves total runtime but drifts an internal
+            # cue-bound exit is not an executable music-led route.
+            return None
     route_payload = {
         "contract_version": "candidate-complete-route-v1",
         "candidate_execution_sha256s": [
@@ -2394,6 +2499,7 @@ def optimize_pre_render_candidate_route(
     max_editorial_reprise_overlap_fraction: float = 0.5,
     max_ranked_routes: int | None = None,
     max_duration_variants_per_route: int = 16,
+    cue_tolerance_ms: int | None = None,
 ) -> CandidateRouteResult:
     """Build an executable frontier without making editorial substitutions.
 
@@ -2449,6 +2555,8 @@ def optimize_pre_render_candidate_route(
         raise ValueError(
             "max duration variants per route must be positive"
         )
+    if cue_tolerance_ms is not None and cue_tolerance_ms < 0:
+        raise ValueError("cue tolerance must be non-negative")
     states = [_CandidateRouteState()]
     for beat in beats:
         feasible_options = [
@@ -2573,6 +2681,7 @@ def optimize_pre_render_candidate_route(
                 max_editorial_reprise_overlap_fraction=(
                     max_editorial_reprise_overlap_fraction
                 ),
+                cue_tolerance_ms=cue_tolerance_ms,
                 durations_ms=durations_ms,
                 primary_durations_ms=primary_durations_ms,
             )
@@ -2697,6 +2806,7 @@ def rebuild_route_with_semantic_authorities(
     max_panel_runtime_fraction: float | None = None,
     target_duration_ms: int | None = None,
     max_editorial_reprise_overlap_fraction: float = 0.5,
+    cue_tolerance_ms: int | None = None,
 ) -> CandidateCompleteRoute:
     """Rebuild one full route after Gemini makes a bounded replan decision.
 
@@ -2794,6 +2904,8 @@ def rebuild_route_with_semantic_authorities(
                 or frozen_execution.source_clip_id != option.source_clip_id
                 or frozen_execution.cue_id != option.cue_id
                 or frozen_execution.cue_aligned != option.cue_aligned
+                or frozen_execution.exit_cue_time_ms
+                != option.exit_cue_time_ms
                 or frozen_execution.presentation_mode != option.presentation_mode
                 or frozen_execution.entry_composition != option.entry_composition
                 or frozen_execution.exit_composition != option.exit_composition
@@ -2847,6 +2959,7 @@ def rebuild_route_with_semantic_authorities(
         max_editorial_reprise_overlap_fraction=(
             max_editorial_reprise_overlap_fraction
         ),
+        cue_tolerance_ms=cue_tolerance_ms,
         max_ranked_routes=1,
     )
     route = rebuilt.ranked_routes[0]

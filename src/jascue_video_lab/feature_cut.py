@@ -126,6 +126,7 @@ from .music_assembly import (
 )
 from .multi_tracking import validate_segmentation_track_alignment
 from .models import (
+    CandidateVisualEventSupport,
     EvidenceApprovalSource,
     EvidenceAspectConstraintV2,
     EvidenceClaimSource,
@@ -266,6 +267,7 @@ from .sequence_optimizer import (
     optimize_pre_render_candidate_route,
     solve_semantic_rhythm_durations,
     solve_music_aligned_boundaries,
+    validate_cumulative_music_boundary_bindings,
 )
 from .storage import read_json, utc_now, write_json
 
@@ -1564,6 +1566,12 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
         "target": "FeatureEditPlan",
         "module": "scripts.plan_clip_card_feature_cut",
         "source_model": "DirectVideoEditPlan",
+        "response_schema_factory": "direct_video_response_schema",
+        "response_schema_variants": [
+            ["16:9"],
+            ["9:16"],
+            ["16:9", "9:16"],
+        ],
         "canonicalizer": "canonicalize_direct_video_edit_plan_output",
         "source_plan_has_model_provenance": False,
         "projector": "reproject_direct_video_edit_plan",
@@ -1782,10 +1790,33 @@ def _validate_external_projection_semantics(
     request_schema = (
         response_format.get("schema") if isinstance(response_format, dict) else None
     )
-    expected_source_schema = gemini_response_schema(source_model)
-    if not _structured_schema_is_backward_compatible(
-        request_schema,
-        expected_source_schema,
+    expected_source_schemas = [gemini_response_schema(source_model)]
+    response_schema_factory_name = contract.get("response_schema_factory")
+    response_schema_variants = contract.get("response_schema_variants")
+    if response_schema_factory_name is not None:
+        response_schema_factory = getattr(
+            module,
+            response_schema_factory_name,
+            None,
+        )
+        if not callable(response_schema_factory) or not isinstance(
+            response_schema_variants, list
+        ):
+            raise ValueError(
+                "external projection response-schema registry is invalid"
+            )
+        expected_source_schemas.extend(
+            response_schema_factory(tuple(variant))
+            for variant in response_schema_variants
+            if isinstance(variant, list)
+            and all(isinstance(value, str) for value in variant)
+        )
+    if not any(
+        _structured_schema_is_backward_compatible(
+            request_schema,
+            expected_source_schema,
+        )
+        for expected_source_schema in expected_source_schemas
     ):
         raise ValueError(
             "external projection source request schema does not match its "
@@ -13764,28 +13795,131 @@ def _pre_render_music_exit_by_feature(
             exits[chapter.feature_id] = {
                 "cue_id": "no-music",
                 "cue_aligned": True,
+                "exit_cue_time_ms": None,
             }
         elif row is not None:
             cue_id = row.get("music_cue_id")
+            cue_aligned = bool(row.get("music_snap_applied")) or (
+                row.get("music_snap_rejected_reason") == "content_locked"
+            )
+            resolved_boundary_ms = row.get("resolved_boundary_ms")
             exits[chapter.feature_id] = {
                 "cue_id": (
                     str(cue_id)
                     if cue_id is not None
                     else f"content-exit:{chapter.feature_id}"
                 ),
-                "cue_aligned": bool(row.get("music_snap_applied"))
-                or row.get("music_snap_rejected_reason") == "content_locked",
+                "cue_aligned": cue_aligned,
+                "exit_cue_time_ms": (
+                    int(resolved_boundary_ms)
+                    if cue_aligned
+                    and isinstance(resolved_boundary_ms, (int, float))
+                    else None
+                ),
             }
         else:
+            is_timeline_end = index == len(plan.chapters) - 1
+            timeline_end_ms = duration_audit.get("project_timeline_end_ms")
             exits[chapter.feature_id] = {
                 "cue_id": (
                     "music-timeline-end"
-                    if index == len(plan.chapters) - 1
+                    if is_timeline_end
                     else f"unresolved-exit:{chapter.feature_id}"
                 ),
-                "cue_aligned": index == len(plan.chapters) - 1,
+                "cue_aligned": is_timeline_end,
+                "exit_cue_time_ms": (
+                    int(timeline_end_ms)
+                    if is_timeline_end
+                    and isinstance(timeline_end_ms, (int, float))
+                    else None
+                ),
             }
     return exits
+
+
+def _policy_cue_tolerance_ms(policy: Any, *, fps: int = 30) -> int:
+    """Convert the autonomous sync ceiling to project milliseconds."""
+
+    sync = getattr(policy, "sync", None)
+    tolerance_frames = int(getattr(sync, "hard_tolerance_frames", 2))
+    return round(tolerance_frames * 1000 / fps)
+
+
+def _validate_runtime_route_music_boundaries(
+    *,
+    route: CandidateRouteResult | None,
+    reconciliation: Any,
+    cue_tolerance_ms: int,
+) -> dict[str, Any]:
+    """Recheck immutable cut cues against rendered PTS durations.
+
+    Pre-render validation proves the planned duration vector.  Exact source
+    PTS quantization and a locally measured shorter interval can still move a
+    downstream cut, so delivery needs the same proof over the reconciled
+    runtime durations.  This check never selects another cue.
+    """
+
+    if route is None:
+        return {
+            "contract_version": "runtime-music-boundary-validation-v1",
+            "status": "not_applicable",
+            "reason": "no_pre_render_route",
+            "cue_tolerance_ms": cue_tolerance_ms,
+            "boundaries": [],
+        }
+    runtime_by_beat = {
+        segment.beat_id: segment for segment in reconciliation.segments
+    }
+    if set(runtime_by_beat) != {
+        selection.beat_id for selection in route.selections
+    }:
+        raise FeatureCutSystemFailure(
+            "runtime music-boundary validation route/segment set changed"
+        )
+    runtime_selections = tuple(
+        selection.model_copy(
+            update={
+                "trim_duration_ms": runtime_by_beat[
+                    selection.beat_id
+                ].resolved_duration_ms,
+                "source_in_ms": None,
+                "source_out_ms": None,
+                "candidate_execution_sha256": None,
+            }
+        )
+        for selection in route.selections
+    )
+    validate_cumulative_music_boundary_bindings(
+        runtime_selections,
+        cue_tolerance_ms=cue_tolerance_ms,
+    )
+    cursor_ms = 0
+    boundaries: list[dict[str, Any]] = []
+    for selection in runtime_selections:
+        cursor_ms += selection.trim_duration_ms
+        if selection.exit_cue_time_ms is None:
+            continue
+        boundaries.append(
+            {
+                "beat_id": selection.beat_id,
+                "cue_id": selection.cue_id,
+                "expected_project_end_ms": selection.exit_cue_time_ms,
+                "actual_project_end_ms": cursor_ms,
+                "delta_ms": cursor_ms - selection.exit_cue_time_ms,
+                "passed": (
+                    abs(cursor_ms - selection.exit_cue_time_ms)
+                    <= cue_tolerance_ms
+                ),
+            }
+        )
+    return {
+        "contract_version": "runtime-music-boundary-validation-v1",
+        "status": "passed",
+        "cue_tolerance_ms": cue_tolerance_ms,
+        "route_total_duration_ms": route.total_duration_ms,
+        "runtime_total_duration_ms": reconciliation.resolved_total_duration_ms,
+        "boundaries": boundaries,
+    }
 
 
 def _vertical_candidate_composition_signature(
@@ -14160,6 +14294,9 @@ def _build_pre_render_vertical_candidate_route(
                 cue_aligned=cue_by_id[chapter.feature_id][
                     "cue_aligned"
                 ],
+                exit_cue_time_ms=cue_by_id[chapter.feature_id][
+                    "exit_cue_time_ms"
+                ],
                 presentation_mode=(
                     candidate_feasibility[candidate.candidate_id][0]
                 ),
@@ -14184,6 +14321,15 @@ def _build_pre_render_vertical_candidate_route(
                 ),
                 preflight_deferred_gates=(
                     candidate_feasibility[candidate.candidate_id][2]
+                ),
+                visual_event_support=(
+                    tuple(getattr(candidate, "visual_event_support", ()))
+                    if getattr(candidate, "visual_event_support", None)
+                    is not None
+                    else None
+                ),
+                editorial_fulfillment_intent=getattr(
+                    candidate, "editorial_fulfillment_intent", None
                 ),
                 source_clip_id=(
                     str(timing["source_clip_id"])
@@ -14252,6 +14398,7 @@ def _build_pre_render_vertical_candidate_route(
         max_editorial_reprise_overlap_fraction=(
             policy.editorial.max_editorial_reprise_overlap_fraction
         ),
+        cue_tolerance_ms=_policy_cue_tolerance_ms(policy),
     )
 
 
@@ -14363,6 +14510,7 @@ def _initial_horizontal_primary_route_conflict_frontier(
                 trim_duration_ms=primary.trim_duration_ms,
                 cue_id=primary.cue_id,
                 cue_aligned=primary.cue_aligned,
+                exit_cue_time_ms=primary.exit_cue_time_ms,
                 presentation_mode=primary.presentation_mode,
                 entry_composition=primary.entry_composition,
                 exit_composition=primary.exit_composition,
@@ -14643,6 +14791,9 @@ def _build_pre_render_horizontal_candidate_route(
                 ),
                 cue_id=cue_by_id[chapter.feature_id]["cue_id"],
                 cue_aligned=cue_by_id[chapter.feature_id]["cue_aligned"],
+                exit_cue_time_ms=cue_by_id[chapter.feature_id][
+                    "exit_cue_time_ms"
+                ],
                 presentation_mode=(
                     "source_hold"
                     if candidate.strategy == "original"
@@ -14661,6 +14812,15 @@ def _build_pre_render_horizontal_candidate_route(
                     1.0 - len(candidate.quality_risks) * 0.06,
                 ),
                 preflight_hard_failures=tuple(dict.fromkeys(hard_failures)),
+                visual_event_support=(
+                    tuple(getattr(candidate, "visual_event_support", ()))
+                    if getattr(candidate, "visual_event_support", None)
+                    is not None
+                    else None
+                ),
+                editorial_fulfillment_intent=getattr(
+                    candidate, "editorial_fulfillment_intent", None
+                ),
                 source_clip_id=(
                     str(timing["source_clip_id"])
                     if timing.get("source_clip_id") is not None
@@ -14748,12 +14908,14 @@ def _build_pre_render_horizontal_candidate_route(
             max_editorial_reprise_overlap_fraction=(
                 policy.editorial.max_editorial_reprise_overlap_fraction
             ),
+            cue_tolerance_ms=_policy_cue_tolerance_ms(policy),
         )
     except ValueError as error:
         if not str(error).startswith(
             (
                 "candidate route has no options for beat ",
                 "pre-render sequence frontier has no hard-safe option for ",
+                "pre-render sequence frontier has no route inside duration and ",
             )
         ):
             raise
@@ -15242,6 +15404,7 @@ def _materialize_resolved_frontier_route(
             trim_duration_ms=source_out_ms - source_in_ms,
             cue_id=base_selection.cue_id,
             cue_aligned=base_selection.cue_aligned,
+            exit_cue_time_ms=base_selection.exit_cue_time_ms,
             presentation_mode=presentation_mode,
             entry_composition=base_selection.entry_composition,
             exit_composition=base_selection.exit_composition,
@@ -15598,6 +15761,7 @@ def _apply_pre_render_complete_route_executions(
             trim_duration_ms=duration_ms,
             cue_id=primary.cue_id,
             cue_aligned=primary.cue_aligned,
+            exit_cue_time_ms=primary.exit_cue_time_ms,
             presentation_mode=option.presentation_mode,
             entry_composition=option.entry_composition,
             exit_composition=option.exit_composition,
@@ -15798,6 +15962,463 @@ def _horizontal_primary_clean_recovery_root(editorial_dir: Path) -> Path:
     return editorial_dir / "horizontal-primary-clean-recovery"
 
 
+def _horizontal_primary_dirty_edge_duration_reconciliation_root(
+    editorial_dir: Path,
+) -> Path:
+    """Keep bounded duration reconciliation separate from semantic recovery."""
+
+    return editorial_dir / "horizontal-primary-dirty-edge-duration-reconciliation"
+
+
+def _horizontal_replan_failure_clean_interval_ms(
+    failure_facts: Sequence[Mapping[str, Any]],
+) -> tuple[int, int] | None:
+    """Intersect reliable dirty-edge clean intervals from one execution."""
+
+    clean_heads: list[int] = []
+    clean_tails: list[int] = []
+    for fact in failure_facts:
+        evidence = fact.get("source_camera_motion_evidence")
+        if not isinstance(evidence, Mapping) or not bool(
+            evidence.get("reliable", False)
+        ):
+            continue
+        if not (
+            bool(evidence.get("dirty_head", False))
+            or bool(evidence.get("dirty_tail", False))
+        ):
+            continue
+        clean_head = evidence.get("clean_head_start_ms")
+        clean_tail = evidence.get("clean_tail_end_ms")
+        if (
+            isinstance(clean_head, int)
+            and isinstance(clean_tail, int)
+            and 0 <= clean_head < clean_tail
+        ):
+            clean_heads.append(clean_head)
+            clean_tails.append(clean_tail)
+    if not clean_heads or not clean_tails:
+        return None
+    clean_interval = max(clean_heads), min(clean_tails)
+    return clean_interval if clean_interval[0] < clean_interval[1] else None
+
+
+def _horizontal_locked_cue_project_ends(
+    selections: Sequence[CandidateRouteSelection],
+) -> tuple[dict[str, Any], ...]:
+    """Project only cue-aligned boundaries into immutable project time."""
+
+    project_end_ms = 0
+    boundaries: list[dict[str, Any]] = []
+    for selection in selections:
+        project_end_ms += selection.trim_duration_ms
+        if selection.cue_aligned:
+            boundaries.append(
+                {
+                    "beat_id": selection.beat_id,
+                    "cue_id": selection.cue_id,
+                    "project_end_ms": project_end_ms,
+                }
+            )
+    return tuple(boundaries)
+
+
+def _selected_horizontal_route_option(
+    route: CandidateRouteResult,
+    selection: CandidateRouteSelection,
+) -> CandidateRouteOption | None:
+    """Load the current candidate binding without promoting any alternate."""
+
+    direct = route.option_bindings_by_beat.get(selection.beat_id, {}).get(
+        selection.candidate_id
+    )
+    if direct is not None:
+        return direct
+    return next(
+        (
+            binding.option
+            for binding in route.semantic_replan_candidate_bindings_by_beat.get(
+                selection.beat_id, ()
+            )
+            if binding.option.candidate_id == selection.candidate_id
+        ),
+        None,
+    )
+
+
+def _attempt_horizontal_primary_dirty_edge_duration_reconciliation(
+    *,
+    route: CandidateRouteResult,
+    failures_by_beat: Mapping[str, Sequence[Mapping[str, Any]]],
+    editorial_dir: Path,
+    policy: AutonomousEditPolicy,
+    plan_path: Path,
+) -> CandidateRouteResult | None:
+    """Shorten one dirty primary and redistribute only inside locked cues.
+
+    This remains a zero-paid execution repair.  The selected Gemini candidate,
+    beat order, cue IDs, cue alignment and presentation are immutable.  A
+    reliable clean interval may reduce one trim only when the released time can
+    be placed inside the same locked-cue segment and the complete route remains
+    source-time feasible.
+    """
+
+    _, decision_path = _horizontal_preflight_local_infeasibility_replan_paths(
+        editorial_dir
+    )
+    if decision_path.is_file() or not route.selections:
+        return None
+
+    selections = tuple(route.selections)
+    selections_by_beat = {selection.beat_id: selection for selection in selections}
+    selected_options = {
+        selection.beat_id: _selected_horizontal_route_option(route, selection)
+        for selection in selections
+    }
+    if any(option is None for option in selected_options.values()):
+        raise FeatureCutSystemFailure(
+            "horizontal dirty-edge duration reconciliation has no selected "
+            "candidate binding"
+        )
+    options_by_beat = {
+        beat_id: option
+        for beat_id, option in selected_options.items()
+        if option is not None
+    }
+    before_cue_ends = _horizontal_locked_cue_project_ends(selections)
+
+    for beat_id, raw_facts in sorted(failures_by_beat.items()):
+        selection = selections_by_beat.get(beat_id)
+        option = options_by_beat.get(beat_id)
+        facts = tuple(dict(row) for row in raw_facts)
+        if selection is None or option is None or not facts:
+            continue
+        if any(
+            str(row.get("candidate_id") or "") != selection.candidate_id
+            for row in facts
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal dirty-edge duration failure is not bound to its "
+                "selected candidate"
+            )
+        if (
+            option.fixed_source_in_ms is not None
+            or option.fixed_source_out_ms is not None
+            or option.safe_window_start_ms is None
+            or option.safe_window_end_ms is None
+            or option.source_anchor_ms is None
+        ):
+            continue
+        clean_interval = _horizontal_replan_failure_clean_interval_ms(facts)
+        if clean_interval is None:
+            continue
+        clean_start_ms = max(option.safe_window_start_ms, clean_interval[0])
+        clean_end_ms = min(option.safe_window_end_ms, clean_interval[1])
+        clean_capacity_ms = clean_end_ms - clean_start_ms
+        if not (
+            option.minimum_readable_ms
+            <= clean_capacity_ms
+            < selection.trim_duration_ms
+            and clean_start_ms <= option.source_anchor_ms < clean_end_ms
+        ):
+            continue
+
+        # The defective beat is fixed to the largest clean interval.  The
+        # existing route optimizer then assigns its released time only to
+        # other bounds in the same cue-delimited segment.
+        cleaned_option = option.model_copy(
+            update={
+                "trim_duration_ms": clean_capacity_ms,
+                "minimum_readable_ms": clean_capacity_ms,
+                "preferred_readable_ms": clean_capacity_ms,
+                "maximum_readable_ms": clean_capacity_ms,
+                "safe_capacity_ms": clean_capacity_ms,
+                "safe_window_start_ms": clean_start_ms,
+                "safe_window_end_ms": clean_end_ms,
+            }
+        )
+        reconciled_options = dict(options_by_beat)
+        reconciled_options[beat_id] = cleaned_option
+
+        # Every cue-aligned beat pins the cumulative project end at its
+        # original music boundary.  A segment ends at that cue; only the
+        # beats inside it may exchange duration.  The trailing uncued segment
+        # uses the closest policy-legal total to the old project duration.
+        segments: list[tuple[tuple[str, ...], int]] = []
+        segment_start = 0
+        for index, row in enumerate(selections):
+            if row.cue_aligned:
+                segment_rows = selections[segment_start : index + 1]
+                segments.append(
+                    (
+                        tuple(item.beat_id for item in segment_rows),
+                        sum(item.trim_duration_ms for item in segment_rows),
+                    )
+                )
+                segment_start = index + 1
+        if segment_start < len(selections):
+            trailing_rows = selections[segment_start:]
+            trailing_maximum_ms = sum(
+                reconciled_options[item.beat_id].maximum_readable_ms
+                for item in trailing_rows
+            )
+            desired_total_ms = min(route.total_duration_ms, sum(
+                reconciled_options[item.beat_id].maximum_readable_ms
+                for item in selections
+            ))
+            locked_total_ms = sum(target for _, target in segments)
+            segments.append(
+                (
+                    tuple(item.beat_id for item in trailing_rows),
+                    min(
+                        trailing_maximum_ms,
+                        max(0, desired_total_ms - locked_total_ms),
+                    ),
+                )
+            )
+
+        allocated_durations: dict[str, int] = {}
+        try:
+            for segment_beat_ids, segment_target_ms in segments:
+                # ``exit_cue_time_ms`` is expressed on the complete project
+                # timeline.  The bounded segment optimizer starts its local
+                # clock at zero, so carrying the global boundary into this
+                # temporary subproblem makes an otherwise valid duration
+                # exchange look off-cue.  Translate only the segment-ending
+                # cue for the local solve; the final whole-route rebuild below
+                # continues to use the original global cue binding.
+                local_segment_options = []
+                for segment_index, segment_beat_id in enumerate(
+                    segment_beat_ids
+                ):
+                    segment_option = reconciled_options[segment_beat_id]
+                    if segment_option.cue_aligned:
+                        if segment_index != len(segment_beat_ids) - 1:
+                            raise FeatureCutSystemFailure(
+                                "horizontal dirty-edge cue segment contains "
+                                "an internal locked boundary"
+                            )
+                        segment_option = segment_option.model_copy(
+                            update={"exit_cue_time_ms": segment_target_ms}
+                        )
+                    local_segment_options.append(
+                        CandidateRouteBeat(
+                            beat_id=segment_beat_id,
+                            options=(segment_option,),
+                        )
+                    )
+                segment_route = optimize_pre_render_candidate_route(
+                    tuple(local_segment_options),
+                    minimum_duration_ms=1,
+                    maximum_duration_ms=max(1, segment_target_ms),
+                    target_duration_ms=segment_target_ms,
+                    max_panel_runtime_fraction=None,
+                    max_editorial_reprise_overlap_fraction=(
+                        policy.editorial.max_editorial_reprise_overlap_fraction
+                    ),
+                    max_duration_variants_per_route=64,
+                )
+                allocated_durations.update(
+                    {
+                        row.beat_id: row.trim_duration_ms
+                        for row in segment_route.selections
+                    }
+                )
+            if set(allocated_durations) != set(selections_by_beat):
+                raise ValueError("reconciliation did not allocate every beat")
+            reconciled_route_options = tuple(
+                CandidateRouteBeat(
+                    beat_id=selection.beat_id,
+                    options=(
+                        reconciled_options[selection.beat_id].model_copy(
+                            update={
+                                "trim_duration_ms": allocated_durations[
+                                    selection.beat_id
+                                ],
+                                "minimum_readable_ms": allocated_durations[
+                                    selection.beat_id
+                                ],
+                                "preferred_readable_ms": allocated_durations[
+                                    selection.beat_id
+                                ],
+                                "maximum_readable_ms": allocated_durations[
+                                    selection.beat_id
+                                ],
+                            }
+                        ),
+                    ),
+                )
+                for selection in selections
+            )
+            reconciled_total_ms = sum(allocated_durations.values())
+            if not policy.duration.min_ms <= reconciled_total_ms <= policy.duration.max_ms:
+                continue
+            fixed_options = {
+                item.beat_id: route_option.options[0]
+                for item, route_option in zip(
+                    selections, reconciled_route_options, strict=True
+                )
+            }
+            rebuilt_selections: list[CandidateRouteSelection] = []
+            for prior_selection in selections:
+                duration_ms = allocated_durations[prior_selection.beat_id]
+                if (
+                    prior_selection.beat_id == beat_id
+                    and duration_ms == clean_capacity_ms
+                ):
+                    rebound = rebind_selected_candidate_execution(
+                        route,
+                        beat_id=beat_id,
+                        candidate_id=prior_selection.candidate_id,
+                        duration_ms=duration_ms,
+                        source_in_ms=clean_start_ms,
+                    )
+                elif duration_ms == prior_selection.trim_duration_ms:
+                    rebound = prior_selection
+                else:
+                    rebound = materialize_selected_candidate_execution(
+                        route,
+                        beat_id=prior_selection.beat_id,
+                        candidate_id=prior_selection.candidate_id,
+                        duration_ms=duration_ms,
+                    )
+                rebuilt_selections.append(
+                    rebound.model_copy(
+                        update={
+                            "decision_codes": (
+                                *prior_selection.decision_codes,
+                                "deterministic_dirty_edge_duration_reconciliation",
+                            )
+                        }
+                    )
+                )
+        except ValueError:
+            continue
+        if (
+            tuple(row.beat_id for row in rebuilt_selections)
+            != tuple(row.beat_id for row in selections)
+            or any(
+                (
+                    after.candidate_id != before.candidate_id
+                    or after.cue_id != before.cue_id
+                    or after.cue_aligned != before.cue_aligned
+                    or after.presentation_mode != before.presentation_mode
+                )
+                for before, after in zip(
+                    selections, rebuilt_selections, strict=True
+                )
+            )
+        ):
+            raise FeatureCutSystemFailure(
+                "horizontal dirty-edge duration reconciliation changed "
+                "immutable editorial bindings"
+            )
+        after_cue_ends = _horizontal_locked_cue_project_ends(
+            rebuilt_selections
+        )
+        if after_cue_ends != before_cue_ends:
+            continue
+
+        updated_option_bindings = {
+            route_beat_id: dict(bindings)
+            for route_beat_id, bindings in route.option_bindings_by_beat.items()
+        }
+        updated_semantic_bindings: dict[
+            str, tuple[SemanticReplanCandidateBinding, ...]
+        ] = {}
+        for route_beat_id, fixed_option in fixed_options.items():
+            updated_option_bindings.setdefault(route_beat_id, {})[
+                fixed_option.candidate_id
+            ] = fixed_option
+        for route_beat_id, bindings in (
+            route.semantic_replan_candidate_bindings_by_beat.items()
+        ):
+            updated_semantic_bindings[route_beat_id] = tuple(
+                binding.model_copy(update={"option": fixed_options[route_beat_id]})
+                if binding.option.candidate_id
+                == fixed_options[route_beat_id].candidate_id
+                else binding
+                for binding in bindings
+            )
+        reconciled_route = route.model_copy(
+            update={
+                "selections": tuple(rebuilt_selections),
+                "option_bindings_by_beat": updated_option_bindings,
+                # A pre-existing reuse/vector conflict may be the reason this
+                # route is about to enter scoped semantic recovery.  Duration
+                # reconciliation must not pretend that conflict is solved or
+                # let it prevent an otherwise valid same-candidate clean
+                # trim.  The next preflight/replan pass rebuilds the complete
+                # ranked route after resolving that independent conflict.
+                "total_duration_ms": reconciled_total_ms,
+                "ranked_routes": (),
+                "semantic_replan_candidate_bindings_by_beat": (
+                    updated_semantic_bindings
+                ),
+            }
+        )
+        evidence_hashes = sorted(
+            {
+                str(row.get("source_camera_motion_evidence_sha256"))
+                for row in facts
+                if re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(row.get("source_camera_motion_evidence_sha256") or ""),
+                )
+            }
+        )
+        record = {
+            "contract_version": (
+                "horizontal-primary-dirty-edge-duration-reconciliation-v1"
+            ),
+            "policy_reference": policy.policy_reference,
+            "plan_sha256": sha256_file(plan_path),
+            "route_definition_sha256_before": _pre_render_route_definition_sha256(
+                route
+            ),
+            "route_definition_sha256_after": _pre_render_route_definition_sha256(
+                reconciled_route
+            ),
+            "beat_id": beat_id,
+            "candidate_id": selection.candidate_id,
+            "clean_source_window_ms": {
+                "start": clean_start_ms,
+                "end": clean_end_ms,
+                "capacity": clean_capacity_ms,
+            },
+            "before_durations_ms": {
+                row.beat_id: row.trim_duration_ms for row in selections
+            },
+            "after_durations_ms": {
+                row.beat_id: row.trim_duration_ms
+                for row in reconciled_route.selections
+            },
+            "before_locked_cue_project_ends": list(before_cue_ends),
+            "after_locked_cue_project_ends": list(after_cue_ends),
+            "preserved_cue_ids": [row["cue_id"] for row in before_cue_ends],
+            "source_motion_evidence_sha256s": evidence_hashes,
+            "failure_facts": list(facts),
+        }
+        record_path = (
+            _horizontal_primary_dirty_edge_duration_reconciliation_root(
+                editorial_dir
+            )
+            / "records"
+            / beat_id
+            / f"{_stable_fingerprint(record)}.json"
+        )
+        if record_path.exists():
+            if read_json(record_path) != record:
+                raise FeatureCutSystemFailure(
+                    "horizontal dirty-edge duration reconciliation would "
+                    "overwrite evidence"
+                )
+        else:
+            write_json(record_path, record)
+        return reconciled_route
+    return None
+
+
 def _horizontal_primary_clean_recovery_records(
     *,
     editorial_dir: Path,
@@ -15965,6 +16586,7 @@ def _attempt_horizontal_primary_clean_window_recovery(
                 max_editorial_reprise_overlap_fraction=(
                     policy.editorial.max_editorial_reprise_overlap_fraction
                 ),
+                cue_tolerance_ms=_policy_cue_tolerance_ms(policy),
             )
             _validate_horizontal_frozen_replan_execution_vector(
                 rebuilt=rebuilt,
@@ -16111,6 +16733,7 @@ def _horizontal_replan_effective_execution_state(
     allowed_reuse_ids_by_option: Mapping[str, Mapping[str, Sequence[str]]],
     failure_records: Sequence[Mapping[str, Any]],
     policy: AutonomousEditPolicy,
+    selected_option_indexes_by_beat: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Advance only through Gemini's ordered options and bounded rebinds.
 
@@ -16126,6 +16749,17 @@ def _horizontal_replan_effective_execution_state(
     }
     records_by_option: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
     for record in failure_records:
+        # A global pair/vector conflict says only that exact combination was
+        # infeasible.  It must not permanently exhaust either semantic option;
+        # the bounded vector search below may pair it with a different
+        # Gemini-ordered fallback from another beat.
+        typed_classes = {
+            str(value) for value in record.get("typed_failure_classes", ())
+        }
+        if typed_classes and typed_classes <= {
+            "typed_horizontal_frozen_execution_reuse_conflict"
+        }:
+            continue
         key = (str(record["beat_id"]), str(record["selected_option_id"]))
         records_by_option.setdefault(key, []).append(record)
 
@@ -16134,6 +16768,7 @@ def _horizontal_replan_effective_execution_state(
     selected_executions: dict[str, CandidateRouteSelection] = {}
     selected_actions: dict[str, Mapping[str, Any]] = {}
     reuse_authorities: dict[str, SemanticReplanReuseAuthority] = {}
+    remaining_fallback_option_ids_by_beat: dict[str, tuple[str, ...]] = {}
     for decision in decisions:
         beat_id = str(decision["beat_id"])
         original = route_selection_by_beat.get(beat_id)
@@ -16150,7 +16785,19 @@ def _horizontal_replan_effective_execution_state(
                 "horizontal replan decision has duplicate ordered options"
             )
         chosen = False
-        for option_index, option_id in enumerate(option_order):
+        requested_index = (selected_option_indexes_by_beat or {}).get(beat_id)
+        if requested_index is not None:
+            if not 0 <= requested_index < len(option_order):
+                raise FeatureCutSystemFailure(
+                    "horizontal recovery option-vector index is outside the "
+                    "Gemini decision"
+                )
+            enumerated_options = (
+                (requested_index, option_order[requested_index]),
+            )
+        else:
+            enumerated_options = tuple(enumerate(option_order))
+        for option_index, option_id in enumerated_options:
             option_records = sorted(
                 records_by_option.get((beat_id, option_id), ()),
                 key=lambda row: int(row["candidate_execution_attempt_index"]),
@@ -16159,12 +16806,30 @@ def _horizontal_replan_effective_execution_state(
             if action is not None:
                 if option_records:
                     continue
+                action_candidate_id = str(action.get("candidate_id") or "")
+                try:
+                    action_execution = materialize_selected_candidate_execution(
+                        base_route,
+                        beat_id=beat_id,
+                        candidate_id=action_candidate_id,
+                        duration_ms=original.trim_duration_ms,
+                    )
+                except ValueError as error:
+                    raise FeatureCutSystemFailure(
+                        "horizontal motion-preservation action cannot restore "
+                        "its immutable candidate execution"
+                    ) from error
                 _validate_horizontal_motion_preservation_action(
                     action,
-                    selection=original,
+                    selection=action_execution,
                 )
                 selected_option_ids[beat_id] = option_id
+                selected_candidate_ids[beat_id] = action_candidate_id
+                selected_executions[beat_id] = action_execution
                 selected_actions[beat_id] = action
+                remaining_fallback_option_ids_by_beat[beat_id] = tuple(
+                    option_order[option_index + 1 :]
+                )
                 chosen = True
                 break
             candidate_id = option_id.removeprefix(beat_id + "--")
@@ -16255,6 +16920,9 @@ def _horizontal_replan_effective_execution_state(
             selected_option_ids[beat_id] = option_id
             selected_candidate_ids[beat_id] = candidate_id
             selected_executions[beat_id] = execution
+            remaining_fallback_option_ids_by_beat[beat_id] = tuple(
+                option_order[option_index + 1 :]
+            )
             if reuse_authority is not None:
                 reuse_authorities[beat_id] = reuse_authority
             chosen = True
@@ -16270,6 +16938,9 @@ def _horizontal_replan_effective_execution_state(
         "selected_executions": selected_executions,
         "selected_actions": selected_actions,
         "reuse_authorities": reuse_authorities,
+        "remaining_fallback_option_ids_by_beat": (
+            remaining_fallback_option_ids_by_beat
+        ),
     }
 
 
@@ -16341,32 +17012,54 @@ def _horizontal_infeasible_frozen_execution_conflicts(
                     failure_code = "editorial_reprise_overlap_exceeded"
             if failure_code is None:
                 continue
-            failures.setdefault(later.beat_id, []).append(
+            remaining = state.get(
+                "remaining_fallback_option_ids_by_beat", {}
+            )
+            if not isinstance(remaining, Mapping):
+                raise FeatureCutSystemFailure(
+                    "horizontal recovery state has no remaining fallback map"
+                )
+            # The constraint is owned by the later reuse declaration, but an
+            # already-exhausted later option cannot be advanced again.  When
+            # its conflicting peer still has a Gemini-ordered fallback,
+            # journal that peer's exact execution instead.  This is a hard
+            # feasibility cursor, not a local candidate choice: the next
+            # option remains exactly Gemini's supplied order.
+            failed = later
+            other = earlier
+            if (
+                not tuple(remaining.get(later.beat_id, ()))
+                and tuple(remaining.get(earlier.beat_id, ()))
+            ):
+                failed = earlier
+                other = later
+            failures.setdefault(failed.beat_id, []).append(
                 {
-                    "candidate_id": later.candidate_id,
+                    "candidate_id": failed.candidate_id,
                     "candidate_execution_sha256": (
-                        later.candidate_execution_sha256
+                        failed.candidate_execution_sha256
                     ),
                     "failure_class": (
                         "typed_horizontal_frozen_execution_reuse_conflict"
                     ),
                     "reason": failure_code,
+                    "constraint_owner_beat_id": later.beat_id,
                     "source_identity": {
-                        "source_clip_id": later.source_clip_id,
-                        "source_asset_id": later.source_asset_id,
+                        "source_clip_id": failed.source_clip_id,
+                        "source_asset_id": failed.source_asset_id,
                     },
                     "source_window_ms": {
-                        "start": later.source_in_ms,
-                        "end": later.source_out_ms,
+                        "start": failed.source_in_ms,
+                        "end": failed.source_out_ms,
                     },
-                    "other_beat_id": earlier.beat_id,
-                    "other_candidate_id": earlier.candidate_id,
+                    "other_beat_id": other.beat_id,
+                    "other_candidate_id": other.candidate_id,
                     "other_candidate_execution_sha256": (
-                        earlier.candidate_execution_sha256
+                        other.candidate_execution_sha256
                     ),
                     "other_source_window_ms": {
-                        "start": earlier.source_in_ms,
-                        "end": earlier.source_out_ms,
+                        "start": other.source_in_ms,
+                        "end": other.source_out_ms,
                     },
                     "overlap_ms": overlap_ms,
                 }
@@ -17225,6 +17918,50 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             policy=policy,
             plan_path=plan_path,
         )
+        selected_option_indexes: dict[str, int] | None = None
+        vector_path = context_path.parent / "frozen-execution-vector-search.json"
+        if vector_path.is_file():
+            vector = read_json(vector_path)
+            selected_option_ids = (
+                vector.get("selected_option_ids_by_beat")
+                if isinstance(vector, Mapping)
+                else None
+            )
+            if not isinstance(selected_option_ids, Mapping) or (
+                vector.get("context_sha256") != sha256_file(context_path)
+                or vector.get("decision_sha256") != sha256_file(decision_path)
+                or vector.get("policy_reference") != policy.policy_reference
+                or vector.get("selected_execution_vector_sha256")
+                != _stable_fingerprint(
+                    [
+                        selection.model_dump(mode="json")
+                        for selection in route.selections
+                    ]
+                )
+            ):
+                raise FeatureCutSystemFailure(
+                    "horizontal failure journal vector differs from its "
+                    "selected route"
+                )
+            selected_option_indexes = {}
+            for decision in recovery["decisions"]:
+                beat_id = str(decision["beat_id"])
+                option_order = (
+                    str(decision["selected_option_id"]),
+                    *(
+                        str(value)
+                        for value in decision.get("fallback_option_ids", ())
+                    ),
+                )
+                selected_option_id = str(selected_option_ids.get(beat_id) or "")
+                if selected_option_id not in option_order:
+                    raise FeatureCutSystemFailure(
+                        "horizontal failure journal vector selected an unknown "
+                        "Gemini option"
+                    )
+                selected_option_indexes[beat_id] = option_order.index(
+                    selected_option_id
+                )
         state = _horizontal_replan_effective_execution_state(
             base_route=recovery["base_route"],
             decisions=recovery["decisions"],
@@ -17234,6 +17971,7 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             ],
             failure_records=recovery["failure_records"],
             policy=policy,
+            selected_option_indexes_by_beat=selected_option_indexes,
         )
         state["failure_records"] = recovery["failure_records"]
         _append_horizontal_replan_execution_failure_records(
@@ -17305,22 +18043,47 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             for row in failures
             if isinstance(row.get("motion_preservation_action"), Mapping)
         }
-        if len(actions) > 1:
-            raise FeatureCutSystemFailure(
-                "horizontal preflight has conflicting motion-preservation "
-                "actions for one beat"
-            )
         for action_id, action in actions.items():
+            action_candidate_id = str(action.get("candidate_id") or "")
+            action_selection = selected
+            if action_candidate_id != selected.candidate_id:
+                try:
+                    action_selection = materialize_selected_candidate_execution(
+                        route,
+                        beat_id=beat_id,
+                        candidate_id=action_candidate_id,
+                        duration_ms=selected.trim_duration_ms,
+                    )
+                except ValueError as error:
+                    raise FeatureCutSystemFailure(
+                        "horizontal motion-preservation action is not bound to "
+                        "a retained immutable alternate execution"
+                    ) from error
             _validate_horizontal_motion_preservation_action(
                 action,
-                selection=selected,
+                selection=action_selection,
             )
             if action_id in motion_actions_by_option:
                 raise FeatureCutSystemFailure(
                     "horizontal motion-preservation action ID is duplicated"
                 )
             motion_actions_by_option[action_id] = action
-        eligible_ids = alternate_ids + tuple(actions)
+        failed_candidate_ids = {
+            str(row.get("candidate_id") or "")
+            for row in failures
+            if row.get("candidate_id")
+        }
+        # Every retained Top-K execution was measured before this sole paid
+        # decision. A candidate with a typed local failure is not offered as
+        # a raw fallback; a clean semantic-motion contradiction is represented
+        # only by its exact, hash-bound preserve action.
+        safe_alternate_ids = tuple(
+            option_id
+            for option_id in alternate_ids
+            if option_id.removeprefix(beat_id + "--")
+            not in failed_candidate_ids
+        )
+        eligible_ids = safe_alternate_ids + tuple(actions)
         if not eligible_ids:
             failure_root = context_path.parent
             write_json(
@@ -17475,9 +18238,11 @@ def _persist_preflight_horizontal_local_infeasibility_replan(
             "fulfillment, timing, exact-event, source-motion, SAM, or geometry "
             "gate. Choose exactly one supplied immutable option per affected "
             "beat using the whole timeline and music context. A "
-            "retain_primary_preserve_observed_motion option is an opaque action "
-            "ID, not a candidate fallback: it keeps the already bound primary "
-            "and permits source-hold only. This is the single scoped recovery "
+            "retain_primary_preserve_observed_motion is a historical opaque "
+            "action ID, not a request to invent a candidate. Each such action "
+            "binds the exact measured primary or Top-K alternate named in its "
+            "action evidence and permits source-hold only. This is the single "
+            "scoped recovery "
             "decision; do not invent media/time or request a local fallback.\n\n"
             + json.dumps(context, ensure_ascii=False)
         ),
@@ -17561,21 +18326,53 @@ def _restore_preflight_horizontal_local_replan(
     )
     base_route = recovery["base_route"]
     failure_records = list(recovery["failure_records"])
-    restore_pass_cap = _horizontal_recovery_pass_limit(
-        beat_count=len(recovery["decisions"]),
-        attempt_limit=policy.recovery.max_candidate_attempts_per_beat,
+    decisions_by_beat = {
+        str(decision["beat_id"]): decision
+        for decision in recovery["decisions"]
+    }
+    decision_beat_order = tuple(
+        selection.beat_id
+        for selection in base_route.selections
+        if selection.beat_id in decisions_by_beat
     )
-    for _restore_pass in range(restore_pass_cap):
-        state = _horizontal_replan_effective_execution_state(
-            base_route=base_route,
-            decisions=recovery["decisions"],
-            motion_actions_by_option=recovery["motion_actions_by_option"],
-            allowed_reuse_ids_by_option=recovery[
-                "allowed_reuse_ids_by_option"
-            ],
-            failure_records=failure_records,
-            policy=policy,
+    if set(decision_beat_order) != set(decisions_by_beat):
+        raise FeatureCutSystemFailure(
+            "horizontal replan decisions do not bind the whole route order"
         )
+    option_counts = tuple(
+        1 + len(decisions_by_beat[beat_id].get("fallback_option_ids", ()))
+        for beat_id in decision_beat_order
+    )
+    option_vectors = sorted(
+        product(*(range(count) for count in option_counts)),
+        key=lambda vector: (sum(vector), vector),
+    )
+    vector_attempts: list[dict[str, Any]] = []
+    for vector in option_vectors:
+        option_indexes = dict(zip(decision_beat_order, vector, strict=True))
+        try:
+            state = _horizontal_replan_effective_execution_state(
+                base_route=base_route,
+                decisions=recovery["decisions"],
+                motion_actions_by_option=recovery[
+                    "motion_actions_by_option"
+                ],
+                allowed_reuse_ids_by_option=recovery[
+                    "allowed_reuse_ids_by_option"
+                ],
+                failure_records=failure_records,
+                policy=policy,
+                selected_option_indexes_by_beat=option_indexes,
+            )
+        except CandidateKnownInfeasible as error:
+            vector_attempts.append(
+                {
+                    "option_indexes_by_beat": option_indexes,
+                    "status": "execution_exhausted",
+                    "reason": str(error),
+                }
+            )
+            continue
         selected_candidate_ids = state["selected_candidate_ids"]
         selected_motion_actions = state["selected_actions"]
         reuse_authorities = state["reuse_authorities"]
@@ -17610,6 +18407,7 @@ def _restore_preflight_horizontal_local_replan(
                 max_editorial_reprise_overlap_fraction=(
                     policy.editorial.max_editorial_reprise_overlap_fraction
                 ),
+                cue_tolerance_ms=_policy_cue_tolerance_ms(policy),
             )
             _validate_horizontal_frozen_replan_execution_vector(
                 rebuilt=rebuilt,
@@ -17617,90 +18415,70 @@ def _restore_preflight_horizontal_local_replan(
                 expected_total_duration_ms=base_route.total_duration_ms,
             )
         except ValueError as error:
-            current_by_beat = {
-                selection.beat_id: selection for selection in route.selections
-            }
-            changed_beats = [
-                beat_id
-                for beat_id, attempted in frozen_executions.items()
-                if (
-                    beat_id in state["selected_executions"]
-                    and (
-                        current_by_beat.get(beat_id) is None
-                        or current_by_beat[
-                            beat_id
-                        ].candidate_execution_sha256
-                        != attempted.candidate_execution_sha256
-                    )
-                )
-            ]
-            # A single measured execution may become globally infeasible
-            # after its dirty-head rebind (for example, by exceeding an
-            # already-authorized source-reuse overlap).  That is a typed hard
-            # failure of this exact execution, so advance only this beat to
-            # Gemini's next ordered fallback.  Multiple simultaneous changes
-            # would require a new cross-beat semantic choice and remain
-            # fail-closed under the one-replan policy.
-            if len(changed_beats) != 1:
-                raise FeatureCutSystemFailure(
-                    "horizontal preflight selected alternates cannot preserve "
-                    "the complete frozen execution vector"
-                ) from error
-            failed_beat = changed_beats[0]
-            attempted_route = base_route.model_copy(
-                update={
-                    "selections": tuple(
-                        frozen_executions[selection.beat_id]
-                        for selection in base_route.selections
-                    )
+            vector_attempts.append(
+                {
+                    "option_indexes_by_beat": option_indexes,
+                    "selected_option_ids_by_beat": state[
+                        "selected_option_ids"
+                    ],
+                    "status": "global_vector_infeasible",
+                    "reason": str(error),
                 }
             )
-            state["failure_records"] = failure_records
-            _append_horizontal_replan_execution_failure_records(
-                route=attempted_route,
-                base_route=base_route,
-                context_path=context_path,
-                decision_path=decision_path,
-                plan_path=plan_path,
-                policy=policy,
-                failure_facts_by_beat={
-                    failed_beat: (
-                        {
-                            "candidate_id": frozen_executions[
-                                failed_beat
-                            ].candidate_id,
-                            "failure_class": (
-                                "typed_global_route_reuse_or_policy_failure"
-                            ),
-                            "reason": str(error),
-                        },
-                    )
-                },
-                state=state,
-            )
-            failure_records = _load_horizontal_replan_execution_failure_records(
-                context_path=context_path,
-                decision_path=decision_path,
-                plan_path=plan_path,
-                policy=policy,
-                option_ids_by_beat=recovery["option_ids_by_beat"],
-            )
             continue
+        vector_attempts.append(
+            {
+                "option_indexes_by_beat": option_indexes,
+                "selected_option_ids_by_beat": state[
+                    "selected_option_ids"
+                ],
+                "status": "selected_first_globally_feasible",
+            }
+        )
         break
     else:
-        raise FeatureCutSystemFailure(
-            "horizontal preflight frozen-route recovery pass cap exhausted"
+        write_json(
+            context_path.parent / "frozen-execution-vector-search.json",
+            {
+                "contract_version": (
+                    "horizontal-frozen-execution-vector-search-v1"
+                ),
+                "context_sha256": sha256_file(context_path),
+                "decision_sha256": sha256_file(decision_path),
+                "policy_reference": policy.policy_reference,
+                "option_vector_count": len(option_vectors),
+                "attempts": vector_attempts,
+                "status": "no_globally_feasible_vector",
+                "generated_at": utc_now(),
+            },
         )
+        raise CandidateKnownInfeasible(
+            "horizontal Gemini-authorized option vectors have no globally "
+            "feasible execution"
+        )
+    write_json(
+        context_path.parent / "frozen-execution-vector-search.json",
+        {
+            "contract_version": "horizontal-frozen-execution-vector-search-v1",
+            "context_sha256": sha256_file(context_path),
+            "decision_sha256": sha256_file(decision_path),
+            "policy_reference": policy.policy_reference,
+            "option_vector_count": len(option_vectors),
+            "attempts": vector_attempts,
+            "selected_option_ids_by_beat": state["selected_option_ids"],
+            "selected_execution_vector_sha256": _stable_fingerprint(
+                [
+                    selection.model_dump(mode="json")
+                    for selection in rebuilt.selections
+                ]
+            ),
+            "status": "selected_first_globally_feasible",
+            "generated_at": utc_now(),
+        },
+    )
     fallback_ids = dict(base_route.fallback_candidate_ids_by_beat)
     for beat_id, candidate_id in selected_candidate_ids.items():
         fallback_ids[beat_id] = (candidate_id,)
-    for beat_id in selected_motion_actions:
-        original = next(
-            selection
-            for selection in base_route.selections
-            if selection.beat_id == beat_id
-        )
-        fallback_ids[beat_id] = (original.candidate_id,)
     return base_route.model_copy(
         update={
             "selections": rebuilt.selections,
@@ -17710,6 +18488,95 @@ def _restore_preflight_horizontal_local_replan(
                 base_route
             ),
         }
+    )
+
+
+def _restore_horizontal_replan_with_frozen_conflict_recovery(
+    *,
+    route: CandidateRouteResult,
+    editorial_dir: Path,
+    policy: AutonomousEditPolicy,
+    client: GeminiLabClient,
+    plan_path: Path,
+    chapter_durations: Mapping[str, float],
+    music_supplied: bool,
+    output_timeline_cues: Sequence[Any],
+) -> CandidateRouteResult | None:
+    """Restore one paid decision through its finite execution journal.
+
+    Both startup resume and the immediate post-preflight path use this same
+    implementation.  A frozen vector conflict can only exhaust the current
+    exact execution and advance through Gemini's already ordered fallbacks;
+    this helper never requests another semantic decision.
+    """
+
+    restore_pass_cap = _horizontal_recovery_pass_limit(
+        beat_count=len(route.selections),
+        attempt_limit=policy.recovery.max_candidate_attempts_per_beat,
+    )
+    for _restore_pass in range(restore_pass_cap):
+        try:
+            return _restore_preflight_horizontal_local_replan(
+                route=route,
+                editorial_dir=editorial_dir,
+                policy=policy,
+                plan_path=plan_path,
+                chapter_durations=chapter_durations,
+            )
+        except FeatureCutSystemFailure as error:
+            if str(error) != (
+                "horizontal preflight selected alternates cannot preserve "
+                "the complete frozen execution vector"
+            ):
+                raise
+            context_path, decision_path = (
+                _horizontal_preflight_local_infeasibility_replan_paths(
+                    editorial_dir
+                )
+            )
+            if not context_path.is_file() or not decision_path.is_file():
+                raise
+            recovery = _load_horizontal_replan_recovery_authority(
+                route=route,
+                context_path=context_path,
+                decision_path=decision_path,
+                policy=policy,
+                plan_path=plan_path,
+            )
+            state = _horizontal_replan_effective_execution_state(
+                base_route=recovery["base_route"],
+                decisions=recovery["decisions"],
+                motion_actions_by_option=recovery["motion_actions_by_option"],
+                allowed_reuse_ids_by_option=recovery[
+                    "allowed_reuse_ids_by_option"
+                ],
+                failure_records=recovery["failure_records"],
+                policy=policy,
+            )
+            active_route, frozen_conflicts = (
+                _horizontal_infeasible_frozen_execution_conflicts(
+                    base_route=recovery["base_route"],
+                    state=state,
+                    max_editorial_reprise_overlap_fraction=(
+                        policy.editorial.max_editorial_reprise_overlap_fraction
+                    ),
+                )
+            )
+            if not frozen_conflicts:
+                raise
+            _persist_preflight_horizontal_local_infeasibility_replan(
+                route=active_route,
+                failures_by_beat=frozen_conflicts,
+                editorial_dir=editorial_dir,
+                policy=policy,
+                client=client,
+                plan_path=plan_path,
+                music_supplied=music_supplied,
+                output_timeline_cues=output_timeline_cues,
+            )
+    raise CandidateKnownInfeasible(
+        "horizontal Gemini fallback combinations exhausted before a globally "
+        "feasible frozen route"
     )
 
 
@@ -17938,6 +18805,54 @@ def _load_horizontal_motion_preservation_authorities(
             policy=policy,
             plan_path=plan_path,
         )
+        vector_path = context_path.parent / "frozen-execution-vector-search.json"
+        if vector_path.is_file():
+            vector = read_json(vector_path)
+            if not isinstance(vector, Mapping) or (
+                vector.get("contract_version")
+                != "horizontal-frozen-execution-vector-search-v1"
+                or vector.get("context_sha256") != sha256_file(context_path)
+                or vector.get("decision_sha256") != sha256_file(decision_path)
+                or vector.get("policy_reference") != policy.policy_reference
+                or vector.get("status") != "selected_first_globally_feasible"
+                or vector.get("selected_execution_vector_sha256")
+                != _stable_fingerprint(
+                    [
+                        selection.model_dump(mode="json")
+                        for selection in route.selections
+                    ]
+                )
+            ):
+                raise FeatureCutSystemFailure(
+                    "motion-preservation vector authority differs from the "
+                    "selected horizontal route"
+                )
+            selected_option_ids = vector.get("selected_option_ids_by_beat")
+            if not isinstance(selected_option_ids, Mapping):
+                raise FeatureCutSystemFailure(
+                    "motion-preservation vector has no selected option map"
+                )
+            selections = {
+                selection.beat_id: selection for selection in route.selections
+            }
+            selected_actions: dict[str, dict[str, Any]] = {}
+            for beat_id, option_id in selected_option_ids.items():
+                action = recovery["motion_actions_by_option"].get(
+                    str(option_id)
+                )
+                if action is None:
+                    continue
+                selection = selections.get(str(beat_id))
+                if selection is None:
+                    raise FeatureCutSystemFailure(
+                        "motion-preservation vector beat is outside its route"
+                    )
+                _validate_horizontal_motion_preservation_action(
+                    action,
+                    selection=selection,
+                )
+                selected_actions[str(beat_id)] = dict(action)
+            return selected_actions
         state = _horizontal_replan_effective_execution_state(
             base_route=recovery["base_route"],
             decisions=recovery["decisions"],
@@ -18817,6 +19732,7 @@ def _selected_preflight_local_replan(
             max_editorial_reprise_overlap_fraction=(
                 policy.editorial.max_editorial_reprise_overlap_fraction
             ),
+            cue_tolerance_ms=_policy_cue_tolerance_ms(policy),
         )
     except ValueError as error:
         raise FeatureCutSystemFailure(
@@ -18918,6 +19834,7 @@ def _selected_preflight_local_replan(
                 max_editorial_reprise_overlap_fraction=(
                     policy.editorial.max_editorial_reprise_overlap_fraction
                 ),
+                cue_tolerance_ms=_policy_cue_tolerance_ms(policy),
             )
         except ValueError:
             # A listed exact fallback still needs a deterministic complete
@@ -20511,6 +21428,7 @@ def _runtime_fulfillment_observation(
     candidate_id: str,
     evidence_event: Mapping[str, Any] | None,
     available_visual_event_types: tuple[str, ...] | None = None,
+    editorial_fulfillment_intent: str | None = None,
 ) -> EvidenceFulfillmentObservation:
     """Project the hash-bound selected-evidence snapshot into one observation."""
 
@@ -20536,12 +21454,112 @@ def _runtime_fulfillment_observation(
         )
     return EvidenceFulfillmentObservation(
         candidate_id=candidate_id,
-        evidence_provenance=str(
-            evidence_event.get("evidence_provenance") or "unknown"
+        evidence_provenance=(
+            "context_only"
+            if editorial_fulfillment_intent == "contextual_identity"
+            else str(evidence_event.get("evidence_provenance") or "unknown")
         ),
         observable_predicates=tuple(dict.fromkeys(predicates)),
         available_visual_event_types=available_visual_event_types,
     )
+
+
+def _candidate_visual_event_preflight_assessment(
+    contracts: Sequence[EditorialBeatContract],
+    *,
+    option: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project Gemini's coarse event claims into a fail-closed three-state gate.
+
+    ``observed_present`` admits the candidate to later exact-frame resolution;
+    it never replaces an ExactEventLock.  Missing/uncertain claims are
+    unresolved, while a complete set of explicit absences is unsupported.
+    This keeps a broad evidence provenance such as ``direct_physical_action``
+    from silently standing in for a specific visual event.
+    """
+
+    requested_rows: list[str] = []
+    for contract in contracts:
+        alternatives = getattr(
+            contract, "effective_fulfillment_alternatives", None
+        )
+        if alternatives is None:
+            requested_rows.extend(
+                event.event_type
+                for event in getattr(contract, "visual_events", ())
+            )
+            continue
+        requested_rows.extend(
+            event.event_type
+            for alternative in alternatives
+            if alternative.exact_event_requirement == "required_when_selected"
+            for event in alternative.visual_events
+        )
+    requested = tuple(dict.fromkeys(requested_rows))
+    if not requested:
+        return {
+            "status": "not_required",
+            "requested_visual_event_types": [],
+            "available_visual_event_types": [],
+            "unresolved_visual_event_types": [],
+            "explicitly_absent_visual_event_types": [],
+        }
+    raw_support = option.get("visual_event_support")
+    if raw_support is None:
+        return {
+            "status": "unresolved",
+            "requested_visual_event_types": list(requested),
+            "available_visual_event_types": [],
+            "unresolved_visual_event_types": list(requested),
+            "explicitly_absent_visual_event_types": [],
+            "reason": "candidate_visual_event_support_not_assessed",
+        }
+    if not isinstance(raw_support, (list, tuple)):
+        raise FeatureCutSystemFailure(
+            "candidate visual-event support is malformed"
+        )
+    support_rows = tuple(
+        CandidateVisualEventSupport.model_validate(row)
+        for row in raw_support
+    )
+    by_type = {row.event_type: row for row in support_rows}
+    if len(by_type) != len(support_rows):
+        raise FeatureCutSystemFailure(
+            "candidate visual-event support contains duplicate event types"
+        )
+    available = [
+        event_type
+        for event_type in requested
+        if by_type.get(event_type) is not None
+        and by_type[event_type].status == "observed_present"
+    ]
+    absent = [
+        event_type
+        for event_type in requested
+        if by_type.get(event_type) is not None
+        and by_type[event_type].status == "observed_absent"
+    ]
+    unresolved = [
+        event_type
+        for event_type in requested
+        if by_type.get(event_type) is None
+        or by_type[event_type].status == "uncertain"
+    ]
+    status = (
+        "unresolved"
+        if unresolved
+        else "direct_supported"
+        if set(requested).issubset(available)
+        else "explicitly_unsupported"
+    )
+    return {
+        "status": status,
+        "requested_visual_event_types": list(requested),
+        "available_visual_event_types": available,
+        "unresolved_visual_event_types": unresolved,
+        "explicitly_absent_visual_event_types": absent,
+        "support_rows": [row.model_dump(mode="json") for row in support_rows],
+    }
 
 
 def _select_runtime_candidate_fulfillments(
@@ -20559,11 +21577,25 @@ def _select_runtime_candidate_fulfillments(
         candidate_id=str(option.get("candidate_id") or "selected"),
         evidence_event=evidence_events.get((source_asset_id, event_id)),
         available_visual_event_types=available_visual_event_types,
+        editorial_fulfillment_intent=(
+            str(option.get("editorial_fulfillment_intent"))
+            if option.get("editorial_fulfillment_intent") is not None
+            else None
+        ),
     )
-    return tuple(
-        select_strongest_evidence_fulfillment(contract, (observation,))
+    selections = tuple(
+        select_strongest_evidence_fulfillment(
+            contract,
+            (observation,),
+            requested_fulfillment_level=(
+                str(option.get("editorial_fulfillment_intent"))
+                if option.get("editorial_fulfillment_intent") is not None
+                else None
+            ),
+        )
         for contract in contracts
     )
+    return selections
 
 
 def _require_runtime_candidate_fulfillments(
@@ -21270,14 +22302,16 @@ def _preflight_horizontal_route_primaries(
     ] | None = None,
     motion_preservation_authorities: Mapping[str, Mapping[str, Any]] | None = None,
     skip_typed_infeasible_beat_ids: Collection[str] = (),
+    summary_path: Path | None = None,
+    preflight_scope: str = "selected_primary",
 ) -> dict[str, list[dict[str, Any]]]:
-    """Measure every selected 16:9 primary before admitting any render.
+    """Measure every selected 16:9 execution before admitting any render.
 
     This intentionally uses ``compile_geometry=False``: zero-paid preflight
     checks hard fulfillment, quality-safe timing, and photographed source
-    motion only. It does not ground, crop, or measure an alternate, preserving
-    Gemini's exclusive scoped-replan authority over every retained Top-K
-    fallback.
+    motion only. It does not ground, crop, or promote another candidate. A
+    caller may supply one exact alternate execution so the sole grouped Gemini
+    recovery can see its complete measured option frontier in advance.
     """
 
     selected_by_beat = {selection.beat_id: selection for selection in route.selections}
@@ -21337,19 +22371,37 @@ def _preflight_horizontal_route_primaries(
             )
         prepared: dict[str, Any] | None = None
         motion_preservation_action: dict[str, Any] | None = None
+        event_support_assessment: dict[str, Any] | None = None
         try:
-            _select_runtime_candidate_fulfillments(
-                tuple(
-                    contract
-                    for contract in editorial_contracts
-                    if (
-                        contract.feature_id == beat_id
-                        and contract.priority == "hard"
-                    )
-                ),
-                option=option,
-                evidence_events=candidate_evidence_events or {},
+            contracts_for_beat = tuple(
+                contract
+                for contract in editorial_contracts
+                if contract.feature_id == beat_id
             )
+            event_support_assessment = (
+                _candidate_visual_event_preflight_assessment(
+                    contracts_for_beat,
+                    option=option,
+                )
+            )
+            try:
+                _select_runtime_candidate_fulfillments(
+                    contracts_for_beat,
+                    option=option,
+                    evidence_events=candidate_evidence_events or {},
+                    available_visual_event_types=tuple(
+                        event_support_assessment[
+                            "available_visual_event_types"
+                        ]
+                    ),
+                )
+            except ValueError as error:
+                if event_support_assessment["status"] == "not_required":
+                    raise
+                raise CandidateKnownInfeasible(
+                    "candidate exact-event support "
+                    + str(event_support_assessment["status"])
+                ) from error
             prepared = _prepare_horizontal_runtime_candidate(
                 option=option,
                 selected=selected,
@@ -21455,6 +22507,11 @@ def _preflight_horizontal_route_primaries(
                     if motion_preservation_action is not None
                     else {}
                 ),
+                **(
+                    {"visual_event_support": event_support_assessment}
+                    if event_support_assessment is not None
+                    else {}
+                ),
             }
             failures.setdefault(beat_id, []).append(failure)
             summary_rows.append({"beat_id": beat_id, "status": "failed", **failure})
@@ -21483,16 +22540,19 @@ def _preflight_horizontal_route_primaries(
                 "source_camera_motion_role": geometry.get(
                     "source_camera_motion_role"
                 ),
+                "visual_event_support": event_support_assessment,
             }
         )
     write_json(
-        output_dir / "horizontal-primary-preflight" / "summary.json",
+        summary_path
+        or output_dir / "horizontal-primary-preflight" / "summary.json",
         {
             "contract_version": "horizontal-primary-preflight-v1",
+            "preflight_scope": preflight_scope,
             "route_definition_sha256": _pre_render_route_definition_sha256(route),
             "rows": summary_rows,
             "all_selected_primaries_checked_before_render": True,
-            "alternates_prepared": False,
+            "alternates_prepared": preflight_scope == "recovery_alternate",
             "generated_at": utc_now(),
         },
     )
@@ -27128,6 +28188,7 @@ def _run_feature_cut_experiment_impl(
                 uploaded=uploaded,
                 uploaded_audio=uploaded_audio,
                 music_sha256=music_sha256,
+                editorial_beat_contracts=editorial_templates,
                 prompt_template=plan_prompt,
                 run_id=f"feature-plan-{uuid.uuid4().hex[:8]}",
                 run_dir=plan_dir,
@@ -27978,6 +29039,9 @@ def _run_feature_cut_experiment_impl(
                         autonomous_policy.editorial
                         .max_editorial_reprise_overlap_fraction
                     ),
+                    cue_tolerance_ms=_policy_cue_tolerance_ms(
+                        autonomous_policy
+                    ),
                 )
                 merged_bindings = {
                     beat_id: {
@@ -28136,84 +29200,18 @@ def _run_feature_cut_experiment_impl(
             pre_render_horizontal_candidate_route is not None
             and autonomous_policy is not None
         ):
-            restore_pass_cap = _horizontal_recovery_pass_limit(
-                beat_count=len(pre_render_horizontal_candidate_route.selections),
-                attempt_limit=(
-                    autonomous_policy.recovery.max_candidate_attempts_per_beat
-                ),
-            )
-            for _restore_pass in range(restore_pass_cap):
-                try:
-                    restored_horizontal_replan = (
-                        _restore_preflight_horizontal_local_replan(
-                            route=pre_render_horizontal_candidate_route,
-                            editorial_dir=editorial_dir,
-                            policy=autonomous_policy,
-                            plan_path=plan_path,
-                            chapter_durations=chapter_durations,
-                        )
-                    )
-                    break
-                except FeatureCutSystemFailure as error:
-                    if (
-                        str(error)
-                        != "horizontal preflight selected alternates cannot preserve "
-                        "the complete frozen execution vector"
-                    ):
-                        raise
-                    context_path, decision_path = (
-                        _horizontal_preflight_local_infeasibility_replan_paths(
-                            editorial_dir
-                        )
-                    )
-                    if not context_path.is_file() or not decision_path.is_file():
-                        raise
-                    recovery = _load_horizontal_replan_recovery_authority(
-                        route=pre_render_horizontal_candidate_route,
-                        context_path=context_path,
-                        decision_path=decision_path,
-                        policy=autonomous_policy,
-                        plan_path=plan_path,
-                    )
-                    state = _horizontal_replan_effective_execution_state(
-                        base_route=recovery["base_route"],
-                        decisions=recovery["decisions"],
-                        motion_actions_by_option=recovery[
-                            "motion_actions_by_option"
-                        ],
-                        allowed_reuse_ids_by_option=recovery[
-                            "allowed_reuse_ids_by_option"
-                        ],
-                        failure_records=recovery["failure_records"],
-                        policy=autonomous_policy,
-                    )
-                    active_route, frozen_conflicts = (
-                        _horizontal_infeasible_frozen_execution_conflicts(
-                            base_route=recovery["base_route"],
-                            state=state,
-                            max_editorial_reprise_overlap_fraction=(
-                                autonomous_policy.editorial
-                                .max_editorial_reprise_overlap_fraction
-                            ),
-                        )
-                    )
-                    if not frozen_conflicts:
-                        raise
-                    _persist_preflight_horizontal_local_infeasibility_replan(
-                        route=active_route,
-                        failures_by_beat=frozen_conflicts,
-                        editorial_dir=editorial_dir,
-                        policy=autonomous_policy,
-                        client=client,
-                        plan_path=plan_path,
-                        music_supplied=music_lock is not None,
-                        output_timeline_cues=output_timeline_cues or (),
-                    )
-            else:
-                raise CandidateKnownInfeasible(
-                    "horizontal Gemini fallback combinations exhausted before "
-                    "a globally feasible frozen route"
+            restored_horizontal_replan = (
+                _restore_horizontal_replan_with_frozen_conflict_recovery(
+                    route=pre_render_horizontal_candidate_route,
+                    editorial_dir=editorial_dir,
+                    policy=autonomous_policy,
+                    client=client,
+                    plan_path=plan_path,
+                    chapter_durations=chapter_durations,
+                    music_supplied=music_lock is not None,
+                    output_timeline_cues=output_timeline_cues or (),
                 )
+            )
             if restored_horizontal_replan is not None:
                 pre_render_horizontal_candidate_route = restored_horizontal_replan
                 initial_horizontal_route_failures = {}
@@ -28608,6 +29606,211 @@ def _run_feature_cut_experiment_impl(
                         )
                         horizontal_motion_preservation_authorities = {}
                         continue
+                    primary_duration_reconciliation = (
+                        _attempt_horizontal_primary_dirty_edge_duration_reconciliation(
+                            route=pre_render_horizontal_candidate_route,
+                            failures_by_beat=horizontal_primary_failures,
+                            editorial_dir=editorial_dir,
+                            policy=autonomous_policy,
+                            plan_path=plan_path,
+                        )
+                    )
+                    if primary_duration_reconciliation is not None:
+                        pre_render_horizontal_candidate_route = (
+                            primary_duration_reconciliation
+                        )
+                        chapter_durations = {
+                            selection.beat_id: (
+                                selection.trim_duration_ms / 1000
+                            )
+                            for selection in (
+                                pre_render_horizontal_candidate_route.selections
+                            )
+                        }
+                        duration_audit = {
+                            **duration_audit,
+                            "resolved_chapter_durations_seconds": (
+                                chapter_durations
+                            ),
+                            "duration_authority": (
+                                "horizontal_dirty_edge_duration_reconciliation"
+                            ),
+                        }
+                        write_json(
+                            output_dir / "editorial-duration-plan.json",
+                            duration_audit,
+                        )
+                        horizontal_motion_preservation_authorities = {}
+                        continue
+                    # The one scoped decision must not discover fallback
+                    # defects one execution at a time.  Measure every retained
+                    # Top-K alternate now, before the paid call, and offer
+                    # either its raw clean execution or its exact preserve-
+                    # motion action. Dirty/jolted alternates are omitted from
+                    # the finite option set with their typed evidence.
+                    alternate_failures: dict[str, list[dict[str, Any]]] = {}
+                    alternate_summary: list[dict[str, Any]] = []
+                    selected_by_beat = {
+                        selection.beat_id: selection
+                        for selection in (
+                            pre_render_horizontal_candidate_route.selections
+                        )
+                    }
+                    for beat_id in sorted(horizontal_primary_failures):
+                        selected_execution = selected_by_beat.get(beat_id)
+                        if selected_execution is None:
+                            continue
+                        for binding in (
+                            pre_render_horizontal_candidate_route
+                            .semantic_replan_candidate_bindings_by_beat.get(
+                                beat_id, ()
+                            )
+                        ):
+                            option_binding = binding.option
+                            if (
+                                option_binding.candidate_id
+                                == selected_execution.candidate_id
+                            ):
+                                continue
+                            try:
+                                execution = materialize_selected_candidate_execution(
+                                    pre_render_horizontal_candidate_route,
+                                    beat_id=beat_id,
+                                    candidate_id=option_binding.candidate_id,
+                                    duration_ms=(
+                                        selected_execution.trim_duration_ms
+                                    ),
+                                )
+                            except ValueError as error:
+                                failure = {
+                                    "candidate_id": option_binding.candidate_id,
+                                    "failure_class": (
+                                        "typed_alternate_execution_materialization_gate"
+                                    ),
+                                    "reason": str(error),
+                                    "preflight_scope": "recovery_alternate",
+                                }
+                                alternate_failures.setdefault(
+                                    beat_id, []
+                                ).append(failure)
+                                alternate_summary.append(
+                                    {"beat_id": beat_id, **failure}
+                                )
+                                continue
+                            alternate_route = (
+                                pre_render_horizontal_candidate_route.model_copy(
+                                    update={
+                                        "selections": (execution,),
+                                        "fallback_candidate_ids_by_beat": {
+                                            beat_id: (
+                                                option_binding.candidate_id,
+                                            )
+                                        },
+                                        "option_bindings_by_beat": {
+                                            beat_id: {
+                                                option_binding.candidate_id: (
+                                                    option_binding
+                                                )
+                                            }
+                                        },
+                                        "total_duration_ms": (
+                                            execution.trim_duration_ms
+                                        ),
+                                        "ranked_routes": (),
+                                        "semantic_replan_candidate_bindings_by_beat": {
+                                            beat_id: (binding,)
+                                        },
+                                    }
+                                )
+                            )
+                            measured = _preflight_horizontal_route_primaries(
+                                route=alternate_route,
+                                plan=plan,
+                                brief_by_id=brief_by_id,
+                                frames=frames,
+                                clips=clips,
+                                shot_cache=shot_cache,
+                                shots_dir=shots_dir,
+                                scdet_threshold=scdet_threshold,
+                                trim_decisions=trim_decisions,
+                                shot_quality_maps=shot_quality_maps,
+                                source_audio_cache=source_audio_cache,
+                                source_media_cache=source_media_cache,
+                                track_cache=track_cache,
+                                client=client,
+                                checkpoint_path=checkpoint_path,
+                                grounding_prompt=grounding_prompt,
+                                output_dir=output_dir,
+                                sam_analysis_fps=sam_analysis_fps,
+                                model_request_block_reason=(
+                                    gemini_geometry_block_reason
+                                ),
+                                strict=(
+                                    autonomous_policy.execution_profile
+                                    == "autonomous_strict"
+                                ),
+                                editorial_contracts=editorial_templates,
+                                candidate_evidence_events=(
+                                    candidate_evidence_events
+                                ),
+                                summary_path=(
+                                    output_dir
+                                    / "horizontal-alternate-preflight"
+                                    / "candidates"
+                                    / beat_id
+                                    / option_binding.candidate_id
+                                    / "summary.json"
+                                ),
+                                preflight_scope="recovery_alternate",
+                            )
+                            rows = [
+                                {
+                                    **dict(row),
+                                    "preflight_scope": "recovery_alternate",
+                                }
+                                for row in measured.get(beat_id, ())
+                            ]
+                            alternate_failures.setdefault(beat_id, []).extend(
+                                rows
+                            )
+                            alternate_summary.append(
+                                {
+                                    "beat_id": beat_id,
+                                    "candidate_id": (
+                                        option_binding.candidate_id
+                                    ),
+                                    "status": (
+                                        "failed" if rows else "passed"
+                                    ),
+                                    "failures": rows,
+                                }
+                            )
+                    if alternate_failures:
+                        merged_failures = {
+                            beat_id: [dict(row) for row in rows]
+                            for beat_id, rows in (
+                                horizontal_primary_failures.items()
+                            )
+                        }
+                        for beat_id, rows in alternate_failures.items():
+                            merged_failures.setdefault(beat_id, []).extend(rows)
+                        horizontal_primary_failures = {
+                            beat_id: tuple(rows)
+                            for beat_id, rows in merged_failures.items()
+                        }
+                    write_json(
+                        output_dir
+                        / "horizontal-alternate-preflight"
+                        / "summary.json",
+                        {
+                            "contract_version": (
+                                "horizontal-recovery-alternate-preflight-v1"
+                            ),
+                            "rows": alternate_summary,
+                            "all_retained_alternates_measured_before_replan": True,
+                            "generated_at": utc_now(),
+                        },
+                    )
                 _persist_preflight_horizontal_local_infeasibility_replan(
                     route=pre_render_horizontal_candidate_route,
                     failures_by_beat=horizontal_primary_failures,
@@ -28619,12 +29822,17 @@ def _run_feature_cut_experiment_impl(
                     output_timeline_cues=output_timeline_cues or (),
                 )
                 initial_horizontal_route_failures = {}
-                restored_horizontal_replan = _restore_preflight_horizontal_local_replan(
+                restored_horizontal_replan = (
+                    _restore_horizontal_replan_with_frozen_conflict_recovery(
                     route=pre_render_horizontal_candidate_route,
                     editorial_dir=editorial_dir,
                     policy=autonomous_policy,
+                    client=client,
                     plan_path=plan_path,
                     chapter_durations=chapter_durations,
+                    music_supplied=music_lock is not None,
+                    output_timeline_cues=output_timeline_cues or (),
+                    )
                 )
                 if restored_horizontal_replan is None:
                     raise FeatureCutSystemFailure(
@@ -30765,6 +31973,7 @@ def _run_feature_cut_experiment_impl(
                         trim_duration_ms=int(selected_local["end_ms"]) - int(selected_local["start_ms"]),
                         cue_id=previous.cue_id,
                         cue_aligned=previous.cue_aligned,
+                        exit_cue_time_ms=previous.exit_cue_time_ms,
                         presentation_mode=measured_mode,
                         entry_composition=previous.entry_composition,
                         exit_composition=previous.exit_composition,
@@ -36990,6 +38199,22 @@ def _run_feature_cut_experiment_impl(
                         runtime_timing_reconciliation.failure_codes
                     )
                 )
+            runtime_music_boundary_path = (
+                context_dir / "runtime-music-boundary-validation.json"
+            )
+            write_json(
+                runtime_music_boundary_path,
+                _validate_runtime_route_music_boundaries(
+                    route=active_pre_render_route,
+                    reconciliation=runtime_timing_reconciliation,
+                    cue_tolerance_ms=_policy_cue_tolerance_ms(
+                        autonomous_policy
+                    ),
+                ),
+            )
+            autonomous_context_paths["runtime_music_boundary_validation"] = (
+                runtime_music_boundary_path.resolve()
+            )
             resolved_timeline = build_resolved_timeline(
                 aspect=audit_aspect.replace("x", ":"),  # type: ignore[arg-type]
                 reconciliation=runtime_timing_reconciliation,
@@ -37874,6 +39099,23 @@ def _run_feature_cut_experiment_impl(
                             horizontal_runtime_reconciliation.failure_codes
                         )
                     )
+                horizontal_runtime_music_boundary_path = (
+                    horizontal_context_dir
+                    / "runtime-music-boundary-validation.json"
+                )
+                write_json(
+                    horizontal_runtime_music_boundary_path,
+                    _validate_runtime_route_music_boundaries(
+                        route=pre_render_horizontal_candidate_route,
+                        reconciliation=horizontal_runtime_reconciliation,
+                        cue_tolerance_ms=_policy_cue_tolerance_ms(
+                            autonomous_policy
+                        ),
+                    ),
+                )
+                horizontal_context["runtime_music_boundary_validation"] = (
+                    horizontal_runtime_music_boundary_path.resolve()
+                )
                 horizontal_runtime_path = (
                     horizontal_context_dir
                     / "runtime-sequence-timing-reconciliation.json"

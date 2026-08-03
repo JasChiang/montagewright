@@ -16,6 +16,7 @@ from .autonomous_policy import (
     validate_authority_binding,
 )
 from .models import (
+    CandidateVisualEventType,
     DenseFrame,
     DenseFrameCatalog,
     FeatureEvidenceProvenance,
@@ -28,20 +29,7 @@ from .schema import gemini_response_schema
 from .storage import utc_now
 
 
-VisualEventType = Literal[
-    "camera_gesture_apex",
-    "generation_result_stable_start",
-    "watch_ui_state_change",
-    "underwater_lift_apex",
-    "group_laugh_reaction_peak",
-    "freeze_start",
-    "action_onset",
-    "action_apex",
-    "state_change",
-    "result_stable_start",
-    "reaction_peak",
-    "clean_out",
-]
+VisualEventType = CandidateVisualEventType
 CueRelation = Literal[
     "accent",
     "principal_downbeat",
@@ -452,6 +440,8 @@ def illustrative_coverage_planning_instruction(
 def select_strongest_evidence_fulfillment(
     contract: EditorialBeatContract,
     observations: Sequence[EvidenceFulfillmentObservation],
+    *,
+    requested_fulfillment_level: EvidenceFulfillmentLevel | None = None,
 ) -> EditorialBeatFulfillmentSelection:
     """Select the strongest contract-authorized evidence without relabeling it.
 
@@ -461,8 +451,21 @@ def select_strongest_evidence_fulfillment(
     selected alternative remains fail-closed and still requires resolution.
     """
 
+    eligible_alternatives = contract.effective_fulfillment_alternatives
+    if requested_fulfillment_level is not None:
+        eligible_alternatives = tuple(
+            alternative
+            for alternative in eligible_alternatives
+            if alternative.fulfillment_level == requested_fulfillment_level
+        )
+        if not eligible_alternatives:
+            raise ValueError(
+                "requested fulfillment level is not authorized by the "
+                f"editorial beat contract: {contract.beat_id}/"
+                f"{requested_fulfillment_level}"
+            )
     alternatives = sorted(
-        contract.effective_fulfillment_alternatives,
+        eligible_alternatives,
         key=lambda alternative: _FULFILLMENT_STRENGTH[
             alternative.fulfillment_level
         ],
@@ -521,7 +524,9 @@ def select_strongest_evidence_fulfillment(
             )
     raise ValueError(
         "no evidence candidate satisfies the editorial beat minimum "
-        f"fulfillment level: {contract.beat_id}/{minimum_level}"
+        "fulfillment level: "
+        f"{contract.beat_id}/"
+        f"{requested_fulfillment_level or minimum_level}"
     )
 
 

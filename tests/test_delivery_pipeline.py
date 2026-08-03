@@ -2547,6 +2547,105 @@ def test_direct_plan_reuse_requires_exact_current_shortlist_binding(
     )
 
 
+def test_completed_direct_plan_resume_does_not_reserve_new_planning_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A post-planning restart must remain possible at the signed budget."""
+
+    catalog = tmp_path / "catalog.json"
+    brief = tmp_path / "brief.json"
+    policy_path = tmp_path / "policy.json"
+    contracts = tmp_path / "contracts.json"
+    music = tmp_path / "music.wav"
+    library = tmp_path / "clip-cards"
+    output_dir = tmp_path / "delivery"
+    for path in (catalog, brief, contracts):
+        write_json(path, {})
+    write_json(policy_path, _autonomous_policy())
+    music.write_bytes(b"music")
+    library.mkdir()
+
+    shortlist = output_dir / "retrieval" / "feature-shortlist.json"
+    write_json(shortlist, {"candidate_ids": ["candidate-a"]})
+    plan_dir = output_dir / "picture" / "gemini-plan"
+    for name in ("feature_edit_plan.json", "selected-clip-card-evidence.json"):
+        write_json(plan_dir / name, {})
+    record = plan_dir / "feature-plan-projections" / "projection.json"
+    write_json(
+        record,
+        {
+            "source_artifacts": [
+                {
+                    "role": "feature_shortlist",
+                    "path": str(shortlist.resolve()),
+                    "sha256": sha256_file(shortlist),
+                }
+            ]
+        },
+    )
+    write_json(
+        plan_dir / "feature-plan.external-projection.json",
+        {
+            "record_path": str(record.relative_to(plan_dir)),
+            "record_sha256": sha256_file(record),
+        },
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "_resolve_prepared_clip_card_library",
+        lambda **_kwargs: (library, SimpleNamespace(), (), 1_000),
+    )
+    monkeypatch.setattr(pipeline, "_refresh_stale_clip_cards", lambda **_kwargs: ())
+    monkeypatch.setattr(
+        pipeline,
+        "_archive_stale_clip_card_supplements",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        pipeline.FeatureShortlistPlan,
+        "model_validate",
+        lambda _payload: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+
+    def unexpected_reserve(**_kwargs):
+        raise AssertionError("completed plan resume attempted a paid reserve")
+
+    monkeypatch.setattr(
+        pipeline,
+        "_maximum_candidate_video_budget_ms",
+        unexpected_reserve,
+    )
+
+    result = pipeline._prepare_fresh_autonomous_direct_plan(
+        catalog_path=catalog,
+        brief_path=brief,
+        music_path=music,
+        music_duration_ms=90_000,
+        policy_path=policy_path,
+        editorial_contracts_path=contracts,
+        prepared_library_path=library,
+        output_dir=output_dir,
+        budget_ledger=BudgetLedger(max_cost_usd=0.01, max_interactions=1),
+    )
+
+    assert result["shortlist_usage"]["request_count"] == 0
+    assert result["planning_usage"] == {
+        "request_count": 0,
+        "reuse_status": "validated_existing_direct_plan_artifacts",
+    }
+
+
 def test_stale_planning_stage_moves_out_of_active_namespace(
     tmp_path: Path,
 ) -> None:

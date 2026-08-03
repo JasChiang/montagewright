@@ -31,6 +31,7 @@ from .event_lock import (
     ExactEventLockV2,
     ExactEventSelectionGroup,
     bracket_dense_frames_by_difference,
+    illustrative_coverage_planning_instruction,
     resolve_exact_event_locks,
     validate_exact_event_evidence_provenance,
 )
@@ -6000,6 +6001,7 @@ model_provenance (return it unchanged with interaction_id=null):
         uploaded: Any,
         uploaded_audio: Any | None = None,
         music_sha256: str | None = None,
+        editorial_beat_contracts: Sequence[EditorialBeatContract] = (),
         prompt_template: str,
         run_id: str,
         run_dir: Path,
@@ -6056,6 +6058,30 @@ model_provenance (return it unchanged with interaction_id=null):
                 if music_supplied
                 else "本次未附音樂；不得推測不存在的節拍或能量變化。\n"
             )
+            + "\n## EditorialBeatContracts 的候選事件支援契約\n"
+            + "對每個 horizontal_candidates 與 vertical_candidates，"
+            + "visual_event_support 必須逐項涵蓋該 chapter 下列 contract "
+            + "出現的每一種 visual event，狀態只能是 observed_present、"
+            + "observed_absent 或 uncertain。observed_present 只表示 bounded "
+            + "candidate 直接看得到該事件，稍後仍會由本機 exact-frame resolver "
+            + "驗證；看到實體、人物或 UI 靜態存在，不等於看到了動作 apex、"
+            + "狀態轉換、結果開始或反應峰值。不得以 broad evidence_provenance "
+            + "代替 visual-event 判斷。\n"
+            + json.dumps(
+                [
+                    contract.model_dump(mode="json")
+                    for contract in editorial_beat_contracts
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+            + illustrative_coverage_planning_instruction(
+                getattr(brief, "illustrative_coverage_policy", None)
+            )
+            + " 若沒有直接對應畫面且上述 policy 授權，可選與章節主體或情境"
+            + "相關的產品／環境空景；此時 evidence_provenance 必須如實使用 "
+            + "context_only，不得把空景標成直接功能或動作證據。\n"
             + "\n## 使用者提供的 editorial brief（文字可用，但不等於影片證據）\n"
             + json.dumps(brief_for_model, ensure_ascii=False, indent=2)
         )
@@ -6309,6 +6335,50 @@ model_provenance (return it unchanged with interaction_id=null):
             if actual_ids != expected_ids:
                 raise GeminiContractError(
                     f"Feature Edit Plan chapters differ from brief: expected={expected_ids}, actual={actual_ids}"
+                )
+            requested_events_by_feature: dict[str, set[str]] = {}
+            for contract in editorial_beat_contracts:
+                if contract.feature_id is None:
+                    continue
+                requested_events_by_feature.setdefault(
+                    contract.feature_id, set()
+                ).update(
+                    event.event_type
+                    for alternative in (
+                        contract.effective_fulfillment_alternatives
+                    )
+                    for event in alternative.visual_events
+                )
+            missing_event_support: list[str] = []
+            for chapter in parsed.chapters:
+                requested_events = requested_events_by_feature.get(
+                    chapter.feature_id, set()
+                )
+                for candidate in (
+                    *chapter.horizontal_candidates,
+                    *chapter.vertical_candidates,
+                ):
+                    assessed = (
+                        {
+                            row.event_type
+                            for row in candidate.visual_event_support
+                        }
+                        if candidate.visual_event_support is not None
+                        else set()
+                    )
+                    missing = sorted(requested_events - assessed)
+                    if missing:
+                        missing_event_support.append(
+                            chapter.feature_id
+                            + "/"
+                            + candidate.candidate_id
+                            + ":"
+                            + ",".join(missing)
+                        )
+            if missing_event_support:
+                raise GeminiContractError(
+                    "Feature Edit Plan omitted candidate visual-event support: "
+                    + "; ".join(missing_event_support)
                 )
             valid_frame_ids = {frame.frame_id for frame in catalog.frames}
             invalid = sorted(

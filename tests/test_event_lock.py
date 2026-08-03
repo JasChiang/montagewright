@@ -665,6 +665,35 @@ def test_illustrative_policy_compiles_only_preferred_contextual_fallbacks() -> N
     )
     assert direct_selection.candidate_id == "direct-camera-gesture"
     assert direct_selection.fulfillment_level == "direct_demonstration"
+    contextual_selection = select_strongest_evidence_fulfillment(
+        compiled[1],
+        [
+            EvidenceFulfillmentObservation(
+                candidate_id="related-product-empty-shot",
+                evidence_provenance="context_only",
+                available_visual_event_types=(),
+            ),
+            EvidenceFulfillmentObservation(
+                candidate_id="direct-camera-gesture",
+                evidence_provenance="direct_physical_action",
+                available_visual_event_types=("camera_gesture_apex",),
+            ),
+        ],
+        requested_fulfillment_level="contextual_identity",
+    )
+    assert contextual_selection.candidate_id == "related-product-empty-shot"
+    assert contextual_selection.fulfillment_level == "contextual_identity"
+    with pytest.raises(ValueError, match="not authorized"):
+        select_strongest_evidence_fulfillment(
+            compiled[1],
+            [
+                EvidenceFulfillmentObservation(
+                    candidate_id="direct-camera-gesture",
+                    evidence_provenance="direct_physical_action",
+                )
+            ],
+            requested_fulfillment_level="visible_result",
+        )
     selection = select_strongest_evidence_fulfillment(
         compiled[1],
         [

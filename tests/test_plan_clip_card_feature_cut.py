@@ -589,6 +589,14 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
                     strategy="original",
                     zoom_intent="none",
                     camera_intent="hold",
+                    visual_event_support=[
+                        {
+                            "event_type": "result_stable_start",
+                            "status": "observed_present",
+                            "observable_reason": "The result visibly settles.",
+                        }
+                    ],
+                    editorial_fulfillment_intent="direct_demonstration",
                 ),
                 horizontal_alternates=[],
                 vertical=DirectVideoVerticalDecision(
@@ -603,6 +611,14 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
                     ),
                     allow_controlled_clip=True,
                     framing_intent="Observe the subject, then the sign.",
+                    visual_event_support=[
+                        {
+                            "event_type": "result_stable_start",
+                            "status": "observed_present",
+                            "observable_reason": "The result visibly settles.",
+                        }
+                    ],
+                    editorial_fulfillment_intent="direct_demonstration",
                     required_entity_indices=[1, 2],
                     preferred_entity_indices=[],
                     sacrificable_entity_indices=[],
@@ -673,6 +689,9 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
     assert candidate.event_id == "demo"
     assert candidate.frame_id == "RF000001"
     assert candidate.source_camera_motion_role == "editorially_useful"
+    assert candidate.editorial_fulfillment_intent == "direct_demonstration"
+    assert candidate.visual_event_support is not None
+    assert candidate.visual_event_support[0].status == "observed_present"
     assert projected.chapters[0].horizontal_candidate_id == "rank-01"
     assert projected.chapters[0].vertical_candidate_id == "rank-01"
     assert (
@@ -686,6 +705,17 @@ def test_direct_video_response_uses_integer_ranks_and_projects_ids_locally() -> 
             projected,
             cards={ASSET_ID: card},
         ),
+    )
+    assert (
+        executable.chapters[0].horizontal_candidates[0]
+        .editorial_fulfillment_intent
+        == "direct_demonstration"
+    )
+    assert (
+        executable.chapters[0].horizontal_candidates[0]
+        .visual_event_support[0]
+        .event_type
+        == "result_stable_start"
     )
     minimum_visibility = {
         region.entity_id: region.minimum_visible_fraction
@@ -859,6 +889,14 @@ def test_direct_video_aspect_contract_is_required_nullable_and_fail_closed() -> 
         strategy="original",
         zoom_intent="none",
         camera_intent="hold",
+        visual_event_support=[
+            {
+                "event_type": "result_stable_start",
+                "status": "observed_present",
+                "observable_reason": "The bounded landscape take shows it.",
+            }
+        ],
+        editorial_fulfillment_intent="direct_demonstration",
     )
     vertical = DirectVideoVerticalDecision(
         candidate_rank=1,
@@ -987,17 +1025,26 @@ def test_horizontal_decision_keeps_motion_and_reuse_authority_candidate_scoped()
 
 def test_direct_video_response_schema_requires_candidate_semantic_authority() -> None:
     schema = direct_video_response_schema(("16:9",))
-    for decision_name in (
-        "DirectVideoHorizontalDecision",
-        "DirectVideoVerticalDecision",
-    ):
+    assert "DirectVideoVerticalDecision" not in schema["$defs"]
+    assert "DirectVideoAttentionStep" not in schema["$defs"]
+    assert schema["$defs"]["DirectVideoChapterDecision"]["properties"][
+        "vertical"
+    ]["type"] == "null"
+    for decision_name in ("DirectVideoHorizontalDecision",):
         required = set(schema["$defs"][decision_name]["required"])
         assert {
+            "visual_event_support",
+            "editorial_fulfillment_intent",
             "source_camera_motion_role",
             "source_camera_motion_reason",
             "source_reuse_mode",
             "source_reuse_justification",
         } <= required
+        fulfillment = schema["$defs"][decision_name]["properties"][
+            "editorial_fulfillment_intent"
+        ]
+        assert "anyOf" not in fulfillment
+        assert fulfillment["type"] == "string"
 
 
 def test_horizontal_only_projection_keeps_vertical_shadow_inactive() -> None:
@@ -1006,6 +1053,14 @@ def test_horizontal_only_projection_keeps_vertical_shadow_inactive() -> None:
         strategy="original",
         zoom_intent="none",
         camera_intent="hold",
+        visual_event_support=[
+            {
+                "event_type": "result_stable_start",
+                "status": "observed_present",
+                "observable_reason": "The bounded landscape take shows it.",
+            }
+        ],
+        editorial_fulfillment_intent="direct_demonstration",
     )
     direct = DirectVideoEditPlan(
         contract_version="direct-video-edit-plan-v2",
@@ -1051,6 +1106,9 @@ def test_horizontal_only_projection_keeps_vertical_shadow_inactive() -> None:
     candidate = projected.chapters[0].candidates[0]
     assert candidate.horizontal_authorized is True
     assert candidate.vertical_authorized is False
+    assert candidate.editorial_fulfillment_intent == "direct_demonstration"
+    assert candidate.visual_event_support is not None
+    assert candidate.visual_event_support[0].status == "observed_present"
     executable = project_feature_contracts_v3(
         projected,
         brief=_brief(),
@@ -1267,6 +1325,42 @@ def test_direct_video_canonicalization_preserves_phase_local_anchors() -> None:
         change["rule"] != "required_entities_remain_visible_in_attention_phase"
         for change in changes
     )
+
+
+def test_direct_video_canonicalization_treats_original_as_representation_precedence() -> None:
+    payload = {
+        "chapters": [
+            {
+                "evidence_status": "supported",
+                "horizontal": {
+                    "candidate_rank": 2,
+                    "strategy": "original",
+                    "zoom_intent": "detail",
+                    "camera_intent": "push_in",
+                    "focus_entity_index": 3,
+                },
+            }
+        ]
+    }
+
+    canonical, changes = canonicalize_direct_video_edit_plan_output(
+        json.dumps(payload)
+    )
+    horizontal = json.loads(canonical)["chapters"][0]["horizontal"]
+
+    assert horizontal["candidate_rank"] == 2
+    assert horizontal["strategy"] == "original"
+    assert horizontal["zoom_intent"] == "none"
+    assert horizontal["camera_intent"] == "hold"
+    assert horizontal["focus_entity_index"] is None
+    assert {change["rule"] for change in changes}.issuperset(
+        {
+            "explicit_original_strategy_disables_zoom",
+            "explicit_original_strategy_holds_virtual_camera",
+            "explicit_original_strategy_has_no_focus_entity",
+        }
+    )
+    DirectVideoHorizontalDecision.model_validate(horizontal)
 
 
 def test_direct_video_canonicalization_removes_only_empty_vertical_fields_from_horizontal() -> None:

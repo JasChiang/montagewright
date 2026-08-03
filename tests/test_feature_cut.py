@@ -4920,6 +4920,199 @@ def test_horizontal_primary_failure_persists_one_grouped_alternate_replan(
     ]
 
 
+def test_horizontal_grouped_replan_receives_complete_measured_alternate_frontier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed alternates become exact actions; clean alternates stay raw."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(
+            target_ms=30_000,
+            min_ms=30_000,
+            max_ms=30_000,
+        ),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    duration_update = {
+        "trim_duration_ms": 30_000,
+        "minimum_readable_ms": 30_000,
+        "preferred_readable_ms": 30_000,
+        "maximum_readable_ms": 30_000,
+        "fixed_source_out_ms": 30_000,
+        "safe_capacity_ms": 30_000,
+        "safe_window_end_ms": 30_000,
+        "source_anchor_ms": 15_000,
+    }
+    primary = _local_replan_option(
+        "hero", "rank-01", "a", rank=1
+    ).model_copy(update=duration_update)
+    motion_alternate = _local_replan_option(
+        "hero", "rank-02", "b", rank=2
+    ).model_copy(update=duration_update)
+    clean_alternate = _local_replan_option(
+        "hero", "rank-03", "c", rank=3
+    ).model_copy(update=duration_update)
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="hero", options=(primary,)),),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    ).model_copy(
+        update={
+            "semantic_replan_candidate_bindings_by_beat": {
+                "hero": tuple(
+                    SemanticReplanCandidateBinding(option=option)
+                    for option in (
+                        primary,
+                        motion_alternate,
+                        clean_alternate,
+                    )
+                )
+            }
+        }
+    )
+    motion_execution = (
+        feature_cut_module.materialize_selected_candidate_execution(
+            route,
+            beat_id="hero",
+            candidate_id="rank-02",
+            duration_ms=30_000,
+        )
+    )
+    evidence_sha = "d" * 64
+    action_id = feature_cut_module._horizontal_motion_preservation_action_id(
+        beat_id="hero",
+        candidate_id="rank-02",
+        candidate_execution_sha256=str(
+            motion_execution.candidate_execution_sha256
+        ),
+        source_asset_id=motion_execution.source_asset_id,
+        source_in_ms=int(motion_execution.source_in_ms or 0),
+        source_out_ms=int(motion_execution.source_out_ms or 0),
+        source_motion_evidence_sha256=evidence_sha,
+    )
+    action = {
+        "contract_version": "horizontal-motion-preservation-action-v1",
+        "action_id": action_id,
+        "action": "retain_primary_preserve_observed_motion",
+        "beat_id": "hero",
+        "candidate_id": "rank-02",
+        "candidate_execution_sha256": (
+            motion_execution.candidate_execution_sha256
+        ),
+        "source_asset_id": motion_execution.source_asset_id,
+        "source_clip_id": motion_execution.source_clip_id,
+        "source_in_ms": motion_execution.source_in_ms,
+        "source_out_ms": motion_execution.source_out_ms,
+        "source_motion_evidence_sha256": evidence_sha,
+        "exact_source_interval": {
+            "source_sha256": "e" * 64,
+            "start_pts": 3,
+            "end_pts_exclusive": 33,
+            "start_frame_sha256": "f" * 64,
+            "end_exclusive_frame_sha256": "1" * 64,
+            "source_time_base": "1/30",
+        },
+        "effective_source_camera_motion_role": "editorially_useful",
+        "runtime_handling": "preserve_as_observed_no_synthetic_motion",
+    }
+    reel = tmp_path / "complete-frontier.mp4"
+    reel.write_bytes(b"complete measured frontier")
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_build_horizontal_motion_recovery_reel",
+        lambda _actions, *, output_dir: {
+            "contract_version": "horizontal-motion-recovery-reel-v1",
+            "action_ids": [action_id],
+            "reel_path": str(reel),
+            "reel_sha256": hashlib.sha256(reel.read_bytes()).hexdigest(),
+            "reel_duration_ms": 900,
+        },
+    )
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["option_ids_by_beat"] == {
+                "hero": ("hero--rank-03", action_id)
+            }
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "hero",
+                            "selected_option_id": action_id,
+                            "fallback_option_ids": ["hero--rank-03"],
+                            "semantic_reason": "preserve_source_motion",
+                            "unresolved_concern_codes": [],
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    ),
+                )
+            )
+            return SimpleNamespace(
+                decision=decision,
+                interaction_ids=("complete-frontier",),
+            )
+
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=route,
+        failures_by_beat={
+            "hero": (
+                {
+                    "candidate_id": "rank-01",
+                    "failure_class": "typed_horizontal_exact_event_failure",
+                    "reason": "primary failed",
+                },
+                {
+                    "candidate_id": "rank-02",
+                    "failure_class": (
+                        "typed_source_camera_motion_role_mismatch"
+                    ),
+                    "reason": "alternate has useful source motion",
+                    "motion_preservation_action": action,
+                },
+            )
+        },
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    editorial_dir = tmp_path / "editorial"
+    restored = _restore_preflight_horizontal_local_replan(
+        route=route,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+        chapter_durations={"hero": 30.0},
+    )
+    assert restored is not None
+    assert restored.selections[0].candidate_id == "rank-02"
+    assert restored.selections[0].candidate_execution_sha256 == (
+        motion_execution.candidate_execution_sha256
+    )
+    assert feature_cut_module._load_horizontal_motion_preservation_authorities(
+        route=restored,
+        editorial_dir=editorial_dir,
+        policy=policy,
+        plan_path=plan_path,
+    ) == {"hero": action}
+
+
 def test_horizontal_initial_distinct_interval_conflict_uses_grouped_replan(
     tmp_path: Path,
 ) -> None:
@@ -5058,6 +5251,7 @@ def test_horizontal_initial_distinct_interval_conflict_uses_grouped_replan(
         ]
     } == {"rank-01", "rank-02"}
 
+
     plan_path = tmp_path / "feature-plan.json"
     plan_path.write_text("{}", encoding="utf-8")
 
@@ -5117,6 +5311,102 @@ def test_horizontal_initial_distinct_interval_conflict_uses_grouped_replan(
         "fold8_camera": "rank-02",
     }
     assert restored.total_duration_ms == 30_000
+
+
+def test_horizontal_actual_trim_conflict_uses_grouped_replan() -> None:
+    """Actual semantic dwells must reach replan when minimum dwells fit."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+
+    def candidate(beat_id: str, candidate_id: str, rank: int, marker: str):
+        return SimpleNamespace(
+            candidate_id=candidate_id,
+            rank=rank,
+            source_asset_id="sha256:" + marker * 64,
+            event_id=f"event-{beat_id}-{candidate_id}",
+            confidence=0.9,
+            strategy="original",
+            camera_intent="hold",
+            target_description=None,
+            quality_risks=[],
+            source_reuse_mode=(
+                "distinct_interval" if candidate_id == "rank-01" else "none"
+            ),
+            source_reuse_justification=(
+                "separate observed interval" if candidate_id == "rank-01" else None
+            ),
+        )
+
+    chapters = [
+        SimpleNamespace(
+            feature_id=beat_id,
+            horizontal_candidates=[
+                candidate(beat_id, "rank-01", 1, "a"),
+                candidate(beat_id, "rank-02", 2, marker),
+            ],
+        )
+        for beat_id, marker in (("first", "b"), ("second", "c"))
+    ]
+    plan = SimpleNamespace(chapters=chapters)
+    rhythm = SimpleNamespace(
+        chapters=[
+            SimpleNamespace(
+                feature_id=chapter.feature_id,
+                minimum_duration_seconds=4,
+                preferred_duration_seconds=15,
+                maximum_duration_seconds=16,
+            )
+            for chapter in chapters
+        ]
+    )
+    timing_facts: dict[tuple[str, str], dict[str, object]] = {}
+    for chapter in chapters:
+        for item in chapter.horizontal_candidates:
+            shared = item.candidate_id == "rank-01"
+            capacity = 20_000 if shared else 30_000
+            timing_facts[(chapter.feature_id, item.candidate_id)] = {
+                "candidate_timing_sha256": item.source_asset_id.removeprefix(
+                    "sha256:"
+                ),
+                "source_clip_id": (
+                    "shared-source" if shared else chapter.feature_id + "-alternate"
+                ),
+                "safe_capacity_ms": capacity,
+                "safe_window_start_ms": 0,
+                "safe_window_end_ms": capacity,
+                "source_anchor_ms": capacity // 2,
+                "fixed_source_in_ms": None,
+                "fixed_source_out_ms": None,
+            }
+
+    with pytest.raises(feature_cut_module.InitialHorizontalRouteConflict) as error:
+        feature_cut_module._build_pre_render_horizontal_candidate_route(
+            plan,
+            chapter_durations={"first": 15.0, "second": 15.0},
+            rhythm_plan=rhythm,
+            duration_audit={},
+            policy=policy,
+            candidate_timing_facts=timing_facts,
+        )
+
+    conflict = error.value
+    assert set(conflict.failures_by_beat) == {"second"}
+    assert conflict.failures_by_beat["second"][0]["failure_class"] == (
+        "typed_horizontal_initial_route_distinct_interval_capacity_conflict"
+    )
+    assert conflict.failures_by_beat["second"][0][
+        "required_distinct_interval_ms"
+    ] == 30_000
 
 
 def test_horizontal_primary_clean_recovery_rebinds_same_candidate_before_replan(
@@ -5209,6 +5499,315 @@ def test_horizontal_primary_clean_recovery_rebinds_same_candidate_before_replan(
     assert record["before_execution_sha256"] == original.candidate_execution_sha256
     assert record["after_execution_sha256"] == rebound.candidate_execution_sha256
     assert record["source_motion_evidence_sha256s"] == ["e" * 64]
+
+
+def test_horizontal_dirty_edge_duration_reconciliation_preserves_locked_cues(
+    tmp_path: Path,
+) -> None:
+    """A 5,280ms dirty primary contracts to 4,438ms without moving cues."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+
+    def option(
+        beat_id: str,
+        marker: str,
+        *,
+        trim_ms: int,
+        minimum_ms: int,
+        preferred_ms: int,
+        maximum_ms: int,
+        cue_id: str,
+        cue_aligned: bool,
+        exit_cue_time_ms: int | None,
+        safe_end_ms: int,
+        anchor_ms: int,
+    ) -> CandidateRouteOption:
+        return CandidateRouteOption(
+            beat_id=beat_id,
+            candidate_id=f"{beat_id}-rank-01",
+            source_asset_id="sha256:" + marker * 64,
+            source_clip_id=f"clip-{marker}",
+            event_id=f"event-{beat_id}",
+            planner_rank=1,
+            semantic_confidence=0.9,
+            trim_duration_ms=trim_ms,
+            minimum_readable_ms=minimum_ms,
+            preferred_readable_ms=preferred_ms,
+            maximum_readable_ms=maximum_ms,
+            cue_id=cue_id,
+            cue_aligned=cue_aligned,
+            exit_cue_time_ms=exit_cue_time_ms,
+            safe_capacity_ms=safe_end_ms,
+            safe_window_start_ms=0,
+            safe_window_end_ms=safe_end_ms,
+            source_anchor_ms=anchor_ms,
+            candidate_timing_sha256=marker * 64,
+        )
+
+    opening = option(
+        "opening",
+        "a",
+        trim_ms=8_000,
+        minimum_ms=8_000,
+        preferred_ms=8_000,
+        maximum_ms=8_000,
+        cue_id="locked-cue-00020",
+        cue_aligned=True,
+        exit_cue_time_ms=8_000,
+        safe_end_ms=8_000,
+        anchor_ms=4_000,
+    )
+    design = option(
+        "fold8_design",
+        "b",
+        trim_ms=6_000,
+        minimum_ms=4_000,
+        preferred_ms=6_000,
+        maximum_ms=8_000,
+        cue_id="no-music",
+        cue_aligned=False,
+        exit_cue_time_ms=None,
+        safe_end_ms=20_000,
+        anchor_ms=10_000,
+    )
+    displays = option(
+        "fold8_displays",
+        "c",
+        trim_ms=10_720,
+        minimum_ms=4_000,
+        preferred_ms=10_720,
+        maximum_ms=12_000,
+        cue_id="no-music",
+        cue_aligned=False,
+        exit_cue_time_ms=None,
+        safe_end_ms=20_000,
+        anchor_ms=10_000,
+    )
+    camera = option(
+        "fold8_camera",
+        "d",
+        trim_ms=5_280,
+        minimum_ms=4_000,
+        preferred_ms=5_280,
+        maximum_ms=5_280,
+        cue_id="locked-cue-00059",
+        cue_aligned=True,
+        exit_cue_time_ms=30_000,
+        safe_end_ms=5_280,
+        anchor_ms=3_000,
+    )
+    route = optimize_pre_render_candidate_route(
+        tuple(
+            CandidateRouteBeat(beat_id=row.beat_id, options=(row,))
+            for row in (opening, design, displays, camera)
+        ),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+        cue_tolerance_ms=0,
+    ).model_copy(
+        update={
+            "semantic_replan_candidate_bindings_by_beat": {
+                row.beat_id: (SemanticReplanCandidateBinding(option=row),)
+                for row in (opening, design, displays, camera)
+            }
+        }
+    )
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    reconciled = (
+        feature_cut_module
+        ._attempt_horizontal_primary_dirty_edge_duration_reconciliation(
+            route=route,
+            failures_by_beat={
+                "fold8_camera": (
+                    {
+                        "candidate_id": "fold8_camera-rank-01",
+                        "source_camera_motion_evidence_sha256": "e" * 64,
+                        "source_camera_motion_evidence": {
+                            "reliable": True,
+                            "dirty_head": True,
+                            "dirty_tail": False,
+                            "clean_head_start_ms": 842,
+                            "clean_tail_end_ms": 5_280,
+                        },
+                    },
+                )
+            },
+            editorial_dir=tmp_path / "editorial",
+            policy=policy,
+            plan_path=plan_path,
+        )
+    )
+
+    assert reconciled is not None
+    before = {row.beat_id: row for row in route.selections}
+    after = {row.beat_id: row for row in reconciled.selections}
+    assert after["fold8_camera"].trim_duration_ms == 4_438
+    assert (
+        after["fold8_design"].trim_duration_ms
+        + after["fold8_displays"].trim_duration_ms
+        == before["fold8_design"].trim_duration_ms
+        + before["fold8_displays"].trim_duration_ms
+        + 842
+    )
+    assert reconciled.total_duration_ms == route.total_duration_ms == 30_000
+    assert feature_cut_module._horizontal_locked_cue_project_ends(
+        reconciled.selections
+    ) == feature_cut_module._horizontal_locked_cue_project_ends(route.selections)
+    assert [row.candidate_id for row in reconciled.selections] == [
+        row.candidate_id for row in route.selections
+    ]
+    assert [row.cue_id for row in reconciled.selections] == [
+        row.cue_id for row in route.selections
+    ]
+    assert reconciled.option_bindings_by_beat["fold8_camera"][
+        "fold8_camera-rank-01"
+    ].trim_duration_ms == 4_438
+    records = list(
+        (
+            tmp_path
+            / "editorial"
+            / "horizontal-primary-dirty-edge-duration-reconciliation"
+            / "records"
+            / "fold8_camera"
+        ).glob("*.json")
+    )
+    assert len(records) == 1
+    audit = read_json(records[0])
+    assert audit["before_locked_cue_project_ends"] == audit[
+        "after_locked_cue_project_ends"
+    ]
+    assert audit["preserved_cue_ids"] == [
+        "locked-cue-00020",
+        "locked-cue-00059",
+    ]
+
+
+def test_preferred_fulfillment_failed_alternate_is_not_in_horizontal_replan_frontier(
+    tmp_path: Path,
+) -> None:
+    """A preferred-contract failure is as ineligible as a hard one at runtime."""
+
+    policy = AutonomousEditPolicy(
+        execution_profile="autonomous_strict",
+        content_mode="music_led_feature",
+        requested_aspects=("16:9",),
+        duration=DurationPolicy(target_ms=30_000, min_ms=30_000, max_ms=30_000),
+        budget=BudgetPolicy(
+            max_gemini_cost_usd=1.25,
+            max_paid_interactions=25,
+            max_semantic_replans=1,
+        ),
+    )
+    duration_update = {
+        "trim_duration_ms": 30_000,
+        "minimum_readable_ms": 30_000,
+        "preferred_readable_ms": 30_000,
+        "maximum_readable_ms": 30_000,
+        "fixed_source_out_ms": 30_000,
+        "safe_capacity_ms": 30_000,
+        "safe_window_end_ms": 30_000,
+        "source_anchor_ms": 15_000,
+    }
+    primary = _local_replan_option("hero", "rank-01", "a", rank=1).model_copy(
+        update=duration_update
+    )
+    preferred_inadmissible = _local_replan_option(
+        "hero", "rank-02", "b", rank=2
+    ).model_copy(update=duration_update)
+    eligible = _local_replan_option("hero", "rank-03", "c", rank=3).model_copy(
+        update=duration_update
+    )
+    route = optimize_pre_render_candidate_route(
+        (CandidateRouteBeat(beat_id="hero", options=(primary,)),),
+        minimum_duration_ms=30_000,
+        maximum_duration_ms=30_000,
+        target_duration_ms=30_000,
+    ).model_copy(
+        update={
+            "semantic_replan_candidate_bindings_by_beat": {
+                "hero": tuple(
+                    SemanticReplanCandidateBinding(option=row)
+                    for row in (
+                        primary,
+                        preferred_inadmissible,
+                        eligible,
+                    )
+                )
+            }
+        }
+    )
+    plan_path = tmp_path / "feature-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    class FakeClient:
+        def negotiate_grouped_edit_decisions(self, **kwargs):
+            assert kwargs["option_ids_by_beat"] == {"hero": ("hero--rank-03",)}
+            decision = SimpleNamespace(
+                decisions=(
+                    SimpleNamespace(
+                        model_dump=lambda **_kwargs: {
+                            "beat_id": "hero",
+                            "selected_option_id": "hero--rank-03",
+                            "fallback_option_ids": [],
+                            "semantic_reason": "preserve_readability",
+                            "unresolved_concern_codes": [],
+                            "source_reuse_mode": "none",
+                            "source_reuse_justification": None,
+                            "reuse_of_beat_ids": [],
+                        }
+                    ),
+                )
+            )
+            return SimpleNamespace(
+                decision=decision,
+                interaction_ids=("preferred-filter",),
+            )
+
+    _persist_preflight_horizontal_local_infeasibility_replan(
+        route=route,
+        failures_by_beat={
+            "hero": (
+                {
+                    "candidate_id": "rank-01",
+                    "failure_class": "typed_quality_timing_or_fulfillment_gate",
+                    "reason": "selected primary failed source motion",
+                },
+                {
+                    "candidate_id": "rank-02",
+                    "failure_class": "typed_quality_timing_or_fulfillment_gate",
+                    "reason": "candidate is below the editorial fulfillment minimum",
+                    "preflight_scope": "recovery_alternate",
+                    "contract_priority": "preferred",
+                },
+            )
+        },
+        editorial_dir=tmp_path / "editorial",
+        policy=policy,
+        client=FakeClient(),
+        plan_path=plan_path,
+        music_supplied=True,
+        output_timeline_cues=(),
+    )
+    context = read_json(
+        tmp_path
+        / "editorial"
+        / "preflight-horizontal-local-infeasibility-replan"
+        / "context.json"
+    )
+    assert context["option_ids_by_beat"] == {"hero": ["hero--rank-03"]}
 
 
 def test_horizontal_motion_preservation_is_a_distinct_grouped_action_and_restores(
@@ -5612,6 +6211,58 @@ def test_horizontal_recovery_pass_limit_includes_last_authorized_execution() -> 
         beat_count=2,
         attempt_limit=3,
     ) == 26
+
+
+def test_frozen_conflict_advances_peer_when_constraint_owner_is_exhausted() -> None:
+    """A pair conflict follows Gemini's remaining peer fallback, if any."""
+
+    earlier_option = _local_replan_option("earlier", "rank-01", "a", rank=1)
+    later_option = _local_replan_option("later", "rank-03", "a", rank=3).model_copy(
+        update={
+            "reuse_mode": "distinct_interval",
+            "reuse_justification": "separate interval",
+        }
+    )
+    earlier = _local_replan_execution(earlier_option)
+    later = _local_replan_execution(later_option)
+    route = CandidateRouteResult(
+        selections=(earlier, later),
+        fallback_candidate_ids_by_beat={
+            "earlier": ("rank-01",),
+            "later": ("rank-03",),
+        },
+        option_bindings_by_beat={
+            "earlier": {"rank-01": earlier_option},
+            "later": {"rank-03": later_option},
+        },
+        objective_score=0.0,
+        beam_width=1,
+        total_duration_ms=20_000,
+    )
+
+    _active, failures = (
+        feature_cut_module._horizontal_infeasible_frozen_execution_conflicts(
+            base_route=route,
+            state={
+                "selected_executions": {
+                    "earlier": earlier,
+                    "later": later,
+                },
+                "remaining_fallback_option_ids_by_beat": {
+                    "earlier": ("earlier--rank-02",),
+                    "later": (),
+                },
+            },
+            max_editorial_reprise_overlap_fraction=0.5,
+        )
+    )
+
+    assert set(failures) == {"earlier"}
+    fact = failures["earlier"][0]
+    assert fact["candidate_id"] == "rank-01"
+    assert fact["other_beat_id"] == "later"
+    assert fact["constraint_owner_beat_id"] == "later"
+    assert fact["reason"] == "distinct_interval_reuse_overlaps"
 
 def test_horizontal_mixed_replan_freezes_retain_execution_while_selecting_alternate(
     tmp_path: Path,
@@ -6260,7 +6911,7 @@ def test_generic_candidate_timing_facts_bind_horizontal_top_k_before_route(
     assert len(fact["candidate_timing_sha256"]) == 64
 
 
-def test_horizontal_preflight_collects_hard_fulfillment_failure(
+def test_horizontal_preflight_collects_preferred_fulfillment_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6285,9 +6936,10 @@ def test_horizontal_preflight_collects_hard_fulfillment_failure(
     )
     prepared_called = False
 
-    def reject_hard_fulfillment(contracts, **_kwargs):
+    def reject_preferred_fulfillment(contracts, **_kwargs):
         assert len(contracts) == 1
-        raise ValueError("hard visual obligation cannot be fulfilled")
+        assert contracts[0].priority == "preferred"
+        raise ValueError("preferred visual obligation cannot be fulfilled")
 
     def prepared(**_kwargs):
         nonlocal prepared_called
@@ -6297,7 +6949,7 @@ def test_horizontal_preflight_collects_hard_fulfillment_failure(
     monkeypatch.setattr(
         feature_cut_module,
         "_select_runtime_candidate_fulfillments",
-        reject_hard_fulfillment,
+        reject_preferred_fulfillment,
     )
     monkeypatch.setattr(
         feature_cut_module,
@@ -6327,7 +6979,7 @@ def test_horizontal_preflight_collects_hard_fulfillment_failure(
         model_request_block_reason=None,
         strict=False,
         editorial_contracts=(
-            SimpleNamespace(feature_id="hero", priority="hard"),
+            SimpleNamespace(feature_id="hero", priority="preferred"),
         ),
         candidate_evidence_events={},
     )
@@ -7418,6 +8070,78 @@ def test_runtime_fulfillment_binds_context_without_exact_event() -> None:
     assert selections[0].fulfillment_level == "contextual_identity"
     assert selections[0].visual_events == ()
     assert selections[0].exact_event_required is False
+
+
+def test_runtime_fulfillment_executes_gemini_contextual_empty_shot_intent() -> None:
+    source_asset_id = "sha256:" + "b" * 64
+    contract = EditorialBeatContract.model_validate(
+        {
+            "beat_id": "preferred-feature",
+            "feature_id": "feature",
+            "priority": "preferred",
+            "evidence_query_lock_sha256": "1" * 64,
+            "required_target_ids": ["product"],
+            "narrative_function": "feature_evidence",
+            "minimum_fulfillment_level": "contextual_identity",
+            "fulfillment_alternatives": [
+                {
+                    "fulfillment_level": "direct_demonstration",
+                    "accepted_evidence_provenance": ["direct_physical_action"],
+                    "claim_support_level": "direct",
+                    "exact_event_requirement": "required_when_selected",
+                    "visual_events": [
+                        {
+                            "event_type": "camera_gesture_apex",
+                            "cue_relation": "accent",
+                            "tolerance_frames": 2,
+                        }
+                    ],
+                },
+                {
+                    "fulfillment_level": "contextual_identity",
+                    "accepted_evidence_provenance": ["context_only"],
+                    "claim_support_level": "illustrative_only",
+                    "exact_event_requirement": "none",
+                    "degradation_codes": [
+                        "direct_evidence_unavailable",
+                        "contextual_visual_substitution",
+                    ],
+                    "copy_suppression_codes": [
+                        "specific_claim_copy_suppressed"
+                    ],
+                },
+            ],
+            "duration": {
+                "minimum_readable_frames": 12,
+                "preferred_frames": 24,
+                "maximum_frames": 48,
+            },
+            "relation_mode": "single_subject",
+            "allowed_reconstruction": ["continuous"],
+        }
+    )
+
+    selections = _select_runtime_candidate_fulfillments(
+        (contract,),
+        option={
+            "candidate_id": "rank-02",
+            "source_asset_id": source_asset_id,
+            "event_id": "product-empty-shot",
+            "editorial_fulfillment_intent": "contextual_identity",
+        },
+        evidence_events={
+            (source_asset_id, "product-empty-shot"): {
+                # A broad source-level provenance cannot upgrade Gemini's
+                # candidate-level illustrative intent into a demonstration.
+                "evidence_provenance": "direct_physical_action",
+            }
+        },
+        available_visual_event_types=(),
+    )
+
+    assert selections[0].fulfillment_level == "contextual_identity"
+    assert selections[0].exact_event_required is False
+    assert "contextual_visual_substitution" in selections[0].degradation_codes
 
 
 def test_selected_evidence_v3_validates_effective_observation_integrity(
@@ -12465,6 +13189,78 @@ def test_hard_target_cardinality_keeps_extra_planner_context_soft() -> None:
 
     assert [region.role for region in bound] == ["required", "preferred"]
     assert bound[1].evidence_role == "context_reference"
+
+
+def test_candidate_visual_event_preflight_is_three_state_and_fail_closed() -> None:
+    contract = EditorialBeatContract(
+        beat_id="camera",
+        feature_id="camera",
+        priority="preferred",
+        evidence_query_lock_sha256="a" * 64,
+        required_target_ids=("camera",),
+        narrative_function="feature_evidence",
+        visual_events=(
+            {
+                "event_type": "camera_gesture_apex",
+                "cue_relation": "accent",
+                "tolerance_frames": 2,
+            },
+        ),
+        duration={
+            "minimum_readable_frames": 18,
+            "preferred_frames": 36,
+            "maximum_frames": 72,
+        },
+        relation_mode="single_subject",
+        allowed_reconstruction=("continuous",),
+    )
+
+    unresolved = (
+        feature_cut_module._candidate_visual_event_preflight_assessment(
+            (contract,), option={"candidate_id": "rank-01"}
+        )
+    )
+    supported = (
+        feature_cut_module._candidate_visual_event_preflight_assessment(
+            (contract,),
+            option={
+                "candidate_id": "rank-01",
+                "visual_event_support": [
+                    {
+                        "event_type": "camera_gesture_apex",
+                        "status": "observed_present",
+                        "observable_reason": "A hand gesture reaches its apex.",
+                    }
+                ],
+            },
+        )
+    )
+    unsupported = (
+        feature_cut_module._candidate_visual_event_preflight_assessment(
+            (contract,),
+            option={
+                "candidate_id": "rank-03",
+                "visual_event_support": [
+                    {
+                        "event_type": "camera_gesture_apex",
+                        "status": "observed_absent",
+                        "observable_reason": "The product remains static with no hand.",
+                    }
+                ],
+            },
+        )
+    )
+
+    assert unresolved["status"] == "unresolved"
+    assert unresolved["available_visual_event_types"] == []
+    assert supported["status"] == "direct_supported"
+    assert supported["available_visual_event_types"] == [
+        "camera_gesture_apex"
+    ]
+    assert unsupported["status"] == "explicitly_unsupported"
+    assert unsupported["explicitly_absent_visual_event_types"] == [
+        "camera_gesture_apex"
+    ]
 
 
 def test_preferred_candidate_below_fulfillment_minimum_is_candidate_failure() -> None:
@@ -17721,4 +18517,111 @@ def test_feature_cut_authority_rejects_tampered_eligibility(
             policy=policy,
             expected_scope="feature_cut",
             expected_aspect=None,
+        )
+
+
+def test_pre_render_music_exit_binds_resolved_project_time() -> None:
+    plan = SimpleNamespace(
+        chapters=[
+            SimpleNamespace(feature_id="opening"),
+            SimpleNamespace(feature_id="closing"),
+        ]
+    )
+    exits = feature_cut_module._pre_render_music_exit_by_feature(
+        plan,
+        duration_audit={
+            "music_lock_definition_sha256": "a" * 64,
+            "project_timeline_end_ms": 10_000,
+            "music_boundary_refinements": [
+                {
+                    "boundary_after_feature_id": "opening",
+                    "music_cue_id": "downbeat-1",
+                    "music_snap_applied": True,
+                    "music_snap_rejected_reason": None,
+                    "resolved_boundary_ms": 4_000,
+                }
+            ],
+        },
+    )
+
+    assert exits["opening"] == {
+        "cue_id": "downbeat-1",
+        "cue_aligned": True,
+        "exit_cue_time_ms": 4_000,
+    }
+    assert exits["closing"] == {
+        "cue_id": "music-timeline-end",
+        "cue_aligned": True,
+        "exit_cue_time_ms": 10_000,
+    }
+
+
+def test_runtime_music_boundary_validation_uses_rendered_durations() -> None:
+    opening = _local_replan_option("opening", "rank-01", "a", rank=1).model_copy(
+        update={
+            "trim_duration_ms": 4_000,
+            "minimum_readable_ms": 3_000,
+            "preferred_readable_ms": 4_000,
+            "maximum_readable_ms": 5_000,
+            "cue_id": "downbeat-1",
+            "cue_aligned": True,
+            "exit_cue_time_ms": 4_000,
+            "fixed_source_out_ms": 4_000,
+            "safe_capacity_ms": 4_000,
+            "safe_window_end_ms": 4_000,
+            "source_anchor_ms": 2_000,
+        }
+    )
+    closing = _local_replan_option("closing", "rank-01", "b", rank=1).model_copy(
+        update={
+            "trim_duration_ms": 6_000,
+            "minimum_readable_ms": 5_000,
+            "preferred_readable_ms": 6_000,
+            "maximum_readable_ms": 7_000,
+            "cue_id": "music-timeline-end",
+            "cue_aligned": True,
+            "exit_cue_time_ms": 10_000,
+            "fixed_source_out_ms": 6_000,
+            "safe_capacity_ms": 6_000,
+            "safe_window_end_ms": 6_000,
+            "source_anchor_ms": 3_000,
+        }
+    )
+    route = optimize_pre_render_candidate_route(
+        (
+            CandidateRouteBeat(beat_id="opening", options=(opening,)),
+            CandidateRouteBeat(beat_id="closing", options=(closing,)),
+        ),
+        minimum_duration_ms=10_000,
+        maximum_duration_ms=10_000,
+        target_duration_ms=10_000,
+        cue_tolerance_ms=0,
+    )
+    exact = SimpleNamespace(
+        segments=(
+            SimpleNamespace(beat_id="opening", resolved_duration_ms=4_000),
+            SimpleNamespace(beat_id="closing", resolved_duration_ms=6_000),
+        ),
+        resolved_total_duration_ms=10_000,
+    )
+    result = feature_cut_module._validate_runtime_route_music_boundaries(
+        route=route,
+        reconciliation=exact,
+        cue_tolerance_ms=0,
+    )
+    assert result["status"] == "passed"
+    assert result["boundaries"][0]["delta_ms"] == 0
+
+    drifted = SimpleNamespace(
+        segments=(
+            SimpleNamespace(beat_id="opening", resolved_duration_ms=3_900),
+            SimpleNamespace(beat_id="closing", resolved_duration_ms=6_100),
+        ),
+        resolved_total_duration_ms=10_000,
+    )
+    with pytest.raises(ValueError, match="music_boundary_cue_miss"):
+        feature_cut_module._validate_runtime_route_music_boundaries(
+            route=route,
+            reconciliation=drifted,
+            cue_tolerance_ms=50,
         )

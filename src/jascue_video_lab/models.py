@@ -4301,6 +4301,35 @@ class SelectedVerticalFramingProposal(StrictModel):
         return self
 
 
+CandidateVisualEventType = Literal[
+    "camera_gesture_apex",
+    "generation_result_stable_start",
+    "watch_ui_state_change",
+    "underwater_lift_apex",
+    "group_laugh_reaction_peak",
+    "freeze_start",
+    "action_onset",
+    "action_apex",
+    "state_change",
+    "result_stable_start",
+    "reaction_peak",
+    "clean_out",
+]
+
+
+class CandidateVisualEventSupport(StrictModel):
+    """Gemini's coarse, candidate-level event observation.
+
+    This is semantic admission evidence, not an exact frame lock.  The local
+    exact-event resolver still has to bind every observed-present claim to a
+    source frame before rendering.
+    """
+
+    event_type: CandidateVisualEventType
+    status: Literal["observed_present", "observed_absent", "uncertain"]
+    observable_reason: str = Field(min_length=1, max_length=500)
+
+
 class FeatureHorizontalCandidate(StrictModel):
     """One evidence-bound 16:9 option retained for local automatic routing."""
 
@@ -4327,6 +4356,21 @@ class FeatureHorizontalCandidate(StrictModel):
         "unknown",
     ] = "unknown"
     source_camera_motion_reason: str | None = Field(default=None, max_length=300)
+    visual_event_support: list[CandidateVisualEventSupport] | None = Field(
+        default=None,
+        max_length=8,
+        description=(
+            "Coarse support status for every visual event requested by this "
+            "chapter's EditorialBeatContracts. None means legacy/unassessed, "
+            "not implicitly supported."
+        ),
+    )
+    editorial_fulfillment_intent: Literal[
+        "contextual_identity",
+        "visible_state",
+        "visible_result",
+        "direct_demonstration",
+    ] | None = None
     source_reuse_mode: Literal[
         "none",
         "distinct_interval",
@@ -4339,6 +4383,10 @@ class FeatureHorizontalCandidate(StrictModel):
 
     @model_validator(mode="after")
     def validate_geometry_intent(self) -> "FeatureHorizontalCandidate":
+        if self.visual_event_support is not None:
+            event_types = [row.event_type for row in self.visual_event_support]
+            if len(event_types) != len(set(event_types)):
+                raise ValueError("candidate visual-event support must be unique")
         if self.source_reuse_mode == "none":
             if self.source_reuse_justification is not None:
                 raise ValueError(
@@ -4424,6 +4472,21 @@ class FeatureVerticalCandidate(StrictModel):
         default=None,
         max_length=300,
     )
+    visual_event_support: list[CandidateVisualEventSupport] | None = Field(
+        default=None,
+        max_length=8,
+        description=(
+            "Coarse support status for every visual event requested by this "
+            "chapter's EditorialBeatContracts. None means legacy/unassessed, "
+            "not implicitly supported."
+        ),
+    )
+    editorial_fulfillment_intent: Literal[
+        "contextual_identity",
+        "visible_state",
+        "visible_result",
+        "direct_demonstration",
+    ] | None = None
     physical_scale_comparison: bool = False
     allow_controlled_clip: bool = False
     target_description: str | None = None
@@ -4444,6 +4507,10 @@ class FeatureVerticalCandidate(StrictModel):
 
     @model_validator(mode="after")
     def validate_geometry_intent(self) -> "FeatureVerticalCandidate":
+        if self.visual_event_support is not None:
+            event_types = [row.event_type for row in self.visual_event_support]
+            if len(event_types) != len(set(event_types)):
+                raise ValueError("candidate visual-event support must be unique")
         if self.source_reuse_mode == "none":
             if self.source_reuse_justification is not None:
                 raise ValueError(
