@@ -1127,6 +1127,36 @@ def canonicalize_feature_edit_plan_output(
                         ),
                     }
                 )
+        # The wire contract always carries a reuse justification so structured
+        # output cannot silently omit one; a non-reuse candidate writes the
+        # sentinel. Converting it back to local null is representation repair,
+        # and a justification that survives here is the model's own words.
+        for candidate_field in ("horizontal_candidates", "vertical_candidates"):
+            candidates = chapter.get(candidate_field)
+            if not isinstance(candidates, list):
+                continue
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                justification = candidate.get("source_reuse_justification")
+                if not isinstance(justification, str):
+                    continue
+                if justification.strip() != _REUSE_JUSTIFICATION_SENTINEL:
+                    continue
+                candidate["source_reuse_justification"] = None
+                changes.append(
+                    {
+                        "json_path": (
+                            f"$.chapters[{chapter_index}].{candidate_field}"
+                            f"[{candidates.index(candidate)}]"
+                            ".source_reuse_justification"
+                        ),
+                        "before": _REUSE_JUSTIFICATION_SENTINEL,
+                        "after": None,
+                        "rule": "reuse_justification_sentinel_to_local_null",
+                    }
+                )
+
         evidence_status = chapter.get("evidence_status")
         horizontal_frame = chapter.get("horizontal_frame_id")
         vertical_frame = chapter.get("vertical_frame_id")
@@ -1547,7 +1577,46 @@ def _feature_edit_plan_response_schema(frame_ids: list[str]) -> dict[str, Any]:
     bind_string_enum("FeatureVerticalCandidate", "frame_id")
     _relax_nested_candidate_enums(schema)
     _require_motion_reason(schema)
+    _require_reuse_justification(schema)
     return schema
+
+
+_REUSE_JUSTIFICATION_SENTINEL = "NOT_REUSED"
+
+
+def _require_reuse_justification(schema: dict[str, Any]) -> None:
+    """Make the reuse justification unskippable without breaking non-reuse.
+
+    The justification is required exactly when source_reuse_mode is not
+    "none", and forbidden when it is, so a plain required field would reject
+    the common case.  Leaving it optional instead let the model claim
+    distinct_interval reuse and say nothing about why, losing a whole paid
+    plan to local validation.
+
+    Asks for a required string with an explicit sentinel for the non-reuse
+    case, the same wire shape RF_NONE already uses for an absent aspect
+    frame.  Canonicalization turns the sentinel back into local ``None``.
+    """
+
+    for definition in ("FeatureHorizontalCandidate", "FeatureVerticalCandidate"):
+        candidate = schema["$defs"].get(definition)
+        if candidate is None:
+            continue
+        properties = candidate.get("properties", {})
+        if "source_reuse_justification" not in properties:
+            continue
+        properties["source_reuse_justification"] = {
+            "type": "string",
+            "description": (
+                "Why reusing this source is editorially motivated, in terms "
+                "of what is visible. Required whenever source_reuse_mode is "
+                f"not 'none'. Write exactly {_REUSE_JUSTIFICATION_SENTINEL} "
+                "when the mode is 'none'."
+            ),
+        }
+        required = candidate.setdefault("required", [])
+        if "source_reuse_justification" not in required:
+            required.append("source_reuse_justification")
 
 
 def _require_motion_reason(schema: dict[str, Any]) -> None:

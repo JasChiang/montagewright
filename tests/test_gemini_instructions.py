@@ -1359,6 +1359,62 @@ def test_feature_plan_chapter_completes_an_unstated_rank_one_mirror() -> None:
     }
 
 
+def test_feature_plan_reuse_justification_uses_a_wire_sentinel() -> None:
+    """A conditionally required field still has to be unskippable.
+
+    The justification is required when source_reuse_mode is not "none" and
+    forbidden when it is, so it cannot simply be marked required. Left
+    optional, the model claimed distinct_interval reuse and said nothing about
+    why, which only surfaced after the plan was paid for.
+    """
+
+    schema = gemini_module._feature_edit_plan_response_schema(["RF000001"])
+    for definition in ("FeatureHorizontalCandidate", "FeatureVerticalCandidate"):
+        candidate = schema["$defs"][definition]
+        field = candidate["properties"]["source_reuse_justification"]
+        assert field["type"] == "string"
+        assert "source_reuse_justification" in candidate["required"]
+        assert gemini_module._REUSE_JUSTIFICATION_SENTINEL in field["description"]
+
+    canonical, changes = canonicalize_feature_edit_plan_output(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "evidence_status": "supported",
+                        "horizontal_frame_id": "RF000001",
+                        "vertical_frame_id": "RF000002",
+                        "horizontal_candidates": [
+                            {
+                                "rank": 1,
+                                "frame_id": "RF000001",
+                                "source_reuse_mode": "none",
+                                "source_reuse_justification": (
+                                    gemini_module._REUSE_JUSTIFICATION_SENTINEL
+                                ),
+                            },
+                            {
+                                "rank": 2,
+                                "frame_id": "RF000009",
+                                "source_reuse_mode": "distinct_interval",
+                                "source_reuse_justification": "later beat",
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    candidates = json.loads(canonical)["chapters"][0]["horizontal_candidates"]
+    assert candidates[0]["source_reuse_justification"] is None
+    # A real justification is never rewritten.
+    assert candidates[1]["source_reuse_justification"] == "later beat"
+    assert any(
+        change["rule"] == "reuse_justification_sentinel_to_local_null"
+        for change in changes
+    )
+
+
 def test_feature_plan_repairs_a_null_rank_one_mirror() -> None:
     """An explicit null states nothing, exactly like an omitted key.
 
