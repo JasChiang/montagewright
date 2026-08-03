@@ -1512,7 +1512,64 @@ def _feature_edit_plan_response_schema(frame_ids: list[str]) -> dict[str, Any]:
             chapter_required.append(field_name)
     bind_string_enum("FeatureHorizontalCandidate", "frame_id")
     bind_string_enum("FeatureVerticalCandidate", "frame_id")
+    _relax_nested_candidate_enums(schema)
     return schema
+
+
+# Types reached through two or more nested arrays: a chapter list, then a
+# candidate list, then this type's own repeated entries.
+_DEEP_CANDIDATE_DEFINITIONS = (
+    "FeatureHorizontalCandidate",
+    "FeatureVerticalCandidate",
+    "CandidateVisualEventSupport",
+)
+# The catalog frame binding is the one constraint local validation cannot
+# reproduce, so its enum is never relaxed.
+_SCHEMA_BOUND_CANDIDATE_FIELDS = frozenset({"frame_id"})
+
+
+def _relax_nested_candidate_enums(schema: dict[str, Any]) -> int:
+    """Describe deeply nested closed vocabularies without a schema ``enum``.
+
+    Interactions structured output rejects a response schema once its
+    constrained-decoding grammar grows past an internal ceiling, and an
+    ``enum`` costs far more inside repeated nested arrays than the same field
+    would at the top level.  Every vocabulary relaxed here is a Pydantic
+    ``Literal`` that :class:`FeatureEditPlan` still enforces when the response
+    is parsed, so the contract is unchanged and only moves from generation
+    time to validation time.  The catalog frame IDs stay bound in the schema
+    because a generated ID cannot be re-derived locally.
+
+    Returns the number of relaxed vocabularies so a regression test can assert
+    the ceiling stays respected as the plan contract grows.
+    """
+
+    relaxed = 0
+
+    def relax(node: Any) -> Any:
+        nonlocal relaxed
+        if isinstance(node, dict):
+            if isinstance(node.get("enum"), list):
+                relaxed += 1
+                remainder = {
+                    key: value for key, value in node.items() if key != "enum"
+                }
+                remainder["type"] = "string"
+                return remainder
+            return {key: relax(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [relax(item) for item in node]
+        return node
+
+    for definition in _DEEP_CANDIDATE_DEFINITIONS:
+        properties = schema["$defs"].get(definition, {}).get("properties")
+        if not properties:
+            continue
+        for field_name, field_schema in list(properties.items()):
+            if field_name in _SCHEMA_BOUND_CANDIDATE_FIELDS:
+                continue
+            properties[field_name] = relax(field_schema)
+    return relaxed
 
 
 class GeminiContractError(RuntimeError):

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
+from pydantic import ValidationError
 
 import jascue_video_lab.gemini as gemini_module
 from jascue_video_lab.autonomous_policy import (
@@ -1548,6 +1549,74 @@ def test_feature_plan_rf_ids_are_catalog_bound_in_response_schema() -> None:
         "attention_observation",
     ):
         assert field_name in chapter_schema["required"]
+
+
+def test_feature_plan_nested_candidate_vocabularies_leave_the_schema() -> None:
+    """Nested closed vocabularies must not re-enter the response schema.
+
+    Interactions rejects the whole plan request once the constrained-decoding
+    grammar passes an internal ceiling, and an ``enum`` two or more nested
+    arrays deep is what pushed it over historically.  The vocabularies below
+    are Pydantic ``Literal`` fields that FeatureEditPlan still enforces at
+    parse time, so relaxing them costs no contract strength.
+    """
+
+    legal_ids = ["RF000001", "RF000002"]
+    schema = gemini_module._feature_edit_plan_response_schema(legal_ids)
+
+    for definition in gemini_module._DEEP_CANDIDATE_DEFINITIONS:
+        properties = schema["$defs"].get(definition, {}).get("properties", {})
+        for field_name, field_schema in properties.items():
+            if field_name in gemini_module._SCHEMA_BOUND_CANDIDATE_FIELDS:
+                continue
+            assert "enum" not in json.dumps(field_schema), (
+                f"{definition}.{field_name} reintroduced a nested enum"
+            )
+
+    # The catalog binding is the one vocabulary local validation cannot
+    # reproduce, so it has to survive the relaxation.
+    for definition in ("FeatureHorizontalCandidate", "FeatureVerticalCandidate"):
+        assert schema["$defs"][definition]["properties"]["frame_id"]["enum"] == (
+            legal_ids
+        )
+
+
+def test_feature_plan_relaxed_vocabularies_still_reject_invalid_values() -> None:
+    """Relaxing the schema must not widen what the parsed plan accepts."""
+
+    relaxed = gemini_module._relax_nested_candidate_enums(
+        {
+            "$defs": {
+                "FeatureHorizontalCandidate": {
+                    "properties": {
+                        "frame_id": {"type": "string", "enum": ["RF000001"]},
+                        "source_reuse_mode": {
+                            "type": "string",
+                            "enum": ["distinct_interval"],
+                        },
+                    }
+                }
+            }
+        }
+    )
+    assert relaxed == 1
+
+    with pytest.raises(ValidationError):
+        FeatureChapterSelect.model_validate(
+            {
+                "feature_id": "demo",
+                "evidence_status": "supported",
+                "observed_visual_evidence": "visible",
+                "selection_reason": "fits",
+                "horizontal_strategy": "not_a_real_strategy",
+                "horizontal_zoom_intent": "none",
+                "horizontal_target_description": None,
+                "vertical_strategy": "tracked_crop",
+                "vertical_target_description": None,
+                "quality_risks": [],
+                "confidence": "high",
+            }
+        )
 
 
 def test_feature_plan_not_found_transport_sentinel_becomes_local_null() -> None:
