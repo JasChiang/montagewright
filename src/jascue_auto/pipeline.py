@@ -151,17 +151,39 @@ def follow_subjects(
 
             duration = clip.approx_out_seconds - clip.approx_in_seconds
 
-            if reframe.then_subject is not None:
+            if reframe.then_subject is not None and reframe.subject is not None:
                 # Two subjects in one frame: pan from the first to the second
-                # rather than cutting the take to itself.
+                # rather than cutting the take to itself. Both endpoints are
+                # measured, because a nine-box position is a hint about which
+                # subject is meant, not a coordinate to aim at -- aiming at it
+                # overshoots the subject and lands on background.
+                frames, _ = _sample_frames(
+                    source, clip.approx_in_seconds, clip.approx_out_seconds, work
+                )
+                centres = []
+                for subject in (reframe.subject, reframe.then_subject):
+                    boxes, usage = locate_subject(
+                        frames, subject.description, client=client
+                    )
+                    report.usages.append(usage)
+                    seen = [
+                        float(box["centre_x"])
+                        for box in boxes
+                        if box.get("present") and box.get("centre_x") is not None
+                    ]
+                    centres.append(
+                        sum(seen) / len(seen) if seen else 0.5
+                    )
                 paths[clip.clip_id] = build_handoff_path(
                     source_aspect=source.aspect_ratio,
                     target_aspect=target_aspect,
                     duration_seconds=duration,
-                    from_position=reframe.subject.coarse_position
-                    if reframe.subject
-                    else "center",
-                    to_position=reframe.then_subject.coarse_position,
+                    from_centre=centres[0],
+                    to_centre=centres[1],
+                    energy=reframe.camera_energy,
+                )
+                report.subject_notes[clip.clip_id] = (
+                    f"handoff {centres[0]:.3f} -> {centres[1]:.3f}"
                 )
                 report.following_shots += 1
                 continue

@@ -251,19 +251,24 @@ def build_handoff_path(
     source_aspect: float,
     target_aspect: float,
     duration_seconds: float,
-    from_position: str,
-    to_position: str,
+    from_centre: float,
+    to_centre: float,
+    energy: CameraEnergy = "calm",
 ) -> CropPath:
     """Carry the eye from one subject to another inside one shot.
 
     Splitting the shot instead, which this did first, cuts a continuous take
     to itself: same background, same light, same moment, and the frame jumps
-    2362 pixels sideways. That is not an edit, it is a jump cut with nothing
-    motivating it, and it is what a viewer notices at the two-second mark.
+    sideways. That is a jump cut with nothing motivating it.
 
-    An editor moving attention across a static frame either pans across it or
-    cuts away and back. Panning is what a handoff means, so panning is what it
-    does.
+    The endpoints are measured subject centres, not nine-box guesses. Mapping
+    "mid_left" and "mid_right" onto the edges of the frame sent the crop to
+    0.192 and 0.808 for two handsets that actually sit at 0.359 and 0.635 --
+    overshooting each subject by about a sixth of the frame, so the pan began
+    with the first phone half out of frame on the right, crossed empty
+    background in the middle, and ended with the second one clipped on the
+    left. It also made the move twice as long as it needed to be, which is the
+    same bug showing up as speed.
     """
 
     if target_aspect < source_aspect:
@@ -274,31 +279,24 @@ def build_handoff_path(
         crop_height = source_aspect / target_aspect
 
     free_x = max(0.0, 1.0 - crop_width)
-    free_y = max(0.0, 1.0 - crop_height)
+    y = (1.0 - crop_height) / 2.0
 
-    def anchor(position: str) -> tuple[float, float]:
-        vertical, _, horizontal = position.partition("_")
-        across = {"left": 0.0, "center": 0.5, "right": 1.0}.get(horizontal, 0.5)
-        down = {"top": 0.0, "mid": 0.5, "bottom": 1.0}.get(vertical, 0.5)
-        x = across * free_x
-        y = down * free_y
-        if free_x > 0.0:
-            x = min(max(x, free_x * CROP_MARGIN), free_x * (1.0 - CROP_MARGIN))
-        if free_y > 0.0:
-            y = min(max(y, free_y * CROP_MARGIN), free_y * (1.0 - CROP_MARGIN))
-        return x, y
+    def centred_on(centre: float) -> float:
+        """Put the crop around a measured subject centre, not past it."""
 
-    start_x, start_y = anchor(from_position)
-    end_x, end_y = anchor(to_position)
-    return CropPath(
+        return min(max(centre - crop_width / 2.0, 0.0), free_x)
+
+    start_x = centred_on(from_centre)
+    end_x = centred_on(to_centre)
+
+    path = CropPath(
         [
-            Keyframe(0.0, CropBox(start_x, start_y, crop_width, crop_height)),
-            Keyframe(
-                duration_seconds,
-                CropBox(end_x, end_y, crop_width, crop_height),
-            ),
+            Keyframe(0.0, CropBox(start_x, y, crop_width, crop_height)),
+            Keyframe(duration_seconds, CropBox(end_x, y, crop_width, crop_height)),
         ]
     )
+    limited, _ = _limit_speed(path.keyframes, ENERGY_LIMITS[energy])
+    return CropPath(limited)
 
 
 def build_zoom_path(
@@ -351,6 +349,79 @@ def build_zoom_path(
     )
 
 
+def visible_fraction(crop: CropBox, observation: Observation) -> float:
+    """How much of the subject the crop actually contains.
+
+    Centring on a subject says nothing about whether it fits. A subject 0.55
+    of the frame wide inside a 0.316 crop is 57% visible however perfectly it
+    is centred, and the path builder reported that shot as executed with no
+    degradation -- the crop was exactly where it was asked to be, and half the
+    product was outside it.
+    """
+
+    left = max(crop.x, observation.centre_x - observation.width / 2.0)
+    right = min(crop.x + crop.width, observation.centre_x + observation.width / 2.0)
+    across = max(0.0, right - left) / max(observation.width, 1e-9)
+
+    top = max(crop.y, observation.centre_y - observation.height / 2.0)
+    bottom = min(
+        crop.y + crop.height, observation.centre_y + observation.height / 2.0
+    )
+    down = max(0.0, bottom - top) / max(observation.height, 1e-9)
+    return across * down
+
+
+def _report_fit(
+    path: CropPath,
+    observations: list[Observation],
+    *,
+    clip_id: str,
+    min_visible: float,
+    degradations: list[DegradationStep] | None,
+) -> CropPath:
+    """Record how much of the subject the finished path actually holds.
+
+    Every exit from the path builder passes through here. Placing this only on
+    the moving branch, as it was first, skipped exactly the shots that need it
+    -- a subject too big for the crop usually is not moving, so the static
+    early return carried it straight past the check.
+    """
+
+    if degradations is None or not observations:
+        return path
+
+    worst = min(
+        visible_fraction(
+            path.keyframes[
+                min(index, len(path.keyframes) - 1)
+            ].crop,
+            observation,
+        )
+        for index, observation in enumerate(observations)
+    )
+    if worst < min_visible:
+        degradations.append(
+            DegradationStep(
+                clip_id=clip_id,
+                ladder="other",
+                ladder_other="subject_larger_than_crop",
+                trigger=(
+                    "the subject does not fit the target aspect at any point "
+                    "in this shot, so it is framed as fully as the crop allows"
+                ),
+                measured={
+                    "worst_visible_fraction": round(worst, 4),
+                    "requested_min_visible": min_visible,
+                    "subject_width_vw": round(
+                        max(o.width for o in observations), 4
+                    ),
+                    "crop_width_vw": round(path.keyframes[0].crop.width, 4),
+                },
+            )
+        )
+    return path
+
+
 def build_crop_path(
     observations: list[Observation],
     *,
@@ -358,6 +429,7 @@ def build_crop_path(
     target_aspect: float,
     energy: CameraEnergy = "calm",
     clip_id: str = "",
+    min_visible: float = 0.85,
     degradations: list[DegradationStep] | None = None,
 ) -> CropPath:
     """Turn subject observations into a crop that follows them.
@@ -412,7 +484,15 @@ def build_crop_path(
                     },
                 )
             )
-        return CropPath([Keyframe(observations[0].seconds, crop_at(_percentile(centres, 0.5)))])
+        return _report_fit(
+            CropPath(
+                [Keyframe(observations[0].seconds, crop_at(_percentile(centres, 0.5)))]
+            ),
+            observations,
+            clip_id=clip_id,
+            min_visible=min_visible,
+            degradations=degradations,
+        )
 
     wandered = sum(
         abs(later.centre_x - earlier.centre_x)
@@ -443,13 +523,19 @@ def build_crop_path(
                     },
                 )
             )
-        return CropPath(
-            [
-                Keyframe(
-                    observations[0].seconds,
-                    crop_at(_percentile(centres, 0.5)),
-                )
-            ]
+        return _report_fit(
+            CropPath(
+                [
+                    Keyframe(
+                        observations[0].seconds,
+                        crop_at(_percentile(centres, 0.5)),
+                    )
+                ]
+            ),
+            observations,
+            clip_id=clip_id,
+            min_visible=min_visible,
+            degradations=degradations,
         )
 
     raw: list[Keyframe] = []
@@ -571,3 +657,54 @@ def ffmpeg_crop_expression(
     x_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.x, width)},{width}-out_w))/2)*2"
     y_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.y, height)},{height}-out_h))/2)*2"
     return w_expr, h_expr, x_expr, y_expr
+
+
+def observations_from_sam(
+    track: dict,
+    *,
+    clip_start_seconds: float,
+) -> list[Observation]:
+    """Read a SAM propagation result as subject observations.
+
+    Sampling five frames and interpolating between them, which is what this
+    replaces, describes a three-second shot at one point every 0.6 seconds and
+    guesses the rest. A subject that crosses the frame and comes back inside
+    one sample interval is invisible to that, and so is the moment a hand
+    enters and takes the subject with it.
+
+    SAM propagates a single seed box across every analysed frame, so the
+    trajectory is measured rather than inferred. The seed still comes from
+    Gemini, because knowing which of two similar handsets is meant is not
+    something a tracker can answer.
+    """
+
+    observations: list[Observation] = []
+    for sample in track.get("samples", []):
+        geometry = sample.get("geometry") or {}
+        box = geometry.get("normalized_box_xyxy") or sample.get("box_2d")
+        if not box or len(box) != 4:
+            continue
+        # The old package reports normalised boxes in 0..1000.
+        scale = 1000.0 if max(box) > 1.0 else 1.0
+        x0, y0, x1, y1 = (value / scale for value in box)
+        width, height = abs(x1 - x0), abs(y1 - y0)
+        if width <= 0 or height <= 0:
+            continue
+        at = float(sample.get("timeline_ms", 0)) / 1000.0 - clip_start_seconds
+        if at < 0:
+            continue
+        try:
+            observations.append(
+                Observation(
+                    seconds=at,
+                    centre_x=(x0 + x1) / 2.0,
+                    centre_y=(y0 + y1) / 2.0,
+                    width=width,
+                    height=height,
+                )
+            )
+        except OutOfFrame:
+            # A mask that left the frame is not a reason to discard the rest
+            # of a measured track.
+            continue
+    return observations
