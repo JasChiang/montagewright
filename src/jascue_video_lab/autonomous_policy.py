@@ -83,7 +83,13 @@ class MediaResolutionPolicy(FrozenStrictModel):
 
 
 class GeminiOperationLimit(FrozenStrictModel):
-    max_output_tokens: int = Field(ge=256, le=32_768)
+    # The upper bound tracks what the model will actually accept, so a policy
+    # can budget for a verbose answer instead of being capped below it. A
+    # twelve-chapter Top-K plan has been measured at 24.5k output tokens, and
+    # a run that exceeds its ceiling loses the whole paid response. Per
+    # operation defaults stay where they are; raising them would inflate every
+    # budget reservation whether or not the tokens are used.
+    max_output_tokens: int = Field(ge=256, le=65_536)
     thinking_level: ThinkingLevel
 
 
