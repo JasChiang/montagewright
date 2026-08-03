@@ -208,28 +208,54 @@ class Reframe(ModelFacing):
 
 
 class MusicSync(ModelFacing):
-    """Musical placement by name, never by second.
+    """How this shot sits against the music.
 
-    Seconds from the model were the previous system's weakest link: it planned
-    cuts first and then tried to slide them onto beats, which failed outright
-    the moment durations had no slack. Names resolve against the local beat
-    grid, so the grid decides the timing and the model decides the meaning.
+    Timing resolves locally against a measured grid, so nothing here is a
+    timestamp. What is here is the editorial part: whether this cut wants to
+    be felt with the music or against it, and why.
+
+    Cutting everything to a fixed beat count is the failure mode on the other
+    side of ignoring the music entirely. A shot whose action needs another
+    half-second should get it and land late; a hard accent should be hit even
+    if the shot before it has to give way. Say which of those this is.
     """
 
+    cut_on_beat: bool = Field(
+        default=True,
+        description=(
+            "True to land the out-point on the nearest musical event. False "
+            "when the content should govern -- an action mid-completion, a "
+            "reaction still landing, a held beat of silence. Cutting through "
+            "a finished gesture to hit an accent is worse than arriving a "
+            "moment late."
+        ),
+    )
     sync_to: str | None = Field(
         default=None,
         description=(
-            "A named point in the track -- 'chorus_1_start', 'drop', "
-            "'outro_start'. Never a timestamp."
+            "A named point this shot should coincide with, when it matters: "
+            "'chorus_1_start', 'drop', 'outro_start'. Leave null when no "
+            "particular moment in the track is being targeted."
         ),
-    )
-    cut_on_beat: bool = Field(
-        default=True, description="Whether this clip's out-point wants a beat."
     )
     beats: int | None = Field(
         default=None,
         ge=1,
-        description="Length in beats, when the clip should run a set count.",
+        description=(
+            "Length in beats, only when the shot genuinely wants a musical "
+            "count -- a montage pulse, a repeated figure. Leave null and let "
+            "the clip's own in and out times express the length whenever the "
+            "content, not the metre, decides how long this is on screen."
+        ),
+    )
+    rhythm_reason: str = Field(
+        default="",
+        description=(
+            "Why this shot takes the length it does, in terms of what is "
+            "happening on screen and in the track. One line. This is the "
+            "record of an editorial decision, so 'eight beats' is not a "
+            "reason -- 'the fold completes on the downbeat' is."
+        ),
     )
 
 
