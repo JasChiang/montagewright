@@ -38,11 +38,15 @@ ENERGY_LIMITS: dict[CameraEnergy, dict[str, float]] = {
 # Movement below this is invisible and only adds jitter, so the camera holds.
 DEADBAND = 0.02
 
-# How much of a subject's travel has to end up as net displacement before the
-# camera commits to following it. A subject that steps out and comes back
-# inside one short shot has gone nowhere; an operator watching that holds the
-# frame, and a camera that chases each swing reads as a wobble rather than a
-# move. Below this the shot is framed on where the subject spent its time.
+# How much of a subject's travel has to end up as net displacement before a
+# follow is worth executing. A subject that steps out and comes back inside
+# one short shot has gone nowhere, and chasing each swing reads as a wobble.
+#
+# Crossing this threshold is not a veto. The planner asked for a follow and a
+# follow is what it gets when there is motion to follow; below the threshold
+# the shot is framed on where the subject spent its time AND the substitution
+# is written into the degradation record. Silently returning a hold, which is
+# what this did first, tells the planner its instruction was carried out.
 MIN_DIRECTNESS = 0.6
 
 
@@ -104,14 +108,20 @@ class CropPath:
         return all(
             abs(frame.crop.x - first.x) < 1e-6
             and abs(frame.crop.y - first.y) < 1e-6
+            and abs(frame.crop.width - first.width) < 1e-6
+            and abs(frame.crop.height - first.height) < 1e-6
             for frame in self.keyframes
         )
 
     def travel(self) -> float:
-        """Total horizontal movement, in viewport widths."""
+        """Total movement across every axis, in viewport widths."""
 
         return sum(
-            abs(later.crop.x - earlier.crop.x)
+            max(
+                abs(later.crop.x - earlier.crop.x),
+                abs(later.crop.y - earlier.crop.y),
+                abs(later.crop.width - earlier.crop.width),
+            )
             for earlier, later in zip(self.keyframes, self.keyframes[1:])
         )
 
@@ -184,6 +194,163 @@ def _smooth(keyframes: list[Keyframe], strength: float = 0.5) -> list[Keyframe]:
     return smoothed
 
 
+def build_sweep_path(
+    *,
+    source_aspect: float,
+    target_aspect: float,
+    duration_seconds: float,
+    direction: str,
+    energy: CameraEnergy = "calm",
+) -> CropPath:
+    """A designed move across a static arrangement.
+
+    No subject is followed here because nothing is moving. A row of handsets
+    wants the eye carried across it, and that is a decision about how to
+    present the frame rather than a reaction to something in it. Treating this
+    as a follow of the group's centre yields a hold, which is the answer to a
+    question nobody asked.
+    """
+
+    if target_aspect < source_aspect:
+        crop_width = target_aspect / source_aspect
+        crop_height = 1.0
+    else:
+        crop_width = 1.0
+        crop_height = source_aspect / target_aspect
+
+    free_x = max(0.0, 1.0 - crop_width)
+    if free_x <= 0.0:
+        return CropPath(
+            [Keyframe(0.0, CropBox(0.0, (1.0 - crop_height) / 2.0, crop_width, crop_height))]
+        )
+
+    # Sweep the width the energy allows in the time available, never more of
+    # the frame than exists.
+    limits = ENERGY_LIMITS[energy]
+    reach = min(free_x, limits["max_speed"] * duration_seconds)
+    inset = free_x * CROP_MARGIN
+    if direction == "sweep_left":
+        start, end = min(free_x - inset, inset + reach), inset
+    else:
+        start, end = inset, min(free_x - inset, inset + reach)
+
+    y = (1.0 - crop_height) / 2.0
+    return CropPath(
+        [
+            Keyframe(0.0, CropBox(start, y, crop_width, crop_height)),
+            Keyframe(
+                duration_seconds,
+                CropBox(end, y, crop_width, crop_height),
+            ),
+        ]
+    )
+
+
+def build_handoff_path(
+    *,
+    source_aspect: float,
+    target_aspect: float,
+    duration_seconds: float,
+    from_position: str,
+    to_position: str,
+) -> CropPath:
+    """Carry the eye from one subject to another inside one shot.
+
+    Splitting the shot instead, which this did first, cuts a continuous take
+    to itself: same background, same light, same moment, and the frame jumps
+    2362 pixels sideways. That is not an edit, it is a jump cut with nothing
+    motivating it, and it is what a viewer notices at the two-second mark.
+
+    An editor moving attention across a static frame either pans across it or
+    cuts away and back. Panning is what a handoff means, so panning is what it
+    does.
+    """
+
+    if target_aspect < source_aspect:
+        crop_width = target_aspect / source_aspect
+        crop_height = 1.0
+    else:
+        crop_width = 1.0
+        crop_height = source_aspect / target_aspect
+
+    free_x = max(0.0, 1.0 - crop_width)
+    free_y = max(0.0, 1.0 - crop_height)
+
+    def anchor(position: str) -> tuple[float, float]:
+        vertical, _, horizontal = position.partition("_")
+        across = {"left": 0.0, "center": 0.5, "right": 1.0}.get(horizontal, 0.5)
+        down = {"top": 0.0, "mid": 0.5, "bottom": 1.0}.get(vertical, 0.5)
+        x = across * free_x
+        y = down * free_y
+        if free_x > 0.0:
+            x = min(max(x, free_x * CROP_MARGIN), free_x * (1.0 - CROP_MARGIN))
+        if free_y > 0.0:
+            y = min(max(y, free_y * CROP_MARGIN), free_y * (1.0 - CROP_MARGIN))
+        return x, y
+
+    start_x, start_y = anchor(from_position)
+    end_x, end_y = anchor(to_position)
+    return CropPath(
+        [
+            Keyframe(0.0, CropBox(start_x, start_y, crop_width, crop_height)),
+            Keyframe(
+                duration_seconds,
+                CropBox(end_x, end_y, crop_width, crop_height),
+            ),
+        ]
+    )
+
+
+def build_zoom_path(
+    *,
+    source_aspect: float,
+    target_aspect: float,
+    duration_seconds: float,
+    direction: str,
+    centre_x: float = 0.5,
+    centre_y: float = 0.5,
+    energy: CameraEnergy = "calm",
+) -> CropPath:
+    """Close in on something, or open out from it.
+
+    The most-asked-for move on this material by some distance -- four of
+    eleven shots in one selection -- because a product film is mostly about
+    looking closer at things rather than chasing them.
+
+    The crop shrinks toward the subject for a push in and grows away for a
+    pull out. How far it travels is bounded by how much frame there is: a crop
+    that is already most of the source has nowhere to go, and forcing one
+    would soften the picture rather than move it.
+    """
+
+    if target_aspect < source_aspect:
+        base_width = target_aspect / source_aspect
+        base_height = 1.0
+    else:
+        base_width = 1.0
+        base_height = source_aspect / target_aspect
+
+    # Zoom range scales with energy: a calm push is barely felt, a dynamic one
+    # is a move in its own right. Capped so the tightest crop still has real
+    # pixels behind it.
+    span = {"calm": 0.10, "active": 0.18, "dynamic": 0.28}[energy]
+    tight = max(0.35, 1.0 - span)
+
+    wide = (base_width, base_height)
+    close = (base_width * tight, base_height * tight)
+    first, last = (wide, close) if direction == "push_in" else (close, wide)
+
+    def box(size: tuple[float, float]) -> CropBox:
+        width, height = size
+        x = min(max(centre_x - width / 2.0, 0.0), max(0.0, 1.0 - width))
+        y = min(max(centre_y - height / 2.0, 0.0), max(0.0, 1.0 - height))
+        return CropBox(x, y, width, height)
+
+    return CropPath(
+        [Keyframe(0.0, box(first)), Keyframe(duration_seconds, box(last))]
+    )
+
+
 def build_crop_path(
     observations: list[Observation],
     *,
@@ -195,8 +362,9 @@ def build_crop_path(
 ) -> CropPath:
     """Turn subject observations into a crop that follows them.
 
-    Returns a single-keyframe path when the subject barely moves; that is a
-    hold, not a failure, and it is recorded as neither.
+    Returns a single-keyframe path when the subject barely moves. That is a
+    hold, and when a follow was asked for it is also a substitution, so it is
+    recorded as one.
     """
 
     if not observations:
@@ -225,8 +393,25 @@ def build_crop_path(
         return CropBox(x=x, y=(1.0 - crop_height) / 2.0, width=crop_width, height=crop_height)
 
     if spread < DEADBAND or free_x <= 0.0:
-        # Nothing worth following. A still camera on a still subject is the
-        # right answer, so no degradation is recorded.
+        if degradations is not None:
+            degradations.append(
+                DegradationStep(
+                    clip_id=clip_id,
+                    ladder="static_on_subject",
+                    trigger=(
+                        "a follow was planned but the subject does not move "
+                        "in this shot"
+                        if free_x > 0.0
+                        else "a follow was planned but the crop already fills "
+                        "the frame on this axis, leaving nowhere to move"
+                    ),
+                    measured={
+                        "subject_spread_vw": round(spread, 4),
+                        "deadband_vw": DEADBAND,
+                        "free_travel_vw": round(free_x, 4),
+                    },
+                )
+            )
         return CropPath([Keyframe(observations[0].seconds, crop_at(_percentile(centres, 0.5)))])
 
     wandered = sum(
@@ -236,9 +421,28 @@ def build_crop_path(
     net = abs(centres[-1] - centres[0])
     directness = net / wandered if wandered > 1e-9 else 0.0
     if directness < MIN_DIRECTNESS:
-        # The subject moved but did not go anywhere. Hold on where it spent
-        # its time rather than retracing each swing. This is a framing
-        # decision, not a fallback, so nothing is recorded as degraded.
+        # The subject moved but did not go anywhere. Framing on where it spent
+        # its time beats retracing each swing -- and this is a substitution
+        # for what was asked, so it is recorded rather than passed off as the
+        # plan being carried out.
+        if degradations is not None:
+            degradations.append(
+                DegradationStep(
+                    clip_id=clip_id,
+                    ladder="static_on_subject",
+                    trigger=(
+                        "a follow was planned but the subject returned to "
+                        "where it started, so following it would read as a "
+                        "wobble rather than a move"
+                    ),
+                    measured={
+                        "directness": round(directness, 4),
+                        "threshold": MIN_DIRECTNESS,
+                        "net_displacement_vw": round(net, 4),
+                        "total_wander_vw": round(wandered, 4),
+                    },
+                )
+            )
         return CropPath(
             [
                 Keyframe(
@@ -298,43 +502,72 @@ def build_crop_path(
     return path
 
 
-def ffmpeg_crop_expression(
-    path: CropPath, width: int, height: int
-) -> tuple[str, str, int, int]:
-    """Render a path as an ffmpeg crop filter's arguments.
+def _eased(start: float, end: float, at: float, span: float) -> str:
+    """A smoothstep ramp between two values, as an ffmpeg expression.
 
-    Returns (x expression, y expression, crop width, crop height). A static
-    path yields plain numbers; a moving one yields a piecewise-linear
-    expression in `t`, which keeps the motion in one filter rather than
-    driving it from a command file.
+    Linear interpolation, which this used first, gives constant velocity with
+    an instant start and an instant stop. Nothing physical moves that way and
+    nothing shot by hand looks that way, which is most of what reads as
+    mechanical in a generated move. Smoothstep eases both ends, so the camera
+    takes up the move and sets it down.
+
+    This is also where the acceleration budget finally does something:
+    ENERGY_LIMITS carried a max_accel that nothing referenced, because a
+    constant-velocity ramp has no acceleration to bound.
     """
 
-    first = path.keyframes[0].crop
-    crop_w, crop_h = first.to_pixels(width, height)[2:]
+    delta = end - start
+    # 3u^2 - 2u^3 over the segment's own normalised time.
+    unit = f"clip((t-{at:.3f})/{span:.6f},0,1)"
+    return f"{start:.3f}+({delta:.3f})*({unit}*{unit}*(3-2*{unit}))"
 
-    if path.is_static:
-        x, y = first.to_pixels(width, height)[:2]
-        return str(x), str(y), crop_w, crop_h
 
-    # Build from the last segment backwards so each `if` falls through to the
-    # earlier one, ending at the first keyframe's value.
-    expression = f"{path.keyframes[0].crop.x * width:.3f}"
+def _axis_expression(
+    path: CropPath, pick, scale: int, *, ease: bool = True
+) -> str:
+    """Piecewise expression for one axis over the whole shot."""
+
+    first = pick(path.keyframes[0].crop) * scale
+    expression = f"{first:.3f}"
     for earlier, later in zip(path.keyframes, path.keyframes[1:]):
-        start_x = earlier.crop.x * width
-        end_x = later.crop.x * width
+        start = pick(earlier.crop) * scale
+        end = pick(later.crop) * scale
         span = max(later.seconds - earlier.seconds, 1e-6)
         ramp = (
-            f"{start_x:.3f}+({end_x - start_x:.3f})*"
-            f"(t-{earlier.seconds:.3f})/{span:.3f}"
+            _eased(start, end, earlier.seconds, span)
+            if ease
+            else f"{start:.3f}+({end - start:.3f})*(t-{earlier.seconds:.3f})/{span:.6f}"
         )
         expression = (
             f"if(between(t,{earlier.seconds:.3f},{later.seconds:.3f}),"
             f"{ramp},{expression})"
         )
-    # Past the final keyframe, hold the last position.
     last = path.keyframes[-1]
-    expression = (
-        f"if(gte(t,{last.seconds:.3f}),{last.crop.x * width:.3f},{expression})"
+    return (
+        f"if(gte(t,{last.seconds:.3f}),{pick(last.crop) * scale:.3f},"
+        f"{expression})"
     )
-    y = first.to_pixels(width, height)[1]
-    return expression, str(y), crop_w, crop_h
+
+
+def ffmpeg_crop_expression(
+    path: CropPath, width: int, height: int
+) -> tuple[str, str, str, str]:
+    """Render a path as a crop filter's four arguments.
+
+    Returns expressions for width, height, x and y. A static path yields
+    plain numbers. Anything that moves -- across, down, or in -- yields eased
+    expressions in `t`, so one filter carries the whole move.
+    """
+
+    first = path.keyframes[0].crop
+    if path.is_static:
+        x, y, crop_w, crop_h = first.to_pixels(width, height)
+        return str(crop_w), str(crop_h), str(x), str(y)
+
+    # Crop extents must stay even for chroma subsampling, and must not run off
+    # the frame at any point in the ramp.
+    w_expr = f"floor(min({_axis_expression(path, lambda c: c.width, width)},{width})/2)*2"
+    h_expr = f"floor(min({_axis_expression(path, lambda c: c.height, height)},{height})/2)*2"
+    x_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.x, width)},{width}-out_w))/2)*2"
+    y_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.y, height)},{height}-out_h))/2)*2"
+    return w_expr, h_expr, x_expr, y_expr

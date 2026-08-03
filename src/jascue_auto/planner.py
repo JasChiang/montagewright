@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jascue_auto.capabilities import MOVE_NAMES, describe_for_prompt
 from jascue_auto.grounding import BeatGrid
 from jascue_auto.schema import EDL, Clip, MusicSync
 
@@ -626,6 +627,7 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                         "subject",
                         "subject_position",
                         "energy",
+                        "camera_move",
                         "why",
                     ],
                     "properties": {
@@ -651,6 +653,15 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                         "energy": {
                             "type": "string",
                             "enum": ["low", "medium", "high"],
+                        },
+                        "camera_move": {
+                            "type": "string",
+                            "enum": list(MOVE_NAMES),
+                            "description": (
+                                "How the frame should move. Pick from what "
+                                "the execution layer can do; the menu is in "
+                                "the instructions above."
+                            ),
                         },
                         "why": {"type": "string"},
                         "then_subject": {
@@ -745,6 +756,7 @@ def select_shots(
                     f"目標長度 {direction['target_seconds']:.0f} 秒，"
                     f"輸出 {direction['aspect']}。\n\n"
                     f"## 剪輯 brief\n\n{brief}\n\n"
+                    f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
                     f"## 可用素材（{len(usable)} 支）\n\n{listing}\n"
                 ),
             }

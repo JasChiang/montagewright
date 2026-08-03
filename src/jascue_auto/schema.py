@@ -197,6 +197,15 @@ class Reframe(ModelFacing):
             "halves get a frame that commits to one thing."
         ),
     )
+    camera_move: str = Field(
+        default="hold",
+        description=(
+            "The move the planner chose from the declared capability list. "
+            "The executor dispatches on this, so a name outside the list is "
+            "carried out as a hold and recorded as unsupported rather than "
+            "silently ignored."
+        ),
+    )
     camera_energy: CameraEnergy = Field(
         default="calm",
         description=(

@@ -111,10 +111,19 @@ def _render_segment(
         # separate command stream.
         from jascue_auto.reframe import ffmpeg_crop_expression
 
-        x_expr, y_expr, width, height = ffmpeg_crop_expression(
+        w_expr, h_expr, x_expr, y_expr = ffmpeg_crop_expression(
             segment.crop_path, source.width, source.height
         )
-        filters.append(f"crop={width}:{height}:'{x_expr}':{y_expr}")
+        filters.append(
+            f"crop=w='{w_expr}':h='{h_expr}':x='{x_expr}':y='{y_expr}'"
+        )
+        # A zoom changes the crop size per frame, so the output has to be
+        # pinned to one resolution or the encoder sees a stream that changes
+        # shape mid-shot.
+        out_w, out_h = segment.crop_path.keyframes[0].crop.to_pixels(
+            source.width, source.height
+        )[2:]
+        filters.append(f"scale={out_w}:{out_h}")
     elif segment.crop is not None:
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)
         filters.append(f"crop={width}:{height}:{x}:{y}")

@@ -30,6 +30,9 @@ from jascue_auto.reframe import (
     Observation,
     OutOfFrame,
     build_crop_path,
+    build_handoff_path,
+    build_sweep_path,
+    build_zoom_path,
 )
 from jascue_auto.renderer import RenderResult, render
 from jascue_auto.schema import EDL, DegradationStep
@@ -141,16 +144,56 @@ def follow_subjects(
         work = Path(raw_work)
         for clip in edl.clips:
             reframe = clip.reframe
-            if reframe is None or reframe.subject is None:
+            if reframe is None:
                 continue
             source = sources[clip.source_id]
-            frames, times = _sample_frames(
-                source, clip.approx_in_seconds, clip.approx_out_seconds, work
-            )
-            boxes, usage = locate_subject(
-                frames, reframe.subject.description, client=client
-            )
-            report.usages.append(usage)
+            move = reframe.camera_move
+
+            duration = clip.approx_out_seconds - clip.approx_in_seconds
+
+            if reframe.then_subject is not None:
+                # Two subjects in one frame: pan from the first to the second
+                # rather than cutting the take to itself.
+                paths[clip.clip_id] = build_handoff_path(
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    duration_seconds=duration,
+                    from_position=reframe.subject.coarse_position
+                    if reframe.subject
+                    else "center",
+                    to_position=reframe.then_subject.coarse_position,
+                )
+                report.following_shots += 1
+                continue
+
+            if move in {"push_in", "pull_out"}:
+                paths[clip.clip_id] = build_zoom_path(
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    duration_seconds=duration,
+                    direction=move,
+                    energy=reframe.camera_energy,
+                )
+                report.following_shots += 1
+                continue
+
+            if move in {"sweep_left", "sweep_right"}:
+                # A designed move across a still arrangement. Nothing is
+                # tracked because nothing is moving, so this costs no call.
+                paths[clip.clip_id] = build_sweep_path(
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    duration_seconds=duration,
+                    direction=move,
+                    energy=reframe.camera_energy,
+                )
+                report.following_shots += 1
+                continue
+
+            if move == "hold" or reframe.subject is None:
+                report.static_shots += 1
+                continue
+
 
             observations = []
             for box in boxes:
@@ -215,6 +258,45 @@ def follow_subjects(
     return paths
 
 
+def split_handoffs(edl: EDL) -> EDL:
+    """Turn a two-subject shot into two shots, each with one subject.
+
+    A camera cannot follow one thing and then another inside a single move
+    without losing both: the first subject is abandoned mid-gesture and the
+    second is arrived at late. Splitting at the plan layer gives each half its
+    own frame and its own follow, and the join between them is a cut, which is
+    how an editor carries the eye from one thing to the next anyway.
+
+    Each half keeps the parent's rhythm decision, halved, so a handoff costs
+    the same screen time it was given.
+    """
+
+    rewritten: list[Any] = []
+    for clip in edl.clips:
+        reframe = clip.reframe
+        second = getattr(reframe, "then_subject", None) if reframe else None
+        if reframe is None or second is None:
+            rewritten.append(clip)
+            continue
+
+        midpoint = (clip.approx_in_seconds + clip.approx_out_seconds) / 2.0
+        first_half = clip.model_copy(
+            update={
+                "clip_id": f"{clip.clip_id}a",
+                "approx_out_seconds": midpoint,
+            }
+        )
+        second_half = clip.model_copy(
+            update={
+                "clip_id": f"{clip.clip_id}b",
+                "approx_in_seconds": midpoint,
+                "reframe": reframe.model_copy(update={"subject": second}),
+            }
+        )
+        rewritten += [first_half, second_half]
+    return edl.model_copy(update={"clips": rewritten})
+
+
 def run(
     edl: EDL,
     sources: dict[str, Source],
@@ -264,42 +346,3 @@ def run(
 
     result = render(plan, output_dir, music=music, keep_segments=False)
     return result, plan, report, edl
-
-
-def split_handoffs(edl: EDL) -> EDL:
-    """Turn a two-subject shot into two shots, each with one subject.
-
-    A camera cannot follow one thing and then another inside a single move
-    without losing both: the first subject is abandoned mid-gesture and the
-    second is arrived at late. Splitting at the plan layer gives each half its
-    own frame and its own follow, and the join between them is a cut, which is
-    how an editor carries the eye from one thing to the next anyway.
-
-    Each half keeps the parent's rhythm decision, halved, so a handoff costs
-    the same screen time it was given.
-    """
-
-    rewritten: list[Any] = []
-    for clip in edl.clips:
-        reframe = clip.reframe
-        second = getattr(reframe, "then_subject", None) if reframe else None
-        if reframe is None or second is None:
-            rewritten.append(clip)
-            continue
-
-        midpoint = (clip.approx_in_seconds + clip.approx_out_seconds) / 2.0
-        first_half = clip.model_copy(
-            update={
-                "clip_id": f"{clip.clip_id}a",
-                "approx_out_seconds": midpoint,
-            }
-        )
-        second_half = clip.model_copy(
-            update={
-                "clip_id": f"{clip.clip_id}b",
-                "approx_in_seconds": midpoint,
-                "reframe": reframe.model_copy(update={"subject": second}),
-            }
-        )
-        rewritten += [first_half, second_half]
-    return edl.model_copy(update={"clips": rewritten})
