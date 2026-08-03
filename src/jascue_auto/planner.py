@@ -482,3 +482,260 @@ def locate_subject(
         for entry in frames_out:
             entry.setdefault("disambiguation", disambiguation)
     return frames_out, Usage.from_interaction(interaction)
+
+
+@dataclass(frozen=True)
+class MaterialItem:
+    """One source as the planner sees it: an id, a length, a description."""
+
+    source_id: str
+    duration_seconds: float
+    summary: str
+
+
+def _direction_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "reasoning",
+            "material_assessment",
+            "direction",
+            "target_seconds",
+            "aspect",
+            "unusable",
+        ],
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": (
+                    "Why this material wants this treatment. Written first, "
+                    "because a conclusion explained afterwards tends to be "
+                    "the conventional one."
+                ),
+            },
+            "material_assessment": {"type": "string"},
+            "direction": {"type": "string"},
+            "target_seconds": {"type": "number"},
+            "aspect": {"type": "string", "enum": ["16:9", "9:16", "1:1"]},
+            "music_suggestion": {"type": "string"},
+            "unusable": {
+                "type": "array",
+                "description": (
+                    "Only takes that genuinely failed. Handheld movement, "
+                    "soft focus, and unusual framing are style, not defects."
+                ),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["source_id", "reason"],
+                    "properties": {
+                        "source_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "superseded_by": {
+                            "type": "string",
+                            "description": (
+                                "The better attempt at the same action, when "
+                                "this is a repeated take."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+def decide_direction(
+    material: list[MaterialItem],
+    *,
+    brief: str,
+    music: Path | None = None,
+    client: Any | None = None,
+) -> tuple[dict[str, Any], Usage]:
+    """Stage one: what should this material become.
+
+    The material arrives as descriptions rather than as video. Seventy-odd
+    clips of 4K would cost more to send than the whole rest of the run, and
+    the descriptions were themselves produced by watching each one.
+    """
+
+    if client is None:
+        client = _default_client()
+
+    listing = "\n".join(
+        f"- {item.source_id} ({item.duration_seconds:.1f}s): {item.summary}"
+        for item in material
+    )
+    prompt = (PROMPTS / "direction_zh-TW.txt").read_text(encoding="utf-8")
+    request_input: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                f"{prompt}\n\n## 剪輯 brief\n\n{brief}\n\n"
+                f"## 素材（{len(material)} 支）\n\n{listing}\n"
+            ),
+        }
+    ]
+    if music is not None:
+        uploaded = upload_music(music, client)
+        request_input.append(
+            {"type": "audio", "mime_type": "audio/mpeg", "uri": uploaded.uri}
+        )
+
+    interaction = client.interactions.create(
+        model=MODEL_ID,
+        store=False,
+        input=request_input,
+        generation_config={
+            "thinking_level": THINKING_HIGH,
+            "max_output_tokens": 8192,
+        },
+        response_format={
+            "mime_type": "application/json",
+            "schema": _direction_schema(),
+        },
+    )
+    return _parse(interaction, what="direction pass"), Usage.from_interaction(
+        interaction
+    )
+
+
+def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
+    """Flat shots plus flat coverage. Nothing nests more than one level.
+
+    The previous plan schema reached the API's grammar ceiling and every call
+    failed with a bare 400 for days. Keeping the shape shallow is not tidiness
+    here, it is the difference between a contract that can be served and one
+    that cannot.
+    """
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["shots", "covered", "uncovered"],
+        "properties": {
+            "shots": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "source_id",
+                        "start_seconds",
+                        "subject",
+                        "subject_position",
+                        "energy",
+                        "why",
+                    ],
+                    "properties": {
+                        "source_id": {"type": "string", "enum": source_ids},
+                        "start_seconds": {"type": "number"},
+                        "subject": {
+                            "type": "string",
+                            "description": (
+                                "What this shot is about, described so it can "
+                                "be told from anything similar in the same "
+                                "frame. 'the left, darker handset', not 'the "
+                                "handset'."
+                            ),
+                        },
+                        "subject_position": {
+                            "type": "string",
+                            "enum": [
+                                "top_left", "top_center", "top_right",
+                                "mid_left", "center", "mid_right",
+                                "bottom_left", "bottom_center", "bottom_right",
+                            ],
+                        },
+                        "energy": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                        },
+                        "why": {"type": "string"},
+                    },
+                },
+            },
+            "covered": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["goal", "shot_indexes"],
+                    "properties": {
+                        "goal": {"type": "string"},
+                        "shot_indexes": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "0-based positions in `shots`.",
+                        },
+                    },
+                },
+            },
+            "uncovered": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["goal", "reason"],
+                    "properties": {
+                        "goal": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+
+
+def select_shots(
+    material: list[MaterialItem],
+    direction: dict[str, Any],
+    *,
+    brief: str,
+    client: Any | None = None,
+) -> tuple[dict[str, Any], Usage]:
+    """Stage two: which shots, in what order, and why each one."""
+
+    if client is None:
+        client = _default_client()
+
+    usable = [
+        item
+        for item in material
+        if item.source_id
+        not in {entry["source_id"] for entry in direction.get("unusable", [])}
+    ]
+    listing = "\n".join(
+        f"- {item.source_id} ({item.duration_seconds:.1f}s): {item.summary}"
+        for item in usable
+    )
+    prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
+    interaction = client.interactions.create(
+        model=MODEL_ID,
+        store=False,
+        input=[
+            {
+                "type": "text",
+                "text": (
+                    f"{prompt}\n\n## 已定好的調性\n\n"
+                    f"{direction['direction']}\n\n"
+                    f"目標長度 {direction['target_seconds']:.0f} 秒，"
+                    f"輸出 {direction['aspect']}。\n\n"
+                    f"## 剪輯 brief\n\n{brief}\n\n"
+                    f"## 可用素材（{len(usable)} 支）\n\n{listing}\n"
+                ),
+            }
+        ],
+        generation_config={
+            "thinking_level": THINKING_HIGH,
+            "max_output_tokens": 16384,
+        },
+        response_format={
+            "mime_type": "application/json",
+            "schema": _selection_schema([item.source_id for item in usable]),
+        },
+    )
+    return _parse(interaction, what="selection pass"), Usage.from_interaction(
+        interaction
+    )

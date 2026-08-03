@@ -226,8 +226,15 @@ def run(
     music: Path | None = None,
     decide_rhythm_first: bool = True,
     client: Any | None = None,
-) -> tuple[RenderResult, RenderPlan, Report]:
-    """Take an EDL to a finished file."""
+) -> tuple[RenderResult, RenderPlan, Report, EDL]:
+    """Take an EDL to a finished file.
+
+    The resolved EDL comes back with it. The rhythm pass rewrites durations
+    inside this call, and a caller that renders a second aspect from the EDL
+    it passed in gets the placeholder lengths instead of the decided ones --
+    which looks like a render that worked and sounds like one that ignored the
+    music.
+    """
 
     report = Report()
 
@@ -256,4 +263,4 @@ def run(
     report.degradations.extend(plan.degradations)
 
     result = render(plan, output_dir, music=music, keep_segments=False)
-    return result, plan, report
+    return result, plan, report, edl
