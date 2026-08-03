@@ -1524,8 +1524,19 @@ _DEEP_CANDIDATE_DEFINITIONS = (
     "CandidateVisualEventSupport",
 )
 # The catalog frame binding is the one constraint local validation cannot
-# reproduce, so its enum is never relaxed.
+# reproduce, so its enum survives on both sides of the mirror.
 _SCHEMA_BOUND_CANDIDATE_FIELDS = frozenset({"frame_id"})
+# FeatureChapterSelect mirrors its rank-1 candidate field for field.  Both
+# sides have to be described the same way: leaving the chapter side enum bound
+# while the candidate side is free lets the model satisfy one and not the
+# other, which turns a paid plan into a guaranteed mirror validation failure.
+_MIRRORED_CHAPTER_FIELDS = (
+    "horizontal_strategy",
+    "horizontal_zoom_intent",
+    "horizontal_camera_intent",
+    "vertical_strategy",
+    "evidence_provenance",
+)
 
 
 def _relax_nested_candidate_enums(schema: dict[str, Any]) -> int:
@@ -1539,6 +1550,12 @@ def _relax_nested_candidate_enums(schema: dict[str, Any]) -> int:
     is parsed, so the contract is unchanged and only moves from generation
     time to validation time.  The catalog frame IDs stay bound in the schema
     because a generated ID cannot be re-derived locally.
+
+    The chapter-level counterparts of the mirrored candidate fields are
+    relaxed alongside them.  A chapter has to reproduce its rank-1 candidate
+    field for field, so describing one side as a closed vocabulary and the
+    other as free text only teaches the model to satisfy the half that cannot
+    be checked locally.
 
     Returns the number of relaxed vocabularies so a regression test can assert
     the ceiling stays respected as the plan contract grows.
@@ -1569,6 +1586,14 @@ def _relax_nested_candidate_enums(schema: dict[str, Any]) -> int:
             if field_name in _SCHEMA_BOUND_CANDIDATE_FIELDS:
                 continue
             properties[field_name] = relax(field_schema)
+
+    chapter_properties = (
+        schema["$defs"].get("FeatureChapterSelect", {}).get("properties", {})
+    )
+    for field_name in _MIRRORED_CHAPTER_FIELDS:
+        field_schema = chapter_properties.get(field_name)
+        if field_schema is not None:
+            chapter_properties[field_name] = relax(field_schema)
     return relaxed
 
 

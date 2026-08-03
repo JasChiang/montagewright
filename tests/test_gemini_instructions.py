@@ -1581,6 +1581,35 @@ def test_feature_plan_nested_candidate_vocabularies_leave_the_schema() -> None:
         )
 
 
+def test_feature_plan_mirrored_fields_are_described_identically() -> None:
+    """Both halves of the rank-1 mirror must be equally constrained.
+
+    A chapter has to reproduce its rank-1 candidate field for field.  Binding
+    one side to an enum while the other is free text lets the model satisfy
+    only the half the schema checks, so every plan then fails the local mirror
+    validator after it has already been paid for.
+    """
+
+    schema = gemini_module._feature_edit_plan_response_schema(["RF000001"])
+    chapter = schema["$defs"]["FeatureChapterSelect"]["properties"]
+    horizontal = schema["$defs"]["FeatureHorizontalCandidate"]["properties"]
+    vertical = schema["$defs"]["FeatureVerticalCandidate"]["properties"]
+
+    mirrors = (
+        (chapter["horizontal_frame_id"], horizontal["frame_id"]),
+        (chapter["horizontal_strategy"], horizontal["strategy"]),
+        (chapter["horizontal_zoom_intent"], horizontal["zoom_intent"]),
+        (chapter["horizontal_camera_intent"], horizontal["camera_intent"]),
+        (chapter["vertical_frame_id"], vertical["frame_id"]),
+        (chapter["vertical_strategy"], vertical["strategy"]),
+        (chapter["evidence_provenance"], vertical["evidence_provenance"]),
+    )
+    for chapter_side, candidate_side in mirrors:
+        assert ("enum" in json.dumps(chapter_side)) == (
+            "enum" in json.dumps(candidate_side)
+        )
+
+
 def test_feature_plan_relaxed_vocabularies_still_reject_invalid_values() -> None:
     """Relaxing the schema must not widen what the parsed plan accepts."""
 
