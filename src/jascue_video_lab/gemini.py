@@ -1513,7 +1513,35 @@ def _feature_edit_plan_response_schema(frame_ids: list[str]) -> dict[str, Any]:
     bind_string_enum("FeatureHorizontalCandidate", "frame_id")
     bind_string_enum("FeatureVerticalCandidate", "frame_id")
     _relax_nested_candidate_enums(schema)
+    _require_motion_reason(schema)
     return schema
+
+
+def _require_motion_reason(schema: dict[str, Any]) -> None:
+    """Make the motion reason unskippable rather than merely requested.
+
+    A candidate that classifies source-camera motion has to say what it saw,
+    and the wire contract left the field optional and nullable while only the
+    description asked for it.  The model supplied every reason on one run and
+    none on the next, which spends a full plan before local validation can
+    reject it.  Asking for a plain required string removes the choice; the
+    parsed model still accepts ``None`` for the paths that never classify.
+    """
+
+    for definition in ("FeatureHorizontalCandidate", "FeatureVerticalCandidate"):
+        candidate = schema["$defs"].get(definition)
+        if candidate is None:
+            continue
+        field_schema = candidate["properties"].get("source_camera_motion_reason")
+        if field_schema is None:
+            continue
+        candidate["properties"]["source_camera_motion_reason"] = {
+            "type": "string",
+            "description": field_schema.get("description", ""),
+        }
+        required = candidate.setdefault("required", [])
+        if "source_camera_motion_reason" not in required:
+            required.append("source_camera_motion_reason")
 
 
 # Types reached through two or more nested arrays: a chapter list, then a
