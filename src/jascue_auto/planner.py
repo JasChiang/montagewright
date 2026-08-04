@@ -30,6 +30,21 @@ from jascue_auto.uploads import UploadCache
 from jascue_auto.schema import EDL, Clip, MusicSync
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
+
+# A planning call carrying seventy-four proxies measured 600 seconds, exactly
+# the ten-minute ceiling first set here, and the next run died on it. The cap
+# exists to turn a silent hang into an error, not to cut off work that is
+# genuinely running -- so it sits well clear of the longest call observed.
+REQUEST_TIMEOUT_MS = int(
+    os.environ.get("JASCUE_AUTO_TIMEOUT_MS", str(25 * 60 * 1000))
+)
+
+
+def _http_options(types):
+    return types.HttpOptions(
+        timeout=REQUEST_TIMEOUT_MS,
+        retry_options=types.HttpRetryOptions(attempts=1),
+    )
 MODEL_ID = os.environ.get("JASCUE_AUTO_MODEL", "gemini-3.6-flash")
 
 # 3.6 Flash deprecated the sampling knobs, so consistency comes from the
@@ -309,13 +324,7 @@ def _default_client() -> Any:
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise PlannerError("GEMINI_API_KEY is required for a live rhythm pass")
-    return genai.Client(
-        api_key=key,
-        http_options=types.HttpOptions(
-            timeout=10 * 60 * 1000,
-            retry_options=types.HttpRetryOptions(attempts=1),
-        ),
-    )
+    return genai.Client(api_key=key, http_options=_http_options(types))
 
 
 def _subject_schema(frame_count: int) -> dict[str, Any]:

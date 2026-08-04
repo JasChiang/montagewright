@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,22 @@ from typing import Any
 # The service expires files at 48 hours. Treating anything past 46 as gone
 # leaves room for a long call to finish rather than losing its inputs midway.
 LIFETIME_SECONDS = 46 * 3600
+
+
+def default_cache_path() -> Path:
+    """Where the cache lives when nobody says otherwise.
+
+    Keyed by content, so it belongs to the material rather than to a run.
+    Storing it under the output directory, which is what this did first, meant
+    a second cut of the same footage into a new folder re-uploaded all
+    seventy-five files -- roughly eight minutes spent proving the bytes had not
+    changed.
+    """
+
+    root = Path(
+        os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+    ) / "jascue-auto"
+    return root / "uploads.json"
 
 
 def content_hash(path: Path) -> str:

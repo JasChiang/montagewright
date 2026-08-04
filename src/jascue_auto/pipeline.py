@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from jascue_auto.clipcard import find_subject, load_card
+from jascue_auto.cost import Ledger
 from jascue_auto.executor import RenderPlan, Source, plan_render
 from jascue_auto.grounding import BeatGrid, apply_to_edl, ground_timeline
 from jascue_auto.planner import Usage, decide_rhythm, locate_subject
@@ -51,6 +52,12 @@ SUBJECT_SAMPLES = 5
 # is worth it against interpolating between samples 0.6 seconds apart.
 TRACK_FPS = 4.0
 
+# How much of a shot the tracker has to hold before its trajectory is worth
+# more than the sampled positions. Below this the samples are used and the
+# shortfall is recorded, because a track that survived one frame in nine is
+# not a measurement, it is a single guess wearing a measurement's name.
+TRACK_QUORUM = 0.5
+
 
 @dataclass
 class Report:
@@ -75,6 +82,10 @@ class Report:
     upscales: dict[str, float] = field(default_factory=dict)
     delivered_seconds: float | None = None
     usages: list[Usage] = field(default_factory=list)
+    # What each stage cost, in dollars. The totals were only ever tokens,
+    # which answers "how much was sent" rather than "where did the money go"
+    # -- and the two point at different stages entirely.
+    ledger: Ledger | None = None
 
     @property
     def input_tokens(self) -> int:
@@ -92,8 +103,16 @@ class Report:
             return None
         return round(self.target_seconds - self.delivered_seconds, 2)
 
+    def spend(self) -> dict[str, object]:
+        return self.ledger.summary() if self.ledger is not None else {}
+
     def summary(self) -> str:
         gap = self.duration_shortfall
+        spent = (
+            f", ${self.ledger.spent_usd:.4f}"
+            if self.ledger is not None and self.ledger.entries
+            else ""
+        )
         tail = (
             f", {abs(gap):.0f}s {'short of' if gap > 0 else 'over'} the "
             f"{self.target_seconds:.0f}s asked for"
@@ -106,7 +125,19 @@ class Report:
             f"{self.static_shots} held, "
             f"{len(self.degradations)} degradations, "
             f"{self.input_tokens} in / {self.output_tokens} out tokens"
-            f"{tail}"
+            f"{spent}{tail}"
+        )
+
+
+def _charge(report: "Report", stage: str, usage: Usage) -> None:
+    """Book a call against both the token tally and the stage ledger."""
+
+    report.usages.append(usage)
+    if report.ledger is not None:
+        report.ledger.record(
+            stage,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens + usage.thought_tokens,
         )
 
 
@@ -253,7 +284,7 @@ def follow_subjects(
                     boxes, usage = locate_subject(
                         frames, subject.description, client=client
                     )
-                    report.usages.append(usage)
+                    _charge(report, "subject", usage)
                     seen = [
                         float(box["centre_x"])
                         for box in boxes
@@ -294,7 +325,7 @@ def follow_subjects(
                     boxes, usage = locate_subject(
                         frames, reframe.subject.description, client=client
                     )
-                    report.usages.append(usage)
+                    _charge(report, "subject", usage)
                     seen = [
                         (float(b["centre_x"]), float(b["centre_y"]))
                         for b in boxes
@@ -437,7 +468,7 @@ def follow_subjects(
                 boxes, usage = locate_subject(
                     frames, reframe.subject.description, client=client
                 )
-                report.usages.append(usage)
+                _charge(report, "subject", usage)
 
             observations = []
             for box in boxes:
@@ -515,11 +546,36 @@ def follow_subjects(
                             f"{type(error).__name__}"
                         )
                     else:
-                        if tracked:
-                            observations = tracked
-                            report.subject_notes[clip.clip_id] = (
-                                f"tracked {states}"
+                        report.subject_notes[clip.clip_id] = f"tracked {states}"
+                        total = sum(states.values()) or 1
+                        kept = states.get("tracked", 0)
+                        if kept / total < TRACK_QUORUM:
+                            # Most of the shot was not tracked. Falling back to
+                            # the sampled positions is right, but doing it
+                            # quietly is how a nine-frame trajectory becomes a
+                            # single observation and the crop lands wherever
+                            # that one frame happened to be -- on a hand rather
+                            # than the phone it was holding, in one case.
+                            report.degradations.append(
+                                DegradationStep(
+                                    clip_id=clip.clip_id,
+                                    ladder="other",
+                                    ladder_other="tracking_lost_most_frames",
+                                    trigger=(
+                                        "the tracker held the subject in "
+                                        f"{kept} of {total} analysed frames, "
+                                        "so the framing rests on sampled "
+                                        "positions instead"
+                                    ),
+                                    measured={
+                                        "tracked_frames": float(kept),
+                                        "analysed_frames": float(total),
+                                        "kept_fraction": round(kept / total, 3),
+                                    },
+                                )
                             )
+                        elif tracked:
+                            observations = tracked
 
             path = build_crop_path(
                 observations,
@@ -589,6 +645,7 @@ def run(
     music: Path | None = None,
     cards: dict[str, Path] | None = None,
     checkpoint: Path | None = None,
+    ledger: Ledger | None = None,
     decide_rhythm_first: bool = True,
     client: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
@@ -601,13 +658,13 @@ def run(
     music.
     """
 
-    report = Report()
+    report = Report(ledger=ledger)
 
     if decide_rhythm_first:
         edl, usage = decide_rhythm(
             edl, grid, intent=intent, music=music, client=client
         )
-        report.usages.append(usage)
+        _charge(report, "rhythm", usage)
 
     timeline = ground_timeline(edl, grid)
     report.aligned_cuts = timeline.aligned_count

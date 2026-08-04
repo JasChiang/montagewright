@@ -15,11 +15,12 @@ import sys
 from pathlib import Path
 
 from jascue_auto.clipcard import build_library, load_card, subjects_from_card
+from jascue_auto.cost import Ledger
 from jascue_auto.grounding import load_beat_grid
 from jascue_auto.pipeline import probe, run
 from jascue_auto.planner import MaterialItem, decide_direction, select_shots
 from jascue_auto.schema import EDL, Clip, Reframe, Subject
-from jascue_auto.uploads import UploadCache
+from jascue_auto.uploads import UploadCache, default_cache_path
 
 ASPECTS = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV"}
@@ -32,13 +33,9 @@ def _client():
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise SystemExit("GEMINI_API_KEY is required")
-    return genai.Client(
-        api_key=key,
-        http_options=types.HttpOptions(
-            timeout=10 * 60 * 1000,
-            retry_options=types.HttpRetryOptions(attempts=1),
-        ),
-    )
+    from jascue_auto.planner import _http_options
+
+    return genai.Client(api_key=key, http_options=_http_options(types))
 
 
 def _make_proxy(source: Path, destination: Path) -> Path:
@@ -70,7 +67,8 @@ def command_render(args: argparse.Namespace) -> int:
     output.mkdir(parents=True, exist_ok=True)
     work = output / "work"
     client = _client()
-    cache = UploadCache.load(work / "upload-cache.json")
+    cache = UploadCache.load(args.upload_cache or default_cache_path())
+    ledger = Ledger(cap_usd=args.budget)
 
     sources_paths = sorted(
         path for path in rushes.iterdir() if path.suffix in VIDEO_SUFFIXES
@@ -86,9 +84,14 @@ def command_render(args: argparse.Namespace) -> int:
     cards, stats = build_library(
         proxies, work / "cards", client=client, cache=cache
     )
+    ledger.record(
+        "clip_cards",
+        input_tokens=stats["input"],
+        output_tokens=stats["output"],
+    )
     print(
         f"cards: {stats['written']} written, {stats['reused']} reused, "
-        f"{stats['failed']} failed",
+        f"{stats['failed']} failed  (${ledger.spent_usd:.4f})",
         flush=True,
     )
 
@@ -112,8 +115,15 @@ def command_render(args: argparse.Namespace) -> int:
         )
 
     brief = args.brief.read_text(encoding="utf-8") if args.brief else ""
+    ledger.check()
     direction, usage_direction = decide_direction(
         material, brief=brief, music=args.music, cache=cache, client=client
+    )
+    ledger.record(
+        "direction",
+        input_tokens=usage_direction.input_tokens,
+        output_tokens=usage_direction.output_tokens
+        + usage_direction.thought_tokens,
     )
     print(
         f"direction: {direction['target_seconds']:.0f}s {direction['aspect']}, "
@@ -121,8 +131,15 @@ def command_render(args: argparse.Namespace) -> int:
         flush=True,
     )
 
+    ledger.check()
     selection, usage_selection = select_shots(
         material, direction, brief=brief, cache=cache, client=client
+    )
+    ledger.record(
+        "selection",
+        input_tokens=usage_selection.input_tokens,
+        output_tokens=usage_selection.output_tokens
+        + usage_selection.thought_tokens,
     )
     print(f"selection: {len(selection['shots'])} shots", flush=True)
 
@@ -148,8 +165,13 @@ def command_render(args: argparse.Namespace) -> int:
         music=args.music,
         cards=cards,
         checkpoint=args.sam_checkpoint,
+        ledger=ledger,
         client=client,
     )
+    # The direction set a length; somebody has to compare it with what came
+    # out. Three layers each made a defensible call last run and delivered
+    # 17.9 seconds against 30, with nothing in the report saying so.
+    report.target_seconds = float(direction["target_seconds"])
 
     _write_report(
         output,
@@ -161,6 +183,10 @@ def command_render(args: argparse.Namespace) -> int:
         usages=[usage_direction, usage_selection],
     )
     print(f"\n{report.summary()}", flush=True)
+    for stage, usd in sorted(
+        report.spend().get("by_stage", {}).items(), key=lambda kv: -kv[1]
+    ):
+        print(f"  {stage:12s} ${usd:.4f}", flush=True)
     print(f"deliverable {result.deliverable}", flush=True)
     print(f"preview     {result.preview}", flush=True)
     return 0
@@ -253,6 +279,10 @@ def _write_report(output: Path, **parts) -> None:
             + sum(u.output_tokens + u.thought_tokens for u in parts["usages"]),
         },
         "duration_seconds": round(parts["result"].duration_seconds, 3),
+        "target_seconds": report.target_seconds,
+        "duration_shortfall_seconds": report.duration_shortfall,
+        "extended_for_moves": report.extended_for_moves,
+        "spend": report.spend(),
     }
     (output / "report.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
@@ -270,6 +300,20 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--music-map", type=Path)
     render.add_argument("--aspect", choices=sorted(ASPECTS), default="9:16")
     render.add_argument("--sam-checkpoint", type=Path)
+    render.add_argument(
+        "--budget",
+        type=float,
+        default=5.0,
+        help="Total spend ceiling in USD. Reaching it stops the run with the "
+        "best cut so far rather than making the next step cheaper.",
+    )
+    render.add_argument(
+        "--upload-cache",
+        type=Path,
+        help="Where uploaded-media URIs are remembered. Defaults to a shared "
+        "location, because the key is the file's content and a per-run store "
+        "re-uploads material that has not changed.",
+    )
     render.add_argument("--output", type=Path, required=True)
     render.set_defaults(handler=command_render)
 
