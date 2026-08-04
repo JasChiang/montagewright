@@ -351,6 +351,7 @@ def _write_report(output: Path, **parts) -> None:
         "extended_for_moves": report.extended_for_moves,
         "spend": report.spend(),
         "cut_on_action": parts.get("snaps", {}),
+        "rhythm": report.rhythm_decisions,
         "review": {
             "stopped_because": parts.get("stopped_because"),
             "rounds": [

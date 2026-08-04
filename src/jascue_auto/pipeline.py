@@ -76,6 +76,7 @@ class Report:
     # nobody reporting the gap.
     target_seconds: float | None = None
     extended_for_moves: dict[str, str] = field(default_factory=dict)
+    rhythm_decisions: dict[str, dict] = field(default_factory=dict)
     # Enlargement actually applied per shot. Reported as a number because
     # sharpness is measurable: nobody should have to tell a soft proxy apart
     # from an over-enlarged shot by eye, and at preview resolution they look
@@ -120,8 +121,14 @@ class Report:
             if gap is not None and abs(gap) >= 1.0
             else ""
         )
+        wanted = sum(
+            1
+            for entry in self.rhythm_decisions.values()
+            if entry.get("cut_on_beat")
+        ) or self.total_cuts
         return (
-            f"{self.aligned_cuts}/{self.total_cuts} cuts on a musical event, "
+            f"{self.aligned_cuts}/{wanted} cuts on a musical event "
+            f"({self.total_cuts - wanted} content-led by choice), "
             f"{self.following_shots} shots following a subject, "
             f"{self.static_shots} held, "
             f"{len(self.degradations)} degradations, "
@@ -693,6 +700,18 @@ def run(
     report.aligned_cuts = timeline.aligned_count
     report.total_cuts = len(timeline.clips)
     report.delivered_seconds = round(timeline.duration_seconds, 2)
+    # Whether a cut missed the grid or was never aimed at it are different
+    # facts, and a bare "8/10" cannot tell them apart -- which is how a
+    # deliberate content-led cut reads as a failure to align.
+    report.rhythm_decisions = {
+        entry.clip.clip_id: {
+            "cut_on_beat": entry.clip.music_sync.cut_on_beat,
+            "landed_on": entry.landed_on,
+            "seconds": round(entry.duration_seconds, 3),
+            "why": entry.clip.music_sync.rhythm_reason,
+        }
+        for entry in timeline.clips
+    }
     report.extended_for_moves = {
         entry.clip.clip_id: entry.extended_for_move
         for entry in timeline.clips
