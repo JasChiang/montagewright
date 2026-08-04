@@ -62,11 +62,18 @@ class Report:
     static_shots: int = 0
     degradations: list[DegradationStep] = field(default_factory=list)
     subject_notes: dict[str, str] = field(default_factory=dict)
+    # What the direction asked for against what the cut runs to. Three layers
+    # each made a defensible call -- 45 seconds of material, ten shots, a
+    # beat-led length -- and the result was a third of the intended film with
+    # nobody reporting the gap.
+    target_seconds: float | None = None
+    extended_for_moves: dict[str, str] = field(default_factory=dict)
     # Enlargement actually applied per shot. Reported as a number because
     # sharpness is measurable: nobody should have to tell a soft proxy apart
     # from an over-enlarged shot by eye, and at preview resolution they look
     # the same.
     upscales: dict[str, float] = field(default_factory=dict)
+    delivered_seconds: float | None = None
     usages: list[Usage] = field(default_factory=list)
 
     @property
@@ -79,13 +86,27 @@ class Report:
             usage.output_tokens + usage.thought_tokens for usage in self.usages
         )
 
+    @property
+    def duration_shortfall(self) -> float | None:
+        if self.target_seconds is None or self.delivered_seconds is None:
+            return None
+        return round(self.target_seconds - self.delivered_seconds, 2)
+
     def summary(self) -> str:
+        gap = self.duration_shortfall
+        tail = (
+            f", {abs(gap):.0f}s {'short of' if gap > 0 else 'over'} the "
+            f"{self.target_seconds:.0f}s asked for"
+            if gap is not None and abs(gap) >= 1.0
+            else ""
+        )
         return (
             f"{self.aligned_cuts}/{self.total_cuts} cuts on a musical event, "
             f"{self.following_shots} shots following a subject, "
             f"{self.static_shots} held, "
             f"{len(self.degradations)} degradations, "
             f"{self.input_tokens} in / {self.output_tokens} out tokens"
+            f"{tail}"
         )
 
 
@@ -345,6 +366,44 @@ def follow_subjects(
                 continue
 
             if move == "hold" or reframe.subject is None:
+                # A subject that has to survive whole and is wider than the
+                # crop cannot be held: holding it means showing part of it,
+                # and half a wordmark is unreadable rather than tighter. The
+                # eye reads a long title by travelling along it, so the camera
+                # does the same.
+                if (
+                    reframe.subject is not None
+                    and reframe.subject.min_visible >= 1.0
+                    and card is not None
+                ):
+                    known = find_subject(card, reframe.subject.description)
+                    crop_width = target_aspect / source.aspect_ratio
+                    if known is not None and known.width > crop_width:
+                        paths[clip.clip_id] = build_sweep_path(
+                            source_aspect=source.aspect_ratio,
+                            target_aspect=target_aspect,
+                            duration_seconds=duration,
+                            direction="sweep_right",
+                            energy=reframe.camera_energy,
+                        )
+                        report.degradations.append(
+                            DegradationStep(
+                                clip_id=clip.clip_id,
+                                ladder="other",
+                                ladder_other="read_across_instead_of_cropping",
+                                trigger=(
+                                    "the subject must survive whole and is "
+                                    "wider than the crop, so the camera reads "
+                                    "across it rather than showing part of it"
+                                ),
+                                measured={
+                                    "subject_width_vw": round(known.width, 4),
+                                    "crop_width_vw": round(crop_width, 4),
+                                },
+                            )
+                        )
+                        report.following_shots += 1
+                        continue
                 report.static_shots += 1
                 continue
 
@@ -553,6 +612,12 @@ def run(
     timeline = ground_timeline(edl, grid)
     report.aligned_cuts = timeline.aligned_count
     report.total_cuts = len(timeline.clips)
+    report.delivered_seconds = round(timeline.duration_seconds, 2)
+    report.extended_for_moves = {
+        entry.clip.clip_id: entry.extended_for_move
+        for entry in timeline.clips
+        if entry.extended_for_move
+    }
     edl = apply_to_edl(edl, timeline)
 
     paths = follow_subjects(

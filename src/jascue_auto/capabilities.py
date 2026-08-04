@@ -21,6 +21,11 @@ class Capability:
     name: str
     when: str
     needs_subject: bool
+    # Seconds this move needs before a viewer can read it. A sweep across
+    # three handsets in 1.5s is inside every speed limit and still arrives
+    # before anyone has looked at the second one -- "not too fast" and
+    # "legible" are different tests, and only the first was being applied.
+    min_seconds: float = 0.0
 
 
 CAMERA_MOVES: tuple[Capability, ...] = (
@@ -31,6 +36,7 @@ CAMERA_MOVES: tuple[Capability, ...] = (
             "不是沒有決定。"
         ),
         needs_subject=True,
+        min_seconds=0.8,
     ),
     Capability(
         name="follow",
@@ -39,6 +45,7 @@ CAMERA_MOVES: tuple[Capability, ...] = (
             "因為沒有東西可跟。"
         ),
         needs_subject=True,
+        min_seconds=2.0,
     ),
     Capability(
         name="sweep_left",
@@ -48,11 +55,13 @@ CAMERA_MOVES: tuple[Capability, ...] = (
             "從右邊開始往左掃。"
         ),
         needs_subject=False,
+        min_seconds=3.0,
     ),
     Capability(
         name="sweep_right",
         when="同上，從左邊開始往右掃。",
         needs_subject=False,
+        min_seconds=3.0,
     ),
     Capability(
         name="push_in",
@@ -61,15 +70,20 @@ CAMERA_MOVES: tuple[Capability, ...] = (
             "一個材質。畫面尺寸夠大才會好看。"
         ),
         needs_subject=True,
+        min_seconds=2.5,
     ),
     Capability(
         name="pull_out",
         when="從細節退開，交代它在什麼脈絡裡，通常用在一段的收尾。",
         needs_subject=True,
+        min_seconds=2.5,
     ),
 )
 
 MOVE_NAMES: tuple[str, ...] = tuple(move.name for move in CAMERA_MOVES)
+MOVE_FLOORS: dict[str, float] = {
+    move.name: move.min_seconds for move in CAMERA_MOVES
+}
 
 # Where the subject sits when it does not fill the output ratio.
 #
@@ -104,10 +118,20 @@ def describe_for_prompt() -> str:
     lines = ["本機執行層目前做得到這些運鏡，請從中選："]
     for move in CAMERA_MOVES:
         subject = "需要指定主體" if move.needs_subject else "不需要主體"
-        lines.append(f"- `{move.name}`（{subject}）：{move.when}")
+        lines.append(
+            f"- `{move.name}`（{subject}，至少 {move.min_seconds:g} 秒）："
+            f"{move.when}"
+        )
     lines.append(
         "選了做不到的組合——例如對靜止主體選 follow——本機會照實記錄實際"
         "做到什麼，不會假裝執行了。"
+    )
+    lines.append("")
+    lines.append(
+        "每種運鏡需要的最短時間不同（下面括號裡的秒數）。時間不夠的運鏡"
+        "看不懂——三台手機橫掃如果只有 1.5 秒，觀眾還沒看到第二台就切了。"
+        "節奏那一步會把這個當下限，所以選了需要時間的運鏡，這顆就會拿到"
+        "足夠的長度。"
     )
     lines.append("")
     lines.append("主體沒有填滿輸出比例時，它擺哪裡由你決定（framing）：")

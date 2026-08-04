@@ -109,6 +109,9 @@ class GroundedClip:
     timeline_out_seconds: float
     landed_on: str | None = None
     note: str | None = None
+    # Set when a camera move lengthened this shot past what the rhythm asked
+    # for, so the report can say why the cut runs where it does.
+    extended_for_move: str | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -132,11 +135,26 @@ class GroundedTimeline:
 
 
 def _requested_duration(clip: Clip, grid: BeatGrid | None) -> float:
-    """How long this clip wants to be, in seconds."""
+    """How long this clip wants to be, in seconds.
+
+    A camera move sets a floor. A sweep across three handsets is inside every
+    speed limit at 1.5 seconds and still arrives before anyone has looked at
+    the second one, because "not too fast" and "legible" are different tests.
+    The rhythm decides the length; the move decides how short that length is
+    allowed to get.
+    """
+
+    from jascue_auto.capabilities import MOVE_FLOORS
 
     if grid is not None and clip.music_sync.beats:
-        return clip.music_sync.beats * grid.seconds_per_beat
-    return clip.approx_out_seconds - clip.approx_in_seconds
+        wanted = clip.music_sync.beats * grid.seconds_per_beat
+    else:
+        wanted = clip.approx_out_seconds - clip.approx_in_seconds
+
+    floor = 0.0
+    if clip.reframe is not None:
+        floor = MOVE_FLOORS.get(clip.reframe.camera_move, 0.0)
+    return max(wanted, floor)
 
 
 def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
@@ -152,8 +170,19 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
     grounded: list[GroundedClip] = []
     cursor = 0.0
 
+    from jascue_auto.capabilities import MOVE_FLOORS
+
     for clip in edl.clips:
+        rhythm_wanted = (
+            clip.music_sync.beats * grid.seconds_per_beat
+            if grid is not None and clip.music_sync.beats
+            else clip.approx_out_seconds - clip.approx_in_seconds
+        )
         wanted = _requested_duration(clip, grid)
+        move = clip.reframe.camera_move if clip.reframe else "hold"
+        extended = (
+            move if wanted > rhythm_wanted + 1e-6 else None
+        )
         end = cursor + wanted
         landed: str | None = None
         note: str | None = None
@@ -182,6 +211,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 timeline_out_seconds=end,
                 landed_on=landed,
                 note=note,
+                extended_for_move=extended,
             )
         )
         cursor = end
