@@ -348,6 +348,37 @@ def follow_subjects(
                 report.static_shots += 1
                 continue
 
+            # A follow needs to know where the subject is. The card answered
+            # that when it was written and the answer has not changed since,
+            # so ask it before paying for a fresh grounding on every rhythm
+            # tweak, second aspect and review round.
+            known = (
+                find_subject(card, reframe.subject.description)
+                if card is not None
+                else None
+            )
+            if known is not None:
+                boxes = [
+                    {
+                        "frame_index": 0,
+                        "present": True,
+                        "centre_x": known.centre_x,
+                        "centre_y": known.centre_y,
+                        "width": known.width,
+                        "height": known.height,
+                    }
+                ]
+                times = [clip.approx_in_seconds]
+                frames = []
+                report.subject_notes[clip.clip_id] = f"card: {known.label}"
+            else:
+                frames, times = _sample_frames(
+                    source, clip.approx_in_seconds, clip.approx_out_seconds, work
+                )
+                boxes, usage = locate_subject(
+                    frames, reframe.subject.description, client=client
+                )
+                report.usages.append(usage)
 
             observations = []
             for box in boxes:

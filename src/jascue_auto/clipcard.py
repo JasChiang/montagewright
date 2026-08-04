@@ -183,3 +183,95 @@ def find_subject(card: dict[str, Any], description: str) -> SubjectBox | None:
             if len(word) >= 2 and word in description:
                 return box
     return None
+
+
+def describe_clip(
+    proxy: Path,
+    *,
+    client,
+    cache=None,
+    model_id: str | None = None,
+) -> tuple[dict[str, Any], Any]:
+    """Watch one clip and write its card.
+
+    Called once per asset, ever. The result is content-addressed, so a card
+    survives every rerun, every second aspect and every review round -- which
+    is the whole reason the subject boxes belong here rather than being
+    grounded again on each render.
+    """
+
+    from jascue_auto.planner import MODEL_ID, Usage, _parse, _to_frame_fractions
+
+    prompts = Path(__file__).resolve().parent / "prompts"
+    instruction = (prompts / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
+
+    if cache is None:
+        uploaded = client.files.upload(file=str(proxy))
+        uri = uploaded.uri
+    else:
+        uri, _ = cache.uri_for(proxy, client, mime_type="video/mp4")
+
+    interaction = client.interactions.create(
+        model=model_id or MODEL_ID,
+        store=False,
+        input=[
+            {"type": "text", "text": instruction},
+            {
+                "type": "video",
+                "mime_type": "video/mp4",
+                "uri": uri,
+                "media_resolution": "low",
+            },
+        ],
+        generation_config={"thinking_level": "low", "max_output_tokens": 8192},
+        response_format={
+            "mime_type": "application/json",
+            "schema": card_schema(),
+        },
+    )
+    card = _parse(interaction, what="clip card")
+    # The model answers boxes in its native 0..1000 space for some clips
+    # whatever the field says, so the conversion happens on receipt.
+    card["subjects"] = _to_frame_fractions(card.get("subjects", []))
+    return card, Usage.from_interaction(interaction)
+
+
+def build_library(
+    proxies: dict[str, Path],
+    card_dir: Path,
+    *,
+    client,
+    cache=None,
+    model_id: str | None = None,
+) -> tuple[dict[str, Path], dict[str, Any]]:
+    """Write a card for every asset that does not already have one.
+
+    Resumable by construction: an existing card of the current version is left
+    alone. A run interrupted halfway costs nothing to restart, which matters
+    when the alternative is seventy-four paid calls.
+    """
+
+    card_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+    stats = {"written": 0, "reused": 0, "failed": 0, "input": 0, "output": 0}
+
+    for source_id, proxy in sorted(proxies.items()):
+        destination = card_dir / f"{source_id}.json"
+        if load_card(destination) is not None:
+            paths[source_id] = destination
+            stats["reused"] += 1
+            continue
+        try:
+            card, usage = describe_clip(
+                proxy, client=client, cache=cache, model_id=model_id
+            )
+        except Exception:
+            # One unreadable clip is not a reason to abandon the library.
+            stats["failed"] += 1
+            continue
+        save_card(destination, card)
+        paths[source_id] = destination
+        stats["written"] += 1
+        stats["input"] += usage.input_tokens
+        stats["output"] += usage.output_tokens + usage.thought_tokens
+    return paths, stats
