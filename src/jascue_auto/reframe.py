@@ -393,6 +393,86 @@ def achieved_upscale(
     return max(output_width / pixels_w, output_height / pixels_h)
 
 
+def build_tilt_path(
+    observations: list[Observation],
+    *,
+    source_aspect: float,
+    target_aspect: float,
+    energy: CameraEnergy = "calm",
+    clip_id: str = "",
+    degradations: list[DegradationStep] | None = None,
+) -> CropPath:
+    """Follow a subject up or down the frame.
+
+    A watch lowered into a tank, a handset lifted off a table: the motion that
+    carries the shot is vertical, and a crop that only ever moves sideways
+    cannot follow it. Worse, it reports the subject as having no horizontal
+    spread and holds -- the shot is described as needing no camera work when
+    what actually happened is that its movement was on an axis nothing looked
+    at.
+
+    Converting a wide source to a tall one leaves the crop at full height with
+    nowhere to go vertically. That is a real limit rather than a failure to
+    try, so it is stated as one.
+    """
+
+    if not observations:
+        raise ValueError("a tilt needs at least one observation")
+
+    if target_aspect < source_aspect:
+        crop_width = target_aspect / source_aspect
+        crop_height = 1.0
+    else:
+        crop_width = 1.0
+        crop_height = source_aspect / target_aspect
+
+    free_y = max(0.0, 1.0 - crop_height)
+    centres_y = [observation.centre_y for observation in observations]
+    spread = _percentile(centres_y, 0.95) - _percentile(centres_y, 0.05)
+    x = min(
+        max(
+            sum(o.centre_x for o in observations) / len(observations)
+            - crop_width / 2.0,
+            0.0,
+        ),
+        max(0.0, 1.0 - crop_width),
+    )
+
+    def at(centre_y: float) -> CropBox:
+        y = min(max(centre_y - crop_height / 2.0, 0.0), free_y)
+        return CropBox(x=x, y=y, width=crop_width, height=crop_height)
+
+    if free_y <= 0.0 or spread < DEADBAND:
+        if degradations is not None:
+            degradations.append(
+                DegradationStep(
+                    clip_id=clip_id,
+                    ladder="static_on_subject",
+                    trigger=(
+                        "a tilt was planned but the crop already fills the "
+                        "frame vertically, leaving nowhere to move"
+                        if free_y <= 0.0
+                        else "a tilt was planned but the subject does not "
+                        "move vertically in this shot"
+                    ),
+                    measured={
+                        "vertical_spread_vw": round(spread, 4),
+                        "free_travel_vw": round(free_y, 4),
+                    },
+                )
+            )
+        return CropPath(
+            [Keyframe(observations[0].seconds, at(_percentile(centres_y, 0.5)))]
+        )
+
+    raw = [
+        Keyframe(observation.seconds, at(observation.centre_y))
+        for observation in observations
+    ]
+    limited, _ = _limit_speed(raw, ENERGY_LIMITS[energy])
+    return CropPath(limited)
+
+
 def build_zoom_path(
     *,
     source_aspect: float,

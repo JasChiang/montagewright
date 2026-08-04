@@ -36,6 +36,7 @@ from jascue_auto.reframe import (
     build_crop_path,
     build_handoff_path,
     build_sweep_path,
+    build_tilt_path,
     build_zoom_path,
     observations_from_sam,
 )
@@ -271,9 +272,9 @@ def follow_subjects(
             duration = clip.approx_out_seconds - clip.approx_in_seconds
 
             if (
-                reframe.then_subject is not None
+                move == "pan"
+                and reframe.then_subject is not None
                 and reframe.subject is not None
-                and move not in {"sweep_left", "sweep_right", "push_in", "pull_out"}
             ):
                 # Two subjects in one frame: pan from the first to the second
                 # rather than cutting the take to itself. Both endpoints are
@@ -394,7 +395,7 @@ def follow_subjects(
                 report.following_shots += 1
                 continue
 
-            if move in {"sweep_left", "sweep_right"}:
+            if move in {"sweep_left", "sweep_right"}:  # legacy names
                 # A designed move across a still arrangement. Nothing is
                 # tracked because nothing is moving, so this costs no call.
                 paths[clip.clip_id] = build_sweep_path(
@@ -481,6 +482,7 @@ def follow_subjects(
                 )
                 _charge(report, "subject", usage)
 
+            wants_tilt = move == "tilt"
             observations = []
             for box in boxes:
                 if not box.get("present"):
@@ -588,16 +590,26 @@ def follow_subjects(
                         elif tracked:
                             observations = tracked
 
-            path = build_crop_path(
-                observations,
-                source_aspect=source.aspect_ratio,
-                target_aspect=target_aspect,
-                energy=reframe.camera_energy,
-                framing=reframe.framing,
-                clip_id=clip.clip_id,
-                min_visible=reframe.subject.min_visible,
-                degradations=report.degradations,
-            )
+            if wants_tilt:
+                path = build_tilt_path(
+                    observations,
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    energy=reframe.camera_energy,
+                    clip_id=clip.clip_id,
+                    degradations=report.degradations,
+                )
+            else:
+                path = build_crop_path(
+                    observations,
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    energy=reframe.camera_energy,
+                    framing=reframe.framing,
+                    clip_id=clip.clip_id,
+                    min_visible=reframe.subject.min_visible,
+                    degradations=report.degradations,
+                )
             paths[clip.clip_id] = path
             if path.is_static:
                 report.static_shots += 1

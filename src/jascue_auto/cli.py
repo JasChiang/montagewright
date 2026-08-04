@@ -15,9 +15,10 @@ import sys
 from pathlib import Path
 
 from jascue_auto.clipcard import build_library, load_card, subjects_from_card
-from jascue_auto.cost import Ledger
+from jascue_auto.cost import BudgetSpent, Ledger
 from jascue_auto.grounding import load_beat_grid
 from jascue_auto.pipeline import probe, run
+from jascue_auto.review import Round, actionable_keys, adjudicate, review_cut, should_continue
 from jascue_auto.planner import MaterialItem, decide_direction, select_shots
 from jascue_auto.schema import EDL, Clip, Reframe, Subject
 from jascue_auto.uploads import UploadCache, default_cache_path
@@ -173,8 +174,56 @@ def command_render(args: argparse.Namespace) -> int:
     # 17.9 seconds against 30, with nothing in the report saying so.
     report.target_seconds = float(direction["target_seconds"])
 
+    rounds: list[Round] = []
+    stopped = "review not requested"
+    if args.review:
+        # Every round renders before it reviews, so a stopping condition
+        # always leaves a finished film rather than a half-planned one.
+        while True:
+            keep_going, stopped = should_continue(rounds, ledger=ledger)
+            if not keep_going:
+                break
+            try:
+                verdict = review_cut(
+                    result.preview,
+                    brief=brief,
+                    direction=direction["direction"],
+                    client=client,
+                    cache=cache,
+                    ledger=ledger,
+                )
+            except BudgetSpent as error:
+                stopped = str(error)
+                break
+            rounds.append(
+                Round(
+                    index=len(rounds) + 1,
+                    verdict=verdict,
+                    actionable=actionable_keys(verdict),
+                )
+            )
+            print(
+                f"review {len(rounds)}: {verdict.verdict} "
+                f"({len(verdict.issues)} issues) — {verdict.overall[:70]}",
+                flush=True,
+            )
+            keep_going, stopped = should_continue(rounds, ledger=ledger)
+            if not keep_going:
+                break
+            # Nothing re-plans from a verdict yet, so a second round would
+            # render the same cut and read the same complaint. Stopping here
+            # is honest; looping would only spend money to agree with itself.
+            stopped = "revision requested; re-planning is not implemented yet"
+            break
+        if rounds:
+            report.degradations = adjudicate(
+                report.degradations, rounds[-1].verdict
+            )
+
     _write_report(
         output,
+        rounds=rounds,
+        stopped_because=stopped,
         direction=direction,
         selection=selection,
         report=report,
@@ -283,6 +332,27 @@ def _write_report(output: Path, **parts) -> None:
         "duration_shortfall_seconds": report.duration_shortfall,
         "extended_for_moves": report.extended_for_moves,
         "spend": report.spend(),
+        "review": {
+            "stopped_because": parts.get("stopped_because"),
+            "rounds": [
+                {
+                    "verdict": entry.verdict.verdict,
+                    "overall": entry.verdict.overall,
+                    "issues": [
+                        {
+                            "clip_id": issue.clip_id,
+                            "at_seconds": issue.at_seconds,
+                            "type": issue.issue_type,
+                            "severity": issue.severity,
+                            "description": issue.description,
+                            "fix": issue.fix,
+                        }
+                        for issue in entry.verdict.issues
+                    ],
+                }
+                for entry in parts.get("rounds", [])
+            ],
+        },
     }
     (output / "report.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
@@ -313,6 +383,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Where uploaded-media URIs are remembered. Defaults to a shared "
         "location, because the key is the file's content and a per-run store "
         "re-uploads material that has not changed.",
+    )
+    render.add_argument(
+        "--review",
+        action="store_true",
+        help="Watch the finished cut and report what it would change.",
     )
     render.add_argument("--output", type=Path, required=True)
     render.set_defaults(handler=command_render)

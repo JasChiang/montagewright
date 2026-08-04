@@ -32,42 +32,38 @@ CAMERA_MOVES: tuple[Capability, ...] = (
     Capability(
         name="hold",
         when=(
-            "畫面本身已經成立，或主體靜止且資訊集中。不動是一個決定，"
-            "不是沒有決定。"
+            "畫面本身已經成立，或主體靜止且資訊集中。"
+            "素材本身已經有攝影機運動時也用這個——讓它自己的推軌或搖攝演完，"
+            "再疊一層數位運鏡兩者會打架。不動是一個決定，不是沒有決定。"
         ),
         needs_subject=True,
         min_seconds=0.8,
     ),
     Capability(
-        name="follow",
+        name="pan",
         when=(
-            "主體在畫面裡實際移動，鏡頭跟著它。主體不動時選這個會得到 hold，"
-            "因為沒有東西可跟。"
+            "水平帶過去。指定一個主體就跟著它走；指定兩個就從第一個帶到"
+            "第二個；一排東西（三台手機、一列手錶）就從頭掃到尾。"
+            "主體不動又只有一個時會變成 hold，因為沒有東西可跟。"
         ),
         needs_subject=True,
-        min_seconds=2.0,
+        min_seconds=2.5,
     ),
     Capability(
-        name="sweep_left",
+        name="tilt",
         when=(
-            "畫面是靜態的陳列或並排（一排手錶、三台手機、一整面產品牆），"
-            "要讓觀眾逐一看過去。這是設計出來的運鏡，跟主體動不動無關；"
-            "從右邊開始往左掃。"
+            "垂直帶過去。主體上下移動時用——放進水裡、從桌面拿起、"
+            "沿著機身從上往下看。橫式素材出直式時上下沒有空間可移，"
+            "本機會照實回報做不到。"
         ),
-        needs_subject=False,
-        min_seconds=3.0,
-    ),
-    Capability(
-        name="sweep_right",
-        when="同上，從左邊開始往右掃。",
-        needs_subject=False,
-        min_seconds=3.0,
+        needs_subject=True,
+        min_seconds=2.5,
     ),
     Capability(
         name="push_in",
         when=(
-            "要把注意力收束到一個細節上——鏡頭模組、螢幕上的數值、"
-            "一個材質。畫面尺寸夠大才會好看。"
+            "收緊到一個細節上——鏡頭模組、螢幕上的數值、一個材質。"
+            "本機依來源解析度決定收多緊，不會為了框滿而放大到糊。"
         ),
         needs_subject=True,
         min_seconds=2.5,
@@ -79,6 +75,13 @@ CAMERA_MOVES: tuple[Capability, ...] = (
         min_seconds=2.5,
     ),
 )
+
+# These name what a crop can do, not what a camera can do. A dolly, a crane or
+# a true track all change viewpoint, which produces parallax -- foreground and
+# background moving at different rates -- and no amount of moving a window
+# over an already-shot frame produces that. Offering `dolly_zoom` would get it
+# chosen for an effect the executor cannot deliver, which is the same failure
+# as any other capability declared and not built.
 
 MOVE_NAMES: tuple[str, ...] = tuple(move.name for move in CAMERA_MOVES)
 MOVE_FLOORS: dict[str, float] = {
