@@ -270,7 +270,11 @@ def follow_subjects(
 
             duration = clip.approx_out_seconds - clip.approx_in_seconds
 
-            if reframe.then_subject is not None and reframe.subject is not None:
+            if (
+                reframe.then_subject is not None
+                and reframe.subject is not None
+                and move not in {"sweep_left", "sweep_right", "push_in", "pull_out"}
+            ):
                 # Two subjects in one frame: pan from the first to the second
                 # rather than cutting the take to itself. Both endpoints are
                 # measured, because a nine-box position is a hint about which
@@ -280,6 +284,7 @@ def follow_subjects(
                     source, clip.approx_in_seconds, clip.approx_out_seconds, work
                 )
                 centres = []
+                widths = []
                 for subject in (reframe.subject, reframe.then_subject):
                     boxes, usage = locate_subject(
                         frames, subject.description, client=client
@@ -290,15 +295,21 @@ def follow_subjects(
                         for box in boxes
                         if box.get("present") and box.get("centre_x") is not None
                     ]
-                    centres.append(
-                        sum(seen) / len(seen) if seen else 0.5
-                    )
+                    centres.append(sum(seen) / len(seen) if seen else 0.5)
+                    spans = [
+                        float(box["width"])
+                        for box in boxes
+                        if box.get("present") and box.get("width") is not None
+                    ]
+                    widths.append(sum(spans) / len(spans) if spans else 0.0)
                 paths[clip.clip_id] = build_handoff_path(
                     source_aspect=source.aspect_ratio,
                     target_aspect=target_aspect,
                     duration_seconds=duration,
                     from_centre=centres[0],
                     to_centre=centres[1],
+                    from_width=widths[0],
+                    to_width=widths[1],
                     energy=reframe.camera_energy,
                 )
                 report.subject_notes[clip.clip_id] = (

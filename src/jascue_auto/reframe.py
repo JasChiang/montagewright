@@ -253,6 +253,8 @@ def build_handoff_path(
     duration_seconds: float,
     from_centre: float,
     to_centre: float,
+    from_width: float = 0.0,
+    to_width: float = 0.0,
     energy: CameraEnergy = "calm",
 ) -> CropPath:
     """Carry the eye from one subject to another inside one shot.
@@ -281,13 +283,28 @@ def build_handoff_path(
     free_x = max(0.0, 1.0 - crop_width)
     y = (1.0 - crop_height) / 2.0
 
-    def centred_on(centre: float) -> float:
-        """Put the crop around a measured subject centre, not past it."""
+    def centred_on(centre: float, subject_width: float = 0.0) -> float:
+        """Frame the subject without travelling past it into background.
 
-        return min(max(centre - crop_width / 2.0, 0.0), free_x)
+        Centring alone is not framing. A subject sitting at 0.72 of the frame
+        is centred by pushing the crop's right edge to 0.88 -- and if the
+        subject itself ends at 0.83, the last twentieth of the shot is wall.
+        The pan stops where the subject's far edge does, with a margin, so it
+        arrives on the subject rather than beside it.
+        """
 
-    start_x = centred_on(from_centre)
-    end_x = centred_on(to_centre)
+        wanted = centre - crop_width / 2.0
+        if subject_width > 0.0:
+            far = centre + subject_width / 2.0
+            # Keep a little air past the subject, no more.
+            limit = min(free_x, max(0.0, far + crop_width * CROP_MARGIN - crop_width))
+            near = centre - subject_width / 2.0
+            floor = max(0.0, near - crop_width * CROP_MARGIN)
+            wanted = min(max(wanted, floor), max(limit, floor))
+        return min(max(wanted, 0.0), free_x)
+
+    start_x = centred_on(from_centre, from_width)
+    end_x = centred_on(to_centre, to_width)
 
     path = CropPath(
         [
