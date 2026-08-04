@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from jascue_auto.clipcard import build_library, load_card
+from jascue_auto.clipcard import build_library, load_card, subjects_from_card
 from jascue_auto.grounding import load_beat_grid
 from jascue_auto.pipeline import probe, run
 from jascue_auto.planner import MaterialItem, decide_direction, select_shots
@@ -103,6 +103,11 @@ def command_render(args: argparse.Namespace) -> int:
                 duration_seconds=_duration(proxy),
                 summary=(card or {}).get("summary", ""),
                 proxy=proxy,
+                composition=(card or {}).get("composition", ""),
+                camera_moves=bool((card or {}).get("camera_moves", False)),
+                subjects=tuple(
+                    box.label for box in subjects_from_card(card or {})
+                ),
             )
         )
 
@@ -184,6 +189,10 @@ def _edl_from_selection(selection: dict, rushes: Path) -> EDL:
             subject=Subject(
                 description=shot["subject"],
                 coarse_position=shot["subject_position"],
+                # Text and UI have to survive whole or they say nothing. The
+                # first run cropped a Galaxy Unpacked wordmark down to "y
+                # Unpacked", which is worse than not using the shot.
+                min_visible=1.0 if shot.get("must_be_whole") else 0.85,
             ),
             intent=shot.get("why", "")[:120],
             camera_move=shot.get("camera_move", "hold"),

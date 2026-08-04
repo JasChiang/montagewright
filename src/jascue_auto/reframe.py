@@ -581,63 +581,22 @@ def build_crop_path(
         y = min(max(subject_y - crop_height * share, 0.0), max(0.0, 1.0 - crop_height))
         return CropBox(x=x, y=y, width=crop_width, height=crop_height)
 
-    if spread < DEADBAND or free_x <= 0.0:
-        if degradations is not None:
-            degradations.append(
-                DegradationStep(
-                    clip_id=clip_id,
-                    ladder="static_on_subject",
-                    trigger=(
-                        "a follow was planned but the subject does not move "
-                        "in this shot"
-                        if free_x > 0.0
-                        else "a follow was planned but the crop already fills "
-                        "the frame on this axis, leaving nowhere to move"
-                    ),
-                    measured={
-                        "subject_spread_vw": round(spread, 4),
-                        "deadband_vw": DEADBAND,
-                        "free_travel_vw": round(free_x, 4),
-                    },
-                )
-            )
-        return _report_fit(
-            CropPath(
-                [Keyframe(observations[0].seconds, crop_at(_percentile(centres, 0.5)))]
-            ),
-            observations,
-            clip_id=clip_id,
-            min_visible=min_visible,
-            degradations=degradations,
-        )
+    def hold(trigger: str, measured: dict[str, float]) -> CropPath:
+        """Frame where the subject spent its time, and say why not to follow.
 
-    wandered = sum(
-        abs(later.centre_x - earlier.centre_x)
-        for earlier, later in zip(observations, observations[1:])
-    )
-    net = abs(centres[-1] - centres[0])
-    directness = net / wandered if wandered > 1e-9 else 0.0
-    if directness < MIN_DIRECTNESS:
-        # The subject moved but did not go anywhere. Framing on where it spent
-        # its time beats retracing each swing -- and this is a substitution
-        # for what was asked, so it is recorded rather than passed off as the
-        # plan being carried out.
+        Both reasons to hold end here: the subject barely moved, or it moved
+        and came back. Either way a follow was planned and something else was
+        delivered, so the substitution is recorded rather than passed off as
+        the plan being carried out.
+        """
+
         if degradations is not None:
             degradations.append(
                 DegradationStep(
                     clip_id=clip_id,
                     ladder="static_on_subject",
-                    trigger=(
-                        "a follow was planned but the subject returned to "
-                        "where it started, so following it would read as a "
-                        "wobble rather than a move"
-                    ),
-                    measured={
-                        "directness": round(directness, 4),
-                        "threshold": MIN_DIRECTNESS,
-                        "net_displacement_vw": round(net, 4),
-                        "total_wander_vw": round(wandered, 4),
-                    },
+                    trigger=trigger,
+                    measured=measured,
                 )
             )
         return _report_fit(
@@ -653,6 +612,38 @@ def build_crop_path(
             clip_id=clip_id,
             min_visible=min_visible,
             degradations=degradations,
+        )
+
+    if spread < DEADBAND or free_x <= 0.0:
+        return hold(
+            "a follow was planned but the subject does not move in this shot"
+            if free_x > 0.0
+            else "a follow was planned but the crop already fills the frame "
+            "on this axis, leaving nowhere to move",
+            {
+                "subject_spread_vw": round(spread, 4),
+                "deadband_vw": DEADBAND,
+                "free_travel_vw": round(free_x, 4),
+            },
+        )
+
+    wandered = sum(
+        abs(later.centre_x - earlier.centre_x)
+        for earlier, later in zip(observations, observations[1:])
+    )
+    net = abs(centres[-1] - centres[0])
+    directness = net / wandered if wandered > 1e-9 else 0.0
+    if directness < MIN_DIRECTNESS:
+        return hold(
+            "a follow was planned but the subject returned to where it "
+            "started, so following it would read as a wobble rather than a "
+            "move",
+            {
+                "directness": round(directness, 4),
+                "threshold": MIN_DIRECTNESS,
+                "net_displacement_vw": round(net, 4),
+                "total_wander_vw": round(wandered, 4),
+            },
         )
 
     raw: list[Keyframe] = []

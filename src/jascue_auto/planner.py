@@ -505,6 +505,12 @@ class MaterialItem:
     duration_seconds: float
     summary: str
     proxy: Path | None = None
+    # What the card already measured. A horizontal layout is not a warning
+    # that the shot resists a vertical cut -- it is the reason to move the
+    # camera across it rather than crop the middle out and call it framing.
+    composition: str = ""
+    subjects: tuple[str, ...] = ()
+    camera_moves: bool = False
 
 
 def _direction_schema() -> dict[str, Any]:
@@ -558,6 +564,28 @@ def _direction_schema() -> dict[str, Any]:
             },
         },
     }
+
+
+def _describe_material(material: list[MaterialItem]) -> str:
+    """The card's measurements alongside the description.
+
+    Composition and subject labels were being computed, stored, and never
+    sent. The planner was choosing camera moves for shots whose layout it had
+    to infer from prose, when the card already knew.
+    """
+
+    lines = []
+    for item in material:
+        facts = [f"{item.duration_seconds:.1f}s"]
+        if item.composition:
+            facts.append(f"構圖{item.composition}")
+        if item.camera_moves:
+            facts.append("攝影機有運動")
+        head = f"- {item.source_id}（{'、'.join(facts)}）：{item.summary}"
+        if item.subjects:
+            head += "\n    可框住的主體：" + "；".join(item.subjects)
+        lines.append(head)
+    return "\n".join(lines)
 
 
 def _attach_material(
@@ -616,10 +644,7 @@ def decide_direction(
     if client is None:
         client = _default_client()
 
-    listing = "\n".join(
-        f"- {item.source_id} ({item.duration_seconds:.1f}s): {item.summary}"
-        for item in material
-    )
+    listing = _describe_material(material)
     prompt = (PROMPTS / "direction_zh-TW.txt").read_text(encoding="utf-8")
     request_input: list[dict[str, Any]] = [
         {
@@ -703,6 +728,18 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                         "energy": {
                             "type": "string",
                             "enum": ["low", "medium", "high"],
+                        },
+                        "must_be_whole": {
+                            "type": "boolean",
+                            "description": (
+                                "True when partial cropping destroys this "
+                                "subject: rendered text, a logo, a UI state, "
+                                "a readout. Half a wordmark is not a tighter "
+                                "shot of a wordmark, it is an unreadable one. "
+                                "False for anything that still reads when its "
+                                "edges leave frame -- a person, a held "
+                                "product, a face in a group."
+                            ),
                         },
                         "framing": {
                             "type": "string",
@@ -799,10 +836,7 @@ def select_shots(
         if item.source_id
         not in {entry["source_id"] for entry in direction.get("unusable", [])}
     ]
-    listing = "\n".join(
-        f"- {item.source_id} ({item.duration_seconds:.1f}s): {item.summary}"
-        for item in usable
-    )
+    listing = _describe_material(usable)
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     selection_input: list[dict[str, Any]] = [
         {
