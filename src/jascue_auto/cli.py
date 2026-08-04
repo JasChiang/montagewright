@@ -14,7 +14,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from jascue_auto.clipcard import build_library, load_card, subjects_from_card
+from jascue_auto.clipcard import (
+    build_library,
+    load_card,
+    snap_to_action,
+    subjects_from_card,
+)
 from jascue_auto.cost import BudgetSpent, Ledger
 from jascue_auto.grounding import load_beat_grid
 from jascue_auto.pipeline import probe, run
@@ -144,7 +149,9 @@ def command_render(args: argparse.Namespace) -> int:
     )
     print(f"selection: {len(selection['shots'])} shots", flush=True)
 
-    edl = _edl_from_selection(selection, rushes)
+    edl, snaps = _edl_from_selection(selection, rushes, cards)
+    if snaps:
+        print(f"cut on action: {len(snaps)} in-points moved", flush=True)
     sources = {
         shot["source_id"]: probe(
             shot["source_id"], rushes / f"{shot['source_id']}{_suffix(rushes, shot['source_id'])}"
@@ -222,6 +229,7 @@ def command_render(args: argparse.Namespace) -> int:
 
     _write_report(
         output,
+        snaps=snaps,
         rounds=rounds,
         stopped_because=stopped,
         direction=direction,
@@ -257,8 +265,11 @@ def _duration(path: Path) -> float:
     return float(json.loads(completed.stdout)["format"]["duration"])
 
 
-def _edl_from_selection(selection: dict, rushes: Path) -> EDL:
+def _edl_from_selection(
+    selection: dict, rushes: Path, cards: dict[str, Path]
+) -> tuple[EDL, dict[str, str]]:
     clips = []
+    snaps: dict[str, str] = {}
     for index, shot in enumerate(selection["shots"]):
         reframe = Reframe(
             subject=Subject(
@@ -285,18 +296,25 @@ def _edl_from_selection(selection: dict, rushes: Path) -> EDL:
                     )
                 }
             )
+        clip_id = f"k{index:02d}"
+        start = float(shot["start_seconds"])
+        card = load_card(cards[shot["source_id"]]) if shot["source_id"] in cards else None
+        if card is not None:
+            start, note = snap_to_action(card, start, 4.0)
+            if note:
+                snaps[clip_id] = note
         clips.append(
             Clip(
-                clip_id=f"k{index:02d}",
+                clip_id=clip_id,
                 source_id=shot["source_id"],
-                approx_in_seconds=float(shot["start_seconds"]),
-                approx_out_seconds=float(shot["start_seconds"]) + 4.0,
+                approx_in_seconds=start,
+                approx_out_seconds=start + 4.0,
                 in_looks_like=shot["subject"],
                 energy_intent=shot.get("energy", "medium"),
                 reframe=reframe,
             )
         )
-    return EDL(project_id=rushes.name, clips=clips)
+    return EDL(project_id=rushes.name, clips=clips), snaps
 
 
 def _write_report(output: Path, **parts) -> None:
@@ -332,6 +350,7 @@ def _write_report(output: Path, **parts) -> None:
         "duration_shortfall_seconds": report.duration_shortfall,
         "extended_for_moves": report.extended_for_moves,
         "spend": report.spend(),
+        "cut_on_action": parts.get("snaps", {}),
         "review": {
             "stopped_because": parts.get("stopped_because"),
             "rounds": [

@@ -28,6 +28,54 @@ CARD_VERSION = "jascue-auto-clip-card-v1"
 
 
 @dataclass(frozen=True)
+class Beat:
+    """One movement in a clip, and when it runs."""
+
+    what: str
+    starts_seconds: float
+    ends_seconds: float
+
+
+def action_beats(card: dict[str, Any]) -> list[Beat]:
+    beats: list[Beat] = []
+    for entry in card.get("action", []) or []:
+        try:
+            start = float(entry["starts_seconds"])
+            end = float(entry["ends_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end > start:
+            beats.append(Beat(str(entry.get("what", "")), start, end))
+    return sorted(beats, key=lambda beat: beat.starts_seconds)
+
+
+def snap_to_action(
+    card: dict[str, Any], wanted_start: float, duration: float
+) -> tuple[float, str | None]:
+    """Move a planned in-point onto the nearest action that contains it.
+
+    A cut placed by arithmetic lands wherever the seconds fall, which is
+    usually the middle of a gesture. An editor entering a shot goes in as the
+    movement starts. This only moves the in-point when there is an action
+    close enough to be the one meant -- half the shot's length -- so a static
+    shot keeps the timing it was given.
+    """
+
+    beats = action_beats(card)
+    if not beats:
+        return wanted_start, None
+
+    tolerance = max(0.5, duration / 2.0)
+    nearest = min(beats, key=lambda beat: abs(beat.starts_seconds - wanted_start))
+    drift = nearest.starts_seconds - wanted_start
+    if abs(drift) > tolerance:
+        return wanted_start, None
+    return nearest.starts_seconds, (
+        f"moved {drift:+.2f}s onto '{nearest.what}'" if abs(drift) > 0.05 else None
+    )
+
+
+@dataclass(frozen=True)
 class SubjectBox:
     """One nameable thing in the frame, with where it sits."""
 
@@ -49,7 +97,13 @@ def card_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["summary", "usable", "composition", "subjects"],
+        "required": [
+            "summary",
+            "usable",
+            "composition",
+            "subjects",
+            "action",
+        ],
         "properties": {
             "summary": {
                 "type": "string",
@@ -75,6 +129,33 @@ def card_schema() -> dict[str, Any]:
                     "sit in one happily. Recorded here so the edit knows "
                     "before it commits an aspect."
                 ),
+            },
+            "action": {
+                "type": "array",
+                "description": (
+                    "Where things actually happen in this clip. An editor "
+                    "cuts on action -- into a gesture as it begins, out as it "
+                    "completes -- and a cut placed by arithmetic lands "
+                    "mid-movement, which reads as a mistake even to someone "
+                    "who cannot say why. Empty for a static shot."
+                ),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["what", "starts_seconds", "ends_seconds"],
+                    "properties": {
+                        "what": {
+                            "type": "string",
+                            "description": (
+                                "The movement, in a few words: 'the hand "
+                                "reaches in', 'the phone opens', 'the watch "
+                                "is lowered'."
+                            ),
+                        },
+                        "starts_seconds": {"type": "number"},
+                        "ends_seconds": {"type": "number"},
+                    },
+                },
             },
             "camera_moves": {
                 "type": "boolean",

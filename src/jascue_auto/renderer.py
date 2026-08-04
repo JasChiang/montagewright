@@ -35,9 +35,23 @@ TRUE_PEAK_CEILING_DB = -1.5
 TRUE_PEAK_CEILING_LINEAR = 10 ** (TRUE_PEAK_CEILING_DB / 20)
 PREVIEW_HEIGHT = 640
 
+# Extra material kept either side of each cut, never shown. A transition needs
+# two shots to overlap, and an exact cut leaves nothing to overlap with; a
+# nudge of a quarter of a second later needs frames that were never rendered.
+# Editors call these handles and always cut them.
+HANDLE_SECONDS = 0.5
+
 
 class RenderError(RuntimeError):
     """ffmpeg refused, and the command plus its stderr are attached."""
+
+
+@dataclass(frozen=True)
+class Handles:
+    """How much spare material a segment carries, and where."""
+
+    head_seconds: float
+    tail_seconds: float
 
 
 @dataclass(frozen=True)
@@ -100,7 +114,7 @@ def probe_duration(path: Path) -> float:
 
 def _render_segment(
     segment: Segment, destination: Path, *, video_encoder: str
-) -> Path:
+) -> tuple[Path, "Handles"]:
     """Cut one shot, cropping if the plan asked for it."""
 
     filters: list[str] = []
@@ -128,6 +142,15 @@ def _render_segment(
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)
         filters.append(f"crop={width}:{height}:{x}:{y}")
 
+    # The delivered segment is cut exactly. Handles are written alongside it
+    # as their own file, so a transition or a nudge has material without the
+    # timeline paying for it -- the concat stays frame-exact because every
+    # segment is already the length it is meant to be.
+    head = min(HANDLE_SECONDS, segment.in_seconds)
+    tail = min(
+        HANDLE_SECONDS,
+        max(0.0, source.duration_seconds - segment.out_seconds),
+    )
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         # Seeking before -i decodes from the preceding keyframe, which is both
@@ -145,20 +168,47 @@ def _render_segment(
         str(destination),
     ]
     _run(command)
-    return destination
+
+    if head > 0.0 or tail > 0.0:
+        spare = destination.with_name(f"{destination.stem}.handles.mp4")
+        _run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{segment.in_seconds - head:.6f}",
+                "-to", f"{segment.out_seconds + tail:.6f}",
+                "-i", str(segment.source.path),
+            ]
+            + (["-vf", ",".join(filters)] if filters else [])
+            + [
+                "-c:v", video_encoder, "-b:v", "12M",
+                "-c:a", "aac", "-b:a", "192k",
+                "-pix_fmt", "yuv420p", str(spare),
+            ]
+        )
+    return destination, Handles(head_seconds=head, tail_seconds=tail)
 
 
-def _concat(segment_paths: list[Path], destination: Path, work_dir: Path) -> Path:
+def _concat(
+    segment_paths: list[tuple[Path, Handles, float]],
+    destination: Path,
+    work_dir: Path,
+) -> Path:
     """Join the segments without touching the streams again.
 
     The segments already share a codec, pixel format, and sample rate because
     this module wrote all of them, so a stream copy is exact. Re-encoding here
     would be a second generation loss for no gain.
+
+    Handles are trimmed at render time rather than here. Asking the concat
+    demuxer for inpoint/outpoint on a copied stream lands on the nearest
+    keyframe, which drifted a two-shot test by 124ms -- and every cut in this
+    pipeline is placed against a measured beat, so drift that accumulates
+    across a timeline is not a rounding detail, it is the alignment gone.
     """
 
     listing = work_dir / "concat.txt"
     listing.write_text(
-        "".join(f"file '{path.resolve()}'\n" for path in segment_paths),
+        "".join(f"file '{path.resolve()}'\n" for path, _, _ in segment_paths),
         encoding="utf-8",
     )
     _run(
@@ -245,11 +295,13 @@ def render(
     segment_paths: list[Path] = []
     for index, segment in enumerate(plan.segments):
         destination = segment_dir / f"{index:03d}-{segment.clip_id}.mp4"
-        segment_paths.append(
-            _render_segment(segment, destination, video_encoder=video_encoder)
+        rendered, handles = _render_segment(
+            segment, destination, video_encoder=video_encoder
         )
+        segment_paths.append((rendered, handles, segment.duration_seconds))
 
     picture = _concat(segment_paths, output_dir / "picture.mp4", output_dir)
+    kept_paths = [path for path, _, _ in segment_paths]
 
     deliverable = output_dir / "deliverable.mp4"
     if music is not None:
@@ -265,11 +317,11 @@ def render(
 
     if not keep_segments:
         shutil.rmtree(segment_dir, ignore_errors=True)
-        segment_paths = []
+        kept_paths = []
 
     return RenderResult(
         deliverable=deliverable,
         preview=preview,
-        segment_paths=tuple(segment_paths),
+        segment_paths=tuple(kept_paths),
         duration_seconds=probe_duration(deliverable),
     )
