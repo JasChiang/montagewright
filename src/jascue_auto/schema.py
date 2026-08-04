@@ -197,6 +197,15 @@ class Reframe(ModelFacing):
             "halves get a frame that commits to one thing."
         ),
     )
+    framing: str = Field(
+        default="thirds",
+        description=(
+            "Where the subject sits when it does not fill the output ratio. "
+            "Negative space is a composition rather than a shortfall, so this "
+            "asks where the subject goes in that space -- not how to remove "
+            "it. Local code holds one sharpness ceiling regardless."
+        ),
+    )
     camera_move: str = Field(
         default="hold",
         description=(

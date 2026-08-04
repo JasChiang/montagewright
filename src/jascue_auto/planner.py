@@ -20,8 +20,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from jascue_auto.capabilities import MOVE_NAMES, describe_for_prompt
+from jascue_auto.capabilities import (
+    INTENT_NAMES,
+    MOVE_NAMES,
+    describe_for_prompt,
+)
 from jascue_auto.grounding import BeatGrid
+from jascue_auto.uploads import UploadCache
 from jascue_auto.schema import EDL, Clip, MusicSync
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
@@ -487,11 +492,19 @@ def locate_subject(
 
 @dataclass(frozen=True)
 class MaterialItem:
-    """One source as the planner sees it: an id, a length, a description."""
+    """One source as the planner sees it.
+
+    The proxy is what makes the difference between reading about a shot and
+    watching it. Selection ran on summaries alone at first, which meant the
+    step that decides which shot to use had never seen any of them -- so it
+    could not tell a horizontally composed frame that will fight a vertical
+    crop from one that will sit in it happily.
+    """
 
     source_id: str
     duration_seconds: float
     summary: str
+    proxy: Path | None = None
 
 
 def _direction_schema() -> dict[str, Any]:
@@ -547,11 +560,50 @@ def _direction_schema() -> dict[str, Any]:
     }
 
 
+def _attach_material(
+    material: list[MaterialItem], cache: UploadCache | None, client: Any
+) -> list[dict[str, Any]]:
+    """Attach every proxy that exists, reusing anything already uploaded."""
+
+    attached: list[dict[str, Any]] = []
+    for item in material:
+        if item.proxy is None or not item.proxy.exists():
+            continue
+        if cache is None:
+            uploaded = client.files.upload(file=str(item.proxy))
+            uri = uploaded.uri
+        else:
+            uri, _ = cache.uri_for(item.proxy, client, mime_type="video/mp4")
+        attached.append(
+            {
+                "type": "video",
+                "mime_type": "video/mp4",
+                "uri": uri,
+                "media_resolution": "low",
+            }
+        )
+    return attached
+
+
+def _attach_music(
+    music: Path, cache: UploadCache | None, client: Any
+) -> dict[str, Any]:
+    if cache is None:
+        return {
+            "type": "audio",
+            "mime_type": "audio/mpeg",
+            "uri": upload_music(music, client).uri,
+        }
+    uri, _ = cache.uri_for(music, client, mime_type="audio/mpeg")
+    return {"type": "audio", "mime_type": "audio/mpeg", "uri": uri}
+
+
 def decide_direction(
     material: list[MaterialItem],
     *,
     brief: str,
     music: Path | None = None,
+    cache: UploadCache | None = None,
     client: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage one: what should this material become.
@@ -574,15 +626,13 @@ def decide_direction(
             "type": "text",
             "text": (
                 f"{prompt}\n\n## 剪輯 brief\n\n{brief}\n\n"
-                f"## 素材（{len(material)} 支）\n\n{listing}\n"
+                f"## 素材（{len(material)} 支，依序附上影片）\n\n{listing}\n"
             ),
         }
     ]
+    request_input += _attach_material(material, cache, client)
     if music is not None:
-        uploaded = upload_music(music, client)
-        request_input.append(
-            {"type": "audio", "mime_type": "audio/mpeg", "uri": uploaded.uri}
-        )
+        request_input.append(_attach_music(music, cache, client))
 
     interaction = client.interactions.create(
         model=MODEL_ID,
@@ -653,6 +703,15 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                         "energy": {
                             "type": "string",
                             "enum": ["low", "medium", "high"],
+                        },
+                        "framing": {
+                            "type": "string",
+                            "enum": list(INTENT_NAMES),
+                            "description": (
+                                "Where the subject sits when it does not fill "
+                                "the output ratio. Empty frame is a "
+                                "composition, not a shortfall."
+                            ),
                         },
                         "camera_move": {
                             "type": "string",
@@ -726,6 +785,7 @@ def select_shots(
     direction: dict[str, Any],
     *,
     brief: str,
+    cache: UploadCache | None = None,
     client: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage two: which shots, in what order, and why each one."""
@@ -744,23 +804,26 @@ def select_shots(
         for item in usable
     )
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
-    interaction = client.interactions.create(
-        model=MODEL_ID,
-        store=False,
-        input=[
-            {
-                "type": "text",
-                "text": (
+    selection_input: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
                     f"{prompt}\n\n## 已定好的調性\n\n"
                     f"{direction['direction']}\n\n"
                     f"目標長度 {direction['target_seconds']:.0f} 秒，"
                     f"輸出 {direction['aspect']}。\n\n"
                     f"## 剪輯 brief\n\n{brief}\n\n"
                     f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
-                    f"## 可用素材（{len(usable)} 支）\n\n{listing}\n"
-                ),
-            }
-        ],
+                    f"## 可用素材（{len(usable)} 支，依序附上影片）\n\n{listing}\n"
+            ),
+        }
+    ]
+    selection_input += _attach_material(usable, cache, client)
+
+    interaction = client.interactions.create(
+        model=MODEL_ID,
+        store=False,
+        input=selection_input,
         generation_config={
             "thinking_level": THINKING_HIGH,
             "max_output_tokens": 16384,

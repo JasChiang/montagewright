@@ -22,11 +22,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jascue_auto.clipcard import find_subject, load_card
 from jascue_auto.executor import RenderPlan, Source, plan_render
 from jascue_auto.grounding import BeatGrid, apply_to_edl, ground_timeline
 from jascue_auto.planner import Usage, decide_rhythm, locate_subject
 from jascue_auto.reframe import (
     CropPath,
+    achieved_upscale,
+    zoom_budget,
     Observation,
     OutOfFrame,
     build_crop_path,
@@ -59,6 +62,11 @@ class Report:
     static_shots: int = 0
     degradations: list[DegradationStep] = field(default_factory=list)
     subject_notes: dict[str, str] = field(default_factory=dict)
+    # Enlargement actually applied per shot. Reported as a number because
+    # sharpness is measurable: nobody should have to tell a soft proxy apart
+    # from an over-enlarged shot by eye, and at preview resolution they look
+    # the same.
+    upscales: dict[str, float] = field(default_factory=dict)
     usages: list[Usage] = field(default_factory=list)
 
     @property
@@ -181,6 +189,8 @@ def follow_subjects(
     *,
     target_aspect: float,
     report: Report,
+    output_size: tuple[int, int] = (1080, 1920),
+    cards: dict[str, Path] | None = None,
     checkpoint: Path | None = None,
     client: Any | None = None,
 ) -> dict[str, CropPath]:
@@ -200,6 +210,11 @@ def follow_subjects(
                 continue
             source = sources[clip.source_id]
             move = reframe.camera_move
+            card = (
+                load_card(cards[clip.source_id])
+                if cards and clip.source_id in cards
+                else None
+            )
 
             duration = clip.approx_out_seconds - clip.approx_in_seconds
 
@@ -270,7 +285,27 @@ def follow_subjects(
                         report.subject_notes[clip.clip_id] = (
                             f"{move} on ({centre_x:.3f}, {centre_y:.3f})"
                         )
-                paths[clip.clip_id] = build_zoom_path(
+                # Read what the source can supply before choosing how far to
+                # push. A fixed percentage is blind to what it is cropping.
+                out_w, out_h = output_size
+                budget = zoom_budget(
+                    source_width=source.width,
+                    source_height=source.height,
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    output_width=out_w,
+                    output_height=out_h,
+                )
+                subject_height = None
+                if seen:
+                    heights = [
+                        float(b["height"])
+                        for b in boxes
+                        if b.get("present") and b.get("height") is not None
+                    ]
+                    if heights:
+                        subject_height = sum(heights) / len(heights)
+                path = build_zoom_path(
                     source_aspect=source.aspect_ratio,
                     target_aspect=target_aspect,
                     duration_seconds=duration,
@@ -278,7 +313,21 @@ def follow_subjects(
                     centre_x=centre_x,
                     centre_y=centre_y,
                     energy=reframe.camera_energy,
+                    framing=reframe.framing,
+                    budget=budget,
+                    subject_height=subject_height,
+                    clip_id=clip.clip_id,
+                    degradations=report.degradations,
                 )
+                tightest = min(path.keyframes, key=lambda k: k.crop.width).crop
+                report.upscales[clip.clip_id] = achieved_upscale(
+                    tightest,
+                    source_width=source.width,
+                    source_height=source.height,
+                    output_width=out_w,
+                    output_height=out_h,
+                )
+                paths[clip.clip_id] = path
                 report.following_shots += 1
                 continue
 
@@ -387,6 +436,7 @@ def follow_subjects(
                 source_aspect=source.aspect_ratio,
                 target_aspect=target_aspect,
                 energy=reframe.camera_energy,
+                framing=reframe.framing,
                 clip_id=clip.clip_id,
                 min_visible=reframe.subject.min_visible,
                 degradations=report.degradations,
@@ -447,6 +497,7 @@ def run(
     target_aspect: float,
     intent: str,
     music: Path | None = None,
+    cards: dict[str, Path] | None = None,
     checkpoint: Path | None = None,
     decide_rhythm_first: bool = True,
     client: Any | None = None,
@@ -478,6 +529,7 @@ def run(
         sources,
         target_aspect=target_aspect,
         report=report,
+        cards=cards,
         checkpoint=checkpoint,
         client=client,
     )

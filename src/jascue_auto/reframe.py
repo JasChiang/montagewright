@@ -299,6 +299,83 @@ def build_handoff_path(
     return CropPath(limited)
 
 
+# How far the delivered frame may be enlarged past what the source supplies.
+#
+# These are the cost of each editorial answer, not a rule about which to pick.
+# Holding every shot to the sharp figure is a local veto on a question only the
+# edit can settle: a coin held against a hinge to show 4.1mm is worth showing
+# soft, and a wide establisher is not. The planner says which this is; these
+# numbers say what it costs.
+# One ceiling, because softening the picture was never the thing worth
+# trading. Empty frame is an acceptable outcome; a soft frame is not.
+MAX_UPSCALE = 1.35
+
+# Where the subject centre lands vertically within the crop, per intent. The
+# thirds figure leaves the air above a subject that a centred frame throws
+# away evenly on both sides -- which is why a coin dead-centre in a tall frame
+# reads as untouched rather than composed.
+PLACEMENT: dict[str, float] = {
+    "thirds": 0.618,
+    "centre": 0.5,
+    "fill": 0.5,
+}
+
+
+def zoom_budget(
+    *,
+    source_width: int,
+    source_height: int,
+    source_aspect: float,
+    target_aspect: float,
+    output_width: int,
+    output_height: int,
+    max_upscale: float = MAX_UPSCALE,
+) -> float:
+    """The tightest crop this source can supply at this output size.
+
+    Read before choosing a zoom rather than after. A fixed percentage per
+    energy level is blind to what it is cropping: the same 28% is nothing on
+    a 4K source and unwatchable on a 1080 one.
+
+    Returned as a scale factor -- 1.0 means no room to push at all, 0.4 means
+    the crop may shrink to 40% of its base size before the delivered frame is
+    being enlarged past the budget.
+    """
+
+    if target_aspect < source_aspect:
+        base_w = (target_aspect / source_aspect) * source_width
+        base_h = float(source_height)
+    else:
+        base_w = float(source_width)
+        base_h = (source_aspect / target_aspect) * source_height
+
+    # The crop may shrink until delivering it would enlarge past the budget.
+    limit_w = (output_width / max_upscale) / max(base_w, 1e-6)
+    limit_h = (output_height / max_upscale) / max(base_h, 1e-6)
+    return min(1.0, max(limit_w, limit_h, 0.05))
+
+
+def achieved_upscale(
+    crop: CropBox,
+    *,
+    source_width: int,
+    source_height: int,
+    output_width: int,
+    output_height: int,
+) -> float:
+    """How much this crop has to be enlarged to fill the output.
+
+    A number, reported alongside the cut. Sharpness is measurable, so nobody
+    should be asked to judge it from a preview -- least of all to tell a soft
+    proxy apart from a genuinely over-enlarged shot, which at preview
+    resolution look identical.
+    """
+
+    pixels_w = max(crop.width * source_width, 1e-6)
+    pixels_h = max(crop.height * source_height, 1e-6)
+    return max(output_width / pixels_w, output_height / pixels_h)
+
+
 def build_zoom_path(
     *,
     source_aspect: float,
@@ -308,6 +385,11 @@ def build_zoom_path(
     centre_x: float = 0.5,
     centre_y: float = 0.5,
     energy: CameraEnergy = "calm",
+    framing: str = "thirds",
+    budget: float = 0.0,
+    subject_height: float | None = None,
+    clip_id: str = "",
+    degradations: list[DegradationStep] | None = None,
 ) -> CropPath:
     """Close in on something, or open out from it.
 
@@ -328,11 +410,33 @@ def build_zoom_path(
         base_width = 1.0
         base_height = source_aspect / target_aspect
 
-    # Zoom range scales with energy: a calm push is barely felt, a dynamic one
-    # is a move in its own right. Capped so the tightest crop still has real
-    # pixels behind it.
-    span = {"calm": 0.10, "active": 0.18, "dynamic": 0.28}[energy]
-    tight = max(0.35, 1.0 - span)
+    # What the shot wants: enough of a push that the subject reads, with room
+    # around it. What the source allows: whatever keeps the delivered frame
+    # inside its enlargement budget. Take the more conservative.
+    wanted = {"calm": 0.90, "active": 0.82, "dynamic": 0.72}[energy]
+    if subject_height is not None and subject_height > 0.0 and framing == "fill":
+        # Only a fill intent chases the subject's size. The others accept the
+        # frame the source gives and place the subject inside it.
+        wanted = min(wanted, max(0.2, subject_height / 0.66))
+    allowed = budget if budget > 0.0 else 0.35
+    tight = max(wanted, allowed)
+
+    if degradations is not None and wanted < allowed - 1e-6:
+        degradations.append(
+            DegradationStep(
+                clip_id=clip_id,
+                ladder="reduced_zoom",
+                trigger=(
+                    "the source cannot supply the push this shot wants without "
+                    "enlarging the delivered frame past its budget"
+                ),
+                measured={
+                    "wanted_scale": round(wanted, 4),
+                    "allowed_scale": round(allowed, 4),
+                    "subject_height_vw": round(subject_height or 0.0, 4),
+                },
+            )
+        )
 
     wide = (base_width, base_height)
     close = (base_width * tight, base_height * tight)
@@ -340,8 +444,13 @@ def build_zoom_path(
 
     def box(size: tuple[float, float]) -> CropBox:
         width, height = size
+        # Put the subject on the intended line of the crop rather than in the
+        # middle of it. A centred subject splits its negative space evenly
+        # above and below, which reads as an untouched frame; placing it on
+        # the lower third gathers that space into one piece of air above.
+        share = PLACEMENT.get(framing, 0.5)
         x = min(max(centre_x - width / 2.0, 0.0), max(0.0, 1.0 - width))
-        y = min(max(centre_y - height / 2.0, 0.0), max(0.0, 1.0 - height))
+        y = min(max(centre_y - height * share, 0.0), max(0.0, 1.0 - height))
         return CropBox(x, y, width, height)
 
     return CropPath(
@@ -428,6 +537,7 @@ def build_crop_path(
     source_aspect: float,
     target_aspect: float,
     energy: CameraEnergy = "calm",
+    framing: str = "thirds",
     clip_id: str = "",
     min_visible: float = 0.85,
     degradations: list[DegradationStep] | None = None,
@@ -462,7 +572,14 @@ def build_crop_path(
             x = min(max(x, free_x * CROP_MARGIN), free_x * (1.0 - CROP_MARGIN))
         else:
             x = 0.0
-        return CropBox(x=x, y=(1.0 - crop_height) / 2.0, width=crop_width, height=crop_height)
+        share = PLACEMENT.get(framing, 0.5)
+        subject_y = (
+            sum(o.centre_y for o in observations) / len(observations)
+            if observations
+            else 0.5
+        )
+        y = min(max(subject_y - crop_height * share, 0.0), max(0.0, 1.0 - crop_height))
+        return CropBox(x=x, y=y, width=crop_width, height=crop_height)
 
     if spread < DEADBAND or free_x <= 0.0:
         if degradations is not None:

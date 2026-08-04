@@ -71,6 +71,32 @@ CAMERA_MOVES: tuple[Capability, ...] = (
 
 MOVE_NAMES: tuple[str, ...] = tuple(move.name for move in CAMERA_MOVES)
 
+# Where the subject sits when it does not fill the output ratio.
+#
+# A subject small in a clean frame is a composition, not a shortfall. Product
+# work on a white sweep is mostly negative space, and the question it asks is
+# where the subject sits in that space -- not how to get rid of it. Enlarging
+# the picture to fill the frame answers a question nobody asked and softens
+# the result to do it.
+FRAMING_INTENTS: tuple[tuple[str, str], ...] = (
+    (
+        "thirds",
+        "主體放在三分線上，留白在另一側。乾淨背景、產品陳列、"
+        "帶情緒的空鏡都適合。這是大部分情況的預設。",
+    ),
+    (
+        "centre",
+        "主體置中。對稱構圖、正面對鏡、或主體本身就是畫面全部時使用。",
+    ),
+    (
+        "fill",
+        "主體盡量佔滿畫面。細節特寫、螢幕上的數值、材質質感這類"
+        "要看清楚的鏡頭用這個；本機仍會守住放大上限，不會為了填滿而糊掉。",
+    ),
+)
+
+INTENT_NAMES: tuple[str, ...] = tuple(name for name, _ in FRAMING_INTENTS)
+
 
 def describe_for_prompt() -> str:
     """The menu as the planner reads it."""
@@ -82,5 +108,13 @@ def describe_for_prompt() -> str:
     lines.append(
         "選了做不到的組合——例如對靜止主體選 follow——本機會照實記錄實際"
         "做到什麼，不會假裝執行了。"
+    )
+    lines.append("")
+    lines.append("主體沒有填滿輸出比例時，它擺哪裡由你決定（framing）：")
+    for name, when in FRAMING_INTENTS:
+        lines.append(f"- `{name}`：{when}")
+    lines.append(
+        "留白本身是合法的構圖，不是要被消滅的東西。本機不會為了填滿畫面"
+        "而放大到糊，實際放大倍數會回報成數字。"
     )
     return "\n".join(lines)
