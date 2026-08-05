@@ -156,11 +156,6 @@ class Subject(ModelFacing):
             "is the single most common reason a shot cannot be reframed."
         )
     )
-    coarse_position: Literal[
-        "top_left", "top_center", "top_right",
-        "mid_left", "center", "mid_right",
-        "bottom_left", "bottom_center", "bottom_right",
-    ] = Field(description="Where it sits at the clip's start, roughly.")
     min_visible: Normalised = Field(
         default=0.85,
         description=(

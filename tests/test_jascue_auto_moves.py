@@ -270,3 +270,441 @@ def test_framing_intents_are_all_known_to_the_builders() -> None:
             direction="push_in", energy="calm", budget=0.6, framing=intent,
         )
         assert path.keyframes
+
+
+def test_a_subject_wider_than_the_delivery_is_recorded_under_every_move() -> None:
+    """The fit check belongs to the clip, not to one branch of the dispatch.
+
+    It lived inside the hold branch, so a wordmark 0.88 of a 16:9 frame wide
+    was swept across when the planner asked for a hold and silently cropped to
+    "Galaxy Unpac" when it asked for a push -- same material, same impossible
+    promise, one of them unrecorded. None of the five path builders except
+    build_crop_path reports fit, so nothing else caught it either.
+    """
+
+    import inspect
+
+    from jascue_auto import pipeline
+
+    source = inspect.getsource(pipeline.follow_subjects)
+    fact_at = source.index("subject_wider_than_delivery")
+    for branch in ('if (\n                move == "pan"', 'if move in {"push_in"'):
+        assert source.index(branch) > fact_at, (
+            f"the fit check must run before {branch!r} dispatches, or that "
+            "move delivers a clipped subject with nothing in the report"
+        )
+
+
+def test_a_subject_that_cannot_fit_says_so_before_it_is_chosen() -> None:
+    """`must_be_whole` is only answerable if the ceiling travels with the subject."""
+
+    from jascue_auto.cli import _subject_line
+    from jascue_auto.clipcard import SubjectBox
+
+    wide = SubjectBox(
+        label="寫著 Galaxy Unpacked 的螢幕畫面",
+        centre_x=0.52, centre_y=0.49, width=0.88, height=0.81, moves=False,
+    )
+    line = _subject_line(wide, WIDE, TALL)
+    assert "36%" in line, line
+
+    small = SubjectBox(
+        label="硬幣", centre_x=0.5, centre_y=0.5, width=0.10, height=0.2,
+        moves=False,
+    )
+    assert _subject_line(small, WIDE, TALL) == "硬幣"
+
+
+def test_a_pan_onto_a_small_subject_centres_it_rather_than_hugging_an_edge() -> None:
+    """Both edge bounds exist for a subject that fills the crop.
+
+    A folded Flip 0.19 of the frame wide, panned to inside a 0.316 crop,
+    cannot touch both edges: "do not travel past the far edge" and "do not
+    start far from the near edge" describe an empty interval. Resolving that
+    by taking one bound put the phone a tenth of the way in with a third of
+    the frame wall behind it, which reads on screen as the pan overshooting.
+    """
+
+    path = build_handoff_path(
+        source_aspect=WIDE,
+        target_aspect=TALL,
+        duration_seconds=4.0,
+        from_centre=0.28,
+        to_centre=0.69,
+        from_width=0.20,
+        to_width=0.19,
+    )
+    end = path.keyframes[-1].crop
+    where = (0.69 - end.x) / end.width
+    assert 0.4 <= where <= 0.6, (
+        f"the destination sits at {where:.2f} of the frame, not centred"
+    )
+
+
+def test_rhythm_is_told_the_length_it_is_dividing_up() -> None:
+    """Eight lengths decided in isolation summed to 26s of a 45s film."""
+
+    import inspect
+
+    from jascue_auto import planner
+
+    source = inspect.getsource(planner.decide_rhythm)
+    assert "target_seconds" in source
+    assert "定調要" in source
+
+
+def test_selection_is_told_that_shot_count_is_a_length_decision() -> None:
+    """Told only "35 seconds", selection picked sixteen shots.
+
+    Every length downstream then had to be two seconds, which fits a static
+    product view and does not fit a gesture playing out or a screen being
+    read -- so the film hit its target duration by cutting away from more
+    things sooner.
+    """
+
+    from jascue_auto.planner import PROMPTS
+
+    prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
+    assert "顆數與長度是同一個決定" in prompt
+    assert "seconds_needed" in prompt
+
+
+def test_the_layer_that_picks_a_shot_says_how_long_it_needs() -> None:
+    """Length started from a constant, not from the shot.
+
+    Every clip left selection with a flat four-second window, so the layer
+    that knew what the shot was for had no say in how long it ran, and the
+    layer that set the length began from a number nobody chose.
+    """
+
+    import inspect
+
+    from jascue_auto import cli
+    from jascue_auto.planner import _selection_schema
+
+    shot = _selection_schema(["C1"])["properties"]["shots"]["items"]
+    assert "seconds_needed" in shot["required"]
+
+    source = inspect.getsource(cli._edl_from_selection)
+    assert "seconds_needed" in source
+    assert "start + 4.0" not in source
+
+
+def test_a_move_floor_reports_rather_than_lengthens() -> None:
+    """The length is the planner's; the floor says what could not happen.
+
+    A flat 2.5s raised any pan to 2.5s, which reads as a safeguard and is a
+    length decision made by a constant -- how long a sweep needs depends on
+    how far it travels and what is on the way, and only the layer that
+    watched the shot knows that. The menu now says local code will not add
+    time, so it must not.
+    """
+
+    import inspect
+
+    from jascue_auto import grounding
+
+    source = inspect.getsource(grounding._requested_duration)
+    assert "MOVE_FLOORS" not in source, (
+        "the requested length must come back whole, floor applied nowhere"
+    )
+    assert "move_too_short" in inspect.getsource(grounding.ground_timeline)
+
+
+def test_the_menu_hands_the_timing_judgement_to_the_planner() -> None:
+    from jascue_auto.capabilities import describe_for_prompt
+
+    menu = describe_for_prompt()
+    assert "seconds_needed" in menu
+    assert "本機不會替你補時間" in menu
+    assert "至少" not in menu
+
+
+def test_the_shot_reviewer_sees_the_shot_and_settles_its_degradations() -> None:
+    """Adjudication rested on a viewer who never saw the shot in question.
+
+    "The subject is 0.88 of frame wide and can show 36% of itself" is not
+    judgeable from a thirty-second film and a line of numbers. Whoever
+    watched that one shot settles it.
+    """
+
+    from jascue_auto.review import adjudicate
+    from jascue_auto.schema import DegradationStep, Issue, ReviewVerdict
+
+    step = DegradationStep(
+        clip_id="k00",
+        ladder="other",
+        ladder_other="subject_wider_than_delivery",
+        trigger="wider than any crop at the delivery aspect",
+        measured={"subject_width_vw": 0.88},
+    )
+    silent = ReviewVerdict(verdict="approve", overall="", issues=[])
+
+    kept = adjudicate([step], silent, {"k00": {
+        "degradation_verdict": "acceptable", "note": "字完整讀得到",
+    }})
+    assert kept[0].adjudication == "accept"
+    assert "字完整讀得到" in kept[0].adjudication_reason
+
+    sent_back = adjudicate([step], silent, {"k00": {
+        "degradation_verdict": "replan", "note": "字被裁掉一角",
+    }})
+    assert sent_back[0].adjudication == "replan"
+
+    # No shot verdict: the whole-cut reviewer's silence still decides.
+    assert adjudicate([step], silent, {})[0].adjudication == "accept"
+
+
+def test_segments_survive_the_render_so_they_can_be_reviewed() -> None:
+    import inspect
+
+    from jascue_auto import pipeline
+
+    assert "keep_segments=True" in inspect.getsource(pipeline.run)
+
+
+def test_the_report_says_why_a_degradation_was_settled() -> None:
+    """"replan" with no grounds leaves the reader where the reviewer was."""
+
+    import inspect
+
+    from jascue_auto import cli
+
+    assert "adjudication_reason" in inspect.getsource(cli._write_report)
+
+
+def test_replanning_is_a_new_plan_rather_than_a_softer_fallback() -> None:
+    """A ladder answers a failed shot with a less obvious version of itself.
+
+    Push less far, sweep more slowly, crop a little wider -- none of those
+    ask why the shot failed. A coin that fell outside the frame is not
+    recovered by a gentler push; it wants a different take, a different
+    subject, or the admission that the shot was about the handset edge.
+    """
+
+    from jascue_auto.planner import PROMPTS
+
+    prompt = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
+    assert "不是把原本的做法縮水" in prompt
+    assert "放棄這顆" in prompt
+    # It must also be able to stand its ground: the shot reviewer sees one
+    # shot with no context, and "swept past without stopping to be read" is
+    # sometimes exactly what was wanted.
+    assert "也可能是規劃本來就沒問題" in prompt
+
+
+def test_a_sweep_is_judged_against_its_own_intent_not_legibility() -> None:
+    """Reading the text is one valid outcome of a pan, not the only one.
+
+    Leading the eye across a wall to open a scene is a different job from
+    letting a viewer read the wall, and a reviewer holding every sweep to
+    the second standard sends back shots that did what they meant to.
+    """
+
+    from jascue_auto.planner import PROMPTS
+
+    prompt = (PROMPTS / "shotreview_zh-TW.txt").read_text(encoding="utf-8")
+    assert "判準來自這顆自己的宣告，不是一套通用標準" in prompt
+    assert "本來就不是問題" in prompt or "完全不是問題" in prompt
+
+
+def test_the_executor_does_not_swap_the_move_it_was_given() -> None:
+    """A substitution the planner cannot see is a decision it cannot argue with.
+
+    A replan chose hold for a wide title, reasoning that travelling across it
+    was what cut it in the first place -- and the executor swapped the hold
+    for a sweep, so the next review described a sweep across a clipped title
+    and the loop spent a round fighting itself.
+    """
+
+    import inspect
+
+    from jascue_auto import pipeline
+
+    source = inspect.getsource(pipeline.follow_subjects)
+    assert "build_sweep_path" not in source.split('if move == "hold"')[1], (
+        "the hold branch must hold; the fit is already recorded"
+    )
+    assert "subject_wider_than_delivery" in source
+
+
+def test_must_be_whole_is_described_as_a_requirement_not_a_lever() -> None:
+    """The planner replanned two shots by only setting this flag.
+
+    Its stated reasoning was that the crop engine would scale to preserve
+    the whole wordmark. Nothing does that -- shrinking a subject to fit is
+    pillarboxing, which this pipeline will not do -- so the flag produced a
+    record and an identical frame, and the loop spent a round on it twice.
+    """
+
+    from jascue_auto.planner import PROMPTS, _selection_schema
+
+    described = _selection_schema(["C1"])["properties"]["shots"]["items"][
+        "properties"
+    ]["must_be_whole"]["description"]
+    assert "does not fulfil" in described
+
+    prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
+    assert "是一句宣告，不是一個開關" in prompt
+    replan = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
+    assert "不是一個做法" in replan
+
+
+def test_no_pass_rations_its_output_ceiling() -> None:
+    """A flat ceiling truncates the whole pass, not its tail.
+
+    Twenty-two shots stopped mid-token at 8192 and the run died: the answer
+    is one decision plus one sentence per shot, so it scales with the cut.
+    """
+
+    import inspect
+
+    from jascue_auto import planner
+
+    source = inspect.getsource(planner.decide_rhythm)
+    assert "MAX_OUTPUT_TOKENS" in source
+    assert '"max_output_tokens": 8192' not in source
+    # Billing is on tokens produced, so rationing the ceiling bought nothing
+    # and cost a whole pass. One generous constant, everywhere.
+    assert planner.MAX_OUTPUT_TOKENS >= 32768
+
+
+def test_an_action_beat_has_to_be_long_enough_to_be_one() -> None:
+    """Twenty-six of forty-one beats in one library were under 0.25s.
+
+    "The models rotate their phones, 0.02 to 0.06s" is not a span, and the
+    two fields carrying every timestamp in the schema were the only ones
+    with no description telling the model what a good answer looks like.
+    Downstream, in-points were snapped onto those numbers.
+    """
+
+    from jascue_auto.clipcard import action_beats, card_schema
+
+    entry = card_schema()["properties"]["action"]["items"]["properties"]
+    assert entry["ends_seconds"].get("description"), (
+        "the field that carries the timing must say what it wants"
+    )
+
+    card = {"action": [
+        {"what": "翻轉手機", "starts_seconds": 0.02, "ends_seconds": 0.06},
+        {"what": "手伸進畫面", "starts_seconds": 2.0, "ends_seconds": 3.4},
+    ]}
+    kept = action_beats(card)
+    assert [beat.what for beat in kept] == ["手伸進畫面"]
+
+
+def test_a_library_that_wrote_nothing_stops_the_run() -> None:
+    """An empty card library is missing input, not a degradation.
+
+    A NameError in the request took all seventy-four cards down, was
+    reported as the routine "74 failed ($0.0000)" line, and the run went on
+    to pick an aspect, choose sixteen shots and spend $1.80 planning a film
+    out of nothing -- every downstream layer reading the absence as "these
+    clips have no description" rather than as a failure.
+    """
+
+    import tempfile
+    from pathlib import Path
+
+    from jascue_auto.clipcard import CardLibraryEmpty, build_library
+
+    class Refuses:
+        class files:
+            @staticmethod
+            def upload(**_):
+                raise RuntimeError("no")
+
+    with tempfile.TemporaryDirectory() as work:
+        try:
+            build_library(
+                {"a": Path("a.mp4")}, Path(work), client=Refuses()
+            )
+        except CardLibraryEmpty as error:
+            assert "RuntimeError" in str(error), "the reason has to survive"
+        else:
+            raise AssertionError("an empty library must not pass silently")
+
+
+def test_clip_cards_can_be_written_at_all() -> None:
+    """The request referenced a name the module never imported."""
+
+    import inspect
+
+    from jascue_auto import clipcard
+
+    assert "MAX_OUTPUT_TOKENS" in dir(clipcard)
+    compile(inspect.getsource(clipcard), "clipcard.py", "exec")
+
+
+def test_the_card_says_what_the_source_camera_does() -> None:
+    """"The camera moves" does not support the decision it feeds.
+
+    A reference cut held a static frame on the left-hand handset and let the
+    take's own move bring a third one in from the right. Choosing that needs
+    to know what the move reveals; a boolean cannot say, and the planner was
+    left to either ignore the movement or lay a digital one over it.
+    """
+
+    from jascue_auto.clipcard import card_schema
+    from jascue_auto.planner import MaterialItem, _describe_material
+
+    schema = card_schema()
+    assert "camera_motion" in schema["required"]
+
+    described = _describe_material([
+        MaterialItem(
+            source_id="C1",
+            duration_seconds=9.0,
+            summary="兩台摺疊機並排",
+            camera_moves=True,
+            camera_motion="往右平移，右邊會有第三台手機進畫面",
+        )
+    ])
+    assert "第三台" in described, described
+
+
+def test_a_card_box_is_only_reused_when_nothing_moved() -> None:
+    """The box says where, and said nothing about when.
+
+    `moves` was parsed off every subject and read by no one, so a held frame
+    on a take whose camera pans was aimed at wherever the card happened to
+    look -- and the subject walked out of it. The card knows which kind of
+    shot this is; the reuse now depends on it.
+    """
+
+    import inspect
+
+    from jascue_auto import pipeline
+    from jascue_auto.clipcard import card_schema, subjects_from_card
+
+    box = card_schema()["properties"]["subjects"]["items"]
+    assert "at_seconds" in box["required"], "a position needs its moment"
+
+    parsed = subjects_from_card({"subjects": [{
+        "label": "手機", "centre_x": 0.5, "centre_y": 0.5,
+        "width": 0.2, "height": 0.4, "moves": True, "at_seconds": 1.2,
+    }]})
+    assert parsed[0].at_seconds == 1.2
+    assert parsed[0].moves
+
+    source = inspect.getsource(pipeline.follow_subjects)
+    assert "not box.moves" in source, (
+        "a moving subject must be measured over the shot, not reused"
+    )
+
+
+def test_takes_set_aside_before_planning_say_why() -> None:
+    """A run working from sixty-six of seventy-four looked like a full one.
+
+    The card gives a reason a take failed and the filter dropped it, so
+    "why wasn't the good coin shot used" had no answer anywhere in the
+    output -- not in the report, not on the console.
+    """
+
+    import inspect
+
+    from jascue_auto import cli
+
+    source = inspect.getsource(cli.command_render)
+    assert "unusable_reason" in source
+    assert "set_aside" in inspect.getsource(cli._write_report)

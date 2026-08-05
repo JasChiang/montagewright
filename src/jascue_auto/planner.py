@@ -51,6 +51,13 @@ MODEL_ID = os.environ.get("JASCUE_AUTO_MODEL", "gemini-3.6-flash")
 # response schema and the instructions rather than from temperature.
 THINKING_HIGH = "high"
 
+# Room to answer, everywhere. Billing is on tokens produced, not on the
+# ceiling, so a high one costs nothing and a low one costs the whole pass:
+# a twenty-two shot rhythm answer stopped mid-token at 8192 and took every
+# length in the film with it. Sizing this per call was solving the wrong
+# problem -- there was never a reason to ration it.
+MAX_OUTPUT_TOKENS = 32768
+
 
 class PlannerError(RuntimeError):
     pass
@@ -162,16 +169,60 @@ def _describe_music(grid: BeatGrid) -> str:
     return "\n".join(lines)
 
 
-def _describe_clips(edl: EDL) -> str:
+def _describe_clips(edl: EDL, context: dict[str, dict] | None = None) -> str:
+    """Everything about a shot that bears on how long it should be.
+
+    The rhythm pass used to receive an id, a description and an energy label,
+    and nothing about why the shot was chosen. Given "the purple foldable in
+    the middle" and a fast track it decided on one second -- a reasonable call
+    on what it could see, and the wrong one for a shot whose job was to let a
+    viewer read a 4.1-inch cover screen.
+
+    A length is a judgement about purpose, so the purpose travels with it: why
+    this shot was picked, what movement happens in it and when, how much of
+    the frame the subject holds, and whether the audience has met this product
+    already.
+    """
+
+    context = context or {}
+    seen: set[str] = set()
     lines = []
     for index, clip in enumerate(edl.clips, start=1):
+        extra = context.get(clip.clip_id, {})
         approx = clip.approx_out_seconds - clip.approx_in_seconds
         described = clip.in_looks_like or "(no description supplied)"
-        lines.append(
-            f"{index}. clip_id={clip.clip_id} source={clip.source_id} "
-            f"available≈{approx:.1f}s energy={clip.energy_intent}\n"
-            f"   content: {described}"
+        subject = (
+            clip.reframe.subject.description
+            if clip.reframe and clip.reframe.subject
+            else ""
         )
+        first_time = subject not in seen
+        seen.add(subject)
+
+        # The action beats below are timestamped against the source, so the
+        # in-point has to travel with them or "the gesture finishes at 4.5s"
+        # cannot be turned into "hold this shot 2.5 seconds".
+        facts = [
+            f"從素材第 {clip.approx_in_seconds:.1f}s 進",
+            f"選片說這顆需要≈{approx:.1f}s",
+            f"能量={clip.energy_intent}",
+        ]
+        if clip.reframe:
+            facts.append(f"運鏡={clip.reframe.camera_move}")
+        share = extra.get("subject_share")
+        if share:
+            facts.append(f"主體佔畫面{share * 100:.0f}%")
+        facts.append("這個產品第一次出現" if first_time else "已出現過")
+
+        line = (
+            f"{index}. clip_id={clip.clip_id}（{'、'.join(facts)}）\n"
+            f"   畫面：{described}"
+        )
+        if extra.get("why"):
+            line += f"\n   為什麼選這顆：{extra['why']}"
+        if extra.get("action"):
+            line += f"\n   這段裡的動作：{extra['action']}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -201,7 +252,10 @@ def decide_rhythm(
     grid: BeatGrid,
     *,
     intent: str,
+    brief: str = "",
+    context: dict[str, dict] | None = None,
     music: Path | None = None,
+    target_seconds: float = 0.0,
     client: Any | None = None,
 ) -> tuple[EDL, Usage]:
     """Return the EDL with each clip's rhythm decided by the model.
@@ -229,8 +283,24 @@ def decide_rhythm(
             "type": "text",
             "text": (
                 f"{prompt}\n\n## 這支片要傳達什麼\n\n{intent}\n\n"
-                f"## 音樂\n\n{heard}\n{_describe_music(grid)}\n\n"
-                f"## 畫面（依序）\n\n{_describe_clips(edl)}\n"
+                + (f"## 剪輯 brief\n\n{brief}\n\n" if brief else "")
+                + f"## 音樂\n\n{heard}\n{_describe_music(grid)}\n\n"
+                + (
+                    # Every length was decided against its own neighbours and
+                    # nothing against the whole, so eight defensible calls
+                    # summed to 26 seconds of a 45-second film -- and a
+                    # fourteen-second gesture got four seconds while the
+                    # reasoning claimed it played out. The arithmetic has to
+                    # be visible to be spent.
+                    f"## 長度\n\n定調要 {target_seconds:.0f} 秒，"
+                    f"你手上有 {len(edl.clips)} 顆，"
+                    f"平均每顆 {target_seconds / max(len(edl.clips), 1):.1f} 秒。"
+                    "這是總量不是配額——該長的長、該短的短，但加起來要到。"
+                    "素材裡有動作起訖的，動作做完需要多久就是那顆的下限。\n\n"
+                    if target_seconds > 0
+                    else ""
+                )
+                + f"## 畫面（依序）\n\n{_describe_clips(edl, context)}\n"
             ),
         }
     ]
@@ -250,7 +320,7 @@ def decide_rhythm(
         "input": request_input,
         "generation_config": {
             "thinking_level": THINKING_HIGH,
-            "max_output_tokens": 8192,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
         "response_format": {
             "mime_type": "application/json",
@@ -484,7 +554,7 @@ def locate_subject(
         model=MODEL_ID,
         store=False,
         input=request_input,
-        generation_config={"thinking_level": "low", "max_output_tokens": 8192},
+        generation_config={"thinking_level": "low", "max_output_tokens": MAX_OUTPUT_TOKENS},
         response_format={
             "mime_type": "application/json",
             "schema": _subject_schema(len(frames)),
@@ -520,6 +590,20 @@ class MaterialItem:
     composition: str = ""
     subjects: tuple[str, ...] = ()
     camera_moves: bool = False
+    # What the source camera does, not merely that it does something. A
+    # reference cut held a static frame on the left-hand handset and let the
+    # take's own move bring a third one in from the right -- a decision that
+    # needs to know what the move reveals, which a boolean cannot say.
+    camera_motion: str = ""
+    # Which stretch is worth cutting into, what happens where, and what the
+    # material was judged to need. Selection picks a start second, and it was
+    # picking one blind: a shot whose first second is the camera still
+    # swinging past a board reads as fine at clip level and terrible in the
+    # 1.8s the cut actually used.
+    usable_from: float = 0.0
+    usable_to: float = 0.0
+    action: tuple[str, ...] = ()
+    needs: tuple[str, ...] = ()
 
 
 def _direction_schema() -> dict[str, Any]:
@@ -588,9 +672,22 @@ def _describe_material(material: list[MaterialItem]) -> str:
         facts = [f"{item.duration_seconds:.1f}s"]
         if item.composition:
             facts.append(f"構圖{item.composition}")
-        if item.camera_moves:
+        if item.camera_motion:
+            facts.append(f"素材自己的運鏡：{item.camera_motion}")
+        elif item.camera_moves:
             facts.append("攝影機有運動")
+        if item.usable_to > 0 and (
+            item.usable_from > 0.05
+            or item.usable_to < item.duration_seconds - 0.05
+        ):
+            facts.append(
+                f"可用區間 {item.usable_from:.1f}–{item.usable_to:.1f}s"
+            )
         head = f"- {item.source_id}（{'、'.join(facts)}）：{item.summary}"
+        if item.action:
+            head += "\n    動作：" + "；".join(item.action)
+        if item.needs:
+            head += "\n    需要處理：" + "；".join(item.needs)
         if item.subjects:
             head += "\n    可框住的主體：" + "；".join(item.subjects)
         lines.append(head)
@@ -674,7 +771,7 @@ def decide_direction(
         input=request_input,
         generation_config={
             "thinking_level": THINKING_HIGH,
-            "max_output_tokens": 8192,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
         response_format={
             "mime_type": "application/json",
@@ -709,14 +806,27 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                         "source_id",
                         "start_seconds",
                         "subject",
-                        "subject_position",
                         "energy",
                         "camera_move",
+                        "seconds_needed",
                         "why",
                     ],
                     "properties": {
                         "source_id": {"type": "string", "enum": source_ids},
                         "start_seconds": {"type": "number"},
+                        "seconds_needed": {
+                            "type": "number",
+                            "description": (
+                                "How many seconds this shot needs to do the "
+                                "job you picked it for: the gesture playing "
+                                "out, the screen being read, the move "
+                                "arriving. Choosing the shots and choosing "
+                                "how long they run is one decision -- these "
+                                "are what your list adds up to, so a count "
+                                "that leaves each shot less than it needs is "
+                                "a count with too many shots in it."
+                            ),
+                        },
                         "subject": {
                             "type": "string",
                             "description": (
@@ -725,14 +835,6 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                                 "frame. 'the left, darker handset', not 'the "
                                 "handset'."
                             ),
-                        },
-                        "subject_position": {
-                            "type": "string",
-                            "enum": [
-                                "top_left", "top_center", "top_right",
-                                "mid_left", "center", "mid_right",
-                                "bottom_left", "bottom_center", "bottom_right",
-                            ],
                         },
                         "energy": {
                             "type": "string",
@@ -747,7 +849,12 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                                 "shot of a wordmark, it is an unreadable one. "
                                 "False for anything that still reads when its "
                                 "edges leave frame -- a person, a held "
-                                "product, a face in a group."
+                                "product, a face in a group. This states a "
+                                "requirement; it does not fulfil one. No "
+                                "crop can shrink a subject to fit, so the "
+                                "plan has to satisfy it: travel across the "
+                                "subject, choose a take where it is narrower, "
+                                "or set this false and accept a partial view."
                             ),
                         },
                         "framing": {
@@ -782,14 +889,6 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                                 "changes target mid-move loses both. Omit "
                                 "when one subject carries the whole shot."
                             ),
-                        },
-                        "then_subject_position": {
-                            "type": "string",
-                            "enum": [
-                                "top_left", "top_center", "top_right",
-                                "mid_left", "center", "mid_right",
-                                "bottom_left", "bottom_center", "bottom_right",
-                            ],
                         },
                     },
                 },
@@ -869,7 +968,7 @@ def select_shots(
         input=selection_input,
         generation_config={
             "thinking_level": THINKING_HIGH,
-            "max_output_tokens": 16384,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
         response_format={
             "mime_type": "application/json",
@@ -877,5 +976,85 @@ def select_shots(
         },
     )
     return _parse(interaction, what="selection pass"), Usage.from_interaction(
+        interaction
+    )
+
+
+def replan_shots(
+    failing: list[tuple[int, dict[str, Any], str]],
+    material: list[MaterialItem],
+    direction: dict[str, Any],
+    *,
+    brief: str = "",
+    context: str = "",
+    cache: UploadCache | None = None,
+    client: Any | None = None,
+) -> tuple[dict[str, Any], Usage]:
+    """Plan the shots that did not deliver, again, from what was seen.
+
+    Not a fallback ladder. Walking one down -- push less far, sweep more
+    slowly, crop a little wider -- answers a shot that failed with a less
+    obvious version of the same failure, and it does it without ever asking
+    why the shot failed. A coin that fell outside the frame is not fixed by
+    a gentler push; it is fixed by a different take, a different subject, or
+    by admitting the shot was about the edge of the handset all along. That
+    is a planning question, so it goes back to the planner, with what the
+    reviewer saw attached.
+
+    `failing` carries each shot's index so the new plan can be dropped back
+    into the running order it came from.
+    """
+
+    if client is None:
+        client = _default_client()
+
+    usable = [
+        item
+        for item in material
+        if item.source_id
+        not in {entry["source_id"] for entry in direction.get("unusable", [])}
+    ]
+    prompt = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
+    problems = "\n\n".join(
+        f"### 第 {index + 1} 顆（{shot['source_id']}）\n"
+        f"原本的規劃：運鏡 {shot.get('camera_move')}、"
+        f"主體「{shot.get('subject')}」、構圖 {shot.get('framing')}、"
+        f"{float(shot.get('seconds_needed') or 0):.1f} 秒\n"
+        f"當初的理由：{shot.get('why', '')}\n"
+        f"看片的人說：{note}"
+        for index, shot, note in failing
+    )
+    replan_input: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                f"{prompt}\n\n## 已定好的調性\n\n{direction['direction']}\n\n"
+                f"目標長度 {direction['target_seconds']:.0f} 秒，"
+                f"輸出 {direction['aspect']}。\n\n"
+                + (f"## 剪輯 brief\n\n{brief}\n\n" if brief else "")
+                + f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
+                + (f"## 這支片其他顆在講什麼\n\n{context}\n\n" if context else "")
+                + f"## 要重新規劃的鏡頭\n\n{problems}\n\n"
+                f"## 可用素材（{len(usable)} 支，依序附上影片）\n\n"
+                f"{_describe_material(usable)}\n"
+            ),
+        }
+    ]
+    replan_input += _attach_material(usable, cache, client)
+
+    interaction = client.interactions.create(
+        model=MODEL_ID,
+        store=False,
+        input=replan_input,
+        generation_config={
+            "thinking_level": THINKING_HIGH,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        },
+        response_format={
+            "mime_type": "application/json",
+            "schema": _selection_schema([item.source_id for item in usable]),
+        },
+    )
+    return _parse(interaction, what="replan pass"), Usage.from_interaction(
         interaction
     )

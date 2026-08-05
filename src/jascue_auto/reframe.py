@@ -300,7 +300,14 @@ def build_handoff_path(
             limit = min(free_x, max(0.0, far + crop_width * CROP_MARGIN - crop_width))
             near = centre - subject_width / 2.0
             floor = max(0.0, near - crop_width * CROP_MARGIN)
-            wanted = min(max(wanted, floor), max(limit, floor))
+            # Both bounds exist to stop the crop drifting off a subject that
+            # fills it. A subject narrower than the crop cannot touch both
+            # edges, so they contradict -- and resolving that by taking one of
+            # them hugs the subject to that edge: a folded Flip ending a pan
+            # sat at a tenth of the frame with a third of it wall, which reads
+            # as the pan having gone too far. Slack means centred.
+            if floor <= limit:
+                wanted = min(max(wanted, floor), limit)
         return min(max(wanted, 0.0), free_x)
 
     start_x = centred_on(from_centre, from_width)

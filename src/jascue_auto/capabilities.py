@@ -21,10 +21,14 @@ class Capability:
     name: str
     when: str
     needs_subject: bool
-    # Seconds this move needs before a viewer can read it. A sweep across
-    # three handsets in 1.5s is inside every speed limit and still arrives
-    # before anyone has looked at the second one -- "not too fast" and
-    # "legible" are different tests, and only the first was being applied.
+    # The shortest this move can be and still register as a move at all --
+    # a technical floor, not an answer to "how long should this shot be".
+    # How long a sweep needs depends on how far it travels and how much has
+    # to be taken in on the way, and that is visible in the material: the
+    # same 2.5 seconds that reads a two-word logo is not enough for three
+    # handsets, and is twice what a short push needs. The planner watches the
+    # shot, so the planner sets the length; this is what the executor reports
+    # against when the length it was given cannot contain the move.
     min_seconds: float = 0.0
 
 
@@ -122,8 +126,8 @@ def describe_for_prompt() -> str:
     for move in CAMERA_MOVES:
         subject = "需要指定主體" if move.needs_subject else "不需要主體"
         lines.append(
-            f"- `{move.name}`（{subject}，至少 {move.min_seconds:g} 秒）："
-            f"{move.when}"
+            f"- `{move.name}`（{subject}，短於 {move.min_seconds:g} 秒就"
+            f"不成立）：{move.when}"
         )
     lines.append(
         "選了做不到的組合——例如對靜止主體選 follow——本機會照實記錄實際"
@@ -131,10 +135,12 @@ def describe_for_prompt() -> str:
     )
     lines.append("")
     lines.append(
-        "每種運鏡需要的最短時間不同（下面括號裡的秒數）。時間不夠的運鏡"
-        "看不懂——三台手機橫掃如果只有 1.5 秒，觀眾還沒看到第二台就切了。"
-        "節奏那一步會把這個當下限，所以選了需要時間的運鏡，這顆就會拿到"
-        "足夠的長度。"
+        "括號裡的秒數是這個運鏡在技術上還算得上運鏡的底線，不是它需要多久。"
+        "需要多久你看素材決定：鏡頭要走多遠、路上有幾樣東西要讓觀眾看進去、"
+        "字有多長要讀完。同樣是橫掃，兩個字的 logo 跟一排三台手機需要的時間"
+        "差很多。你看得到這顆畫面，所以把這個判斷寫進 `seconds_needed`。"
+        "時間不夠的運鏡看不懂——三台手機橫掃只有 1.5 秒，觀眾還沒看到第二台"
+        "就切了。本機不會替你補時間，只會在做不到的時候照實回報。"
     )
     lines.append("")
     lines.append("主體沒有填滿輸出比例時，它擺哪裡由你決定（framing）：")

@@ -76,63 +76,50 @@ def test_a_partly_long_window_is_trimmed_without_being_called_a_degradation() ->
     assert any("out-point trimmed" in note for note in plan.notes)
 
 
-def test_a_subject_anchors_the_crop_off_centre() -> None:
-    """A subject on the left is not framed by cropping to the middle."""
+def test_the_executor_no_longer_aims_from_a_nine_box_name() -> None:
+    """That name says which subject is meant, not where to point.
 
-    def crop_x(position: str) -> int:
-        clip = _clip(
-            position,
-            0.0,
-            2.0,
-            reframe=Reframe(
-                subject=Subject(
-                    description="the left, grey handset",
-                    coarse_position=position,
-                )
-            ),
-        )
-        plan = plan_render(
-            _edl(clip), {"uhd": UHD}, target_aspect=PORTRAIT
-        )
-        assert plan.segments[0].crop is not None
-        return plan.segments[0].crop.to_pixels(3840, 2160)[0]
-
-    assert crop_x("mid_left") < crop_x("center") < crop_x("mid_right")
-
-
-def test_anchoring_keeps_a_margin_at_the_extremes() -> None:
-    """An edge subject does not put the frame edge through itself."""
-
-    clip = _clip(
-        "edge",
-        0.0,
-        2.0,
-        reframe=Reframe(
-            subject=Subject(
-                description="the leftmost handset", coarse_position="mid_left"
-            )
-        ),
-    )
-    plan = plan_render(_edl(clip), {"uhd": UHD}, target_aspect=PORTRAIT)
-    crop = plan.segments[0].crop
-    assert crop is not None
-    assert crop.x > 0.0, "a left anchor still keeps some frame to its left"
-    assert crop.x <= (1.0 - crop.width) * CROP_MARGIN + 1e-9
-
-
-def test_a_stated_subject_is_not_a_degradation() -> None:
-    """Doing what the plan asked is not a fall back."""
+    Read as a coordinate it put "mid_right" at 0.615 for a handset spanning
+    0.475 to 0.825, delivering it half out of frame with the backdrop behind
+    it -- the same mistake already found on the handoff path, where two
+    handsets at 0.359 and 0.635 were panned between 0.192 and 0.808. Every
+    position acted on now is measured: the card's box, SAM propagation, or a
+    grounding call. Reaching the executor's fallback means none of them had
+    an answer, and it says so instead of guessing.
+    """
 
     clip = _clip(
         "framed",
         0.0,
         2.0,
-        reframe=Reframe(
-            subject=Subject(description="the watch face", coarse_position="center")
-        ),
+        reframe=Reframe(subject=Subject(description="the left, grey handset")),
     )
     plan = plan_render(_edl(clip), {"uhd": UHD}, target_aspect=PORTRAIT)
-    assert not plan.degradations
+    crop = plan.segments[0].crop
+    assert crop is not None
+    assert abs(crop.x - (1.0 - crop.width) / 2.0) < 1e-9, "centred, not guessed"
+    assert any(
+        "never located" in step.trigger for step in plan.degradations
+    ), plan.degradations
+
+
+def test_a_subject_nobody_could_place_is_a_degradation() -> None:
+    """It stopped being "doing what the plan asked" when the aim went.
+
+    The executor used to satisfy a stated subject out of its nine-box name,
+    so arriving here was normal. Now every real position is measured
+    upstream, and arriving here means the subject was named and never found
+    -- a centred frame is the fallback, and a fallback is recorded.
+    """
+
+    clip = _clip(
+        "framed",
+        0.0,
+        2.0,
+        reframe=Reframe(subject=Subject(description="the watch face")),
+    )
+    plan = plan_render(_edl(clip), {"uhd": UHD}, target_aspect=PORTRAIT)
+    assert [step.ladder for step in plan.degradations] == ["center_crop"]
 
 
 def test_a_missing_subject_centres_and_says_so() -> None:

@@ -15,7 +15,9 @@ import sys
 from pathlib import Path
 
 from jascue_auto.clipcard import (
+    action_beats,
     build_library,
+    find_subject,
     load_card,
     snap_to_action,
     subjects_from_card,
@@ -23,8 +25,20 @@ from jascue_auto.clipcard import (
 from jascue_auto.cost import BudgetSpent, Ledger
 from jascue_auto.grounding import load_beat_grid
 from jascue_auto.pipeline import probe, run
-from jascue_auto.review import Round, actionable_keys, adjudicate, review_cut, should_continue
-from jascue_auto.planner import MaterialItem, decide_direction, select_shots
+from jascue_auto.review import (
+    Round,
+    actionable_keys,
+    adjudicate,
+    review_cut,
+    review_shots,
+    should_continue,
+)
+from jascue_auto.planner import (
+    MaterialItem,
+    decide_direction,
+    replan_shots,
+    select_shots,
+)
 from jascue_auto.schema import EDL, Clip, Reframe, Subject
 from jascue_auto.uploads import UploadCache, default_cache_path
 
@@ -100,11 +114,22 @@ def command_render(args: argparse.Namespace) -> int:
         f"{stats['failed']} failed  (${ledger.spent_usd:.4f})",
         flush=True,
     )
+    for line in stats.get("failures", [])[:5]:
+        print(f"  card failed — {line[:140]}", flush=True)
 
     material = []
+    # Which takes were set aside before anything was planned, and why. The
+    # card gives a reason and it was being dropped on the floor, so a run
+    # that quietly worked from sixty-six of seventy-four clips looked
+    # identical to one that had all of them -- and "why didn't it use the
+    # good coin shot" had no answer anywhere in the output.
+    set_aside: dict[str, str] = {}
     for source_id, proxy in proxies.items():
         card = load_card(cards[source_id]) if source_id in cards else None
         if card is not None and not card.get("usable", True):
+            set_aside[source_id] = str(
+                card.get("unusable_reason") or "no reason given"
+            )
             continue
         material.append(
             MaterialItem(
@@ -114,11 +139,31 @@ def command_render(args: argparse.Namespace) -> int:
                 proxy=proxy,
                 composition=(card or {}).get("composition", ""),
                 camera_moves=bool((card or {}).get("camera_moves", False)),
+                camera_motion=str((card or {}).get("camera_motion", "") or ""),
+                usable_from=float((card or {}).get("usable_from_seconds", 0.0)),
+                usable_to=float((card or {}).get("usable_to_seconds", 0.0)),
+                action=tuple(
+                    f"{beat.what} {beat.starts_seconds:.1f}-{beat.ends_seconds:.1f}s"
+                    for beat in action_beats(card or {})[:4]
+                ),
+                needs=tuple(
+                    f"{entry.get('what')}（{entry.get('why', '')[:60]}）"
+                    for entry in (card or {}).get("needs", [])
+                ),
                 subjects=tuple(
-                    box.label for box in subjects_from_card(card or {})
+                    _subject_line(box, _aspect(proxy), ASPECTS[args.aspect])
+                    for box in subjects_from_card(card or {})
                 ),
             )
         )
+
+    if set_aside:
+        print(
+            f"set aside: {len(set_aside)} clips the cards called unusable",
+            flush=True,
+        )
+        for source_id, why in list(set_aside.items())[:5]:
+            print(f"  {source_id} — {why[:110]}", flush=True)
 
     brief = args.brief.read_text(encoding="utf-8") if args.brief else ""
     ledger.check()
@@ -162,6 +207,8 @@ def command_render(args: argparse.Namespace) -> int:
     if grid is None:
         raise SystemExit("--music-map is required; run analyze-music first")
 
+    rhythm_context = _rhythm_context(selection, cards)
+
     aspect = ASPECTS[args.aspect]
     result, plan, report, resolved = run(
         edl,
@@ -170,6 +217,9 @@ def command_render(args: argparse.Namespace) -> int:
         output,
         target_aspect=aspect,
         intent=direction["direction"],
+        brief=brief,
+        rhythm_context=rhythm_context,
+        target_seconds=float(direction["target_seconds"]),
         music=args.music,
         cards=cards,
         checkpoint=args.sam_checkpoint,
@@ -182,6 +232,7 @@ def command_render(args: argparse.Namespace) -> int:
     report.target_seconds = float(direction["target_seconds"])
 
     rounds: list[Round] = []
+    shot_verdicts: dict[str, dict] = {}
     stopped = "review not requested"
     if args.review:
         # Every round renders before it reviews, so a stopping condition
@@ -190,6 +241,41 @@ def command_render(args: argparse.Namespace) -> int:
             keep_going, stopped = should_continue(rounds, ledger=ledger)
             if not keep_going:
                 break
+            # Two questions, two viewings. The shots say whether each one did
+            # what its plan promised; the cut says whether the eight of them
+            # are a film. Only the second was ever asked, and it is the one
+            # that cannot see a clipped wordmark going past in three seconds.
+            try:
+                shot_verdicts = review_shots(
+                    {
+                        f"k{index:02d}": path
+                        for index, path in enumerate(result.segment_paths)
+                    },
+                    selection["shots"],
+                    seconds={
+                        clip_id: entry["seconds"]
+                        for clip_id, entry in report.rhythm_decisions.items()
+                    },
+                    degradations=report.degradations,
+                    client=client,
+                    cache=cache,
+                    ledger=ledger,
+                )
+            except BudgetSpent as error:
+                stopped = str(error)
+                break
+            missed = [
+                f"{clip_id}: {entry.get('note', '')}"
+                for clip_id, entry in shot_verdicts.items()
+                if not entry.get("delivered", True)
+            ]
+            print(
+                f"shots: {len(shot_verdicts) - len(missed)}/"
+                f"{len(shot_verdicts)} delivered what they planned",
+                flush=True,
+            )
+            for line in missed:
+                print(f"  {line[:110]}", flush=True)
             try:
                 verdict = review_cut(
                     result.preview,
@@ -217,20 +303,101 @@ def command_render(args: argparse.Namespace) -> int:
             keep_going, stopped = should_continue(rounds, ledger=ledger)
             if not keep_going:
                 break
-            # Nothing re-plans from a verdict yet, so a second round would
-            # render the same cut and read the same complaint. Stopping here
-            # is honest; looping would only spend money to agree with itself.
-            stopped = "revision requested; re-planning is not implemented yet"
-            break
+            failing = [
+                (index, shot, shot_verdicts[f"k{index:02d}"].get("note", ""))
+                for index, shot in enumerate(selection["shots"])
+                if not shot_verdicts.get(f"k{index:02d}", {}).get(
+                    "delivered", True
+                )
+            ]
+            if not failing:
+                # The cut reviewer wants a change nobody can point at a shot.
+                stopped = (
+                    "revision asked for, but no shot was named as undelivered"
+                )
+                break
+            try:
+                replanned, usage = replan_shots(
+                    failing,
+                    material,
+                    direction,
+                    brief=brief,
+                    context="\n".join(
+                        f"第 {index + 1} 顆（{shot['source_id']}）："
+                        f"{shot.get('why', '')}"
+                        for index, shot in enumerate(selection["shots"])
+                    ),
+                    cache=cache,
+                    client=client,
+                )
+            except BudgetSpent as error:
+                stopped = str(error)
+                break
+            ledger.record(
+                "replan",
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens + usage.thought_tokens,
+            )
+            fresh = replanned.get("shots", [])
+            if len(fresh) != len(failing):
+                stopped = (
+                    f"replan returned {len(fresh)} shots for "
+                    f"{len(failing)} that needed one"
+                )
+                break
+            for (index, old, _), new in zip(failing, fresh):
+                print(
+                    f"  replan k{index:02d}: {old['source_id']} "
+                    f"{old.get('camera_move')} → {new['source_id']} "
+                    f"{new.get('camera_move')} — {new.get('why', '')[:70]}",
+                    flush=True,
+                )
+                selection["shots"][index] = new
+            # Everything downstream is rebuilt from the amended selection, so
+            # the next round renders a different film rather than re-reading
+            # the same one.
+            edl, snaps = _edl_from_selection(selection, rushes, cards)
+            sources = {
+                shot["source_id"]: probe(
+                    shot["source_id"],
+                    rushes
+                    / f"{shot['source_id']}{_suffix(rushes, shot['source_id'])}",
+                )
+                for shot in selection["shots"]
+            }
+            rhythm_context = _rhythm_context(selection, cards)
+            try:
+                result, plan, report, resolved = run(
+                    edl,
+                    sources,
+                    grid,
+                    output,
+                    target_aspect=aspect,
+                    intent=direction["direction"],
+                    brief=brief,
+                    rhythm_context=rhythm_context,
+                    target_seconds=float(direction["target_seconds"]),
+                    music=args.music,
+                    cards=cards,
+                    checkpoint=args.sam_checkpoint,
+                    ledger=ledger,
+                    client=client,
+                )
+            except BudgetSpent as error:
+                stopped = str(error)
+                break
+            report.target_seconds = float(direction["target_seconds"])
         if rounds:
             report.degradations = adjudicate(
-                report.degradations, rounds[-1].verdict
+                report.degradations, rounds[-1].verdict, shot_verdicts
             )
 
     _write_report(
         output,
         snaps=snaps,
+        set_aside=set_aside,
         rounds=rounds,
+        shot_verdicts=shot_verdicts,
         stopped_because=stopped,
         direction=direction,
         selection=selection,
@@ -256,6 +423,23 @@ def _suffix(rushes: Path, stem: str) -> str:
     return ".mp4"
 
 
+def _subject_line(box, source_aspect: float, target_aspect: float) -> str:
+    """A subject, and how much of it the delivery frame can hold.
+
+    Selection was marking a wordmark "must be whole" on a 16:9 plate being
+    delivered 9:16, where the widest possible crop covers a third of it. The
+    planner was not being careless -- it had no way to know, so the promise
+    was unkeepable at the moment it was made. Told the fraction, it can move
+    the camera across the subject, pick a tighter shot of the same thing, or
+    accept a partial view on purpose.
+    """
+
+    fits = min(1.0, (target_aspect / source_aspect) / max(box.width, 1e-9))
+    if fits >= 0.995:
+        return box.label
+    return f"{box.label}（交付比例裡最多只能露出 {fits * 100:.0f}%）"
+
+
 def _duration(path: Path) -> float:
     completed = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -263,6 +447,49 @@ def _duration(path: Path) -> float:
         capture_output=True, text=True, check=True,
     )
     return float(json.loads(completed.stdout)["format"]["duration"])
+
+
+def _aspect(path: Path) -> float:
+    completed = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    stream = json.loads(completed.stdout)["streams"][0]
+    return float(stream["width"]) / float(stream["height"])
+
+
+def _rhythm_context(
+    selection: dict, cards: dict[str, Path]
+) -> dict[str, dict]:
+    """Why each shot exists, what moves in it, how much frame it holds.
+
+    A length is a judgement about purpose, and the rhythm pass was being
+    asked to make it from a description and an energy label.
+    """
+
+    context: dict[str, dict] = {}
+    for index, shot in enumerate(selection["shots"]):
+        clip_id = f"k{index:02d}"
+        card = (
+            load_card(cards[shot["source_id"]])
+            if shot["source_id"] in cards
+            else None
+        )
+        entry: dict[str, object] = {"why": shot.get("why", "")}
+        if card is not None:
+            box = find_subject(card, shot["subject"])
+            if box is not None:
+                entry["subject_share"] = round(box.width * box.height, 4)
+            beats = action_beats(card)
+            if beats:
+                entry["action"] = "；".join(
+                    f"{beat.what} {beat.starts_seconds:.1f}-"
+                    f"{beat.ends_seconds:.1f}s"
+                    for beat in beats[:3]
+                )
+        context[clip_id] = entry
+    return context
 
 
 def _edl_from_selection(
@@ -274,7 +501,6 @@ def _edl_from_selection(
         reframe = Reframe(
             subject=Subject(
                 description=shot["subject"],
-                coarse_position=shot["subject_position"],
                 # Text and UI have to survive whole or they say nothing. The
                 # first run cropped a Galaxy Unpacked wordmark down to "y
                 # Unpacked", which is worse than not using the shot.
@@ -290,17 +516,19 @@ def _edl_from_selection(
                 update={
                     "then_subject": Subject(
                         description=shot["then_subject"],
-                        coarse_position=shot.get(
-                            "then_subject_position", "center"
-                        ),
                     )
                 }
             )
         clip_id = f"k{index:02d}"
         start = float(shot["start_seconds"])
+        # What selection said this shot needs to do its job. It used to be a
+        # flat four seconds for every shot, which meant the layer that chose
+        # the material had no say in how long it ran and the layer that chose
+        # the length started from a constant.
+        wanted = float(shot.get("seconds_needed") or 0.0) or 4.0
         card = load_card(cards[shot["source_id"]]) if shot["source_id"] in cards else None
         if card is not None:
-            start, note = snap_to_action(card, start, 4.0)
+            start, note = snap_to_action(card, start, wanted)
             if note:
                 snaps[clip_id] = note
         clips.append(
@@ -308,7 +536,7 @@ def _edl_from_selection(
                 clip_id=clip_id,
                 source_id=shot["source_id"],
                 approx_in_seconds=start,
-                approx_out_seconds=start + 4.0,
+                approx_out_seconds=start + wanted,
                 in_looks_like=shot["subject"],
                 energy_intent=shot.get("energy", "medium"),
                 reframe=reframe,
@@ -336,6 +564,10 @@ def _write_report(output: Path, **parts) -> None:
                 "trigger": step.trigger,
                 "measured": step.measured,
                 "adjudication": step.adjudication,
+                # Who settled it and on what grounds. Without this the report
+                # says "replan" and nothing about why, which is the same
+                # position the reviewer was in before they could see the shot.
+                "adjudication_reason": step.adjudication_reason,
             }
             for step in report.degradations
         ],
@@ -348,10 +580,16 @@ def _write_report(output: Path, **parts) -> None:
         "duration_seconds": round(parts["result"].duration_seconds, 3),
         "target_seconds": report.target_seconds,
         "duration_shortfall_seconds": report.duration_shortfall,
-        "extended_for_moves": report.extended_for_moves,
+        "moves_too_short": report.moves_too_short,
         "spend": report.spend(),
         "cut_on_action": parts.get("snaps", {}),
+        "set_aside": parts.get("set_aside", {}),
         "rhythm": report.rhythm_decisions,
+        # Per shot, against the plan that asked for it. The whole-cut verdict
+        # below answers a different question and has never once caught a
+        # composition fault, because at thirty seconds the next shot arrives
+        # before the fault registers.
+        "shots": parts.get("shot_verdicts", {}),
         "review": {
             "stopped_because": parts.get("stopped_because"),
             "rounds": [

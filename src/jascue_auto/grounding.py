@@ -111,7 +111,7 @@ class GroundedClip:
     note: str | None = None
     # Set when a camera move lengthened this shot past what the rhythm asked
     # for, so the report can say why the cut runs where it does.
-    extended_for_move: str | None = None
+    move_too_short: str | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -137,24 +137,17 @@ class GroundedTimeline:
 def _requested_duration(clip: Clip, grid: BeatGrid | None) -> float:
     """How long this clip wants to be, in seconds.
 
-    A camera move sets a floor. A sweep across three handsets is inside every
-    speed limit at 1.5 seconds and still arrives before anyone has looked at
-    the second one, because "not too fast" and "legible" are different tests.
-    The rhythm decides the length; the move decides how short that length is
-    allowed to get.
+    The length is the planner's, whole. A flat per-move floor used to raise it
+    here, which reads as safety and is a length decision made by a constant:
+    how long a sweep needs depends on how far it travels and how much is on
+    the way, and the planner is the one who watched the shot. What the floor
+    is good for is saying afterwards that the move could not happen in the
+    time it was given -- reported, not corrected.
     """
 
-    from jascue_auto.capabilities import MOVE_FLOORS
-
     if grid is not None and clip.music_sync.beats:
-        wanted = clip.music_sync.beats * grid.seconds_per_beat
-    else:
-        wanted = clip.approx_out_seconds - clip.approx_in_seconds
-
-    floor = 0.0
-    if clip.reframe is not None:
-        floor = MOVE_FLOORS.get(clip.reframe.camera_move, 0.0)
-    return max(wanted, floor)
+        return clip.music_sync.beats * grid.seconds_per_beat
+    return clip.approx_out_seconds - clip.approx_in_seconds
 
 
 def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
@@ -173,15 +166,17 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
     from jascue_auto.capabilities import MOVE_FLOORS
 
     for clip in edl.clips:
-        rhythm_wanted = (
-            clip.music_sync.beats * grid.seconds_per_beat
-            if grid is not None and clip.music_sync.beats
-            else clip.approx_out_seconds - clip.approx_in_seconds
-        )
         wanted = _requested_duration(clip, grid)
         move = clip.reframe.camera_move if clip.reframe else "hold"
-        extended = (
-            move if wanted > rhythm_wanted + 1e-6 else None
+        floor = MOVE_FLOORS.get(move, 0.0)
+        # Not a correction. The move stays as asked and runs in the time it
+        # was given; this says it will not read, so the report and the review
+        # round see it instead of a shot that quietly arrives too fast.
+        too_short = (
+            f"{move} needs about {floor:g}s to register and has "
+            f"{wanted:.2f}s"
+            if floor > 0.0 and wanted < floor - 1e-6
+            else None
         )
         end = cursor + wanted
         landed: str | None = None
@@ -211,7 +206,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 timeline_out_seconds=end,
                 landed_on=landed,
                 note=note,
-                extended_for_move=extended,
+                move_too_short=too_short,
             )
         )
         cursor = end

@@ -149,35 +149,27 @@ def _centred_crop(source_aspect: float, target_aspect: float) -> CropBox:
 def _subject_crop(
     source_aspect: float, target_aspect: float, clip: Clip
 ) -> tuple[CropBox, str | None]:
-    """Frame the stated subject, or say why the centre had to do.
+    """Centre, and say the subject was never located.
 
-    Only the subject's coarse position is available at this stage; tracking
-    refines it later. A coarse anchor still beats a centred guess, because a
-    subject the planner put on the left is not at the centre and cropping to
-    the middle is how it leaves the frame.
+    This used to anchor the crop from the planner's nine-box name. That name
+    answers "which of these things do you mean", and it was being read as
+    "aim here": "mid_right" put the frame at 0.615 for a handset spanning
+    0.475 to 0.825, so the shot arrived half out of frame with the backdrop
+    filling the rest. The same mistake had already been found and fixed on
+    the handoff path, where two handsets at 0.359 and 0.635 were panned
+    between 0.192 and 0.808.
+
+    Every position the pipeline acts on is measured now -- from the clip
+    card's box, from SAM propagation, or from a grounding call. Reaching
+    this function means none of those had an answer, and a centred frame
+    that says so is more use than a confident guess.
     """
 
     base = _centred_crop(source_aspect, target_aspect)
     reframe = clip.reframe
     if reframe is None or reframe.subject is None:
         return base, "no subject stated; centred"
-
-    horizontal, _, vertical = reframe.subject.coarse_position.partition("_")
-    # Nine-box names read vertical-first: "mid_left" is mid vertically.
-    bias = {"left": 0.0, "center": 0.5, "right": 1.0}.get(vertical, 0.5)
-    top_bias = {"top": 0.0, "mid": 0.5, "bottom": 1.0}.get(horizontal, 0.5)
-
-    free_x = 1.0 - base.width
-    free_y = 1.0 - base.height
-    # Pull toward the subject but keep a margin of the opposite side, so a
-    # subject at the edge does not put the frame edge through it.
-    x = min(max(bias * free_x, 0.0), free_x)
-    y = min(max(top_bias * free_y, 0.0), free_y)
-    if free_x > 0.0:
-        x = min(max(x, free_x * CROP_MARGIN), free_x * (1.0 - CROP_MARGIN))
-    if free_y > 0.0:
-        y = min(max(y, free_y * CROP_MARGIN), free_y * (1.0 - CROP_MARGIN))
-    return CropBox(x=x, y=y, width=base.width, height=base.height), None
+    return base, "the subject was never located; centred"
 
 
 def plan_render(

@@ -24,7 +24,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jascue_auto.planner import MAX_OUTPUT_TOKENS
+
 CARD_VERSION = "jascue-auto-clip-card-v1"
+
+
+class CardLibraryEmpty(RuntimeError):
+    """Every clip failed to describe, so there is nothing to plan from."""
 
 
 @dataclass(frozen=True)
@@ -44,7 +50,13 @@ def action_beats(card: dict[str, Any]) -> list[Beat]:
             end = float(entry["ends_seconds"])
         except (KeyError, TypeError, ValueError):
             continue
-        if end > start:
+        # A span shorter than a few frames is not a span. Twenty-six of
+        # forty-one beats in one library came back under a quarter of a
+        # second -- "the models rotate their phones, 0.02 to 0.06s" -- and
+        # every consumer downstream treated them as real: in-points were
+        # snapped onto them and the rhythm pass was shown them as how long
+        # the action takes. A guessed timestamp is worse than none.
+        if end - start >= 0.25:
             beats.append(Beat(str(entry.get("what", "")), start, end))
     return sorted(beats, key=lambda beat: beat.starts_seconds)
 
@@ -85,6 +97,9 @@ class SubjectBox:
     width: float
     height: float
     moves: bool
+    # When this position was true. A box is a moment, and a moment is the
+    # whole answer only for a locked-off frame.
+    at_seconds: float = 0.0
 
     @property
     def is_horizontal(self) -> bool:
@@ -103,6 +118,10 @@ def card_schema() -> dict[str, Any]:
             "composition",
             "subjects",
             "action",
+            "camera_motion",
+            "usable_from_seconds",
+            "usable_to_seconds",
+            "needs",
         ],
         "properties": {
             "summary": {
@@ -130,6 +149,51 @@ def card_schema() -> dict[str, Any]:
                     "before it commits an aspect."
                 ),
             },
+            "usable_from_seconds": {
+                "type": "number",
+                "description": (
+                    "從第幾秒起這支才真的可用。開頭常有攝影機還在甩、還在"
+                    "對焦、或畫面還沒穩定的部分——那些不是可以剪進片子的"
+                    "素材，寫出可用的起點比說整支不能用有用得多。"
+                    "整支都可用就填 0。"
+                ),
+            },
+            "usable_to_seconds": {
+                "type": "number",
+                "description": (
+                    "到第幾秒為止還可用。結尾常有鏡頭已經移開、"
+                    "人已經走出畫面、或開始收東西的部分。"
+                    "整支都可用就填總長。"
+                ),
+            },
+            "needs": {
+                "type": "array",
+                "description": (
+                    "這支素材要用的話需要什麼處理。這是你看過畫面之後的"
+                    "理解，不是規則：主體太小就要推近，重點偏在一側就要"
+                    "裁切重新構圖，內容橫向鋪開就要橫搖帶過，"
+                    "只有一段可用就要修剪。什麼都不需要就留空。"
+                ),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["what", "why"],
+                    "properties": {
+                        "what": {
+                            "type": "string",
+                            "enum": ["trim", "crop", "zoom", "pan", "tilt"],
+                        },
+                        "why": {
+                            "type": "string",
+                            "description": (
+                                "用畫面上看得到的東西說明。「主體只佔畫面"
+                                "一小塊，直式輸出要推近才看得清楚」"
+                                "比「需要 zoom」有用。"
+                            ),
+                        },
+                    },
+                },
+            },
             "action": {
                 "type": "array",
                 "description": (
@@ -152,14 +216,40 @@ def card_schema() -> dict[str, Any]:
                                 "is lowered'."
                             ),
                         },
-                        "starts_seconds": {"type": "number"},
-                        "ends_seconds": {"type": "number"},
+                        "starts_seconds": {
+                            "type": "number",
+                            "description": (
+                                "動作開始的那一秒——手還沒碰到之前、機身還"
+                                "沒開始翻之前。"
+                            ),
+                        },
+                        "ends_seconds": {
+                            "type": "number",
+                            "description": (
+                                "動作完成的那一秒。這是一段時間，不是一個"
+                                "瞬間：起訖相同或只差零點幾秒，等於沒有指出"
+                                "任何東西，後面就沒辦法把畫面切在動作上。"
+                                "看不出來動作在哪裡結束，就不要寫這一筆——"
+                                "留空比給一個猜的時間有用。"
+                            ),
+                        },
                     },
                 },
             },
             "camera_moves": {
                 "type": "boolean",
                 "description": "Whether the camera itself moves in this take.",
+            },
+            "camera_motion": {
+                "type": "string",
+                "description": (
+                    "攝影機怎麼動，以及動了之後畫面裡多了什麼、少了什麼。"
+                    "「往右平移，右邊會有第三台白色手機進畫面」、"
+                    "「緩慢推近到機身鉸鏈」、「繞著產品轉，背面轉出來」。"
+                    "這決定的是要不要再加一層數位運鏡：素材自己會把東西"
+                    "帶進來時，框住不動讓它演完就好，兩個運鏡疊在一起會"
+                    "打架。攝影機不動就留空。"
+                ),
             },
             "subjects": {
                 "type": "array",
@@ -177,6 +267,7 @@ def card_schema() -> dict[str, Any]:
                         "width",
                         "height",
                         "moves",
+                        "at_seconds",
                     ],
                     "properties": {
                         "label": {
@@ -195,6 +286,15 @@ def card_schema() -> dict[str, Any]:
                         "centre_y": {"type": "number"},
                         "width": {"type": "number"},
                         "height": {"type": "number"},
+                        "at_seconds": {
+                            "type": "number",
+                            "description": (
+                                "你是看第幾秒說出這個位置的。攝影機或主體"
+                                "在動的時候，位置只在那一刻成立——後面要拿"
+                                "這個框去框別的時間點，得先知道它是什麼時候"
+                                "量的。"
+                            ),
+                        },
                         "moves": {
                             "type": "boolean",
                             "description": (
@@ -236,6 +336,7 @@ def subjects_from_card(card: dict[str, Any]) -> list[SubjectBox]:
                     width=float(entry["width"]),
                     height=float(entry["height"]),
                     moves=bool(entry.get("moves", False)),
+                    at_seconds=float(entry.get("at_seconds", 0.0) or 0.0),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -304,7 +405,7 @@ def describe_clip(
                 "media_resolution": "low",
             },
         ],
-        generation_config={"thinking_level": "low", "max_output_tokens": 8192},
+        generation_config={"thinking_level": "low", "max_output_tokens": MAX_OUTPUT_TOKENS},
         response_format={
             "mime_type": "application/json",
             "schema": card_schema(),
@@ -335,6 +436,7 @@ def build_library(
     card_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
     stats = {"written": 0, "reused": 0, "failed": 0, "input": 0, "output": 0}
+    failures: list[str] = []
 
     for source_id, proxy in sorted(proxies.items()):
         destination = card_dir / f"{source_id}.json"
@@ -346,8 +448,13 @@ def build_library(
             card, usage = describe_clip(
                 proxy, client=client, cache=cache, model_id=model_id
             )
-        except Exception:
+        except Exception as error:
             # One unreadable clip is not a reason to abandon the library.
+            # Losing why it failed is a different matter: a NameError in the
+            # request took all seventy-four down and reported it as the
+            # routine "74 failed ($0.0000)" line, and the run went on to
+            # plan a film from an empty library.
+            failures.append(f"{source_id}: {type(error).__name__}: {error}")
             stats["failed"] += 1
             continue
         save_card(destination, card)
@@ -355,4 +462,15 @@ def build_library(
         stats["written"] += 1
         stats["input"] += usage.input_tokens
         stats["output"] += usage.output_tokens + usage.thought_tokens
+    stats["failures"] = failures
+    if failures and not paths:
+        # Not a degradation. A library with nothing in it is the input
+        # missing, and everything downstream reads its absence as "these
+        # clips have no description" rather than as an error -- one run
+        # picked an aspect, chose sixteen shots and spent $1.80 planning a
+        # film out of empty cards before anything said so.
+        raise CardLibraryEmpty(
+            f"every one of the {len(failures)} clips failed to describe; "
+            f"first: {failures[0]}"
+        )
     return paths, stats
