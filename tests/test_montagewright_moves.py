@@ -720,7 +720,7 @@ def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
             "/api/runs/{run_id}/shot/{index}"} <= paths
 
     page = PAGE.read_text(encoding="utf-8")
-    for shown in ("素材檔名", "運鏡", "主體", "為什麼用這顆", "降級", "逐顆驗收"):
+    for shown in ("素材", "運鏡", "主體", "為什麼用這顆", "降級", "逐顆驗收"):
         assert shown in page, shown
 
 
@@ -1248,3 +1248,33 @@ def test_a_folder_can_be_clicked_instead_of_typed() -> None:
 
     page = PAGE.read_text(encoding="utf-8")
     assert "browseTo" in page and "用這個資料夾" in page
+
+
+def test_every_paid_stage_checks_the_cap_before_spending() -> None:
+    """"Call before dispatching, so the cap stops work rather than paying
+    for it" -- and three stages did not.
+
+    Transcription, replanning and the re-render after a replan all recorded
+    against the ledger and none of them asked it first, so a run at $5.90 of
+    a $6 cap would still fire a replan and land past it. The accounting was
+    right; the stopping was not.
+    """
+
+    import inspect
+    import re
+
+    from montagewright import cli
+
+    source = inspect.getsource(cli.command_render)
+    # Each of these is a paid call site; each must be preceded by a check.
+    for call in ("transcribe(", "replan_shots("):
+        for match in re.finditer(re.escape(call), source):
+            before = source[max(0, match.start() - 700):match.start()]
+            assert "ledger.check()" in before, f"{call} spends unchecked"
+
+    # Inside the render, the subject pass is one call per shot, so a cap read
+    # only between stages lets a whole plan through after it is reached.
+    from montagewright import pipeline
+
+    inner = inspect.getsource(pipeline.follow_subjects)
+    assert inner.count("_afford(report)") == inner.count("locate_subject(")

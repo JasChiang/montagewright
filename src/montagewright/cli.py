@@ -180,6 +180,10 @@ def command_render(args: argparse.Namespace) -> int:
             destination = work / "transcripts" / f"{source_id}.json"
             card = load_transcript(destination)
             if card is None:
+                # Before the call, not after: a transcript on a long clip is
+                # one of the more expensive things here, and the cap is meant
+                # to stop work rather than to describe it afterwards.
+                ledger.check()
                 try:
                     card, usage = transcribe(
                         proxies[source_id], client=client,
@@ -428,6 +432,7 @@ def command_render(args: argparse.Namespace) -> int:
                 )
                 break
             try:
+                ledger.check()
                 replanned, usage = replan_shots(
                     failing,
                     material,
@@ -477,6 +482,7 @@ def command_render(args: argparse.Namespace) -> int:
             }
             rhythm_context = _rhythm_context(selection, cards)
             try:
+                ledger.check()
                 result, plan, report, resolved = cut(
                     edl, sources, rhythm_context
                 )

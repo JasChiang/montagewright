@@ -144,6 +144,18 @@ class Report:
         )
 
 
+def _afford(report: "Report") -> None:
+    """Stop before a paid call rather than after it.
+
+    The subject pass runs once per shot that needs locating, so a plan with
+    twenty shots is twenty calls; a cap consulted only between stages lets
+    all twenty through after it has already been reached.
+    """
+
+    if report.ledger is not None:
+        report.ledger.check()
+
+
 def _charge(report: "Report", stage: str, usage: Usage) -> None:
     """Book a call against both the token tally and the stage ledger."""
 
@@ -335,6 +347,7 @@ def follow_subjects(
                 centres = []
                 widths = []
                 for subject in (reframe.subject, reframe.then_subject):
+                    _afford(report)
                     boxes, usage = locate_subject(
                         frames, subject.description, client=client
                     )
@@ -382,6 +395,7 @@ def follow_subjects(
                         clip.approx_out_seconds,
                         work,
                     )
+                    _afford(report)
                     boxes, usage = locate_subject(
                         frames, reframe.subject.description, client=client
                     )
@@ -509,6 +523,7 @@ def follow_subjects(
                             clip.approx_out_seconds,
                             work,
                         )
+                        _afford(report)
                         boxes, usage = locate_subject(
                             frames, reframe.subject.description, client=client
                         )
@@ -579,6 +594,7 @@ def follow_subjects(
                 frames, times = _sample_frames(
                     source, clip.approx_in_seconds, clip.approx_out_seconds, work
                 )
+                _afford(report)
                 boxes, usage = locate_subject(
                     frames, reframe.subject.description, client=client
                 )
@@ -795,6 +811,8 @@ def run(
     # the one selection asked for -- calling it with no grid asked it to
     # describe music that is not there.
     if decide_rhythm_first and grid is not None:
+        if ledger is not None:
+            ledger.check()
         edl, usage = decide_rhythm(
             edl,
             grid,

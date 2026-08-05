@@ -6,198 +6,365 @@
 <title>montagewright</title>
 <style>
   :root {
-    --bg: #fbfbfa; --panel: #fff; --ink: #1b1b1a; --dim: #6c6c68;
-    --line: #e4e3df; --accent: #b4442e; --ok: #2f6f4f; --warn: #8a6a1f;
-    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    --bg: #f7f6f3;
+    --surface: #fff;
+    --sunken: #faf9f7;
+    --ink: #1c1b19;
+    --ink-soft: #55534e;
+    --dim: #8b8880;
+    --line: #e6e3dd;
+    --line-soft: #f0eeE9;
+    --accent: #b3452a;
+    --accent-soft: #fdf2ee;
+    --ok: #2c6a4c;
+    --shadow: 0 1px 2px rgba(28,27,25,.04), 0 8px 24px -12px rgba(28,27,25,.10);
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", sans-serif;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #161614; --panel: #1e1e1c; --ink: #eceae5; --dim: #9a9891;
-      --line: #302f2c; --accent: #e08268; --ok: #7fbf9b; --warn: #d6b45f;
+      --bg: #14140f;
+      --surface: #1c1c18;
+      --sunken: #191915;
+      --ink: #efece4;
+      --ink-soft: #b6b2a8;
+      --dim: #8a867c;
+      --line: #2e2d27;
+      --line-soft: #26251f;
+      --accent: #e08b6e;
+      --accent-soft: #2a1f19;
+      --ok: #7cc09b;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px -14px rgba(0,0,0,.6);
     }
   }
   * { box-sizing: border-box; }
+  html { -webkit-font-smoothing: antialiased; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
-    font: 15px/1.6 -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+    font: 15px/1.65 var(--sans);
   }
+  ::selection { background: var(--accent-soft); }
+
   header {
-    padding: 22px 28px 16px; border-bottom: 1px solid var(--line);
-    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 30px 32px 22px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
   }
-  h1 { margin: 0; font-size: 19px; letter-spacing: .01em; }
-  header p { margin: 0; color: var(--dim); font-size: 13px; }
-  main { max-width: 1180px; margin: 0 auto; padding: 24px 28px 80px; }
-  .panel {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 10px; padding: 20px; margin-bottom: 20px;
+  header .inner {
+    max-width: 1060px; margin: 0 auto;
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
   }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; }
-  label { display: block; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
-  input[type=file], input[type=number], select, textarea {
-    width: 100%; padding: 9px 10px; border: 1px solid var(--line);
-    border-radius: 7px; background: var(--bg); color: var(--ink);
+  h1 {
+    margin: 0; font-size: 17px; font-weight: 620;
+    letter-spacing: -.01em;
+  }
+  h1 .dot { color: var(--accent); }
+  header p { margin: 0; color: var(--dim); font-size: 13.5px; }
+
+  main { max-width: 1060px; margin: 0 auto; padding: 28px 32px 100px; }
+
+  section {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 26px 28px;
+    margin-bottom: 18px;
+    box-shadow: var(--shadow);
+  }
+  h2 {
+    margin: 0 0 3px; font-size: 14.5px; font-weight: 620;
+    letter-spacing: -.005em;
+  }
+  h2 + .sub { margin: 0 0 20px; color: var(--dim); font-size: 13px; }
+
+  .fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 18px 20px;
+  }
+  .field { min-width: 0; }
+  .field.wide { grid-column: 1 / -1; }
+  label {
+    display: block; font-size: 12.5px; font-weight: 550;
+    color: var(--ink-soft); margin-bottom: 7px; letter-spacing: .01em;
+  }
+  input[type=text], input[type=number], input[type=file], select, textarea {
+    width: 100%; padding: 10px 12px;
+    border: 1px solid var(--line); border-radius: 9px;
+    background: var(--sunken); color: var(--ink);
     font: inherit; font-size: 14px;
+    transition: border-color .15s, background .15s;
   }
-  textarea { min-height: 96px; resize: vertical; }
+  input[type=text]::placeholder, textarea::placeholder { color: var(--dim); }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--accent);
+    background: var(--surface);
+  }
+  textarea { min-height: 92px; resize: vertical; line-height: 1.6; }
+  select { cursor: pointer; }
+
   button {
-    padding: 10px 20px; border: 0; border-radius: 7px; cursor: pointer;
-    background: var(--accent); color: #fff; font: inherit; font-weight: 600;
+    padding: 10px 18px; border: 1px solid transparent; border-radius: 9px;
+    cursor: pointer; background: var(--accent); color: #fff;
+    font: inherit; font-size: 14px; font-weight: 580;
+    transition: filter .15s, transform .05s;
   }
-  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
-  button:disabled { opacity: .45; cursor: not-allowed; }
-  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 18px; }
+  button:hover { filter: brightness(1.07); }
+  button:active { transform: translateY(.5px); }
+  button.ghost {
+    background: transparent; color: var(--ink-soft);
+    border-color: var(--line);
+  }
+  button.ghost:hover { background: var(--sunken); filter: none; }
+  button:disabled { opacity: .4; cursor: not-allowed; filter: none; }
+  button.big { padding: 12px 26px; font-size: 14.5px; border-radius: 10px; }
+
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .actions {
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+    margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--line-soft);
+  }
+  .check {
+    display: inline-flex; gap: 8px; align-items: center;
+    font-size: 13.5px; color: var(--ink-soft); cursor: pointer;
+    margin: 0;
+  }
+  .check input { width: auto; }
+  .hint { color: var(--dim); font-size: 12.5px; margin-top: 8px; }
+  .hint a { color: var(--ink-soft); text-decoration: none; border-bottom: 1px solid var(--line); }
+  .hint a:hover { color: var(--accent); border-color: currentColor; }
+
+  /* folder picker */
+  .picker {
+    margin-top: 12px; border: 1px solid var(--line); border-radius: 11px;
+    background: var(--sunken); overflow: hidden;
+  }
+  .picker .crumb {
+    padding: 11px 14px; border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 12px; color: var(--dim);
+    background: var(--surface); overflow-x: auto; white-space: nowrap;
+  }
+  .picker .listing { max-height: 260px; overflow: auto; padding: 6px; }
+  .pick {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: 7px; cursor: pointer;
+    font-size: 13.5px; transition: background .1s;
+  }
+  .pick:hover { background: var(--accent-soft); }
+  .pick .ico { color: var(--dim); flex: none; width: 16px; }
+  .pick .count { margin-left: auto; color: var(--dim); font-size: 12px; }
+  .pick.file { cursor: default; color: var(--ink-soft); }
+  .pick.file:hover { background: transparent; }
+  .picker .foot {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 12px 14px; border-top: 1px solid var(--line);
+    background: var(--surface);
+  }
+
+  /* progress */
   #log {
-    font-family: var(--mono); font-size: 12.5px; line-height: 1.75;
-    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-    padding: 14px; max-height: 300px; overflow: auto; white-space: pre-wrap;
+    font-family: var(--mono); font-size: 12px; line-height: 1.85;
+    background: var(--sunken); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px 18px;
+    max-height: 320px; overflow: auto; white-space: pre-wrap;
+    color: var(--ink-soft);
   }
   #log .stage { color: var(--ink); font-weight: 600; }
   #log .bad { color: var(--accent); }
-  #log .good { color: var(--ok); }
-  .stats { display: flex; gap: 26px; flex-wrap: wrap; margin: 0 0 18px; }
-  .stat b { display: block; font-size: 21px; font-weight: 650; }
+  #log .good { color: var(--ok); font-weight: 600; }
+  .state { font-size: 14px; font-weight: 600; display: flex; gap: 9px; align-items: center; }
+  .state::before {
+    content: ''; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent); flex: none;
+  }
+  .state.done::before { background: var(--ok); }
+
+  /* results */
+  .stats {
+    display: flex; gap: 34px; flex-wrap: wrap;
+    padding-bottom: 22px; margin-bottom: 22px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .stat b {
+    display: block; font-size: 24px; font-weight: 640;
+    letter-spacing: -.02em; line-height: 1.25;
+  }
   .stat span { font-size: 12px; color: var(--dim); }
-  video { width: 100%; max-width: 340px; border-radius: 10px; background: #000; }
+  .delivery { display: flex; gap: 30px; flex-wrap: wrap; align-items: flex-start; }
+  video {
+    width: 296px; border-radius: 12px; background: #000;
+    box-shadow: var(--shadow); display: block;
+  }
+  .downloads { display: flex; flex-direction: column; gap: 7px; margin-top: 14px; }
+  a.link {
+    color: var(--ink-soft); font-size: 13px; text-decoration: none;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  a.link::before { content: '↓'; color: var(--dim); }
+  a.link:hover { color: var(--accent); }
+
   table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-size: 12px; color: var(--dim); font-weight: 600; }
-  td.mono { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
-  .tag { display: inline-block; padding: 1px 7px; border-radius: 5px; font-size: 11.5px; border: 1px solid var(--line); }
-  .tag.ok { color: var(--ok); border-color: currentColor; }
-  .tag.no { color: var(--accent); border-color: currentColor; }
-  .why { color: var(--dim); font-size: 12.5px; }
-  .scroll { overflow-x: auto; }
-  .hide { display: none; }
-  a.shot { color: var(--dim); font-size: 12px; text-decoration: none; border-bottom: 1px dotted currentColor; }
+  th {
+    text-align: left; padding: 0 12px 9px; font-size: 11.5px;
+    color: var(--dim); font-weight: 600; letter-spacing: .03em;
+    text-transform: uppercase; border-bottom: 1px solid var(--line);
+  }
+  td {
+    text-align: left; padding: 11px 12px; vertical-align: top;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover, table tr:hover { background: var(--sunken); }
+  td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+  td.num { white-space: nowrap; color: var(--ink-soft); }
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11.5px; font-weight: 550; border: 1px solid var(--line);
+    color: var(--dim); white-space: nowrap;
+  }
+  .tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); background: color-mix(in srgb, var(--ok) 8%, transparent); }
+  .tag.no { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); background: var(--accent-soft); }
+  .why { color: var(--dim); font-size: 12.5px; line-height: 1.55; }
+  .scroll { overflow-x: auto; margin: 0 -4px; padding: 0 4px; }
+  .hide { display: none !important; }
+  a.shot { color: var(--ink-soft); text-decoration: none; border-bottom: 1px solid var(--line); }
+  a.shot:hover { color: var(--accent); border-color: currentColor; }
 </style>
 </head>
 <body>
 <header>
-  <h1>montagewright</h1>
-  <p>丟一個資料夾進來，看它怎麼剪，以及為什麼</p>
+  <div class="inner">
+    <h1>montagewright<span class="dot">.</span></h1>
+    <p>丟一個資料夾進來，看它怎麼剪，以及為什麼</p>
+  </div>
 </header>
 
 <main>
-  <section class="panel" id="setup">
-    <div class="grid">
-      <div style="grid-column:1/-1">
+  <section id="setup">
+    <div class="fields">
+      <div class="field wide">
         <label>素材</label>
-        <div style="display:flex;gap:8px">
+        <div class="row" style="gap:8px;flex-wrap:nowrap">
           <input type="text" id="path" placeholder="點「瀏覽」選一個資料夾，或直接貼路徑">
           <button type="button" class="ghost" id="browse" style="white-space:nowrap">瀏覽…</button>
         </div>
-        <div class="hide" id="picker" style="margin-top:10px;border:1px solid var(--line);border-radius:8px;padding:12px;background:var(--bg)">
-          <div class="mono why" id="crumb" style="margin-bottom:8px"></div>
-          <div id="listing" style="max-height:240px;overflow:auto"></div>
-          <div class="row" style="margin-top:10px">
+        <div class="picker hide" id="picker">
+          <div class="crumb" id="crumb"></div>
+          <div class="listing" id="listing"></div>
+          <div class="foot">
             <button type="button" id="use-here">用這個資料夾</button>
             <button type="button" class="ghost" id="close-picker">關閉</button>
             <span class="why" id="picker-note"></span>
           </div>
         </div>
-        <div class="why" style="margin-top:6px">
+        <div class="hint">
           本機素材用路徑就好——上傳等於把硬碟上的檔案搬進瀏覽器再寫回去。
           <a href="#" id="show-upload">還是要用上傳</a>
         </div>
       </div>
-      <div class="hide" id="upload-row" style="grid-column:1/-1">
+
+      <div class="field wide hide" id="upload-row">
         <label>上傳素材資料夾</label>
         <input type="file" id="rushes" webkitdirectory directory multiple>
       </div>
-      <div>
-        <label>音樂路徑（留空＝不配樂）</label>
-        <input type="text" id="music-path" placeholder="/Users/…/track.mp3">
+
+      <div class="field">
+        <label>音樂路徑</label>
+        <input type="text" id="music-path" placeholder="留空＝不配樂">
       </div>
-      <div>
-        <label>語音</label>
-        <select id="speech">
-          <option value="auto">自動（卡片說是內容才轉錄）</option>
-          <option value="never">不要轉錄</option>
-        </select>
-      </div>
-      <div>
-        <label>語言</label>
-        <input type="text" id="locale" value="zh-TW">
-      </div>
-      <div>
+      <div class="field">
         <label>輸出比例</label>
         <select id="aspect">
           <option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option>
         </select>
       </div>
-      <div>
-        <label>可編輯的 timeline（預設不輸出）</label>
+      <div class="field">
+        <label>語音</label>
+        <select id="speech">
+          <option value="auto">自動判斷</option>
+          <option value="never">不要轉錄</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>語言</label>
+        <input type="text" id="locale" value="zh-TW">
+      </div>
+      <div class="field">
+        <label>可編輯時間軸</label>
         <select id="timeline">
           <option value="none">不需要</option>
-          <option value="premiere">Premiere／Resolve（xml）</option>
-          <option value="finalcut">Final Cut（fcpxml）</option>
+          <option value="premiere">Premiere／Resolve</option>
+          <option value="finalcut">Final Cut</option>
           <option value="both">兩種都要</option>
         </select>
       </div>
-      <div>
+      <div class="field">
         <label>預算上限（美元）</label>
         <input type="number" id="budget" value="6" min="0.5" step="0.5">
       </div>
+
+      <div class="field wide">
+        <label>Brief（可留空）</label>
+        <textarea id="brief" placeholder="這支片要傳達什麼、給誰看、非講不可的是什麼"></textarea>
+      </div>
     </div>
-    <div style="margin-top:16px">
-      <label>Brief（可留空）</label>
-      <textarea id="brief" placeholder="這支片要傳達什麼、給誰看、非講不可的是什麼"></textarea>
-    </div>
-    <div class="row">
-      <button id="go">開始剪</button>
-      <label style="margin:0;display:flex;gap:7px;align-items:center;color:var(--ink)">
-        <input type="checkbox" id="review" checked style="width:auto"> 開啟自審與重新規劃
+
+    <div class="actions">
+      <button id="go" class="big">開始剪</button>
+      <label class="check">
+        <input type="checkbox" id="review" checked> 開啟自審與重新規劃
       </label>
       <span id="picked" class="why"></span>
     </div>
   </section>
 
-  <section class="panel hide" id="past">
-    <h2 style="margin:0 0 12px;font-size:15px">先前的剪輯</h2>
+  <section class="hide" id="past">
+    <h2>先前的剪輯</h2>
+    <p class="sub">點開可以跟這一輪比較。重開服務也還在。</p>
     <div class="scroll"><table id="past-table"></table></div>
   </section>
 
-  <section class="panel hide" id="progress">
-    <div class="row" style="margin:0 0 14px;justify-content:space-between">
-      <strong id="state">執行中</strong>
+  <section class="hide" id="progress">
+    <div class="row" style="justify-content:space-between;margin-bottom:16px">
+      <span class="state" id="state">執行中</span>
       <button class="ghost" id="stop">停止</button>
     </div>
     <div id="log"></div>
   </section>
 
-  <section class="panel hide" id="result">
+  <section class="hide" id="result">
     <div class="stats" id="stats"></div>
-    <div style="display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start">
+    <div class="delivery">
       <div>
         <video id="video" controls playsinline></video>
-        <div class="row" style="margin-top:10px">
-          <a id="download" class="shot" download>下載完整畫質</a>
-          <a id="subs" class="shot hide" download>下載字幕 SRT</a>
-          <a id="tl-pr" class="shot hide" download>Premiere XML</a>
-          <a id="tl-fc" class="shot hide" download>Final Cut XML</a>
+        <div class="downloads">
+          <a id="download" class="link" download>完整畫質</a>
+          <a id="subs" class="link hide" download>字幕 SRT</a>
+          <a id="tl-pr" class="link hide" download>Premiere XML</a>
+          <a id="tl-fc" class="link hide" download>Final Cut XML</a>
         </div>
       </div>
-      <div style="flex:1;min-width:300px">
+      <div style="flex:1;min-width:280px">
         <table id="spend"></table>
       </div>
     </div>
   </section>
 
-  <section class="panel hide" id="shots">
-    <h2 style="margin:0 0 4px;font-size:15px">每一顆用了什麼、怎麼處理</h2>
-    <p class="why" style="margin:0 0 14px">點檔名可以單獨看那一顆——構圖問題在成片裡會被下一顆蓋過去。</p>
+  <section class="hide" id="shots">
+    <h2>每一顆用了什麼、怎麼處理</h2>
+    <p class="sub">點檔名可以單獨看那一顆——構圖問題在成片裡會被下一顆蓋過去。</p>
     <div class="scroll"><table id="shot-table"></table></div>
   </section>
 
-  <section class="panel hide" id="transcripts">
-    <h2 style="margin:0 0 4px;font-size:15px">聽到了什麼</h2>
-    <p class="why" style="margin:0 0 14px">辨識器聽的、Gemini 改的、誰講的。轉錯的地方會讓後面每一個決定都跟著錯。</p>
+  <section class="hide" id="transcripts">
+    <h2>聽到了什麼</h2>
+    <p class="sub">辨識器聽的、Gemini 改的、誰講的。轉錯的地方會讓後面每個決定都跟著錯。</p>
     <div class="scroll"><table id="tx-table"></table></div>
   </section>
 
-  <section class="panel hide" id="aside">
-    <h2 style="margin:0 0 12px;font-size:15px">沒有用的素材</h2>
+  <section class="hide" id="aside">
+    <h2>沒有用的素材</h2>
+    <p class="sub">卡片判定不能用的，以及它給的理由。</p>
     <div class="scroll"><table id="aside-table"></table></div>
   </section>
 </main>
@@ -215,18 +382,21 @@ async function browseTo(path) {
   picking = d.here;
   $('crumb').textContent = d.here;
   const rows = [];
-  if (d.parent) rows.push(`<div class="pick" data-path="${esc(d.parent)}">📁 <span class="why">..</span></div>`);
+  if (d.parent) rows.push(`<div class="pick" data-path="${esc(d.parent)}">
+    <span class="ico">↰</span><span class="why">上一層</span></div>`);
   for (const f of d.folders) {
-    rows.push(`<div class="pick" data-path="${esc(f.path)}">📁 ${esc(f.name)}` +
-      (f.clips ? ` <span class="why">${f.clips} 支影片</span>` : '') + `</div>`);
+    rows.push(`<div class="pick" data-path="${esc(f.path)}">
+      <span class="ico">▸</span>${esc(f.name)}` +
+      (f.clips ? `<span class="count">${f.clips} 支</span>` : '') + `</div>`);
   }
-  for (const v of d.videos) rows.push(`<div class="why" style="padding:3px 0">🎬 ${esc(v.name)}</div>`);
-  $('listing').innerHTML = rows.join('') || '<div class="why">這裡沒有東西</div>';
+  for (const v of d.videos) {
+    rows.push(`<div class="pick file"><span class="ico">·</span>${esc(v.name)}</div>`);
+  }
+  $('listing').innerHTML = rows.join('') ||
+    '<div class="pick file"><span class="ico">·</span>這裡沒有東西</div>';
   $('picker-note').textContent = d.videos.length
     ? `這層有 ${d.videos.length} 支影片` : '這層沒有影片，往下點';
-  for (const el of $('listing').querySelectorAll('.pick')) {
-    el.style.cursor = 'pointer';
-    el.style.padding = '3px 0';
+  for (const el of $('listing').querySelectorAll('.pick[data-path]')) {
     el.onclick = () => browseTo(el.dataset.path);
   }
 }
@@ -390,16 +560,20 @@ function render(report) {
     ['顆數', (report.selection?.shots || []).length, '鏡頭'],
     ['對上音樂', report.cuts_on_music ?? '—', '刀'],
     ['降級', (report.degradations || []).length, '筆，都有量測值'],
-    ['花費', '$' + Object.values(report.spend || {}).reduce((a, b) => a + (b.usd ?? b ?? 0), 0).toFixed(2), '本輪'],
+    ['花費', '$' + Object.values(report.spend?.by_stage || {}).reduce((a, b) => a + b, 0).toFixed(2), '本輪'],
   ];
   $('stats').innerHTML = stats.map(([k, v, s]) =>
     `<div class="stat"><b>${esc(String(v))}</b><span>${esc(k)}・${esc(s)}</span></div>`).join('');
 
-  const spend = Object.entries(report.spend || {})
-    .map(([k, v]) => [k, typeof v === 'object' ? (v.usd ?? 0) : v])
+  // The report nests these under by_stage alongside the cap and the running
+  // total; iterating the outer object showed one row called "by_stage".
+  const spend = Object.entries(report.spend?.by_stage || {})
     .sort((a, b) => b[1] - a[1]);
-  $('spend').innerHTML = '<tr><th>階段</th><th>花費</th></tr>' + spend.map(([k, v]) =>
-    `<tr><td>${esc(k)}</td><td class="mono">$${Number(v).toFixed(4)}</td></tr>`).join('');
+  const total = spend.reduce((a, [, v]) => a + v, 0);
+  $('spend').innerHTML = '<tr><th>階段</th><th style="text-align:right">花費</th></tr>' +
+    spend.map(([k, v]) =>
+      `<tr><td>${esc(k)}</td><td class="mono" style="text-align:right">$${v.toFixed(4)}</td></tr>`).join('') +
+    `<tr><td class="why">合計</td><td class="mono" style="text-align:right">$${total.toFixed(4)}</td></tr>`;
 
   const shots = report.selection?.shots || [];
   const rhythm = report.rhythm || {}, verdicts = report.shots || {};
@@ -407,7 +581,10 @@ function render(report) {
   for (const d of report.degradations || []) (degByClip[d.clip_id] ||= []).push(d);
 
   $('shot-table').innerHTML =
-    '<tr><th>#</th><th>素材檔名</th><th>進點／長度</th><th>運鏡</th><th>主體／說話者</th>' +
+    '<colgroup><col style="width:34px"><col style="width:130px"><col style="width:104px">' +
+    '<col style="width:88px"><col style="width:170px"><col><col style="width:150px">' +
+    '<col style="width:170px"></colgroup>' +
+    '<tr><th>#</th><th>素材</th><th>進點／長度</th><th>運鏡</th><th>主體／說話者</th>' +
     '<th>為什麼用這顆</th><th>降級</th><th>逐顆驗收</th></tr>' +
     shots.map((s, i) => {
       const k = 'k' + String(i).padStart(2, '0');
@@ -418,8 +595,8 @@ function render(report) {
         `<span class="tag ${v.delivered ? 'ok' : 'no'}">${v.delivered ? '做到' : '沒做到'}</span>`;
       return `<tr>
         <td class="mono">${i}</td>
-        <td class="mono"><a class="shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a></td>
-        <td class="mono">${Number(s.start_seconds ?? 0).toFixed(1)}s ／ ${Number(r.seconds ?? 0).toFixed(2)}s</td>
+        <td class="mono" style="word-break:break-all"><a class="shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a></td>
+        <td class="mono num">${Number(s.start_seconds ?? 0).toFixed(1)}s<br>${Number(r.seconds ?? 0).toFixed(2)}s</td>
         <td>${esc(s.camera_move)}${s.framing ? `<div class="why">${esc(s.framing)}</div>` : ''}</td>
         <td>${esc(s.subject)}${s.must_be_whole ? '<div class="why">要完整</div>' : ''}${v.speaker ? `<div class="why">說話：${esc(v.speaker)}</div>` : ''}</td>
         <td class="why">${esc(s.why)}${r.why ? `<div style="margin-top:5px">節奏：${esc(r.why)}</div>` : ''}</td>
