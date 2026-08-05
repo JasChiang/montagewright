@@ -1919,3 +1919,39 @@ def test_the_overlay_eases_the_way_the_render_does() -> None:
     from montagewright.reframe import _eased
 
     assert "*(3-2*" in _eased(0.0, 1.0, 0.0, 1.0)
+
+
+def test_the_reel_moves_without_relaying_itself_out_every_frame() -> None:
+    """A one-pixel line, sixty times a second, at the cost of a full layout.
+
+    Writing `left` on the playhead relayouts the reel under it; a transform
+    is composited. Reading the scroller's geometry after writing that style
+    forces the browser to flush the layout it was told to do. And the clock
+    reads in seconds, so writing its text every frame is fifty-nine text
+    measurements a second that change nothing.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "translateX(${x}px)" in page
+    assert "if (now !== clockSaid)" in page
+    # Every measurement read before anything is written.
+    move = page[page.index("function movePlayhead()"):]
+    move = move[:move.index("\n}")]
+    assert move.index("box.scrollLeft, wide") < move.index("style.transform")
+
+
+def test_the_crop_overlay_does_not_measure_the_page_every_frame() -> None:
+    """Two getBoundingClientRect calls a frame, to move one rectangle.
+
+    Where the take sits inside the frame changes when the window changes or
+    another take loads, and at no other time.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "let placed = null" in page
+    assert "function forgetPlacement()" in page
+    assert "loadedmetadata" in page

@@ -172,7 +172,11 @@
   }
   .lane img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .5; }
   .lane.silent { display: grid; place-items: center; font-size: 10.5px; color: var(--dim); }
-  .playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--accent); z-index: 6; cursor: ew-resize; }
+  .playhead {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 1px;
+    background: var(--accent); z-index: 6; cursor: ew-resize;
+    will-change: transform;
+  }
   .playhead::before {
     content: ''; position: absolute; top: 0; left: -4px; width: 9px; height: 9px;
     background: var(--accent); clip-path: polygon(0 0, 100% 0, 50% 100%);
@@ -1268,15 +1272,28 @@ $('new-run').addEventListener('click', () => {
 });
 
 
+let clockSaid = '';
 function movePlayhead() {
   const at = $('video').currentTime || 0;
-  $('playhead').style.left = `${at * scale}px`;
-  $('clock').textContent = `${clock(at)} / ${clock(reelSeconds())}`;
-  // Keep it in view when it runs off the end of a zoomed reel.
-  const box = $('scroller');
   const x = at * scale;
-  if (x < box.scrollLeft || x > box.scrollLeft + box.clientWidth - 40) {
-    box.scrollLeft = Math.max(0, x - box.clientWidth * 0.4);
+  const box = $('scroller');
+
+  // Read every measurement before writing anything. Interleaving them makes
+  // the browser flush a layout per read, sixty times a second, for a line
+  // that is one pixel wide.
+  const left = box.scrollLeft, wide = box.clientWidth;
+
+  // transform, not left: the playhead is composited and never relayouts the
+  // reel under it.
+  $('playhead').style.transform = `translateX(${x}px)`;
+  // A clock that reads in seconds does not need writing sixty times a
+  // second, and every write is a text measurement.
+  const now = `${clock(at)} / ${clock(reelSeconds())}`;
+  if (now !== clockSaid) { $('clock').textContent = now; clockSaid = now; }
+
+  // Keep it in view when it runs off the end of a zoomed reel.
+  if (x < left || x > left + wide - 40) {
+    box.scrollLeft = Math.max(0, x - wide * 0.4);
   }
 }
 
@@ -1433,18 +1450,32 @@ function cropSays(b, box) {
   return `${move}　${from} → ${to}　現在 ${here}`;
 }
 
+// Where the take sits inside the frame. Cleared whenever that could have
+// moved, and only measured again when it is next needed.
+let placed = null;
+function forgetPlacement() { placed = null; }
+
 function drawCrop() {
   const b = blocks[picked];
   if (!peeking || !b) { $('cropbox').classList.add('hide'); return; }
   const raw = $('raw-video');
   const box = cropAt(b, raw.currentTime - b.in_seconds);
   if (!box || !raw.videoWidth) { $('cropbox').classList.add('hide'); return; }
-  const shown = raw.getBoundingClientRect();
-  const holder = $('frame').getBoundingClientRect();
+  // These only change when the window or the loaded take does, and asking
+  // for them is a synchronous layout -- twice a frame, to move a rectangle.
+  if (!placed) {
+    const shown = raw.getBoundingClientRect();
+    const holder = $('frame').getBoundingClientRect();
+    placed = {
+      left: shown.left - holder.left, top: shown.top - holder.top,
+      width: shown.width, height: shown.height,
+    };
+  }
+  const shown = placed;
   const el = $('cropbox');
   el.classList.remove('hide');
-  el.style.left = `${shown.left - holder.left + box.x * shown.width}px`;
-  el.style.top = `${shown.top - holder.top + box.y * shown.height}px`;
+  el.style.left = `${shown.left + box.x * shown.width}px`;
+  el.style.top = `${shown.top + box.y * shown.height}px`;
   el.style.width = `${box.w * shown.width}px`;
   el.style.height = `${box.h * shown.height}px`;
   el.dataset.say = cropSays(b, box);
@@ -1456,6 +1487,7 @@ function peek(on) {
   $('see-raw').classList.toggle('on', on);
   $('video').classList.toggle('hide', on);
   $('raw-video').classList.toggle('hide', !on);
+  forgetPlacement();
   if (!on) { $('cropbox').classList.add('hide'); return; }
   const b = blocks[picked];
   if (!b) return;
@@ -1481,7 +1513,10 @@ for (const when of ['loadedmetadata', 'loadeddata', 'seeked', 'canplay']) {
     drawCrop();
   });
 }
-addEventListener('resize', drawCrop);
+addEventListener('resize', () => { forgetPlacement(); drawCrop(); });
+$('raw-video').addEventListener('loadedmetadata', () => {
+  forgetPlacement(); drawCrop();
+});
 </script>
 </body>
 </html>
