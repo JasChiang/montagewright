@@ -434,6 +434,29 @@ def describe_clip(
     return card, Usage.from_interaction(interaction)
 
 
+def card_map(proxies: Path, card_dir: Path) -> dict[str, Path]:
+    """Which card describes which source, rebuilt after the fact.
+
+    `build_library` hands this map back when it writes the cards, and anything
+    asking for it later has to derive it the same way -- a card is named for
+    the bytes it describes, not for the source those bytes came from. Two
+    callers took the filename to be the source id instead. Every lookup
+    missed, so every shot was reframed with no subject to aim at, so every
+    crop sat dead centre while the report went on describing the subject it
+    had followed. It looked like a working cut. That is the whole reason this
+    is a function and not two dict comprehensions.
+    """
+
+    from montagewright.uploads import content_hash
+
+    found: dict[str, Path] = {}
+    for proxy in sorted(proxies.glob("*.mp4")):
+        card = card_dir / f"{content_hash(proxy)[:20]}.json"
+        if card.exists():
+            found[proxy.stem] = card
+    return found
+
+
 def build_library(
     proxies: dict[str, Path],
     card_dir: Path,

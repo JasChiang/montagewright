@@ -63,8 +63,16 @@
   /* The take is 16:9 and the cut is 9:16, so whichever is showing has to be
      the one that fits -- letting the wider one size the box pushed it over
      the reel. */
-  .frame { position: relative; display: flex; min-width: 0; min-height: 0;
-           max-width: 100%; max-height: 100%; }
+  /* align-items defaults to stretch, which forced the video's height to the
+     box and left its width intrinsic -- a 9:16 file in a landscape element,
+     object-fit dutifully pillarboxing it against the element's own black. */
+  /* height, not just max-height: a percentage max resolves against a
+     containing block whose own height is auto, which is to say it does not
+     resolve at all -- the take ran three times the height of the box and the
+     crop box drawn on it landed off the top of the screen. */
+  .frame { position: relative; display: flex; align-items: center;
+           justify-content: center; width: 100%; height: 100%;
+           min-width: 0; min-height: 0; }
   .screen video {
     max-width: 100%; max-height: 100%; width: auto; height: auto;
     border-radius: 6px; background: #000; display: block; object-fit: contain;
@@ -300,7 +308,7 @@
       <div class="over" id="over"></div>
       <div class="frame" id="frame">
         <video id="video" playsinline></video>
-        <video id="raw-video" playsinline controls preload="metadata" class="hide"></video>
+        <video id="raw-video" playsinline muted preload="auto" class="hide"></video>
         <div class="cropbox hide" id="cropbox"></div>
       </div>
       <div class="peek">
@@ -456,7 +464,7 @@
 
 
 const $ = (id) => document.getElementById(id);
-let runId = null, seen = 0, timer = null, ticker = null, allLines = [];
+let runId = null, seen = 0, timer = null, ticker = null, allLines = [], lastSource = '';
 
 let picking = '', pickTarget = 'path', pickKind = 'video';
 
@@ -546,7 +554,7 @@ async function loadPast() {
       <td class="mono">${r.shots || '—'}</td>
       <td class="mono">${r.delivered != null ? r.delivered + '/' + r.shots : '—'}</td>
       <td class="mono">${r.spend != null ? '$' + r.spend.toFixed(2) : '—'}</td>
-      <td><a class="shot" href="#" onclick="openRun('${r.run_id}');return false">打開</a></td>
+      <td><a class="shot" href="#" onclick="openRun('${r.run_id}', '${esc(where.split('/').pop())}');return false">打開</a></td>
     </tr>`);
   }
   $('past-table').innerHTML =
@@ -564,8 +572,8 @@ async function loadPast() {
   }
 }
 
-async function openRun(id) {
-  runId = id; seen = 0;
+async function openRun(id, where) {
+  runId = id; seen = 0; lastSource = where || '';
   const data = await (await fetch(`/api/runs/${id}`)).json();
   $('log').textContent = data.lines.join('\n');
   allLines = data.lines;
@@ -631,12 +639,20 @@ function inspect(i) {
 async function showStrip() {
   const data = await (await fetch(`/api/runs/${runId}/timeline-data`)).json();
   if (!data.blocks.length) return;
-  blocks = data.blocks.map((b, i) => ({ ...b, index: i }));
+  // index is which shot of the report this is, and it arrives with the
+  // block. Renumbering it by reel position was the same number until a recut
+  // reordered or dropped anything, after which every panel read out another
+  // shot's reasoning and the recut asked to re-cut the wrong take.
+  blocks = data.blocks;
   blocksWere = JSON.parse(JSON.stringify(blocks));
   paintStrip();
   $('strip').classList.remove('hide');
   if (blocks.length) { picked = 0; paintStrip(); inspect(0); paintWaves(
     blocks.reduce((a, b) => a + b.seconds, 0) || 1); }
+  // The take can be asked for before the reel has loaded, and peek can only
+  // find one through a block. It used to give up quietly and leave the
+  // button lit over an empty player.
+  if (peeking) peek(true);
   // Clicking anywhere on the reel is a seek, which is what a timeline is for.
   $('reel').onclick = (e) => {
     if (e.target.closest('.blk')) return;
@@ -816,6 +832,7 @@ document.addEventListener('DOMContentLoaded', () => {
       picked = now; paintStrip(); inspect(now);
       if (peeking) peek(true);
     }
+    mirrorRaw();
   });
   addEventListener('resize', () => { if (blocks.length) paintStrip(); });
 });
@@ -1111,6 +1128,11 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s ?? 
 
 function render(report) {
   lastReport = report;
+  const where = (report.selection?.shots || []).length;
+  $('crumb-what').textContent = lastSource || '這一輪';
+  $('crumb-meta').textContent =
+    `${(report.duration_seconds ?? 0).toFixed(1)}s · ${where} 顆 · $`
+    + Object.values(report.spend?.by_stage || {}).reduce((a, b) => a + b, 0).toFixed(2);
   const howMany = (report.selection?.shots || []).length;
   const [landed, wanted] = String(report.cuts_on_music ?? '0/0').split('/').map(Number);
   const degraded = (report.degradations || []).length;
@@ -1223,10 +1245,24 @@ $('new-run').addEventListener('click', () => {
 
 
 function movePlayhead() {
-  $('playhead').style.left = `${($('video').currentTime || 0) * scale}px`;
-  $('clock').textContent =
-    `${clock($('video').currentTime || 0)} / ${clock(reelSeconds())}`;
+  const at = $('video').currentTime || 0;
+  $('playhead').style.left = `${at * scale}px`;
+  $('clock').textContent = `${clock(at)} / ${clock(reelSeconds())}`;
+  // Keep it in view when it runs off the end of a zoomed reel.
+  const box = $('scroller');
+  const x = at * scale;
+  if (x < box.scrollLeft || x > box.scrollLeft + box.clientWidth - 40) {
+    box.scrollLeft = Math.max(0, x - box.clientWidth * 0.4);
+  }
 }
+
+// timeupdate fires about four times a second, which reads as a stutter on a
+// zoomed reel; this follows the frame.
+function tick() {
+  if (!$('video').paused) { movePlayhead(); mirrorRaw(); drawCrop(); }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
 
 $('zoom').addEventListener('input', () => {
   scale = +$('zoom').value;
@@ -1309,6 +1345,52 @@ function cropAt(block, seconds) {
   return keys[keys.length - 1];
 }
 
+// The reel is the master clock. Peeking shows the same moment in the take it
+// was cut from, so the box, the cut and the playhead all say one thing --
+// two players each running their own time was two answers to "where am I".
+function mirrorRaw() {
+  const b = blocks[picked];
+  if (!peeking || !b) return;
+  const started = blocks.slice(0, picked).reduce((a, x) => a + x.seconds, 0);
+  const into = ($('video').currentTime || 0) - started;
+  const want = b.in_seconds + Math.max(0, Math.min(into, b.seconds));
+  const raw = $('raw-video');
+  if (raw.readyState && Math.abs(raw.currentTime - want) > 0.08) {
+    raw.currentTime = want;
+  }
+}
+
+const MOVES = {
+  hold: '定住', pan: '橫搖', tilt: '直搖', push_in: '推近', pull_out: '拉遠',
+};
+
+// Where across the frame the box sits. The width is fixed by the delivery
+// aspect -- 9:16 out of 16:9 is 0.316 wide on every shot ever -- so a label
+// built out of it printed the same sentence thirteen times and read as a
+// bug. What varies, and what a person is actually checking, is where it is
+// pointed and whether it moved.
+function across(centre) {
+  if (centre < 0.34) return '偏左';
+  if (centre < 0.44) return '略偏左';
+  if (centre <= 0.56) return '置中';
+  if (centre <= 0.66) return '略偏右';
+  return '偏右';
+}
+
+function cropSays(b, box) {
+  const move = MOVES[b.camera_move] || b.camera_move || '定住';
+  const keys = b.crop || [];
+  const here = across(box.x + box.w / 2);
+  if (keys.length < 2) return `${move}　${here}`;
+  const from = across(keys[0].x + keys[0].w / 2);
+  const to = across(keys[keys.length - 1].x + keys[keys.length - 1].w / 2);
+  const zoom = Math.round((keys[0].w / keys[keys.length - 1].w) * 100) / 100;
+  if (zoom > 1.03) return `${move}　放大到 ${zoom}×　現在 ${here}`;
+  if (zoom < 0.97) return `${move}　縮到 ${zoom}×　現在 ${here}`;
+  if (from === to) return `${move}　${here}`;
+  return `${move}　${from} → ${to}　現在 ${here}`;
+}
+
 function drawCrop() {
   const b = blocks[picked];
   if (!peeking || !b) { $('cropbox').classList.add('hide'); return; }
@@ -1323,8 +1405,7 @@ function drawCrop() {
   el.style.top = `${shown.top - holder.top + box.y * shown.height}px`;
   el.style.width = `${box.w * shown.width}px`;
   el.style.height = `${box.h * shown.height}px`;
-  el.dataset.say = `${(b.crop || []).length > 1 ? '跟拍中' : '定住'}　`
-    + `${Math.round(box.w * 100)}% 寬`;
+  el.dataset.say = cropSays(b, box);
 }
 
 function peek(on) {
@@ -1344,6 +1425,7 @@ function peek(on) {
   } else if (raw.readyState) {
     raw.currentTime = b.in_seconds;
   }
+  mirrorRaw();
   drawCrop();
 }
 

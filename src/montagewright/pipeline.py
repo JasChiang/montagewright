@@ -16,6 +16,7 @@ indistinguishable from one that did both.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -320,6 +321,26 @@ def follow_subjects(
 
             duration = clip.approx_out_seconds - clip.approx_in_seconds
 
+            # No card means no measured subject, and the reframe below will
+            # quietly centre the crop. That is a defensible last resort and
+            # an indefensible silence: a whole timeline was rebuilt this way,
+            # every crop identical and dead centre, and nothing anywhere said
+            # the subject had gone missing.
+            if reframe.subject is not None and card is None:
+                report.degradations.append(
+                    DegradationStep(
+                        clip_id=clip.clip_id,
+                        ladder="center_crop",
+                        trigger=(
+                            f"no card describes {clip.source_id}, so there is "
+                            f"no measured position for "
+                            f"\"{reframe.subject.description}\" and the crop "
+                            f"can only be centred"
+                        ),
+                        measured={},
+                    )
+                )
+
             # Whether a subject fits the delivery aspect is a fact about the
             # material, not a property of the move chosen for it. It used to
             # be checked inside the hold branch only, so the same wordmark
@@ -327,8 +348,12 @@ def follow_subjects(
             # "Galaxy Unpac" the moment the planner asked for a push instead
             # -- and nothing recorded it, because only one of the five path
             # builders reports fit. The check belongs to the clip.
+            known = (
+                find_subject(card, reframe.subject.description)
+                if card is not None and reframe.subject is not None
+                else None
+            )
             if reframe.subject is not None and card is not None:
-                known = find_subject(card, reframe.subject.description)
                 crop_width = target_aspect / source.aspect_ratio
                 if known is not None and known.width > crop_width:
                     report.degradations.append(
@@ -370,7 +395,19 @@ def follow_subjects(
                 centres = []
                 widths = []
                 for subject in (reframe.subject, reframe.then_subject):
+                    # Without a client there is nothing to ask, which is the
+                    # case when a plan is rebuilt after the run. Skipping the
+                    # subject left this list short and the indexing below
+                    # raised on it; the card measured both endpoints already,
+                    # and two measured endpoints is the whole move.
                     if not _may_ask(client):
+                        seat = (
+                            find_subject(card, subject.description)
+                            if card is not None
+                            else None
+                        )
+                        centres.append(seat.centre_x if seat else 0.5)
+                        widths.append(seat.width if seat else 0.0)
                         continue
                     _afford(report)
                     boxes, usage = locate_subject(
@@ -413,15 +450,28 @@ def follow_subjects(
                 # framing at all when the crop is otherwise full height, so
                 # aiming it blindly wastes the one chance the shot has.
                 centre_x, centre_y = 0.5, 0.5
-                if reframe.subject is not None:
+                seen: list[tuple[float, float]] = []
+                boxes = []
+                if reframe.subject is not None and not _may_ask(client):
+                    # A rebuild, with nothing to ask. Skipping the clip left
+                    # no path at all, and the executor fell back to a centred
+                    # still -- so a push read back as a hold on the middle of
+                    # the frame, and the interface drew that as what had been
+                    # rendered. A zoom needs one point to aim at, and the
+                    # card has one.
+                    if known is not None:
+                        centre_x, centre_y = known.centre_x, known.centre_y
+                        report.subject_notes[clip.clip_id] = (
+                            f"{move} on ({centre_x:.3f}, {centre_y:.3f}) "
+                            f"from the card"
+                        )
+                elif reframe.subject is not None:
                     frames, _ = _sample_frames(
                         source,
                         clip.approx_in_seconds,
                         clip.approx_out_seconds,
                         work,
                     )
-                    if not _may_ask(client):
-                        continue
                     _afford(report)
                     boxes, usage = locate_subject(
                         frames, reframe.subject.description, client=client
@@ -449,7 +499,7 @@ def follow_subjects(
                     output_width=out_w,
                     output_height=out_h,
                 )
-                subject_height = None
+                subject_height = known.height if known is not None else None
                 if seen:
                     heights = [
                         float(b["height"])
@@ -887,6 +937,33 @@ def run(
         cards=cards,
         checkpoint=checkpoint,
         client=client,
+    )
+
+    # Keep the paths the render actually used. Rebuilding them later is
+    # cheap arithmetic only for a held frame; a follow came out of a mask
+    # propagation that needed a checkpoint and a grounding call, and neither
+    # is available after the fact. Without this the interface could only ever
+    # redraw every move as a static centred box and call it what happened.
+    trail = output_dir / "work" / "crops.json"
+    trail.parent.mkdir(parents=True, exist_ok=True)
+    trail.write_text(
+        json.dumps(
+            {
+                clip_id: [
+                    {
+                        "at": round(frame.at_seconds, 3),
+                        "x": round(frame.crop.x, 5),
+                        "y": round(frame.crop.y, 5),
+                        "w": round(frame.crop.width, 5),
+                        "h": round(frame.crop.height, 5),
+                    }
+                    for frame in path.keyframes
+                ]
+                for clip_id, path in paths.items()
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
     plan = plan_render(

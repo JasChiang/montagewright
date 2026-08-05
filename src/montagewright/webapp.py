@@ -145,6 +145,10 @@ def _collect(run: Run) -> None:
     run.remember()
 
 
+class _AlreadyHave(Exception):
+    """The run recorded its crops, so there is nothing to rebuild."""
+
+
 def _typed_path(raw: str) -> Path | None:
     """Whatever a person pasted, as a path.
 
@@ -442,7 +446,22 @@ def create_app() -> FastAPI:
 
         found: dict[str, float] = {}
         crops: dict[str, list] = {}
+
+        # What the render actually used, if the run left it behind. Only a
+        # held frame can be re-derived afterwards -- a follow came out of a
+        # propagation nothing here can repeat -- so recomputing was the
+        # interface drawing every move as a static box and presenting it as
+        # evidence. Runs from before this was written still fall through.
+        trail = run.output / "work" / "crops.json"
+        if trail.exists():
+            try:
+                crops = json.loads(trail.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                print(f"timeline-data: unreadable crops.json ({error})", True)
+
         try:
+            if crops:
+                raise _AlreadyHave
             plan, _, _ = _rebuild(run)
             for segment in plan.segments:
                 path = segment.crop_path
@@ -459,6 +478,8 @@ def create_app() -> FastAPI:
                     }
                     for at, box in keys
                 ]
+        except _AlreadyHave:
+            pass
         except Exception as error:
             # The reel is still useful without the boxes, but a silent except
             # here is how "0/13 have a crop path" looked like a fact about the
@@ -486,6 +507,11 @@ def create_app() -> FastAPI:
                 )
             blocks.append({
                 "clip_id": key,
+                # Which shot of the report this is, which is what the take
+                # endpoint is keyed by. Its position in the reel is not the
+                # same number the moment anything is reordered or dropped,
+                # and peeking at the take asked for /source/undefined.
+                "index": index,
                 # Where the crop actually sat, keyframe by keyframe. Without
                 # it "it followed the subject" is a claim in a report; with
                 # it you can watch the box move over the original.
@@ -496,6 +522,7 @@ def create_app() -> FastAPI:
                 "in_seconds": float(shot.get("start_seconds", 0.0)),
                 "source_seconds": round(found[source_id], 3),
                 "subject": shot.get("subject", ""),
+                "camera_move": shot.get("camera_move", "hold"),
                 "why": shot.get("why", ""),
                 "delivered": verdicts.get(key, {}).get("delivered"),
                 "note": verdicts.get(key, {}).get("note", ""),
@@ -512,6 +539,7 @@ def create_app() -> FastAPI:
         the film.
         """
 
+        from montagewright.clipcard import card_map
         from montagewright.executor import plan_render
         from montagewright.pipeline import Report, follow_subjects, probe
         from montagewright.schema import EDL, Clip, Reframe, Subject
@@ -533,11 +561,10 @@ def create_app() -> FastAPI:
         aspect = ASPECTS.get(
             report.get("direction", {}).get("aspect", "9:16"), 9 / 16
         )
-        cards = {
-            path.stem: path
-            for path in (Path.home() / ".cache" / "montagewright"
-                         / "library" / "cards").glob("*.json")
-        }
+        cards = card_map(
+            run.output / "work" / "proxies",
+            Path.home() / ".cache" / "montagewright" / "library" / "cards",
+        )
         clips, sources = [], {}
         for index, entry in enumerate(wanted):
             plan = original[int(entry["index"])]

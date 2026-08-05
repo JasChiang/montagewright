@@ -851,10 +851,19 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                         "subject": {
                             "type": "string",
                             "description": (
-                                "What this shot is about, described so it can "
-                                "be told from anything similar in the same "
-                                "frame. 'the left, darker handset', not 'the "
-                                "handset'."
+                                "What this shot is about. When the material "
+                                "listing shows 可框住的主體 for this clip and "
+                                "one of them is what the shot is about, copy "
+                                "that label exactly -- the position of that "
+                                "subject is already measured and free to "
+                                "reuse, and any rewording of it, including "
+                                "into another language, throws the "
+                                "measurement away and has to buy it back. "
+                                "Only describe one in your own words when the "
+                                "listing has none that fits, and then say it "
+                                "so it can be told from anything similar in "
+                                "the same frame: 'the left, darker handset', "
+                                "not 'the handset'."
                             ),
                         },
                         "energy": {

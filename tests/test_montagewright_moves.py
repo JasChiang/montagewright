@@ -1628,5 +1628,89 @@ def test_the_crop_can_be_checked_against_the_take_it_came_from() -> None:
     page = PAGE.read_text(encoding="utf-8")
     assert "cropAt" in page and "drawCrop" in page
     assert "原素材＋裁切框" in page
-    # A single box is a hold; several is a follow, and it says which.
-    assert "跟拍中" in page and "定住" in page
+    # A label built from the crop width said the same sentence on every
+    # shot -- 9:16 out of 16:9 is 0.316 wide always. It has to say where the
+    # box is pointed and whether it travelled.
+    assert "cropSays" in page and "across(" in page
+    assert "偏左" in page and "偏右" in page and "置中" in page
+
+
+def test_a_card_is_found_by_what_it_describes_not_by_its_filename(
+    tmp_path,
+) -> None:
+    """The rebuild used to key cards by filename and miss every one.
+
+    A card is named for the hash of the proxy it describes. Taking that name
+    to be the source id meant the map was empty in a way nothing could see:
+    every lookup missed, every shot reframed with no subject, every crop dead
+    centre -- and the report still described the subject it had followed.
+    """
+
+    from montagewright.clipcard import card_map
+    from montagewright.uploads import content_hash
+
+    proxies = tmp_path / "proxies"
+    proxies.mkdir()
+    cards = tmp_path / "cards"
+    cards.mkdir()
+
+    proxy = proxies / "C8329.mp4"
+    proxy.write_bytes(b"not really a video, but it hashes")
+    named_for_its_bytes = cards / f"{content_hash(proxy)[:20]}.json"
+    named_for_its_bytes.write_text("{}", encoding="utf-8")
+
+    found = card_map(proxies, cards)
+    assert found == {"C8329": named_for_its_bytes}
+    # The old way. It is what the bug looked like from the inside.
+    assert "C8329" not in {path.stem: path for path in cards.glob("*.json")}
+
+
+def test_a_proxy_with_no_card_is_left_out_rather_than_guessed_at(
+    tmp_path,
+) -> None:
+    from montagewright.clipcard import card_map
+
+    (tmp_path / "proxies").mkdir()
+    (tmp_path / "cards").mkdir()
+    (tmp_path / "proxies" / "C0001.mp4").write_bytes(b"unanalysed")
+    assert card_map(tmp_path / "proxies", tmp_path / "cards") == {}
+
+
+def test_the_planner_is_told_to_name_a_subject_the_card_already_measured(
+) -> None:
+    """A reworded subject is a subject that has to be located again.
+
+    The listing hands the planner every subject the card measured, with its
+    box. Free-form naming meant six shots in nine described theirs in wording
+    the card never used -- sometimes in another language entirely -- and each
+    miss fell through to a paid grounding call for a position already sitting
+    in the library.
+    """
+
+    from montagewright.planner import _selection_schema
+
+    schema = _selection_schema(["C8330", "C8332"])
+    said = str(schema)
+    assert "可框住的主體" in said
+    assert "copy" in said and "exactly" in said
+
+
+def test_a_block_carries_the_shot_it_came_from() -> None:
+    """Peeking at the take needs the shot's index, not the reel's.
+
+    The two are the same number until a recut drops or reorders anything, and
+    the block never carried either -- so the take never loaded, and the crop
+    box had no picture to be drawn on.
+    """
+
+    from pathlib import Path
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "/source/${b.index}" in page
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "webapp.py"
+    ).read_text(encoding="utf-8")
+    assert '"index": index,' in source

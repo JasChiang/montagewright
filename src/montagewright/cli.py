@@ -909,6 +909,7 @@ def command_timeline(args: argparse.Namespace) -> int:
     nothing -- the subject positions come out of the cards.
     """
 
+    from montagewright.clipcard import card_map
     from montagewright.executor import plan_render
     from montagewright.pipeline import Report, follow_subjects, probe
     from montagewright.timeline import to_fcpxml, to_xmeml
@@ -919,7 +920,7 @@ def command_timeline(args: argparse.Namespace) -> int:
     rhythm = report.get("rhythm", {})
     aspect = ASPECTS.get(report.get("direction", {}).get("aspect", "9:16"), 9 / 16)
     library = (args.library or default_library()).expanduser()
-    cards = {p.stem: p for p in (library / "cards").glob("*.json")}
+    cards = card_map(output / "work" / "proxies", library / "cards")
 
     hunting = [output / "work" / "shots"] + (
         [args.rushes.expanduser()] if args.rushes else []
