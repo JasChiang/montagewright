@@ -491,8 +491,15 @@ def create_app() -> FastAPI:
                 run.output / "picture.mp4",
             )
         elif which == "music":
+            # The bed as it was laid, when the render kept it. Drawing the
+            # track as it arrived showed a flat wall of music and said
+            # nothing about whether it steps back for the voice, which is
+            # the one thing about a mix anybody checks before posting.
             source = None
-            if "--music" in run.command:
+            laid = run.output / "bed-as-laid.m4a"
+            if laid.exists():
+                source = laid
+            elif "--music" in run.command:
                 candidate = Path(run.command[run.command.index("--music") + 1])
                 source = candidate if candidate.exists() else None
             if source is None:

@@ -53,6 +53,17 @@
   /* An editor with nothing in it -- a black rectangle, empty tracks, an
      empty inspector -- is what this showed before anything had been cut.
      It reads as broken rather than as new. */
+  .keys {
+    position: fixed; right: 18px; bottom: 18px; z-index: 60;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; box-shadow: 0 12px 40px rgba(0,0,0,.35);
+    font-size: 12.5px; max-width: 320px;
+  }
+  .keys b { display: block; margin-bottom: 8px; font-size: 12px; color: var(--dim); }
+  .keys dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  .keys dt { font-family: var(--mono); color: var(--soft); }
+  .keys dd { margin: 0; }
+
   .nothing-yet {
     flex: 1; display: none; flex-direction: column; align-items: center;
     justify-content: center; gap: 14px; text-align: center; padding: 40px;
@@ -351,6 +362,22 @@
     <button id="new-run">新的一輪</button>
   </div>
 
+  <div class="keys hide" id="keys">
+    <b>鍵盤</b>
+    <dl>
+      <dt>空白</dt><dd>播放／暫停</dd>
+      <dt>← →</dt><dd>前後一格（按住 Shift 是一秒）</dd>
+      <dt>↑ ↓</dt><dd>上一顆／下一顆</dd>
+      <dt>I</dt><dd>把進點改到播放頭</dd>
+      <dt>O</dt><dd>把出點改到播放頭</dd>
+      <dt>P</dt><dd>切換原素材＋裁切框</dd>
+      <dt>F</dt><dd>時間軸符合寬度</dd>
+      <dt>Delete</dt><dd>刪掉這一顆</dd>
+      <dt>⌘Z</dt><dd>還原</dd>
+      <dt>?</dt><dd>開關這張表</dd>
+    </dl>
+  </div>
+
   <div class="nothing-yet" id="nothing-yet">
     <h2>還沒有剪過東西</h2>
     <p>指一個放毛片的資料夾，它會看過每一支、決定怎麼剪、然後交出一支片<br>
@@ -386,6 +413,7 @@
       <span class="vol">音量 <input type="range" id="vol" min="0" max="1" step="0.05" value="1"></span>
       <span class="grow" id="strip-note">拖邊緣改進出點，拖方塊換順序，× 刪掉</span>
       <span class="zoom">縮放 <input type="range" id="zoom" min="6" max="120" step="1" value="24"></span>
+      <button class="ghost" id="show-keys" title="鍵盤操作">?</button>
       <button class="ghost" id="fit">符合寬度</button>
       <button class="ghost" id="undo-cut">還原</button>
       <button class="ghost hide" id="burn">燒進畫面</button>
@@ -910,7 +938,8 @@ function paintWaves(total) {
     const img = new Image();
     img.onload = () => {
       lane.classList.remove('silent');
-      lane.innerHTML = `<span class="name">${which === 'voice' ? '人聲' : '音樂'}</span>`;
+      lane.innerHTML =
+        `<span class="name">${which === 'voice' ? '人聲' : '音樂'}</span>`;
       lane.appendChild(img);
     };
     img.onerror = () => {
@@ -983,17 +1012,7 @@ function wireStrip() {
       const was = { in: b.in_seconds, sec: b.seconds };
       const perPx = 1 / scale;
       const move = (ev) => {
-        const d = (ev.clientX - startX) * perPx;
-        if (edge === 'l') {
-          // Pulling the head earlier eats into the handle; the shot keeps
-          // its out-point, so it gets longer rather than sliding.
-          const shift = Math.max(-was.in, Math.min(d, was.sec - 0.3));
-          b.in_seconds = +(was.in + shift).toFixed(3);
-          b.seconds = +(was.sec - shift).toFixed(3);
-        } else {
-          const room = b.source_seconds ? b.source_seconds - b.in_seconds : 99;
-          b.seconds = +Math.max(0.3, Math.min(was.sec + d, room)).toFixed(3);
-        }
+        trimBy(i, edge, (ev.clientX - startX) * perPx, was);
         paintStrip();
       };
       const up = () => {
@@ -1004,6 +1023,37 @@ function wireStrip() {
       document.addEventListener('mouseup', up);
     };
   }
+}
+
+// One definition of what trimming an edge means, so the mouse and the
+// keyboard cannot come to different answers about it.
+function trimBy(i, edge, by, was) {
+  const b = blocks[i];
+  if (edge === 'l') {
+    // Pulling the head earlier eats into the handle; the shot keeps its
+    // out-point, so it gets longer rather than sliding.
+    const shift = Math.max(-was.in, Math.min(by, was.sec - 0.3));
+    b.in_seconds = +(was.in + shift).toFixed(3);
+    b.seconds = +(was.sec - shift).toFixed(3);
+  } else {
+    const room = b.source_seconds ? b.source_seconds - b.in_seconds : 99;
+    b.seconds = +Math.max(0.3, Math.min(was.sec + by, room)).toFixed(3);
+  }
+}
+
+// Where the playhead sits inside the shot it is over.
+function intoShot(i) {
+  const before = blocks.slice(0, i).reduce((a, b) => a + b.seconds, 0);
+  return ($('video').currentTime || 0) - before;
+}
+
+function goToShot(i) {
+  if (!blocks.length) return;
+  picked = Math.max(0, Math.min(i, blocks.length - 1));
+  const at = blocks.slice(0, picked).reduce((a, b) => a + b.seconds, 0);
+  $('video').currentTime = at + 0.03;
+  paintStrip(); inspect(picked); movePlayhead();
+  if (peeking) peek(true);
 }
 
 $('undo-cut').addEventListener('click', () => {
@@ -1568,11 +1618,58 @@ $('playhead').addEventListener('mousedown', (e) => {
 });
 
 addEventListener('keydown', (e) => {
+  // A subtitle is edited in place, so the letters of a shortcut are also
+  // the letters of a word somebody is typing.
   if (/input|textarea/i.test(e.target.tagName)) return;
-  if (e.code === 'Space') { e.preventDefault(); $('play').click(); }
-  if (e.key === 'ArrowLeft') $('video').currentTime -= e.shiftKey ? 1 : 1 / 30;
-  if (e.key === 'ArrowRight') $('video').currentTime += e.shiftKey ? 1 : 1 / 30;
+  if (e.target.isContentEditable) return;
+  if (e.metaKey || e.ctrlKey) {
+    if (e.key === 'z') { e.preventDefault(); $('undo-cut').click(); }
+    return;
+  }
+
+  const keys = {
+    Space: () => $('play').click(),
+    ArrowLeft: () => { $('video').currentTime -= e.shiftKey ? 1 : 1 / 30; },
+    ArrowRight: () => { $('video').currentTime += e.shiftKey ? 1 : 1 / 30; },
+    ArrowUp: () => goToShot(picked - 1),
+    ArrowDown: () => goToShot(picked + 1),
+    // The two an edit actually needs: trim this shot to where you are
+    // looking. Dragging a two-pixel grip to do that is the part of a
+    // timeline nobody enjoys.
+    i: () => {
+      if (picked < 0) return;
+      const b = blocks[picked];
+      trimBy(picked, 'l', intoShot(picked),
+             { in: b.in_seconds, sec: b.seconds });
+      paintStrip();
+    },
+    o: () => {
+      if (picked < 0) return;
+      const b = blocks[picked];
+      trimBy(picked, 'r', intoShot(picked) - b.seconds,
+             { in: b.in_seconds, sec: b.seconds });
+      paintStrip();
+    },
+    p: () => (peeking ? $('see-cut') : $('see-raw')).click(),
+    f: () => $('fit').click(),
+    Backspace: () => dropShot(picked),
+    Delete: () => dropShot(picked),
+    '?': () => $('keys').classList.toggle('hide'),
+  };
+  const act = keys[e.code === 'Space' ? 'Space' : e.key];
+  if (!act) return;
+  e.preventDefault();
+  act();
 });
+
+function dropShot(i) {
+  if (i < 0 || blocks.length < 2) return;
+  blocks.splice(i, 1);
+  picked = Math.min(i, blocks.length - 1);
+  paintStrip(); inspect(picked);
+}
+
+$('show-keys').addEventListener('click', () => $('keys').classList.toggle('hide'));
 
 $('fold').addEventListener('click', () => {
   const shut = $('panes').classList.toggle('shut');

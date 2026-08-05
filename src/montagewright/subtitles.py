@@ -32,8 +32,9 @@ from typing import Sequence
 # one typographic mistake in Chinese that everybody notices.
 NEVER_STARTS = "，。、！？：；）」』】》,.!?;:)]}"
 
-# Ordered by preference. The first that opens wins; a machine with none of
-# them cannot burn Chinese subtitles and is told so rather than shown boxes.
+# Where to look when the system cannot be asked. Ordered by preference; a
+# machine with none of them and no fontconfig cannot burn Chinese subtitles,
+# and is told so rather than shown boxes.
 FONTS: tuple[str, ...] = (
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -92,17 +93,100 @@ def safe_area(aspect: str) -> SafeArea:
     return SAFE_AREAS.get(aspect, SAFE_AREAS["9:16"])
 
 
-def _face(size: int):
+# Set to a path to override everything below it.
+CHOSEN: str | None = None
+
+
+def _asked_of_the_system(lang: str) -> list[str]:
+    """Candidate font files, ranked, from fontconfig if it is installed.
+
+    A hard-coded list of paths is a guess about somebody else's machine. It
+    was also wrong on this one in both directions: it missed the font the
+    system would have named, and the font the system names first --
+    PingFang -- is one FreeType cannot open, so asking has to be the start
+    of the search rather than the end of it.
+    """
+
+    try:
+        found = subprocess.run(
+            ["fc-match", "--sort", "-f", "%{file}\n", f":lang={lang}"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [one for one in found.stdout.splitlines() if one.strip()]
+
+
+def _can_draw(face, text: str) -> bool:
+    """Whether this font has the characters, rather than boxes for them.
+
+    Pillow draws a missing glyph as .notdef and says nothing, so a name it
+    cannot spell comes out as tofu in a finished film. A private-use
+    codepoint is missing from every sane font, so anything that renders
+    identically to it is missing too.
+    """
+
+    absent = face.getmask("\ue001")
+    for letter in set(text):
+        if letter.isspace():
+            continue
+        mask = face.getmask(letter)
+        if mask.size == absent.size and bytes(mask) == bytes(absent):
+            return False
+    return True
+
+
+def cannot_spell(text: str, *, size: int = 40) -> str:
+    """The characters the chosen font has no glyph for.
+
+    Worth saying out loud: they are drawn as empty boxes and nothing else
+    reports it, so a name the font cannot spell reaches a finished film.
+    """
+
+    face = _face(size, text=text)
+    return "".join(
+        sorted({
+            letter for letter in text
+            if not letter.isspace() and not _can_draw(face, letter)
+        })
+    )
+
+
+def _face(size: int, *, text: str = "", lang: str = "zh-tw"):
     from PIL import ImageFont
 
-    for candidate in FONTS:
+    tried: list[str] = []
+    if CHOSEN:
+        tried.append(CHOSEN)
+    tried += _asked_of_the_system(lang)
+    tried += list(FONTS)
+
+    # Rank order, but "draws everything" cannot be the only rule. One emoji
+    # in a line means no Chinese font qualifies, and taking the first
+    # candidate that did set a whole street interview in STIX Two Math.
+    # So: the best-ranked font that draws the most of the text, which is
+    # the CJK font missing one emoji rather than a maths font missing the
+    # language.
+    wanted = {one for one in text if not one.isspace()}
+    best = None
+    for rank, candidate in enumerate(tried[:24]):
         try:
-            return ImageFont.truetype(candidate, size)
+            face = ImageFont.truetype(candidate, size)
         except OSError:
             continue
+        if not wanted:
+            return face
+        drawn = sum(1 for one in wanted if _can_draw(face, one))
+        if drawn == len(wanted):
+            return face
+        if best is None or drawn > best[0]:
+            best = (drawn, rank, face)
+    if best is not None:
+        return best[2]
     raise NoFontHere(
-        "no CJK font found; subtitles can be written as a file but not "
-        "burned into the picture on this machine"
+        "no font here can draw these subtitles; they can still be written "
+        "as a file. Set montagewright.subtitles.CHOSEN to a font path, or "
+        "install fontconfig so the system can be asked."
     )
 
 
@@ -362,6 +446,13 @@ def burn(
     face = _face(max(12, round(height * area.text_height)))
     room = round(width * (1 - area.side_margin * 2))
     lines = split_cues(lines, face, room)
+
+    unknown = cannot_spell("".join(line.text for line in lines))
+    if unknown:
+        print(
+            f"subtitles: no glyph for {unknown} — they will be empty boxes",
+            flush=True,
+        )
 
     drawn = []
     for index, line in enumerate(lines):

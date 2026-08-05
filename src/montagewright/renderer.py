@@ -336,16 +336,39 @@ def _mux_music(
             f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled"
             "[out]"
         )
-    _run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(picture), "-i", str(music),
-            "-filter_complex", chain,
-            "-map", "0:v:0", "-map", "[out]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest", str(destination),
+    # Keep the bed as it ended up, not as it arrived. Whether the music
+    # steps back for the voice is the one thing about a mix somebody wants
+    # to check before posting, and the only honest way to show it is to draw
+    # the track that was actually laid under the words. Inferring it from
+    # where the speech is would be a picture of the intention.
+    # A filter label is consumed once, so the bed cannot simply be named
+    # twice -- it is split, one copy into the mix and one into a file.
+    bed_out = []
+    if "[ducked];" in chain:
+        chain = chain.replace(
+            "[ducked];", "[ducked];[ducked]asplit=2[duck_mix][bed_only];", 1
+        ).replace("[voice][ducked]amix", "[voice][duck_mix]amix", 1)
+        bed_out = ["-map", "[bed_only]"]
+    elif "[bed];" in chain and "[voice][bed]amix" in chain:
+        chain = chain.replace(
+            "[bed];", "[bed];[bed]asplit=2[bed_mix][bed_only];", 1
+        ).replace("[voice][bed]amix", "[voice][bed_mix]amix", 1)
+        bed_out = ["-map", "[bed_only]"]
+
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(picture), "-i", str(music),
+        "-filter_complex", chain,
+        "-map", "0:v:0", "-map", "[out]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest", str(destination),
+    ]
+    if bed_out:
+        command += bed_out + [
+            "-c:a", "aac", "-b:a", "128k", "-shortest",
+            str(destination.parent / "bed-as-laid.m4a"),
         ]
-    )
+    _run(command)
     return destination
 
 

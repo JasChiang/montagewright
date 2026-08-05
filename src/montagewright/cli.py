@@ -661,7 +661,11 @@ def command_render(args: argparse.Namespace) -> int:
             )
             print(f"subtitles   {output / 'subtitles.srt'}", flush=True)
             if args.subtitles == "burn":
+                from montagewright import subtitles as typeset
                 from montagewright.subtitles import NoFontHere, burn
+
+                if args.subtitle_font:
+                    typeset.CHOSEN = str(args.subtitle_font.expanduser())
 
                 try:
                     burned = burn(
@@ -1145,6 +1149,11 @@ def main(argv: list[str] | None = None) -> int:
             "sidecar writes an SRT beside the cut; burn also puts the words "
             "on the picture, inside the safe area for the delivery aspect"
         ),
+    )
+    render.add_argument(
+        "--subtitle-font", type=Path,
+        help="a font file to set the subtitles in; the system is asked if "
+             "this is not given",
     )
     render.add_argument(
         "--speech", choices=["auto", "never"], default="auto",

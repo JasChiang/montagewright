@@ -2469,3 +2469,52 @@ def test_the_setup_offers_what_the_command_line_offers() -> None:
     ).read_text(encoding="utf-8")
     assert 'subtitles: str = Form("sidecar")' in source
     assert 'command += ["--subtitles", subtitles]' in source
+
+
+def test_the_system_is_asked_for_a_font_before_paths_are_guessed() -> None:
+    """A hard-coded list of paths is a guess about somebody else's machine.
+
+    It was wrong on this one in both directions: it missed the font the
+    system would have named, and the font the system names first is one
+    FreeType cannot open. So asking is the start of the search, not the end.
+    """
+
+    from montagewright import subtitles as typeset
+
+    face = typeset._face(40, text="夏天最崩潰的事")
+    assert face is not None
+    assert typeset._can_draw(face, "夏天最崩潰的事")
+
+    # An explicit choice wins over anything found.
+    was = typeset.CHOSEN
+    try:
+        typeset.CHOSEN = "/System/Library/Fonts/STHeiti Medium.ttc"
+        assert typeset._face(40, text="夏天").path.endswith("STHeiti Medium.ttc")
+    finally:
+        typeset.CHOSEN = was
+
+
+def test_a_font_is_chosen_for_the_language_not_for_one_stray_character(
+) -> None:
+    """One emoji in a line means no Chinese font draws everything.
+
+    Taking the first candidate that did set a whole street interview in a
+    maths font, which had the emoji and not the language.
+    """
+
+    from montagewright import subtitles as typeset
+
+    with_emoji = typeset._face(40, text="好熱😀真的")
+    plain = typeset._face(40, text="好熱真的")
+    assert with_emoji.path == plain.path
+    assert typeset._can_draw(with_emoji, "好熱真的")
+
+
+def test_characters_the_font_cannot_spell_are_named() -> None:
+    """Pillow draws a missing glyph as an empty box and says nothing, so a
+    name it cannot spell reaches a finished film."""
+
+    from montagewright.subtitles import cannot_spell
+
+    assert cannot_spell("夏天最崩潰的事") == ""
+    assert "😀" in cannot_spell("好熱😀真的")
