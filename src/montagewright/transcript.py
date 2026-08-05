@@ -203,8 +203,14 @@ def snap(seconds: float, candidates: list[float], *, within: float = 0.6) -> flo
     return nearest if abs(nearest - seconds) <= within else seconds
 
 
-def to_srt(lines: list[Line]) -> str:
-    """Standard subtitles, so this is useful without the rest of the tool."""
+def to_srt(lines: list[Line], *, with_speaker: bool = False) -> str:
+    """Standard subtitles, so this is useful without the rest of the tool.
+
+    Who said it is structured data, not part of the line, so putting it on
+    screen is a decision rather than a default. The two callers had already
+    drifted -- one prefixed the name and one did not -- which is what an
+    implicit choice does.
+    """
 
     def stamp(seconds: float) -> str:
         milli = max(0, round(seconds * 1000))
@@ -215,10 +221,15 @@ def to_srt(lines: list[Line]) -> str:
 
     blocks = []
     for index, line in enumerate(lines, start=1):
+        said = (
+            f"{line.speaker}：{line.text}"
+            if with_speaker and line.speaker
+            else line.text
+        )
         blocks.append(
             f"{index}\n"
             f"{stamp(line.starts_seconds)} --> {stamp(line.ends_seconds)}\n"
-            f"{line.text}\n"
+            f"{said}\n"
         )
     return "\n".join(blocks)
 
@@ -253,6 +264,51 @@ def lines_of(card: dict[str, Any]) -> list[Line]:
         for entry in card.get("lines", []) or []
         if entry.get("text")
     ]
+
+
+def against_cut(
+    shots: list[dict],
+    rhythm: dict[str, dict],
+    # A source with nothing transcribed has no card, and `load` returns None
+    # for one it cannot read. Both mean the same thing here: no lines.
+    cards: dict[str, dict | None],
+) -> list[Line]:
+    """Every transcribed line, moved onto the timeline the shots landed on.
+
+    A line is timed against the take it was spoken in, and the cut kept two
+    seconds of that take starting somewhere in the middle. A subtitle file
+    that makes the reader work out which take a line came from is not one.
+
+    This was written inside the SRT endpoint, which was the only thing that
+    needed it. Three things need it now -- the file, the track on the
+    timeline, and eventually burning it into the picture -- and three copies
+    of "where does this line land" is three answers to it.
+    """
+
+    timed: list[Line] = []
+    cursor = 0.0
+    for index, shot in enumerate(shots):
+        seconds = float(rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0))
+        card = cards.get(str(shot.get("source_id", "")))
+        start = float(shot.get("start_seconds", 0.0))
+        for line in lines_of(card or {}):
+            if line.ends_seconds <= start:
+                continue
+            if line.starts_seconds >= start + seconds:
+                continue
+            timed.append(
+                Line(
+                    text=line.text,
+                    starts_seconds=cursor
+                    + max(0.0, line.starts_seconds - start),
+                    ends_seconds=cursor
+                    + min(seconds, line.ends_seconds - start),
+                    heard=line.heard,
+                    speaker=line.speaker,
+                )
+            )
+        cursor += seconds
+    return timed
 
 
 def _schema() -> dict[str, Any]:

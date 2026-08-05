@@ -172,6 +172,30 @@
   }
   .lane img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .5; }
   .lane.silent { display: grid; place-items: center; font-size: 10.5px; color: var(--dim); }
+  .lane.subs { height: 40px; }
+  /* Every other lane draws a waveform behind its name. This one draws
+     opaque blocks, and the first line of a cut usually starts at zero. */
+  .lane.subs .name { top: -1px; left: 0; border-radius: 0 3px 3px 0; z-index: 9; }
+  .sub {
+    position: absolute; top: 5px; height: 30px; box-sizing: border-box;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: 2px 6px; overflow: hidden; cursor: text; font-size: 11.5px;
+    line-height: 1.15; white-space: nowrap; text-overflow: ellipsis;
+  }
+  .sub.on { border-color: var(--accent); }
+  /* A line whose wording was corrected. The transcript still says what was
+     heard; this says that the two now differ. */
+  .sub.fixed { border-left: 3px solid var(--accent); }
+  .sub .who { color: var(--dim); margin-right: 4px; }
+  .sub[contenteditable="true"] {
+    white-space: normal; overflow: visible; z-index: 8; height: auto;
+    min-height: 30px; background: var(--deep); border-color: var(--accent);
+  }
+  .sub .edge {
+    position: absolute; top: 0; bottom: 0; width: 6px; cursor: ew-resize;
+  }
+  .sub .edge.l { left: -2px; }
+  .sub .edge.r { right: -2px; }
   .playhead {
     position: absolute; left: 0; top: 0; bottom: 0; width: 1px;
     background: var(--accent); z-index: 6; cursor: ew-resize;
@@ -348,6 +372,7 @@
       <div class="reel" id="reel">
         <div class="ruler" id="ruler"></div>
         <div class="track" id="track"></div>
+        <div class="lane subs" id="lane-subs"><span class="name">字幕</span></div>
         <div class="lane" id="lane-voice"><span class="name">人聲</span></div>
         <div class="lane" id="lane-music"><span class="name">音樂</span></div>
         <div class="playhead" id="playhead" style="left:0"></div>
@@ -672,6 +697,7 @@ async function showStrip() {
   // find one through a block. It used to give up quietly and leave the
   // button lit over an empty player.
   if (peeking) peek(true);
+  loadSubs();
   // Clicking anywhere on the reel is a seek, which is what a timeline is for.
   $('reel').onclick = (e) => {
     if (e.target.closest('.blk')) return;
@@ -719,6 +745,133 @@ function paintRuler(total) {
 // time and two ffmpeg passes over the film per pixel of drag. Rounding to a
 // step the cache can hold, and only asking once the drag settles, turns a
 // drag from hundreds of decodes into at most a few.
+// The lines as they will appear, against the shots they sit under. Wrong
+// wording is easiest to notice next to the picture that explains it, which
+// is why this is a track and not a list in a drawer.
+let subs = [], subsEdited = false;
+
+async function loadSubs() {
+  try {
+    const got = await fetch(`/api/runs/${runId}/subtitle-track`);
+    if (!got.ok) { subs = []; paintSubs(); return; }
+    const data = await got.json();
+    subs = data.lines || [];
+    subsEdited = !!data.edited;
+  } catch (error) { subs = []; }
+  paintSubs();
+}
+
+function paintSubs() {
+  const lane = $('lane-subs');
+  lane.classList.toggle('silent', !subs.length);
+  if (!subs.length) {
+    lane.innerHTML = '這支片沒有語音，所以沒有字幕';
+    return;
+  }
+  lane.innerHTML = `<span class="name">字幕</span>` + subs.map((line, i) => {
+    const wide = Math.max(14, (line.until - line.at) * scale - 2);
+    const changed = line.derived && line.derived !== line.text;
+    return `<div class="sub ${changed ? 'fixed' : ''}"
+      style="left:${line.at * scale}px;width:${wide}px"
+      data-i="${i}" title="${esc(
+        changed ? `原本：${line.derived}\n聽到：${line.heard}`
+                : (line.heard || line.text))}">
+      <span class="edge l" data-edge="l" data-i="${i}"></span>${
+        line.speaker ? `<span class="who">${esc(line.speaker)}</span>` : ''
+      }${esc(line.text)}<span class="edge r" data-edge="r" data-i="${i}"></span>
+    </div>`;
+  }).join('');
+  wireSubs();
+}
+
+function wireSubs() {
+  for (const el of $('lane-subs').querySelectorAll('.sub')) {
+    const i = +el.dataset.i;
+
+    el.onclick = (e) => {
+      if (e.target.closest('.edge')) return;
+      // Clicking a line takes you to it. Reading a subtitle without the
+      // frame under it is how a correct line gets "fixed".
+      $('video').currentTime = subs[i].at + 0.01;
+      movePlayhead();
+      for (const other of $('lane-subs').querySelectorAll('.sub')) {
+        other.classList.remove('on');
+      }
+      el.classList.add('on');
+    };
+
+    el.ondblclick = (e) => {
+      if (e.target.closest('.edge')) return;
+      el.setAttribute('contenteditable', 'true');
+      el.textContent = subs[i].text;
+      el.focus();
+      document.getSelection().selectAllChildren(el);
+    };
+
+    el.onblur = () => {
+      if (el.getAttribute('contenteditable') !== 'true') return;
+      el.removeAttribute('contenteditable');
+      const said = el.textContent.trim();
+      if (said && said !== subs[i].text) { subs[i].text = said; saveSubs(); }
+      paintSubs();
+    };
+
+    el.onkeydown = (e) => {
+      if (el.getAttribute('contenteditable') !== 'true') return;
+      if (e.key === 'Enter') { e.preventDefault(); el.blur(); }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        el.removeAttribute('contenteditable');
+        paintSubs();
+      }
+      // Typing in a subtitle is not a keyboard shortcut.
+      e.stopPropagation();
+    };
+
+    for (const grip of el.querySelectorAll('.edge')) {
+      grip.onmousedown = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const side = grip.dataset.edge;
+        const from = e.clientX;
+        const was = { at: subs[i].at, until: subs[i].until };
+        const move = (ev) => {
+          const by = (ev.clientX - from) / scale;
+          if (side === 'l') {
+            subs[i].at = Math.max(0, Math.min(was.at + by, subs[i].until - 0.2));
+          } else {
+            subs[i].until = Math.max(subs[i].at + 0.2, was.until + by);
+          }
+          paintSubs();
+        };
+        const up = () => {
+          document.removeEventListener('mousemove', move);
+          document.removeEventListener('mouseup', up);
+          saveSubs();
+        };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+      };
+    }
+  }
+}
+
+// Saved as they are changed. A correction that needs a button to survive is
+// a correction somebody will lose.
+let subsSaving = null;
+function saveSubs() {
+  clearTimeout(subsSaving);
+  subsSaving = setTimeout(async () => {
+    try {
+      await fetch(`/api/runs/${runId}/subtitle-track`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lines: subs }),
+      });
+      subsEdited = true;
+    } catch (error) { /* the lines are still on screen */ }
+  }, 400);
+}
+
 function paintWaves(total) {
   const asked = Math.max(600, Math.min(6000, Math.round(total * scale * 2)));
   const width = Math.min(6000, Math.ceil(asked / 500) * 500);
@@ -756,6 +909,7 @@ function paintStrip() {
     </div>`;
   }).join('');
   wireStrip();
+  paintSubs();
   const changed = JSON.stringify(blocks) !== JSON.stringify(blocksWere);
   $('recut').classList.toggle('hide', !changed);
   $('strip-note').textContent = changed

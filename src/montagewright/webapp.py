@@ -31,6 +31,8 @@ from pathlib import Path
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from montagewright.uploads import default_library
+
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".aiff", ".MP3", ".M4A", ".WAV"}
 # The names a request may ask for, and what each one is as a ratio. These
@@ -155,6 +157,69 @@ def _collect(run: Run) -> None:
     run.returncode = run.process.wait()
     run.state = "done" if run.returncode == 0 else "failed"
     run.remember()
+
+
+def _transcript_map(run) -> dict:
+    """Which transcript belongs to which source, for this run.
+
+    Transcripts moved into the shared library when they became worth keeping
+    across runs, and they are named for the bytes they describe -- the same
+    rule as the cards, for the same reason. Two readers here were still
+    looking in the output directory, which nothing has written since, and
+    keying by filename, which is a hash. So they found nothing and said
+    nothing: the transcript tab was empty for every run, and the subtitles
+    were empty for every run, and both looked like "this cut has no speech".
+    """
+
+    from montagewright.clipcard import card_map
+    from montagewright.transcript import load
+
+    found = card_map(
+        run.output / "work" / "proxies",
+        default_library() / "transcripts",
+    )
+    return {
+        source_id: card
+        for source_id, path in found.items()
+        if (card := load(path)) is not None
+    }
+
+
+def _subtitle_lines(run, *, edits: bool = True) -> "list":
+    """What should appear on screen, edits included.
+
+    The derived lines come from the transcripts and the running order. An
+    edited set, if there is one, replaces them wholesale -- it was derived
+    from the same cut and then corrected, so merging the two would mean
+    re-deriving a line somebody had already fixed.
+    """
+
+    from montagewright.transcript import Line, against_cut
+
+    edited = run.output / "work" / "subtitles.json"
+    if edits and edited.exists():
+        try:
+            saved = json.loads(edited.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = []
+        if saved:
+            return [
+                Line(
+                    text=str(one.get("text", "")),
+                    starts_seconds=float(one.get("at", 0.0)),
+                    ends_seconds=float(one.get("until", 0.0)),
+                    heard=str(one.get("heard", "")),
+                    speaker=str(one.get("speaker", "")),
+                )
+                for one in saved
+            ]
+
+    report = run.report() or {}
+    return against_cut(
+        report.get("selection", {}).get("shots", []),
+        report.get("rhythm", {}),
+        _transcript_map(run),
+    )
 
 
 class _AlreadyHave(Exception):
@@ -585,7 +650,7 @@ def create_app() -> FastAPI:
         )
         cards = card_map(
             run.output / "work" / "proxies",
-            Path.home() / ".cache" / "montagewright" / "library" / "cards",
+            default_library() / "cards",
         )
         clips, sources = [], {}
         for index, entry in enumerate(wanted):
@@ -651,8 +716,7 @@ def create_app() -> FastAPI:
         result = render_cut(
             plan, run.output, music=music, keep_segments=True,
             keep_voice=bool(
-                list((Path.home() / ".cache" / "montagewright" / "library"
-                      / "transcripts").glob("*.json"))
+                list((default_library() / "transcripts").glob("*.json"))
             ),
             under_speech=str(
                 report.get("direction", {}).get("music_under_speech") or "duck"
@@ -675,16 +739,12 @@ def create_app() -> FastAPI:
         wrong sentence.
         """
 
-        from montagewright.transcript import lines_of, load
+        from montagewright.transcript import lines_of
 
         run = _run(run_id)
-        folder = run.output / "work" / "transcripts"
         out = {}
-        for path in sorted(folder.glob("*.json")):
-            card = load(path)
-            if card is None:
-                continue
-            out[path.stem] = {
+        for source_id, card in sorted(_transcript_map(run).items()):
+            out[source_id] = {
                 "language": card.get("language"),
                 "summary": card.get("summary", ""),
                 "lines": [
@@ -817,6 +877,71 @@ def create_app() -> FastAPI:
             filename=f"{run_id}.{suffix}",
         )
 
+    @app.get("/api/runs/{run_id}/subtitle-track")
+    def subtitle_track(run_id: str) -> JSONResponse:
+        """The subtitles as a track, so they can be read against the picture.
+
+        Same lines the file gets. A line that is wrong is wrong in both, and
+        the place to notice is next to the shot it is under.
+        """
+
+        run = _run(run_id)
+        # What the transcripts and the running order produce, before anyone
+        # touched it. Sent so the track can mark the lines that were changed
+        # -- comparing against `heard` marked almost all of them, because
+        # correcting what the recogniser misheard is the whole point of the
+        # pass that produced them.
+        derived = {
+            round(line.starts_seconds, 3): line.text
+            for line in _subtitle_lines(run, edits=False)
+        }
+        return JSONResponse({
+            "lines": [
+                {
+                    "at": round(line.starts_seconds, 3),
+                    "until": round(line.ends_seconds, 3),
+                    "text": line.text,
+                    "speaker": line.speaker,
+                    "heard": line.heard,
+                    "derived": derived.get(round(line.starts_seconds, 3), ""),
+                }
+                for line in _subtitle_lines(run)
+            ],
+            "edited": (run.output / "work" / "subtitles.json").exists(),
+        })
+
+    @app.put("/api/runs/{run_id}/subtitle-track")
+    async def edit_subtitle_track(run_id: str, request: Request) -> JSONResponse:
+        """Keep an edited set of lines beside the ones that were derived.
+
+        Gemini fixes most of what the recogniser mishears and not all of it,
+        and the name of a product is exactly the kind of word it gets wrong.
+        Edits are kept separately rather than written back over the
+        transcript: the transcript is what was heard, which stays true, and
+        this is what should appear on screen.
+        """
+
+        run = _run(run_id)
+        sent = (await request.json()).get("lines", [])
+        kept = [
+            {
+                "at": round(float(one.get("at", 0.0)), 3),
+                "until": round(float(one.get("until", 0.0)), 3),
+                "text": str(one.get("text", "")),
+                "speaker": str(one.get("speaker", "")),
+                "heard": str(one.get("heard", "")),
+            }
+            for one in sent
+            if str(one.get("text", "")).strip()
+        ]
+        kept.sort(key=lambda one: one["at"])
+        destination = run.output / "work" / "subtitles.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return JSONResponse({"lines": len(kept)})
+
     @app.get("/api/runs/{run_id}/subtitles")
     def subtitles(run_id: str):
         """Every transcript in the run, as one SRT against the finished cut.
@@ -826,48 +951,15 @@ def create_app() -> FastAPI:
         the reader to work out which take a line came from is not one.
         """
 
-        from montagewright.transcript import Line, lines_of, load, to_srt
+        from montagewright.transcript import to_srt
 
         run = _run(run_id)
-        report = run.report() or {}
-        shots = report.get("selection", {}).get("shots", [])
-        rhythm = report.get("rhythm", {})
-        cards = {
-            path.stem: load(path)
-            for path in (run.output / "work" / "transcripts").glob("*.json")
-        }
-        timed: list[Line] = []
-        cursor = 0.0
-        for index, shot in enumerate(shots):
-            seconds = float(
-                rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)
-            )
-            card = cards.get(shot.get("source_id", ""))
-            start = float(shot.get("start_seconds", 0.0))
-            for line in lines_of(card or {}):
-                if line.ends_seconds <= start:
-                    continue
-                if line.starts_seconds >= start + seconds:
-                    continue
-                timed.append(
-                    Line(
-                        text=(
-                            f"{line.speaker}：{line.text}"
-                            if line.speaker
-                            else line.text
-                        ),
-                        starts_seconds=cursor
-                        + max(0.0, line.starts_seconds - start),
-                        ends_seconds=cursor
-                        + min(seconds, line.ends_seconds - start),
-                        heard=line.heard,
-                    )
-                )
-            cursor += seconds
+        timed = _subtitle_lines(run)
         if not timed:
             raise HTTPException(404, "nothing was transcribed in this run")
         path = run.output / "subtitles.srt"
-        path.write_text(to_srt(timed), encoding="utf-8")
+        # Several people in one cut; the file says which is which.
+        path.write_text(to_srt(timed, with_speaker=True), encoding="utf-8")
         return FileResponse(
             path, media_type="text/plain", filename=f"{run_id}.srt"
         )

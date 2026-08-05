@@ -929,6 +929,7 @@ def command_transcribe(args: argparse.Namespace) -> int:
     """
 
     from montagewright.transcript import describe, lines_of, load, save, to_srt
+    from montagewright.uploads import content_hash
 
     client = _client()
     cache = UploadCache.load(args.upload_cache or default_cache_path())
@@ -945,12 +946,25 @@ def command_transcribe(args: argparse.Namespace) -> int:
     output = (args.output or args.source.parent).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
 
+    library = (args.library or default_library()).expanduser()
+    work = output / "work"
+
     for source in sources:
-        destination = output / f"{source.stem}.transcript.json"
+        # The same proxy a render would make, keyed the same way. Both
+        # commands transcribe the same material and this one kept its answer
+        # beside its own output under the file's name, so rendering the same
+        # folder afterwards found nothing and paid for all of it again -- at
+        # twenty cents a clip, on the most expensive call in the tool.
+        proxy = _make_proxy(
+            source, work / "proxies" / f"{source.stem}.mp4", library=library
+        )
+        destination = (
+            library / "transcripts" / f"{content_hash(proxy)[:20]}.json"
+        )
         card = load(destination)
         if card is None:
             card, usage = describe(
-                source, client=client, locale=args.locale, cache=cache
+                proxy, client=client, locale=args.locale, cache=cache
             )
             ledger.record(
                 "transcript",
@@ -1106,6 +1120,10 @@ def main(argv: list[str] | None = None) -> int:
     speak.add_argument("--output", type=Path)
     speak.add_argument("--budget", type=float, default=5.0)
     speak.add_argument("--upload-cache", type=Path)
+    speak.add_argument(
+        "--library", type=Path,
+        help="where cards and transcripts live; shared across runs",
+    )
     speak.set_defaults(handler=command_transcribe)
 
     lay = sub.add_parser(

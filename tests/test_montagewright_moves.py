@@ -2066,3 +2066,120 @@ def test_a_cut_already_in_the_runs_folder_is_left_alone(tmp_path) -> None:
         assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == ["abc123"]
     finally:
         web.RUNS_ROOT = was
+
+
+def test_a_line_lands_where_the_cut_put_the_take_it_came_from() -> None:
+    """A line is timed against its take; the cut kept part of that take.
+
+    This lived inside the SRT endpoint because that was the only thing that
+    needed it. The track on the timeline needs it, and burning it into the
+    picture will need it, and three copies of "where does this line land" is
+    three answers to it.
+    """
+
+    from montagewright.transcript import against_cut
+
+    lines = against_cut(
+        [
+            {"source_id": "A", "start_seconds": 2.0},
+            {"source_id": "B", "start_seconds": 0.0},
+        ],
+        {"k00": {"seconds": 3.0}, "k01": {"seconds": 2.0}},
+        {
+            "A": {"lines": [
+                {"text": "早安", "starts_seconds": 2.5, "ends_seconds": 4.0,
+                 "speaker": "主持人"},
+                # Spoken in the take, after the part that was used.
+                {"text": "太早了", "starts_seconds": 9.0, "ends_seconds": 10.0},
+            ]},
+            "B": {"lines": [
+                {"text": "第二顆", "starts_seconds": 0.2, "ends_seconds": 1.4},
+            ]},
+        },
+    )
+
+    assert [line.text for line in lines] == ["早安", "第二顆"]
+    assert lines[0].starts_seconds == 0.5      # 2.5 in a take entered at 2.0
+    assert lines[0].speaker == "主持人"
+    assert lines[1].starts_seconds == 3.2      # after a three-second shot
+
+
+def test_who_said_it_is_a_decision_rather_than_a_default() -> None:
+    """Two callers had already drifted -- one prefixed, one did not."""
+
+    from montagewright.transcript import Line, to_srt
+
+    lines = [
+        Line(text="早安", starts_seconds=0.5, ends_seconds=2.0,
+             speaker="主持人"),
+        Line(text="你好", starts_seconds=2.0, ends_seconds=3.0),
+    ]
+    named = to_srt(lines, with_speaker=True)
+    plain = to_srt(lines)
+
+    assert "主持人：早安" in named and "主持人" not in plain
+    # And neither loses the numbering or the timestamps.
+    for made in (named, plain):
+        assert made.startswith("1\n00:00:00,500 --> 00:00:02,000\n")
+        assert "\n2\n00:00:02,000 --> 00:00:03,000\n" in made
+
+
+def test_an_edited_line_is_what_appears_and_the_transcript_stays_true(
+    tmp_path, monkeypatch,
+) -> None:
+    """Gemini fixes most of what the recogniser mishears, not all of it.
+
+    A product name is exactly the kind of word it gets wrong. The correction
+    is kept beside the transcript rather than written over it: the transcript
+    is what was heard, which stays true, and this is what should be on
+    screen.
+
+    Built the way a run builds it -- a proxy per source, and a transcript in
+    the shared library named for that proxy's bytes. Two readers were looking
+    in the output directory and keying by filename, so every run had an empty
+    transcript tab and no subtitles, and both read as "no speech here".
+    """
+
+    import json
+    from dataclasses import dataclass
+
+    from montagewright.transcript import save
+    from montagewright.uploads import content_hash
+    from montagewright.webapp import _subtitle_lines
+
+    monkeypatch.setenv("MONTAGEWRIGHT_LIBRARY", str(tmp_path / "library"))
+
+    @dataclass
+    class Pretend:
+        output: Path
+
+        def report(self):
+            return {
+                "selection": {"shots": [{"source_id": "A",
+                                         "start_seconds": 0.0}]},
+                "rhythm": {"k00": {"seconds": 3.0}},
+            }
+
+    proxies = tmp_path / "out" / "work" / "proxies"
+    proxies.mkdir(parents=True)
+    proxy = proxies / "A.mp4"
+    proxy.write_bytes(b"a take with someone talking in it")
+
+    save({"lines": [
+        {"text": "Galaxy Z 佛的", "starts_seconds": 0.0,
+         "ends_seconds": 2.0, "heard": "Galaxy Z 佛的"},
+    ]}, tmp_path / "library" / "transcripts"
+        / f"{content_hash(proxy)[:20]}.json")
+
+    run = Pretend(output=tmp_path / "out")
+    assert [line.text for line in _subtitle_lines(run)] == ["Galaxy Z 佛的"]
+
+    (tmp_path / "out" / "work" / "subtitles.json").write_text(
+        json.dumps([{"at": 0.0, "until": 2.0, "text": "Galaxy Z Fold",
+                     "heard": "Galaxy Z 佛的"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    fixed = _subtitle_lines(run)
+    assert [line.text for line in fixed] == ["Galaxy Z Fold"]
+    # What was actually heard survives the correction.
+    assert fixed[0].heard == "Galaxy Z 佛的"

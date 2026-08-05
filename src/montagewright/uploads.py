@@ -137,9 +137,18 @@ def _ascii_named(path: Path):
 
 
 def default_library() -> Path:
-    """Where what was learned about the material lives, across every run."""
+    """Where what was learned about the material lives, across every run.
 
-    return Path.home() / ".cache" / "montagewright" / "library"
+    Redirectable, because the web app had three hand-written copies of this
+    path and a test has nowhere to put a fixture that the code will look in.
+    """
+
+    return Path(
+        os.environ.get(
+            "MONTAGEWRIGHT_LIBRARY",
+            Path.home() / ".cache" / "montagewright" / "library",
+        )
+    )
 
 
 def upload_now(path: Path, client: Any) -> Any:
