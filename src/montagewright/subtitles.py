@@ -48,6 +48,59 @@ FONTS: tuple[str, ...] = (
 )
 
 
+# Enough colours to tell people apart, and no more. They are picked to stay
+# legible over a moving picture rather than to be pretty: high value, low
+# saturation, and none of them the red the interface uses for its own marks.
+SPEAKER_COLOURS: tuple[tuple[int, int, int], ...] = (
+    (255, 255, 255),
+    (255, 226, 138),
+    (168, 226, 255),
+    (198, 246, 186),
+    (255, 198, 224),
+)
+
+
+@dataclass(frozen=True)
+class Style:
+    """How the words look. Everything here is a decision somebody may want
+    to make differently, so none of it is buried in the drawing code."""
+
+    fill: tuple[int, int, int] = (255, 255, 255)
+    outline: tuple[int, int, int] = (0, 0, 0)
+    outline_alpha: int = 205
+    # A share of the type size, so it holds at any frame height.
+    outline_width: float = 0.09
+    # A plate behind the words, for footage too busy for an outline alone.
+    plate: tuple[int, int, int] | None = None
+    plate_alpha: int = 150
+    # Colour each speaker differently. In an interview this says who is
+    # talking faster than reading the words does.
+    by_speaker: bool = False
+    # Scale the size the safe area asks for, for anyone who wants it bigger.
+    size_scale: float = 1.0
+
+
+def palette_for(lines, style: Style) -> dict[str, tuple[int, int, int]]:
+    """A colour per speaker, assigned in the order they first talk.
+
+    Hashing the name instead gave two people in one interview the same
+    colour, which is worse than giving them all the same one: it says they
+    are the same person.
+    """
+
+    if not style.by_speaker:
+        return {}
+    order: list[str] = []
+    for line in lines:
+        who = getattr(line, "speaker", "")
+        if who and who not in order:
+            order.append(who)
+    return {
+        who: SPEAKER_COLOURS[index % len(SPEAKER_COLOURS)]
+        for index, who in enumerate(order)
+    }
+
+
 class NoFontHere(RuntimeError):
     """Nothing on this machine can draw the characters in these lines."""
 
@@ -418,6 +471,8 @@ def draw_line(
     height: int,
     area: SafeArea,
     into: Path,
+    style: Style | None = None,
+    ink: tuple[int, int, int] | None = None,
 ) -> tuple[Path, int, int] | None:
     """One subtitle as a transparent image, plus where to put it.
 
@@ -427,8 +482,9 @@ def draw_line(
 
     from PIL import Image, ImageDraw
 
+    style = style or Style()
     room = round(width * (1 - area.side_margin * 2))
-    asked = max(12, round(height * area.text_height))
+    asked = max(12, round(height * area.text_height * style.size_scale))
 
     # Fit by getting smaller, never by saying less. Cutting the overflow
     # off at max_lines dropped the last word of a sentence and left a cut
@@ -446,7 +502,7 @@ def draw_line(
     # An outline, not a box. A box is legible and covers the picture; an
     # outline stays readable over both a bright sky and a dark interior,
     # which is what a street interview is made of.
-    edge = max(2, round(size * 0.09))
+    edge = max(2, round(size * style.outline_width))
     gap = round(size * 0.34)
     step = size + gap
 
@@ -457,12 +513,19 @@ def draw_line(
         (0, 0, 0, 0),
     )
     pen = ImageDraw.Draw(canvas)
+    if style.plate is not None:
+        pen.rounded_rectangle(
+            (0, 0, canvas.width - 1, canvas.height - 1),
+            radius=max(4, round(size * 0.22)),
+            fill=(*style.plate, style.plate_alpha),
+        )
+    ink = ink or style.fill
     for index, one in enumerate(lines):
         at_x = (canvas.width - face.getbbox(one)[2]) // 2
         at_y = edge * 2 + index * step
         pen.text(
-            (at_x, at_y), one, font=face, fill=(255, 255, 255, 255),
-            stroke_width=edge, stroke_fill=(0, 0, 0, 205),
+            (at_x, at_y), one, font=face, fill=(*ink, 255),
+            stroke_width=edge, stroke_fill=(*style.outline, style.outline_alpha),
         )
 
     into.parent.mkdir(parents=True, exist_ok=True)
@@ -479,6 +542,7 @@ def burn(
     *,
     aspect: str,
     work: Path,
+    style: Style | None = None,
 ) -> Path:
     """Composite the lines onto the picture, each over its own window.
 
@@ -501,6 +565,8 @@ def burn(
     room = round(width * (1 - area.side_margin * 2))
     lines = split_cues(lines, face, room)
 
+    style = style or Style()
+    palette = palette_for(lines, style)
     unknown = cannot_spell("".join(line.text for line in lines))
     if unknown:
         print(
@@ -513,6 +579,8 @@ def burn(
         made = draw_line(
             line.text, width=width, height=height, area=area,
             into=work / f"sub-{index:04d}.png",
+            style=style,
+            ink=palette.get(getattr(line, "speaker", "")) or style.fill,
         )
         if made is not None:
             drawn.append((made, line))

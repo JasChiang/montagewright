@@ -253,6 +253,60 @@ def save(card: dict[str, Any], path: Path) -> Path:
     return path
 
 
+def words_in(card: dict[str, Any]) -> list[Word]:
+    """The words a card kept, if it kept any."""
+
+    made: list[Word] = []
+    for entry in card.get("words", []) or []:
+        try:
+            made.append(Word(
+                text=str(entry.get("text", "")),
+                starts_seconds=float(entry["starts_seconds"]),
+                ends_seconds=float(entry["ends_seconds"]),
+                confidence=(
+                    None if entry.get("confidence") is None
+                    else float(entry["confidence"])
+                ),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return made
+
+
+def words_for(
+    card: dict[str, Any], source: Path, *, locale: str = "zh-TW",
+    into: Path | None = None,
+) -> list[Word]:
+    """The words for this material, measured again if the card has none.
+
+    The recogniser runs on this machine and costs nothing, so a card written
+    before words were kept is not a reason to go without them -- or to pay
+    for the correction pass a second time. What comes back is written into
+    the card so the next reader does not have to ask.
+    """
+
+    kept = words_in(card)
+    if kept or not source.exists():
+        return kept
+    try:
+        heard = hear(source, locale=locale)
+    except Exception:
+        return []
+    found = words_of(heard)
+    if found and into is not None:
+        card["words"] = [
+            {
+                "text": word.text,
+                "starts_seconds": round(word.starts_seconds, 3),
+                "ends_seconds": round(word.ends_seconds, 3),
+                "confidence": word.confidence,
+            }
+            for word in found
+        ]
+        save(card, into)
+    return found
+
+
 def lines_of(card: dict[str, Any]) -> list[Line]:
     return [
         Line(
@@ -545,5 +599,19 @@ def describe(
         # talking shot lands mid-syllable, and every consumer of this card
         # needs them, not just the one that wrote them.
         "silences": silences,
+        # When each word was said. Measured locally and used here to write
+        # the prompt and find the silences, then thrown away -- which put
+        # word-level subtitles out of reach of a card that already knew the
+        # answer. Kept without bumping the card version: an older card
+        # simply has no words, and getting them again costs nothing.
+        "words": [
+            {
+                "text": word.text,
+                "starts_seconds": round(word.starts_seconds, 3),
+                "ends_seconds": round(word.ends_seconds, 3),
+                "confidence": word.confidence,
+            }
+            for word in words
+        ],
     }
     return card, Usage.from_interaction(interaction)
