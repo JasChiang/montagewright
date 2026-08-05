@@ -430,7 +430,23 @@ def create_app() -> FastAPI:
 
         run = _run(run_id)
         if not run.command:
-            raise HTTPException(400, "this run did not record how it started")
+            # Recorded before the command was kept. What carries the value is
+            # the work directory -- cards, transcripts, the direction, the
+            # selection -- and that belongs to the output, so a plain run
+            # pointed back at it picks all of them up. The options it was
+            # started with are lost; the money is not.
+            if not run.source or not Path(run.source).exists():
+                raise HTTPException(
+                    400, "this run did not record how it started"
+                )
+            run.command = [
+                sys.executable, "-u", "-m", "montagewright.cli", "render",
+                run.source, "--output", str(run.output), "--review",
+            ]
+            run.lines.append(
+                "— 這一輪是舊版存的，沒有記下當初的選項；"
+                "用預設值續跑，已經算好的東西都會沿用 —"
+            )
         if run.process is not None and run.process.poll() is None:
             raise HTTPException(409, "it is still going")
         run.lines.append("— 續跑 —")

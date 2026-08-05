@@ -615,9 +615,11 @@ def test_a_library_that_wrote_nothing_stops_the_run() -> None:
                 raise RuntimeError("no")
 
     with tempfile.TemporaryDirectory() as work:
+        clip = Path(work) / "a.mp4"
+        clip.write_bytes(b"not really a video")
         try:
             build_library(
-                {"a": Path("a.mp4")}, Path(work), client=Refuses()
+                {"a": clip}, Path(work) / "cards", client=Refuses()
             )
         except CardLibraryEmpty as error:
             assert "RuntimeError" in str(error), "the reason has to survive"
@@ -1396,3 +1398,26 @@ def test_a_run_that_died_can_be_picked_up_where_it_stopped() -> None:
     paths = {r.path for r in create_app().routes if hasattr(r, "path")}
     assert "/api/runs/{run_id}/resume" in paths
     assert "繼續跑" in PAGE.read_text(encoding="utf-8")
+
+
+def test_cards_belong_to_the_material_not_to_one_attempt() -> None:
+    """"Content-addressed" and "written once per output directory" at once.
+
+    Cards and transcripts describe the clip, which is why they are worth
+    keeping -- and they lived beside the output, so a second cut of the same
+    rushes rewrote all seventy-four of them for forty-four cents before
+    anything had been decided. They are named by the bytes now and live in
+    one library, so any run over the same material finds them.
+    """
+
+    import inspect
+
+    from montagewright import cli, clipcard
+    from montagewright.uploads import default_library
+
+    assert "library" in str(default_library())
+    assert "content_hash(proxy)" in inspect.getsource(clipcard.build_library)
+
+    source = inspect.getsource(cli.command_render)
+    assert 'library / "cards"' in source
+    assert 'library / "transcripts"' in source

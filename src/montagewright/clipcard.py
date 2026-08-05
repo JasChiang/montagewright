@@ -451,13 +451,19 @@ def build_library(
     """
 
     card_dir.mkdir(parents=True, exist_ok=True)
+    # Named by what they describe, not by where the file happened to sit. A
+    # card is only worth caching because it stays true, and it stays true for
+    # the same bytes under any name in any folder -- keeping them per run
+    # meant "content-addressed" and "written once per output directory" at
+    # the same time, so a second cut of the same rushes rewrote all of them.
+    from montagewright.uploads import content_hash
     paths: dict[str, Path] = {}
     stats = {"written": 0, "reused": 0, "failed": 0, "input": 0, "output": 0}
     failures: list[str] = []
 
     total = len(proxies)
     for index, (source_id, proxy) in enumerate(sorted(proxies.items()), start=1):
-        destination = card_dir / f"{source_id}.json"
+        destination = card_dir / f"{content_hash(proxy)[:20]}.json"
         if load_card(destination) is not None:
             paths[source_id] = destination
             stats["reused"] += 1

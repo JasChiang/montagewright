@@ -137,6 +137,12 @@ def _ascii_named(path: Path):
         shutil.rmtree(safe, ignore_errors=True)
 
 
+def default_library() -> Path:
+    """Where what was learned about the material lives, across every run."""
+
+    return Path.home() / ".cache" / "montagewright" / "library"
+
+
 def upload_now(path: Path, client: Any) -> Any:
     """Upload and wait until the file can actually be used.
 

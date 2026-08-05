@@ -40,7 +40,11 @@ from montagewright.planner import (
     select_shots,
 )
 from montagewright.schema import EDL, Clip, Reframe, Subject
-from montagewright.uploads import UploadCache, default_cache_path
+from montagewright.uploads import (
+    UploadCache,
+    default_cache_path,
+    default_library,
+)
 
 ASPECTS = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5}
 
@@ -90,6 +94,11 @@ def command_render(args: argparse.Namespace) -> int:
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     work = output / "work"
+    # Cards and transcripts describe the material, so they belong to the
+    # material rather than to one attempt at cutting it. Keeping them beside
+    # the output meant every new run over the same rushes paid for them again
+    # -- forty-four cents of cards before anything was decided.
+    library = (args.library or default_library()).expanduser()
     client = _client()
     cache = UploadCache.load(args.upload_cache or default_cache_path())
     ledger = Ledger(cap_usd=args.budget)
@@ -145,7 +154,7 @@ def command_render(args: argparse.Namespace) -> int:
         print(f"  card {index}/{total}  {source_id}", flush=True)
 
     cards, stats = build_library(
-        proxies, work / "cards", client=client, cache=cache, progress=wrote
+        proxies, library / "cards", client=client, cache=cache, progress=wrote
     )
     ledger.record(
         "clip_cards",
@@ -180,7 +189,12 @@ def command_render(args: argparse.Namespace) -> int:
             flush=True,
         )
         for source_id in speaking:
-            destination = work / "transcripts" / f"{source_id}.json"
+            from montagewright.uploads import content_hash
+
+            destination = (
+                library / "transcripts"
+                / f"{content_hash(proxies[source_id])[:20]}.json"
+            )
             card = load_transcript(destination)
             if card is None:
                 # Before the call, not after: a transcript on a long clip is
@@ -914,6 +928,10 @@ def main(argv: list[str] | None = None) -> int:
         help="transcribe clips whose card calls the speech content",
     )
     render.add_argument("--locale", default="zh-TW")
+    render.add_argument(
+        "--library", type=Path,
+        help="where cards and transcripts live; shared across runs",
+    )
     render.set_defaults(handler=command_render)
 
     speak = sub.add_parser(
