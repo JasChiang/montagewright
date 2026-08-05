@@ -151,3 +151,26 @@ def describe_for_prompt() -> str:
         "而放大到糊，實際放大倍數會回報成數字。"
     )
     return "\n".join(lines)
+
+
+# What this tool does not do, in the same place and for the same reason as
+# what it does. A reviewer judging the cut against a brief has no way to know
+# the difference between "this was done badly" and "this cannot be done here"
+# -- so it reported a missing title card as a fault every round, which is a
+# paid call spent on something no replan can ever fix, and a verdict of
+# "revise" on a cut that was as asked.
+CANNOT: tuple[tuple[str, str], ...] = (
+    ("字卡、標題、下標與任何疊加文字", "沒有製作字幕以外的文字圖層"),
+    ("轉場特效", "每一次都是硬切；長度與切點是唯一的節奏工具"),
+    ("調色與濾鏡", "畫面只做裁切、縮放與響度處理"),
+    ("速度變化", "沒有慢動作或加速"),
+    ("畫面合成", "不疊圖、不分割畫面、不做子母畫面"),
+)
+
+
+def describe_limits_for_prompt() -> str:
+    """The same list, for a prompt that is about to judge the result."""
+
+    return "\n".join(
+        f"- {what}：{why}" for what, why in CANNOT
+    )

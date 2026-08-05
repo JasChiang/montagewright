@@ -1955,3 +1955,30 @@ def test_the_crop_overlay_does_not_measure_the_page_every_frame() -> None:
     assert "let placed = null" in page
     assert "function forgetPlacement()" in page
     assert "loadedmetadata" in page
+
+
+def test_the_reviewer_is_told_what_this_tool_cannot_do() -> None:
+    """A reviewer cannot tell "done badly" from "cannot be done here".
+
+    A brief asked for title cards. There is no text layer, so the reviewer
+    reported their absence as a fault, returned "revise" on a cut that was
+    exactly as planned, and sent a paid round after something no replan can
+    ever fix. The list of what the executor can do already lives in one
+    place and is rendered into the prompt that chooses; the list of what it
+    cannot now sits beside it, rendered into the prompt that judges.
+    """
+
+    from montagewright.capabilities import CANNOT, describe_limits_for_prompt
+    from montagewright.review import PROMPTS
+
+    said = describe_limits_for_prompt()
+    assert "字卡" in said and "轉場" in said
+    assert len(CANNOT) == said.count("\n") + 1
+
+    prompt = (PROMPTS / "review_zh-TW.txt").read_text(encoding="utf-8")
+    assert "{limits}" in prompt
+    assert "不要把它們當成缺點寫進 issues" in prompt
+
+    # And it is actually substituted, not left as a literal brace.
+    filled = prompt.replace("{limits}", said)
+    assert "{limits}" not in filled and "字卡" in filled

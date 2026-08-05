@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from montagewright.capabilities import describe_limits_for_prompt
 from montagewright.cost import BudgetSpent, Ledger
 from montagewright.schema import DegradationStep, Issue, ReviewVerdict
 
@@ -126,7 +127,9 @@ def review_cut(
     if ledger is not None:
         ledger.check()
 
-    instruction = (PROMPTS / "review_zh-TW.txt").read_text(encoding="utf-8")
+    instruction = (PROMPTS / "review_zh-TW.txt").read_text(
+        encoding="utf-8"
+    ).replace("{limits}", describe_limits_for_prompt())
     if cache is None:
         uri = upload_now(preview, client).uri
     else:
