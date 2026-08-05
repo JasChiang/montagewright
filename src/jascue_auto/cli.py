@@ -308,24 +308,35 @@ def command_render(args: argparse.Namespace) -> int:
     rhythm_context = _rhythm_context(selection, cards)
 
     aspect = ASPECTS[args.aspect]
-    result, plan, report, resolved = run(
-        edl,
-        sources,
-        grid,
-        output,
-        target_aspect=aspect,
-        intent=direction["direction"],
-        brief=brief,
-        rhythm_context=rhythm_context,
-        target_seconds=float(direction["target_seconds"]),
-        music=args.music,
-        cards=cards,
-        checkpoint=args.sam_checkpoint,
-        ledger=ledger,
-        keep_voice=bool(transcripts),
-        under_speech=str(direction.get("music_under_speech") or "duck"),
-        client=client,
-    )
+
+    def cut(edl, sources, rhythm_context):
+        """Render this plan. One definition, because a replan renders again.
+
+        It was written out twice, and only the first copy learned to keep the
+        voice -- so a run that revised anything delivered the same film with
+        the speech thrown away and nothing but the bed left.
+        """
+
+        return run(
+            edl,
+            sources,
+            grid,
+            output,
+            target_aspect=aspect,
+            intent=direction["direction"],
+            brief=brief,
+            rhythm_context=rhythm_context,
+            target_seconds=float(direction["target_seconds"]),
+            music=args.music,
+            cards=cards,
+            checkpoint=args.sam_checkpoint,
+            ledger=ledger,
+            keep_voice=bool(transcripts),
+            under_speech=str(direction.get("music_under_speech") or "duck"),
+            client=client,
+        )
+
+    result, plan, report, resolved = cut(edl, sources, rhythm_context)
     # The direction set a length; somebody has to compare it with what came
     # out. Three layers each made a defensible call last run and delivered
     # 17.9 seconds against 30, with nothing in the report saying so.
@@ -466,21 +477,8 @@ def command_render(args: argparse.Namespace) -> int:
             }
             rhythm_context = _rhythm_context(selection, cards)
             try:
-                result, plan, report, resolved = run(
-                    edl,
-                    sources,
-                    grid,
-                    output,
-                    target_aspect=aspect,
-                    intent=direction["direction"],
-                    brief=brief,
-                    rhythm_context=rhythm_context,
-                    target_seconds=float(direction["target_seconds"]),
-                    music=args.music,
-                    cards=cards,
-                    checkpoint=args.sam_checkpoint,
-                    ledger=ledger,
-                    client=client,
+                result, plan, report, resolved = cut(
+                    edl, sources, rhythm_context
                 )
             except BudgetSpent as error:
                 stopped = str(error)

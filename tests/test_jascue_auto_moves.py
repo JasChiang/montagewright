@@ -1163,3 +1163,24 @@ def test_the_voice_is_levelled_before_anything_goes_under_it() -> None:
     source = inspect.getsource(renderer._mux_music)
     # Both paths: the steady bed and the ducked one.
     assert source.count("VOICE_LEVELLER") == 2
+
+
+def test_a_replan_renders_the_same_way_the_first_pass_did() -> None:
+    """The render call was written out twice and only one copy kept up.
+
+    The first learned to keep the voice and lay the bed under it; the second,
+    which runs after a replan, did not -- so any run that revised anything
+    delivered the film with the speech thrown away and nothing but music
+    left, having sounded correct in the round before.
+    """
+
+    import inspect
+
+    from jascue_auto import cli
+
+    source = inspect.getsource(cli.command_render)
+    assert source.count("keep_voice=bool(transcripts)") == 1
+    assert source.count("resolved = run(") == 0, (
+        "both renders go through one definition"
+    )
+    assert source.count("= cut(") == 2
