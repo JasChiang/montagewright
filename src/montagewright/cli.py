@@ -584,6 +584,18 @@ def command_render(args: argparse.Namespace) -> int:
     ):
         print(f"  {stage:12s} ${usd:.4f}", flush=True)
     print(f"deliverable {result.deliverable}", flush=True)
+    # What produced this, beside what it produced. The web interface lists
+    # every cut in the runs folder, and it was listing only the ones it had
+    # started itself -- a run made from the command line left a report, a
+    # film and a timeline, and nothing that could open them.
+    (output / "command.json").write_text(
+        json.dumps({
+            "source": str(rushes),
+            "command": [sys.executable, "-u", "-m", "montagewright.cli"]
+            + sys.argv[1:],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"preview     {result.preview}", flush=True)
 
     # Off unless asked for. A rendered file is what most runs want; a

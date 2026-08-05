@@ -1982,3 +1982,39 @@ def test_the_reviewer_is_told_what_this_tool_cannot_do() -> None:
     # And it is actually substituted, not left as a literal brace.
     filled = prompt.replace("{limits}", said)
     assert "{limits}" not in filled and "字卡" in filled
+
+
+def test_a_run_made_from_the_command_line_is_openable(tmp_path) -> None:
+    """The interface listed only the cuts it had started itself.
+
+    A run from the command line left a report, a film and two timelines, and
+    nothing that could open them -- so the one made to check the crops with
+    could not be looked at.
+    """
+
+    import json
+
+    import montagewright.webapp as web
+
+    folder = tmp_path / "check-0805"
+    (folder / "out").mkdir(parents=True)
+    (folder / "out" / "command.json").write_text(
+        json.dumps({"source": "/rushes", "command": ["render", "/rushes"]}),
+        encoding="utf-8",
+    )
+    (folder / "out" / "report.json").write_text("{}", encoding="utf-8")
+
+    was_root, was_runs = web.RUNS_ROOT, dict(web.RUNS)
+    try:
+        web.RUNS_ROOT = tmp_path
+        web.RUNS.clear()
+        web.recall()
+        assert "check-0805" in web.RUNS
+        found = web.RUNS["check-0805"]
+        assert found.source == "/rushes"
+        assert found.state == "done"
+        assert found.started_at > 0
+    finally:
+        web.RUNS_ROOT = was_root
+        web.RUNS.clear()
+        web.RUNS.update(was_runs)

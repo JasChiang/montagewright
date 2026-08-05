@@ -110,13 +110,25 @@ def recall() -> None:
     if not RUNS_ROOT.exists():
         return
     for folder in sorted(RUNS_ROOT.iterdir()):
+        if folder.name in RUNS or not folder.is_dir():
+            continue
+        # Either the note this server wrote, or the one the command line
+        # leaves beside its output. A cut is a cut however it was started.
         note = folder / "run.json"
-        if folder.name in RUNS or not note.exists():
+        spare = folder / "out" / "command.json"
+        if not note.exists() and not spare.exists():
             continue
         try:
-            saved = json.loads(note.read_text(encoding="utf-8"))
+            saved = json.loads(
+                (note if note.exists() else spare).read_text(encoding="utf-8")
+            )
         except (OSError, json.JSONDecodeError):
             continue
+        if not note.exists():
+            saved.setdefault("state", "done")
+            saved.setdefault(
+                "started_at", (folder / "out").stat().st_mtime
+            )
         RUNS[folder.name] = Run(
             run_id=folder.name,
             root=folder,
