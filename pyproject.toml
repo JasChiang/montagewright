@@ -1,7 +1,7 @@
 [project]
-name = "jascue-video-lab"
+name = "montagewright"
 version = "0.1.0"
-description = "Isolated Gemini 3.6 Flash video understanding and single-frame grounding experiment"
+description = "Rushes to a finished cut, with every decision on the record"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -19,8 +19,8 @@ dev = [
 ]
 
 [project.scripts]
-jascue-auto = "jascue_auto.cli:main"
-jascue-auto-web = "jascue_auto.webapp:main"
+montagewright = "montagewright.cli:main"
+montagewright-web = "montagewright.webapp:main"
 
 [project.optional-dependencies]
 tracking = [
@@ -38,7 +38,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/jascue_video_lab", "src/jascue_auto", "scripts"]
+packages = ["src/jascue_video_lab", "src/montagewright", "scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -43,7 +43,7 @@ def default_cache_path() -> Path:
 
     root = Path(
         os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
-    ) / "jascue-auto"
+    ) / "montagewright"
     return root / "uploads.json"
 
 
@@ -125,7 +125,7 @@ def _ascii_named(path: Path):
         yield path
         return
 
-    safe = Path(tempfile.mkdtemp(prefix="jascue-upload-"))
+    safe = Path(tempfile.mkdtemp(prefix="montagewright-upload-"))
     linked = safe / f"{content_hash(path)[:16]}{path.suffix}"
     try:
         os.link(path, linked)

@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from jascue_auto.executor import (
+from montagewright.executor import (
     CROP_MARGIN,
     CropBox,
     MissingSource,
     Source,
     plan_render,
 )
-from jascue_auto.schema import EDL, Clip, Reframe, Subject
+from montagewright.schema import EDL, Clip, Reframe, Subject
 
 UHD = Source("uhd", Path("uhd.mp4"), duration_seconds=10.0, width=3840, height=2160)
 PORTRAIT = 9 / 16

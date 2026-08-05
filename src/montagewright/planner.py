@@ -20,14 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from jascue_auto.capabilities import (
+from montagewright.capabilities import (
     INTENT_NAMES,
     MOVE_NAMES,
     describe_for_prompt,
 )
-from jascue_auto.grounding import BeatGrid
-from jascue_auto.uploads import UploadCache, upload_now
-from jascue_auto.schema import EDL, Clip, MusicSync
+from montagewright.grounding import BeatGrid
+from montagewright.uploads import UploadCache, upload_now
+from montagewright.schema import EDL, Clip, MusicSync
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
 
@@ -36,7 +36,7 @@ PROMPTS = Path(__file__).resolve().parent / "prompts"
 # exists to turn a silent hang into an error, not to cut off work that is
 # genuinely running -- so it sits well clear of the longest call observed.
 REQUEST_TIMEOUT_MS = int(
-    os.environ.get("JASCUE_AUTO_TIMEOUT_MS", str(25 * 60 * 1000))
+    os.environ.get("MONTAGEWRIGHT_TIMEOUT_MS", str(25 * 60 * 1000))
 )
 
 
@@ -45,7 +45,7 @@ def _http_options(types):
         timeout=REQUEST_TIMEOUT_MS,
         retry_options=types.HttpRetryOptions(attempts=1),
     )
-MODEL_ID = os.environ.get("JASCUE_AUTO_MODEL", "gemini-3.6-flash")
+MODEL_ID = os.environ.get("MONTAGEWRIGHT_MODEL", "gemini-3.6-flash")
 
 # 3.6 Flash deprecated the sampling knobs, so consistency comes from the
 # response schema and the instructions rather than from temperature.

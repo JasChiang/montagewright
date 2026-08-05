@@ -384,7 +384,7 @@ class EDL(ModelFacing):
     bug gets told apart from a planning one.
     """
 
-    edl_version: Literal["jascue-auto-edl-v1"] = "jascue-auto-edl-v1"
+    edl_version: Literal["montagewright-edl-v1"] = "montagewright-edl-v1"
     project_id: str
     style_decision: StyleDecision | None = Field(
         default=None,

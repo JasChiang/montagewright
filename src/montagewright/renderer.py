@@ -21,7 +21,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from jascue_auto.executor import RenderPlan, Segment
+from montagewright.executor import RenderPlan, Segment
 
 # Short-form platforms normalise to roughly this; matching it here means the
 # cut sounds the same locally as it will after upload.
@@ -167,7 +167,7 @@ def _render_segment(
         # A following camera. The x expression is evaluated per frame, so the
         # motion lives in the same filter as the crop rather than in a
         # separate command stream.
-        from jascue_auto.reframe import ffmpeg_crop_expression
+        from montagewright.reframe import ffmpeg_crop_expression
 
         w_expr, h_expr, x_expr, y_expr = ffmpeg_crop_expression(
             segment.crop_path, source.width, source.height

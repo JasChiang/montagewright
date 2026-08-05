@@ -1,10 +1,10 @@
-# jascue_auto
+# montagewright
 
 Rushes in, a cut out. Gemini decides what the film is; local code decides what
 frame that lands on.
 
 ```
-jascue-auto render RUSHES/ --brief BRIEF.md --music TRACK.mp3 \
+montagewright render RUSHES/ --brief BRIEF.md --music TRACK.mp3 \
   --music-map MAP.lock.json --aspect 9:16 --output CUT/
 ```
 

@@ -1,13 +1,16 @@
-# JasCueVideoLab
+# montagewright
+
+*-wright*：造船的是 shipwright，寫戲的是 playwright。這個做蒙太奇。
+
 
 一個資料夾的毛片進去，一支剪好的片出來，以及每一個決定的完整交代。
 
 ```bash
-jascue-auto render RUSHES/ --brief BRIEF.md --music TRACK.mp3 \
+montagewright render RUSHES/ --brief BRIEF.md --music TRACK.mp3 \
   --aspect 9:16 --review --output CUT/
 
-jascue-auto transcribe VIDEO.mp4        # 只要字幕，不重剪
-jascue-auto-web                         # 同一件事，看得到過程與每顆的理由
+montagewright transcribe VIDEO.mp4        # 只要字幕，不重剪
+montagewright-web                         # 同一件事，看得到過程與每顆的理由
 ```
 
 ## 這是什麼

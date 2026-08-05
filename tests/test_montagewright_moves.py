@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from jascue_auto.capabilities import INTENT_NAMES, MOVE_NAMES
-from jascue_auto.reframe import (
+from montagewright.capabilities import INTENT_NAMES, MOVE_NAMES
+from montagewright.reframe import (
     MAX_UPSCALE,
     Observation,
     achieved_upscale,
@@ -22,7 +22,7 @@ from jascue_auto.reframe import (
     visible_fraction,
     zoom_budget,
 )
-from jascue_auto.executor import CropBox
+from montagewright.executor import CropBox
 
 WIDE, TALL = 16 / 9, 9 / 16
 
@@ -56,7 +56,7 @@ def _still(count: int = 5) -> list[Observation]:
 def test_every_declared_move_has_a_builder() -> None:
     """The menu the planner reads and the code that dispatches cannot drift."""
 
-    from jascue_auto import pipeline
+    from montagewright import pipeline
 
     dispatch = pipeline.follow_subjects.__doc__ or ""
     source = pytest.importorskip("inspect").getsource(pipeline.follow_subjects)
@@ -284,7 +284,7 @@ def test_a_subject_wider_than_the_delivery_is_recorded_under_every_move() -> Non
 
     import inspect
 
-    from jascue_auto import pipeline
+    from montagewright import pipeline
 
     source = inspect.getsource(pipeline.follow_subjects)
     fact_at = source.index("subject_wider_than_delivery")
@@ -298,8 +298,8 @@ def test_a_subject_wider_than_the_delivery_is_recorded_under_every_move() -> Non
 def test_a_subject_that_cannot_fit_says_so_before_it_is_chosen() -> None:
     """`must_be_whole` is only answerable if the ceiling travels with the subject."""
 
-    from jascue_auto.cli import _subject_line
-    from jascue_auto.clipcard import SubjectBox
+    from montagewright.cli import _subject_line
+    from montagewright.clipcard import SubjectBox
 
     wide = SubjectBox(
         label="寫著 Galaxy Unpacked 的螢幕畫面",
@@ -346,7 +346,7 @@ def test_rhythm_is_told_the_length_it_is_dividing_up() -> None:
 
     import inspect
 
-    from jascue_auto import planner
+    from montagewright import planner
 
     source = inspect.getsource(planner.decide_rhythm)
     assert "target_seconds" in source
@@ -362,7 +362,7 @@ def test_selection_is_told_that_shot_count_is_a_length_decision() -> None:
     things sooner.
     """
 
-    from jascue_auto.planner import PROMPTS
+    from montagewright.planner import PROMPTS
 
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     assert "顆數與長度是同一個決定" in prompt
@@ -379,8 +379,8 @@ def test_the_layer_that_picks_a_shot_says_how_long_it_needs() -> None:
 
     import inspect
 
-    from jascue_auto import cli
-    from jascue_auto.planner import _selection_schema
+    from montagewright import cli
+    from montagewright.planner import _selection_schema
 
     shot = _selection_schema(["C1"])["properties"]["shots"]["items"]
     assert "seconds_needed" in shot["required"]
@@ -402,7 +402,7 @@ def test_a_move_floor_reports_rather_than_lengthens() -> None:
 
     import inspect
 
-    from jascue_auto import grounding
+    from montagewright import grounding
 
     source = inspect.getsource(grounding._requested_duration)
     assert "MOVE_FLOORS" not in source, (
@@ -412,7 +412,7 @@ def test_a_move_floor_reports_rather_than_lengthens() -> None:
 
 
 def test_the_menu_hands_the_timing_judgement_to_the_planner() -> None:
-    from jascue_auto.capabilities import describe_for_prompt
+    from montagewright.capabilities import describe_for_prompt
 
     menu = describe_for_prompt()
     assert "seconds_needed" in menu
@@ -428,8 +428,8 @@ def test_the_shot_reviewer_sees_the_shot_and_settles_its_degradations() -> None:
     watched that one shot settles it.
     """
 
-    from jascue_auto.review import adjudicate
-    from jascue_auto.schema import DegradationStep, Issue, ReviewVerdict
+    from montagewright.review import adjudicate
+    from montagewright.schema import DegradationStep, Issue, ReviewVerdict
 
     step = DegradationStep(
         clip_id="k00",
@@ -458,7 +458,7 @@ def test_the_shot_reviewer_sees_the_shot_and_settles_its_degradations() -> None:
 def test_segments_survive_the_render_so_they_can_be_reviewed() -> None:
     import inspect
 
-    from jascue_auto import pipeline
+    from montagewright import pipeline
 
     assert "keep_segments=True" in inspect.getsource(pipeline.run)
 
@@ -468,7 +468,7 @@ def test_the_report_says_why_a_degradation_was_settled() -> None:
 
     import inspect
 
-    from jascue_auto import cli
+    from montagewright import cli
 
     assert "adjudication_reason" in inspect.getsource(cli._write_report)
 
@@ -482,7 +482,7 @@ def test_replanning_is_a_new_plan_rather_than_a_softer_fallback() -> None:
     subject, or the admission that the shot was about the handset edge.
     """
 
-    from jascue_auto.planner import PROMPTS
+    from montagewright.planner import PROMPTS
 
     prompt = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
     assert "不是把原本的做法縮水" in prompt
@@ -501,7 +501,7 @@ def test_a_sweep_is_judged_against_its_own_intent_not_legibility() -> None:
     the second standard sends back shots that did what they meant to.
     """
 
-    from jascue_auto.planner import PROMPTS
+    from montagewright.planner import PROMPTS
 
     prompt = (PROMPTS / "shotreview_zh-TW.txt").read_text(encoding="utf-8")
     assert "判準來自這顆自己的宣告，不是一套通用標準" in prompt
@@ -519,7 +519,7 @@ def test_the_executor_does_not_swap_the_move_it_was_given() -> None:
 
     import inspect
 
-    from jascue_auto import pipeline
+    from montagewright import pipeline
 
     source = inspect.getsource(pipeline.follow_subjects)
     assert "build_sweep_path" not in source.split('if move == "hold"')[1], (
@@ -537,7 +537,7 @@ def test_must_be_whole_is_described_as_a_requirement_not_a_lever() -> None:
     record and an identical frame, and the loop spent a round on it twice.
     """
 
-    from jascue_auto.planner import PROMPTS, _selection_schema
+    from montagewright.planner import PROMPTS, _selection_schema
 
     described = _selection_schema(["C1"])["properties"]["shots"]["items"][
         "properties"
@@ -559,7 +559,7 @@ def test_no_pass_rations_its_output_ceiling() -> None:
 
     import inspect
 
-    from jascue_auto import planner
+    from montagewright import planner
 
     source = inspect.getsource(planner.decide_rhythm)
     assert "MAX_OUTPUT_TOKENS" in source
@@ -578,7 +578,7 @@ def test_an_action_beat_has_to_be_long_enough_to_be_one() -> None:
     Downstream, in-points were snapped onto those numbers.
     """
 
-    from jascue_auto.clipcard import action_beats, card_schema
+    from montagewright.clipcard import action_beats, card_schema
 
     entry = card_schema()["properties"]["action"]["items"]["properties"]
     assert entry["ends_seconds"].get("description"), (
@@ -606,7 +606,7 @@ def test_a_library_that_wrote_nothing_stops_the_run() -> None:
     import tempfile
     from pathlib import Path
 
-    from jascue_auto.clipcard import CardLibraryEmpty, build_library
+    from montagewright.clipcard import CardLibraryEmpty, build_library
 
     class Refuses:
         class files:
@@ -630,7 +630,7 @@ def test_clip_cards_can_be_written_at_all() -> None:
 
     import inspect
 
-    from jascue_auto import clipcard
+    from montagewright import clipcard
 
     assert "MAX_OUTPUT_TOKENS" in dir(clipcard)
     compile(inspect.getsource(clipcard), "clipcard.py", "exec")
@@ -645,8 +645,8 @@ def test_the_card_says_what_the_source_camera_does() -> None:
     left to either ignore the movement or lay a digital one over it.
     """
 
-    from jascue_auto.clipcard import card_schema
-    from jascue_auto.planner import MaterialItem, _describe_material
+    from montagewright.clipcard import card_schema
+    from montagewright.planner import MaterialItem, _describe_material
 
     schema = card_schema()
     assert "camera_motion" in schema["required"]
@@ -674,8 +674,8 @@ def test_a_card_box_is_only_reused_when_nothing_moved() -> None:
 
     import inspect
 
-    from jascue_auto import pipeline
-    from jascue_auto.clipcard import card_schema, subjects_from_card
+    from montagewright import pipeline
+    from montagewright.clipcard import card_schema, subjects_from_card
 
     box = card_schema()["properties"]["subjects"]["items"]
     assert "at_seconds" in box["required"], "a position needs its moment"
@@ -703,7 +703,7 @@ def test_takes_set_aside_before_planning_say_why() -> None:
 
     import inspect
 
-    from jascue_auto import cli
+    from montagewright import cli
 
     source = inspect.getsource(cli.command_render)
     assert "unusable_reason" in source
@@ -713,7 +713,7 @@ def test_takes_set_aside_before_planning_say_why() -> None:
 def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
     """The question after a run is which take that is and why it looks like that."""
 
-    from jascue_auto.webapp import PAGE, create_app
+    from montagewright.webapp import PAGE, create_app
 
     paths = {r.path for r in create_app().routes if hasattr(r, "path")}
     assert {"/api/runs", "/api/runs/{run_id}/video",
@@ -735,7 +735,7 @@ def test_a_track_can_be_measured_without_a_reviewed_lock() -> None:
 
     import inspect
 
-    from jascue_auto import cli, grounding
+    from montagewright import cli, grounding
 
     source = inspect.getsource(grounding.analyse_track)
     assert "downbeat" in source and "section_boundary" in source
@@ -751,7 +751,7 @@ def test_a_transcript_is_its_own_card() -> None:
     fields on the clip card.
     """
 
-    from jascue_auto import clipcard, transcript
+    from montagewright import clipcard, transcript
 
     assert "transcript" not in clipcard.card_schema()["properties"]
     assert transcript.CARD_VERSION != clipcard.CARD_VERSION
@@ -771,7 +771,7 @@ def test_spoken_boundaries_land_on_a_measured_break() -> None:
     """The model hears where a sentence ends; the recogniser marked where the
     sound broke. Neither alone puts the cut in the right place."""
 
-    from jascue_auto.transcript import Word, gaps, snap
+    from montagewright.transcript import Word, gaps, snap
 
     words = [
         Word("溼", 0.0, 0.30), Word("了", 0.30, 0.62),
@@ -797,7 +797,7 @@ def test_every_upload_waits_until_the_file_can_be_used() -> None:
     import re
     from pathlib import Path
 
-    for module in Path("src/jascue_auto").glob("*.py"):
+    for module in Path("src/montagewright").glob("*.py"):
         if module.name == "uploads.py":
             continue
         text = module.read_text(encoding="utf-8")
@@ -807,7 +807,7 @@ def test_every_upload_waits_until_the_file_can_be_used() -> None:
 
 
 def test_the_transcriber_is_reachable_as_its_own_command() -> None:
-    from jascue_auto.cli import main
+    from montagewright.cli import main
 
     try:
         main(["transcribe", "--help"])
@@ -827,7 +827,7 @@ def test_music_goes_under_a_voice_rather_than_over_it() -> None:
 
     import inspect
 
-    from jascue_auto import renderer
+    from montagewright import renderer
 
     source = inspect.getsource(renderer._mux_music)
     assert "sidechaincompress" in source
@@ -846,8 +846,8 @@ def test_a_transcript_is_only_paid_for_where_speech_is_the_content() -> None:
 
     import inspect
 
-    from jascue_auto import cli
-    from jascue_auto.clipcard import card_schema
+    from montagewright import cli
+    from montagewright.clipcard import card_schema
 
     speech = card_schema()["properties"]["speech"]
     assert speech["enum"] == ["none", "ambient", "content"]
@@ -861,9 +861,9 @@ def test_a_transcript_is_only_paid_for_where_speech_is_the_content() -> None:
 def test_the_planner_sees_the_sentences_it_is_choosing_between() -> None:
     """A window out of an interview is chosen because of a sentence."""
 
-    from jascue_auto.cli import _speech_lines
-    from jascue_auto.planner import MaterialItem, _describe_material
-    from jascue_auto.transcript import CARD_VERSION
+    from montagewright.cli import _speech_lines
+    from montagewright.planner import MaterialItem, _describe_material
+    from montagewright.transcript import CARD_VERSION
 
     lines = _speech_lines({
         "version": CARD_VERSION,
@@ -891,7 +891,7 @@ def test_a_cut_that_never_asked_for_a_beat_is_not_a_missed_one() -> None:
     failure in the one line anyone reads.
     """
 
-    from jascue_auto.pipeline import Report
+    from montagewright.pipeline import Report
 
     speech = Report(total_cuts=13, aligned_cuts=0)
     speech.rhythm_decisions = {
@@ -916,7 +916,7 @@ def test_an_already_cut_file_is_opened_along_its_own_boundaries() -> None:
 
     import inspect
 
-    from jascue_auto import cli, grounding
+    from montagewright import cli, grounding
 
     assert "shots_in" in inspect.getsource(cli.command_render)
     source = inspect.getsource(grounding.shots_in)
@@ -934,7 +934,7 @@ def test_music_is_not_required_to_make_a_cut() -> None:
 
     import inspect
 
-    from jascue_auto import cli
+    from montagewright import cli
 
     source = inspect.getsource(cli.command_render)
     assert "--music or --music-map is required" not in source
@@ -952,7 +952,7 @@ def test_a_chinese_filename_can_be_uploaded() -> None:
     import tempfile
     from pathlib import Path
 
-    from jascue_auto.uploads import _ascii_named
+    from montagewright.uploads import _ascii_named
 
     work = Path(tempfile.mkdtemp())
     chinese = work / "夏日街訪_夏天最崩潰的事-00.mp4"
@@ -974,7 +974,7 @@ def test_a_timeline_is_written_only_when_asked_for() -> None:
 
     import inspect
 
-    from jascue_auto import cli
+    from montagewright import cli
 
     source = inspect.getsource(cli.command_render)
     assert 'args.timeline != "none"' in source
@@ -993,8 +993,8 @@ def test_a_timeline_carries_the_reasons_and_the_original_media() -> None:
 
     from pathlib import Path
 
-    from jascue_auto.executor import CropBox, RenderPlan, Segment, Source
-    from jascue_auto.timeline import to_fcpxml, to_xmeml
+    from montagewright.executor import CropBox, RenderPlan, Segment, Source
+    from montagewright.timeline import to_fcpxml, to_xmeml
 
     source = Source(
         source_id="S00", path=Path("/tmp/夏日街訪-00.mp4"),
@@ -1030,7 +1030,7 @@ def test_no_music_means_no_rhythm_pass() -> None:
 
     import inspect
 
-    from jascue_auto import pipeline
+    from montagewright import pipeline
 
     assert "decide_rhythm_first and grid is not None" in inspect.getsource(
         pipeline.run
@@ -1047,8 +1047,8 @@ def test_how_music_sits_under_speech_is_decided_not_computed() -> None:
 
     import inspect
 
-    from jascue_auto import renderer
-    from jascue_auto.planner import PROMPTS, _direction_schema
+    from montagewright import renderer
+    from montagewright.planner import PROMPTS, _direction_schema
 
     field = _direction_schema()["properties"]["music_under_speech"]
     assert field["enum"] == ["bed", "duck", "none"]
@@ -1073,7 +1073,7 @@ def test_the_bed_is_placed_under_the_voice_not_under_the_music() -> None:
 
     import inspect
 
-    from jascue_auto import renderer
+    from montagewright import renderer
 
     assert not hasattr(renderer, "MUSIC_UNDER_VOICE_DB")
     assert renderer.BED_BELOW_VOICE_DB > 0
@@ -1091,7 +1091,7 @@ def test_pauses_come_from_the_punctuation_the_recogniser_wrote() -> None:
     break, and the token carries that break's span.
     """
 
-    from jascue_auto.transcript import Word, gaps, snap_end
+    from montagewright.transcript import Word, gaps, snap_end
 
     words = [
         Word("行", 12.9, 13.14),
@@ -1113,8 +1113,8 @@ def test_the_direction_only_promises_what_the_tools_can_do() -> None:
 
     import inspect
 
-    from jascue_auto import planner
-    from jascue_auto.planner import PROMPTS
+    from montagewright import planner
+    from montagewright.planner import PROMPTS
 
     assert "describe_for_prompt()" in inspect.getsource(planner.decide_direction)
     prompt = (PROMPTS / "direction_zh-TW.txt").read_text(encoding="utf-8")
@@ -1134,8 +1134,8 @@ def test_cutting_before_a_sentence_ends_stays_available() -> None:
 
     import inspect
 
-    from jascue_auto import cli
-    from jascue_auto.planner import PROMPTS
+    from montagewright import cli
+    from montagewright.planner import PROMPTS
 
     source = inspect.getsource(cli._edl_from_selection)
     assert "snap_end" not in source, "the shot's out-point is selection's"
@@ -1157,7 +1157,7 @@ def test_the_voice_is_levelled_before_anything_goes_under_it() -> None:
 
     import inspect
 
-    from jascue_auto import renderer
+    from montagewright import renderer
 
     assert "speechnorm" in renderer.VOICE_LEVELLER
     source = inspect.getsource(renderer._mux_music)
@@ -1176,7 +1176,7 @@ def test_a_replan_renders_the_same_way_the_first_pass_did() -> None:
 
     import inspect
 
-    from jascue_auto import cli
+    from montagewright import cli
 
     source = inspect.getsource(cli.command_render)
     assert source.count("keep_voice=bool(transcripts)") == 1
@@ -1195,7 +1195,7 @@ def test_dropping_the_question_depends_on_something_carrying_the_premise() -> No
     somebody asks what the worst thing about summer is.
     """
 
-    from jascue_auto.planner import PROMPTS
+    from montagewright.planner import PROMPTS
 
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     assert "問句通常不用剪進去" not in prompt
@@ -1212,7 +1212,7 @@ def test_the_page_takes_a_path_and_remembers_what_it_ran() -> None:
     when comparing this one against the last is most of the work.
     """
 
-    from jascue_auto.webapp import MAX_UPLOAD_BYTES, PAGE, RUNS_ROOT, create_app
+    from montagewright.webapp import MAX_UPLOAD_BYTES, PAGE, RUNS_ROOT, create_app
 
     paths = {r.path for r in create_app().routes if hasattr(r, "path")}
     assert "/api/runs/{run_id}/transcripts" in paths

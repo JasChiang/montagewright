@@ -21,12 +21,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from jascue_auto.cost import BudgetSpent, Ledger
-from jascue_auto.schema import DegradationStep, Issue, ReviewVerdict
+from montagewright.cost import BudgetSpent, Ledger
+from montagewright.schema import DegradationStep, Issue, ReviewVerdict
 
-from jascue_auto.planner import MAX_OUTPUT_TOKENS
+from montagewright.planner import MAX_OUTPUT_TOKENS
 
-from jascue_auto.uploads import upload_now
+from montagewright.uploads import upload_now
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
 MAX_ROUNDS = 3
@@ -156,7 +156,7 @@ def review_cut(
             "schema": _verdict_schema(),
         },
     )
-    from jascue_auto.planner import Usage, _parse
+    from montagewright.planner import Usage, _parse
 
     payload = _parse(interaction, what="review")
     if ledger is not None:
@@ -310,7 +310,7 @@ def review_shots(
             "schema": _shot_schema([clip_id for clip_id, _ in sent]),
         },
     )
-    from jascue_auto.planner import Usage, _parse
+    from montagewright.planner import Usage, _parse
 
     payload = _parse(interaction, what="shot review")
     if ledger is not None:

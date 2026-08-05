@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "src" / "jascue_auto"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "src" / "montagewright"
 
 # Modules that calculate. Each is imported as a library; §2.1 of the work
 # order also strips the internal safety margins on the way in, leaving one

@@ -40,12 +40,12 @@ PAGE = Path(__file__).resolve().parent / "web" / "index.html"
 # cut -- and comparing this run against the last one is most of what anybody
 # does with a tool like this.
 RUNS_ROOT = Path(
-    os.environ.get("JASCUE_RUNS", Path.home() / ".cache" / "jascue-auto" / "runs")
+    os.environ.get("MONTAGEWRIGHT_RUNS", Path.home() / ".cache" / "montagewright" / "runs")
 )
 # A browser upload of local material copies it into the browser and writes it
 # back out; the bytes were already on disk. Uploading stays for the case where
 # they genuinely are not, and that case has a ceiling.
-MAX_UPLOAD_BYTES = int(os.environ.get("JASCUE_MAX_UPLOAD", 4 * 1024**3))
+MAX_UPLOAD_BYTES = int(os.environ.get("MONTAGEWRIGHT_MAX_UPLOAD", 4 * 1024**3))
 
 
 @dataclass
@@ -143,7 +143,7 @@ def _save(upload: UploadFile, destination: Path) -> Path:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="jascue-auto")
+    app = FastAPI(title="montagewright")
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -217,7 +217,7 @@ def create_app() -> FastAPI:
             raise HTTPException(400, "no video files there")
 
         command = [
-            sys.executable, "-u", "-m", "jascue_auto.cli", "render",
+            sys.executable, "-u", "-m", "montagewright.cli", "render",
             str(rush_dir), "--aspect", aspect,
             "--budget", str(budget),
             "--output", str(root / "out"),
@@ -295,7 +295,7 @@ def create_app() -> FastAPI:
         wrong sentence.
         """
 
-        from jascue_auto.transcript import lines_of, load
+        from montagewright.transcript import lines_of, load
 
         run = _run(run_id)
         folder = run.output / "work" / "transcripts"
@@ -385,7 +385,7 @@ def create_app() -> FastAPI:
         the reader to work out which take a line came from is not one.
         """
 
-        from jascue_auto.transcript import Line, lines_of, load, to_srt
+        from montagewright.transcript import Line, lines_of, load, to_srt
 
         run = _run(run_id)
         report = run.report() or {}
@@ -453,8 +453,8 @@ def main() -> int:
 
     uvicorn.run(
         app,
-        host=os.environ.get("JASCUE_HOST", "127.0.0.1"),
-        port=int(os.environ.get("JASCUE_PORT", "8765")),
+        host=os.environ.get("MONTAGEWRIGHT_HOST", "127.0.0.1"),
+        port=int(os.environ.get("MONTAGEWRIGHT_PORT", "8765")),
         log_level="warning",
     )
     return 0

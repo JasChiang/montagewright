@@ -22,12 +22,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from jascue_auto.clipcard import find_subject, load_card
-from jascue_auto.cost import Ledger
-from jascue_auto.executor import RenderPlan, Source, plan_render
-from jascue_auto.grounding import BeatGrid, apply_to_edl, ground_timeline
-from jascue_auto.planner import Usage, decide_rhythm, locate_subject
-from jascue_auto.reframe import (
+from montagewright.clipcard import find_subject, load_card
+from montagewright.cost import Ledger
+from montagewright.executor import RenderPlan, Source, plan_render
+from montagewright.grounding import BeatGrid, apply_to_edl, ground_timeline
+from montagewright.planner import Usage, decide_rhythm, locate_subject
+from montagewright.reframe import (
     CropPath,
     achieved_upscale,
     zoom_budget,
@@ -40,8 +40,8 @@ from jascue_auto.reframe import (
     build_zoom_path,
     observations_from_sam,
 )
-from jascue_auto.renderer import RenderResult, render
-from jascue_auto.schema import EDL, DegradationStep
+from montagewright.renderer import RenderResult, render
+from montagewright.schema import EDL, DegradationStep
 
 # Enough samples to see a subject change direction, few enough that one shot
 # costs a fraction of a cent. Interpolation covers the gaps; SAM propagation

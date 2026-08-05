@@ -25,10 +25,10 @@ from pathlib import Path
 
 from typing import TYPE_CHECKING
 
-from jascue_auto.schema import EDL, Clip, DegradationStep
+from montagewright.schema import EDL, Clip, DegradationStep
 
 if TYPE_CHECKING:  # a runtime import would make the two modules circular
-    from jascue_auto.reframe import CropPath
+    from montagewright.reframe import CropPath
 
 # One safety margin, applied once, at the end. The old code added a little
 # padding at detection, a little more at tracking, and more again at

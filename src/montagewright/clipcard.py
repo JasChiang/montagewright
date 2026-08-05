@@ -24,11 +24,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from jascue_auto.planner import MAX_OUTPUT_TOKENS
+from montagewright.planner import MAX_OUTPUT_TOKENS
 
-from jascue_auto.uploads import upload_now
+from montagewright.uploads import upload_now
 
-CARD_VERSION = "jascue-auto-clip-card-v1"
+CARD_VERSION = "montagewright-clip-card-v1"
 
 
 class CardLibraryEmpty(RuntimeError):
@@ -398,7 +398,7 @@ def describe_clip(
     grounded again on each render.
     """
 
-    from jascue_auto.planner import MODEL_ID, Usage, _parse, _to_frame_fractions
+    from montagewright.planner import MODEL_ID, Usage, _parse, _to_frame_fractions
 
     prompts = Path(__file__).resolve().parent / "prompts"
     instruction = (prompts / "clipcard_zh-TW.txt").read_text(encoding="utf-8")

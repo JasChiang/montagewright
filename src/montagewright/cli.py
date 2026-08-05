@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from jascue_auto.clipcard import (
+from montagewright.clipcard import (
     action_beats,
     build_library,
     find_subject,
@@ -22,10 +22,10 @@ from jascue_auto.clipcard import (
     snap_to_action,
     subjects_from_card,
 )
-from jascue_auto.cost import BudgetSpent, Ledger
-from jascue_auto.grounding import analyse_track, load_beat_grid, shots_in
-from jascue_auto.pipeline import probe, run
-from jascue_auto.review import (
+from montagewright.cost import BudgetSpent, Ledger
+from montagewright.grounding import analyse_track, load_beat_grid, shots_in
+from montagewright.pipeline import probe, run
+from montagewright.review import (
     Round,
     actionable_keys,
     adjudicate,
@@ -33,14 +33,14 @@ from jascue_auto.review import (
     review_shots,
     should_continue,
 )
-from jascue_auto.planner import (
+from montagewright.planner import (
     MaterialItem,
     decide_direction,
     replan_shots,
     select_shots,
 )
-from jascue_auto.schema import EDL, Clip, Reframe, Subject
-from jascue_auto.uploads import UploadCache, default_cache_path
+from montagewright.schema import EDL, Clip, Reframe, Subject
+from montagewright.uploads import UploadCache, default_cache_path
 
 ASPECTS = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5}
 
@@ -57,7 +57,7 @@ def _client():
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise SystemExit("GEMINI_API_KEY is required")
-    from jascue_auto.planner import _http_options
+    from montagewright.planner import _http_options
 
     return genai.Client(api_key=key, http_options=_http_options(types))
 
@@ -168,9 +168,9 @@ def command_render(args: argparse.Namespace) -> int:
         and (load_card(cards[source_id]) or {}).get("speech") == "content"
     ]
     if speaking and args.speech != "never":
-        from jascue_auto.transcript import describe as transcribe
-        from jascue_auto.transcript import load as load_transcript
-        from jascue_auto.transcript import save as save_transcript
+        from montagewright.transcript import describe as transcribe
+        from montagewright.transcript import load as load_transcript
+        from montagewright.transcript import save as save_transcript
 
         print(
             f"speech: {len(speaking)} clips carry it as content",
@@ -515,7 +515,7 @@ def command_render(args: argparse.Namespace) -> int:
     # timeline is for the run where somebody intends to open it and disagree
     # with one shot, and writing one every time is clutter in every other.
     if args.timeline != "none":
-        from jascue_auto.timeline import to_fcpxml, to_xmeml
+        from montagewright.timeline import to_fcpxml, to_xmeml
 
         payload = json.loads(
             (output / "report.json").read_text(encoding="utf-8")
@@ -556,7 +556,7 @@ def _speech_lines(card: dict | None, limit: int = 40) -> tuple[str, ...]:
 
     if not card:
         return ()
-    from jascue_auto.transcript import lines_of
+    from montagewright.transcript import lines_of
 
     return tuple(
         f"{line.starts_seconds:.1f}-{line.ends_seconds:.1f}s"
@@ -767,7 +767,7 @@ def command_transcribe(args: argparse.Namespace) -> int:
     same card feeds the editorial passes when there is an edit.
     """
 
-    from jascue_auto.transcript import describe, lines_of, load, save, to_srt
+    from montagewright.transcript import describe, lines_of, load, save, to_srt
 
     client = _client()
     cache = UploadCache.load(args.upload_cache or default_cache_path())
@@ -815,7 +815,7 @@ def command_transcribe(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="jascue-auto")
+    parser = argparse.ArgumentParser(prog="montagewright")
     sub = parser.add_subparsers(dest="command", required=True)
 
     render = sub.add_parser("render", help="Cut a folder of rushes into a film")

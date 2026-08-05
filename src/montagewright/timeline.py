@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
-from jascue_auto.executor import CropBox, RenderPlan, Segment
+from montagewright.executor import CropBox, RenderPlan, Segment
 
 FPS = 30
 

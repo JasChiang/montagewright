@@ -23,8 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from jascue_auto.executor import CROP_MARGIN, CropBox
-from jascue_auto.schema import CameraEnergy, DegradationStep
+from montagewright.executor import CROP_MARGIN, CropBox
+from montagewright.schema import CameraEnergy, DegradationStep
 
 # Per camera_energy, in viewport widths per second and per second squared.
 # 720 px/s on a 1080-wide portrait viewport, the old constant, is 0.667 vw/s --

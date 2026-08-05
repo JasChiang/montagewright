@@ -24,9 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from jascue_auto.uploads import upload_now
+from montagewright.uploads import upload_now
 
-CARD_VERSION = "jascue-auto-transcript-v1"
+CARD_VERSION = "montagewright-transcript-v1"
 TOOL = Path(__file__).resolve().parents[2] / "tools" / "transcribe" / "transcribe"
 
 # Below this a "word" is usually the recogniser splitting one syllable, and a
@@ -324,7 +324,7 @@ def describe(
 ) -> tuple[dict[str, Any], Any]:
     """Hear it locally, then have the words corrected against the picture."""
 
-    from jascue_auto.planner import (
+    from montagewright.planner import (
         MAX_OUTPUT_TOKENS,
         MODEL_ID,
         PROMPTS,

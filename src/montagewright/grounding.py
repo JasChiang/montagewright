@@ -19,7 +19,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from jascue_auto.schema import EDL, Clip
+from montagewright.schema import EDL, Clip
 
 # Cue kinds worth cutting on. A plain beat is included because an eight-beat
 # clip has to land somewhere even when no accent falls there.
@@ -278,7 +278,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
     grounded: list[GroundedClip] = []
     cursor = 0.0
 
-    from jascue_auto.capabilities import MOVE_FLOORS
+    from montagewright.capabilities import MOVE_FLOORS
 
     for clip in edl.clips:
         wanted = _requested_duration(clip, grid)
