@@ -1472,3 +1472,20 @@ def test_a_degradation_is_shown_in_words_with_its_number() -> None:
                   "trim_window_clamped_to_source", "subject_larger_than_crop"):
         assert f"{named}:" in page, named
     assert "measured" in page and "已改動" in page
+
+
+def test_the_adjudication_says_who_looked_and_what_they_concluded() -> None:
+    """"accept" is a word from the schema, not an account of anything.
+
+    It means somebody watched that shot on its own, with the degradation
+    beside it, and decided the picture still works. Which layer did the
+    watching is the part that matters, and the part that changed: the
+    whole-cut reviewer never saw the shot it was ruling on.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "看過畫面：可以這樣交" in page
+    assert "逐顆驗收單獨看了這一顆" in page
+    assert "沒有人看過" in page

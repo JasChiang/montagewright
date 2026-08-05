@@ -847,10 +847,17 @@ const LADDERS = {
   trim_window_clamped_to_source: ['要的長度超過素材本身', '素材沒有那麼長，剪到尾就停'],
   full_move: ['照原本的運鏡做完', ''],
 };
+// Who looked, and what they concluded. This used to be settled by the layer
+// that watched the whole film and never saw the shot in question -- "the
+// subject is 0.88 of frame wide and can show 36% of itself" is not judgeable
+// from a thirty-second cut and a line of numbers.
 const SETTLED = {
-  accept: ['可接受', '看過那一顆之後認為畫面仍然成立'],
-  replan: ['退回重做', '看過之後認為畫面因此不成立'],
-  unadjudicated: ['還沒裁決', '這一輪沒有跑到驗收'],
+  accept: ['看過畫面：可以這樣交',
+           '逐顆驗收單獨看了這一顆，認為雖然沒照原計畫做，畫面仍然成立'],
+  replan: ['看過畫面：這顆要重做',
+           '逐顆驗收認為畫面因此不成立，所以退回重新規劃'],
+  unadjudicated: ['沒有人看過',
+                  '這一輪沒跑到驗收——沒開自審，或提前停了'],
 };
 
 function tellDegradation(d) {
@@ -862,6 +869,7 @@ function tellDegradation(d) {
   return `<div style="margin-bottom:7px">
     <div>${esc(what)}${verdict ? ` <span class="tag" title="${esc(meaning)}">${esc(verdict)}</span>` : ''}</div>
     ${why ? `<div class="why">${esc(why)}</div>` : ''}
+    ${meaning ? `<div class="why">${esc(meaning)}</div>` : ''}
     ${numbers ? `<div class="why mono">${esc(numbers)}</div>` : ''}
   </div>`;
 }
