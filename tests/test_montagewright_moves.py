@@ -1224,3 +1224,27 @@ def test_the_page_takes_a_path_and_remembers_what_it_ran() -> None:
         assert control in page, control
     assert "先前的剪輯" in page
     assert "聽到了什麼" in page
+
+
+def test_a_folder_can_be_clicked_instead_of_typed() -> None:
+    """A browser will not hand over a real path.
+
+    A directory picker gives relative names and nothing else, so pointing
+    this at material sitting next to the server meant typing the path out.
+    The server lists the folders instead -- it binds to localhost, and the
+    person using it owns the disk.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from montagewright.webapp import PAGE, create_app
+
+    listing = TestClient(create_app()).get("/api/browse").json()
+    assert listing["here"], "somewhere to start from"
+    assert "folders" in listing and "videos" in listing
+    # The count is what makes a listing useful: it says which folder holds
+    # the rushes without descending into every one of them.
+    assert all("clips" in folder for folder in listing["folders"])
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "browseTo" in page and "用這個資料夾" in page

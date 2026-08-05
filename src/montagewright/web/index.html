@@ -82,11 +82,23 @@
   <section class="panel" id="setup">
     <div class="grid">
       <div style="grid-column:1/-1">
-        <label>素材路徑（資料夾或單一檔案，本機路徑就好）</label>
-        <input type="text" id="path" placeholder="/Users/…/rushes　或　/Users/…/一支長片.mp4">
+        <label>素材</label>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="path" placeholder="點「瀏覽」選一個資料夾，或直接貼路徑">
+          <button type="button" class="ghost" id="browse" style="white-space:nowrap">瀏覽…</button>
+        </div>
+        <div class="hide" id="picker" style="margin-top:10px;border:1px solid var(--line);border-radius:8px;padding:12px;background:var(--bg)">
+          <div class="mono why" id="crumb" style="margin-bottom:8px"></div>
+          <div id="listing" style="max-height:240px;overflow:auto"></div>
+          <div class="row" style="margin-top:10px">
+            <button type="button" id="use-here">用這個資料夾</button>
+            <button type="button" class="ghost" id="close-picker">關閉</button>
+            <span class="why" id="picker-note"></span>
+          </div>
+        </div>
         <div class="why" style="margin-top:6px">
-          留空的話下面可以改用上傳。本機素材建議用路徑——上傳等於把硬碟上的檔案搬進瀏覽器再寫回去。
-          <a href="#" id="show-upload">改用上傳</a>
+          本機素材用路徑就好——上傳等於把硬碟上的檔案搬進瀏覽器再寫回去。
+          <a href="#" id="show-upload">還是要用上傳</a>
         </div>
       </div>
       <div class="hide" id="upload-row" style="grid-column:1/-1">
@@ -193,6 +205,41 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let runId = null, seen = 0, timer = null;
+
+let picking = '';
+
+async function browseTo(path) {
+  const res = await fetch('/api/browse?path=' + encodeURIComponent(path || ''));
+  if (!res.ok) { $('picker-note').textContent = '打不開'; return; }
+  const d = await res.json();
+  picking = d.here;
+  $('crumb').textContent = d.here;
+  const rows = [];
+  if (d.parent) rows.push(`<div class="pick" data-path="${esc(d.parent)}">📁 <span class="why">..</span></div>`);
+  for (const f of d.folders) {
+    rows.push(`<div class="pick" data-path="${esc(f.path)}">📁 ${esc(f.name)}` +
+      (f.clips ? ` <span class="why">${f.clips} 支影片</span>` : '') + `</div>`);
+  }
+  for (const v of d.videos) rows.push(`<div class="why" style="padding:3px 0">🎬 ${esc(v.name)}</div>`);
+  $('listing').innerHTML = rows.join('') || '<div class="why">這裡沒有東西</div>';
+  $('picker-note').textContent = d.videos.length
+    ? `這層有 ${d.videos.length} 支影片` : '這層沒有影片，往下點';
+  for (const el of $('listing').querySelectorAll('.pick')) {
+    el.style.cursor = 'pointer';
+    el.style.padding = '3px 0';
+    el.onclick = () => browseTo(el.dataset.path);
+  }
+}
+
+$('browse').addEventListener('click', () => {
+  $('picker').classList.remove('hide');
+  browseTo($('path').value.trim());
+});
+$('close-picker').addEventListener('click', () => $('picker').classList.add('hide'));
+$('use-here').addEventListener('click', () => {
+  $('path').value = picking;
+  $('picker').classList.add('hide');
+});
 
 $('show-upload').addEventListener('click', (e) => {
   e.preventDefault(); $('upload-row').classList.remove('hide');

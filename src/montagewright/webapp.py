@@ -258,6 +258,49 @@ def create_app() -> FastAPI:
         threading.Thread(target=_collect, args=(run,), daemon=True).start()
         return JSONResponse({"run_id": run_id})
 
+    @app.get("/api/browse")
+    def browse(path: str = "") -> JSONResponse:
+        """List folders so a path can be clicked instead of typed.
+
+        A browser will not hand over a real filesystem path -- a directory
+        picker gives relative names and nothing else -- so typing one out was
+        the only way to point this at material sitting next to the server.
+        This serves the listing instead. It binds to localhost, and the person
+        using it owns the disk.
+        """
+
+        here = Path(path).expanduser() if path.strip() else Path.home()
+        try:
+            here = here.resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise HTTPException(404, f"{path} is not there")
+        if not here.is_dir():
+            here = here.parent
+
+        folders = []
+        for entry in sorted(here.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            try:
+                clips = sum(
+                    1 for child in entry.iterdir()
+                    if child.suffix in VIDEO_SUFFIXES
+                )
+            except PermissionError:
+                continue
+            folders.append({"name": entry.name, "path": str(entry), "clips": clips})
+        loose = [
+            {"name": entry.name, "path": str(entry)}
+            for entry in sorted(here.iterdir())
+            if entry.is_file() and entry.suffix in VIDEO_SUFFIXES
+        ]
+        return JSONResponse({
+            "here": str(here),
+            "parent": str(here.parent) if here.parent != here else None,
+            "folders": folders,
+            "videos": loose,
+        })
+
     @app.get("/api/runs")
     def history(limit: int = 30) -> JSONResponse:
         """Earlier cuts, so this one can be compared against them."""
