@@ -35,6 +35,18 @@ TRUE_PEAK_CEILING_DB = -1.5
 TRUE_PEAK_CEILING_LINEAR = 10 ** (TRUE_PEAK_CEILING_DB / 20)
 PREVIEW_HEIGHT = 640
 
+# Where the bed sits before anyone speaks. Under a voice a track is
+# accompaniment, and accompaniment at full level is competition.
+MUSIC_UNDER_VOICE_DB = -12
+# How the bed gets out of the way. Attack short enough to be down before the
+# first syllable lands, release long enough that it does not pump between
+# words -- a bed that comes back up inside a sentence is more distracting
+# than one that never moved.
+DUCK_THRESHOLD = 0.03
+DUCK_RATIO = 8
+DUCK_ATTACK_MS = 20
+DUCK_RELEASE_MS = 600
+
 # Extra material kept either side of each cut, never shown. A transition needs
 # two shots to overlap, and an exact cut leaves nothing to overlap with; a
 # nudge of a quarter of a second later needs frames that were never rendered.
@@ -222,21 +234,47 @@ def _concat(
 
 
 def _mux_music(
-    picture: Path, music: Path, destination: Path, *, video_encoder: str
+    picture: Path,
+    music: Path,
+    destination: Path,
+    *,
+    video_encoder: str,
+    keep_voice: bool = False,
 ) -> Path:
     """Lay a music bed under the cut and normalise the result.
 
     The music is trimmed to the picture, never the other way round: stretching
     a track to fit a cut is audible, and holding the picture to fit the track
     means padding it with something nobody chose.
+
+    When the picture carries speech, the music goes under it rather than over
+    it. This used to be unconditional -- `-map 0:v:0 -map [music]` threw the
+    source audio away, which is right for b-roll and destroys an interview,
+    where what was said is the whole content. A fixed lower level is not the
+    answer either: quiet enough never to bury a sentence is too quiet to be
+    doing anything in the gaps. The voice drives the compressor, so the bed
+    steps back for each line and comes up between them.
     """
 
-    _run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(picture), "-i", str(music),
-            "-filter_complex",
-            f"[1:a]atrim=0:{probe_duration(picture):.6f},"
+    duration = probe_duration(picture)
+    if keep_voice:
+        chain = (
+            f"[1:a]atrim=0:{duration:.6f},volume={MUSIC_UNDER_VOICE_DB}dB[bed];"
+            # The voice is the sidechain trigger, not part of the output of
+            # this branch -- asplit because one copy steers the compressor
+            # and the other is what anyone actually hears.
+            "[0:a]asplit=2[voice][key];"
+            f"[bed][key]sidechaincompress="
+            f"threshold={DUCK_THRESHOLD}:ratio={DUCK_RATIO}:"
+            f"attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}[ducked];"
+            "[voice][ducked]amix=inputs=2:duration=first:normalize=0,"
+            f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
+            f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled"
+            "[out]"
+        )
+    else:
+        chain = (
+            f"[1:a]atrim=0:{duration:.6f},"
             f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
             # loudnorm in one pass predicts its true peak rather than
             # measuring it, and overshoots often enough to matter: this cut
@@ -244,8 +282,14 @@ def _mux_music(
             # it holds the ceiling for real, which is what stops a platform's
             # own re-encode from clipping what we sent.
             f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled"
-            "[music]",
-            "-map", "0:v:0", "-map", "[music]",
+            "[out]"
+        )
+    _run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(picture), "-i", str(music),
+            "-filter_complex", chain,
+            "-map", "0:v:0", "-map", "[out]",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
             "-shortest", str(destination),
         ]
@@ -276,6 +320,7 @@ def render(
     *,
     music: Path | None = None,
     keep_segments: bool = True,
+    keep_voice: bool = False,
 ) -> RenderResult:
     """Render a plan to a deliverable and a preview.
 
@@ -306,7 +351,8 @@ def render(
     deliverable = output_dir / "deliverable.mp4"
     if music is not None:
         _mux_music(
-            picture, music, deliverable, video_encoder=video_encoder
+            picture, music, deliverable,
+            video_encoder=video_encoder, keep_voice=keep_voice,
         )
     else:
         shutil.copyfile(picture, deliverable)

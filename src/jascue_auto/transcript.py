@@ -54,6 +54,12 @@ class Line:
     starts_seconds: float
     ends_seconds: float
     heard: str = ""
+    # Who said it, named so the frame can find them. Acoustic diarisation
+    # answers "a different voice"; the picture answers "the man in the blue
+    # shirt", which is the vocabulary the reframe layer already speaks -- and
+    # a talking shot framed on whoever is not talking is the fault this is
+    # here to make fixable.
+    speaker: str = ""
 
     @property
     def duration(self) -> float:
@@ -213,6 +219,7 @@ def lines_of(card: dict[str, Any]) -> list[Line]:
             starts_seconds=float(entry.get("starts_seconds", 0.0)),
             ends_seconds=float(entry.get("ends_seconds", 0.0)),
             heard=str(entry.get("heard", "")),
+            speaker=str(entry.get("speaker", "")),
         )
         for entry in card.get("lines", []) or []
         if entry.get("text")
@@ -241,7 +248,8 @@ def _schema() -> dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "required": [
-                        "text", "heard", "starts_seconds", "ends_seconds"
+                        "text", "heard", "speaker",
+                        "starts_seconds", "ends_seconds",
                     ],
                     "properties": {
                         "text": {
@@ -253,6 +261,14 @@ def _schema() -> dict[str, Any]:
                             "description": (
                                 "辨識器原本給的同一段文字。沒改就填一樣的"
                                 "——後面要靠這個看出你改了什麼。"
+                            ),
+                        },
+                        "speaker": {
+                            "type": "string",
+                            "description": (
+                                "誰在說這一句，用畫面上分辨得出來的描述："
+                                "「戴帽子拿麥克風的主持人」、「穿灰藍上衣的"
+                                "受訪男子」。畫面外的聲音就說畫面外。"
                             ),
                         },
                         "starts_seconds": {"type": "number"},
@@ -290,8 +306,18 @@ def describe(
     heard = hear(source, locale=locale)
     words = words_of(heard)
     silences = gaps(words)
+    # The recogniser's own confidence marks where it struggled, and it is a
+    # good marker: the two characters it got wrong in one interview came back
+    # at 0.72 and 0.79 with everything around them above 0.99. Passing it
+    # points the correction at the places worth looking.
     rough = "\n".join(
-        f"{word.starts_seconds:.2f} {word.text}" for word in words
+        f"{word.starts_seconds:.2f} {word.text}"
+        + (
+            f"  ←不確定 {word.confidence:.2f}"
+            if word.confidence is not None and word.confidence < 0.9
+            else ""
+        )
+        for word in words
     )
 
     if cache is None:
@@ -343,6 +369,7 @@ def describe(
         lines.append({
             "text": str(entry.get("text", "")).strip(),
             "heard": str(entry.get("heard", "")).strip(),
+            "speaker": str(entry.get("speaker", "")).strip(),
             "starts_seconds": round(snap(start, silences), 3),
             "ends_seconds": round(snap(end, silences), 3),
         })

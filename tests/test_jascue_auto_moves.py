@@ -758,6 +758,10 @@ def test_a_transcript_is_its_own_card() -> None:
 
     fields = transcript._schema()["properties"]
     assert "language" in fields, "the locale was a guess; this is the answer"
+    assert "speaker" in fields["lines"]["items"]["required"], (
+        "a talking shot framed on whoever is not talking is the fault this "
+        "is here to make fixable"
+    )
     assert "heard" in fields["lines"]["items"]["properties"], (
         "what the recogniser said has to survive, or a correction is invisible"
     )
@@ -808,3 +812,24 @@ def test_the_transcriber_is_reachable_as_its_own_command() -> None:
         main(["transcribe", "--help"])
     except SystemExit as exit_code:
         assert exit_code.code == 0
+
+
+def test_music_goes_under_a_voice_rather_than_over_it() -> None:
+    """Throwing the source audio away is right for b-roll and ruins an
+    interview, where what was said is the whole content.
+
+    A fixed lower level is not the answer either: quiet enough never to bury
+    a sentence is too quiet to be doing anything in the gaps. Measured on one
+    street interview, the voice as sidechain trigger pulled the bed down 8.2
+    dB against the same bed with a silent trigger.
+    """
+
+    import inspect
+
+    from jascue_auto import renderer
+
+    source = inspect.getsource(renderer._mux_music)
+    assert "sidechaincompress" in source
+    assert "keep_voice" in inspect.signature(renderer.render).parameters
+    # The voice has to reach the output, not only the compressor's key input.
+    assert "asplit" in source and "[voice][ducked]amix" in source
