@@ -172,6 +172,7 @@
   #log .stage { color: var(--ink); font-weight: 600; }
   #log .bad { color: var(--accent); }
   #log .good { color: var(--ok); font-weight: 600; }
+  #log .faint { color: var(--dim); }
   .state { font-size: 14px; font-weight: 600; display: flex; gap: 9px; align-items: center; }
   .state::before {
     content: ''; width: 7px; height: 7px; border-radius: 50%;
@@ -511,6 +512,13 @@ $('go').addEventListener('click', async () => {
   }
   runId = (await res.json()).run_id;
   seen = 0; $('log').textContent = '';
+  // Whatever is on screen belongs to the last run. Leaving it there while a
+  // new one writes cards reads as though the new one already finished.
+  for (const id of ['result', 'shots', 'transcripts', 'aside']) {
+    $(id).classList.add('hide');
+  }
+  for (const id of ['subs', 'tl-pr', 'tl-fc']) $(id).classList.add('hide');
+  $('video').removeAttribute('src');
   timer = setInterval(poll, 1200);
   poll();
 });
@@ -520,6 +528,7 @@ $('stop').addEventListener('click', async () => {
 });
 
 function classify(line) {
+  if (/^\s+card \d+\//.test(line)) return 'faint';
   if (/error|Traceback|failed|refused/i.test(line)) return 'bad';
   if (/^(cards|direction|selection|shots|review|replan|cut on action|set aside|no music map)/.test(line)) return 'stage';
   if (/delivered what they planned/.test(line)) return 'good';

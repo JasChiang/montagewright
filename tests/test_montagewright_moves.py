@@ -1278,3 +1278,44 @@ def test_every_paid_stage_checks_the_cap_before_spending() -> None:
 
     inner = inspect.getsource(pipeline.follow_subjects)
     assert inner.count("_afford(report)") == inner.count("locate_subject(")
+
+
+def test_a_pasted_path_is_taken_as_a_path() -> None:
+    """Finder and browsers hand over a URL, terminals leave the quotes on.
+
+    `Path("file:/Users/...")` is a relative directory called "file:", so a run
+    started with one spent four minutes writing cards and only then failed on
+    a track that had never been there.
+    """
+
+    from montagewright.webapp import _typed_path
+
+    assert str(_typed_path("file:///Users/j/a%20b/%E5%A4%8F.mp3")) == (
+        "/Users/j/a b/夏.mp3"
+    )
+    assert str(_typed_path("file:/Users/j/x.mp3")) == "/Users/j/x.mp3"
+    assert str(_typed_path(' "/Users/j/y.mp3" ')) == "/Users/j/y.mp3"
+    assert _typed_path("   ") is None
+
+
+def test_the_long_silent_stage_reports_itself() -> None:
+    """Seventy-four cards is four minutes with nothing on screen, which looks
+    exactly like a hang."""
+
+    import inspect
+
+    from montagewright import cli, clipcard
+
+    assert "progress" in inspect.signature(clipcard.build_library).parameters
+    assert "card {index}/{total}" in inspect.getsource(cli.command_render)
+
+
+def test_a_new_run_clears_the_last_one_from_the_page() -> None:
+    """Leaving the previous result up while cards are written reads as though
+    the new run had already finished."""
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    start = page.index("runId = (await res.json()).run_id;")
+    assert "classList.add('hide')" in page[start:start + 600]

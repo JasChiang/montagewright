@@ -441,6 +441,7 @@ def build_library(
     client,
     cache=None,
     model_id: str | None = None,
+    progress=None,
 ) -> tuple[dict[str, Path], dict[str, Any]]:
     """Write a card for every asset that does not already have one.
 
@@ -454,7 +455,8 @@ def build_library(
     stats = {"written": 0, "reused": 0, "failed": 0, "input": 0, "output": 0}
     failures: list[str] = []
 
-    for source_id, proxy in sorted(proxies.items()):
+    total = len(proxies)
+    for index, (source_id, proxy) in enumerate(sorted(proxies.items()), start=1):
         destination = card_dir / f"{source_id}.json"
         if load_card(destination) is not None:
             paths[source_id] = destination
@@ -478,6 +480,10 @@ def build_library(
         stats["written"] += 1
         stats["input"] += usage.input_tokens
         stats["output"] += usage.output_tokens + usage.thought_tokens
+        # Seventy-four of these is four minutes with nothing on screen, which
+        # is indistinguishable from a hang to anyone watching.
+        if progress is not None:
+            progress(index, total, source_id)
     stats["failures"] = failures
     if failures and not paths:
         # Not a degradation. A library with nothing in it is the input

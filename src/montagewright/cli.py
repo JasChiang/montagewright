@@ -141,8 +141,11 @@ def command_render(args: argparse.Namespace) -> int:
         path.stem: _make_proxy(path, work / "proxies" / f"{path.stem}.mp4")
         for path in sources_paths
     }
+    def wrote(index: int, total: int, source_id: str) -> None:
+        print(f"  card {index}/{total}  {source_id}", flush=True)
+
     cards, stats = build_library(
-        proxies, work / "cards", client=client, cache=cache
+        proxies, work / "cards", client=client, cache=cache, progress=wrote
     )
     ledger.record(
         "clip_cards",

@@ -135,6 +135,28 @@ def _collect(run: Run) -> None:
     run.remember()
 
 
+def _typed_path(raw: str) -> Path | None:
+    """Whatever a person pasted, as a path.
+
+    Dragging out of Finder or copying from a browser gives a `file://` URL
+    with the spaces and the Chinese percent-encoded; quoting a path in a
+    terminal leaves the quotes on. All of that arrives here looking like a
+    path and is not one -- `Path("file:/Users/...")` is a relative directory
+    called "file:", so the run started, spent four minutes writing cards, and
+    only then failed on a track that was never there.
+    """
+
+    from urllib.parse import unquote, urlparse
+
+    text = raw.strip().strip('"').strip("'")
+    if not text:
+        return None
+    if text.startswith("file:"):
+        parsed = urlparse(text)
+        text = unquote(parsed.path)
+    return Path(text).expanduser()
+
+
 def _save(upload: UploadFile, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as handle:
@@ -173,8 +195,9 @@ def create_app() -> FastAPI:
         # A path is the ordinary case: this runs beside the material, and
         # pushing a folder of 4K through the browser to write it back to disk
         # a directory away is work nobody asked for.
-        if source_path.strip():
-            rush_dir = Path(source_path.strip()).expanduser()
+        typed = _typed_path(source_path)
+        if typed is not None:
+            rush_dir = typed
             if not rush_dir.exists():
                 raise HTTPException(400, f"{rush_dir} is not there")
             if rush_dir.is_file():
@@ -222,8 +245,12 @@ def create_app() -> FastAPI:
             "--budget", str(budget),
             "--output", str(root / "out"),
         ]
-        if music_path.strip():
-            command += ["--music", str(Path(music_path.strip()).expanduser())]
+        track = _typed_path(music_path)
+        if track is not None:
+            if not track.exists():
+                shutil.rmtree(root, ignore_errors=True)
+                raise HTTPException(400, f"{track} is not there")
+            command += ["--music", str(track)]
         elif music is not None and music.filename:
             track = _save(music, root / Path(music.filename).name)
             command += ["--music", str(track)]
