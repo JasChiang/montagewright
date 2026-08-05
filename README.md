@@ -115,6 +115,77 @@ Gemini 說「框住左邊那台深色手機」—— 但畫面上有三台手機
 
 ---
 
+## 怎麼用
+
+### 第一次
+
+```bash
+# 1. 裝起來（需要 Python 3.12 跟 ffmpeg）
+uv sync                      # 或 pip install -e .
+
+# 2. API key
+echo 'GEMINI_API_KEY=...' > .env
+set -a && . ./.env && set +a
+
+# 3. 要用 SAM 追蹤的話，放一份 checkpoint（不放也能跑，只是不會逐幀跟拍）
+#    https://github.com/facebookresearch/sam2 → sam2.1_hiera_tiny.pt
+
+# 4. 要做逐字稿的話（需要 macOS 26），編一次 Swift 工具
+swiftc -parse-as-library -O -o tools/transcribe/transcribe \
+  tools/transcribe/Transcribe.swift
+```
+
+### 最短的一次
+
+```bash
+montagewright render ~/rushes --aspect 9:16 --output ~/cut
+```
+
+素材夾進去、9:16 出來。沒給音樂就不配樂，長度全部由內容決定。
+
+### 實際會用的那一行
+
+```bash
+montagewright render ~/rushes \
+  --brief BRIEF.md \
+  --music track.mp3 \
+  --aspect 9:16 \
+  --sam-checkpoint artifacts/models/sam2.1_hiera_tiny.pt \
+  --review \
+  --timeline both \
+  --budget 6 \
+  --output ~/cut
+```
+
+### 選項裡值得說的
+
+**`--brief`** 是**意圖，不是分鏡表**。寫「這支要讓人想點進去看完整版，開頭三秒決定一切，每一顆都要有笑點或共鳴點」比寫「第一顆用 A、第二顆用 B」有用得多 —— 前者它會拿去當判斷依據，後者只是把你的工作抄一遍。實測同一批素材，加了這種 brief 之後開場整個換掉了。
+
+**`--review`** 打開之後會多做兩件事：**逐顆對照它自己的計畫**（這顆說要推近到鏡頭模組，推到了嗎？說 3.5 秒是為了讓動作做完，做完了嗎？），還有**沒做到的那幾顆重新規劃再跑一次**。這是最值得開的選項，也是最花錢的 —— 大概多三到四成。
+
+**`--timeline`** 預設不產生。要在 Premiere／Final Cut 裡改的時候才加。它指回**原始素材**，所以每顆前後都還能往外拉。
+
+**`--speech`** 預設 `auto` —— 卡片說「這支的聲音是內容」才做逐字稿，b-roll 不會被收費。`never` 是強制關掉。
+
+**`--budget`** 是總上限，包含重新規劃跟重跑。碰到就停，然後交出當下最好的版本 —— 不會為了省錢改用比較差的做法。
+
+**`--music-map`** 幾乎用不到。給 `--music` 就會自己量節拍；這個是給已經人工審過的節拍表用的。
+
+### 花多少錢
+
+實測（Gemini 3.6 Flash）：
+
+| 這一輪 | 顆數 | 片長 | 花費 |
+|---|---|---|---|
+| 74 支毛片，第一次跑（要寫 74 張卡片） | 10 | 34.9s | **$1.43** |
+| 同一批素材再剪一支（卡片快取） | 22 | 71.0s | **$0.55** |
+| 5 分半街訪，含逐字稿與重新規劃 | 13 | 48.6s | **$0.81** |
+| 同一支再剪一次（卡片與逐字稿都快取） | 16 | 46.1s | **$0.46** |
+
+**第一次最貴，之後便宜很多。** 卡片跟逐字稿用檔案內容 hash 快取，同一批素材再剪第二支、第三支都不用重付。
+
+---
+
 ## 網頁介面
 
 ```bash
@@ -170,17 +241,6 @@ montagewright-web        # http://127.0.0.1:8765
 **看整支片，看不出單顆的問題。** 有六個構圖錯誤連續通過了整支片的審查，每一個都是單獨打開那一顆才發現的 —— 三十秒的片子裡，下一顆很快就把上一顆的錯蓋過去。
 
 ---
-
-## 需要什麼環境
-
-Python 3.12、ffmpeg、`GEMINI_API_KEY`。
-
-SAM 追蹤要準備 checkpoint（`--sam-checkpoint`）。逐字稿需要 macOS 26，並先編譯一次 Swift 工具：
-
-```bash
-swiftc -parse-as-library -O -o tools/transcribe/transcribe \
-  tools/transcribe/Transcribe.swift
-```
 
 ## 程式結構
 
