@@ -722,7 +722,7 @@ def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
             "/api/runs/{run_id}/shot/{index}"} <= paths
 
     page = PAGE.read_text(encoding="utf-8")
-    for shown in ("素材", "運鏡", "主體", "為什麼用這顆", "降級", "逐顆驗收"):
+    for shown in ("素材", "運鏡", "主體", "為什麼用這顆", "做不到的地方", "逐顆驗收"):
         assert shown in page, shown
 
 
@@ -1447,3 +1447,28 @@ def test_the_cut_can_be_adjusted_without_replanning_it() -> None:
     assert "eats into the handle" in page
     # One shot at a time, beside the viewer, instead of a table to scroll.
     assert "function inspect" in page and 'id="inspector"' in page
+
+
+def test_a_degradation_is_shown_in_words_with_its_number() -> None:
+    """"static_on_subject　accept" names the code that raised it.
+
+    A degradation is worth recording rather than hiding because it carries
+    the measurement that forced it. Printing the enum and the verdict hides
+    exactly that -- the reader learns there was a fallback and nothing about
+    what happened or how far off it was.
+    """
+
+    from montagewright.schema import DegradationStep
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "tellDegradation" in page
+    # Every ladder the schema can produce has something to say.
+    ladders = DegradationStep.model_fields["ladder"].annotation.__args__
+    for name in ladders:
+        if name != "other":
+            assert f"{name}:" in page, name
+    for named in ("subject_wider_than_delivery", "tracking_lost_most_frames",
+                  "trim_window_clamped_to_source", "subject_larger_than_crop"):
+        assert f"{named}:" in page, named
+    assert "measured" in page and "已改動" in page

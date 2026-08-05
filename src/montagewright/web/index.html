@@ -340,10 +340,6 @@
     </div>
   </section>
 
-  <div class="hide" id="past"></div>
-  <div class="hide" id="shots"></div>
-  <div class="hide" id="transcripts"></div>
-  <div class="hide" id="aside"></div>
 </main>
 
 <script>
@@ -421,7 +417,16 @@ async function loadPast() {
       <td class="mono">${r.spend != null ? '$' + r.spend.toFixed(2) : '—'}</td>
       <td><a class="shot" href="#" onclick="openRun('${r.run_id}');return false">打開</a></td>
     </tr>`).join('');
-  $('past').classList.remove('hide');
+  $('detail').classList.remove('hide');
+  // Nothing open yet: the useful thing on a cold page is what was cut before,
+  // and the tabs that need a run have nothing in them.
+  if (!runId) {
+    for (const id of ['pane-shots', 'pane-tx', 'pane-spend', 'pane-aside']) {
+      $(id).previousElementSibling; // keep the panes, hide their tabs
+      document.querySelector(`.tab[data-pane="${id}"]`).classList.add('hide');
+    }
+    showTab('pane-past');
+  }
 }
 
 async function openRun(id) {
@@ -442,7 +447,10 @@ async function openRun(id) {
     showFault(allLines);
     $('resume').classList.remove('hide');
   }
-  if (data.report) { render(data.report); showExtras(); }
+  if (data.report) {
+    for (const t of document.querySelectorAll('.tab')) t.classList.remove('hide');
+    render(data.report); showExtras(); showTab('pane-shots');
+  }
   window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
 }
 
@@ -477,8 +485,7 @@ function inspect(i) {
       <dt>為什麼選它</dt><dd class="why">${esc(plan.why || '—')}</dd>
       ${rhythm.why ? `<dt>為什麼這個長度</dt><dd class="why">${esc(rhythm.why)}</dd>` : ''}
       ${said.note ? `<dt>驗收看到</dt><dd class="why">${esc(said.note)}</dd>` : ''}
-      ${deg.length ? `<dt>降級</dt><dd>${deg.map(d =>
-        `<div class="why">${esc(d.ladder)}　<span class="tag">${esc(d.adjudication || '')}</span></div>`).join('')}</dd>` : ''}
+      ${deg.length ? `<dt>做不到的地方</dt><dd>${deg.map(tellDegradation).join('')}</dd>` : ''}
     </dl>`;
 }
 
@@ -617,7 +624,7 @@ async function showTranscripts() {
   }
   if (!rows.length) return;
   $('tx-table').innerHTML = '<tr><th>時間</th><th>誰</th><th>說了什麼</th><th>原始辨識</th></tr>' + rows.join('');
-  $('transcripts').classList.remove('hide');
+  $('detail').classList.remove('hide');
 }
 
 function showExtras() {
@@ -670,8 +677,9 @@ $('go').addEventListener('click', async () => {
   seen = 0; allLines = []; $('log').textContent = '';
   // Whatever is on screen belongs to the last run. Leaving it there while a
   // new one writes cards reads as though the new one already finished.
-  for (const id of ['result', 'shots', 'transcripts', 'aside', 'fault']) {
-    $(id).classList.add('hide');
+  for (const id of ['result', 'detail', 'fault']) $(id).classList.add('hide');
+  for (const pane of ['pane-tx', 'pane-aside']) {
+    $(pane).classList.add('hide');
   }
   for (const id of ['subs', 'tl-pr', 'tl-fc']) $(id).classList.add('hide');
   $('video').removeAttribute('src');
@@ -817,9 +825,45 @@ async function poll() {
       showExtras();
       $('result').classList.remove('hide');
     }
-    if (data.report) render(data.report);
+    if (data.report) {
+      for (const t of document.querySelectorAll('.tab')) t.classList.remove('hide');
+      render(data.report); showTab('pane-shots');
+    }
     loadPast();
   }
+}
+
+// The report names these for the code that raises them. On screen they have
+// to say what happened, and carry the number that forced it -- that number is
+// the whole reason a degradation is worth recording rather than hiding.
+const LADDERS = {
+  static_on_subject: ['主體沒有在動，所以定住', '本來計畫跟拍，但量到的主體幾乎沒有位移'],
+  reduced_zoom: ['推近沒有推到底', '再推下去要把畫面放大到會糊'],
+  slower_follow: ['跟拍放慢了', '照原本的速度會超過這一段的運鏡上限'],
+  center_crop: ['框在正中間', '指定的主體沒有被定位到，所以沒有東西可以瞄準'],
+  subject_wider_than_delivery: ['主體比畫面寬', '這個比例的任何裁切都框不下整個主體'],
+  subject_larger_than_crop: ['主體塞不進裁切框', '整段裡沒有一刻框得下它'],
+  tracking_lost_most_frames: ['追蹤掉了大半的幀', '剩下的幀不足以當成一段軌跡'],
+  trim_window_clamped_to_source: ['要的長度超過素材本身', '素材沒有那麼長，剪到尾就停'],
+  full_move: ['照原本的運鏡做完', ''],
+};
+const SETTLED = {
+  accept: ['可接受', '看過那一顆之後認為畫面仍然成立'],
+  replan: ['退回重做', '看過之後認為畫面因此不成立'],
+  unadjudicated: ['還沒裁決', '這一輪沒有跑到驗收'],
+};
+
+function tellDegradation(d) {
+  const [what, why] = LADDERS[d.ladder] || [d.ladder, ''];
+  const [verdict, meaning] = SETTLED[d.adjudication] || [d.adjudication || '', ''];
+  const numbers = Object.entries(d.measured || {})
+    .map(([k, v]) => `${k} ${typeof v === 'number' ? +v.toFixed(3) : v}`)
+    .join('　');
+  return `<div style="margin-bottom:7px">
+    <div>${esc(what)}${verdict ? ` <span class="tag" title="${esc(meaning)}">${esc(verdict)}</span>` : ''}</div>
+    ${why ? `<div class="why">${esc(why)}</div>` : ''}
+    ${numbers ? `<div class="why mono">${esc(numbers)}</div>` : ''}
+  </div>`;
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
@@ -867,12 +911,11 @@ function render(report) {
     '<col style="width:88px"><col style="width:170px"><col><col style="width:150px">' +
     '<col style="width:170px"></colgroup>' +
     '<tr><th>#</th><th>素材</th><th>進點／長度</th><th>運鏡</th><th>主體／說話者</th>' +
-    '<th>為什麼用這顆</th><th>降級</th><th>逐顆驗收</th></tr>' +
+    '<th>為什麼用這顆</th><th>做不到的地方</th><th>逐顆驗收</th></tr>' +
     shots.map((s, i) => {
       const k = 'k' + String(i).padStart(2, '0');
       const r = rhythm[k] || {}, v = verdicts[k] || {};
-      const deg = (degByClip[k] || []).map(d =>
-        `<div class="why">${esc(d.ladder)}${d.adjudication ? ` <span class="tag">${esc(d.adjudication)}</span>` : ''}</div>`).join('');
+      const deg = (degByClip[k] || []).map(tellDegradation).join('');
       const ok = v.delivered === undefined ? '' :
         `<span class="tag ${v.delivered ? 'ok' : 'no'}">${v.delivered ? '做到' : '沒做到'}</span>`;
       return `<tr>
@@ -886,24 +929,27 @@ function render(report) {
         <td>${ok}${v.note ? `<div class="why">${esc(v.note)}</div>` : ''}</td>
       </tr>`;
     }).join('');
-  $('shots').classList.remove('hide');
+  $('detail').classList.remove('hide');
 
   const aside = Object.entries(report.set_aside || {});
   if (aside.length) {
     $('aside-table').innerHTML = '<tr><th>檔名</th><th>卡片說的理由</th></tr>' +
       aside.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="why">${esc(v)}</td></tr>`).join('');
-    $('aside').classList.remove('hide');
+    $('detail').classList.remove('hide');
   }
 }
 
 
+function showTab(pane) {
+  for (const t of document.querySelectorAll('.tab')) {
+    t.classList.toggle('on', t.dataset.pane === pane);
+  }
+  for (const p of document.querySelectorAll('.pane')) {
+    p.classList.toggle('hide', p.id !== pane);
+  }
+}
 for (const tab of document.querySelectorAll('.tab')) {
-  tab.onclick = () => {
-    for (const t of document.querySelectorAll('.tab')) t.classList.remove('on');
-    for (const pane of document.querySelectorAll('.pane')) pane.classList.add('hide');
-    tab.classList.add('on');
-    $(tab.dataset.pane).classList.remove('hide');
-  };
+  tab.onclick = () => showTab(tab.dataset.pane);
 }
 
 $('new-run').addEventListener('click', () => {
