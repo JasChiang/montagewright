@@ -258,32 +258,47 @@ def command_render(args: argparse.Namespace) -> int:
             print(f"  {source_id} — {why[:110]}", flush=True)
 
     brief = args.brief.read_text(encoding="utf-8") if args.brief else ""
-    ledger.check()
-    direction, usage_direction = decide_direction(
-        material, brief=brief, music=args.music, cache=cache, client=client
+    asked = _asked(
+        ",".join(sorted(item.source_id for item in material)),
+        brief, args.aspect, str(args.music or ""),
     )
-    ledger.record(
-        "direction",
-        input_tokens=usage_direction.input_tokens,
-        output_tokens=usage_direction.output_tokens
-        + usage_direction.thought_tokens,
-    )
+    direction = _decided(work, "direction", asked)
+    if direction is None:
+        ledger.check()
+        direction, usage_direction = decide_direction(
+            material, brief=brief, music=args.music, cache=cache, client=client
+        )
+        ledger.record(
+            "direction",
+            input_tokens=usage_direction.input_tokens,
+            output_tokens=usage_direction.output_tokens
+            + usage_direction.thought_tokens,
+        )
+        _decide(work, "direction", asked, direction)
+    else:
+        print("direction: reused from the last attempt", flush=True)
     print(
         f"direction: {direction['target_seconds']:.0f}s {direction['aspect']}, "
         f"{len(direction.get('unusable', []))} ruled out",
         flush=True,
     )
 
-    ledger.check()
-    selection, usage_selection = select_shots(
-        material, direction, brief=brief, cache=cache, client=client
-    )
-    ledger.record(
-        "selection",
-        input_tokens=usage_selection.input_tokens,
-        output_tokens=usage_selection.output_tokens
-        + usage_selection.thought_tokens,
-    )
+    chose = _asked(asked, json.dumps(direction, sort_keys=True, ensure_ascii=False))
+    selection = _decided(work, "selection", chose)
+    if selection is None:
+        ledger.check()
+        selection, usage_selection = select_shots(
+            material, direction, brief=brief, cache=cache, client=client
+        )
+        ledger.record(
+            "selection",
+            input_tokens=usage_selection.input_tokens,
+            output_tokens=usage_selection.output_tokens
+            + usage_selection.thought_tokens,
+        )
+        _decide(work, "selection", chose, selection)
+    else:
+        print("selection: reused from the last attempt", flush=True)
     print(f"selection: {len(selection['shots'])} shots", flush=True)
 
     edl, snaps = _edl_from_selection(selection, rushes, cards)
@@ -510,7 +525,7 @@ def command_render(args: argparse.Namespace) -> int:
         report=report,
         plan=plan,
         result=result,
-        usages=[usage_direction, usage_selection],
+        usages=[],
     )
     print(f"\n{report.summary()}", flush=True)
     for stage, usd in sorted(
@@ -608,6 +623,41 @@ def _aspect(path: Path) -> float:
     )
     stream = json.loads(completed.stdout)["streams"][0]
     return float(stream["width"]) / float(stream["height"])
+
+
+def _decided(work: Path, name: str, key: str) -> dict | None:
+    """A decision already paid for, if it was the same question.
+
+    Cards and transcripts survive a crash because they are keyed by the
+    content they describe. Direction and selection were not kept at all, so a
+    run that died after them -- on a quota, on a bad path -- paid for them
+    again on the way back. They are keyed the same way: the same material,
+    brief and aspect is the same question, and a different one is a different
+    key rather than a stale answer.
+    """
+
+    path = work / f"{name}.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return saved.get("value") if saved.get("key") == key else None
+
+
+def _decide(work: Path, name: str, key: str, value: dict) -> dict:
+    path = work / f"{name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"key": key, "value": value}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return value
+
+
+def _asked(*parts: str) -> str:
+    import hashlib
+
+    return hashlib.sha256("\u0000".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def _rhythm_context(

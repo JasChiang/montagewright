@@ -193,6 +193,17 @@
   }
   .steps li.done .mark { border-color: var(--ok); color: var(--ok); }
   .steps li.now .mark { border-color: var(--accent); color: var(--accent); }
+  .steps li.broke .mark { border-color: var(--accent); color: var(--accent); }
+  .steps li.broke .name { color: var(--accent); }
+  .fault {
+    margin: 0 0 18px; padding: 14px 16px; border-radius: 10px;
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+    font-size: 13.5px; color: var(--ink);
+  }
+  .fault b { display: block; margin-bottom: 5px; }
+  .fault .detail { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
+  .fault a { color: var(--accent); }
   .steps li.now .mark::after {
     content: ''; width: 7px; height: 7px; border-radius: 50%;
     background: var(--accent); animation: pulse 1.4s ease-in-out infinite;
@@ -360,8 +371,12 @@
   <section class="hide" id="progress">
     <div class="row" style="justify-content:space-between;margin-bottom:16px">
       <span class="state" id="state">執行中</span>
-      <button class="ghost" id="stop">停止</button>
+      <span class="row" style="gap:8px">
+        <button id="resume" class="hide">繼續跑</button>
+        <button class="ghost" id="stop">停止</button>
+      </span>
     </div>
+    <div class="fault hide" id="fault"></div>
     <ol class="steps" id="steps"></ol>
     <details id="raw"><summary class="why">原始輸出</summary><div id="log"></div></details>
   </section>
@@ -494,6 +509,10 @@ async function openRun(id) {
   }
   $('state').textContent = { running:'執行中', done:'完成', failed:'失敗', stopped:'已停止', interrupted:'中斷' }[data.state] || data.state;
   paintSteps(allLines);
+  if (data.state !== 'done' && data.state !== 'running') {
+    showFault(allLines);
+    $('resume').classList.remove('hide');
+  }
   if (data.report) { render(data.report); showExtras(); }
   window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
 }
@@ -564,13 +583,23 @@ $('go').addEventListener('click', async () => {
   seen = 0; allLines = []; $('log').textContent = '';
   // Whatever is on screen belongs to the last run. Leaving it there while a
   // new one writes cards reads as though the new one already finished.
-  for (const id of ['result', 'shots', 'transcripts', 'aside']) {
+  for (const id of ['result', 'shots', 'transcripts', 'aside', 'fault']) {
     $(id).classList.add('hide');
   }
   for (const id of ['subs', 'tl-pr', 'tl-fc']) $(id).classList.add('hide');
   $('video').removeAttribute('src');
   timer = setInterval(poll, 1200);
   poll();
+});
+
+$('resume').addEventListener('click', async () => {
+  const res = await fetch(`/api/runs/${runId}/resume`, { method: 'POST' });
+  if (!res.ok) { alert(await res.text()); return; }
+  $('resume').classList.add('hide');
+  $('fault').classList.add('hide');
+  $('state').textContent = '執行中';
+  clearInterval(timer);
+  timer = setInterval(poll, 1200);
 });
 
 $('stop').addEventListener('click', async () => {
@@ -610,9 +639,13 @@ function paintSteps(lines) {
       notes[key] = line.trim();
     });
   });
-  const running = $('state').textContent === '執行中';
+  const label = $('state').textContent;
+  const running = label === '執行中';
+  const broke = label === '失敗' || label === '中斷';
   $('steps').innerHTML = STEPS.map(([key, name, said], i) => {
-    const state = i < reached ? 'done' : i === reached ? (running ? 'now' : 'done') : 'todo';
+    const state = i < reached ? 'done'
+      : i === reached ? (running ? 'now' : broke ? 'broke' : 'done')
+      : 'todo';
     const note = notes[key] && state !== 'todo'
       ? `<div class="said mono" style="color:var(--dim)">${esc(notes[key])}</div>` : '';
     return `<li class="${state}">
@@ -620,6 +653,44 @@ function paintSteps(lines) {
       <div><div class="name">${name}</div><div class="said">${said}</div>${note}</div>
     </li>`;
   }).join('');
+}
+
+// A failure buried in a collapsed panel is a failure nobody sees. Pull out
+// the line that says what went wrong and put it where the eye already is.
+const FAULTS = [
+  [/exceeded its monthly spending cap/,
+   'Google 專案的月度支出上限滿了',
+   '這不是這裡設的 --budget，是 AI Studio 的專案設定。到 <a href="https://ai.studio/spend" target="_blank">ai.studio/spend</a> 調高額度，然後按上面的「繼續跑」——卡片、逐字稿、定調、選片都已經存起來了，不會重付。'],
+  [/RESOURCE_EXHAUSTED|429/,
+   'Gemini 拒絕了請求（429）',
+   '通常是額度或速率限制。等一下再試，或看下面的原始輸出。'],
+  [/CardLibraryEmpty/,
+   '每一支素材都寫不出卡片',
+   '通常是環境問題不是素材問題——API key、網路、或 ffmpeg。原始輸出裡有第一筆失敗的真正原因。'],
+  [/is not there/,
+   '給的路徑不存在',
+   '從 Finder 拖進來的路徑會帶 file:// 前綴，用「瀏覽」選比較保險。'],
+  [/BudgetSpent|budget spent/,
+   '碰到你設的預算上限',
+   '已經完成的部分還在，把上限調高再跑一次就會接下去。'],
+];
+
+function showFault(lines) {
+  for (const line of lines.slice().reverse()) {
+    for (const [pattern, what, why] of FAULTS) {
+      if (pattern.test(line)) {
+        $('fault').innerHTML = `<b>${what}</b><div>${why}</div>`;
+        $('fault').classList.remove('hide');
+        return;
+      }
+    }
+  }
+  const last = lines.filter(l => /Error|Traceback|refused/i.test(l)).pop();
+  if (last) {
+    $('fault').innerHTML =
+      `<b>這一輪沒有跑完</b><div class="detail">${esc(last.slice(0, 200))}</div>`;
+    $('fault').classList.remove('hide');
+  }
 }
 
 function classify(line) {
@@ -645,6 +716,11 @@ async function poll() {
   $('state').className = 'state' + (data.state === 'done' ? ' done' : '');
   allLines = allLines.concat(data.lines);
   paintSteps(allLines);
+  if (data.state === 'failed' || data.state === 'stopped') {
+    showFault(allLines);
+    $('raw').open = true;
+    $('resume').classList.remove('hide');
+  }
 
   if (data.state !== 'running') {
     clearInterval(timer); $('go').disabled = false;

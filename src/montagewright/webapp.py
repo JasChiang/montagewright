@@ -61,6 +61,10 @@ class Run:
     process: subprocess.Popen | None = None
     started_at: float = field(default_factory=time.time)
     source: str = ""
+    # What was run, so it can be run again into the same place. Everything
+    # already paid for -- cards, transcripts, the direction, the selection --
+    # is keyed on disk, so a second attempt picks up where the first stopped.
+    command: list[str] = field(default_factory=list)
 
     @property
     def output(self) -> Path:
@@ -76,6 +80,7 @@ class Run:
                 "state": self.state,
                 "started_at": self.started_at,
                 "source": self.source,
+                "command": self.command,
                 "log": self.lines,
             }, ensure_ascii=False),
             encoding="utf-8",
@@ -120,6 +125,7 @@ def recall() -> None:
             else "interrupted",
             started_at=float(saved.get("started_at", 0.0)),
             source=saved.get("source", ""),
+            command=saved.get("command", []),
         )
 
 
@@ -271,7 +277,9 @@ def create_app() -> FastAPI:
         if checkpoint.exists():
             command += ["--sam-checkpoint", str(checkpoint)]
 
-        run = Run(run_id=run_id, root=root, source=str(rush_dir))
+        run = Run(
+            run_id=run_id, root=root, source=str(rush_dir), command=command
+        )
         run.lines.append(f"{kept} clips from {rush_dir}")
         run.remember()
         run.process = subprocess.Popen(
@@ -410,6 +418,32 @@ def create_app() -> FastAPI:
             "report": run.report() if run.state != "running" else None,
             "has_video": (run.output / "preview.mp4").exists(),
         })
+
+    @app.post("/api/runs/{run_id}/resume")
+    def resume(run_id: str) -> JSONResponse:
+        """Run it again into the same place.
+
+        Nothing already paid for is paid for twice: the cards, transcripts,
+        the direction and the selection are all keyed on disk, so this picks
+        up where the quota or the bad path stopped it.
+        """
+
+        run = _run(run_id)
+        if not run.command:
+            raise HTTPException(400, "this run did not record how it started")
+        if run.process is not None and run.process.poll() is None:
+            raise HTTPException(409, "it is still going")
+        run.lines.append("— 續跑 —")
+        run.state = "running"
+        run.process = subprocess.Popen(
+            run.command,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        run.remember()
+        threading.Thread(target=_collect, args=(run,), daemon=True).start()
+        return JSONResponse({"state": run.state})
 
     @app.post("/api/runs/{run_id}/stop")
     def stop(run_id: str) -> JSONResponse:

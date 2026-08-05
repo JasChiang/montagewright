@@ -1353,3 +1353,46 @@ def test_music_can_be_picked_the_same_way_as_the_rushes() -> None:
     assert "videos" in audio  # the listing switches what it looks for
     page = PAGE.read_text(encoding="utf-8")
     assert "browse-music" in page and "openPicker" in page
+
+
+def test_a_failed_run_says_so_where_it_can_be_seen() -> None:
+    """A run died on the project spend cap and the page showed ticked steps.
+
+    The traceback was in the raw output, folded away, and the stage list
+    marked everything up to the failure as complete and everything after it
+    as pending -- which is what a run still in progress looks like.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "showFault" in page
+    assert "Google 專案的月度支出上限滿了" in page
+    assert "ai.studio/spend" in page
+    # The step it died on is marked, not ticked.
+    assert "broke" in page and ".steps li.broke .name" in page
+
+
+def test_a_run_that_died_can_be_picked_up_where_it_stopped() -> None:
+    """The quota ran out after seventy-four cards and a selection.
+
+    The cards survived because they are keyed by the content they describe.
+    The direction and the selection were not kept at all, so the second
+    attempt paid for them again -- and they are the same question whenever
+    the material, the brief and the aspect are the same.
+    """
+
+    import inspect
+
+    from montagewright import cli
+    from montagewright.webapp import PAGE, create_app
+
+    source = inspect.getsource(cli.command_render)
+    assert '_decided(work, "direction"' in source
+    assert '_decided(work, "selection"' in source
+    # A different brief is a different question, not a stale answer.
+    assert "brief, args.aspect" in source
+
+    paths = {r.path for r in create_app().routes if hasattr(r, "path")}
+    assert "/api/runs/{run_id}/resume" in paths
+    assert "繼續跑" in PAGE.read_text(encoding="utf-8")
