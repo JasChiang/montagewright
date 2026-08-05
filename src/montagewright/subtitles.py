@@ -158,6 +158,49 @@ def cannot_spell(text: str, *, size: int = 40) -> str:
     )
 
 
+# Which face inside a collection, for a language. A .ttc holds several --
+# PingFang carries HK, MO, TC and SC in four weights -- and index 0 is
+# whatever the file happens to list first, which for PingFang is Hong Kong
+# Regular. HK and TC draw some characters differently, so a Taiwanese cut
+# was being set in the wrong regional forms, and Regular is thin against a
+# moving picture.
+REGIONS: dict[str, tuple[str, ...]] = {
+    "zh-tw": ("TC", "HK", "SC"),
+    "zh-hk": ("HK", "TC", "SC"),
+    "zh-cn": ("SC", "TC", "HK"),
+    "ja": ("",),
+}
+WEIGHTS: tuple[str, ...] = ("Medium", "Semibold", "Regular")
+
+
+def _best_face(path: str, size: int, lang: str):
+    """Open the face inside a collection that suits the language."""
+
+    from PIL import ImageFont
+
+    wanted = REGIONS.get(lang.lower(), ("TC", "HK", "SC"))
+    best, best_score = None, None
+    for index in range(12):
+        try:
+            face = ImageFont.truetype(path, size, index=index)
+        except OSError:
+            break
+        family, style = face.getname()
+        region = next(
+            (i for i, tag in enumerate(wanted)
+             if tag and family.endswith(tag)), len(wanted)
+        )
+        weight = next(
+            (i for i, tag in enumerate(WEIGHTS) if tag == style), len(WEIGHTS)
+        )
+        score = (region, weight)
+        if best_score is None or score < best_score:
+            best, best_score = face, score
+        if index == 0 and not path.lower().endswith((".ttc", ".otc")):
+            break
+    return best
+
+
 def _face(size: int, *, text: str = "", lang: str = "zh-tw"):
     from PIL import ImageFont
 
@@ -167,28 +210,33 @@ def _face(size: int, *, text: str = "", lang: str = "zh-tw"):
     tried += _asked_of_the_system(lang)
     tried += list(FONTS)
 
-    # Rank order, but "draws everything" cannot be the only rule. One emoji
-    # in a line means no Chinese font qualifies, and taking the first
-    # candidate that did set a whole street interview in STIX Two Math.
-    # So: the best-ranked font that draws the most of the text, which is
-    # the CJK font missing one emoji rather than a maths font missing the
-    # language.
+    # fontconfig has already ranked these for the language, so rank is the
+    # strong signal and coverage is the check on it. Requiring a font to
+    # draw *everything* let one emoji drag the choice down the list: no
+    # Chinese font qualifies, and the first that did set a street interview
+    # in STIX Two Math. Ranking by coverage instead picked a handwriting
+    # face that merely claims the emoji -- the glyph probe is a heuristic
+    # and it is wrong about some fonts.
+    #
+    # So the first candidate that draws nearly all of it wins, and whatever
+    # it still cannot spell is named by cannot_spell rather than chased.
     wanted = {one for one in text if not one.isspace()}
     best = None
-    for rank, candidate in enumerate(tried[:24]):
+    for candidate in tried[:24]:
         try:
-            face = ImageFont.truetype(candidate, size)
+            face = _best_face(candidate, size, lang) or \
+                ImageFont.truetype(candidate, size)
         except OSError:
             continue
         if not wanted:
             return face
         drawn = sum(1 for one in wanted if _can_draw(face, one))
-        if drawn == len(wanted):
+        if drawn >= len(wanted) * 0.8:
             return face
         if best is None or drawn > best[0]:
-            best = (drawn, rank, face)
+            best = (drawn, face)
     if best is not None:
-        return best[2]
+        return best[1]
     raise NoFontHere(
         "no font here can draw these subtitles; they can still be written "
         "as a file. Set montagewright.subtitles.CHOSEN to a font path, or "

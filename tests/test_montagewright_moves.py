@@ -2558,3 +2558,21 @@ def test_one_shot_can_be_turned_down_without_re_planning_anything() -> None:
 
     page = PAGE.read_text(encoding="utf-8")
     assert 'id="gain"' in page and "gain_db: b.gain_db || 0" in page
+
+
+def test_the_regional_face_and_a_weight_that_reads_over_a_picture() -> None:
+    """A .ttc holds several faces and index 0 is whatever it lists first.
+
+    For PingFang that is Hong Kong Regular, so a Taiwanese cut was being set
+    in the wrong regional character forms, in a weight too thin to hold up
+    against a moving picture.
+    """
+
+    from montagewright import subtitles as typeset
+
+    for lang, region in (("zh-tw", "TC"), ("zh-cn", "SC"), ("zh-hk", "HK")):
+        family, style = typeset._face(40, text="夏天", lang=lang).getname()
+        if not family.startswith("PingFang"):
+            continue  # another machine, another font; nothing to assert
+        assert family.endswith(region), (lang, family)
+        assert style in ("Medium", "Semibold"), (lang, style)
