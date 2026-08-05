@@ -1319,3 +1319,37 @@ def test_a_new_run_clears_the_last_one_from_the_page() -> None:
     page = PAGE.read_text(encoding="utf-8")
     start = page.index("runId = (await res.json()).run_id;")
     assert "classList.add('hide')" in page[start:start + 600]
+
+
+def test_the_page_says_what_each_stage_is_doing() -> None:
+    """"cards: 74 written" does not explain four minutes of nothing.
+
+    The raw output is what the pipeline says to itself. Someone watching a
+    run wants to know which part is happening and what that part is for --
+    especially during the long silent one.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "const STEPS" in page and "paintSteps" in page
+    for said in ("Apple 辨識器給逐字時間", "SAM 逐幀追出在哪裡",
+                 "先逐顆對照它自己的計畫"):
+        assert said in page, said
+    # The machine output is still there, folded away.
+    assert "原始輸出" in page
+
+
+def test_music_can_be_picked_the_same_way_as_the_rushes() -> None:
+    """Typing was the only way, and a path pasted from Finder is a URL."""
+
+    from fastapi.testclient import TestClient
+
+    from montagewright.webapp import PAGE, create_app
+
+    audio = TestClient(create_app()).get(
+        "/api/browse", params={"kind": "audio"}
+    ).json()
+    assert "videos" in audio  # the listing switches what it looks for
+    page = PAGE.read_text(encoding="utf-8")
+    assert "browse-music" in page and "openPicker" in page

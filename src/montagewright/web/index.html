@@ -180,6 +180,35 @@
   }
   .state.done::before { background: var(--ok); }
 
+  .steps { list-style: none; margin: 0 0 18px; padding: 0; }
+  .steps li {
+    display: flex; gap: 13px; padding: 11px 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .steps li:last-child { border-bottom: 0; }
+  .steps .mark {
+    flex: none; width: 18px; height: 18px; margin-top: 2px;
+    border-radius: 50%; border: 1.5px solid var(--line);
+    display: grid; place-items: center; font-size: 10px; color: var(--dim);
+  }
+  .steps li.done .mark { border-color: var(--ok); color: var(--ok); }
+  .steps li.now .mark { border-color: var(--accent); color: var(--accent); }
+  .steps li.now .mark::after {
+    content: ''; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent); animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+  .steps .name { font-weight: 560; font-size: 13.5px; }
+  .steps li.todo .name { color: var(--dim); font-weight: 480; }
+  .steps .said { color: var(--ink-soft); font-size: 12.5px; margin-top: 2px; }
+  .steps li.todo .said { color: var(--dim); }
+  details#raw summary {
+    cursor: pointer; font-size: 12.5px; margin-bottom: 10px;
+    list-style: none;
+  }
+  details#raw summary::before { content: '▸ '; }
+  details#raw[open] summary::before { content: '▾ '; }
+
   /* results */
   .stats {
     display: flex; gap: 34px; flex-wrap: wrap;
@@ -270,8 +299,11 @@
       </div>
 
       <div class="field">
-        <label>音樂路徑</label>
-        <input type="text" id="music-path" placeholder="留空＝不配樂">
+        <label>音樂</label>
+        <div class="row" style="gap:8px;flex-wrap:nowrap">
+          <input type="text" id="music-path" placeholder="留空＝不配樂">
+          <button type="button" class="ghost" id="browse-music" style="white-space:nowrap">瀏覽…</button>
+        </div>
       </div>
       <div class="field">
         <label>輸出比例</label>
@@ -330,7 +362,8 @@
       <span class="state" id="state">執行中</span>
       <button class="ghost" id="stop">停止</button>
     </div>
-    <div id="log"></div>
+    <ol class="steps" id="steps"></ol>
+    <details id="raw"><summary class="why">原始輸出</summary><div id="log"></div></details>
   </section>
 
   <section class="hide" id="result">
@@ -372,12 +405,13 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let runId = null, seen = 0, timer = null;
+let runId = null, seen = 0, timer = null, allLines = [];
 
-let picking = '';
+let picking = '', pickTarget = 'path', pickKind = 'video';
 
 async function browseTo(path) {
-  const res = await fetch('/api/browse?path=' + encodeURIComponent(path || ''));
+  const res = await fetch('/api/browse?path=' + encodeURIComponent(path || '')
+    + '&kind=' + pickKind);
   if (!res.ok) { $('picker-note').textContent = '打不開'; return; }
   const d = await res.json();
   picking = d.here;
@@ -391,24 +425,37 @@ async function browseTo(path) {
       (f.clips ? `<span class="count">${f.clips} 支</span>` : '') + `</div>`);
   }
   for (const v of d.videos) {
-    rows.push(`<div class="pick file"><span class="ico">·</span>${esc(v.name)}</div>`);
+    rows.push(pickKind === 'audio'
+      ? `<div class="pick" data-file="${esc(v.path)}"><span class="ico">♪</span>${esc(v.name)}</div>`
+      : `<div class="pick file"><span class="ico">·</span>${esc(v.name)}</div>`);
   }
   $('listing').innerHTML = rows.join('') ||
     '<div class="pick file"><span class="ico">·</span>這裡沒有東西</div>';
   $('picker-note').textContent = d.videos.length
-    ? `這層有 ${d.videos.length} 支影片` : '這層沒有影片，往下點';
+    ? (pickKind === 'audio' ? `點一個檔案選它` : `這層有 ${d.videos.length} 支影片`)
+    : (pickKind === 'audio' ? '這層沒有音檔，往下點' : '這層沒有影片，往下點');
   for (const el of $('listing').querySelectorAll('.pick[data-path]')) {
     el.onclick = () => browseTo(el.dataset.path);
   }
+  for (const el of $('listing').querySelectorAll('.pick[data-file]')) {
+    el.onclick = () => {
+      $(pickTarget).value = el.dataset.file;
+      $('picker').classList.add('hide');
+    };
+  }
 }
 
-$('browse').addEventListener('click', () => {
+function openPicker(target, kind) {
+  pickTarget = target; pickKind = kind;
+  $('use-here').style.display = kind === 'audio' ? 'none' : '';
   $('picker').classList.remove('hide');
-  browseTo($('path').value.trim());
-});
+  browseTo($(target).value.trim());
+}
+$('browse').addEventListener('click', () => openPicker('path', 'video'));
+$('browse-music').addEventListener('click', () => openPicker('music-path', 'audio'));
 $('close-picker').addEventListener('click', () => $('picker').classList.add('hide'));
 $('use-here').addEventListener('click', () => {
-  $('path').value = picking;
+  $(pickTarget).value = picking;
   $('picker').classList.add('hide');
 });
 
@@ -437,6 +484,7 @@ async function openRun(id) {
   runId = id; seen = 0;
   const data = await (await fetch(`/api/runs/${id}`)).json();
   $('log').textContent = data.lines.join('\n');
+  allLines = data.lines;
   $('progress').classList.remove('hide');
   $('state').textContent = { running:'執行中', done:'完成', failed:'失敗', stopped:'已停止', interrupted:'中斷' }[data.state] || data.state;
   if (data.has_video) {
@@ -444,6 +492,8 @@ async function openRun(id) {
     $('download').href = `/api/runs/${id}/deliverable`;
     $('result').classList.remove('hide');
   }
+  $('state').textContent = { running:'執行中', done:'完成', failed:'失敗', stopped:'已停止', interrupted:'中斷' }[data.state] || data.state;
+  paintSteps(allLines);
   if (data.report) { render(data.report); showExtras(); }
   window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
 }
@@ -511,7 +561,7 @@ $('go').addEventListener('click', async () => {
     $('go').disabled = false; return;
   }
   runId = (await res.json()).run_id;
-  seen = 0; $('log').textContent = '';
+  seen = 0; allLines = []; $('log').textContent = '';
   // Whatever is on screen belongs to the last run. Leaving it there while a
   // new one writes cards reads as though the new one already finished.
   for (const id of ['result', 'shots', 'transcripts', 'aside']) {
@@ -526,6 +576,51 @@ $('go').addEventListener('click', async () => {
 $('stop').addEventListener('click', async () => {
   if (runId) await fetch(`/api/runs/${runId}/stop`, { method: 'POST' });
 });
+
+// What each stage is for, in the order it happens. The raw output says
+// "cards: 74 written"; this says what that was and why it took four minutes.
+const STEPS = [
+  ['proxy',      '準備素材',   '每支壓一份小檔給模型看，順便把已經剪過的長片照場景切點拆開',
+                 l => /clips (from|in) /.test(l)],
+  ['cards',      '看每一支素材', 'Gemini 連聲音一起看完，記下內容、可框住的東西在哪、動作在第幾秒、聲音是不是內容',
+                 l => /^\s*card \d+\/|^cards:/.test(l)],
+  ['speech',     '聽懂在講什麼', 'Apple 辨識器給逐字時間，Gemini 改錯字並標出誰在講',
+                 l => /^speech:|transcribed/.test(l)],
+  ['direction',  '決定剪成什麼', '調性、長度、比例、音樂怎麼鋪',
+                 l => /^direction:/.test(l)],
+  ['selection',  '挑鏡頭',     '用哪幾顆、從第幾秒進、多長、什麼運鏡、框住誰',
+                 l => /^selection:|^cut on action/.test(l)],
+  ['subject',    '找主體與裁切', 'Gemini 指出是哪一個，SAM 逐幀追出在哪裡，算出裁切路徑',
+                 l => /^no music map|frame loading|propagate/.test(l)],
+  ['review',     '驗收',       '先逐顆對照它自己的計畫，再看整支',
+                 l => /^shots:|^review \d/.test(l)],
+  ['replan',     '重新規劃',    '沒做到的那幾顆換個做法，其他不動',
+                 l => /^\s*replan /.test(l)],
+  ['done',       '完成',       '影片、報表、以及你要的時間軸',
+                 l => /^deliverable/.test(l)],
+];
+
+function paintSteps(lines) {
+  let reached = -1;
+  const notes = {};
+  lines.forEach(line => {
+    STEPS.forEach(([key, , , matches], i) => {
+      if (!matches(line)) return;
+      if (i > reached) reached = i;
+      notes[key] = line.trim();
+    });
+  });
+  const running = $('state').textContent === '執行中';
+  $('steps').innerHTML = STEPS.map(([key, name, said], i) => {
+    const state = i < reached ? 'done' : i === reached ? (running ? 'now' : 'done') : 'todo';
+    const note = notes[key] && state !== 'todo'
+      ? `<div class="said mono" style="color:var(--dim)">${esc(notes[key])}</div>` : '';
+    return `<li class="${state}">
+      <span class="mark">${state === 'done' ? '✓' : ''}</span>
+      <div><div class="name">${name}</div><div class="said">${said}</div>${note}</div>
+    </li>`;
+  }).join('');
+}
 
 function classify(line) {
   if (/^\s+card \d+\//.test(line)) return 'faint';
@@ -547,6 +642,9 @@ async function poll() {
   seen = data.total_lines;
   $('log').scrollTop = $('log').scrollHeight;
   $('state').textContent = { running: '執行中', done: '完成', failed: '失敗', stopped: '已停止' }[data.state];
+  $('state').className = 'state' + (data.state === 'done' ? ' done' : '');
+  allLines = allLines.concat(data.lines);
+  paintSteps(allLines);
 
   if (data.state !== 'running') {
     clearInterval(timer); $('go').disabled = false;

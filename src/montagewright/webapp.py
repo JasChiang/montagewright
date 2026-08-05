@@ -32,6 +32,7 @@ from fastapi import FastAPI, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
+AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".aiff", ".MP3", ".M4A", ".WAV"}
 ASPECTS = ("9:16", "16:9", "1:1", "4:5")
 PAGE = Path(__file__).resolve().parent / "web" / "index.html"
 
@@ -286,7 +287,7 @@ def create_app() -> FastAPI:
         return JSONResponse({"run_id": run_id})
 
     @app.get("/api/browse")
-    def browse(path: str = "") -> JSONResponse:
+    def browse(path: str = "", kind: str = "video") -> JSONResponse:
         """List folders so a path can be clicked instead of typed.
 
         A browser will not hand over a real filesystem path -- a directory
@@ -304,6 +305,7 @@ def create_app() -> FastAPI:
         if not here.is_dir():
             here = here.parent
 
+        looking = AUDIO_SUFFIXES if kind == "audio" else VIDEO_SUFFIXES
         folders = []
         for entry in sorted(here.iterdir()):
             if not entry.is_dir() or entry.name.startswith("."):
@@ -311,7 +313,7 @@ def create_app() -> FastAPI:
             try:
                 clips = sum(
                     1 for child in entry.iterdir()
-                    if child.suffix in VIDEO_SUFFIXES
+                    if child.suffix in looking
                 )
             except PermissionError:
                 continue
@@ -319,7 +321,7 @@ def create_app() -> FastAPI:
         loose = [
             {"name": entry.name, "path": str(entry)}
             for entry in sorted(here.iterdir())
-            if entry.is_file() and entry.suffix in VIDEO_SUFFIXES
+            if entry.is_file() and entry.suffix in looking
         ]
         return JSONResponse({
             "here": str(here),
