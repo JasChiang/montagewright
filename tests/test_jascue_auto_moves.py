@@ -1119,3 +1119,27 @@ def test_the_direction_only_promises_what_the_tools_can_do() -> None:
     assert "describe_for_prompt()" in inspect.getsource(planner.decide_direction)
     prompt = (PROMPTS / "direction_zh-TW.txt").read_text(encoding="utf-8")
     assert "只承諾做得到的事" in prompt
+
+
+def test_cutting_before_a_sentence_ends_stays_available() -> None:
+    """Snapping a card's line to the break is not a rule about the cut.
+
+    The card records where the sentence ends, which is a fact. What the shot
+    does with it is selection's -- `seconds_needed` is used as given, with no
+    second snap on the way to the EDL -- so cutting away on the highest word
+    and leaving the answer for the next shot is expressible. Only the prompt
+    was talking anyone out of it, in words that could not tell a deliberate
+    cliffhanger from a sentence hacked short to fit.
+    """
+
+    import inspect
+
+    from jascue_auto import cli
+    from jascue_auto.planner import PROMPTS
+
+    source = inspect.getsource(cli._edl_from_selection)
+    assert "snap_end" not in source, "the shot's out-point is selection's"
+
+    prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
+    assert "留懸念" in prompt
+    assert "為了湊秒數砍掉半句是意外" in prompt
