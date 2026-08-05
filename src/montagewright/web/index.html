@@ -75,9 +75,35 @@
 
   /* strip */
   .strip { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line-soft); }
+  .reel { position: relative; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--sunken); }
+  .ruler {
+    position: relative; height: 20px; border-bottom: 1px solid var(--line);
+    background: var(--surface); font-family: var(--mono); font-size: 9.5px; color: var(--dim);
+  }
+  .ruler span { position: absolute; top: 4px; transform: translateX(2px); }
+  .ruler i { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  .lane { position: relative; height: 40px; border-bottom: 1px solid var(--line-soft); }
+  .lane:last-child { border-bottom: 0; }
+  .lane .name {
+    position: absolute; left: 6px; top: 3px; z-index: 3;
+    font-size: 9.5px; color: var(--dim); background: var(--sunken);
+    padding: 0 4px; border-radius: 3px; pointer-events: none;
+  }
+  .lane img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .55; }
+  .lane.silent { display: grid; place-items: center; font-size: 11px; color: var(--dim); }
+  .playhead {
+    position: absolute; top: 0; bottom: 0; width: 1px; background: var(--accent);
+    pointer-events: none; z-index: 5;
+  }
+  .playhead::before {
+    content: ''; position: absolute; top: 0; left: -3px;
+    border-left: 3.5px solid transparent; border-right: 3.5px solid transparent;
+    border-top: 5px solid var(--accent);
+  }
   .track {
-    display: flex; gap: 2px; height: 52px; user-select: none;
-    border-radius: 8px; overflow: hidden; background: var(--sunken); border: 1px solid var(--line);
+    position: relative; display: flex; gap: 2px; height: 52px; user-select: none;
+    overflow: hidden; background: var(--sunken);
+    border-bottom: 1px solid var(--line-soft);
   }
   .blk {
     position: relative; min-width: 14px; cursor: pointer; padding: 7px 8px; overflow: hidden;
@@ -300,7 +326,13 @@
       <div class="inspector" id="inspector"></div>
     </div>
     <div class="strip hide" id="strip">
-      <div class="track" id="track"></div>
+      <div class="reel" id="reel">
+        <div class="ruler" id="ruler"></div>
+        <div class="track" id="track"></div>
+        <div class="lane" id="lane-voice"><span class="name">人聲</span></div>
+        <div class="lane" id="lane-music"><span class="name">音樂</span></div>
+        <div class="playhead" id="playhead" style="left:0"></div>
+      </div>
       <div class="legend">
         <span id="strip-note">拖邊緣改進出點，拖方塊換順序，× 刪掉</span>
         <span class="row" style="gap:8px">
@@ -498,17 +530,21 @@ function inspect(i) {
     <div class="ins-head">
       <span class="mono">${esc(b.source_id)}</span>
       ${said.delivered === undefined ? '' :
-        `<span class="tag ${said.delivered ? 'ok' : 'no'}">${said.delivered ? '做到' : '沒做到'}</span>`}
+        `<span class="tag ${said.delivered ? 'ok' : 'no'}">${
+          said.delivered ? '做到宣告的事' : '沒做到宣告的事'}</span>`}
     </div>
     <a class="link" href="/api/runs/${runId}/shot/${b.index}" target="_blank">單獨看這一顆</a>
+    ${said.delivered === false ? `<div class="why" style="margin-top:6px">
+      「沒做到」的意思是：逐顆驗收單獨看了這一顆，認為它沒有做到下面那句宣告。
+      不是畫面壞掉，是計畫跟結果對不起來。</div>` : ''}
     <dl>
       <dt>進出點</dt><dd class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds).toFixed(2)}s
         （${b.seconds.toFixed(2)}s${moved ? '，已改動' : ''}）</dd>
       <dt>運鏡</dt><dd>${esc(plan.camera_move || '—')}${plan.framing ? `　<span class="why">${esc(plan.framing)}</span>` : ''}</dd>
       <dt>主體</dt><dd>${esc(plan.subject || '—')}${said.speaker ? `<div class="why">說話：${esc(said.speaker)}</div>` : ''}</dd>
-      <dt>為什麼選它</dt><dd class="why">${esc(plan.why || '—')}</dd>
+      <dt>它宣告要做什麼</dt><dd class="why">${esc(plan.why || '—')}</dd>
       ${rhythm.why ? `<dt>為什麼這個長度</dt><dd class="why">${esc(rhythm.why)}</dd>` : ''}
-      ${said.note ? `<dt>驗收看到</dt><dd class="why">${esc(said.note)}</dd>` : ''}
+      ${said.note ? `<dt>驗收實際看到</dt><dd class="why">${esc(said.note)}</dd>` : ''}
       ${deg.length ? `<dt>做不到的地方</dt><dd>${deg.map(tellDegradation).join('')}</dd>` : ''}
     </dl>`;
 }
@@ -520,11 +556,54 @@ async function showStrip() {
   blocksWere = JSON.parse(JSON.stringify(blocks));
   paintStrip();
   $('strip').classList.remove('hide');
-  if (blocks.length) { picked = 0; paintStrip(); inspect(0); }
+  if (blocks.length) { picked = 0; paintStrip(); inspect(0); paintWaves(
+    blocks.reduce((a, b) => a + b.seconds, 0) || 1); }
+  // Clicking anywhere on the reel is a seek, which is what a timeline is for.
+  $('reel').onclick = (e) => {
+    if (e.target.closest('.blk')) return;
+    const box = $('reel').getBoundingClientRect();
+    const total = blocks.reduce((a, b) => a + b.seconds, 0) || 1;
+    $('video').currentTime = ((e.clientX - box.left) / box.width) * total;
+  };
+}
+
+function paintRuler(total) {
+  // A tick every few seconds, chosen so the labels do not collide at
+  // whatever width the panel happens to be.
+  const px = $('reel').offsetWidth || 900;
+  const step = [1, 2, 5, 10, 15, 30, 60].find(n => total / n <= px / 56) || 60;
+  const marks = [];
+  for (let at = 0; at <= total; at += step) {
+    const left = (at / total) * 100;
+    marks.push(`<i style="left:${left}%"></i>`
+      + `<span style="left:${left}%">${
+        at >= 60 ? `${(at / 60) | 0}:${String((at % 60) | 0).padStart(2, '0')}`
+                 : `${at | 0}s`}</span>`);
+  }
+  $('ruler').innerHTML = marks.join('');
+}
+
+function paintWaves(total) {
+  const width = Math.max(600, Math.round(($('reel').offsetWidth || 900) * 2));
+  for (const which of ['voice', 'music']) {
+    const lane = $(`lane-${which}`);
+    const img = new Image();
+    img.onload = () => {
+      lane.classList.remove('silent');
+      lane.innerHTML = `<span class="name">${which === 'voice' ? '人聲' : '音樂'}</span>`;
+      lane.appendChild(img);
+    };
+    img.onerror = () => {
+      lane.classList.add('silent');
+      lane.innerHTML = which === 'voice' ? '這支片沒有保留原音' : '這支片沒有配樂';
+    };
+    img.src = `/api/runs/${runId}/waveform/${which}?width=${width}`;
+  }
 }
 
 function paintStrip() {
   const total = blocks.reduce((a, b) => a + b.seconds, 0) || 1;
+  paintRuler(total);
   $('track').innerHTML = blocks.map((b, i) => `
     <div class="blk ${b.delivered === false ? 'no' : ''} ${i === picked ? 'on' : ''}"
          style="flex:${b.seconds} 0 0" data-i="${i}" draggable="true"
@@ -625,6 +704,8 @@ $('recut').addEventListener('click', async () => {
 document.addEventListener('DOMContentLoaded', () => {
   $('video').addEventListener('timeupdate', () => {
     if (!blocks.length) return;
+    const total = blocks.reduce((a, b) => a + b.seconds, 0) || 1;
+    $('playhead').style.left = `${($('video').currentTime / total) * 100}%`;
     let at = 0, now = -1;
     blocks.forEach((b, i) => {
       if ($('video').currentTime >= at) now = i;
@@ -632,6 +713,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     if (now !== picked) { picked = now; paintStrip(); inspect(now); }
   });
+  addEventListener('resize', () => { if (blocks.length) paintStrip(); });
 });
 
 async function showTranscripts() {
@@ -971,7 +1053,8 @@ function render(report) {
       const r = rhythm[k] || {}, v = verdicts[k] || {};
       const deg = (degByClip[k] || []).map(tellDegradation).join('');
       const ok = v.delivered === undefined ? '' :
-        `<span class="tag ${v.delivered ? 'ok' : 'no'}">${v.delivered ? '做到' : '沒做到'}</span>`;
+        `<span class="tag ${v.delivered ? 'ok' : 'no'}">${
+          v.delivered ? '做到' : '沒做到'}</span>`;
       return `<tr>
         <td class="mono">${i}</td>
         <td class="mono" style="word-break:break-all"><a class="shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a></td>

@@ -367,6 +367,58 @@ def create_app() -> FastAPI:
             })
         return JSONResponse({"runs": out})
 
+    @app.get("/api/runs/{run_id}/waveform/{which}")
+    def waveform(run_id: str, which: str, width: int = 2000):
+        """The sound as a picture, so the tracks can be read.
+
+        A cut with speech under music is two things happening at once and the
+        page could only play it. Seeing where the voice sits and where the bed
+        steps back is the difference between trusting the mix and checking
+        it.
+        """
+
+        run = _run(run_id)
+        if which == "voice":
+            # picture.mp4 is the cut before the bed goes under it, so it is
+            # the voice alone. Older runs kept only the deliverable.
+            source = next(
+                (
+                    run.output / name
+                    for name in ("picture.mp4", "deliverable.mp4")
+                    if (run.output / name).exists()
+                ),
+                run.output / "picture.mp4",
+            )
+        elif which == "music":
+            source = None
+            if "--music" in run.command:
+                candidate = Path(run.command[run.command.index("--music") + 1])
+                source = candidate if candidate.exists() else None
+            if source is None:
+                raise HTTPException(404, "this cut has no music")
+        else:
+            raise HTTPException(400, "voice or music")
+        if not source.exists():
+            raise HTTPException(404, f"no {which} to draw")
+
+        width = max(400, min(width, 6000))
+        drawn = run.output / f"wave-{which}-{width}.png"
+        if not drawn.exists():
+            report = run.report() or {}
+            seconds = float(report.get("duration_seconds") or 0.0)
+            trim = ["-t", f"{seconds:.3f}"] if seconds and which == "music" else []
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+                + trim + ["-i", str(source), "-filter_complex",
+                          f"aformat=channel_layouts=mono,"
+                          f"showwavespic=s={width}x120:colors=#8b8880",
+                          "-frames:v", "1", str(drawn)],
+                check=False,
+            )
+        if not drawn.exists():
+            raise HTTPException(500, "could not draw it")
+        return FileResponse(drawn, media_type="image/png")
+
     @app.get("/api/runs/{run_id}/timeline-data")
     def timeline_data(run_id: str) -> JSONResponse:
         """Each shot's place on the timeline, and how far it can be pulled.
@@ -574,6 +626,12 @@ def create_app() -> FastAPI:
 
     def _run(run_id: str) -> Run:
         run = RUNS.get(run_id)
+        if run is None:
+            # Runs are picked up off disk lazily, and only the listing was
+            # doing it -- so after a restart every other endpoint answered
+            # "no such run" until something happened to ask for the list.
+            recall()
+            run = RUNS.get(run_id)
         if run is None:
             raise HTTPException(404, "no such run")
         return run

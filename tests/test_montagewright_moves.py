@@ -1569,3 +1569,41 @@ def test_every_way_a_clip_misses_the_film_is_shown() -> None:
     # "Passed over" can only be told from what was on the table.
     assert "material_ids" in page
     assert "material_ids" in inspect.getsource(cli._write_report)
+
+
+def test_the_timeline_has_tracks_on_one_time_scale() -> None:
+    """A cut with speech under music is two things happening at once.
+
+    The page could only play it. Seeing where the voice sits and where the
+    bed steps back is the difference between trusting the mix and checking
+    it -- and a strip laid out by proportion rather than by time cannot line
+    up with anything.
+    """
+
+    from montagewright.webapp import PAGE, create_app
+
+    paths = {r.path for r in create_app().routes if hasattr(r, "path")}
+    assert "/api/runs/{run_id}/waveform/{which}" in paths
+
+    page = PAGE.read_text(encoding="utf-8")
+    for piece in ("paintRuler", "paintWaves", "playhead",
+                  "lane-voice", "lane-music"):
+        assert piece in page, piece
+    # Clicking the reel seeks; a timeline that cannot be scrubbed is a chart.
+    assert "$('reel').onclick" in page
+
+
+def test_a_run_is_found_after_a_restart_without_asking_for_the_list() -> None:
+    """Runs are picked up off disk lazily and only the listing did it.
+
+    Every other endpoint answered "no such run" until something happened to
+    fetch the list first, which is an ordering nobody could see.
+    """
+
+    import inspect
+
+    from montagewright import webapp
+
+    source = inspect.getsource(webapp.create_app)
+    guts = source[source.index("def _run(run_id"):]
+    assert "recall()" in guts[:400]
