@@ -404,19 +404,43 @@ $('show-upload').addEventListener('click', (e) => {
 });
 
 async function loadPast() {
-  const data = await (await fetch('/api/runs?limit=20')).json();
-  if (!data.runs.length) return;
-  $('past-table').innerHTML =
-    '<tr><th>時間</th><th>素材</th><th>片長</th><th>顆數</th><th>逐顆通過</th><th>花費</th><th></th></tr>' +
-    data.runs.map(r => `<tr>
+  const data = await (await fetch('/api/runs?limit=40')).json();
+  if (!data.runs.length) {
+    $('past-table').innerHTML = emptyRow(7, '還沒有跑過任何一輪。');
+    $('detail').classList.remove('hide');
+    showTab('pane-past');
+    return;
+  }
+  // Grouped by the material, because that is the unit of this work: one
+  // folder of rushes, several cuts out of it. It is also the unit the cards
+  // are cached by, so runs in the same group are the cheap ones.
+  const bySource = new Map();
+  for (const r of data.runs) {
+    const key = r.source_path || r.source || '（未知）';
+    if (!bySource.has(key)) bySource.set(key, []);
+    bySource.get(key).push(r);
+  }
+  const rows = [];
+  for (const [where, runs] of bySource) {
+    const cuts = runs.filter(r => r.seconds).length;
+    rows.push(`<tr><td colspan="7" style="padding-top:18px;border-bottom:0">
+      <strong>${esc(where.split('/').pop())}</strong>
+      <span class="why">　${esc(where)}　·　${runs.length} 輪${cuts ? `，${cuts} 支剪成` : ''}</span>
+    </td></tr>`);
+    for (const r of runs) rows.push(`<tr>
       <td class="mono">${new Date(r.started_at * 1000).toLocaleString('zh-TW', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>
-      <td class="mono">${esc(r.source)}</td>
+      <td>${r.state === 'done' ? '' : `<span class="tag ${r.state === 'failed' ? 'no' : ''}">${
+        ({running:'執行中',failed:'失敗',stopped:'已停止',interrupted:'中斷'})[r.state] || r.state}</span>`}</td>
       <td class="mono">${r.seconds ? r.seconds.toFixed(1) + 's' : '—'}</td>
       <td class="mono">${r.shots || '—'}</td>
       <td class="mono">${r.delivered != null ? r.delivered + '/' + r.shots : '—'}</td>
       <td class="mono">${r.spend != null ? '$' + r.spend.toFixed(2) : '—'}</td>
       <td><a class="shot" href="#" onclick="openRun('${r.run_id}');return false">打開</a></td>
-    </tr>`).join('');
+    </tr>`);
+  }
+  $('past-table').innerHTML =
+    '<tr><th>時間</th><th></th><th>片長</th><th>顆數</th><th>逐顆通過</th><th>花費</th><th></th></tr>'
+    + rows.join('');
   $('detail').classList.remove('hide');
   // Nothing open yet: the useful thing on a cold page is what was cut before,
   // and the tabs that need a run have nothing in them.
@@ -622,8 +646,9 @@ async function showTranscripts() {
       <td>${esc(l.text)}</td>
       <td class="why">${l.corrected ? '聽成：' + esc(l.heard) : ''}</td></tr>`);
   }
-  if (!rows.length) return;
-  $('tx-table').innerHTML = '<tr><th>時間</th><th>誰</th><th>說了什麼</th><th>原始辨識</th></tr>' + rows.join('');
+  $('tx-table').innerHTML = '<tr><th>時間</th><th>誰</th><th>說了什麼</th><th>原始辨識</th></tr>'
+    + (rows.length ? rows.join('')
+       : emptyRow(4, '這一輪沒有做逐字稿——素材裡的聲音不是內容，或關掉了語音。'));
   $('detail').classList.remove('hide');
 }
 
@@ -874,6 +899,12 @@ function tellDegradation(d) {
   </div>`;
 }
 
+// An empty panel that shows only its subtitle reads as broken. Empty is
+// usually an answer -- nothing was set aside, nobody spoke -- so it says so.
+function emptyRow(cols, said) {
+  return `<tr><td colspan="${cols}" class="why" style="padding:18px 11px;border-bottom:0">${esc(said)}</td></tr>`;
+}
+
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 
 function render(report) {
@@ -940,11 +971,10 @@ function render(report) {
   $('detail').classList.remove('hide');
 
   const aside = Object.entries(report.set_aside || {});
-  if (aside.length) {
-    $('aside-table').innerHTML = '<tr><th>檔名</th><th>卡片說的理由</th></tr>' +
-      aside.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="why">${esc(v)}</td></tr>`).join('');
-    $('detail').classList.remove('hide');
-  }
+  $('aside-table').innerHTML = '<tr><th>檔名</th><th>卡片說的理由</th></tr>'
+    + (aside.length
+       ? aside.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="why">${esc(v)}</td></tr>`).join('')
+       : emptyRow(2, '每一支素材都可以用，沒有被放到一邊的。'));
 }
 
 

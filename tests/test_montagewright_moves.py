@@ -1489,3 +1489,37 @@ def test_the_adjudication_says_who_looked_and_what_they_concluded() -> None:
     assert "看過畫面：可以這樣交" in page
     assert "逐顆驗收單獨看了這一顆" in page
     assert "沒有人看過" in page
+
+
+def test_an_empty_panel_says_what_empty_means() -> None:
+    """A panel showing only its subtitle reads as broken.
+
+    Nothing set aside means every clip was usable; no transcript means the
+    speech was not the content. Both are answers, and both looked like a
+    failure to load.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "emptyRow" in page
+    assert "每一支素材都可以用" in page
+    assert "這一輪沒有做逐字稿" in page
+    assert "還沒有跑過任何一輪" in page
+
+
+def test_earlier_runs_are_grouped_by_the_material() -> None:
+    """One folder of rushes, several cuts out of it.
+
+    That is the unit of the work and the unit the cards are cached by, so
+    runs in a group are the cheap ones -- which is the thing worth seeing
+    when deciding whether to cut the same material again.
+    """
+
+    from montagewright.webapp import PAGE, create_app
+    from fastapi.testclient import TestClient
+
+    listed = TestClient(create_app()).get("/api/runs").json()["runs"]
+    assert all("source_path" in row for row in listed)
+    page = PAGE.read_text(encoding="utf-8")
+    assert "bySource" in page and "支剪成" in page

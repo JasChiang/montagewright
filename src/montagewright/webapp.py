@@ -354,6 +354,7 @@ def create_app() -> FastAPI:
                 "state": run.state,
                 "started_at": run.started_at,
                 "source": Path(run.source).name if run.source else "",
+                "source_path": run.source,
                 "seconds": report.get("duration_seconds"),
                 "shots": len(report.get("selection", {}).get("shots", [])),
                 "spend": round(
