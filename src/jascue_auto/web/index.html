@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jascue-auto</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --panel: #fff; --ink: #1b1b1a; --dim: #6c6c68;
+    --line: #e4e3df; --accent: #b4442e; --ok: #2f6f4f; --warn: #8a6a1f;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161614; --panel: #1e1e1c; --ink: #eceae5; --dim: #9a9891;
+      --line: #302f2c; --accent: #e08268; --ok: #7fbf9b; --warn: #d6b45f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+  }
+  header {
+    padding: 22px 28px 16px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  h1 { margin: 0; font-size: 19px; letter-spacing: .01em; }
+  header p { margin: 0; color: var(--dim); font-size: 13px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 24px 28px 80px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 20px; margin-bottom: 20px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; }
+  label { display: block; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
+  input[type=file], input[type=number], select, textarea {
+    width: 100%; padding: 9px 10px; border: 1px solid var(--line);
+    border-radius: 7px; background: var(--bg); color: var(--ink);
+    font: inherit; font-size: 14px;
+  }
+  textarea { min-height: 96px; resize: vertical; }
+  button {
+    padding: 10px 20px; border: 0; border-radius: 7px; cursor: pointer;
+    background: var(--accent); color: #fff; font: inherit; font-weight: 600;
+  }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 18px; }
+  #log {
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.75;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px; max-height: 300px; overflow: auto; white-space: pre-wrap;
+  }
+  #log .stage { color: var(--ink); font-weight: 600; }
+  #log .bad { color: var(--accent); }
+  #log .good { color: var(--ok); }
+  .stats { display: flex; gap: 26px; flex-wrap: wrap; margin: 0 0 18px; }
+  .stat b { display: block; font-size: 21px; font-weight: 650; }
+  .stat span { font-size: 12px; color: var(--dim); }
+  video { width: 100%; max-width: 340px; border-radius: 10px; background: #000; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; color: var(--dim); font-weight: 600; }
+  td.mono { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 5px; font-size: 11.5px; border: 1px solid var(--line); }
+  .tag.ok { color: var(--ok); border-color: currentColor; }
+  .tag.no { color: var(--accent); border-color: currentColor; }
+  .why { color: var(--dim); font-size: 12.5px; }
+  .scroll { overflow-x: auto; }
+  .hide { display: none; }
+  a.shot { color: var(--dim); font-size: 12px; text-decoration: none; border-bottom: 1px dotted currentColor; }
+</style>
+</head>
+<body>
+<header>
+  <h1>jascue-auto</h1>
+  <p>丟一個資料夾進來，看它怎麼剪，以及為什麼</p>
+</header>
+
+<main>
+  <section class="panel" id="setup">
+    <div class="grid">
+      <div style="grid-column:1/-1">
+        <label>素材路徑（資料夾或單一檔案，本機路徑就好）</label>
+        <input type="text" id="path" placeholder="/Users/…/rushes　或　/Users/…/一支長片.mp4">
+        <div class="why" style="margin-top:6px">
+          留空的話下面可以改用上傳。本機素材建議用路徑——上傳等於把硬碟上的檔案搬進瀏覽器再寫回去。
+          <a href="#" id="show-upload">改用上傳</a>
+        </div>
+      </div>
+      <div class="hide" id="upload-row" style="grid-column:1/-1">
+        <label>上傳素材資料夾</label>
+        <input type="file" id="rushes" webkitdirectory directory multiple>
+      </div>
+      <div>
+        <label>音樂路徑（留空＝不配樂）</label>
+        <input type="text" id="music-path" placeholder="/Users/…/track.mp3">
+      </div>
+      <div>
+        <label>語音</label>
+        <select id="speech">
+          <option value="auto">自動（卡片說是內容才轉錄）</option>
+          <option value="never">不要轉錄</option>
+        </select>
+      </div>
+      <div>
+        <label>語言</label>
+        <input type="text" id="locale" value="zh-TW">
+      </div>
+      <div>
+        <label>輸出比例</label>
+        <select id="aspect">
+          <option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option>
+        </select>
+      </div>
+      <div>
+        <label>可編輯的 timeline（預設不輸出）</label>
+        <select id="timeline">
+          <option value="none">不需要</option>
+          <option value="premiere">Premiere／Resolve（xml）</option>
+          <option value="finalcut">Final Cut（fcpxml）</option>
+          <option value="both">兩種都要</option>
+        </select>
+      </div>
+      <div>
+        <label>預算上限（美元）</label>
+        <input type="number" id="budget" value="6" min="0.5" step="0.5">
+      </div>
+    </div>
+    <div style="margin-top:16px">
+      <label>Brief（可留空）</label>
+      <textarea id="brief" placeholder="這支片要傳達什麼、給誰看、非講不可的是什麼"></textarea>
+    </div>
+    <div class="row">
+      <button id="go">開始剪</button>
+      <label style="margin:0;display:flex;gap:7px;align-items:center;color:var(--ink)">
+        <input type="checkbox" id="review" checked style="width:auto"> 開啟自審與重新規劃
+      </label>
+      <span id="picked" class="why"></span>
+    </div>
+  </section>
+
+  <section class="panel hide" id="past">
+    <h2 style="margin:0 0 12px;font-size:15px">先前的剪輯</h2>
+    <div class="scroll"><table id="past-table"></table></div>
+  </section>
+
+  <section class="panel hide" id="progress">
+    <div class="row" style="margin:0 0 14px;justify-content:space-between">
+      <strong id="state">執行中</strong>
+      <button class="ghost" id="stop">停止</button>
+    </div>
+    <div id="log"></div>
+  </section>
+
+  <section class="panel hide" id="result">
+    <div class="stats" id="stats"></div>
+    <div style="display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start">
+      <div>
+        <video id="video" controls playsinline></video>
+        <div class="row" style="margin-top:10px">
+          <a id="download" class="shot" download>下載完整畫質</a>
+          <a id="subs" class="shot hide" download>下載字幕 SRT</a>
+          <a id="tl-pr" class="shot hide" download>Premiere XML</a>
+          <a id="tl-fc" class="shot hide" download>Final Cut XML</a>
+        </div>
+      </div>
+      <div style="flex:1;min-width:300px">
+        <table id="spend"></table>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel hide" id="shots">
+    <h2 style="margin:0 0 4px;font-size:15px">每一顆用了什麼、怎麼處理</h2>
+    <p class="why" style="margin:0 0 14px">點檔名可以單獨看那一顆——構圖問題在成片裡會被下一顆蓋過去。</p>
+    <div class="scroll"><table id="shot-table"></table></div>
+  </section>
+
+  <section class="panel hide" id="transcripts">
+    <h2 style="margin:0 0 4px;font-size:15px">聽到了什麼</h2>
+    <p class="why" style="margin:0 0 14px">辨識器聽的、Gemini 改的、誰講的。轉錯的地方會讓後面每一個決定都跟著錯。</p>
+    <div class="scroll"><table id="tx-table"></table></div>
+  </section>
+
+  <section class="panel hide" id="aside">
+    <h2 style="margin:0 0 12px;font-size:15px">沒有用的素材</h2>
+    <div class="scroll"><table id="aside-table"></table></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let runId = null, seen = 0, timer = null;
+
+$('show-upload').addEventListener('click', (e) => {
+  e.preventDefault(); $('upload-row').classList.remove('hide');
+});
+
+async function loadPast() {
+  const data = await (await fetch('/api/runs?limit=20')).json();
+  if (!data.runs.length) return;
+  $('past-table').innerHTML =
+    '<tr><th>時間</th><th>素材</th><th>片長</th><th>顆數</th><th>逐顆通過</th><th>花費</th><th></th></tr>' +
+    data.runs.map(r => `<tr>
+      <td class="mono">${new Date(r.started_at * 1000).toLocaleString('zh-TW', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>
+      <td class="mono">${esc(r.source)}</td>
+      <td class="mono">${r.seconds ? r.seconds.toFixed(1) + 's' : '—'}</td>
+      <td class="mono">${r.shots || '—'}</td>
+      <td class="mono">${r.delivered != null ? r.delivered + '/' + r.shots : '—'}</td>
+      <td class="mono">${r.spend != null ? '$' + r.spend.toFixed(2) : '—'}</td>
+      <td><a class="shot" href="#" onclick="openRun('${r.run_id}');return false">打開</a></td>
+    </tr>`).join('');
+  $('past').classList.remove('hide');
+}
+
+async function openRun(id) {
+  runId = id; seen = 0;
+  const data = await (await fetch(`/api/runs/${id}`)).json();
+  $('log').textContent = data.lines.join('\n');
+  $('progress').classList.remove('hide');
+  $('state').textContent = { running:'執行中', done:'完成', failed:'失敗', stopped:'已停止', interrupted:'中斷' }[data.state] || data.state;
+  if (data.has_video) {
+    $('video').src = `/api/runs/${id}/video`;
+    $('download').href = `/api/runs/${id}/deliverable`;
+    $('result').classList.remove('hide');
+  }
+  if (data.report) { render(data.report); showExtras(); }
+  window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
+}
+
+async function showTranscripts() {
+  const data = await (await fetch(`/api/runs/${runId}/transcripts`)).json();
+  const rows = [];
+  for (const [source, card] of Object.entries(data.sources)) {
+    rows.push(`<tr><td colspan="4" style="padding-top:16px"><strong>${esc(source)}</strong>
+      <span class="why">　${esc(card.language || '')}　${esc(card.summary)}</span></td></tr>`);
+    for (const l of card.lines) rows.push(`<tr>
+      <td class="mono">${l.starts_seconds.toFixed(1)}–${l.ends_seconds.toFixed(1)}s</td>
+      <td class="why">${esc(l.speaker)}</td>
+      <td>${esc(l.text)}</td>
+      <td class="why">${l.corrected ? '聽成：' + esc(l.heard) : ''}</td></tr>`);
+  }
+  if (!rows.length) return;
+  $('tx-table').innerHTML = '<tr><th>時間</th><th>誰</th><th>說了什麼</th><th>原始辨識</th></tr>' + rows.join('');
+  $('transcripts').classList.remove('hide');
+}
+
+function showExtras() {
+  for (const [id, flavour] of [['tl-pr','premiere'], ['tl-fc','finalcut']]) {
+    fetch(`/api/runs/${runId}/timeline/${flavour}`, { method: 'HEAD' })
+      .then(r => { if (r.ok) {
+        $(id).href = `/api/runs/${runId}/timeline/${flavour}`;
+        $(id).classList.remove('hide');
+      }});
+  }
+  fetch(`/api/runs/${runId}/subtitles`, { method: 'HEAD' }).then(r => {
+    if (r.ok) { $('subs').href = `/api/runs/${runId}/subtitles`; $('subs').classList.remove('hide'); }
+  });
+  showTranscripts();
+}
+
+loadPast();
+
+$('rushes').addEventListener('change', () => {
+  const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
+  $('picked').textContent = files.length ? `${files.length} 支影片` : '沒有找到影片檔';
+});
+
+$('go').addEventListener('click', async () => {
+  const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
+  const path = $('path').value.trim();
+  if (!path && !files.length) { alert('給一個素材路徑，或改用上傳'); return; }
+  const body = new FormData();
+  files.forEach(f => body.append('rushes', f, f.name));
+  body.append('source_path', path);
+  body.append('music_path', $('music-path').value.trim());
+  body.append('speech', $('speech').value);
+  body.append('locale', $('locale').value.trim());
+  body.append('brief', $('brief').value);
+  body.append('aspect', $('aspect').value);
+  body.append('budget', $('budget').value);
+  body.append('review', $('review').checked ? 'true' : 'false');
+  body.append('timeline', $('timeline').value);
+
+  $('go').disabled = true;
+  $('progress').classList.remove('hide');
+  $('log').textContent = '上傳中…\n';
+  const res = await fetch('/api/runs', { method: 'POST', body });
+  if (!res.ok) {
+    $('log').textContent = '啟動失敗：' + (await res.text());
+    $('go').disabled = false; return;
+  }
+  runId = (await res.json()).run_id;
+  seen = 0; $('log').textContent = '';
+  timer = setInterval(poll, 1200);
+  poll();
+});
+
+$('stop').addEventListener('click', async () => {
+  if (runId) await fetch(`/api/runs/${runId}/stop`, { method: 'POST' });
+});
+
+function classify(line) {
+  if (/error|Traceback|failed|refused/i.test(line)) return 'bad';
+  if (/^(cards|direction|selection|shots|review|replan|cut on action|set aside|no music map)/.test(line)) return 'stage';
+  if (/delivered what they planned/.test(line)) return 'good';
+  return '';
+}
+
+async function poll() {
+  const res = await fetch(`/api/runs/${runId}?since=${seen}`);
+  const data = await res.json();
+  for (const line of data.lines) {
+    const span = document.createElement('span');
+    span.className = classify(line);
+    span.textContent = line + '\n';
+    $('log').appendChild(span);
+  }
+  seen = data.total_lines;
+  $('log').scrollTop = $('log').scrollHeight;
+  $('state').textContent = { running: '執行中', done: '完成', failed: '失敗', stopped: '已停止' }[data.state];
+
+  if (data.state !== 'running') {
+    clearInterval(timer); $('go').disabled = false;
+    if (data.has_video) {
+      $('video').src = `/api/runs/${runId}/video`;
+      $('download').href = `/api/runs/${runId}/deliverable`;
+      showExtras();
+      $('result').classList.remove('hide');
+    }
+    if (data.report) render(data.report);
+    loadPast();
+  }
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+
+function render(report) {
+  const stats = [
+    ['片長', `${(report.duration_seconds ?? 0).toFixed(1)}s`, `目標 ${report.target_seconds ?? '—'}s`],
+    ['顆數', (report.selection?.shots || []).length, '鏡頭'],
+    ['對上音樂', report.cuts_on_music ?? '—', '刀'],
+    ['降級', (report.degradations || []).length, '筆，都有量測值'],
+    ['花費', '$' + Object.values(report.spend || {}).reduce((a, b) => a + (b.usd ?? b ?? 0), 0).toFixed(2), '本輪'],
+  ];
+  $('stats').innerHTML = stats.map(([k, v, s]) =>
+    `<div class="stat"><b>${esc(String(v))}</b><span>${esc(k)}・${esc(s)}</span></div>`).join('');
+
+  const spend = Object.entries(report.spend || {})
+    .map(([k, v]) => [k, typeof v === 'object' ? (v.usd ?? 0) : v])
+    .sort((a, b) => b[1] - a[1]);
+  $('spend').innerHTML = '<tr><th>階段</th><th>花費</th></tr>' + spend.map(([k, v]) =>
+    `<tr><td>${esc(k)}</td><td class="mono">$${Number(v).toFixed(4)}</td></tr>`).join('');
+
+  const shots = report.selection?.shots || [];
+  const rhythm = report.rhythm || {}, verdicts = report.shots || {};
+  const degByClip = {};
+  for (const d of report.degradations || []) (degByClip[d.clip_id] ||= []).push(d);
+
+  $('shot-table').innerHTML =
+    '<tr><th>#</th><th>素材檔名</th><th>進點／長度</th><th>運鏡</th><th>主體／說話者</th>' +
+    '<th>為什麼用這顆</th><th>降級</th><th>逐顆驗收</th></tr>' +
+    shots.map((s, i) => {
+      const k = 'k' + String(i).padStart(2, '0');
+      const r = rhythm[k] || {}, v = verdicts[k] || {};
+      const deg = (degByClip[k] || []).map(d =>
+        `<div class="why">${esc(d.ladder)}${d.adjudication ? ` <span class="tag">${esc(d.adjudication)}</span>` : ''}</div>`).join('');
+      const ok = v.delivered === undefined ? '' :
+        `<span class="tag ${v.delivered ? 'ok' : 'no'}">${v.delivered ? '做到' : '沒做到'}</span>`;
+      return `<tr>
+        <td class="mono">${i}</td>
+        <td class="mono"><a class="shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a></td>
+        <td class="mono">${Number(s.start_seconds ?? 0).toFixed(1)}s ／ ${Number(r.seconds ?? 0).toFixed(2)}s</td>
+        <td>${esc(s.camera_move)}${s.framing ? `<div class="why">${esc(s.framing)}</div>` : ''}</td>
+        <td>${esc(s.subject)}${s.must_be_whole ? '<div class="why">要完整</div>' : ''}${v.speaker ? `<div class="why">說話：${esc(v.speaker)}</div>` : ''}</td>
+        <td class="why">${esc(s.why)}${r.why ? `<div style="margin-top:5px">節奏：${esc(r.why)}</div>` : ''}</td>
+        <td>${deg || '<span class="why">—</span>'}</td>
+        <td>${ok}${v.note ? `<div class="why">${esc(v.note)}</div>` : ''}</td>
+      </tr>`;
+    }).join('');
+  $('shots').classList.remove('hide');
+
+  const aside = Object.entries(report.set_aside || {});
+  if (aside.length) {
+    $('aside-table').innerHTML = '<tr><th>檔名</th><th>卡片說的理由</th></tr>' +
+      aside.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="why">${esc(v)}</td></tr>`).join('');
+    $('aside').classList.remove('hide');
+  }
+}
+</script>
+</body>
+</html>

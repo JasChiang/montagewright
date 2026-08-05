@@ -29,8 +29,32 @@
 - 品牌、產品型號、人物姓名與專有名詞只能來自影片中逐字清楚可讀的文字、清楚可辨識的語音，或明確提供的 metadata。本請求未提供檔名或其他 metadata；不得僅憑外觀、產品知識或最可能答案猜測特定型號。
 - 如果只能確認品牌而不能確認型號，label 應使用「可辨識品牌＋最具體的可見類別泛稱」，並在 `uncertainties` 說明型號無法由畫面直接確認。模糊文字、相似外觀或模型既有知識都不是身分證據。
 - `evidence` 與 `observable_evidence` 必須描述實際可見／可聽證據，不得把推論改寫成觀察事實。
+- 每個事件先填寫通用的 `evidence_origin`，不要依影片是否為手機、產品、人物
+  或訪談增加領域標籤。`relation` 只能是：
+  - `direct_source_event`：動作、狀態、關係或結果直接發生在本次來源場景。
+  - `mediated_depiction`：來源場景中的螢幕、投影、喇叭或其他載體正在播放／
+    顯示另一段內容；它只能證明「正在呈現該內容」，不能證明內嵌內容中的事件
+    在本次來源場景發生。
+  - `graphic_or_text_claim`：圖卡、字幕、標示或語音只提出陳述，沒有直接呈現
+    該陳述所需的動作／狀態／結果。
+  - `context_only`：只提供相關人物、物件、環境或情緒脈絡。
+  - `unknown`：目前媒體不足以可靠分辨上述關係。
+  `observable_reason` 必須只描述本次媒體如何支持這個來源關係。
+- `evidence_provenance` 是舊 reader 的相容 mirror，不是另一套語意判斷。先決定
+  `evidence_origin.relation`，再依直接看到的事件類型映射成既有 enum：
+  direct source event 才可使用 `direct_physical_action`、
+  `direct_ui_interaction` 或 `direct_result`；mediated depiction 使用
+  `prerecorded_screen_playback`；graphic/text claim 依可見載體使用
+  `promotional_graphic` 或 `textual_claim_only`；其餘使用 `context_only` 或
+  `unknown`。兩欄不得互相矛盾；不確定時兩者都維持 unknown。
 - `grounding_targets` 只列出後續確實可能需要重新構圖、callout、去背或身份確認的指定實例；`target_kind` 必須與引用 Entity 的 kind 完全相同，描述必須包含物件層級、辨識特徵與排除條件。指定物件局部時不可引用整體 Entity；指定整體時也不可擴大到持有人、支架或周邊背景。
 - 複合目標必須拆成多個可獨立驗證的 target，不要要求單一 mask 同時表示數個不同實例。
+- 當事件意義只由產品局部、邊緣、鉸鏈、厚度、尺寸參照物或 UI 小區域承擔時，
+  必須為該最小可見 relation carrier 建立獨立 Entity／grounding target；不得把
+  整台產品或整個人物誤標成 required evidence。只有「完整外形本身」是比較
+  證據時，whole entity 才可成為必要 target。
+- 本次是可跨 brief 重用的 Base Clip Card。不要在此決定注意力順序、camera behavior、運鏡、固定左右方向或 9:16／16:9 的最終呈現方式；這些會在 shortlisted bounded clip 的 observation supplement 與 brief-aware planner 中分開處理。
+- `portrait_attention_sequence` 是舊版相容欄位，本次固定回傳空陣列。空陣列代表這項能力未在 Base Clip Card 評估，不代表畫面沒有注意力轉移。
 
 ## 剪輯用途與構圖
 

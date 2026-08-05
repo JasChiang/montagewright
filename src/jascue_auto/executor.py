@@ -1,0 +1,306 @@
+"""Turn an EDL into concrete render instructions.
+
+This layer has no veto. Every clip in the plan produces a segment, always. When
+something cannot be done as written it is done a rung lower and the reason is
+recorded with the measurement that forced it -- but the segment still exists,
+and the film is still deliverable.
+
+That is a deliberate inversion. The previous system could decide a piece of
+material was not worth using and abandon it, or abandon a whole aspect, and it
+did: a run during verification dropped every 9:16 candidate because one
+declared region wanted to be fully visible, and another dropped the 16:9
+aspect because a frame held two similar handsets. Both times the semantic layer
+had already said what it wanted and the execution layer said no. Only the
+review loop gets to say no here, and it says it about a finished cut.
+
+Degrading is not free either. Each rung down needs its own evidence that the
+rung above was attempted and failed, because a layer permitted to skip to the
+safe option takes it every time.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from typing import TYPE_CHECKING
+
+from jascue_auto.schema import EDL, Clip, DegradationStep
+
+if TYPE_CHECKING:  # a runtime import would make the two modules circular
+    from jascue_auto.reframe import CropPath
+
+# One safety margin, applied once, at the end. The old code added a little
+# padding at detection, a little more at tracking, and more again at
+# smoothing, so the crop that reached ffmpeg was tighter than any single layer
+# intended and no one layer looked wrong.
+CROP_MARGIN = 0.05
+
+
+@dataclass(frozen=True)
+class Source:
+    """A resolved input file and the facts needed to place cuts in it."""
+
+    source_id: str
+    path: Path
+    duration_seconds: float
+    width: int
+    height: int
+
+    @property
+    def aspect_ratio(self) -> float:
+        return self.width / self.height
+
+
+@dataclass(frozen=True)
+class CropBox:
+    """A crop in normalised coordinates. Pixels happen at the ffmpeg edge."""
+
+    x: float
+    y: float
+    width: float
+    height: float
+
+    def __post_init__(self) -> None:
+        if not (0.0 < self.width <= 1.0 and 0.0 < self.height <= 1.0):
+            raise ValueError("crop extent must sit within the frame")
+        if not (0.0 <= self.x <= 1.0 and 0.0 <= self.y <= 1.0):
+            raise ValueError("crop origin must sit within the frame")
+
+    def to_pixels(self, width: int, height: int) -> tuple[int, int, int, int]:
+        """Project onto a real frame.
+
+        Chroma-subsampled encoders want even numbers. An origin of zero is a
+        legitimate answer and stays zero; only the extent is held above zero,
+        since a crop of no width is not a crop.
+        """
+
+        def even_origin(value: float) -> int:
+            return max(0, int(value) // 2 * 2)
+
+        def even_extent(value: float, limit: int) -> int:
+            return max(2, min(limit, int(value) // 2 * 2))
+
+        x = even_origin(self.x * width)
+        y = even_origin(self.y * height)
+        return (
+            x,
+            y,
+            even_extent(self.width * width, width - x),
+            even_extent(self.height * height, height - y),
+        )
+
+
+@dataclass
+class Segment:
+    """One rendered piece of the timeline."""
+
+    clip_id: str
+    source: Source
+    in_seconds: float
+    out_seconds: float
+    crop: CropBox | None = None
+    # Set when the camera follows a subject. `crop` stays populated with the
+    # opening position so anything reading a single box still works.
+    crop_path: "CropPath | None" = None
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.out_seconds - self.in_seconds
+
+
+@dataclass
+class RenderPlan:
+    """Everything the renderer needs, plus an honest account of the cost."""
+
+    project_id: str
+    segments: list[Segment]
+    degradations: list[DegradationStep] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def duration_seconds(self) -> float:
+        return sum(segment.duration_seconds for segment in self.segments)
+
+    @property
+    def degraded_clip_ids(self) -> set[str]:
+        return {step.clip_id for step in self.degradations}
+
+
+class MissingSource(KeyError):
+    """Raised when an EDL names a source nobody supplied.
+
+    This is the one refusal the executor is allowed. It is not a judgement
+    about whether the material is good enough -- it is the plan referring to a
+    file that does not exist, which no amount of degrading can render.
+    """
+
+
+def _centred_crop(source_aspect: float, target_aspect: float) -> CropBox:
+    """The widest crop of `source_aspect` that fills `target_aspect`."""
+
+    if target_aspect < source_aspect:
+        width = target_aspect / source_aspect
+        return CropBox(x=(1.0 - width) / 2.0, y=0.0, width=width, height=1.0)
+    height = source_aspect / target_aspect
+    return CropBox(x=0.0, y=(1.0 - height) / 2.0, width=1.0, height=height)
+
+
+def _subject_crop(
+    source_aspect: float, target_aspect: float, clip: Clip
+) -> tuple[CropBox, str | None]:
+    """Centre, and say the subject was never located.
+
+    This used to anchor the crop from the planner's nine-box name. That name
+    answers "which of these things do you mean", and it was being read as
+    "aim here": "mid_right" put the frame at 0.615 for a handset spanning
+    0.475 to 0.825, so the shot arrived half out of frame with the backdrop
+    filling the rest. The same mistake had already been found and fixed on
+    the handoff path, where two handsets at 0.359 and 0.635 were panned
+    between 0.192 and 0.808.
+
+    Every position the pipeline acts on is measured now -- from the clip
+    card's box, from SAM propagation, or from a grounding call. Reaching
+    this function means none of those had an answer, and a centred frame
+    that says so is more use than a confident guess.
+    """
+
+    base = _centred_crop(source_aspect, target_aspect)
+    reframe = clip.reframe
+    if reframe is None or reframe.subject is None:
+        return base, "no subject stated; centred"
+    return base, "the subject was never located; centred"
+
+
+def plan_render(
+    edl: EDL,
+    sources: dict[str, Source],
+    *,
+    target_aspect: float | None = None,
+    crop_paths: "dict[str, CropPath] | None" = None,
+) -> RenderPlan:
+    """Compile an EDL into segments. Never returns fewer than it was given.
+
+    `target_aspect` is width over height; leave it out to keep each source as
+    shot. The EDL's origin is irrelevant here -- a hand-written plan and a
+    generated one compile identically, which is what makes a hand-written one
+    useful for telling an execution bug apart from a planning one.
+    """
+
+    segments: list[Segment] = []
+    degradations: list[DegradationStep] = []
+    notes: list[str] = []
+
+    for clip in edl.clips:
+        source = sources.get(clip.source_id)
+        if source is None:
+            raise MissingSource(
+                f"clip {clip.clip_id} names source {clip.source_id!r}, which "
+                f"was not supplied. Known: {sorted(sources)}"
+            )
+
+        in_seconds, out_seconds = _resolve_times(
+            clip, source, degradations, notes
+        )
+        crop = None
+        path = (crop_paths or {}).get(clip.clip_id)
+        if path is not None:
+            # A followed subject supersedes the coarse anchor: the path was
+            # built from where the subject actually was, not from a nine-box
+            # guess. `crop` keeps the opening position so a caller reading one
+            # box still sees something sensible.
+            crop = path.keyframes[0].crop
+        elif target_aspect is not None:
+            crop = _resolve_crop(
+                clip, source, target_aspect, degradations
+            )
+        segments.append(
+            Segment(
+                clip_id=clip.clip_id,
+                source=source,
+                in_seconds=in_seconds,
+                out_seconds=out_seconds,
+                crop=crop,
+                crop_path=path,
+            )
+        )
+
+    assert len(segments) == len(edl.clips), "the executor never drops a clip"
+    return RenderPlan(
+        project_id=edl.project_id,
+        segments=segments,
+        degradations=degradations,
+        notes=notes,
+    )
+
+
+def _resolve_times(
+    clip: Clip,
+    source: Source,
+    degradations: list[DegradationStep],
+    notes: list[str],
+) -> tuple[float, float]:
+    """Clamp a clip into its source without ever discarding it."""
+
+    in_seconds = max(0.0, clip.approx_in_seconds)
+    out_seconds = min(source.duration_seconds, clip.approx_out_seconds)
+
+    if out_seconds <= in_seconds:
+        # The window fell outside the material. Keep whatever tail exists
+        # rather than dropping the beat: a short segment can be reviewed and
+        # replanned, a missing one just leaves a hole nobody can see.
+        in_seconds = max(0.0, min(in_seconds, source.duration_seconds - 0.1))
+        out_seconds = source.duration_seconds
+        degradations.append(
+            DegradationStep(
+                clip_id=clip.clip_id,
+                ladder="other",
+                ladder_other="trim_window_clamped_to_source",
+                trigger=(
+                    f"requested {clip.approx_in_seconds:.3f}.."
+                    f"{clip.approx_out_seconds:.3f}s from a "
+                    f"{source.duration_seconds:.3f}s source"
+                ),
+                measured={
+                    "requested_in": clip.approx_in_seconds,
+                    "requested_out": clip.approx_out_seconds,
+                    "source_duration": source.duration_seconds,
+                    "resolved_duration": out_seconds - in_seconds,
+                },
+            )
+        )
+    elif clip.approx_out_seconds > source.duration_seconds:
+        notes.append(
+            f"{clip.clip_id}: out-point trimmed to the end of "
+            f"{clip.source_id} ({source.duration_seconds:.3f}s)"
+        )
+    return in_seconds, out_seconds
+
+
+def _resolve_crop(
+    clip: Clip,
+    source: Source,
+    target_aspect: float,
+    degradations: list[DegradationStep],
+) -> CropBox | None:
+    """Frame for the target aspect, recording any fall back to centre."""
+
+    if abs(source.aspect_ratio - target_aspect) < 1e-3:
+        return None
+
+    crop, fallback_reason = _subject_crop(
+        source.aspect_ratio, target_aspect, clip
+    )
+    if fallback_reason is not None:
+        degradations.append(
+            DegradationStep(
+                clip_id=clip.clip_id,
+                ladder="center_crop",
+                trigger=fallback_reason,
+                measured={
+                    "source_aspect": source.aspect_ratio,
+                    "target_aspect": target_aspect,
+                },
+            )
+        )
+    return crop

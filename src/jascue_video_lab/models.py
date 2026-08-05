@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from enum import StrEnum
 from fractions import Fraction
 from typing import Annotated, Any, Literal
@@ -12,6 +13,26 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 NormalizedCoordinate = Annotated[int, Field(ge=0, le=1000)]
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 MmSs = Annotated[str, Field(pattern=r"^\d{2,}:[0-5]\d$")]
+FeatureEvidenceProvenance = Literal[
+    "direct_physical_action",
+    "direct_ui_interaction",
+    "direct_result",
+    "prerecorded_screen_playback",
+    "promotional_graphic",
+    "textual_claim_only",
+    "context_only",
+    "unknown",
+]
+IllustrativeCoveragePolicy = Literal[
+    "related_product_or_environment_when_direct_absent",
+]
+EvidenceRelation = Literal[
+    "direct_source_event",
+    "mediated_depiction",
+    "graphic_or_text_claim",
+    "context_only",
+    "unknown",
+]
 
 
 class StrictModel(BaseModel):
@@ -20,6 +41,55 @@ class StrictModel(BaseModel):
 
 class FrozenStrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class EvidenceOriginObservation(FrozenStrictModel):
+    """Origin relationship of visible evidence, independent of its subject matter."""
+
+    relation: EvidenceRelation
+    observable_reason: str = Field(min_length=1, max_length=800)
+
+
+_LEGACY_EVIDENCE_RELATIONS: dict[FeatureEvidenceProvenance, EvidenceRelation] = {
+    "direct_physical_action": "direct_source_event",
+    "direct_ui_interaction": "direct_source_event",
+    "direct_result": "direct_source_event",
+    "prerecorded_screen_playback": "mediated_depiction",
+    "promotional_graphic": "graphic_or_text_claim",
+    "textual_claim_only": "graphic_or_text_claim",
+    "context_only": "context_only",
+    "unknown": "unknown",
+}
+
+
+def evidence_relation_from_legacy(
+    provenance: FeatureEvidenceProvenance,
+) -> EvidenceRelation:
+    """Project the legacy mixed enum onto its subject-neutral origin relation."""
+
+    return _LEGACY_EVIDENCE_RELATIONS[provenance]
+
+
+def legacy_evidence_mirror_is_compatible(
+    relation: EvidenceRelation,
+    provenance: FeatureEvidenceProvenance,
+) -> bool:
+    """Accept only exact mirrors or one conservative legacy demotion.
+
+    The legacy enum has no value for a directly observed static state or
+    spatial relation.  Older readers can safely receive ``context_only`` for
+    that case while the generic origin remains authoritative.  The reverse
+    promotion, mediated content marked direct, and every other disagreement
+    remain invalid.
+    """
+
+    if provenance == "unknown":
+        return True
+    projected = evidence_relation_from_legacy(provenance)
+    return projected == relation or (
+        relation == "direct_source_event"
+        and provenance == "context_only"
+    )
 
 
 def _mmss_to_ms(value: str) -> int:
@@ -1114,6 +1184,34 @@ class FullClipGroundingTarget(StrictModel):
     purpose: Literal["reframe", "callout", "isolation", "identity_check"]
 
 
+class FullClipAttentionPhase(StrictModel):
+    """Ordered visible attention evidence recorded while Gemini watches a clip."""
+
+    phase_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    anchor_entity_ids: list[str] = Field(min_length=1, max_length=4)
+    relation_mode: Literal["single_focus", "joint_relation"]
+    suggested_camera_behavior: Literal[
+        "hold",
+        "follow",
+        "follow_deadband",
+        "push_in",
+        "pull_out",
+        "punch_in_cut",
+    ]
+    observable_predicate: str = Field(min_length=1, max_length=800)
+    transition_condition: str = Field(min_length=1, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_attention_phase(self) -> "FullClipAttentionPhase":
+        if len(self.anchor_entity_ids) != len(set(self.anchor_entity_ids)):
+            raise ValueError("attention phase entity IDs must be unique")
+        if self.relation_mode == "single_focus" and len(self.anchor_entity_ids) != 1:
+            raise ValueError("single-focus attention phase requires one entity")
+        if self.relation_mode == "joint_relation" and len(self.anchor_entity_ids) < 2:
+            raise ValueError("joint-relation attention phase requires two entities")
+        return self
+
+
 class FullClipEvent(StrictModel):
     """Gemini semantic event with second-level MM:SS anchors, never model milliseconds."""
 
@@ -1124,6 +1222,8 @@ class FullClipEvent(StrictModel):
     label: str
     description: str
     observable_evidence: str
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
+    evidence_origin: EvidenceOriginObservation | None = None
     evidence_modalities: EvidenceModality
     entity_ids: list[str]
     primary_entity_ids: list[str]
@@ -1152,6 +1252,14 @@ class FullClipEvent(StrictModel):
     dense_refinement: Literal["required", "recommended", "not_needed"]
     dense_refinement_reasons: list[str]
     grounding_targets: list[FullClipGroundingTarget]
+    portrait_attention_sequence: list[FullClipAttentionPhase] = Field(
+        default_factory=list,
+        max_length=8,
+        description=(
+            "Ordered visible attention evidence only; no timestamps, crop "
+            "coordinates, or authorization to execute a virtual camera."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_mmss_interval(self) -> "FullClipEvent":
@@ -1163,7 +1271,28 @@ class FullClipEvent(StrictModel):
             keyframe_ms = _mmss_to_ms(self.recommended_keyframe_mmss)
             if not start_ms <= keyframe_ms < end_ms:
                 raise ValueError("recommended MM:SS keyframe must be inside [start, end)")
+        if (
+            self.evidence_origin is not None
+            and not legacy_evidence_mirror_is_compatible(
+                self.evidence_origin.relation,
+                self.evidence_provenance,
+            )
+        ):
+            raise ValueError(
+                "legacy evidence_provenance conflicts with generic evidence_origin"
+            )
         return self
+
+    def resolved_end_ms(self, duration_ms: int) -> int:
+        """Resolve the only MM:SS interval that can represent a sub-second clip."""
+        labeled_end_ms = _mmss_to_ms(self.end_mmss)
+        if (
+            duration_ms < 1000
+            and _mmss_to_ms(self.start_mmss) == 0
+            and labeled_end_ms == 1000
+        ):
+            return duration_ms
+        return labeled_end_ms
 
 
 class FullClipCard(StrictModel):
@@ -1196,9 +1325,19 @@ class FullClipCard(StrictModel):
         previous_end = 0
         for event in self.events:
             start_ms = _mmss_to_ms(event.start_mmss)
-            end_ms = _mmss_to_ms(event.end_mmss)
+            end_ms = event.resolved_end_ms(self.duration_ms)
             if end_ms > self.duration_ms:
                 raise ValueError(f"event {event.event_id} MM:SS exceeds duration")
+            if end_ms <= start_ms:
+                raise ValueError(
+                    f"event {event.event_id} resolved interval must be non-empty"
+                )
+            if event.recommended_keyframe_mmss is not None:
+                keyframe_ms = _mmss_to_ms(event.recommended_keyframe_mmss)
+                if not start_ms <= keyframe_ms < end_ms:
+                    raise ValueError(
+                        f"event {event.event_id} keyframe exceeds resolved interval"
+                    )
             if start_ms < previous_end:
                 raise ValueError(f"event {event.event_id} overlaps or is out of order")
             previous_end = end_ms
@@ -1209,6 +1348,11 @@ class FullClipCard(StrictModel):
                 + event.optional_entity_ids
                 + event.avoid_overlay_entity_ids
                 + [target.entity_id for target in event.grounding_targets]
+                + [
+                    entity_id
+                    for phase in event.portrait_attention_sequence
+                    for entity_id in phase.anchor_entity_ids
+                ]
             )
             unknown = sorted(set(references) - known_entities)
             if unknown:
@@ -1243,15 +1387,29 @@ class DerivedClipEvent(StrictModel):
     end_ms: int = Field(gt=0)
     recommended_keyframe_ms: int | None = Field(default=None, ge=0)
     shot_ids: list[str]
-    boundary_source: Literal["gemini_mmss_local_conversion"]
+    boundary_source: Literal[
+        "gemini_mmss_local_conversion",
+        "gemini_mmss_subsecond_clip_end_conversion",
+    ]
     exact_frame_required: bool
 
     @model_validator(mode="after")
     def validate_derived_interval(self) -> "DerivedClipEvent":
         if self.start_ms != _mmss_to_ms(self.start_mmss):
             raise ValueError("start_ms must be locally derived from start_mmss")
-        if self.end_ms != _mmss_to_ms(self.end_mmss):
-            raise ValueError("end_ms must be locally derived from end_mmss")
+        labeled_end_ms = _mmss_to_ms(self.end_mmss)
+        if self.boundary_source == "gemini_mmss_local_conversion":
+            if self.end_ms != labeled_end_ms:
+                raise ValueError("end_ms must be locally derived from end_mmss")
+        elif not (
+            self.start_ms == 0
+            and labeled_end_ms == 1000
+            and 0 < self.end_ms < 1000
+        ):
+            raise ValueError(
+                "sub-second clip-end conversion requires 00:00–00:01 display "
+                "labels and an authoritative end below 1000 ms"
+            )
         expected_keyframe = (
             _mmss_to_ms(self.recommended_keyframe_mmss)
             if self.recommended_keyframe_mmss is not None
@@ -1396,6 +1554,707 @@ class DenseEventSelection(StrictModel):
                 raise ValueError("invisible dense selection has incompatible match_status")
         if bool(self.target_entity_id) != bool(self.target_description):
             raise ValueError("dense selection target ID and description must appear together")
+        return self
+
+
+QualityRiskReason = Literal[
+    "black",
+    "white_clip",
+    "freeze",
+    "focus_loss",
+    "motion_blur",
+    "camera_shake",
+    "occlusion",
+    "target_not_visible",
+    "duplicate_pts",
+    "decoder_gap",
+    "compression_artifact",
+]
+
+QualityRiskSeverity = Literal[
+    "hard_block",
+    "trim_candidate",
+    "review",
+    "note",
+]
+
+QualityRiskIntent = Literal[
+    "accidental",
+    "intentional",
+    "unknown",
+]
+
+
+class QualityFrameEvidence(StrictModel):
+    """One reproducible analysis frame tied back to decoded source PTS."""
+
+    frame_id: str = Field(pattern=r"^QF-[0-9a-f]{16}$")
+    frame_pts: int
+    frame_time_ms: int = Field(ge=0)
+    analysis_frame_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class QualityRiskWindow(StrictModel):
+    """Measured source interval; it is not itself an edit instruction."""
+
+    risk_window_id: str = Field(pattern=r"^QRW-[0-9]{4}$")
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    shot_id: str = Field(min_length=1)
+    start_pts: int
+    end_pts: int
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    reason_code: QualityRiskReason
+    severity: QualityRiskSeverity
+    intent: QualityRiskIntent
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence_frame_ids: list[str] = Field(max_length=16)
+    metric_summary: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_quality_window(self) -> "QualityRiskWindow":
+        if self.end_pts <= self.start_pts:
+            raise ValueError("quality risk PTS interval must be non-empty")
+        if self.end_ms <= self.start_ms:
+            raise ValueError("quality risk time interval must be non-empty")
+        if len(self.evidence_frame_ids) != len(set(self.evidence_frame_ids)):
+            raise ValueError("quality risk evidence frame IDs must be unique")
+        if self.reason_code != "decoder_gap" and not self.evidence_frame_ids:
+            raise ValueError(
+                "measured quality risks require at least one evidence frame"
+            )
+        return self
+
+
+class ShotQualityMap(StrictModel):
+    """Deterministic source-FPS measurements for one immutable source shot."""
+
+    contract_version: Literal["shot-quality-map-v1"] = "shot-quality-map-v1"
+    scanner_version: str = Field(min_length=1)
+    source_path: str
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    shot_id: str = Field(min_length=1)
+    shot_start_pts: int
+    shot_end_pts: int
+    shot_start_ms: int = Field(ge=0)
+    shot_end_ms: int = Field(gt=0)
+    source_time_base: Rational
+    analysis_width: int = Field(gt=0)
+    analysis_height: int = Field(gt=0)
+    decoded_frame_count: int = Field(ge=0)
+    request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_frames: list[QualityFrameEvidence]
+    risk_windows: list[QualityRiskWindow]
+    warnings: list[str]
+    generated_at: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_quality_map(self) -> "ShotQualityMap":
+        if self.shot_end_pts <= self.shot_start_pts:
+            raise ValueError("shot quality PTS interval must be non-empty")
+        if self.shot_end_ms <= self.shot_start_ms:
+            raise ValueError("shot quality time interval must be non-empty")
+        evidence_ids = [frame.frame_id for frame in self.evidence_frames]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("quality evidence frame IDs must be unique")
+        known_evidence = set(evidence_ids)
+        window_ids = [window.risk_window_id for window in self.risk_windows]
+        if len(window_ids) != len(set(window_ids)):
+            raise ValueError("quality risk window IDs must be unique")
+        for window in self.risk_windows:
+            if (
+                window.source_asset_id != self.source_asset_id
+                or window.shot_id != self.shot_id
+            ):
+                raise ValueError("quality risk window lineage differs from its map")
+            if not (
+                self.shot_start_ms
+                <= window.start_ms
+                < window.end_ms
+                <= self.shot_end_ms
+            ):
+                raise ValueError("quality risk window lies outside its shot")
+            if not set(window.evidence_frame_ids) <= known_evidence:
+                raise ValueError("quality risk references unknown evidence frames")
+        return self
+
+
+class QualitySafeInterval(StrictModel):
+    """One continuous interval eligible for deterministic source trimming."""
+
+    interval_id: str = Field(pattern=r"^QSI-[0-9]{4}$")
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    shot_id: str = Field(min_length=1)
+    start_pts: int
+    end_pts: int
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    excluded_risk_window_ids: list[str]
+    review_risk_window_ids: list[str]
+    requires_human_review: bool
+    quality_map_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_safe_interval(self) -> "QualitySafeInterval":
+        if self.end_pts <= self.start_pts or self.end_ms <= self.start_ms:
+            raise ValueError("quality-safe interval must be non-empty")
+        if len(self.excluded_risk_window_ids) != len(
+            set(self.excluded_risk_window_ids)
+        ):
+            raise ValueError("excluded risk IDs must be unique")
+        if len(self.review_risk_window_ids) != len(
+            set(self.review_risk_window_ids)
+        ):
+            raise ValueError("review risk IDs must be unique")
+        if self.requires_human_review != bool(self.review_risk_window_ids):
+            raise ValueError(
+                "safe interval review flag must reflect unresolved review risks"
+            )
+        return self
+
+
+class AspectCandidateCapacity(StrictModel):
+    """Quality and geometry capacity for one delivery aspect."""
+
+    aspect: Literal["16:9", "9:16"]
+    geometry_status: Literal[
+        "not_evaluated",
+        "feasible",
+        "partial",
+        "blocked",
+    ]
+    safe_intervals: list[QualitySafeInterval]
+    maximum_continuous_seconds: float = Field(ge=0.0)
+    requires_human_review: bool
+
+    @model_validator(mode="after")
+    def validate_capacity(self) -> "AspectCandidateCapacity":
+        if self.geometry_status == "blocked" and (
+            self.safe_intervals or self.maximum_continuous_seconds != 0
+        ):
+            raise ValueError(
+                "geometry-blocked capacity cannot expose executable intervals"
+            )
+        measured = max(
+            (
+                (interval.end_ms - interval.start_ms) / 1000
+                for interval in self.safe_intervals
+            ),
+            default=0.0,
+        )
+        if abs(measured - self.maximum_continuous_seconds) > 0.001:
+            raise ValueError(
+                "aspect capacity must equal its longest continuous safe interval"
+            )
+        if self.requires_human_review != any(
+            interval.requires_human_review for interval in self.safe_intervals
+        ):
+            raise ValueError(
+                "aspect review flag must reflect its safe interval evidence"
+            )
+        return self
+
+
+class CandidateCapacity(StrictModel):
+    """Planning capacity; never inferred from the complete shot duration."""
+
+    contract_version: Literal["candidate-capacity-v1"] = "candidate-capacity-v1"
+    candidate_id: str = Field(min_length=1)
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    shot_id: str = Field(min_length=1)
+    horizontal: AspectCandidateCapacity
+    vertical: AspectCandidateCapacity
+    min_editorial_duration: float = Field(ge=0.0)
+    preferred_duration: float = Field(ge=0.0)
+    max_editorial_duration: float = Field(ge=0.0)
+    quality_map_path: str
+    quality_map_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_candidate_capacity(self) -> "CandidateCapacity":
+        if self.horizontal.aspect != "16:9" or self.vertical.aspect != "9:16":
+            raise ValueError("candidate capacity aspect fields are reversed")
+        if not (
+            self.min_editorial_duration
+            <= self.preferred_duration
+            <= self.max_editorial_duration
+        ):
+            raise ValueError(
+                "candidate editorial durations must satisfy min <= preferred <= max"
+            )
+        available = min(
+            self.horizontal.maximum_continuous_seconds,
+            self.vertical.maximum_continuous_seconds,
+        )
+        if self.max_editorial_duration > available + 0.001:
+            raise ValueError(
+                "candidate maximum editorial duration exceeds safe aspect capacity"
+            )
+        return self
+
+
+class AttentionChapterProfile(StrictModel):
+    """One chapter's attention evidence and executable dwell envelope."""
+
+    feature_id: str = Field(pattern=r"^[a-z0-9_-]+$")
+    evidence_authority: Literal[
+        "gemini_attention_observation",
+        "gemini_relative_dwell_legacy",
+        "brief_fallback",
+    ]
+    semantic_novelty: float | None = Field(default=None, ge=0.0, le=1.0)
+    action_progress: float | None = Field(default=None, ge=0.0, le=1.0)
+    visual_motion: float | None = Field(default=None, ge=0.0, le=1.0)
+    composition_change: float | None = Field(default=None, ge=0.0, le=1.0)
+    reading_load: float | None = Field(default=None, ge=0.0, le=1.0)
+    unresolved_tension: float | None = Field(default=None, ge=0.0, le=1.0)
+    emotional_hold_value: float | None = Field(default=None, ge=0.0, le=1.0)
+    repetition_pressure: float | None = Field(default=None, ge=0.0, le=1.0)
+    music_transition_opportunity: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    minimum_dwell_seconds: float = Field(gt=0.0)
+    preferred_dwell_seconds: float = Field(gt=0.0)
+    maximum_dwell_seconds: float = Field(gt=0.0)
+    quality_safe_capacity_seconds: float | None = Field(default=None, ge=0.0)
+    flow_intent: "ShotFlowIntent | None" = None
+    rationale: str = Field(min_length=1)
+    uncertainties: list[str]
+    requires_human_review: bool
+
+    @model_validator(mode="after")
+    def validate_attention_profile(self) -> "AttentionChapterProfile":
+        if not (
+            self.minimum_dwell_seconds
+            <= self.preferred_dwell_seconds
+            <= self.maximum_dwell_seconds
+        ):
+            raise ValueError(
+                "attention dwell must satisfy minimum <= preferred <= maximum"
+            )
+        if (
+            self.quality_safe_capacity_seconds is not None
+            and self.maximum_dwell_seconds
+            > self.quality_safe_capacity_seconds + 0.001
+        ):
+            raise ValueError("attention maximum exceeds quality-safe capacity")
+        metrics = (
+            self.semantic_novelty,
+            self.action_progress,
+            self.visual_motion,
+            self.composition_change,
+            self.reading_load,
+            self.unresolved_tension,
+            self.emotional_hold_value,
+            self.repetition_pressure,
+            self.music_transition_opportunity,
+        )
+        if self.evidence_authority == "gemini_attention_observation":
+            if any(value is None for value in metrics):
+                raise ValueError("Gemini attention profiles require the full vector")
+        elif any(value is not None for value in metrics):
+            raise ValueError("legacy attention profiles cannot invent vector values")
+        return self
+
+
+class AttentionProfile(StrictModel):
+    contract_version: Literal["attention-profile-v1"] = "attention-profile-v1"
+    project_id: str
+    source_brief_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_feature_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    chapters: list[AttentionChapterProfile] = Field(min_length=1)
+    generated_at: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_attention_chapters(self) -> "AttentionProfile":
+        ids = [chapter.feature_id for chapter in self.chapters]
+        if len(ids) != len(set(ids)):
+            raise ValueError("attention profile chapter IDs must be unique")
+        return self
+
+
+class RhythmChapterPlan(StrictModel):
+    feature_id: str = Field(pattern=r"^[a-z0-9_-]+$")
+    minimum_duration_seconds: float = Field(gt=0.0)
+    preferred_duration_seconds: float = Field(gt=0.0)
+    maximum_duration_seconds: float = Field(gt=0.0)
+    cut_pressure: float | None = Field(default=None, ge=0.0, le=1.0)
+    boundary_priority: Literal["low", "normal", "high"]
+    boundary_alignment: Literal[
+        "content_locked",
+        "phrase_preferred",
+        "accent_preferred",
+        "free",
+    ] = "free"
+    flow_intent: "ShotFlowIntent | None" = None
+    protected_reasons: list[str]
+    transition_reasons: list[str]
+    evidence_authority: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_rhythm_durations(self) -> "RhythmChapterPlan":
+        if not (
+            self.minimum_duration_seconds
+            <= self.preferred_duration_seconds
+            <= self.maximum_duration_seconds
+        ):
+            raise ValueError(
+                "rhythm durations must satisfy minimum <= preferred <= maximum"
+            )
+        return self
+
+
+class RhythmPlan(StrictModel):
+    contract_version: Literal["rhythm-plan-v1"] = "rhythm-plan-v1"
+    project_id: str
+    style_profile: Literal["calm", "standard", "energetic"]
+    target_duration_seconds: float = Field(gt=0.0)
+    attention_profile_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    chapters: list[RhythmChapterPlan] = Field(min_length=1)
+    interpretation: Literal[
+        "attention_bounds_and_boundary_pressure_not_frame_accurate_cuts"
+    ] = "attention_bounds_and_boundary_pressure_not_frame_accurate_cuts"
+    generated_at: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_rhythm_chapters(self) -> "RhythmPlan":
+        ids = [chapter.feature_id for chapter in self.chapters]
+        if len(ids) != len(set(ids)):
+            raise ValueError("rhythm plan chapter IDs must be unique")
+        if sum(chapter.minimum_duration_seconds for chapter in self.chapters) > (
+            self.target_duration_seconds + 0.001
+        ):
+            raise ValueError("rhythm minimum durations exceed project duration")
+        if sum(chapter.maximum_duration_seconds for chapter in self.chapters) + (
+            0.001
+        ) < self.target_duration_seconds:
+            raise ValueError("rhythm maximum durations cannot fill project duration")
+        return self
+
+
+class VirtualCameraKeyframe(StrictModel):
+    time_seconds: float = Field(ge=0.0)
+    source_pts: int | None = None
+    scale: float = Field(ge=1.0)
+    center_x_normalized: float = Field(ge=0.0, le=1000.0)
+    center_y_normalized: float = Field(ge=0.0, le=1000.0)
+
+
+class VirtualCameraPlan(StrictModel):
+    contract_version: Literal["virtual-camera-plan-v1"] = "virtual-camera-plan-v1"
+    requested_intent: VirtualCameraIntent
+    applied_intent: VirtualCameraIntent
+    anchor_target_ids: list[str]
+    keyframes: list[VirtualCameraKeyframe] = Field(min_length=1)
+    easing: Literal["hold", "linear", "smoothstep", "cut"]
+    geometry_safe_max_scale: float = Field(ge=1.0)
+    source_resolution_native_scale_limit: float = Field(ge=1.0)
+    source_resolution_upscale_required: bool
+    max_velocity: float = Field(ge=0.0)
+    max_acceleration: float = Field(ge=0.0)
+    max_jerk: float = Field(ge=0.0)
+    execution_status: Literal["applied", "fallback", "blocked"]
+    fallback_reason: str | None = None
+    editorial_reason: str = Field(min_length=1)
+    source_track_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_virtual_camera(self) -> "VirtualCameraPlan":
+        times = [keyframe.time_seconds for keyframe in self.keyframes]
+        if times != sorted(set(times)):
+            raise ValueError("virtual-camera keyframe times must be strictly increasing")
+        if self.execution_status == "applied" and self.fallback_reason is not None:
+            raise ValueError("applied virtual-camera plans cannot have a fallback reason")
+        if self.execution_status != "applied" and not self.fallback_reason:
+            raise ValueError("non-applied virtual-camera plans require a reason")
+        if self.requested_intent == "pan_reveal" and len(self.anchor_target_ids) < 2:
+            if self.execution_status == "applied":
+                raise ValueError(
+                    "pan reveal requires two anchors or a non-applied plan"
+                )
+        if max(keyframe.scale for keyframe in self.keyframes) > (
+            self.geometry_safe_max_scale + 0.001
+        ):
+            raise ValueError("virtual-camera scale exceeds geometry-safe limit")
+        expected_upscale = max(
+            keyframe.scale for keyframe in self.keyframes
+        ) > (self.source_resolution_native_scale_limit + 0.001)
+        if self.source_resolution_upscale_required != expected_upscale:
+            raise ValueError(
+                "source-resolution upscale flag disagrees with camera scales"
+            )
+        return self
+
+
+class VerticalVirtualCameraPhase(StrictModel):
+    """One reviewable portrait composition phase over normalized edit progress.
+
+    A phase changes which already-grounded regions are compositionally required.
+    It does not create a new identity, bbox, mask, timestamp, or source edit.
+    """
+
+    phase_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    start_progress: float = Field(ge=0.0, le=1.0)
+    end_progress: float = Field(gt=0.0, le=1.0)
+    anchor_region_ids: list[str] = Field(min_length=1, max_length=4)
+    camera_behavior: Literal[
+        "hold",
+        "follow",
+        "follow_deadband",
+        "push_in",
+        "pull_out",
+        "punch_in_cut",
+    ] = "follow_deadband"
+    movement_motivation: Literal[
+        "none",
+        "maintain_framing",
+        "attention_handoff",
+        "reveal",
+        "emphasis",
+    ] = "none"
+    traversal_policy: Literal[
+        "semantic_order_locked",
+        "spatially_optimizable",
+        "no_continuous_traversal",
+    ] = "semantic_order_locked"
+    cut_admissible: bool = False
+    transition_in: Literal["cut", "smoothstep"] = "cut"
+    transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    minimum_anchor_visible_fraction: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Reviewed visibility floor for the active anchor union during the "
+            "steady part of this phase. A value below 1 permits intentional, "
+            "auditable clipping rather than an implicit center-crop fallback."
+        ),
+    )
+    editorial_reason: str = Field(min_length=1, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_phase(self) -> "VerticalVirtualCameraPhase":
+        if self.end_progress <= self.start_progress:
+            raise ValueError("vertical camera phase must have positive duration")
+        if len(self.anchor_region_ids) != len(set(self.anchor_region_ids)):
+            raise ValueError("vertical camera phase anchor IDs must be unique")
+        if self.transition_in == "cut" and self.transition_duration_fraction != 0:
+            raise ValueError("cut transition cannot have a transition duration")
+        if self.transition_in == "smoothstep" and (
+            self.transition_duration_fraction <= 0
+        ):
+            raise ValueError("smoothstep transition requires a positive duration")
+        return self
+
+
+class VerticalVirtualCameraProposalPhase(StrictModel):
+    """Gemini-authored editorial phase before geometry is allowed to execute.
+
+    Progress values describe relative editorial order only.  They are not source
+    timestamps, frame boundaries, crop coordinates, or proof that the requested
+    anchors can coexist inside a portrait crop.
+    """
+
+    phase_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    start_progress: float = Field(ge=0.0, le=1.0)
+    end_progress: float = Field(gt=0.0, le=1.0)
+    anchor_region_ids: list[str] = Field(min_length=1, max_length=4)
+    camera_behavior: Literal[
+        "hold",
+        "follow",
+        "follow_deadband",
+        "push_in",
+        "pull_out",
+        "punch_in_cut",
+    ] = "follow_deadband"
+    movement_motivation: Literal[
+        "none",
+        "maintain_framing",
+        "attention_handoff",
+        "reveal",
+        "emphasis",
+    ] = "none"
+    cut_admissible: bool = False
+    transition_in: Literal["cut", "smoothstep"] = "cut"
+    transition_duration_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
+    observable_predicate: str = Field(
+        min_length=1,
+        max_length=800,
+        description=(
+            "Visible condition that makes this anchor relevant; do not use brand "
+            "knowledge, an invented timestamp, or an inferred off-screen state."
+        ),
+    )
+    transition_condition: str = Field(
+        min_length=1,
+        max_length=800,
+        description=(
+            "Visible editorial hand-off condition.  A later dense-frame pass may "
+            "refine it to immutable frame IDs before any source trim changes."
+        ),
+    )
+    editorial_reason: str = Field(min_length=1, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_proposal_phase(self) -> "VerticalVirtualCameraProposalPhase":
+        if self.end_progress <= self.start_progress:
+            raise ValueError("vertical camera proposal phase must have positive duration")
+        if len(self.anchor_region_ids) != len(set(self.anchor_region_ids)):
+            raise ValueError("vertical camera proposal anchor IDs must be unique")
+        if self.transition_in == "cut" and self.transition_duration_fraction != 0:
+            raise ValueError("cut transition cannot have a transition duration")
+        if self.transition_in == "smoothstep" and (
+            self.transition_duration_fraction <= 0
+        ):
+            raise ValueError("smoothstep transition requires a positive duration")
+        return self
+
+
+class VerticalVirtualCameraProposal(StrictModel):
+    """Evidence-only Gemini proposal; local geometry remains authoritative."""
+
+    contract_version: Literal["vertical-virtual-camera-proposal-v1"] = (
+        "vertical-virtual-camera-proposal-v1"
+    )
+    composition_mode: Literal[
+        "single_anchor_hold",
+        "single_anchor_follow",
+        "sequential_focus",
+        "joint_relation",
+        "mixed_relation",
+    ]
+    traversal_policy: Literal[
+        "semantic_order_locked",
+        "spatially_optimizable",
+        "no_continuous_traversal",
+    ] = "semantic_order_locked"
+    phases: list[VerticalVirtualCameraProposalPhase] = Field(
+        min_length=1,
+        max_length=8,
+    )
+    proposal_reason: str = Field(min_length=1, max_length=1200)
+    uncertainties: list[str] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_proposal(self) -> "VerticalVirtualCameraProposal":
+        phase_ids = [phase.phase_id for phase in self.phases]
+        if len(phase_ids) != len(set(phase_ids)):
+            raise ValueError("vertical camera proposal phase IDs must be unique")
+        if abs(self.phases[0].start_progress) > 1e-6:
+            raise ValueError("vertical camera proposal must start at progress zero")
+        if abs(self.phases[-1].end_progress - 1.0) > 1e-6:
+            raise ValueError("vertical camera proposal must end at progress one")
+        for prior, current in zip(self.phases[:-1], self.phases[1:], strict=True):
+            if abs(prior.end_progress - current.start_progress) > 1e-6:
+                raise ValueError(
+                    "vertical camera proposal phases must be contiguous"
+                )
+        if any(
+            phase.transition_in == "cut" and not phase.cut_admissible
+            for phase in self.phases[1:]
+        ):
+            raise ValueError(
+                "a proposed hard cut requires an explicit semantic "
+                "cut-admissibility decision"
+            )
+        if self.phases[0].transition_in != "cut":
+            raise ValueError(
+                "the first vertical camera proposal phase must use a cut"
+            )
+        unique_anchor_ids = {
+            region_id
+            for phase in self.phases
+            for region_id in phase.anchor_region_ids
+        }
+        if self.composition_mode == "sequential_focus" and (
+            len(self.phases) < 2 or len(unique_anchor_ids) < 2
+        ):
+            raise ValueError(
+                "sequential focus requires at least two phases and two anchors"
+            )
+        if self.composition_mode in {
+            "single_anchor_hold",
+            "single_anchor_follow",
+        } and len(unique_anchor_ids) != 1:
+            raise ValueError("single-anchor modes must reference exactly one anchor")
+        if self.composition_mode == "joint_relation" and not any(
+            len(phase.anchor_region_ids) >= 2 for phase in self.phases
+        ):
+            raise ValueError(
+                "joint-relation composition requires at least one multi-anchor phase"
+            )
+        if self.composition_mode == "mixed_relation":
+            if not any(
+                len(phase.anchor_region_ids) >= 2 for phase in self.phases
+            ) or not any(
+                len(phase.anchor_region_ids) == 1 for phase in self.phases
+            ):
+                raise ValueError(
+                    "mixed-relation composition requires both joint and "
+                    "single-anchor phases"
+                )
+        if self.traversal_policy == "spatially_optimizable":
+            if self.composition_mode != "sequential_focus" or any(
+                len(phase.anchor_region_ids) != 1 for phase in self.phases
+            ):
+                raise ValueError(
+                    "spatially optimizable traversal is only valid for "
+                    "independent single-anchor sequential phases"
+                )
+        return self
+
+
+class VerticalVirtualCameraPlan(StrictModel):
+    """Executed phase-based 9:16 crop plan tied to tracked region evidence."""
+
+    contract_version: Literal["vertical-virtual-camera-plan-v1"] = (
+        "vertical-virtual-camera-plan-v1"
+    )
+    phases: list[VerticalVirtualCameraPhase] = Field(min_length=1)
+    anchor_region_ids: list[str] = Field(min_length=1)
+    keyframes: list[VirtualCameraKeyframe] = Field(min_length=2)
+    steady_containment_passed: bool
+    transition_minimum_anchor_visible_fraction: float = Field(ge=0.0, le=1.0)
+    max_velocity: float = Field(ge=0.0)
+    max_acceleration: float = Field(ge=0.0)
+    max_jerk: float = Field(ge=0.0)
+    execution_status: Literal["applied", "fallback", "blocked"]
+    fallback_reason: str | None = None
+    requires_human_review: Literal[True] = True
+    editorial_reason: str = Field(min_length=1)
+    source_track_fingerprints: dict[str, str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_vertical_virtual_camera(self) -> "VerticalVirtualCameraPlan":
+        times = [keyframe.time_seconds for keyframe in self.keyframes]
+        if times != sorted(set(times)):
+            raise ValueError(
+                "vertical virtual-camera keyframe times must be strictly increasing"
+            )
+        if self.execution_status == "applied" and self.fallback_reason is not None:
+            raise ValueError(
+                "applied vertical virtual-camera plans cannot have a fallback reason"
+            )
+        if self.execution_status != "applied" and not self.fallback_reason:
+            raise ValueError(
+                "non-applied vertical virtual-camera plans require a reason"
+            )
+        expected_ids = list(
+            dict.fromkeys(
+                region_id
+                for phase in self.phases
+                for region_id in phase.anchor_region_ids
+            )
+        )
+        if self.anchor_region_ids != expected_ids:
+            raise ValueError(
+                "vertical virtual-camera anchor IDs must match phase order"
+            )
+        if any(
+            not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+            for fingerprint in self.source_track_fingerprints.values()
+        ):
+            raise ValueError("vertical camera track fingerprints must be SHA-256")
         return self
 
 
@@ -1973,6 +2832,85 @@ class RunStatus(StrictModel):
     stage: str
     ok: bool
     errors: list[dict[str, object]] = Field(default_factory=list)
+
+
+class FeatureCutExecutionProfile(StrEnum):
+    """How strictly feature-cut prerequisites are enforced before rendering."""
+
+    REVIEW_PREVIEW = "review_preview"
+    PRODUCTION_REVIEW = "production_review"
+    AUTONOMOUS_STRICT = "autonomous_strict"
+    AUTONOMOUS_BEST_EFFORT = "autonomous_best_effort"
+
+
+class FeatureCutRunState(StrEnum):
+    """Editorial state; independent from whether an MP4 was encoded."""
+
+    FAILED = "failed"
+    PARTIAL = "partial"
+    REVIEW_PREVIEW = "review_preview"
+    READY_FOR_HUMAN_REVIEW = "ready_for_human_review"
+    DELIVERY_ELIGIBLE = "delivery_eligible"
+    BEST_EFFORT_COMPLETE = "best_effort_complete"
+
+
+class EligibilityGateStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    NOT_RUN = "not_run"
+    NOT_REQUIRED = "not_required"
+
+
+class FeatureCutEditorialContract(StrictModel):
+    evidence_complete: EligibilityGateStatus
+    candidate_recall_complete: EligibilityGateStatus
+    candidate_resolution_passed: EligibilityGateStatus
+    quality_coverage_complete: EligibilityGateStatus
+    geometry_execution_passed: EligibilityGateStatus
+    human_intent_execution_verified: EligibilityGateStatus
+    technical_quality_passed: EligibilityGateStatus
+    final_sequence_qa_passed: EligibilityGateStatus
+    human_approval_passed: EligibilityGateStatus
+
+
+class FeatureCutEligibilityReport(StrictModel):
+    """Machine-readable handoff state for one feature-cut review render."""
+
+    contract_version: Literal["feature-cut-delivery-eligibility-v1"] = (
+        "feature-cut-delivery-eligibility-v1"
+    )
+    execution_profile: FeatureCutExecutionProfile
+    media_rendered: bool
+    run_state: FeatureCutRunState
+    ready_for_human_review: bool
+    delivery_eligible: bool
+    editorial_contract: FeatureCutEditorialContract
+    blocking_reasons: list[str] = Field(default_factory=list)
+    review_reasons: list[str] = Field(default_factory=list)
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_state(self) -> "FeatureCutEligibilityReport":
+        if self.delivery_eligible:
+            if self.run_state != FeatureCutRunState.DELIVERY_ELIGIBLE:
+                raise ValueError(
+                    "delivery eligibility requires delivery-eligible run state"
+                )
+            if not self.ready_for_human_review:
+                raise ValueError(
+                    "delivery-eligible output must also be review-ready"
+                )
+        if self.ready_for_human_review and self.run_state not in {
+            FeatureCutRunState.READY_FOR_HUMAN_REVIEW,
+            FeatureCutRunState.DELIVERY_ELIGIBLE,
+            FeatureCutRunState.BEST_EFFORT_COMPLETE,
+        }:
+            raise ValueError(
+                "review-ready flag conflicts with the feature-cut run state"
+            )
+        if not self.media_rendered and self.run_state != FeatureCutRunState.FAILED:
+            raise ValueError("a non-rendered run must remain failed")
+        return self
 
 
 class TrackingState(StrEnum):
@@ -2611,10 +3549,34 @@ class RushClip(StrictModel):
 
 
 class RushFrame(StrictModel):
-    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    frame_id: str = Field(
+        pattern=r"^RF[0-9]{6}$",
+        min_length=8,
+        max_length=8,
+    )
     clip_id: str
     requested_time_ms: int = Field(ge=0)
     image_path: str
+    source_image_path: str | None = None
+    frame_time_ms: int | None = Field(default=None, ge=0)
+    frame_pts: int | None = None
+    frame_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_exact_frame_lineage(self) -> "RushFrame":
+        exact = (
+            self.source_image_path,
+            self.frame_time_ms,
+            self.frame_pts,
+            self.frame_hash,
+        )
+        if any(value is not None for value in exact) and not all(
+            value is not None for value in exact
+        ):
+            raise ValueError(
+                "rush frame exact lineage requires time, PTS and hash together"
+            )
+        return self
 
 
 class RushesCatalog(StrictModel):
@@ -2688,15 +3650,42 @@ class FramingRegionIntent(StrictModel):
     kind: Literal["subject", "text_region", "ui_region", "graphic", "other"] = (
         "subject"
     )
+    evidence_role: Literal[
+        "primary_subject",
+        "relation_participant",
+        "relation_carrier",
+        "state_evidence",
+        "context_reference",
+    ] = "primary_subject"
     role: Literal["required", "preferred", "avoid_overlay"] = "required"
     atomic: bool = Field(
         default=False,
         description=(
-            "True when partial clipping changes the meaning of the region, for "
-            "example a text or UI state. Atomic regions are treated as hard cores."
+            "True only when partial clipping destroys the meaning of the "
+            "region, so that no crop is better than a tight one: rendered "
+            "text, a UI state, a logo, a readout. Atomic regions are hard "
+            "cores demanding full visibility, and an aspect where every "
+            "candidate declares one is abandoned rather than cropped. A "
+            "subject that still reads when its edges leave frame -- a person, "
+            "a held product, a face in a group -- is not atomic. Say that with "
+            "atomic false and a minimum_visible_fraction instead."
         ),
     )
-    minimum_visible_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+    minimum_visible_fraction: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Smallest share of the region that still carries its meaning, for "
+            "a region that survives partial clipping. This is the normal way "
+            "to express importance: prefer atomic false with a fraction here "
+            "over declaring a region atomic, because a fraction lets the crop "
+            "be planned while an atomic region can only be honoured or "
+            "abandoned. Leave unset only when atomic is true, where full "
+            "visibility is already implied and any fraction below 1.0 "
+            "contradicts it."
+        ),
+    )
     observable_relations: list[str] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
 
@@ -2718,8 +3707,6 @@ class FramingRegionIntent(StrictModel):
                 raise ValueError(f"{field_name} values must be non-empty")
             if len(values) != len(set(values)):
                 raise ValueError(f"{field_name} values must be unique")
-        if self.role == "required" and self.minimum_visible_fraction not in (None, 1.0):
-            raise ValueError("required regions must be fully visible")
         if self.atomic and self.minimum_visible_fraction not in (None, 1.0):
             raise ValueError("atomic regions must be fully visible")
         if self.role == "avoid_overlay" and self.minimum_visible_fraction is not None:
@@ -2736,11 +3723,631 @@ class FramingRegionIntent(StrictModel):
 
     @property
     def effective_minimum_visible_fraction(self) -> float:
-        if self.execution_role == "hard_core":
+        if self.atomic:
             return 1.0
         if self.execution_role == "overlay_keepout":
             return 0.0
+        if self.role == "required":
+            return (
+                self.minimum_visible_fraction
+                if self.minimum_visible_fraction is not None
+                else 1.0
+            )
         return self.minimum_visible_fraction if self.minimum_visible_fraction is not None else 0.72
+
+
+VirtualCameraIntent = Literal[
+    "hold",
+    "follow",
+    "punch_in_cut",
+    "push_in",
+    "pull_out",
+    "pan_reveal",
+    "recenter",
+]
+
+
+class AttentionObservation(StrictModel):
+    """Gemini's reviewable editorial-attention vector, never a cut point."""
+
+    semantic_novelty: float = Field(ge=0.0, le=1.0)
+    action_progress: float = Field(ge=0.0, le=1.0)
+    visual_motion: float = Field(ge=0.0, le=1.0)
+    composition_change: float = Field(ge=0.0, le=1.0)
+    reading_load: float = Field(ge=0.0, le=1.0)
+    unresolved_tension: float = Field(ge=0.0, le=1.0)
+    emotional_hold_value: float = Field(ge=0.0, le=1.0)
+    repetition_pressure: float = Field(ge=0.0, le=1.0)
+    music_transition_opportunity: float = Field(ge=0.0, le=1.0)
+    minimum_dwell_seconds: float = Field(ge=0.5, le=15.0)
+    maximum_dwell_seconds: float = Field(ge=0.5, le=15.0)
+    rationale: str = Field(min_length=1, max_length=800)
+    uncertainties: list[str] = Field(default_factory=list, max_length=8)
+    requires_human_review: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_dwell_bounds(self) -> "AttentionObservation":
+        if self.maximum_dwell_seconds < self.minimum_dwell_seconds:
+            raise ValueError("attention dwell bounds must satisfy minimum <= maximum")
+        return self
+
+
+class ShotFlowIntent(StrictModel):
+    """Gemini's semantic sequence intent; never an EDL or timing curve."""
+
+    narrative_role: Literal[
+        "hook",
+        "setup",
+        "development",
+        "contrast",
+        "proof",
+        "payoff",
+        "breath",
+        "resolution",
+    ]
+    energy_role: Literal[
+        "low_hold",
+        "rise",
+        "peak",
+        "release",
+        "reset",
+    ]
+    relation_to_previous: Literal[
+        "start",
+        "new_context",
+        "continue_action",
+        "answer",
+        "reaction",
+        "contrast",
+        "reveal",
+        "reset",
+    ]
+    boundary_alignment: Literal[
+        "content_locked",
+        "phrase_preferred",
+        "accent_preferred",
+        "free",
+    ]
+    visual_sync_event: Literal[
+        "action_apex",
+        "reveal",
+        "result_state",
+        "gesture",
+        "ui_change",
+        "intentional_hold",
+    ] | None = None
+    visual_sync_predicate: str | None = Field(default=None, max_length=300)
+    music_target: Literal[
+        "phrase_start",
+        "phrase_end",
+        "downbeat",
+        "accent",
+        "section_change",
+    ] | None = None
+
+    @model_validator(mode="after")
+    def validate_sync_event(self) -> "ShotFlowIntent":
+        values = (
+            self.visual_sync_event,
+            self.visual_sync_predicate,
+            self.music_target,
+        )
+        if any(value is not None for value in values) and any(
+            value is None for value in values
+        ):
+            raise ValueError(
+                "visual sync event, observable predicate, and music target "
+                "must be supplied together"
+            )
+        if self.visual_sync_predicate is not None and not (
+            self.visual_sync_predicate.strip()
+        ):
+            raise ValueError("visual sync predicate must be observable and non-empty")
+        return self
+
+
+class _SelectedFramingRegionBase(StrictModel):
+    """Response-only region base with role-specific JSON schema branches."""
+
+    region_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    entity_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$",
+    )
+    target_description: str = Field(min_length=1)
+    kind: Literal["subject", "text_region", "ui_region", "graphic", "other"] = (
+        "subject"
+    )
+    evidence_role: Literal[
+        "primary_subject",
+        "relation_participant",
+        "relation_carrier",
+        "state_evidence",
+        "context_reference",
+    ]
+    observable_relations: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_text_lists(self) -> "_SelectedFramingRegionBase":
+        for field_name in ("observable_relations", "exclusions"):
+            values = getattr(self, field_name)
+            if any(not value.strip() for value in values):
+                raise ValueError(f"{field_name} values must be non-empty")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} values must be unique")
+        return self
+
+    def to_framing_region_intent(self) -> "FramingRegionIntent":
+        return FramingRegionIntent.model_validate(self.model_dump(mode="python"))
+
+
+class SelectedHardCoreFramingRegion(_SelectedFramingRegionBase):
+    role: Literal["required"]
+    atomic: bool = False
+    minimum_visible_fraction: Literal[1.0] | None = None
+
+    @property
+    def execution_role(self) -> Literal["hard_core"]:
+        return "hard_core"
+
+
+class SelectedSoftExtentFramingRegion(_SelectedFramingRegionBase):
+    role: Literal["preferred"]
+    atomic: Literal[False] = False
+    minimum_visible_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+
+    @property
+    def execution_role(self) -> Literal["soft_extent"]:
+        return "soft_extent"
+
+
+class SelectedOverlayKeepoutFramingRegion(_SelectedFramingRegionBase):
+    role: Literal["avoid_overlay"]
+    atomic: Literal[False] = False
+    minimum_visible_fraction: Literal[None] = None
+
+    @property
+    def execution_role(self) -> Literal["overlay_keepout"]:
+        return "overlay_keepout"
+
+
+SelectedFramingRegion = Annotated[
+    SelectedHardCoreFramingRegion
+    | SelectedSoftExtentFramingRegion
+    | SelectedOverlayKeepoutFramingRegion,
+    Field(discriminator="role"),
+]
+
+
+class VerticalPresentationOptionAssessment(StrictModel):
+    """One evidence-based alternative considered before portrait fallback."""
+
+    mode: Literal[
+        "single_full_bleed_crop",
+        "sequential_virtual_camera",
+        "controlled_clipping",
+        "fit_or_layout",
+        "try_next_candidate",
+    ]
+    verdict: Literal["feasible", "not_feasible", "uncertain", "not_applicable"]
+    observable_reason: str = Field(min_length=1, max_length=800)
+
+
+class SequentialReconstructionContract(StrictModel):
+    """Evidence needed to preserve meaning across separate portrait phases."""
+
+    linkage_type: Literal[
+        "joint_establishing_phase",
+        "shared_tracked_anchor",
+        "visible_transition",
+        "ordered_state_change",
+        "scale_locked_comparison",
+    ]
+    linkage_region_ids: list[str] = Field(min_length=1, max_length=4)
+    preserve_scale: bool = False
+    observable_reason: str = Field(min_length=1, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_reconstruction(self) -> "SequentialReconstructionContract":
+        if len(self.linkage_region_ids) != len(set(self.linkage_region_ids)):
+            raise ValueError("sequential linkage region IDs must be unique")
+        if (
+            self.linkage_type == "scale_locked_comparison"
+            and not self.preserve_scale
+        ):
+            raise ValueError(
+                "scale-locked comparison reconstruction must preserve scale"
+            )
+        return self
+
+
+class SelectedVerticalFramingProposal(StrictModel):
+    """Full-clip semantic framing decision made after editorial selection.
+
+    The proposal may change how one already-selected candidate is presented,
+    but it cannot change the source asset, event, evidence frame, or candidate
+    identity.  Exact coordinates and motion remain downstream local work.
+    """
+
+    contract_version: Literal["selected-vertical-framing-proposal-v3"] = (
+        "selected-vertical-framing-proposal-v3"
+    )
+    candidate_id: str = Field(
+        pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=64
+    )
+    source_asset_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    event_id: str = Field(min_length=1)
+    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    semantic_requirement: Literal[
+        "single_primary",
+        "group_coverage",
+        "sequential_attention",
+        "simultaneous_relation",
+    ]
+    relation_temporal_mode: Literal[
+        "not_applicable",
+        "simultaneous_required",
+        "sequentially_reconstructable",
+        "phase_mixed",
+        "uncertain",
+    ]
+    recommended_action: Literal[
+        "tracked_crop",
+        "fit_or_layout",
+        "try_next_candidate",
+    ]
+    regions: list[SelectedFramingRegion] = Field(default_factory=list, max_length=8)
+    virtual_camera_proposal: VerticalVirtualCameraProposal | None = None
+    sequential_reconstruction: SequentialReconstructionContract | None = None
+    presentation_options: list[VerticalPresentationOptionAssessment] = Field(
+        min_length=1,
+        max_length=5,
+    )
+    observed_evidence: list[str] = Field(min_length=1, max_length=12)
+    decision_reason: str = Field(min_length=1, max_length=1200)
+    uncertainties: list[str] = Field(default_factory=list, max_length=12)
+    confidence: Confidence
+    model_provenance: ModelProvenance
+
+    def _has_bound_atomic_relation_core(self, required_count: int = 2) -> bool:
+        """Return whether one compound core is backed by bound participants.
+
+        Some observable relations are spatially smaller than either complete
+        participant (for example a contact point, an interface state next to
+        the hand operating it, or two adjacent edges used for comparison).
+        Tracking both complete participants can make a full-bleed portrait
+        crop impossible even though one indivisible relation carrier preserves
+        the evidence.  The carrier is only valid when it names an observable
+        relation and the proposal separately binds enough participant entity
+        IDs; prose alone is never sufficient.
+        """
+
+        carriers = [
+            region
+            for region in self.regions
+            if (
+                region.execution_role == "hard_core"
+                and region.atomic
+                and region.evidence_role == "relation_carrier"
+                and region.observable_relations
+            )
+        ]
+        participant_entity_ids = {
+            region.entity_id
+            for region in self.regions
+            if (
+                region.evidence_role == "relation_participant"
+                and region.entity_id is not None
+            )
+        }
+        return bool(carriers) and len(participant_entity_ids) >= required_count
+
+    @model_validator(mode="after")
+    def validate_selected_framing(self) -> "SelectedVerticalFramingProposal":
+        region_ids = [region.region_id for region in self.regions]
+        if len(region_ids) != len(set(region_ids)):
+            raise ValueError("selected framing region IDs must be unique")
+        entity_ids = [
+            region.entity_id for region in self.regions if region.entity_id is not None
+        ]
+        if len(entity_ids) != len(set(entity_ids)):
+            raise ValueError("selected framing entity IDs must be unique")
+        option_modes = [option.mode for option in self.presentation_options]
+        if len(option_modes) != len(set(option_modes)):
+            raise ValueError("portrait presentation option modes must be unique")
+        option_by_mode = {
+            option.mode: option for option in self.presentation_options
+        }
+        if "single_full_bleed_crop" not in option_by_mode:
+            raise ValueError(
+                "portrait framing must assess a single full-bleed crop"
+            )
+        multi_subject_requirement = self.semantic_requirement in {
+            "group_coverage",
+            "sequential_attention",
+            "simultaneous_relation",
+        }
+        if multi_subject_requirement:
+            missing_modes = sorted(
+                {
+                    "sequential_virtual_camera",
+                    "controlled_clipping",
+                    "fit_or_layout",
+                }
+                - set(option_by_mode)
+            )
+            if missing_modes:
+                raise ValueError(
+                    "multi-subject portrait framing must assess alternatives: "
+                    + ", ".join(missing_modes)
+                )
+        if (
+            self.semantic_requirement == "single_primary"
+            and self.relation_temporal_mode != "not_applicable"
+        ):
+            raise ValueError(
+                "single-primary framing cannot claim a temporal relation"
+            )
+        if (
+            self.semantic_requirement == "sequential_attention"
+            and self.relation_temporal_mode != "sequentially_reconstructable"
+        ):
+            raise ValueError(
+                "sequential attention must be sequentially reconstructable"
+            )
+        if (
+            self.semantic_requirement == "simultaneous_relation"
+            and self.relation_temporal_mode == "not_applicable"
+        ):
+            raise ValueError(
+                "a simultaneous relation must declare a strict, sequential, "
+                "mixed, or uncertain temporal mode"
+            )
+        if (
+            self.relation_temporal_mode == "phase_mixed"
+            and not multi_subject_requirement
+        ):
+            raise ValueError(
+                "phase-mixed temporal relations require a multi-subject framing"
+            )
+        if (
+            self.relation_temporal_mode == "uncertain"
+            and self.recommended_action == "tracked_crop"
+        ):
+            raise ValueError(
+                "an uncertain temporal relation cannot authorize tracked crop"
+            )
+        if self.recommended_action == "fit_or_layout":
+            fit_assessment = option_by_mode.get("fit_or_layout")
+            if fit_assessment is None or fit_assessment.verdict != "feasible":
+                raise ValueError(
+                    "fit-or-layout action requires a feasible fit/layout assessment"
+                )
+            for mode in (
+                "single_full_bleed_crop",
+                "sequential_virtual_camera",
+                "controlled_clipping",
+            ):
+                assessment = option_by_mode.get(mode)
+                if assessment is not None and assessment.verdict == "feasible":
+                    raise ValueError(
+                        "fit-or-layout cannot bypass a feasible full-bleed "
+                        f"presentation option: {mode}"
+                    )
+        if self.recommended_action == "tracked_crop" and not self.regions:
+            raise ValueError("tracked-crop framing requires explicit regions")
+        if self.recommended_action != "tracked_crop":
+            # Some Structured Output responses redundantly include a camera
+            # idea even after choosing fit/layout or another candidate.  The
+            # action is authoritative: consumers preserve that surplus field
+            # as evidence but must never execute it.
+            return self
+        if self.virtual_camera_proposal is None:
+            raise ValueError(
+                "tracked-crop framing requires an explicit hold, follow, or "
+                "multi-phase virtual-camera proposal"
+            )
+        proposal = self.virtual_camera_proposal
+        known_region_ids = set(region_ids)
+        referenced = {
+            region_id
+            for phase in proposal.phases
+            for region_id in phase.anchor_region_ids
+        }
+        unknown = sorted(referenced - known_region_ids)
+        if unknown:
+            raise ValueError(
+                "selected framing proposal references unknown regions: "
+                + ", ".join(unknown)
+            )
+        required = {
+            region.region_id
+            for region in self.regions
+            if region.execution_role == "hard_core"
+        }
+        missing_required = sorted(required - referenced)
+        if missing_required:
+            raise ValueError(
+                "every hard-core selected framing region must be referenced: "
+                + ", ".join(missing_required)
+            )
+        if (
+            self.semantic_requirement == "group_coverage"
+            and len(required) < 2
+            and not any(
+                region.atomic
+                for region in self.regions
+                if region.execution_role == "hard_core"
+            )
+        ):
+            raise ValueError(
+                "group coverage requires at least two hard-core member regions "
+                "or one explicitly atomic compound group region"
+            )
+        if (
+            self.semantic_requirement == "group_coverage"
+            and proposal.composition_mode
+            not in {"sequential_focus", "joint_relation", "mixed_relation"}
+            and not (
+                len(required) == 1
+                and any(
+                    region.atomic
+                    for region in self.regions
+                    if region.execution_role == "hard_core"
+                )
+                and proposal.composition_mode == "single_anchor_hold"
+            )
+        ):
+            raise ValueError(
+                "group coverage requires sequential-focus, joint-relation, or "
+                "mixed-relation phases, or one held atomic compound group"
+            )
+        if (
+            self.semantic_requirement == "simultaneous_relation"
+            and len(required) < 2
+            and not self._has_bound_atomic_relation_core()
+        ):
+            raise ValueError(
+                "a simultaneous relation requires at least two independently "
+                "grounded hard-core participant regions, or one atomic relation "
+                "carrier backed by at least two bound participant entities"
+            )
+        if (
+            self.semantic_requirement == "sequential_attention"
+            and proposal.composition_mode != "sequential_focus"
+        ):
+            raise ValueError(
+                "sequential attention requires sequential-focus camera phases"
+            )
+        if (
+            self.relation_temporal_mode == "sequentially_reconstructable"
+            and multi_subject_requirement
+            and proposal.composition_mode != "sequential_focus"
+        ):
+            raise ValueError(
+                "a sequentially reconstructable multi-subject relation requires "
+                "sequential-focus camera phases"
+            )
+        if (
+            self.relation_temporal_mode == "phase_mixed"
+            and proposal.composition_mode != "mixed_relation"
+        ):
+            raise ValueError(
+                "a phase-mixed temporal relation requires mixed-relation camera "
+                "phases"
+            )
+        if (
+            self.relation_temporal_mode == "simultaneous_required"
+            and proposal.composition_mode == "sequential_focus"
+        ):
+            raise ValueError(
+                "a strictly simultaneous relation cannot use sequential focus"
+            )
+        if self.relation_temporal_mode in {
+            "sequentially_reconstructable",
+            "phase_mixed",
+        }:
+            reconstruction = self.sequential_reconstruction
+            if reconstruction is None:
+                raise ValueError(
+                    "sequential or phase-mixed framing requires an explicit "
+                    "reconstruction contract"
+                )
+            linkage_ids = set(reconstruction.linkage_region_ids)
+            unknown_linkage = sorted(linkage_ids - known_region_ids)
+            if unknown_linkage:
+                raise ValueError(
+                    "sequential reconstruction references unknown regions: "
+                    + ", ".join(unknown_linkage)
+                )
+            unreferenced_linkage = sorted(linkage_ids - referenced)
+            if unreferenced_linkage:
+                raise ValueError(
+                    "sequential reconstruction linkage regions must be used by "
+                    "camera phases: "
+                    + ", ".join(unreferenced_linkage)
+                )
+            if reconstruction.linkage_type == "joint_establishing_phase":
+                if not any(
+                    linkage_ids.issubset(set(phase.anchor_region_ids))
+                    for phase in proposal.phases
+                ):
+                    raise ValueError(
+                        "joint establishing reconstruction requires one phase "
+                        "that contains every linkage region"
+                    )
+            if reconstruction.linkage_type == "shared_tracked_anchor":
+                appearances = {
+                    region_id: sum(
+                        region_id in phase.anchor_region_ids
+                        for phase in proposal.phases
+                    )
+                    for region_id in linkage_ids
+                }
+                if not any(count >= 2 for count in appearances.values()):
+                    raise ValueError(
+                        "shared-anchor reconstruction requires a linkage region "
+                        "in at least two phases"
+                    )
+            if reconstruction.preserve_scale:
+                scale_changing = [
+                    phase.phase_id
+                    for phase in proposal.phases
+                    if phase.camera_behavior
+                    in {"push_in", "pull_out", "punch_in_cut"}
+                ]
+                if scale_changing:
+                    raise ValueError(
+                        "scale-preserving reconstruction cannot use scale-changing "
+                        f"phases: {scale_changing}"
+                    )
+        if (
+            self.semantic_requirement == "simultaneous_relation"
+            and proposal.composition_mode == "sequential_focus"
+        ):
+            scale_changing = [
+                phase.phase_id
+                for phase in proposal.phases
+                if phase.camera_behavior
+                in {"push_in", "pull_out", "punch_in_cut"}
+            ]
+            if scale_changing:
+                raise ValueError(
+                    "a sequential comparison may reconstruct a simultaneous "
+                    "relation only with scale-preserving camera behaviors; "
+                    f"scale-changing phases: {scale_changing}"
+                )
+        return self
+
+
+CandidateVisualEventType = Literal[
+    "camera_gesture_apex",
+    "generation_result_stable_start",
+    "watch_ui_state_change",
+    "underwater_lift_apex",
+    "group_laugh_reaction_peak",
+    "freeze_start",
+    "action_onset",
+    "action_apex",
+    "state_change",
+    "result_stable_start",
+    "reaction_peak",
+    "clean_out",
+]
+
+
+class CandidateVisualEventSupport(StrictModel):
+    """Gemini's coarse, candidate-level event observation.
+
+    This is semantic admission evidence, not an exact frame lock.  The local
+    exact-event resolver still has to bind every observed-present claim to a
+    source frame before rendering.
+    """
+
+    event_type: CandidateVisualEventType
+    status: Literal["observed_present", "observed_absent", "uncertain"]
+    observable_reason: str = Field(min_length=1, max_length=500)
 
 
 class FeatureHorizontalCandidate(StrictModel):
@@ -2750,22 +4357,89 @@ class FeatureHorizontalCandidate(StrictModel):
     rank: int = Field(ge=1, le=4)
     source_asset_id: str = Field(min_length=1)
     event_id: str = Field(min_length=1)
-    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    frame_id: str = Field(
+        pattern=r"^RF[0-9]{6}$",
+        min_length=8,
+        max_length=8,
+    )
     observed_visual_evidence: str = Field(min_length=1)
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     selection_reason: str = Field(min_length=1)
     strategy: Literal["original", "tracked_reframe"]
     zoom_intent: Literal["none", "subtle", "detail"]
+    camera_intent: VirtualCameraIntent = "hold"
     target_description: str | None = None
+    source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = "unknown"
+    source_camera_motion_reason: str | None = Field(
+        default=None,
+        max_length=300,
+        description=(
+            "What was actually seen that supports the motion role. Required "
+            "whenever source_camera_motion_role is anything other than "
+            "'unknown'; a classified role without an observable reason is "
+            "rejected."
+        ),
+    )
+    visual_event_support: list[CandidateVisualEventSupport] | None = Field(
+        default=None,
+        max_length=8,
+        description=(
+            "Coarse support status for every visual event requested by this "
+            "chapter's EditorialBeatContracts. None means legacy/unassessed, "
+            "not implicitly supported."
+        ),
+    )
+    editorial_fulfillment_intent: Literal[
+        "contextual_identity",
+        "visible_state",
+        "visible_result",
+        "direct_demonstration",
+    ] | None = None
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
     quality_risks: list[str] = Field(default_factory=list)
     confidence: Confidence
 
     @model_validator(mode="after")
     def validate_geometry_intent(self) -> "FeatureHorizontalCandidate":
+        if self.visual_event_support is not None:
+            event_types = [row.event_type for row in self.visual_event_support]
+            if len(event_types) != len(set(event_types)):
+                raise ValueError("candidate visual-event support must be unique")
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "candidate reuse justification requires a non-none reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError("candidate reuse requires an observable justification")
+        if (
+            self.source_camera_motion_role != "unknown"
+            and not (self.source_camera_motion_reason or "").strip()
+        ):
+            raise ValueError(
+                "classified source-camera motion requires an observable reason"
+            )
         if self.strategy == "tracked_reframe":
             if self.zoom_intent == "none" or not self.target_description:
                 raise ValueError("tracked_reframe candidate requires zoom intent and target")
         elif self.zoom_intent != "none":
             raise ValueError("original candidate must use zoom intent none")
+        if self.strategy == "original" and self.camera_intent != "hold":
+            raise ValueError("original candidate must use virtual-camera intent hold")
         return self
 
 
@@ -2778,16 +4452,117 @@ class FeatureVerticalCandidate(StrictModel):
     event_id: str = Field(min_length=1)
     frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
     observed_visual_evidence: str = Field(min_length=1)
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     selection_reason: str = Field(min_length=1)
     strategy: Literal["tracked_crop", "fit_with_background"]
     crop_mode: Literal["strict", "primary_center"] = "strict"
+    coverage_mode: Literal[
+        "simultaneous",
+        "sequential",
+        "relation_core",
+        "primary_with_context",
+        "independent_detail",
+    ] = "simultaneous"
+    aspect_suitability: Literal[
+        "natural",
+        "reconstructable",
+        "unsuitable",
+    ] = "reconstructable"
+    suitability_risks: list[str] = Field(default_factory=list, max_length=8)
+    presentation_preference: Literal[
+        "static_full_bleed",
+        "tracked_full_bleed",
+        "phase_virtual_camera",
+        "two_panel_layout",
+        "solid_matte_fit",
+    ] = "tracked_full_bleed"
+    presentation_goal: Literal[
+        "hold",
+        "follow",
+        "reveal",
+        "compare",
+        "context_detail",
+        "emphasize",
+    ] = "hold"
+    source_camera_motion_role: Literal[
+        "static_or_negligible",
+        "editorially_useful",
+        "incidental_or_unwanted",
+        "unknown",
+    ] = Field(
+        default="unknown",
+        description=(
+            "Gemini's evidence-bound semantic judgment about motion already "
+            "present in the source take. This never replaces local motion "
+            "measurement and never authorizes synthetic camera movement."
+        ),
+    )
+    source_camera_motion_reason: str | None = Field(
+        default=None,
+        max_length=300,
+        description=(
+            "What was actually seen that supports the motion role. Required "
+            "whenever source_camera_motion_role is anything other than "
+            "'unknown'; a classified role without an observable reason is "
+            "rejected."
+        ),
+    )
+    visual_event_support: list[CandidateVisualEventSupport] | None = Field(
+        default=None,
+        max_length=8,
+        description=(
+            "Coarse support status for every visual event requested by this "
+            "chapter's EditorialBeatContracts. None means legacy/unassessed, "
+            "not implicitly supported."
+        ),
+    )
+    editorial_fulfillment_intent: Literal[
+        "contextual_identity",
+        "visible_state",
+        "visible_result",
+        "direct_demonstration",
+    ] | None = None
+    physical_scale_comparison: bool = False
+    allow_controlled_clip: bool = False
     target_description: str | None = None
     regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=8)
+    virtual_camera_proposal: VerticalVirtualCameraProposal | None = None
     quality_risks: list[str] = Field(default_factory=list)
+    # Candidate-local reuse authority is intentionally separate from the
+    # chapter's selected-primary audit mirror.  The route optimizer may only
+    # select a repeated source when this exact candidate signed the reason.
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = "none"
+    source_reuse_justification: str | None = None
     confidence: Confidence
 
     @model_validator(mode="after")
     def validate_geometry_intent(self) -> "FeatureVerticalCandidate":
+        if self.visual_event_support is not None:
+            event_types = [row.event_type for row in self.visual_event_support]
+            if len(event_types) != len(set(event_types)):
+                raise ValueError("candidate visual-event support must be unique")
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "candidate reuse justification requires a non-none reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError("candidate reuse requires an observable justification")
+        if (
+            self.source_camera_motion_role != "unknown"
+            and not (self.source_camera_motion_reason or "").strip()
+        ):
+            raise ValueError(
+                "classified source-camera motion requires an observable reason"
+            )
         hard_regions = [
             region for region in self.regions if region.execution_role == "hard_core"
         ]
@@ -2795,14 +4570,79 @@ class FeatureVerticalCandidate(StrictModel):
             self.target_description or hard_regions
         ):
             raise ValueError("tracked_crop candidate requires a target or hard-core region")
-        if self.regions and self.strategy != "tracked_crop":
-            raise ValueError("region constraints require tracked_crop")
+        if self.allow_controlled_clip and self.crop_mode != "primary_center":
+            raise ValueError(
+                "controlled clipping requires primary_center crop mode"
+            )
+        if self.strategy == "fit_with_background" and self.allow_controlled_clip:
+            raise ValueError(
+                "fit-with-background cannot request controlled clipping"
+            )
+        if (
+            self.strategy == "tracked_crop"
+            and self.crop_mode == "strict"
+            and any(
+                region.execution_role == "hard_core"
+                and region.effective_minimum_visible_fraction < 1.0
+                for region in self.regions
+            )
+        ):
+            raise ValueError(
+                "strict tracked crops require full visibility for every hard-core region"
+            )
         ids = [region.region_id for region in self.regions]
         if len(ids) != len(set(ids)):
             raise ValueError("candidate region IDs must be unique")
         entity_ids = [region.entity_id for region in self.regions if region.entity_id]
         if len(entity_ids) != len(set(entity_ids)):
             raise ValueError("candidate entity references must be unique")
+        if self.virtual_camera_proposal is not None:
+            if self.strategy != "tracked_crop":
+                raise ValueError(
+                    "vertical camera proposal requires tracked_crop geometry"
+                )
+            if not self.regions:
+                raise ValueError(
+                    "vertical camera proposal requires explicit framing regions"
+                )
+            known_region_ids = set(ids)
+            referenced_region_ids = {
+                region_id
+                for phase in self.virtual_camera_proposal.phases
+                for region_id in phase.anchor_region_ids
+            }
+            unknown = sorted(referenced_region_ids - known_region_ids)
+            if unknown:
+                raise ValueError(
+                    "vertical camera proposal references unknown regions: "
+                    + ", ".join(unknown)
+                )
+            keepout_ids = {
+                region.region_id
+                for region in self.regions
+                if region.execution_role == "overlay_keepout"
+            }
+            invalid_keepouts = sorted(referenced_region_ids & keepout_ids)
+            if invalid_keepouts:
+                raise ValueError(
+                    "overlay keepout regions cannot be virtual-camera anchors: "
+                    + ", ".join(invalid_keepouts)
+                )
+            # ``hard_core`` expresses what must remain visible; an anchor
+            # expresses what the camera attends to.  They intentionally need
+            # not be identical: a phone may be the anchored subject while the
+            # person holding it remains required context.  Geometry/QA checks
+            # containment for every hard-core region downstream.
+        if (
+            self.aspect_suitability != "unsuitable"
+            and self.presentation_preference == "phase_virtual_camera"
+        ):
+            proposal = self.virtual_camera_proposal
+            if proposal is None or len(proposal.phases) < 2:
+                raise ValueError(
+                    "phase virtual-camera preference requires at least two "
+                    "Gemini-described phases"
+                )
         return self
 
 
@@ -2839,6 +4679,10 @@ class FeatureChapterBrief(StrictModel):
     vertical_primary_target_description: str | None = None
     vertical_crop_mode: Literal["strict", "primary_center"] = "strict"
     vertical_regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=4)
+    vertical_camera_phases: list[VerticalVirtualCameraPhase] = Field(
+        default_factory=list,
+        max_length=8,
+    )
     vertical_overflow_policy: Literal["preserve_all", "controlled_clip"] = (
         "preserve_all"
     )
@@ -2862,16 +4706,97 @@ class FeatureChapterBrief(StrictModel):
             raise ValueError(
                 "edge priority only applies when vertical_overflow_policy is controlled_clip"
             )
+        if self.vertical_camera_phases:
+            if not self.vertical_regions:
+                raise ValueError(
+                    "vertical camera phases require explicit framing regions"
+                )
+            phase_ids = [
+                phase.phase_id for phase in self.vertical_camera_phases
+            ]
+            if len(phase_ids) != len(set(phase_ids)):
+                raise ValueError("vertical camera phase IDs must be unique")
+            if abs(self.vertical_camera_phases[0].start_progress) > 1e-6:
+                raise ValueError("vertical camera phases must start at progress zero")
+            if abs(self.vertical_camera_phases[-1].end_progress - 1.0) > 1e-6:
+                raise ValueError("vertical camera phases must end at progress one")
+            for prior, current in zip(
+                self.vertical_camera_phases[:-1],
+                self.vertical_camera_phases[1:],
+                strict=True,
+            ):
+                if abs(prior.end_progress - current.start_progress) > 1e-6:
+                    raise ValueError(
+                        "vertical camera phases must be contiguous and non-overlapping"
+                    )
+            if self.vertical_camera_phases[0].transition_in != "cut":
+                raise ValueError(
+                    "the first vertical camera phase cannot transition from an "
+                    "unknown prior anchor"
+                )
+            known_region_ids = set(ids)
+            referenced_region_ids = {
+                region_id
+                for phase in self.vertical_camera_phases
+                for region_id in phase.anchor_region_ids
+            }
+            unknown = sorted(referenced_region_ids - known_region_ids)
+            if unknown:
+                raise ValueError(
+                    "vertical camera phases reference unknown regions: "
+                    + ", ".join(unknown)
+                )
+            keepout_ids = {
+                region.region_id
+                for region in self.vertical_regions
+                if region.execution_role == "overlay_keepout"
+            }
+            invalid_keepouts = sorted(referenced_region_ids & keepout_ids)
+            if invalid_keepouts:
+                raise ValueError(
+                    "overlay keepout regions cannot be camera anchors: "
+                    + ", ".join(invalid_keepouts)
+                )
+            atomic_ids = {
+                region.region_id
+                for region in self.vertical_regions
+                if region.atomic
+            }
+            for phase in self.vertical_camera_phases:
+                if (
+                    phase.minimum_anchor_visible_fraction < 1.0
+                    and atomic_ids.intersection(phase.anchor_region_ids)
+                ):
+                    raise ValueError(
+                        "camera phases cannot relax visibility for atomic "
+                        "text or UI regions"
+                    )
+            required_ids = {
+                region.region_id
+                for region in self.vertical_regions
+                if region.execution_role == "hard_core"
+            }
+            missing_required = sorted(required_ids - referenced_region_ids)
+            if missing_required:
+                raise ValueError(
+                    "every hard-core region must be active in at least one camera "
+                    "phase: "
+                    + ", ".join(missing_required)
+                )
         return self
 
 
 class FeatureEditBrief(StrictModel):
     project_id: str
     title: str
-    target_duration_seconds: float = Field(ge=60.0, le=90.0)
+    target_duration_seconds: float = Field(ge=30.0, le=120.0)
     render_title_overlays: bool = True
     vertical_fallback_strategy: Literal["fit_with_background", "center_crop"] = (
-        "fit_with_background"
+        "center_crop"
+    )
+    illustrative_coverage_policy: IllustrativeCoveragePolicy | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
     )
     reframe_policy_binding: ReframePolicyBinding | None = None
     chapters: list[FeatureChapterBrief] = Field(min_length=1, max_length=16)
@@ -2881,32 +4806,186 @@ class FeatureEditBrief(StrictModel):
         ids = [chapter.feature_id for chapter in self.chapters]
         if len(ids) != len(set(ids)):
             raise ValueError("feature brief chapter IDs must be unique")
+        if any(chapter.vertical_camera_phases for chapter in self.chapters) and (
+            self.reframe_policy_binding is None
+        ):
+            raise ValueError(
+                "vertical camera phases require an immutable human reframe "
+                "policy binding"
+            )
         return self
 
 
 class FeatureChapterSelect(StrictModel):
     feature_id: str
     evidence_status: Literal["supported", "partial", "not_found"]
-    horizontal_frame_id: str | None = Field(default=None, pattern=r"^RF[0-9]{6}$")
-    vertical_frame_id: str | None = Field(default=None, pattern=r"^RF[0-9]{6}$")
+    horizontal_frame_id: str | None = Field(
+        default=None,
+        pattern=r"^RF[0-9]{6}$",
+        min_length=8,
+        max_length=8,
+    )
+    vertical_frame_id: str | None = Field(
+        default=None,
+        pattern=r"^RF[0-9]{6}$",
+        min_length=8,
+        max_length=8,
+    )
     observed_visual_evidence: str
+    evidence_provenance: FeatureEvidenceProvenance = "unknown"
     selection_reason: str
     horizontal_strategy: Literal["original", "tracked_reframe"]
     horizontal_zoom_intent: Literal["none", "subtle", "detail"]
+    horizontal_camera_intent: VirtualCameraIntent = "hold"
     horizontal_target_description: str | None
     vertical_strategy: Literal["tracked_crop", "fit_with_background"]
     vertical_target_description: str | None
+    vertical_coverage_intent: Literal[
+        "single_primary",
+        "group_coverage",
+        "sequential_attention",
+        "simultaneous_relation",
+    ] = "single_primary"
+    vertical_coverage_target_descriptions: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description=(
+            "Distinct visible subjects or regions whose coverage carries the "
+            "chapter meaning. This is editorial identity, not geometry. Any "
+            "vertical_coverage_intent other than single_primary needs at "
+            "least two entries here, named one subject per entry: a brief "
+            "line like 'the two handsets side by side' describes a group in "
+            "one phrase, and re-using it whole leaves the coverage claim "
+            "unsupported. Name each subject separately, or say "
+            "single_primary."
+        ),
+    )
     quality_risks: list[str]
     confidence: Confidence
+    recommended_duration_seconds: float | None = Field(
+        default=None,
+        ge=1.0,
+        le=15.0,
+        description=(
+            "Gemini's editorial dwell recommendation based on the observable "
+            "action/information, the brief, and (when supplied) the audible music. "
+            "It is a relative planning recommendation, not a source cut point."
+        ),
+    )
+    duration_rationale: str | None = Field(
+        default=None,
+        description=(
+            "Observable editorial reason for the recommended dwell. It must not "
+            "claim fixed pacing rules or invent unsupported content."
+        ),
+    )
+    attention_observation: AttentionObservation | None = None
+    flow_intent: ShotFlowIntent | None = None
+    source_reuse_mode: Literal[
+        "none",
+        "distinct_interval",
+        "alternate_presentation",
+        "editorial_reprise",
+    ] = Field(
+        default="none",
+        description=(
+            "Typed editorial authority for intentionally selecting a source clip "
+            "already used by another chapter. It does not create additional "
+            "unique source capacity."
+        ),
+    )
+    source_reuse_justification: str | None = Field(
+        default=None,
+        description=(
+            "Observable editorial reason required when source_reuse_mode is not "
+            "none. Reuse solely to fill project duration is forbidden."
+        ),
+    )
     horizontal_candidates: list[FeatureHorizontalCandidate] = Field(
         default_factory=list, max_length=4
     )
     vertical_candidates: list[FeatureVerticalCandidate] = Field(
         default_factory=list, max_length=4
     )
+    inactive_aspects: list[Literal["16:9", "9:16"]] = Field(
+        default_factory=list,
+        max_length=1,
+        description=(
+            "Legacy frame mirrors may remain populated for an unrequested "
+            "aspect, but that aspect has no executable candidate frontier."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_evidence(self) -> "FeatureChapterSelect":
+        if len(self.inactive_aspects) != len(set(self.inactive_aspects)):
+            raise ValueError("inactive aspects must be unique")
+        if "16:9" in self.inactive_aspects and self.horizontal_candidates:
+            raise ValueError(
+                "inactive 16:9 aspect cannot retain executable horizontal candidates"
+            )
+        if "9:16" in self.inactive_aspects and self.vertical_candidates:
+            raise ValueError(
+                "inactive 9:16 aspect cannot retain executable vertical candidates"
+            )
+        if self.source_reuse_mode == "none":
+            if self.source_reuse_justification is not None:
+                raise ValueError(
+                    "source reuse justification requires a non-none reuse mode"
+                )
+        elif not (
+            self.source_reuse_justification
+            and self.source_reuse_justification.strip()
+        ):
+            raise ValueError("intentional source reuse requires a justification")
+        atomic_compound_group = (
+            self.vertical_coverage_intent == "group_coverage"
+            and bool(self.vertical_candidates)
+            and all(
+                len(candidate.regions) == 1
+                and candidate.regions[0].atomic
+                and candidate.regions[0].execution_role == "hard_core"
+                for candidate in self.vertical_candidates
+            )
+        )
+        if self.vertical_coverage_intent in {
+            "group_coverage",
+            "sequential_attention",
+            "simultaneous_relation",
+        } and len(self.vertical_coverage_target_descriptions) < 2 and not (
+            atomic_compound_group
+        ):
+            raise ValueError(
+                "multi-subject vertical coverage intent requires at least two "
+                "distinct target descriptions unless group coverage is bound "
+                "to one explicitly atomic compound group region"
+            )
+        if (
+            self.vertical_coverage_intent == "single_primary"
+            and len(self.vertical_coverage_target_descriptions) > 1
+        ):
+            raise ValueError(
+                "single-primary vertical coverage cannot require multiple targets"
+            )
+        if self.recommended_duration_seconds is not None and not (
+            self.duration_rationale and self.duration_rationale.strip()
+        ):
+            raise ValueError(
+                "recommended_duration_seconds requires duration_rationale"
+            )
+        if self.attention_observation is not None:
+            if self.recommended_duration_seconds is None:
+                raise ValueError(
+                    "attention observation requires a preferred dwell recommendation"
+                )
+            if not (
+                self.attention_observation.minimum_dwell_seconds
+                <= self.recommended_duration_seconds
+                <= self.attention_observation.maximum_dwell_seconds
+            ):
+                raise ValueError(
+                    "recommended dwell must lie inside the attention observation bounds"
+                )
         if self.evidence_status == "not_found":
             if self.horizontal_frame_id is not None or self.vertical_frame_id is not None:
                 raise ValueError("not_found feature chapters cannot reference catalog frames")
@@ -2919,6 +4998,11 @@ class FeatureChapterSelect(StrictModel):
                 )
         elif self.horizontal_zoom_intent != "none":
             raise ValueError("original horizontal strategy must use zoom intent none")
+        if (
+            self.horizontal_strategy == "original"
+            and self.horizontal_camera_intent != "hold"
+        ):
+            raise ValueError("original horizontal strategy must hold the virtual camera")
         if self.vertical_strategy == "tracked_crop" and not self.vertical_target_description:
             primary_candidate = next(
                 (candidate for candidate in self.vertical_candidates if candidate.rank == 1),
@@ -2930,8 +5014,16 @@ class FeatureChapterSelect(StrictModel):
                 )
         for field_name in ("horizontal_candidates", "vertical_candidates"):
             candidates = getattr(self, field_name)
-            if candidates and not 2 <= len(candidates) <= 4:
-                raise ValueError(f"{field_name} must preserve 2-4 options when present")
+            # A unique verified event remains usable, but downstream route
+            # recovery must fail closed if that sole candidate proves
+            # non-executable.  Do not invent a second option merely to satisfy
+            # a representation-level Top-K preference.
+            minimum_candidates = 1
+            if candidates and not minimum_candidates <= len(candidates) <= 4:
+                raise ValueError(
+                    f"{field_name} must preserve {minimum_candidates}-4 options "
+                    "when present"
+                )
             ids = [candidate.candidate_id for candidate in candidates]
             ranks = [candidate.rank for candidate in candidates]
             if len(ids) != len(set(ids)) or len(ranks) != len(set(ranks)):
@@ -2956,6 +5048,7 @@ class FeatureChapterSelect(StrictModel):
                 self.horizontal_frame_id != primary.frame_id
                 or self.horizontal_strategy != primary.strategy
                 or self.horizontal_zoom_intent != primary.zoom_intent
+                or self.horizontal_camera_intent != primary.camera_intent
                 or self.horizontal_target_description != primary.target_description
             ):
                 raise ValueError("rank-1 horizontal candidate must match legacy projection")
@@ -2963,6 +5056,7 @@ class FeatureChapterSelect(StrictModel):
             primary = min(self.vertical_candidates, key=lambda item: item.rank)
             if (
                 self.vertical_frame_id != primary.frame_id
+                or self.evidence_provenance != primary.evidence_provenance
                 or self.vertical_strategy != primary.strategy
                 or self.vertical_target_description != primary.target_description
             ):
@@ -2983,4 +5077,622 @@ class FeatureEditPlan(StrictModel):
         ids = [chapter.feature_id for chapter in self.chapters]
         if len(ids) != len(set(ids)):
             raise ValueError("feature plan chapter IDs must be unique")
+        return self
+
+
+class MusicAssemblySpan(FrozenStrictModel):
+    """One half-open source interval mapped onto the output music timeline."""
+
+    span_id: str = Field(pattern=r"^music-span-[0-9]{3}$")
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    output_start_sample: int = Field(ge=0)
+    output_end_sample: int = Field(gt=0)
+    start_boundary_kind: Literal[
+        "track_start",
+        "section_boundary",
+        "phrase_grid",
+    ]
+    end_boundary_kind: Literal["phrase_grid", "natural_track_end"]
+    start_bar_index: int | None = Field(default=None, ge=0)
+    end_bar_index: int | None = Field(default=None, gt=0)
+    bar_count: int | None = Field(default=None, gt=0)
+    phrase_bar_multiple: int | None = Field(default=None, gt=0)
+    start_boundary_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+    end_boundary_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_mapping(self) -> "MusicAssemblySpan":
+        source_duration = self.source_end_sample - self.source_start_sample
+        output_duration = self.output_end_sample - self.output_start_sample
+        if source_duration <= 0:
+            raise ValueError("music assembly source span must be non-empty")
+        if output_duration != source_duration:
+            raise ValueError(
+                "music assembly v1 must preserve sample duration without time-stretching"
+            )
+        if self.start_boundary_kind == "track_start" and self.source_start_sample != 0:
+            raise ValueError("track_start boundary must begin at source sample zero")
+        if (
+            self.start_boundary_kind == "section_boundary"
+            and self.source_start_sample == 0
+        ):
+            raise ValueError("source sample zero must use track_start boundary kind")
+        if self.start_boundary_kind == "phrase_grid":
+            if self.start_bar_index is None or self.phrase_bar_multiple is None:
+                raise ValueError(
+                    "phrase-grid start requires bar index and alignment multiple"
+                )
+            if self.start_bar_index % self.phrase_bar_multiple != 0:
+                raise ValueError("music assembly start is not phrase-grid aligned")
+        elif self.start_bar_index is not None or self.phrase_bar_multiple is not None:
+            raise ValueError(
+                "non-grid start cannot claim phrase-grid alignment metadata"
+            )
+
+        if self.end_boundary_kind == "phrase_grid":
+            if self.start_boundary_kind != "phrase_grid":
+                raise ValueError(
+                    "phrase-grid end requires a phrase-grid start in assembly v1"
+                )
+            if (
+                self.start_bar_index is None
+                or self.end_bar_index is None
+                or self.bar_count is None
+                or self.phrase_bar_multiple is None
+            ):
+                raise ValueError("phrase-grid interval requires complete bar metadata")
+            if self.end_bar_index <= self.start_bar_index:
+                raise ValueError("music assembly bar interval must be non-empty")
+            if self.bar_count != self.end_bar_index - self.start_bar_index:
+                raise ValueError(
+                    "music assembly bar_count does not match its bar interval"
+                )
+            if self.bar_count % self.phrase_bar_multiple != 0:
+                raise ValueError("music assembly duration is not phrase-grid aligned")
+        elif self.end_bar_index is not None or self.bar_count is not None:
+            raise ValueError(
+                "natural track end cannot claim a complete phrase-grid ending"
+            )
+        return self
+
+
+class MusicAssemblyCueInstance(FrozenStrictModel):
+    """A locked source cue projected onto the assembled output timeline."""
+
+    cue_instance_id: str = Field(pattern=r"^music-cue-instance-[0-9]{5}$")
+    source_cue_id: str = Field(pattern=r"^locked-cue-[0-9]{5}$")
+    span_id: str = Field(pattern=r"^music-span-[0-9]{3}$")
+    kind: Literal[
+        "section_boundary",
+        "downbeat",
+        "beat",
+        "accent",
+        "ending_hit",
+    ]
+    priority: Literal["hard", "preferred", "optional"]
+    source_sample_index: int = Field(ge=0)
+    output_sample_index: int = Field(ge=0)
+    strength: float = Field(ge=0.0, le=1.0)
+
+
+class MusicAssemblyPlan(StrictModel):
+    """Immutable v1 plan for one continuous, non-spliced music interval."""
+
+    contract_version: Literal["music-assembly-plan-v1"] = "music-assembly-plan-v1"
+    assembly_id: str = Field(pattern=r"^music-assembly:[0-9a-f]{64}$")
+    assembly_mode: Literal["single_continuous_interval"] = (
+        "single_continuous_interval"
+    )
+    join_count: Literal[0] = 0
+    music_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    music_lock_path: str = Field(min_length=1)
+    music_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    master_sample_rate: int = Field(ge=8_000, le=192_000)
+    source_duration_samples: int = Field(gt=0)
+    target_duration_samples: int = Field(gt=0)
+    minimum_duration_samples: int = Field(gt=0)
+    maximum_duration_samples: int = Field(gt=0)
+    output_duration_samples: int = Field(gt=0)
+    target_duration_error_samples: int = Field(ge=0)
+    ending_policy: Literal[
+        "short_fade_at_phrase_grid_boundary",
+        "preserve_natural_track_end_no_fade_out",
+    ]
+    preferred_phrase_bars: tuple[int, ...] = Field(min_length=1, max_length=16)
+    spans: list[MusicAssemblySpan] = Field(min_length=1, max_length=1)
+    cue_instances: list[MusicAssemblyCueInstance]
+    uncertainties: list[str]
+    requires_human_review: Literal[True] = True
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_single_continuous_interval(self) -> "MusicAssemblyPlan":
+        if not (
+            self.minimum_duration_samples
+            <= self.target_duration_samples
+            <= self.maximum_duration_samples
+        ):
+            raise ValueError("target music duration must lie inside the requested range")
+        if len(set(self.preferred_phrase_bars)) != len(self.preferred_phrase_bars):
+            raise ValueError("preferred phrase-bar values must be unique")
+        if any(value <= 0 for value in self.preferred_phrase_bars):
+            raise ValueError("preferred phrase-bar values must be positive")
+        if len(self.spans) != 1:
+            raise ValueError(
+                "music assembly v1 permits exactly one continuous source interval"
+            )
+        span = self.spans[0]
+        if span.output_start_sample != 0:
+            raise ValueError("music assembly v1 output must begin at sample zero")
+        if span.source_end_sample > self.source_duration_samples:
+            raise ValueError("music assembly source span exceeds the locked source")
+        if span.output_end_sample != self.output_duration_samples:
+            raise ValueError("music assembly span does not cover the output timeline")
+        if not (
+            self.minimum_duration_samples
+            <= self.output_duration_samples
+            <= self.maximum_duration_samples
+        ):
+            raise ValueError("assembled music duration lies outside the requested range")
+        if self.target_duration_error_samples != abs(
+            self.output_duration_samples - self.target_duration_samples
+        ):
+            raise ValueError("target music duration error is inconsistent")
+        if (
+            span.phrase_bar_multiple is not None
+            and span.phrase_bar_multiple not in self.preferred_phrase_bars
+        ):
+            raise ValueError("selected phrase grid was not one of the requested grids")
+        if span.end_boundary_kind == "natural_track_end":
+            if self.ending_policy != "preserve_natural_track_end_no_fade_out":
+                raise ValueError(
+                    "natural track end requires the no-fade preservation policy"
+                )
+            if span.source_end_sample != self.source_duration_samples:
+                raise ValueError(
+                    "natural_track_end must preserve the locked source endpoint"
+                )
+            if span.end_boundary_cue_id is not None:
+                raise ValueError(
+                    "natural_track_end is an exclusive endpoint, not a source cue"
+                )
+        elif self.ending_policy != "short_fade_at_phrase_grid_boundary":
+            raise ValueError(
+                "phrase-grid ending requires the explicit short-fade policy"
+            )
+
+        instance_ids = [item.cue_instance_id for item in self.cue_instances]
+        source_ids = [item.source_cue_id for item in self.cue_instances]
+        if len(instance_ids) != len(set(instance_ids)):
+            raise ValueError("music cue instance IDs must be unique")
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("a locked source cue may only be mapped once in v1")
+        ordering = [
+            (item.output_sample_index, item.cue_instance_id)
+            for item in self.cue_instances
+        ]
+        if ordering != sorted(ordering):
+            raise ValueError("music cue instances must be chronological")
+        for item in self.cue_instances:
+            if item.span_id != span.span_id:
+                raise ValueError("music cue instance references an unknown span")
+            if not (
+                span.source_start_sample
+                <= item.source_sample_index
+                < span.source_end_sample
+            ):
+                raise ValueError("music cue instance lies outside its source span")
+            expected_output = (
+                span.output_start_sample
+                + item.source_sample_index
+                - span.source_start_sample
+            )
+            if item.output_sample_index != expected_output:
+                raise ValueError("music cue source/output sample mapping is inconsistent")
+        return self
+
+
+class MusicAssemblyArtifactBinding(StrictModel):
+    """Hashes that bind a saved assembly plan to its reviewed music lock."""
+
+    contract_version: Literal["music-assembly-artifact-binding-v1"] = (
+        "music-assembly-artifact-binding-v1"
+    )
+    assembly_id: str = Field(pattern=r"^music-assembly:[0-9a-f]{64}$")
+    assembly_plan_path: str = Field(min_length=1)
+    assembly_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_lock_path: str = Field(min_length=1)
+    music_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    generated_at: str
+
+
+class MusicAssemblyRenderManifest(StrictModel):
+    """Auditable QC record for one FFmpeg-rendered music interval."""
+
+    contract_version: Literal["music-assembly-render-v1"] = (
+        "music-assembly-render-v1"
+    )
+    render_id: str = Field(pattern=r"^music-render:[0-9a-f]{64}$")
+    assembly_id: str = Field(pattern=r"^music-assembly:[0-9a-f]{64}$")
+    assembly_plan_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_audio_path: str = Field(min_length=1)
+    source_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_audio_path: str = Field(min_length=1)
+    output_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_codec: Literal["pcm_s16le"] = "pcm_s16le"
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    source_master_sample_rate: int = Field(ge=8_000, le=192_000)
+    end_boundary_kind: Literal["phrase_grid", "natural_track_end"]
+    output_sample_rate: Literal[48_000] = 48_000
+    output_channels: Literal[2] = 2
+    expected_output_samples: int = Field(gt=0)
+    probed_output_samples: int = Field(gt=0)
+    duration_delta_samples: int
+    duration_tolerance_samples: int = Field(ge=0, le=16)
+    fade_in_samples: int = Field(gt=0)
+    fade_out_samples: int = Field(ge=0)
+    internal_join_count: Literal[0] = 0
+    ending_policy: Literal[
+        "short_fade_at_phrase_grid_boundary",
+        "preserve_natural_track_end_no_fade_out",
+    ]
+    natural_track_end_preserved: bool
+    ffmpeg_filter_graph: str = Field(min_length=1)
+    ffmpeg_command: list[str] = Field(min_length=1)
+    ffprobe_audio_stream: dict[str, Any]
+    qc_passed: bool
+    qc_errors: list[str]
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_render_qc(self) -> "MusicAssemblyRenderManifest":
+        if self.source_end_sample <= self.source_start_sample:
+            raise ValueError("render source interval must be non-empty")
+        if self.duration_delta_samples != (
+            self.probed_output_samples - self.expected_output_samples
+        ):
+            raise ValueError("render duration delta is inconsistent")
+        duration_passed = (
+            abs(self.duration_delta_samples) <= self.duration_tolerance_samples
+        )
+        if self.qc_passed != (duration_passed and not self.qc_errors):
+            raise ValueError("render QC status does not match its measurements")
+        if self.qc_passed and self.qc_errors:
+            raise ValueError("passing render QC cannot retain errors")
+        if not self.qc_passed and not self.qc_errors:
+            raise ValueError("failed render QC must preserve at least one error")
+        expected_natural_end = self.end_boundary_kind == "natural_track_end"
+        if self.natural_track_end_preserved != expected_natural_end:
+            raise ValueError("natural-ending flag is inconsistent with the plan")
+        if expected_natural_end:
+            if self.ending_policy != "preserve_natural_track_end_no_fade_out":
+                raise ValueError(
+                    "natural track end requires the no-fade preservation policy"
+                )
+            if self.fade_out_samples != 0:
+                raise ValueError("natural track end cannot apply a fade-out")
+        else:
+            if self.ending_policy != "short_fade_at_phrase_grid_boundary":
+                raise ValueError(
+                    "phrase-grid ending requires the explicit short-fade policy"
+                )
+            if self.fade_out_samples <= 0:
+                raise ValueError("phrase-grid ending requires a non-zero fade-out")
+        if "concat" in self.ffmpeg_filter_graph.lower():
+            raise ValueError("music assembly v1 render graph cannot contain concat")
+        return self
+
+
+class MusicEditSpanV2(FrozenStrictModel):
+    """One reviewed source passage mapped without time-stretching."""
+
+    span_id: str = Field(pattern=r"^music-edit-span-[0-9]{3}$")
+    section_id: str = Field(pattern=r"^section-[0-9]{3}$")
+    semantic_role: Literal[
+        "intro",
+        "establish",
+        "build",
+        "climax",
+        "release",
+        "outro",
+        "neutral",
+    ]
+    energy_band: Literal["low", "medium", "high", "unknown"]
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    output_start_sample: int = Field(ge=0)
+    output_end_sample: int = Field(gt=0)
+    start_boundary_kind: Literal[
+        "track_start",
+        "section_boundary",
+        "locked_cue",
+    ]
+    end_boundary_kind: Literal[
+        "section_boundary",
+        "locked_cue",
+        "natural_track_end",
+    ]
+    start_boundary_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+    end_boundary_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_music_edit_span(self) -> "MusicEditSpanV2":
+        source_duration = self.source_end_sample - self.source_start_sample
+        output_duration = self.output_end_sample - self.output_start_sample
+        if source_duration != output_duration:
+            raise ValueError("music edit spans cannot time-stretch source audio")
+        if self.start_boundary_kind == "locked_cue":
+            if self.start_boundary_cue_id is None:
+                raise ValueError("locked-cue start requires its cue ID")
+        elif self.start_boundary_cue_id is not None:
+            raise ValueError("non-cue start cannot claim a locked cue ID")
+        if self.end_boundary_kind == "locked_cue":
+            if self.end_boundary_cue_id is None:
+                raise ValueError("locked-cue end requires its cue ID")
+        elif self.end_boundary_cue_id is not None:
+            raise ValueError("non-cue end cannot claim a locked cue ID")
+        if (
+            self.start_boundary_kind == "track_start"
+            and self.source_start_sample != 0
+        ):
+            raise ValueError("track-start music span must begin at sample zero")
+        return self
+
+
+class MusicEditJoinV2(FrozenStrictModel):
+    """An explicit, reviewable transition between two music passages."""
+
+    join_id: str = Field(pattern=r"^music-edit-join-[0-9]{3}$")
+    left_span_id: str = Field(pattern=r"^music-edit-span-[0-9]{3}$")
+    right_span_id: str = Field(pattern=r"^music-edit-span-[0-9]{3}$")
+    join_type: Literal["cut", "micro_crossfade"]
+    duration_samples: int = Field(ge=0)
+    alignment: Literal[
+        "section_boundary",
+        "phrase_grid",
+        "downbeat",
+        "accent",
+        "transient",
+    ]
+    energy_transition: Literal[
+        "matched",
+        "rising",
+        "falling",
+        "intentional_contrast",
+        "unknown",
+    ]
+    editorial_reason: str = Field(min_length=1, max_length=500)
+    requires_human_review: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_join(self) -> "MusicEditJoinV2":
+        if self.left_span_id == self.right_span_id:
+            raise ValueError("music join must connect two different spans")
+        if self.join_type == "cut" and self.duration_samples != 0:
+            raise ValueError("hard music cut must have zero overlap")
+        if self.join_type == "micro_crossfade" and self.duration_samples <= 0:
+            raise ValueError("micro crossfade requires a positive overlap")
+        return self
+
+
+class MusicDuckingRegionV2(FrozenStrictModel):
+    """An output-timeline gain reduction with a typed editorial purpose."""
+
+    region_id: str = Field(pattern=r"^music-duck-[0-9]{3}$")
+    output_start_sample: int = Field(ge=0)
+    output_end_sample: int = Field(gt=0)
+    gain_db: float = Field(ge=-30.0, le=0.0)
+    reason: Literal[
+        "dialogue",
+        "narration",
+        "ui_focus",
+        "editorial_emphasis",
+    ]
+
+    @model_validator(mode="after")
+    def validate_ducking_region(self) -> "MusicDuckingRegionV2":
+        if self.output_end_sample <= self.output_start_sample:
+            raise ValueError("music ducking region must be non-empty")
+        return self
+
+
+class MusicEditEndingV2(FrozenStrictModel):
+    """The reviewed way a shortened soundtrack resolves."""
+
+    mode: Literal[
+        "natural_track_end",
+        "phrase_fade_out",
+        "reviewed_ending_hit",
+    ]
+    fade_out_samples: int = Field(ge=0)
+    ending_cue_id: str | None = Field(
+        default=None,
+        pattern=r"^locked-cue-[0-9]{5}$",
+    )
+    editorial_reason: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_ending(self) -> "MusicEditEndingV2":
+        if self.mode == "natural_track_end":
+            if self.fade_out_samples != 0 or self.ending_cue_id is not None:
+                raise ValueError("natural music ending cannot add a fade or cue")
+        elif self.mode == "phrase_fade_out":
+            if self.fade_out_samples <= 0 or self.ending_cue_id is not None:
+                raise ValueError("phrase fade requires a fade and no ending cue")
+        elif self.ending_cue_id is None:
+            raise ValueError("reviewed ending hit requires its locked cue ID")
+        return self
+
+
+class MusicEditPlanV2(StrictModel):
+    """Reviewed multi-passage soundtrack edit; exact samples remain local."""
+
+    contract_version: Literal["music-edit-plan-v2"] = "music-edit-plan-v2"
+    edit_id: str = Field(pattern=r"^music-edit:[0-9a-f]{64}$")
+    music_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    music_lock_path: str = Field(min_length=1)
+    music_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    music_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    master_sample_rate: int = Field(ge=8_000, le=192_000)
+    source_duration_samples: int = Field(gt=0)
+    target_duration_samples: int = Field(gt=0)
+    minimum_duration_samples: int = Field(gt=0)
+    maximum_duration_samples: int = Field(gt=0)
+    output_duration_samples: int = Field(gt=0)
+    target_duration_error_samples: int = Field(ge=0)
+    spans: list[MusicEditSpanV2] = Field(min_length=1, max_length=4)
+    joins: list[MusicEditJoinV2] = Field(max_length=3)
+    ending: MusicEditEndingV2
+    ducking_regions: list[MusicDuckingRegionV2] = Field(max_length=32)
+    uncertainties: list[str]
+    requires_human_review: Literal[True] = True
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_music_edit_plan(self) -> "MusicEditPlanV2":
+        if not (
+            self.minimum_duration_samples
+            <= self.target_duration_samples
+            <= self.maximum_duration_samples
+        ):
+            raise ValueError("target music duration must lie inside its range")
+        if not (
+            self.minimum_duration_samples
+            <= self.output_duration_samples
+            <= self.maximum_duration_samples
+        ):
+            raise ValueError("music edit output duration lies outside its range")
+        if self.target_duration_error_samples != abs(
+            self.output_duration_samples - self.target_duration_samples
+        ):
+            raise ValueError("music edit target duration error is inconsistent")
+        if len(self.joins) != len(self.spans) - 1:
+            raise ValueError("music edit must have exactly one join between spans")
+
+        span_ids = [span.span_id for span in self.spans]
+        if len(span_ids) != len(set(span_ids)):
+            raise ValueError("music edit span IDs must be unique")
+        if self.spans[0].output_start_sample != 0:
+            raise ValueError("music edit output must begin at sample zero")
+        for index, span in enumerate(self.spans):
+            if span.source_end_sample > self.source_duration_samples:
+                raise ValueError("music edit span exceeds the locked source")
+            if index == 0:
+                continue
+            join = self.joins[index - 1]
+            prior = self.spans[index - 1]
+            if join.left_span_id != prior.span_id:
+                raise ValueError("music join left span is not adjacent")
+            if join.right_span_id != span.span_id:
+                raise ValueError("music join right span is not adjacent")
+            if join.join_type == "micro_crossfade":
+                minimum = max(1, round(self.master_sample_rate * 0.005))
+                maximum = round(self.master_sample_rate * 0.200)
+                if not minimum <= join.duration_samples <= maximum:
+                    raise ValueError(
+                        "micro crossfade must remain between 5 and 200 ms"
+                    )
+                if join.duration_samples >= (
+                    span.source_end_sample - span.source_start_sample
+                ):
+                    raise ValueError("crossfade cannot consume the right span")
+                if join.duration_samples >= (
+                    prior.source_end_sample - prior.source_start_sample
+                ):
+                    raise ValueError("crossfade cannot consume the left span")
+            expected_start = prior.output_end_sample - join.duration_samples
+            if span.output_start_sample != expected_start:
+                raise ValueError("music span placement disagrees with its join")
+
+        if self.spans[-1].output_end_sample != self.output_duration_samples:
+            raise ValueError("music spans do not cover the output timeline")
+        source_intervals = sorted(
+            (span.source_start_sample, span.source_end_sample)
+            for span in self.spans
+        )
+        for prior, current in zip(
+            source_intervals[:-1],
+            source_intervals[1:],
+            strict=True,
+        ):
+            if current[0] < prior[1]:
+                raise ValueError(
+                    "music edit cannot silently replay overlapping source passages"
+                )
+        if self.ending.mode == "natural_track_end":
+            if self.spans[-1].source_end_sample != self.source_duration_samples:
+                raise ValueError("natural ending must preserve the source endpoint")
+            if self.spans[-1].end_boundary_kind != "natural_track_end":
+                raise ValueError("natural ending requires a natural-end span")
+        elif self.spans[-1].end_boundary_kind == "natural_track_end":
+            raise ValueError("natural-end span cannot claim an artificial ending")
+        if self.ending.fade_out_samples >= self.output_duration_samples:
+            raise ValueError("music ending fade cannot consume the full edit")
+        if self.ending.mode == "reviewed_ending_hit":
+            if self.spans[-1].end_boundary_cue_id != self.ending.ending_cue_id:
+                raise ValueError("ending hit must match the final locked cue")
+        for region in self.ducking_regions:
+            if region.output_end_sample > self.output_duration_samples:
+                raise ValueError("music ducking region exceeds the output timeline")
+        return self
+
+
+class MusicEditRenderManifestV2(StrictModel):
+    """Deterministic FFmpeg render evidence for a reviewed MusicEditPlanV2."""
+
+    contract_version: Literal["music-edit-render-v2"] = "music-edit-render-v2"
+    render_id: str = Field(pattern=r"^music-edit-render:[0-9a-f]{64}$")
+    edit_id: str = Field(pattern=r"^music-edit:[0-9a-f]{64}$")
+    edit_plan_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_audio_path: str = Field(min_length=1)
+    source_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_audio_path: str = Field(min_length=1)
+    output_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_codec: Literal["pcm_s16le"] = "pcm_s16le"
+    output_sample_rate: Literal[48_000] = 48_000
+    output_channels: Literal[2] = 2
+    expected_output_samples: int = Field(gt=0)
+    probed_output_samples: int = Field(gt=0)
+    duration_delta_samples: int
+    duration_tolerance_samples: int = Field(ge=0, le=16)
+    internal_join_count: int = Field(ge=0, le=3)
+    crossfade_samples: int = Field(ge=0)
+    fade_in_samples: int = Field(gt=0)
+    fade_out_samples: int = Field(ge=0)
+    ducking_region_count: int = Field(ge=0, le=32)
+    ffmpeg_filter_graph: str = Field(min_length=1)
+    ffmpeg_command: list[str] = Field(min_length=1)
+    ffprobe_audio_stream: dict[str, Any]
+    qc_passed: bool
+    qc_errors: list[str]
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_music_edit_render(self) -> "MusicEditRenderManifestV2":
+        if self.duration_delta_samples != (
+            self.probed_output_samples - self.expected_output_samples
+        ):
+            raise ValueError("music edit render duration delta is inconsistent")
+        passed = (
+            abs(self.duration_delta_samples) <= self.duration_tolerance_samples
+            and not self.qc_errors
+        )
+        if self.qc_passed != passed:
+            raise ValueError("music edit render QC status is inconsistent")
         return self

@@ -12,9 +12,38 @@
 
 1. 最適合 16:9 的 `horizontal_frame_id`。
 2. 最適合 9:16 的 `vertical_frame_id`，可以與橫式不同。
-3. 只描述畫面直接可見的 `observed_visual_evidence`。
+3. 只描述畫面直接可見的 `observed_visual_evidence`。先使用輸入 Clip Card
+   的通用 `evidence_origin` 判斷這是來源場景中的直接事件、內嵌媒體、圖文
+   claim、脈絡或未知；它適用於任何內容類型。輸出的
+   `evidence_provenance` 只是舊 reader 所需的相容 mirror：
+   - `direct_physical_action`：原始場景中直接拍到動作、手勢、反應或物理事件。
+   - `direct_ui_interaction`：直接拍到使用者操作 UI，且可見狀態真的改變。
+   - `direct_result`：直接拍到流程完成後穩定、可讀的實際結果。
+   - `prerecorded_screen_playback`：鏡頭裡的螢幕只是在播放既錄影片、demo reel
+     或另一段內容；這只能證明播放／顯示，不能證明螢幕裡的功能或事件在現場發生。
+   - `promotional_graphic`：廣告圖、動畫、產品宣傳卡或示意畫面。
+   - `textual_claim_only`：只有文字、標題或標示聲稱某功能。
+   - `context_only`：只有相關產品／人物／環境，沒有 brief 要求的動作或結果。
+   - `unknown`：目前抽樣無法可靠分辨。不得把 unknown 當 direct evidence。
+   外層 `evidence_provenance` 必須與 rank-1 vertical candidate 相同，且不得
+   與輸入的 generic evidence origin 衝突。螢幕中螢幕、
+   宣傳字卡或文字 claim 不得因內容「看起來像」功能結果，就標成 direct result。
 4. 如果精確功能 UI 沒有被 2 秒 sampling 捕捉，但有相近產品／操作 B-roll，使用 `partial`，並清楚寫明差距。
 5. 完全沒有合理畫面則使用 `not_found`，兩個 frame ID 都回傳 null；不得拿相近但不符合事件條件的素材假裝是直接證據。
+6. 對 supported／partial chapter 提出 `recommended_duration_seconds` 與 `duration_rationale`。停留長度必須依本次畫面真正包含的資訊量、動作 setup／action／result、brief 中的敘事重要性，以及本次實際提供的音樂流動綜合判斷；不得套用「靜態畫面固定幾秒」或「動作畫面固定幾秒」之類的硬規則。這只是相對剪輯建議，不是原片 timestamp；本機會依總長、shot、原始 PTS 與合法 handles 校正。
+   - 同時填寫 `attention_observation`，分開評估 semantic novelty、動作在片段結尾是否已完成、visual motion、composition change、reading load、尚未解決的動作／懸念、刻意停留價值、重複壓力與音樂轉場機會。每個值 0–1，只代表本次可見證據下的相對判斷，不是客觀真值。
+   - `minimum_dwell_seconds` 是辨認主體、看懂必要文字、完成動作或保留必要情緒停頓所需的下限；`maximum_dwell_seconds` 是在資訊開始重複前仍合理的上限。`recommended_duration_seconds` 必須位於兩者之間。全部仍是待審 editorial proposal，不是 source timestamp。
+7. 不同 chapter 原則上應選不同 source clip／take；重用不是一律禁止，但必須是可說明的剪輯選擇，不得用來湊滿交付秒數。未重用時使用 `source_reuse_mode=none` 且 justification 為 null；重用時必須填寫非空的 `source_reuse_justification`，並依真正目的選擇：
+   - `distinct_interval`：同一來源的另一段時間，提供不同動作、狀態或環境資訊；不可重播相同區間。
+   - `alternate_presentation`：同一證據以不同構圖、景別或視覺重點再次呈現，第二次必須讓觀眾看到不同資訊，不只是換比例。
+   - `editorial_reprise`：為前後呼應、回顧、章節間隔或 montage 節奏而有意重現；即使內容相同，也必須具有清楚的全片結構作用。
+   同一來源的空景、人物、表演、操作、細節或任何其他內容都適用相同規則。不得只因第一候選 confidence 較高而重複使用幾乎相同的構圖，也不得把重用冒充新的獨立素材容量。
+8. 每個 supported／partial chapter 的 `horizontal_candidates` 與
+   `vertical_candidates` 都必須各保留 2–4 個不同 source event／RF frame 的
+   可執行候選，rank 從 1 連續排列；rank-1 必須與外層相容欄位完全一致。
+   候選不是重複詢問模型，而是同一次回應中供後續品質、geometry 與重複風險
+   gate 依序嘗試的備選。若真的只有一個有證據的素材，請回傳 `partial` 並在
+   uncertainties 說明，不得複製同一影格湊數。
 
 使用者 brief 的規格文字是允許顯示的 editorial copy，但不是你從影片觀察到的證據。不要因為 brief 寫了某功能，就謊稱畫面中確實看見。
 
@@ -22,6 +51,7 @@
 
 - 全景、兩人分居左右、完整產品陳列或本來構圖已緊密：`horizontal_strategy=original`、`horizontal_zoom_intent=none`。
 - 若有一個明確且可持續辨識的實例或局部值得在高解析原片內做安全 punch-in：使用 `tracked_reframe`，並以 `subtle` 或 `detail` 表示剪輯意圖。
+- `horizontal_camera_intent` 只描述剪輯意圖：`hold` 保持穩定、`follow` 只隨目標移動、`punch_in_cut` 以硬切改成近景、`push_in`／`pull_out` 是短而有目的的漸進運鏡、`recenter` 是重新置中。`pan_reveal` 只有畫面存在兩個可區分且需交接的 anchor 時才可使用。不要輸出像素座標或倍率。
 - `subtle` 只是輕微強調；`detail` 才是指定局部或關鍵狀態。實際倍率由本機依 mask、移動範圍、安全 margin 與來源／輸出解析度上限計算，你不要輸出 zoom 數字。
 - `horizontal_target_description` 必須指定要持續保留的實例與層級。SAM 只提供 geometry，不能替代剪輯意圖。
 
@@ -29,15 +59,124 @@
 
 不能再只回答 left／center／right。
 
+- 先輸出 `vertical_coverage_intent`。`single_primary` 只適用於一個主體即可
+  完整承擔章節意義；`group_coverage` 表示多個可見成員都必須至少被清楚呈現
+  一次；`sequential_attention` 表示畫面本身具有可觀察的交接順序；
+  `simultaneous_relation` 只用於接觸、交接、重疊、不可拆的精確空間關係或
+  同時狀態必須直接同框才成立的情況。一般外觀、功能、UI、人物或物件比較，
+  即使原片並排，也應優先分類為 `group_coverage`；若畫面有可觀察的順序則用
+  `sequential_attention`。相對大小本身不會自動要求全程同框，只要後續能在
+  同一來源尺度下依序呈現或保留短暫關係畫面。多主體本身不強迫運鏡，但不得
+  為了方便直式裁切，把共同承擔
+  lineup、團體、集合、對照或交接意義的成員任意降為背景。
+- `vertical_coverage_target_descriptions` 列出真正承擔 coverage intent 的可見
+  實例或局部；多主體 intent 至少列出兩個可區分的描述。它們是後續完整片段
+  構圖複核的輸入，不是 bbox、座標或追蹤結果。
 - 如果一個可持續辨識的主要實例或局部能由 bbox seed + mask tracking 保留，使用 `tracked_crop`，並寫出精確、可區分相似實例的 `vertical_target_description`。
 - 若 brief 提供 `vertical_primary_target_description`，它是人工指定的直式主視覺。優先回傳 `tracked_crop`，不得為保留次要人物或背景而自行改成 `fit_with_background`。
-- 未指定人工主視覺時，若同時要保留的必要主體太寬、兩人分居左右、物件無法可靠追蹤，或單一 9:16 crop 會切掉必要資訊，才使用 `fit_with_background`。
+- 未指定人工主視覺時，單一 9:16 crop 放不下多個必要主體，不代表應立刻使用
+  `fit_with_background`。先判斷能否使用相同來源尺度依序觀看、虛擬鏡頭、
+  punch-in cut，或只裁掉不承載意義的外圍；這些都不可行，而且關係確實必須
+  同框時，才使用 `fit_with_background` 或改選更適合直式的候選。
 - `primary_center` 代表可以犧牲明確標示為次要的 context，但指定的主要實例、局部、狀態或事件證據仍須可見；不得把它誤解成可任意截斷主要證據。
 - 不得為了強行使用 crop 而犧牲任何 required entity 或 required evidence。
 - `vertical_target_description` 必須指定實例、物件層級、可見辨識特徵與排除條件；不可只寫寬泛類別名稱。
 
+### 9:16 虛擬鏡頭 proposal
+
+若同一個 source shot 內有兩個以上依序重要、但不必同時出現在單一
+9:16 crop 的可追蹤實例，可在該 `vertical_candidate` 提出
+`virtual_camera_proposal`。這是待 Grounding／SAM／geometry 驗證的剪輯意圖，
+不是座標或可直接執行的運鏡：
+
+- 先在 `regions` 建立穩定且可重複引用的 region ID，描述可見實例、局部層級、
+  辨識特徵、排除條件，以及 `required`／`preferred`／`avoid_overlay` role；
+  本機會再映射為 hard core／soft extent／overlay keepout。
+- phase 的 `anchor_region_ids` 只能引用同一 candidate 內已存在的 region ID。
+- phase 順序必須由這支素材實際可見的資訊揭露、人物視線、操作流程或動作交接
+  決定。不得輸出左、右、上、下等字面運鏡方向；本機會從 grounded geometry
+  推導實際方向。語意時序須維持時用 `semantic_order_locked`；
+  `spatially_optimizable` 只授權本機在各 phase 的可行構圖區域內選擇較短、
+  較單調的位置，不授權交換影片中的 temporal phase order；不應連續移動時
+  用 `no_continuous_traversal`。
+  不得在可直接單調掃視的主體前，額外建立沒有語意必要的中央共同構圖。
+- `observable_predicate` 說明為什麼此時該看該 anchor；
+  `transition_condition` 說明畫面中出現什麼可見條件才適合交接。
+- `movement_motivation` 必須逐 phase 說明是 `none`、`maintain_framing`、
+  `attention_handoff`、`reveal` 或 `emphasis`；沒有可見必要性就是 `none`。
+- 只有 phase boundary 前後各自成立、沒有 simultaneous relation 跨界、沒有
+  切斷接觸／交接／UI 狀態轉換／閱讀或未完成動作，而且仍保留必要
+  setup／result／reaction 時，`cut_admissible` 才可為 true。
+- `camera_behavior` 只表達剪輯意圖：一般跟隨優先用
+  `follow_deadband`，避免把 tracker 的細小抖動變成攝影機抖動；
+  只有每一段移動都需要被看見時才用 `follow`。`push_in` 用於畫面直接支持的
+  細節／結果強調，`pull_out` 用於回到整體關係，`punch_in_cut` 用於明確資訊
+  落點的硬切放大，`hold` 用於固定構圖。不得為了補秒數或裝飾靜態畫面而發明
+  運鏡，也不得輸出倍率、像素速度、 easing 或曲線；本機會依來源解析度、移動
+  距離、phase 時長、共同靜態可行區域、settle、速度、加速度與 jerk 決定
+  保持、安全移動或經核准的 cut。微小位移只有在同一靜態構圖仍符合所有
+  hard anchors 時才會保持不動；反向折返也只能在 `cut_admissible=true`
+  時改成 cut。
+- `start_progress`／`end_progress` 只表示相對敘事順序，必須從 0 連續覆蓋到 1；
+  不得輸出或暗示 source timestamp。快速或關鍵交接仍需後續 dense frame ID
+  refine 才能改動精確剪點。
+- 能穩定只看一個 anchor 時，使用 `single_anchor_hold` 或
+  `single_anchor_follow`；需要依序交接才用 `sequential_focus`；兩者關係必須
+  同時成立時用 `joint_relation`，各 phase 同時引用必要 anchors。
+- 若固定 crop 已經清楚、移動沒有新增資訊、anchor 不可持續辨識、交接條件只靠
+  推測，或一次 9:16 無法保留必需的 joint relation，請將
+  `virtual_camera_proposal` 留空，改選其他 take、`fit_with_background`、
+  split／PiP 候選或人工 review。
+- 若 A 與 B 的關係可依序重建，候選不得只因橫向過寬就留空 proposal。應建立
+  兩個可 Grounding 的 required region 與 `sequential_focus` phases；順序由
+  畫面實際資訊流決定，不得固定左→右。
+- 若同一候選先後包含可依序觀看與必須同框的語意區段，不得以單一全片
+  `hold` 或全片 sequential 隱藏差異；保留可觀察的 phase 切換證據，讓
+  selected-clip refinement 使用 `phase_mixed` 與 joint／single-anchor phases。
+- required region 不只可以是人物或主要物件。若手勢、移動物、指向、UI 結果、
+  計分、標誌、終點線、圖表或共同尺度參照被裁掉後會改變事件意義，也必須
+  以可 Grounding 的最小 required region 保存；不得只保住主體本身。
+- 自動 proposal 不得授權裁掉 anchor。本機只會以 100% active-anchor
+  containment 執行；任何 intentional clipping 都必須另有人工 policy。
+
 ## 品質
 
 優先：主體清楚、低動態模糊、低遮擋、構圖乾淨、能代表 chapter、與前後 chapter 不重複。把 2 秒抽樣、相似 take、UI 反光、手部遮擋與功能證據不足寫入 uncertainties／quality_risks。
+
+## 剪輯呈現的決策權
+
+你不只是在標示「這支素材可不可以裁成直式」，也要為每一個
+`vertical_candidate` 選擇一個**主要剪輯呈現方式**。這是全片剪輯計畫的一
+部分：選擇時要同時考慮本 chapter 的資訊揭露、前後鏡頭、素材重複壓力、以及
+音樂段落的推進／呼吸／峰值／收尾。可用的方式只有 schema 中的
+`presentation_preference`：
+
+- `static_full_bleed`：固定滿版構圖已清楚，移動不會增加資訊。
+- `tracked_full_bleed`：主體的真實位移需要被持續保留；這是跟隨，不是把 tracker
+  的細小抖動做成運鏡。
+- `phase_virtual_camera`：同一鏡頭有可觀察、按順序揭露的資訊，且你已提出可驗證
+  phase proposal。它可以是 hold、follow、reveal、短暫 emphasis 或合乎畫面條件的
+  punch-in cut；不得為了填秒數發明移動。
+- `two_panel_layout`：觀眾必須同時比較、同時保留 relation，或 context 與 detail
+  必須並讀時才選。它不是「裁不下就分割」的技術保底。
+- `solid_matte_fit`：完整來源範圍本身就是正確語意，且比改選更合適的 take、滿版或
+  有動機的分段觀看更能保留必要資訊時才選；它不是安全檢查失敗時的預設答案。
+
+上述五種方式互不等價。請把最符合剪輯意圖的一種填為此 candidate 的
+`presentation_preference`，並用 `presentation_goal`、coverage intent、regions、
+source camera motion 與（需要時）phase proposal 說清楚原因。本機只會測量 bbox、
+PTS、可見面積、來源運動、SAM track、可行 crop path、panel 像素配置與音樂 cue
+誤差，並嚴格執行你選定的方式；它不會把 static 改成 tracked、把 tracked 改成
+virtual camera、或因為可以保留所有人就自行改成 two-panel／solid fit。
+
+若你選的方式經本機測量不可執行，系統會帶著該 candidate、其他已量測的候選、
+相鄰 sequence、完整音樂 cue context 與失敗原因，進行一次受限的 semantic replan。
+那時才由你在既有、可執行的 immutable options 中改選；本機不會自行降級或捏造
+新的剪輯方式。因此每個 Top-K 候選都應提出自己真正適合的呈現方式，不能把 rank-2
+到 rank-4 都複製成同一個保守 fallback。若候選重用先前 source，必須在該 candidate
+本身提供符合全片目的的 `source_reuse_mode` 與可觀察 justification；後續本機只會
+驗證這份授權，不能自行補上重用理由。
+
+若本次同時提供音樂，必須真的聆聽音樂，讓開場、建立、推進、峰值、呼吸與收尾等可聽見的段落角色影響素材、動作相位與相對停留長度；不得為了逐拍對齊而破壞 brief 順序、切斷完整動作或重複素材。不得輸出音樂 timestamp、sample 或自行改寫本機鎖定的時間證據。
 
 只回傳符合 Structured Output schema 的資料。

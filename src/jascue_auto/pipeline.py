@@ -1,0 +1,856 @@
+"""Run the stages in order and report what happened.
+
+The order is fixed and each stage answers one question:
+
+    rhythm    how long should each shot be, given the music and the material
+    subject   where is the thing this shot is about, at a few sampled moments
+    reframe   what crop follows that, inside this shot's energy budget
+    ground    which musical event does each cut actually land on
+    render    the file
+
+Every semantic question goes to the model; every measurement stays local. The
+report at the end says which cuts landed on music and which shots had to
+settle for less than the plan asked, because a cut that quietly did neither is
+indistinguishable from one that did both.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from jascue_auto.clipcard import find_subject, load_card
+from jascue_auto.cost import Ledger
+from jascue_auto.executor import RenderPlan, Source, plan_render
+from jascue_auto.grounding import BeatGrid, apply_to_edl, ground_timeline
+from jascue_auto.planner import Usage, decide_rhythm, locate_subject
+from jascue_auto.reframe import (
+    CropPath,
+    achieved_upscale,
+    zoom_budget,
+    Observation,
+    OutOfFrame,
+    build_crop_path,
+    build_handoff_path,
+    build_sweep_path,
+    build_tilt_path,
+    build_zoom_path,
+    observations_from_sam,
+)
+from jascue_auto.renderer import RenderResult, render
+from jascue_auto.schema import EDL, DegradationStep
+
+# Enough samples to see a subject change direction, few enough that one shot
+# costs a fraction of a cent. Interpolation covers the gaps; SAM propagation
+# replaces this when per-frame accuracy starts to matter.
+SUBJECT_SAMPLES = 5
+
+# Analysis rate for mask propagation. Four a second catches a gesture starting
+# and finishing; the cost is roughly ten seconds of wall time per shot, which
+# is worth it against interpolating between samples 0.6 seconds apart.
+TRACK_FPS = 4.0
+
+# How much of a shot the tracker has to hold before its trajectory is worth
+# more than the sampled positions. Below this the samples are used and the
+# shortfall is recorded, because a track that survived one frame in nine is
+# not a measurement, it is a single guess wearing a measurement's name.
+TRACK_QUORUM = 0.5
+
+
+@dataclass
+class Report:
+    """What the run did, in the terms someone would ask about it."""
+
+    aligned_cuts: int = 0
+    total_cuts: int = 0
+    following_shots: int = 0
+    static_shots: int = 0
+    degradations: list[DegradationStep] = field(default_factory=list)
+    subject_notes: dict[str, str] = field(default_factory=dict)
+    # What the direction asked for against what the cut runs to. Three layers
+    # each made a defensible call -- 45 seconds of material, ten shots, a
+    # beat-led length -- and the result was a third of the intended film with
+    # nobody reporting the gap.
+    target_seconds: float | None = None
+    moves_too_short: dict[str, str] = field(default_factory=dict)
+    rhythm_decisions: dict[str, dict] = field(default_factory=dict)
+    # Enlargement actually applied per shot. Reported as a number because
+    # sharpness is measurable: nobody should have to tell a soft proxy apart
+    # from an over-enlarged shot by eye, and at preview resolution they look
+    # the same.
+    upscales: dict[str, float] = field(default_factory=dict)
+    delivered_seconds: float | None = None
+    usages: list[Usage] = field(default_factory=list)
+    # What each stage cost, in dollars. The totals were only ever tokens,
+    # which answers "how much was sent" rather than "where did the money go"
+    # -- and the two point at different stages entirely.
+    ledger: Ledger | None = None
+
+    @property
+    def input_tokens(self) -> int:
+        return sum(usage.input_tokens for usage in self.usages)
+
+    @property
+    def output_tokens(self) -> int:
+        return sum(
+            usage.output_tokens + usage.thought_tokens for usage in self.usages
+        )
+
+    @property
+    def duration_shortfall(self) -> float | None:
+        if self.target_seconds is None or self.delivered_seconds is None:
+            return None
+        return round(self.target_seconds - self.delivered_seconds, 2)
+
+    def spend(self) -> dict[str, object]:
+        return self.ledger.summary() if self.ledger is not None else {}
+
+    def summary(self) -> str:
+        gap = self.duration_shortfall
+        spent = (
+            f", ${self.ledger.spent_usd:.4f}"
+            if self.ledger is not None and self.ledger.entries
+            else ""
+        )
+        tail = (
+            f", {abs(gap):.0f}s {'short of' if gap > 0 else 'over'} the "
+            f"{self.target_seconds:.0f}s asked for"
+            if gap is not None and abs(gap) >= 1.0
+            else ""
+        )
+        # A film where nothing asked for a beat is not a film that missed
+        # every beat. The fallback for "no rhythm pass ran" was reading a
+        # speech-led cut -- thirteen shots, every one deliberately off the
+        # grid so a sentence could finish -- as 0/13 aligned.
+        if self.rhythm_decisions:
+            wanted = sum(
+                1
+                for entry in self.rhythm_decisions.values()
+                if entry.get("cut_on_beat")
+            )
+        else:
+            wanted = self.total_cuts
+        return (
+            f"{self.aligned_cuts}/{wanted} cuts on a musical event "
+            f"({self.total_cuts - wanted} content-led by choice), "
+            f"{self.following_shots} shots following a subject, "
+            f"{self.static_shots} held, "
+            f"{len(self.degradations)} degradations, "
+            f"{self.input_tokens} in / {self.output_tokens} out tokens"
+            f"{spent}{tail}"
+        )
+
+
+def _charge(report: "Report", stage: str, usage: Usage) -> None:
+    """Book a call against both the token tally and the stage ledger."""
+
+    report.usages.append(usage)
+    if report.ledger is not None:
+        report.ledger.record(
+            stage,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens + usage.thought_tokens,
+        )
+
+
+def probe(source_id: str, path: Path) -> Source:
+    import json
+
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:format=duration",
+            "-of", "json", str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(completed.stdout)
+    stream = payload["streams"][0]
+    return Source(
+        source_id=source_id,
+        path=path,
+        duration_seconds=float(payload["format"]["duration"]),
+        width=int(stream["width"]),
+        height=int(stream["height"]),
+    )
+
+
+def _sample_frames(
+    source: Source, start: float, end: float, work: Path
+) -> tuple[list[Path], list[float]]:
+    """Pull evenly spaced stills across the shot's own window."""
+
+    span = max(end - start, 0.1)
+    times = [
+        start + span * (index + 0.5) / SUBJECT_SAMPLES
+        for index in range(SUBJECT_SAMPLES)
+    ]
+    frames = []
+    for index, at in enumerate(times):
+        destination = work / f"{source.source_id}-{index}.jpg"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{at:.3f}", "-i", str(source.path),
+                "-frames:v", "1", "-vf", "scale=960:-2", str(destination),
+            ],
+            check=True,
+        )
+        frames.append(destination)
+    return frames, times
+
+
+def _track_subject(
+    source: Source,
+    clip,
+    subject_description: str,
+    seed_box: list[int],
+    checkpoint: Path,
+    work: Path,
+) -> tuple[list[Observation], dict[str, int]]:
+    """Propagate a Gemini seed across every analysed frame of the shot."""
+
+    from jascue_video_lab.sam_tracking import track_bbox_sam21
+
+    track = track_bbox_sam21(
+        video_path=source.path,
+        checkpoint_path=checkpoint,
+        seed_time_ms=int(clip.approx_in_seconds * 1000) + 100,
+        seed_box_2d=seed_box,
+        target_description=subject_description,
+        output_dir=work / f"sam-{clip.clip_id}",
+        seed_source="gemini_frame_grounding",
+        analysis_fps=TRACK_FPS,
+        max_side=960,
+        allowed_start_ms=int(clip.approx_in_seconds * 1000),
+        allowed_end_ms=int(clip.approx_out_seconds * 1000),
+    )
+    return observations_from_sam(
+        track, clip_start_seconds=clip.approx_in_seconds
+    )
+
+
+def _seed_box(box: dict[str, Any]) -> list[int]:
+    """Gemini's centre-and-size answer as the tracker's x-first 0..1000 box."""
+
+    half_w = float(box["width"]) / 2.0
+    half_h = float(box["height"]) / 2.0
+    centre_x = float(box["centre_x"])
+    centre_y = float(box["centre_y"])
+    return [
+        int(max(0.0, centre_x - half_w) * 1000),
+        int(max(0.0, centre_y - half_h) * 1000),
+        int(min(1.0, centre_x + half_w) * 1000),
+        int(min(1.0, centre_y + half_h) * 1000),
+    ]
+
+
+def follow_subjects(
+    edl: EDL,
+    sources: dict[str, Source],
+    *,
+    target_aspect: float,
+    report: Report,
+    output_size: tuple[int, int] = (1080, 1920),
+    cards: dict[str, Path] | None = None,
+    checkpoint: Path | None = None,
+    client: Any | None = None,
+) -> dict[str, CropPath]:
+    """Build a crop path per shot that names a subject.
+
+    A shot whose subject turns out to be still gets a held frame, which is the
+    right answer rather than a failure -- the deadband decides that, not a
+    threshold anyone has to tune.
+    """
+
+    paths: dict[str, CropPath] = {}
+    with tempfile.TemporaryDirectory() as raw_work:
+        work = Path(raw_work)
+        for clip in edl.clips:
+            reframe = clip.reframe
+            if reframe is None:
+                continue
+            source = sources[clip.source_id]
+            move = reframe.camera_move
+            card = (
+                load_card(cards[clip.source_id])
+                if cards and clip.source_id in cards
+                else None
+            )
+
+            duration = clip.approx_out_seconds - clip.approx_in_seconds
+
+            # Whether a subject fits the delivery aspect is a fact about the
+            # material, not a property of the move chosen for it. It used to
+            # be checked inside the hold branch only, so the same wordmark
+            # that a hold would have swept across was quietly cropped to
+            # "Galaxy Unpac" the moment the planner asked for a push instead
+            # -- and nothing recorded it, because only one of the five path
+            # builders reports fit. The check belongs to the clip.
+            if reframe.subject is not None and card is not None:
+                known = find_subject(card, reframe.subject.description)
+                crop_width = target_aspect / source.aspect_ratio
+                if known is not None and known.width > crop_width:
+                    report.degradations.append(
+                        DegradationStep(
+                            clip_id=clip.clip_id,
+                            ladder="other",
+                            ladder_other="subject_wider_than_delivery",
+                            trigger=(
+                                f"the subject is wider than any crop of this "
+                                f"source at the delivery aspect, so a {move} "
+                                f"can only ever hold part of it"
+                            ),
+                            measured={
+                                "subject_width_vw": round(known.width, 4),
+                                "widest_crop_vw": round(crop_width, 4),
+                                "most_visible_fraction": round(
+                                    crop_width / known.width, 4
+                                ),
+                                "requested_min_visible": (
+                                    reframe.subject.min_visible
+                                ),
+                            },
+                        )
+                    )
+
+            if (
+                move == "pan"
+                and reframe.then_subject is not None
+                and reframe.subject is not None
+            ):
+                # Two subjects in one frame: pan from the first to the second
+                # rather than cutting the take to itself. Both endpoints are
+                # measured, because a nine-box position is a hint about which
+                # subject is meant, not a coordinate to aim at -- aiming at it
+                # overshoots the subject and lands on background.
+                frames, _ = _sample_frames(
+                    source, clip.approx_in_seconds, clip.approx_out_seconds, work
+                )
+                centres = []
+                widths = []
+                for subject in (reframe.subject, reframe.then_subject):
+                    boxes, usage = locate_subject(
+                        frames, subject.description, client=client
+                    )
+                    _charge(report, "subject", usage)
+                    seen = [
+                        float(box["centre_x"])
+                        for box in boxes
+                        if box.get("present") and box.get("centre_x") is not None
+                    ]
+                    centres.append(sum(seen) / len(seen) if seen else 0.5)
+                    spans = [
+                        float(box["width"])
+                        for box in boxes
+                        if box.get("present") and box.get("width") is not None
+                    ]
+                    widths.append(sum(spans) / len(spans) if spans else 0.0)
+                paths[clip.clip_id] = build_handoff_path(
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    duration_seconds=duration,
+                    from_centre=centres[0],
+                    to_centre=centres[1],
+                    from_width=widths[0],
+                    to_width=widths[1],
+                    energy=reframe.camera_energy,
+                )
+                report.subject_notes[clip.clip_id] = (
+                    f"handoff {centres[0]:.3f} -> {centres[1]:.3f}"
+                )
+                report.following_shots += 1
+                continue
+
+            if move in {"push_in", "pull_out"}:
+                # Push toward the subject, not toward the middle of the frame.
+                # Zooming on the geometric centre put a coin-against-a-hinge
+                # shot in the bottom third with 40% of the frame empty above
+                # it -- and a zoom is the only move that can change vertical
+                # framing at all when the crop is otherwise full height, so
+                # aiming it blindly wastes the one chance the shot has.
+                centre_x, centre_y = 0.5, 0.5
+                if reframe.subject is not None:
+                    frames, _ = _sample_frames(
+                        source,
+                        clip.approx_in_seconds,
+                        clip.approx_out_seconds,
+                        work,
+                    )
+                    boxes, usage = locate_subject(
+                        frames, reframe.subject.description, client=client
+                    )
+                    _charge(report, "subject", usage)
+                    seen = [
+                        (float(b["centre_x"]), float(b["centre_y"]))
+                        for b in boxes
+                        if b.get("present") and b.get("centre_x") is not None
+                    ]
+                    if seen:
+                        centre_x = sum(x for x, _ in seen) / len(seen)
+                        centre_y = sum(y for _, y in seen) / len(seen)
+                        report.subject_notes[clip.clip_id] = (
+                            f"{move} on ({centre_x:.3f}, {centre_y:.3f})"
+                        )
+                # Read what the source can supply before choosing how far to
+                # push. A fixed percentage is blind to what it is cropping.
+                out_w, out_h = output_size
+                budget = zoom_budget(
+                    source_width=source.width,
+                    source_height=source.height,
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    output_width=out_w,
+                    output_height=out_h,
+                )
+                subject_height = None
+                if seen:
+                    heights = [
+                        float(b["height"])
+                        for b in boxes
+                        if b.get("present") and b.get("height") is not None
+                    ]
+                    if heights:
+                        subject_height = sum(heights) / len(heights)
+                path = build_zoom_path(
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    duration_seconds=duration,
+                    direction=move,
+                    centre_x=centre_x,
+                    centre_y=centre_y,
+                    energy=reframe.camera_energy,
+                    framing=reframe.framing,
+                    budget=budget,
+                    subject_height=subject_height,
+                    clip_id=clip.clip_id,
+                    degradations=report.degradations,
+                )
+                tightest = min(path.keyframes, key=lambda k: k.crop.width).crop
+                report.upscales[clip.clip_id] = achieved_upscale(
+                    tightest,
+                    source_width=source.width,
+                    source_height=source.height,
+                    output_width=out_w,
+                    output_height=out_h,
+                )
+                paths[clip.clip_id] = path
+                report.following_shots += 1
+                continue
+
+            if move in {"sweep_left", "sweep_right"}:  # legacy names
+                # A designed move across a still arrangement. Nothing is
+                # tracked because nothing is moving, so this costs no call.
+                paths[clip.clip_id] = build_sweep_path(
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    duration_seconds=duration,
+                    direction=move,
+                    energy=reframe.camera_energy,
+                )
+                report.following_shots += 1
+                continue
+
+            if move == "hold" or reframe.subject is None:
+                # No substitution here. This branch used to notice that a
+                # subject too wide to sit in the crop could be read across
+                # instead, and swap the hold for a sweep. It looks like help
+                # and it is the execution layer deciding: a replan that had
+                # just chosen hold *because* travelling across the title was
+                # what cut it came back describing a sweep across the title,
+                # having been overruled by a layer it cannot see or argue
+                # with. The fit is recorded above; whether to answer it with
+                # a different move, a different take or a partial view is a
+                # planning question, and the shot reviewer now puts it to the
+                # planner in those terms.
+                #
+                # A held shot still has to be aimed. Every other move
+                # measures where its subject is; this one fell through to
+                # the executor's fallback, which reads the nine-box name as
+                # a coordinate -- "mid_right" became x=0.61 and a phone
+                # spanning 0.475 to 0.825 arrived half out of frame with the
+                # wall behind it filling the rest. The card already knows
+                # where the thing is, and that lesson is written down for
+                # the handoff path, which was fixed and left this one alone.
+                if reframe.subject is not None:
+                    box = (
+                        find_subject(card, reframe.subject.description)
+                        if card is not None
+                        else None
+                    )
+                    # A card box is one moment. That is the whole answer for
+                    # a locked-off frame and a snapshot for anything else --
+                    # the subject the card saw at 1.2s is somewhere else by
+                    # the end of a take whose camera pans. The card says
+                    # which of those this is, in a field nothing read.
+                    settled = box is not None and not box.moves and not (
+                        card or {}
+                    ).get("camera_motion")
+                    centre = (
+                        (box.centre_x, box.centre_y, box.width, box.height)
+                        if settled and box is not None
+                        else None
+                    )
+                    if centre is None:
+                        # Either the card had no box for what was named, or
+                        # it had one that will not hold still. Measure across
+                        # this shot's own window: for a held frame the mean
+                        # of the trajectory is the placement that keeps the
+                        # subject inside for all of it, rather than framing
+                        # where it started and letting it walk out.
+                        frames, _ = _sample_frames(
+                            source,
+                            clip.approx_in_seconds,
+                            clip.approx_out_seconds,
+                            work,
+                        )
+                        boxes, usage = locate_subject(
+                            frames, reframe.subject.description, client=client
+                        )
+                        _charge(report, "subject", usage)
+                        seen = [
+                            b for b in boxes
+                            if b.get("present") and b.get("centre_x") is not None
+                        ]
+                        if seen:
+                            centre = (
+                                sum(float(b["centre_x"]) for b in seen) / len(seen),
+                                sum(float(b["centre_y"]) for b in seen) / len(seen),
+                                sum(float(b.get("width") or 0.0) for b in seen) / len(seen),
+                                sum(float(b.get("height") or 0.0) for b in seen) / len(seen),
+                            )
+                    if centre is not None:
+                        cx, cy, bw, bh = centre
+                        paths[clip.clip_id] = build_crop_path(
+                            [
+                                Observation(
+                                    seconds=0.0,
+                                    centre_x=cx,
+                                    centre_y=cy,
+                                    width=bw,
+                                    height=bh,
+                                )
+                            ],
+                            source_aspect=source.aspect_ratio,
+                            target_aspect=target_aspect,
+                            energy=reframe.camera_energy,
+                            framing=reframe.framing,
+                            clip_id=clip.clip_id,
+                            min_visible=reframe.subject.min_visible,
+                            degradations=report.degradations,
+                        )
+                        report.subject_notes[clip.clip_id] = (
+                            f"hold on ({cx:.3f}, {cy:.3f})"
+                        )
+                        report.static_shots += 1
+                        continue
+                report.static_shots += 1
+                continue
+
+            # A follow needs to know where the subject is. The card answered
+            # that when it was written and the answer has not changed since,
+            # so ask it before paying for a fresh grounding on every rhythm
+            # tweak, second aspect and review round.
+            known = (
+                find_subject(card, reframe.subject.description)
+                if card is not None
+                else None
+            )
+            if known is not None:
+                boxes = [
+                    {
+                        "frame_index": 0,
+                        "present": True,
+                        "centre_x": known.centre_x,
+                        "centre_y": known.centre_y,
+                        "width": known.width,
+                        "height": known.height,
+                    }
+                ]
+                times = [clip.approx_in_seconds]
+                frames = []
+                report.subject_notes[clip.clip_id] = f"card: {known.label}"
+            else:
+                frames, times = _sample_frames(
+                    source, clip.approx_in_seconds, clip.approx_out_seconds, work
+                )
+                boxes, usage = locate_subject(
+                    frames, reframe.subject.description, client=client
+                )
+                _charge(report, "subject", usage)
+
+            wants_tilt = move == "tilt"
+            observations = []
+            for box in boxes:
+                if not box.get("present"):
+                    continue
+                index = int(box.get("frame_index", -1))
+                if not 0 <= index < len(times):
+                    continue
+                try:
+                    observations.append(
+                        Observation(
+                            seconds=times[index] - clip.approx_in_seconds,
+                            centre_x=float(box["centre_x"]),
+                            centre_y=float(box["centre_y"]),
+                            width=float(box["width"]),
+                            height=float(box["height"]),
+                        )
+                    )
+                except (OutOfFrame, KeyError, TypeError, ValueError) as error:
+                    # One unusable observation is not a reason to abandon the
+                    # shot; the remaining samples still describe the motion.
+                    report.subject_notes[clip.clip_id] = str(error)[:160]
+
+            if not observations:
+                report.degradations.append(
+                    DegradationStep(
+                        clip_id=clip.clip_id,
+                        ladder="center_crop",
+                        trigger=(
+                            "the subject was not located in any sampled "
+                            "frame, so the shot is framed centrally"
+                        ),
+                        measured={"samples": float(len(times))},
+                    )
+                )
+                continue
+
+            note = next(
+                (
+                    str(box["disambiguation"])
+                    for box in boxes
+                    if box.get("disambiguation")
+                ),
+                "",
+            )
+            if note:
+                report.subject_notes[clip.clip_id] = note
+
+            # Gemini said which subject; the tracker says where it goes. When
+            # a checkpoint is available the trajectory is measured per frame
+            # rather than interpolated between five samples.
+            if checkpoint is not None and boxes:
+                seed = next(
+                    (
+                        box
+                        for box in boxes
+                        if box.get("present")
+                        and box.get("centre_x") is not None
+                    ),
+                    None,
+                )
+                if seed is not None:
+                    try:
+                        tracked, states = _track_subject(
+                            source,
+                            clip,
+                            reframe.subject.description,
+                            _seed_box(seed),
+                            checkpoint,
+                            work,
+                        )
+                    except Exception as error:  # tracking is an optimisation
+                        report.subject_notes[clip.clip_id] = (
+                            f"tracking unavailable, using sampled positions: "
+                            f"{type(error).__name__}"
+                        )
+                    else:
+                        report.subject_notes[clip.clip_id] = f"tracked {states}"
+                        total = sum(states.values()) or 1
+                        kept = states.get("tracked", 0)
+                        if kept / total < TRACK_QUORUM:
+                            # Most of the shot was not tracked. Falling back to
+                            # the sampled positions is right, but doing it
+                            # quietly is how a nine-frame trajectory becomes a
+                            # single observation and the crop lands wherever
+                            # that one frame happened to be -- on a hand rather
+                            # than the phone it was holding, in one case.
+                            report.degradations.append(
+                                DegradationStep(
+                                    clip_id=clip.clip_id,
+                                    ladder="other",
+                                    ladder_other="tracking_lost_most_frames",
+                                    trigger=(
+                                        "the tracker held the subject in "
+                                        f"{kept} of {total} analysed frames, "
+                                        "so the framing rests on sampled "
+                                        "positions instead"
+                                    ),
+                                    measured={
+                                        "tracked_frames": float(kept),
+                                        "analysed_frames": float(total),
+                                        "kept_fraction": round(kept / total, 3),
+                                    },
+                                )
+                            )
+                        elif tracked:
+                            observations = tracked
+
+            if wants_tilt:
+                path = build_tilt_path(
+                    observations,
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    energy=reframe.camera_energy,
+                    clip_id=clip.clip_id,
+                    degradations=report.degradations,
+                )
+            else:
+                path = build_crop_path(
+                    observations,
+                    source_aspect=source.aspect_ratio,
+                    target_aspect=target_aspect,
+                    energy=reframe.camera_energy,
+                    framing=reframe.framing,
+                    clip_id=clip.clip_id,
+                    min_visible=reframe.subject.min_visible,
+                    degradations=report.degradations,
+                )
+            paths[clip.clip_id] = path
+            if path.is_static:
+                report.static_shots += 1
+            else:
+                report.following_shots += 1
+    return paths
+
+
+def split_handoffs(edl: EDL) -> EDL:
+    """Turn a two-subject shot into two shots, each with one subject.
+
+    A camera cannot follow one thing and then another inside a single move
+    without losing both: the first subject is abandoned mid-gesture and the
+    second is arrived at late. Splitting at the plan layer gives each half its
+    own frame and its own follow, and the join between them is a cut, which is
+    how an editor carries the eye from one thing to the next anyway.
+
+    Each half keeps the parent's rhythm decision, halved, so a handoff costs
+    the same screen time it was given.
+    """
+
+    rewritten: list[Any] = []
+    for clip in edl.clips:
+        reframe = clip.reframe
+        second = getattr(reframe, "then_subject", None) if reframe else None
+        if reframe is None or second is None:
+            rewritten.append(clip)
+            continue
+
+        midpoint = (clip.approx_in_seconds + clip.approx_out_seconds) / 2.0
+        first_half = clip.model_copy(
+            update={
+                "clip_id": f"{clip.clip_id}a",
+                "approx_out_seconds": midpoint,
+            }
+        )
+        second_half = clip.model_copy(
+            update={
+                "clip_id": f"{clip.clip_id}b",
+                "approx_in_seconds": midpoint,
+                "reframe": reframe.model_copy(update={"subject": second}),
+            }
+        )
+        rewritten += [first_half, second_half]
+    return edl.model_copy(update={"clips": rewritten})
+
+
+def run(
+    edl: EDL,
+    sources: dict[str, Source],
+    grid: BeatGrid,
+    output_dir: Path,
+    *,
+    target_aspect: float,
+    intent: str,
+    brief: str = "",
+    rhythm_context: dict[str, dict] | None = None,
+    music: Path | None = None,
+    cards: dict[str, Path] | None = None,
+    checkpoint: Path | None = None,
+    ledger: Ledger | None = None,
+    decide_rhythm_first: bool = True,
+    target_seconds: float = 0.0,
+    keep_voice: bool = False,
+    under_speech: str = "duck",
+    client: Any | None = None,
+) -> tuple[RenderResult, RenderPlan, Report, EDL]:
+    """Take an EDL to a finished file.
+
+    The resolved EDL comes back with it. The rhythm pass rewrites durations
+    inside this call, and a caller that renders a second aspect from the EDL
+    it passed in gets the placeholder lengths instead of the decided ones --
+    which looks like a render that worked and sounds like one that ignored the
+    music.
+    """
+
+    report = Report(ledger=ledger)
+
+    # Without music there is nothing for this pass to reconcile. Its whole
+    # job is deciding a length against a track, and every length is already
+    # the one selection asked for -- calling it with no grid asked it to
+    # describe music that is not there.
+    if decide_rhythm_first and grid is not None:
+        edl, usage = decide_rhythm(
+            edl,
+            grid,
+            intent=intent,
+            brief=brief,
+            context=rhythm_context or {},
+            music=music,
+            target_seconds=target_seconds,
+            client=client,
+        )
+        _charge(report, "rhythm", usage)
+
+    timeline = ground_timeline(edl, grid)
+    report.aligned_cuts = timeline.aligned_count
+    report.total_cuts = len(timeline.clips)
+    report.delivered_seconds = round(timeline.duration_seconds, 2)
+    # Whether a cut missed the grid or was never aimed at it are different
+    # facts, and a bare "8/10" cannot tell them apart -- which is how a
+    # deliberate content-led cut reads as a failure to align.
+    report.rhythm_decisions = {
+        entry.clip.clip_id: {
+            "cut_on_beat": entry.clip.music_sync.cut_on_beat,
+            "landed_on": entry.landed_on,
+            "seconds": round(entry.duration_seconds, 3),
+            "why": entry.clip.music_sync.rhythm_reason,
+        }
+        for entry in timeline.clips
+    }
+    report.moves_too_short = {
+        entry.clip.clip_id: entry.move_too_short
+        for entry in timeline.clips
+        if entry.move_too_short
+    }
+    edl = apply_to_edl(edl, timeline)
+
+    paths = follow_subjects(
+        edl,
+        sources,
+        target_aspect=target_aspect,
+        report=report,
+        cards=cards,
+        checkpoint=checkpoint,
+        client=client,
+    )
+
+    plan = plan_render(
+        edl, sources, target_aspect=target_aspect, crop_paths=paths
+    )
+    report.degradations.extend(plan.degradations)
+
+    # Kept. A finished cut answers whether this is a film; it does not answer
+    # whether any one shot came out the way it was planned -- six composition
+    # faults in a row survived review of the whole thing and were found by
+    # opening a single shot. The segments are what that question is asked of.
+    result = render(
+        plan, output_dir, music=music, keep_segments=True,
+        keep_voice=keep_voice, under_speech=under_speech,
+    )
+    return result, plan, report, edl

@@ -1,0 +1,48 @@
+{
+  "asset_id": "sha256:faa19abebc6f2dc1d08b61c1814e06921ea23e97cc56e4e7f0771e40b3804cbf",
+  "candidates": [
+    {
+      "box_2d": [
+        248,
+        215,
+        338,
+        591
+      ],
+      "confidence": 0.85,
+      "disambiguation_reason": "左側灰色手機背面的三鏡頭模組外框。",
+      "label": "Fold8 鏡頭模組 (左側灰色手機)"
+    },
+    {
+      "box_2d": [
+        750,
+        219,
+        840,
+        591
+      ],
+      "confidence": 0.85,
+      "disambiguation_reason": "右側深色手機背面的三鏡頭模組外框。",
+      "label": "Fold8 鏡頭模組 (右側深色手機)"
+    }
+  ],
+  "entity_id": "reframe_subject",
+  "event_id": "fold8_camera",
+  "frame_hash": "d13e7d75e8f289202643dd681f5c3d0d98c73e13f157d963693bb2974c4ee5f3",
+  "frame_pts": 0,
+  "frame_time_ms": 0,
+  "match_status": "ambiguous",
+  "model_provenance": {
+    "api": "gemini_interactions",
+    "generated_at": "2026-08-03T09:27:17.785134+00:00",
+    "interaction_id": "",
+    "model_id": "gemini-3.6-flash",
+    "run_id": "feature-h-42932c61",
+    "sdk": "google-genai",
+    "sdk_version": "2.12.1"
+  },
+  "occlusion": "none",
+  "predicate_status": "not_applicable",
+  "source_height": 2160,
+  "source_width": 3840,
+  "visibility_reason": "Both camera modules of the fold phones are fully visible in the frame.",
+  "visible": true
+}

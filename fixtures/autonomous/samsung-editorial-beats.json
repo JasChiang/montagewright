@@ -1,0 +1,201 @@
+{
+  "contract_version": "editorial-beat-fixture-v1",
+  "project_id": "samsung-galaxy-z-autonomous-v1",
+  "beats": [
+    {
+      "beat_id": "camera_gesture",
+      "feature_id": "fold8_camera",
+      "priority": "preferred",
+      "evidence_query_lock_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "required_target_ids": ["camera_gesture"],
+      "allowed_evidence_provenance": ["direct_physical_action"],
+      "narrative_function": "feature_evidence",
+      "visual_events": [
+        {
+          "event_type": "camera_gesture_apex",
+          "cue_relation": "accent",
+          "tolerance_frames": 4
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 18,
+        "preferred_frames": 36,
+        "maximum_frames": 72
+      },
+      "relation_mode": "single_subject",
+      "allowed_reconstruction": ["continuous", "solid_fit"]
+    },
+    {
+      "beat_id": "ai_generation_payoff",
+      "feature_id": "galaxy_ai",
+      "priority": "hard",
+      "evidence_query_lock_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "required_target_ids": ["generation_result"],
+      "allowed_evidence_provenance": [
+        "direct_ui_interaction",
+        "direct_result"
+      ],
+      "narrative_function": "global_energy_peak",
+      "visual_events": [
+        {
+          "event_type": "generation_result_stable_start",
+          "cue_relation": "principal_downbeat",
+          "tolerance_frames": 2
+        }
+      ],
+      "minimum_fulfillment_level": "contextual_identity",
+      "fulfillment_alternatives": [
+        {
+          "fulfillment_level": "direct_demonstration",
+          "accepted_evidence_provenance": [
+            "direct_ui_interaction",
+            "direct_result"
+          ],
+          "claim_support_level": "direct",
+          "exact_event_requirement": "required_when_selected",
+          "visual_events": [
+            {
+              "event_type": "generation_result_stable_start",
+              "cue_relation": "principal_downbeat",
+              "tolerance_frames": 2
+            }
+          ]
+        },
+        {
+          "fulfillment_level": "contextual_identity",
+          "accepted_evidence_provenance": [
+            "direct_physical_action",
+            "prerecorded_screen_playback",
+            "promotional_graphic",
+            "context_only"
+          ],
+          "claim_support_level": "illustrative_only",
+          "exact_event_requirement": "none",
+          "degradation_codes": [
+            "direct_demonstration_unavailable",
+            "contextual_visual_substitution"
+          ],
+          "copy_suppression_codes": [
+            "specific_claim_copy_suppressed"
+          ]
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 24,
+        "preferred_frames": 54,
+        "maximum_frames": 90
+      },
+      "relation_mode": "single_subject",
+      "allowed_reconstruction": ["continuous", "hard_cut_after_result", "solid_fit"]
+    },
+    {
+      "beat_id": "watch_ui",
+      "feature_id": "watch9",
+      "priority": "hard",
+      "evidence_query_lock_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "required_target_ids": ["watch_ui"],
+      "allowed_evidence_provenance": ["direct_ui_interaction"],
+      "narrative_function": "feature_evidence",
+      "visual_events": [
+        {
+          "event_type": "watch_ui_state_change",
+          "cue_relation": "music_emphasis",
+          "tolerance_frames": 2
+        }
+      ],
+      "minimum_fulfillment_level": "contextual_identity",
+      "fulfillment_alternatives": [
+        {
+          "fulfillment_level": "direct_demonstration",
+          "accepted_evidence_provenance": [
+            "direct_ui_interaction"
+          ],
+          "claim_support_level": "direct",
+          "exact_event_requirement": "required_when_selected",
+          "visual_events": [
+            {
+              "event_type": "watch_ui_state_change",
+              "cue_relation": "music_emphasis",
+              "tolerance_frames": 2
+            }
+          ]
+        },
+        {
+          "fulfillment_level": "contextual_identity",
+          "accepted_evidence_provenance": [
+            "direct_physical_action",
+            "direct_ui_interaction",
+            "context_only"
+          ],
+          "claim_support_level": "illustrative_only",
+          "exact_event_requirement": "none",
+          "degradation_codes": [
+            "direct_demonstration_unavailable",
+            "contextual_visual_substitution"
+          ],
+          "copy_suppression_codes": [
+            "specific_claim_copy_suppressed"
+          ]
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 18,
+        "preferred_frames": 42,
+        "maximum_frames": 72
+      },
+      "relation_mode": "context_detail",
+      "allowed_reconstruction": ["continuous", "two_panel_layout", "solid_fit"]
+    },
+    {
+      "beat_id": "underwater_lift",
+      "feature_id": "watch_ultra2",
+      "priority": "preferred",
+      "evidence_query_lock_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "required_target_ids": ["underwater_watch"],
+      "allowed_evidence_provenance": ["direct_physical_action"],
+      "narrative_function": "feature_evidence",
+      "visual_events": [
+        {
+          "event_type": "underwater_lift_apex",
+          "cue_relation": "music_emphasis",
+          "tolerance_frames": 4
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 18,
+        "preferred_frames": 42,
+        "maximum_frames": 84
+      },
+      "relation_mode": "single_subject",
+      "allowed_reconstruction": ["continuous", "solid_fit"]
+    },
+    {
+      "beat_id": "group_laugh_ending",
+      "feature_id": "closing",
+      "priority": "preferred",
+      "evidence_query_lock_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "required_target_ids": ["group_laugh"],
+      "allowed_evidence_provenance": ["direct_physical_action"],
+      "narrative_function": "closing",
+      "visual_events": [
+        {
+          "event_type": "group_laugh_reaction_peak",
+          "cue_relation": "phrase_ending",
+          "tolerance_frames": 2
+        },
+        {
+          "event_type": "freeze_start",
+          "cue_relation": "phrase_ending",
+          "tolerance_frames": 2
+        }
+      ],
+      "duration": {
+        "minimum_readable_frames": 18,
+        "preferred_frames": 45,
+        "maximum_frames": 75
+      },
+      "relation_mode": "simultaneous_relation",
+      "allowed_reconstruction": ["continuous", "intentional_freeze", "solid_fit"]
+    }
+  ]
+}
