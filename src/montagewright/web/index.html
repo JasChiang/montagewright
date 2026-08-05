@@ -1364,9 +1364,11 @@ function cropAt(block, seconds) {
     if (t <= keys[i].at) {
       const a = keys[i - 1], b = keys[i];
       const span = (b.at - a.at) || 1;
-      // The render eases between these; a straight line here is close enough
-      // to show where the frame is, and is honest about being an indication.
-      const p = (t - a.at) / span;
+      // Smoothstep, the same 3u^2-2u^3 the render's crop expression uses.
+      // A straight line here put the box in the wrong place through the
+      // middle of every move, which is the part of a move worth checking.
+      const u = Math.max(0, Math.min((t - a.at) / span, 1));
+      const p = u * u * (3 - 2 * u);
       return {
         x: a.x + (b.x - a.x) * p, y: a.y + (b.y - a.y) * p,
         w: a.w + (b.w - a.w) * p, h: a.h + (b.h - a.h) * p,

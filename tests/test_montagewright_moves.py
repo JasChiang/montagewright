@@ -1899,3 +1899,23 @@ def test_the_selection_becomes_an_edl_without_reaching_for_a_missing_name(
     assert second.approx_out_seconds > second.approx_in_seconds
     assert second.reframe.subject.min_visible == 1.0
     assert snaps == {}
+
+
+def test_the_overlay_eases_the_way_the_render_does() -> None:
+    """The box is checked against the picture, so it has to move like it.
+
+    The crop expression ramps on smoothstep -- the camera takes up the move
+    and sets it down. Interpolating the drawn box linearly put it in the
+    wrong place through the middle of every move, which is the part of a
+    move anyone is checking.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "u * u * (3 - 2 * u)" in page
+
+    # The same curve the expression builder writes.
+    from montagewright.reframe import _eased
+
+    assert "*(3-2*" in _eased(0.0, 1.0, 0.0, 1.0)
