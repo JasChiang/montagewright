@@ -1143,3 +1143,23 @@ def test_cutting_before_a_sentence_ends_stays_available() -> None:
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     assert "留懸念" in prompt
     assert "為了湊秒數砍掉半句是意外" in prompt
+
+
+def test_the_voice_is_levelled_before_anything_goes_under_it() -> None:
+    """One bed cannot sit under two speakers fourteen decibels apart.
+
+    A street interview runs from a shouted answer to a mumbled one. Placed
+    against the average, the bed sat comfortably under the loud speaker and
+    five decibels under the quiet one -- close enough that the reviewer
+    reported the voice as inaudible and, unable to hear the opening line,
+    also reported the hook as missing.
+    """
+
+    import inspect
+
+    from jascue_auto import renderer
+
+    assert "speechnorm" in renderer.VOICE_LEVELLER
+    source = inspect.getsource(renderer._mux_music)
+    # Both paths: the steady bed and the ducked one.
+    assert source.count("VOICE_LEVELLER") == 2

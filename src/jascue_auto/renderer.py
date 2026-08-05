@@ -35,6 +35,14 @@ TRUE_PEAK_CEILING_DB = -1.5
 TRUE_PEAK_CEILING_LINEAR = 10 ** (TRUE_PEAK_CEILING_DB / 20)
 PREVIEW_HEIGHT = 640
 
+# Level the voice before anything is laid under it. A street interview runs
+# from a shouted answer to a mumbled one -- fourteen decibels apart in one
+# take here -- so a bed placed under the average sits comfortably under the
+# loud speaker and nearly on top of the quiet one. speechnorm is built for
+# this: it lifts quiet speech without pumping the gaps the way a compressor
+# aimed at music would.
+VOICE_LEVELLER = "speechnorm=e=12.5:r=0.0001:l=1"
+
 # How far under the voice the bed sits. Measured against the voice, not
 # subtracted from the music: a mastered track reduced by a fixed amount lands
 # wherever that track happened to be mastered, and a street interview averages
@@ -295,7 +303,8 @@ def _mux_music(
         # layer that watched the material rather than by a compressor.
         chain = (
             f"[1:a]atrim=0:{duration:.6f},volume={bed_gain:.2f}dB[bed];"
-            "[0:a][bed]amix=inputs=2:duration=first:normalize=0,"
+            f"[0:a]{VOICE_LEVELLER}[voice];"
+            "[voice][bed]amix=inputs=2:duration=first:normalize=0,"
             f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
             f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled"
             "[out]"
@@ -306,7 +315,7 @@ def _mux_music(
             # The voice is the sidechain trigger, not part of the output of
             # this branch -- asplit because one copy steers the compressor
             # and the other is what anyone actually hears.
-            "[0:a]asplit=2[voice][key];"
+            f"[0:a]{VOICE_LEVELLER},asplit=2[voice][key];"
             f"[bed][key]sidechaincompress="
             f"threshold={DUCK_THRESHOLD}:ratio={DUCK_RATIO}:"
             f"attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}[ducked];"
