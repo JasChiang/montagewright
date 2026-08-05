@@ -366,6 +366,7 @@
       <span class="zoom">縮放 <input type="range" id="zoom" min="6" max="120" step="1" value="24"></span>
       <button class="ghost" id="fit">符合寬度</button>
       <button class="ghost" id="undo-cut">還原</button>
+      <button class="ghost hide" id="burn">燒進畫面</button>
       <button id="recut" class="hide">重新輸出</button>
     </div>
     <div class="scroller" id="scroller">
@@ -763,6 +764,7 @@ async function loadSubs() {
 
 function paintSubs() {
   const lane = $('lane-subs');
+  $('burn').classList.toggle('hide', !subs.length);
   lane.classList.toggle('silent', !subs.length);
   if (!subs.length) {
     lane.innerHTML = '這支片沒有語音，所以沒有字幕';
@@ -1464,6 +1466,30 @@ function paintWavesWhenSettled() {
   clearTimeout(wavesSoon);
   wavesSoon = setTimeout(() => paintWaves(reelSeconds()), 250);
 }
+
+$('burn').addEventListener('click', async () => {
+  const button = $('burn');
+  button.disabled = true;
+  const said = button.textContent;
+  button.textContent = '燒進畫面中…';
+  try {
+    const got = await fetch(`/api/runs/${runId}/burn-subtitles`, {
+      method: 'POST',
+    });
+    const answer = await got.json();
+    if (!got.ok) throw new Error(answer.detail || '燒不進去');
+    // The cut without them stays where it was. Burned-in text cannot be
+    // taken out again, so which one gets posted is not decided here.
+    $('strip-note').innerHTML =
+      `字幕燒好了：${answer.lines} 句，用 ${esc(answer.aspect)} 的安全區　`
+      + `<a class="link" href="/api/runs/${runId}/burned" download>下載</a>`;
+  } catch (error) {
+    $('strip-note').textContent = `燒不進去：${error.message}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = said;
+  }
+});
 
 $('zoom').addEventListener('input', () => {
   scale = +$('zoom').value;

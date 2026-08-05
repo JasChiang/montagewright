@@ -942,6 +942,53 @@ def create_app() -> FastAPI:
         )
         return JSONResponse({"lines": len(kept)})
 
+    @app.post("/api/runs/{run_id}/burn-subtitles")
+    def burn_subtitles(run_id: str) -> JSONResponse:
+        """Put the words on the picture, using the lines as they now read.
+
+        Costs nothing: the transcript was paid for once and the corrections
+        were made by hand. Kept as its own file so the cut without them is
+        still there -- burned-in text cannot be taken out again, and which
+        one gets posted is not this tool's decision.
+        """
+
+        from montagewright.subtitles import NoFontHere, burn
+
+        run = _run(run_id)
+        said = _subtitle_lines(run)
+        if not said:
+            raise HTTPException(404, "nothing was transcribed in this run")
+        source = next(
+            (
+                run.output / name
+                for name in ("deliverable.mp4", "picture.mp4")
+                if (run.output / name).exists()
+            ),
+            None,
+        )
+        if source is None:
+            raise HTTPException(404, "this run has no finished cut")
+        aspect = (run.report() or {}).get("direction", {}).get("aspect", "9:16")
+        try:
+            made = burn(
+                source, said, run.output / "deliverable-subtitled.mp4",
+                aspect=aspect, work=run.output / "work" / "subs",
+            )
+        except NoFontHere as error:
+            raise HTTPException(422, str(error))
+        return JSONResponse({
+            "file": made.name, "lines": len(said), "aspect": aspect,
+        })
+
+    @app.get("/api/runs/{run_id}/burned")
+    def burned(run_id: str):
+        run = _run(run_id)
+        made = run.output / "deliverable-subtitled.mp4"
+        if not made.exists():
+            raise HTTPException(404, "not burned yet")
+        return FileResponse(made, media_type="video/mp4",
+                            filename=f"{run_id}-subtitled.mp4")
+
     @app.get("/api/runs/{run_id}/subtitles")
     def subtitles(run_id: str):
         """Every transcript in the run, as one SRT against the finished cut.

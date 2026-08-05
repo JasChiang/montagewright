@@ -2183,3 +2183,82 @@ def test_an_edited_line_is_what_appears_and_the_transcript_stays_true(
     assert [line.text for line in fixed] == ["Galaxy Z Fold"]
     # What was actually heard survives the correction.
     assert fixed[0].heard == "Galaxy Z 佛的"
+
+
+def test_the_safe_area_is_a_property_of_where_the_film_is_going() -> None:
+    """A 9:16 cut is watched inside an app that draws over its own bottom.
+
+    The handle, the caption and the button rail sit in the lower fifth, so a
+    subtitle where a subtitle traditionally goes is a subtitle nobody reads.
+    A 16:9 cut has none of that. One number for both would be the execution
+    layer deciding something about distribution.
+    """
+
+    from montagewright.subtitles import SAFE_AREAS, safe_area
+
+    tall = safe_area("9:16")
+    wide = safe_area("16:9")
+    assert tall.up_from_bottom > wide.up_from_bottom * 2
+    assert tall.side_margin > wide.side_margin
+    # Every aspect the render flag offers has one.
+    assert set(SAFE_AREAS) == {"9:16", "4:5", "1:1", "16:9"}
+    # An aspect nobody planned for gets the most constrained band, not none.
+    assert safe_area("21:9") == SAFE_AREAS["9:16"]
+
+
+def test_a_subtitle_never_loses_a_word_to_fit() -> None:
+    """Cutting the overflow at max_lines dropped the last word of a
+    sentence and left a cut that looked finished."""
+
+    from montagewright.subtitles import _face, safe_area, wrap
+
+    area = safe_area("9:16")
+    room = round(360 * (1 - area.side_margin * 2))
+    said = "對，然後你就…你就已經濕漉漉了，然後慢慢被自己…被慢慢被下午"
+
+    # At the asked-for size it needs three lines; something has to give, and
+    # what gives is the size.
+    asked = round(640 * area.text_height)
+    assert len(wrap(said, _face(asked), room)) > area.max_lines
+    for attempt in range(6):
+        size = max(12, round(asked * (1 - attempt * 0.06)))
+        lines = wrap(said, _face(size), room)
+        if len(lines) <= area.max_lines:
+            break
+    assert len(lines) <= area.max_lines
+    assert "".join(lines) == said
+
+
+def test_no_line_begins_with_a_mark_that_closes_one() -> None:
+    """Breaking before a comma hangs it under the line above.
+
+    It is the one typographic mistake in Chinese that everybody notices, and
+    it was in the first frame that came out of this.
+    """
+
+    from montagewright.subtitles import NEVER_STARTS, _face, safe_area, wrap
+
+    area = safe_area("9:16")
+    room = round(360 * (1 - area.side_margin * 2))
+    for said in (
+        "對，然後你就…你就已經濕漉漉了，然後慢慢被自己蒸乾",
+        "在夏天讓你最崩潰的事情是什麼？我覺得是流汗，還有曬傷。",
+    ):
+        for line in wrap(said, _face(round(640 * area.text_height)), room)[1:]:
+            assert line[0] not in NEVER_STARTS, line
+
+
+def test_two_lines_are_balanced_rather_than_filled() -> None:
+    """A full line and an orphan reads as a mistake on screen."""
+
+    from montagewright.subtitles import _face, wrap
+
+    face = _face(40)
+    said = "對，然後你就已經濕漉漉了，然後慢慢被自己蒸乾"
+    wide = face.getbbox(said)[2]
+    lines = wrap(said, face, round(wide * 0.6))
+
+    assert len(lines) == 2
+    shorter = min(face.getbbox(one)[2] for one in lines)
+    longer = max(face.getbbox(one)[2] for one in lines)
+    assert shorter > longer * 0.6, lines

@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from montagewright.uploads import upload_now
@@ -269,9 +270,13 @@ def lines_of(card: dict[str, Any]) -> list[Line]:
 def against_cut(
     shots: list[dict],
     rhythm: dict[str, dict],
+    # Read-only, and a Mapping rather than a dict so a caller holding plain
+    # cards can pass them: dict is invariant in its value type, so
+    # dict[str, dict] is not a dict[str, dict | None].
+    #
     # A source with nothing transcribed has no card, and `load` returns None
     # for one it cannot read. Both mean the same thing here: no lines.
-    cards: dict[str, dict | None],
+    cards: Mapping[str, dict | None],
 ) -> list[Line]:
     """Every transcribed line, moved onto the timeline the shots landed on.
 

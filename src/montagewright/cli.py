@@ -637,6 +637,37 @@ def command_render(args: argparse.Namespace) -> int:
         report.spend().get("by_stage", {}).items(), key=lambda kv: -kv[1]
     ):
         print(f"  {stage:12s} ${usd:.4f}", flush=True)
+    # The words, once there is a cut for them to sit on. Written from the
+    # same lines the timeline shows, so what was corrected in the interface
+    # is what gets burned.
+    if transcripts and args.subtitles != "none":
+        from montagewright.transcript import against_cut, to_srt
+
+        said = against_cut(
+            selection["shots"],
+            {k: v for k, v in report.rhythm_decisions.items()},
+            transcripts,
+        )
+        if said:
+            (output / "subtitles.srt").write_text(
+                to_srt(said, with_speaker=True), encoding="utf-8"
+            )
+            print(f"subtitles   {output / 'subtitles.srt'}", flush=True)
+            if args.subtitles == "burn":
+                from montagewright.subtitles import NoFontHere, burn
+
+                try:
+                    burned = burn(
+                        result.deliverable, said,
+                        output / "deliverable-subtitled.mp4",
+                        aspect=args.aspect, work=work / "subs",
+                    )
+                    print(f"burned in   {burned}", flush=True)
+                except NoFontHere as error:
+                    # The cut is finished either way; say what is missing
+                    # rather than failing a render over a font.
+                    print(f"not burned  {error}", flush=True)
+
     print(f"deliverable {result.deliverable}", flush=True)
     print(f"preview     {result.preview}", flush=True)
 
@@ -1100,6 +1131,13 @@ def main(argv: list[str] | None = None) -> int:
         "--timeline", choices=["none", "premiere", "finalcut", "both"],
         default="none",
         help="also write an editable timeline (off unless asked for)",
+    )
+    render.add_argument(
+        "--subtitles", choices=["none", "sidecar", "burn"], default="sidecar",
+        help=(
+            "sidecar writes an SRT beside the cut; burn also puts the words "
+            "on the picture, inside the safe area for the delivery aspect"
+        ),
     )
     render.add_argument(
         "--speech", choices=["auto", "never"], default="auto",

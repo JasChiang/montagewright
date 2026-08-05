@@ -1,0 +1,286 @@
+"""Putting the words on the picture.
+
+Two things decide where a subtitle can sit, and neither is a constant.
+
+The first is the delivery shape. A 9:16 cut is watched inside an app that
+draws its own things over the bottom of the frame -- the handle, the caption,
+the row of buttons -- so a caption sitting where a caption traditionally sits
+is a caption nobody reads. A 16:9 cut has none of that and only wants the
+old title-safe margin. The band is a property of where the film is going, and
+writing one number for all of them would be the execution layer deciding
+something about distribution.
+
+The second is the font. A line that fits in 16:9 does not fit in 9:16, and
+Chinese does not break on spaces, so "how many characters per line" is not a
+number either -- it is measured, against the actual font at the actual size.
+
+The words themselves are drawn here rather than by ffmpeg. Its text filters
+need libass or libfreetype compiled in, and the build on this machine has
+neither, so a tool that depended on them would work here and not there. This
+needs only `overlay`, which every build has.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+# 禁則: characters a line is not allowed to begin with. Breaking before a
+# comma leaves it hanging under the start of the line above, which is the
+# one typographic mistake in Chinese that everybody notices.
+NEVER_STARTS = "，。、！？：；）」』】》,.!?;:)]}"
+
+# Ordered by preference. The first that opens wins; a machine with none of
+# them cannot burn Chinese subtitles and is told so rather than shown boxes.
+FONTS: tuple[str, ...] = (
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/Supplemental/Songti.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+)
+
+
+class NoFontHere(RuntimeError):
+    """Nothing on this machine can draw the characters in these lines."""
+
+
+@dataclass(frozen=True)
+class SafeArea:
+    """Where the words are allowed to be, as fractions of the frame.
+
+    `up_from_bottom` is to the bottom of the last line, not to the baseline
+    of the first: a two-line subtitle grows upward, so that it never grows
+    down into whatever the player is drawing there.
+    """
+
+    up_from_bottom: float
+    side_margin: float
+    # Cap height as a fraction of frame height. Vertical video is watched
+    # smaller and further from the eye than a 16:9 cut on a desktop, so the
+    # same apparent size is a bigger fraction of a shorter frame.
+    text_height: float
+    # No more than this many lines at once. Three lines of Chinese over a
+    # talking head is a wall, and it means the line should have been split
+    # at the cut instead.
+    max_lines: int = 2
+
+
+# Keyed by the same names the aspect flag uses.
+SAFE_AREAS: dict[str, SafeArea] = {
+    # Reels, Shorts and TikTok all draw a caption block and a button rail
+    # over the lower fifth. Measured against a screenshot of each rather
+    # than guessed: the tallest intrusion is TikTok's caption plus handle.
+    "9:16": SafeArea(up_from_bottom=0.22, side_margin=0.08, text_height=0.030),
+    # A feed post. The bottom is clear in the post itself, but a reshare to
+    # a story puts it back, so this keeps a little more room than it needs.
+    "4:5": SafeArea(up_from_bottom=0.14, side_margin=0.07, text_height=0.034),
+    "1:1": SafeArea(up_from_bottom=0.12, side_margin=0.07, text_height=0.038),
+    # Nothing is drawn over this one. The margin is the old title-safe rule.
+    "16:9": SafeArea(up_from_bottom=0.10, side_margin=0.06, text_height=0.045),
+}
+
+
+def safe_area(aspect: str) -> SafeArea:
+    """The band for a delivery shape, defaulting to the most constrained."""
+
+    return SAFE_AREAS.get(aspect, SAFE_AREAS["9:16"])
+
+
+def _face(size: int):
+    from PIL import ImageFont
+
+    for candidate in FONTS:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    raise NoFontHere(
+        "no CJK font found; subtitles can be written as a file but not "
+        "burned into the picture on this machine"
+    )
+
+
+def wrap(text: str, face, room: int) -> list[str]:
+    """Break a line to fit, measuring rather than counting.
+
+    Chinese does not break on spaces, so a character budget is wrong for any
+    line with a number, a product name or a laugh in it. This asks the font
+    how wide the string actually is, and breaks at a space when there is one
+    near enough to be the better break.
+
+    Filling each line before starting the next is how a paragraph is set,
+    and a subtitle is not a paragraph: it left "然後慢慢被自己 / 蒸乾", a
+    full line and an orphan, which reads as a mistake on screen. Two lines
+    get balanced instead.
+    """
+
+    if not text:
+        return []
+    if face.getbbox(text)[2] > room and face.getbbox(text)[2] <= room * 2:
+        halved = _in_two(text, face, room)
+        if halved:
+            return halved
+    lines: list[str] = []
+    rest = text
+    while rest:
+        if face.getbbox(rest)[2] <= room:
+            lines.append(rest)
+            break
+        cut = len(rest)
+        while cut > 1 and face.getbbox(rest[:cut])[2] > room:
+            cut -= 1
+        # Prefer a space, but only if it is not so far back that the line
+        # ends up half empty.
+        spaced = rest.rfind(" ", 0, cut + 1)
+        if spaced > cut * 0.6:
+            cut = spaced
+        # Never leave the next line starting on a closing mark.
+        while cut > 1 and rest[cut:cut + 1] in NEVER_STARTS:
+            cut -= 1
+        lines.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    return lines
+
+
+def _in_two(text: str, face, room: int) -> list[str] | None:
+    """Split once, as near the middle as the font allows."""
+
+    best = None
+    for cut in range(1, len(text)):
+        head, tail = text[:cut].rstrip(), text[cut:].lstrip()
+        if not head or not tail:
+            continue
+        if tail[0] in NEVER_STARTS:
+            continue
+        wide_head = face.getbbox(head)[2]
+        wide_tail = face.getbbox(tail)[2]
+        if wide_head > room or wide_tail > room:
+            continue
+        # A break after punctuation is a break the sentence already had.
+        bonus = 0 if text[cut - 1] in "，。、！？：；,.!?;:" else 1
+        score = (abs(wide_head - wide_tail), bonus)
+        if best is None or score < best[0]:
+            best = (score, [head, tail])
+    return best[1] if best else None
+
+
+def draw_line(
+    text: str,
+    *,
+    width: int,
+    height: int,
+    area: SafeArea,
+    into: Path,
+) -> tuple[Path, int, int] | None:
+    """One subtitle as a transparent image, plus where to put it.
+
+    Returns the file and its top-left corner in the frame, or None when the
+    line has nothing to draw.
+    """
+
+    from PIL import Image, ImageDraw
+
+    room = round(width * (1 - area.side_margin * 2))
+    asked = max(12, round(height * area.text_height))
+
+    # Fit by getting smaller, never by saying less. Cutting the overflow
+    # off at max_lines dropped the last word of a sentence and left a cut
+    # that looked finished, which is the worst way for a subtitle to fail.
+    size, face, lines = asked, _face(asked), []
+    for attempt in range(6):
+        size = max(12, round(asked * (1 - attempt * 0.06)))
+        face = _face(size)
+        lines = wrap(text, face, room)
+        if len(lines) <= area.max_lines:
+            break
+    if not lines:
+        return None
+
+    # An outline, not a box. A box is legible and covers the picture; an
+    # outline stays readable over both a bright sky and a dark interior,
+    # which is what a street interview is made of.
+    edge = max(2, round(size * 0.09))
+    gap = round(size * 0.34)
+    step = size + gap
+
+    widest = max(face.getbbox(one)[2] for one in lines)
+    canvas = Image.new(
+        "RGBA",
+        (widest + edge * 4, step * len(lines) + edge * 4),
+        (0, 0, 0, 0),
+    )
+    pen = ImageDraw.Draw(canvas)
+    for index, one in enumerate(lines):
+        at_x = (canvas.width - face.getbbox(one)[2]) // 2
+        at_y = edge * 2 + index * step
+        pen.text(
+            (at_x, at_y), one, font=face, fill=(255, 255, 255, 255),
+            stroke_width=edge, stroke_fill=(0, 0, 0, 205),
+        )
+
+    into.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(into)
+    left = (width - canvas.width) // 2
+    top = round(height * (1 - area.up_from_bottom)) - canvas.height
+    return into, max(0, left), max(0, top)
+
+
+def burn(
+    picture: Path,
+    lines: Sequence,
+    destination: Path,
+    *,
+    aspect: str,
+    work: Path,
+) -> Path:
+    """Composite the lines onto the picture, each over its own window.
+
+    One overlay per line, gated by time. ffmpeg's own subtitle filters would
+    be one filter instead of thirty, and are not in every build -- including
+    the one this was written on.
+    """
+
+    from montagewright.measure.media import probe_video
+
+    shape = probe_video(picture).video
+    # display_*, not coded_*: the coded size is padded to the macroblock
+    # grid, and a subtitle placed against padding sits a few pixels off.
+    width, height = int(shape.display_width), int(shape.display_height)
+    area = safe_area(aspect)
+
+    drawn = []
+    for index, line in enumerate(lines):
+        made = draw_line(
+            line.text, width=width, height=height, area=area,
+            into=work / f"sub-{index:04d}.png",
+        )
+        if made is not None:
+            drawn.append((made, line))
+    if not drawn:
+        raise ValueError("no lines with anything on them")
+
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-i", str(picture)]
+    for (path, _, _), _ in drawn:
+        command += ["-i", str(path)]
+
+    steps, tag = [], "0:v"
+    for index, ((_, left, top), line) in enumerate(drawn):
+        nxt = f"v{index}"
+        steps.append(
+            f"[{tag}][{index + 1}:v]overlay={left}:{top}:"
+            f"enable='between(t,{line.starts_seconds:.3f},"
+            f"{line.ends_seconds:.3f})'[{nxt}]"
+        )
+        tag = nxt
+    command += [
+        "-filter_complex", ";".join(steps),
+        "-map", f"[{tag}]", "-map", "0:a?",
+        "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", "-c:a", "copy", str(destination),
+    ]
+    subprocess.run(command, check=True)
+    return destination
