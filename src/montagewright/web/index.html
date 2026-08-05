@@ -193,6 +193,45 @@
   }
   .steps li.done .mark { border-color: var(--ok); color: var(--ok); }
   .steps li.now .mark { border-color: var(--accent); color: var(--accent); }
+  /* the strip */
+  .strip { margin: 24px 0 0; padding-top: 22px; border-top: 1px solid var(--line-soft); }
+  .track {
+    display: flex; gap: 2px; height: 46px; user-select: none;
+    border-radius: 8px; overflow: hidden; background: var(--sunken);
+    border: 1px solid var(--line);
+  }
+  .blk {
+    position: relative; min-width: 12px; cursor: pointer;
+    background: color-mix(in srgb, var(--ok) 14%, var(--surface));
+    border-left: 2px solid color-mix(in srgb, var(--ok) 55%, transparent);
+    padding: 6px 7px; overflow: hidden; transition: background .12s;
+  }
+  .blk.no {
+    background: var(--accent-soft);
+    border-left-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  .blk:hover { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+  .blk.on { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .blk .lab {
+    font-size: 10.5px; color: var(--ink-soft); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+  }
+  .blk .dur { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+  .blk .grip {
+    position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize;
+  }
+  .blk .grip.l { left: 0 } .blk .grip.r { right: 0 }
+  .blk .grip:hover { background: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .blk .kill {
+    position: absolute; top: 3px; right: 4px; width: 15px; height: 15px;
+    border-radius: 4px; display: none; place-items: center; font-size: 11px;
+    background: var(--surface); color: var(--accent); border: 1px solid var(--line);
+  }
+  .blk:hover .kill { display: grid; }
+  .strip .legend {
+    display: flex; gap: 14px; justify-content: space-between;
+    margin-top: 8px; font-size: 12px; color: var(--dim);
+  }
   .steps li.broke .mark { border-color: var(--accent); color: var(--accent); }
   .steps li.broke .name { color: var(--accent); }
   .fault {
@@ -397,6 +436,16 @@
         <table id="spend"></table>
       </div>
     </div>
+    <div class="strip hide" id="strip">
+      <div class="track" id="track"></div>
+      <div class="legend">
+        <span id="strip-note">拖邊緣改進出點，拖方塊換順序，× 刪掉</span>
+        <span class="row" style="gap:8px">
+          <button type="button" class="ghost" id="undo-cut" style="padding:5px 11px;font-size:12.5px">還原</button>
+          <button type="button" id="recut" class="hide" style="padding:5px 13px;font-size:12.5px">重新輸出</button>
+        </span>
+      </div>
+    </div>
   </section>
 
   <section class="hide" id="shots">
@@ -517,6 +566,130 @@ async function openRun(id) {
   window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
 }
 
+let blocks = [], blocksWere = [], picked = -1;
+
+async function showStrip() {
+  const data = await (await fetch(`/api/runs/${runId}/timeline-data`)).json();
+  if (!data.blocks.length) return;
+  blocks = data.blocks.map((b, i) => ({ ...b, index: i }));
+  blocksWere = JSON.parse(JSON.stringify(blocks));
+  paintStrip();
+  $('strip').classList.remove('hide');
+}
+
+function paintStrip() {
+  const total = blocks.reduce((a, b) => a + b.seconds, 0) || 1;
+  $('track').innerHTML = blocks.map((b, i) => `
+    <div class="blk ${b.delivered === false ? 'no' : ''} ${i === picked ? 'on' : ''}"
+         style="flex:${b.seconds} 0 0" data-i="${i}" draggable="true"
+         title="${esc(b.source_id)}　${esc(b.subject)}">
+      <div class="grip l" data-edge="l" data-i="${i}"></div>
+      <div class="lab">${esc(b.source_id)}</div>
+      <div class="dur">${b.seconds.toFixed(1)}s</div>
+      <div class="kill" data-kill="${i}">×</div>
+      <div class="grip r" data-edge="r" data-i="${i}"></div>
+    </div>`).join('');
+  wireStrip();
+  const changed = JSON.stringify(blocks) !== JSON.stringify(blocksWere);
+  $('recut').classList.toggle('hide', !changed);
+  $('strip-note').textContent = changed
+    ? `${blocks.length} 顆，共 ${total.toFixed(1)}s——按「重新輸出」套用（不用錢）`
+    : '拖邊緣改進出點，拖方塊換順序，× 刪掉';
+}
+
+function wireStrip() {
+  let from = -1;
+  for (const el of $('track').querySelectorAll('.blk')) {
+    const i = +el.dataset.i;
+    el.onclick = (e) => {
+      if (e.target.dataset.kill !== undefined || e.target.classList.contains('grip')) return;
+      picked = i; paintStrip();
+      const at = blocks.slice(0, i).reduce((a, b) => a + b.seconds, 0);
+      $('video').currentTime = at + 0.05;
+      const row = $('shot-table').querySelectorAll('tr')[blocks[i].index + 1];
+      if (row) row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    };
+    el.ondragstart = () => { from = i; };
+    el.ondragover = (e) => e.preventDefault();
+    el.ondrop = () => {
+      if (from < 0 || from === i) return;
+      const [moved] = blocks.splice(from, 1);
+      blocks.splice(i, 0, moved);
+      from = -1; picked = -1; paintStrip();
+    };
+  }
+  for (const el of $('track').querySelectorAll('[data-kill]')) {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      blocks.splice(+el.dataset.kill, 1);
+      picked = -1; paintStrip();
+    };
+  }
+  for (const grip of $('track').querySelectorAll('.grip')) {
+    grip.onmousedown = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const i = +grip.dataset.i, edge = grip.dataset.edge;
+      const b = blocks[i], startX = e.clientX;
+      const was = { in: b.in_seconds, sec: b.seconds };
+      const perPx = (blocks.reduce((a, x) => a + x.seconds, 0)) / $('track').offsetWidth;
+      const move = (ev) => {
+        const d = (ev.clientX - startX) * perPx;
+        if (edge === 'l') {
+          // Pulling the head earlier eats into the handle; the shot keeps
+          // its out-point, so it gets longer rather than sliding.
+          const shift = Math.max(-was.in, Math.min(d, was.sec - 0.3));
+          b.in_seconds = +(was.in + shift).toFixed(3);
+          b.seconds = +(was.sec - shift).toFixed(3);
+        } else {
+          const room = b.source_seconds ? b.source_seconds - b.in_seconds : 99;
+          b.seconds = +Math.max(0.3, Math.min(was.sec + d, room)).toFixed(3);
+        }
+        paintStrip();
+      };
+      const up = () => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    };
+  }
+}
+
+$('undo-cut').addEventListener('click', () => {
+  blocks = JSON.parse(JSON.stringify(blocksWere)); picked = -1; paintStrip();
+});
+
+$('recut').addEventListener('click', async () => {
+  $('recut').disabled = true;
+  $('strip-note').textContent = '重新輸出中…';
+  const res = await fetch(`/api/runs/${runId}/recut`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ shots: blocks.map(b => ({
+      index: b.index, in_seconds: b.in_seconds, seconds: b.seconds })) }),
+  });
+  $('recut').disabled = false;
+  if (!res.ok) { $('strip-note').textContent = '失敗：' + (await res.text()).slice(0, 120); return; }
+  const out = await res.json();
+  $('video').src = `/api/runs/${runId}/video?t=` + Date.now();
+  blocksWere = JSON.parse(JSON.stringify(blocks));
+  $('strip-note').textContent = `已重新輸出：${out.shots} 顆、${out.seconds.toFixed(1)}s`;
+  $('recut').classList.add('hide');
+});
+
+// Follow the playhead so the strip says where you are.
+document.addEventListener('DOMContentLoaded', () => {
+  $('video').addEventListener('timeupdate', () => {
+    if (!blocks.length) return;
+    let at = 0, now = -1;
+    blocks.forEach((b, i) => {
+      if ($('video').currentTime >= at) now = i;
+      at += b.seconds;
+    });
+    if (now !== picked) { picked = now; paintStrip(); }
+  });
+});
+
 async function showTranscripts() {
   const data = await (await fetch(`/api/runs/${runId}/transcripts`)).json();
   const rows = [];
@@ -546,6 +719,7 @@ function showExtras() {
     if (r.ok) { $('subs').href = `/api/runs/${runId}/subtitles`; $('subs').classList.remove('hide'); }
   });
   showTranscripts();
+  showStrip();
 }
 
 loadPast();

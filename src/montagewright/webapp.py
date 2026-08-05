@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException, UploadFile
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
@@ -365,6 +365,154 @@ def create_app() -> FastAPI:
                 ) or None,
             })
         return JSONResponse({"runs": out})
+
+    @app.get("/api/runs/{run_id}/timeline-data")
+    def timeline_data(run_id: str) -> JSONResponse:
+        """Each shot's place on the timeline, and how far it can be pulled.
+
+        The handles were rendered for exactly this and nothing could reach
+        them: half a second either side, invisible, unusable.
+        """
+
+        from montagewright.pipeline import probe
+
+        run = _run(run_id)
+        report = run.report() or {}
+        shots = report.get("selection", {}).get("shots", [])
+        rhythm = report.get("rhythm", {})
+        verdicts = report.get("shots", {})
+
+        found: dict[str, float] = {}
+        blocks, cursor = [], 0.0
+        for index, shot in enumerate(shots):
+            key = f"k{index:02d}"
+            seconds = float(rhythm.get(key, {}).get("seconds", 0.0))
+            source_id = shot.get("source_id", "")
+            if source_id not in found:
+                match = next(
+                    (
+                        path for path in
+                        list((run.output / "work" / "shots").glob("*"))
+                        + list(Path(run.source).glob("*"))
+                        if path.stem == source_id
+                    ),
+                    None,
+                )
+                found[source_id] = (
+                    probe(source_id, match).duration_seconds if match else 0.0
+                )
+            blocks.append({
+                "clip_id": key,
+                "source_id": source_id,
+                "at": round(cursor, 3),
+                "seconds": round(seconds, 3),
+                "in_seconds": float(shot.get("start_seconds", 0.0)),
+                "source_seconds": round(found[source_id], 3),
+                "subject": shot.get("subject", ""),
+                "why": shot.get("why", ""),
+                "delivered": verdicts.get(key, {}).get("delivered"),
+                "note": verdicts.get(key, {}).get("note", ""),
+            })
+            cursor += seconds
+        return JSONResponse({"blocks": blocks, "seconds": round(cursor, 3)})
+
+    @app.post("/api/runs/{run_id}/recut")
+    async def recut(run_id: str, request: Request) -> JSONResponse:
+        """Render an amended running order. No model calls, so no cost.
+
+        Everything that was decided stays decided -- the crop, the subject,
+        the move. This moves cuts and drops shots, which is the part a person
+        wants after watching it once and does not want to re-plan a whole
+        film for.
+        """
+
+        from montagewright.executor import Source, plan_render
+        from montagewright.pipeline import follow_subjects, probe, Report
+        from montagewright.renderer import render as render_cut
+        from montagewright.schema import EDL, Clip, Reframe, Subject
+
+        run = _run(run_id)
+        report = run.report() or {}
+        wanted = (await request.json()).get("shots", [])
+        if not wanted:
+            raise HTTPException(400, "nothing left to cut")
+
+        original = report.get("selection", {}).get("shots", [])
+        aspect = ASPECTS.get(
+            report.get("direction", {}).get("aspect", "9:16"), 9 / 16
+        )
+        cards = {
+            path.stem: path
+            for path in (Path.home() / ".cache" / "montagewright"
+                         / "library" / "cards").glob("*.json")
+        }
+
+        clips, sources = [], {}
+        for index, entry in enumerate(wanted):
+            plan = original[int(entry["index"])]
+            source_id = plan["source_id"]
+            if source_id not in sources:
+                match = next(
+                    (
+                        path for path in
+                        list((run.output / "work" / "shots").glob("*"))
+                        + list(Path(run.source).glob("*"))
+                        if path.stem == source_id
+                    ),
+                    None,
+                )
+                if match is None:
+                    raise HTTPException(404, f"{source_id} is gone")
+                sources[source_id] = probe(source_id, match)
+            start = float(entry["in_seconds"])
+            clips.append(Clip(
+                clip_id=f"k{index:02d}", source_id=source_id,
+                approx_in_seconds=start,
+                approx_out_seconds=start + float(entry["seconds"]),
+                in_looks_like=plan.get("subject", ""),
+                energy_intent=plan.get("energy", "medium"),
+                reframe=Reframe(
+                    subject=Subject(
+                        description=plan.get("subject", ""),
+                        min_visible=1.0 if plan.get("must_be_whole") else 0.85,
+                    ),
+                    intent=plan.get("why", "")[:120],
+                    camera_move=plan.get("camera_move", "hold"),
+                    framing=plan.get("framing", "thirds"),
+                    camera_energy="active",
+                ),
+            ))
+
+        edl = EDL(project_id=run_id, clips=clips)
+        fresh = Report()
+        paths = follow_subjects(
+            edl, sources, target_aspect=aspect, report=fresh,
+            cards=cards, checkpoint=None, client=None,
+        )
+        plan = plan_render(
+            edl, sources, target_aspect=aspect, crop_paths=paths
+        )
+        # The bed and whether the voice survives were decided when the run
+        # was set up; a recut is a different running order, not a different
+        # film, so both carry over.
+        music = None
+        if "--music" in run.command:
+            candidate = Path(run.command[run.command.index("--music") + 1])
+            music = candidate if candidate.exists() else None
+        result = render_cut(
+            plan, run.output, music=music, keep_segments=True,
+            keep_voice=bool(
+                list((Path.home() / ".cache" / "montagewright" / "library"
+                      / "transcripts").glob("*.json"))
+            ),
+            under_speech=str(
+                report.get("direction", {}).get("music_under_speech") or "duck"
+            ),
+        )
+        return JSONResponse({
+            "seconds": round(result.duration_seconds, 3),
+            "shots": len(clips),
+        })
 
     @app.get("/api/runs/{run_id}/transcripts")
     def transcripts(run_id: str) -> JSONResponse:

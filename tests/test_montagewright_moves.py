@@ -1421,3 +1421,27 @@ def test_cards_belong_to_the_material_not_to_one_attempt() -> None:
     source = inspect.getsource(cli.command_render)
     assert 'library / "cards"' in source
     assert 'library / "transcripts"' in source
+
+
+def test_the_cut_can_be_adjusted_without_replanning_it() -> None:
+    """The four things anyone wants after watching it once.
+
+    A sentence cut short, a shot that runs long, an order that reads better
+    the other way, one shot that should go. None of those need the film
+    re-planned, and re-planning them costs money and changes everything
+    else. The strip trims, reorders and drops; the recut renders from the
+    amended order with no model calls, so it is free.
+    """
+
+    from montagewright.webapp import PAGE, create_app
+
+    paths = {r.path for r in create_app().routes if hasattr(r, "path")}
+    assert "/api/runs/{run_id}/recut" in paths
+    assert "/api/runs/{run_id}/timeline-data" in paths
+
+    page = PAGE.read_text(encoding="utf-8")
+    for piece in ("paintStrip", "data-edge", "ondrop", "data-kill", "undo-cut"):
+        assert piece in page, piece
+    # Pulling the head earlier eats into the handle rather than sliding the
+    # shot, so the out-point stays where the edit put it.
+    assert "keeps its out-point" in page
