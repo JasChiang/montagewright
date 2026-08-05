@@ -1714,3 +1714,68 @@ def test_a_block_carries_the_shot_it_came_from() -> None:
         / "src" / "montagewright" / "webapp.py"
     ).read_text(encoding="utf-8")
     assert '"index": index,' in source
+
+
+def test_the_reel_says_whether_its_boxes_are_the_render_s_or_a_rebuild(
+) -> None:
+    """A guess shaped like evidence is worse than no evidence.
+
+    Only a held frame can be re-derived after the fact, and only when a card
+    can name the subject. Where it cannot, the rebuild centres -- and a
+    centred box drawn over the take, unlabelled, says the render centred
+    too. This view exists to be checkable, so it has to say which it holds.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "crops_are" in page and "cropsAre" in page
+    assert "推測" in page
+    assert "不等於實際裁切" in page
+
+
+def test_peeking_does_not_seek_the_take_every_frame() -> None:
+    """A seek is a decode from the nearest keyframe.
+
+    Doing one per frame to keep two players aligned pinned a core and played
+    like a slideshow, when a playing video keeps its own time for free.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "raw.play()" in page
+    assert "cut.paused ? 0.08 : 0.35" in page
+
+
+def test_the_take_is_served_as_a_proxy_when_there_is_one() -> None:
+    """128MB of 4K to draw a rectangle on, where 256KB says the same thing."""
+
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "webapp.py"
+    ).read_text(encoding="utf-8")
+    assert 'proxy = run.output / "work" / "proxies" / f"{source_id}.mp4"' in source
+    assert "if proxy.exists():" in source
+
+
+def test_one_reframe_builder_for_the_run_and_for_the_rebuild() -> None:
+    """The rebuild's copy was missing then_subject.
+
+    A pan between two subjects in one frame is the only move that reads it,
+    so the handoff branch was never reached and a pan measured at
+    0.278 -> 0.696 was rebuilt as a held centre crop.
+    """
+
+    from montagewright.webapp import _reframe_of
+
+    both = _reframe_of({
+        "subject": "the left, black smartphone",
+        "then_subject": "the right, white smartphone",
+        "camera_move": "pan",
+    })
+    assert both.then_subject is not None
+    assert both.then_subject.description == "the right, white smartphone"
+    assert _reframe_of({"subject": "a phone"}).then_subject is None

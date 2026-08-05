@@ -86,6 +86,12 @@
     font-size: 10px; font-family: var(--mono); color: #fff;
     background: var(--accent); padding: 1px 5px; border-radius: 3px; white-space: nowrap;
   }
+  .warn {
+    position: absolute; left: 18px; right: 18px; bottom: 46px; z-index: 5;
+    font-size: 11.5px; color: #f4d9a8; background: rgba(70,48,16,.9);
+    border: 1px solid rgba(196,142,52,.5); border-radius: 6px;
+    padding: 6px 10px; pointer-events: none;
+  }
   .peek { position: absolute; left: 18px; bottom: 16px; display: flex; gap: 2px; }
   .peek button { font-size: 11.5px; border-radius: 6px; }
   .peek button.on { color: var(--ink); background: var(--panel); }
@@ -311,6 +317,7 @@
         <video id="raw-video" playsinline muted preload="auto" class="hide"></video>
         <div class="cropbox hide" id="cropbox"></div>
       </div>
+      <div class="warn hide" id="crop-warn">這一輪沒有留下裁切紀錄，框是事後從素材卡重算的，不等於實際裁切</div>
       <div class="peek">
         <button class="bare on" id="see-cut">成片</button>
         <button class="bare" id="see-raw">原素材＋裁切框</button>
@@ -598,6 +605,12 @@ async function openRun(id, where) {
 }
 
 let blocks = [], blocksWere = [], picked = -1, lastReport = null;
+// 'recorded' means these are the boxes the render used. 'rebuilt' means the
+// run predates keeping them and they were worked out again from the cards,
+// which lands on the middle of frame wherever a card cannot name the
+// subject. A guess shaped like evidence is worse than no evidence, and this
+// view is only here to be evidence.
+let cropsAre = 'recorded';
 
 // One shot at a time, where the eye already is. The whole table is still
 // under 全部鏡頭 for reading straight through; this is for the shot you just
@@ -644,6 +657,8 @@ async function showStrip() {
   // reordered or dropped anything, after which every panel read out another
   // shot's reasoning and the recut asked to re-cut the wrong take.
   blocks = data.blocks;
+  cropsAre = data.crops_are || 'recorded';
+  $('crop-warn').classList.toggle('hide', cropsAre !== 'rebuilt');
   blocksWere = JSON.parse(JSON.stringify(blocks));
   paintStrip();
   $('strip').classList.remove('hide');
@@ -817,12 +832,14 @@ $('recut').addEventListener('click', async () => {
   $('recut').classList.add('hide');
 });
 
-// Follow the playhead so the strip says where you are.
+// Which shot the playhead is over. Where it is drawn is movePlayhead's
+// job and only its job -- this used to also set the left edge, as a
+// percentage of the whole film, against the pixels-per-second the ruler and
+// the blocks are laid out in. Two handlers writing one property with two
+// different answers is a playhead that jumps whenever either one fires.
 document.addEventListener('DOMContentLoaded', () => {
   $('video').addEventListener('timeupdate', () => {
     if (!blocks.length) return;
-    const total = blocks.reduce((a, b) => a + b.seconds, 0) || 1;
-    $('playhead').style.left = `${($('video').currentTime / total) * 100}%`;
     let at = 0, now = -1;
     blocks.forEach((b, i) => {
       if ($('video').currentTime >= at) now = i;
@@ -1350,12 +1367,20 @@ function cropAt(block, seconds) {
 // two players each running their own time was two answers to "where am I".
 function mirrorRaw() {
   const b = blocks[picked];
-  if (!peeking || !b) return;
+  const raw = $('raw-video');
+  if (!peeking || !b) { if (!raw.paused) raw.pause(); return; }
+  if (!raw.readyState) return;
   const started = blocks.slice(0, picked).reduce((a, x) => a + x.seconds, 0);
   const into = ($('video').currentTime || 0) - started;
   const want = b.in_seconds + Math.max(0, Math.min(into, b.seconds));
-  const raw = $('raw-video');
-  if (raw.readyState && Math.abs(raw.currentTime - want) > 0.08) {
+  // Let it run alongside and only correct when it has actually drifted.
+  // Assigning currentTime every frame is a seek every frame, and a seek is
+  // a decode from the nearest keyframe -- it pinned a core and played like
+  // a slideshow while doing nothing a playing video does not do by itself.
+  const cut = $('video');
+  if (!cut.paused && raw.paused) raw.play().catch(() => {});
+  if (cut.paused && !raw.paused) raw.pause();
+  if (Math.abs(raw.currentTime - want) > (cut.paused ? 0.08 : 0.35)) {
     raw.currentTime = want;
   }
 }
@@ -1378,7 +1403,8 @@ function across(centre) {
 }
 
 function cropSays(b, box) {
-  const move = MOVES[b.camera_move] || b.camera_move || '定住';
+  const move = (cropsAre === 'rebuilt' ? '推測 ' : '')
+    + (MOVES[b.camera_move] || b.camera_move || '定住');
   const keys = b.crop || [];
   const here = across(box.x + box.w / 2);
   if (keys.length < 2) return `${move}　${here}`;

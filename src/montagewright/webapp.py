@@ -145,6 +145,34 @@ def _collect(run: Run) -> None:
     run.remember()
 
 
+def _reframe_of(shot: dict):
+    """The reframe a shot asked for, built the one way.
+
+    A pan between two subjects in one frame is the only move that needs the
+    second one, and the rebuild left it out -- so the handoff branch was
+    never reached, the move fell through to a follow with nothing to follow,
+    and a pan measured at 0.278 -> 0.696 came back as a held centre crop.
+    """
+
+    from montagewright.schema import Reframe, Subject
+
+    reframe = Reframe(
+        subject=Subject(
+            description=shot.get("subject", ""),
+            min_visible=1.0 if shot.get("must_be_whole") else 0.85,
+        ),
+        intent=shot.get("why", "")[:120],
+        camera_move=shot.get("camera_move", "hold"),
+        framing=shot.get("framing", "thirds"),
+        camera_energy="active",
+    )
+    if shot.get("then_subject"):
+        reframe = reframe.model_copy(
+            update={"then_subject": Subject(description=shot["then_subject"])}
+        )
+    return reframe
+
+
 class _AlreadyHave(Exception):
     """The run recorded its crops, so there is nothing to rebuild."""
 
@@ -452,10 +480,12 @@ def create_app() -> FastAPI:
         # propagation nothing here can repeat -- so recomputing was the
         # interface drawing every move as a static box and presenting it as
         # evidence. Runs from before this was written still fall through.
+        recorded = False
         trail = run.output / "work" / "crops.json"
         if trail.exists():
             try:
                 crops = json.loads(trail.read_text(encoding="utf-8"))
+                recorded = bool(crops)
             except (OSError, ValueError) as error:
                 print(f"timeline-data: unreadable crops.json ({error})", True)
 
@@ -528,7 +558,15 @@ def create_app() -> FastAPI:
                 "note": verdicts.get(key, {}).get("note", ""),
             })
             cursor += seconds
-        return JSONResponse({"blocks": blocks, "seconds": round(cursor, 3)})
+        return JSONResponse({
+            "blocks": blocks,
+            "seconds": round(cursor, 3),
+            # Whether these boxes are what the render used or the best that
+            # could be worked out afterwards. A rebuilt box is a guess with
+            # the same shape as evidence, and this view exists to be
+            # evidence -- so it has to say which it is holding.
+            "crops_are": "recorded" if recorded else "rebuilt",
+        })
 
     def _rebuild(run: Run, wanted: list[dict] | None = None):
         """The render plan again, from what the report already records.
@@ -589,16 +627,7 @@ def create_app() -> FastAPI:
                 approx_out_seconds=start + float(entry["seconds"]),
                 in_looks_like=plan.get("subject", ""),
                 energy_intent=plan.get("energy", "medium"),
-                reframe=Reframe(
-                    subject=Subject(
-                        description=plan.get("subject", ""),
-                        min_visible=1.0 if plan.get("must_be_whole") else 0.85,
-                    ),
-                    intent=plan.get("why", "")[:120],
-                    camera_move=plan.get("camera_move", "hold"),
-                    framing=plan.get("framing", "thirds"),
-                    camera_energy="active",
-                ),
+                reframe=_reframe_of(plan),
             ))
         edl = EDL(project_id=run.run_id, clips=clips)
         paths = follow_subjects(
@@ -871,6 +900,15 @@ def create_app() -> FastAPI:
         if index >= len(shots):
             raise HTTPException(404, "no such shot")
         source_id = shots[index]["source_id"]
+
+        # The proxy, when there is one. This view exists to show where the
+        # crop sat, and the proxy is the same framing at a five-hundredth of
+        # the bytes -- the original is 128MB of 4K that the browser has to
+        # decode in full to draw a rectangle on, and every scrub reopens it.
+        proxy = run.output / "work" / "proxies" / f"{source_id}.mp4"
+        if proxy.exists():
+            return FileResponse(proxy, media_type="video/mp4")
+
         match = next(
             (
                 path for path in
