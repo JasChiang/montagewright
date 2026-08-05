@@ -62,10 +62,13 @@ class SafeArea:
     # smaller and further from the eye than a 16:9 cut on a desktop, so the
     # same apparent size is a bigger fraction of a shorter frame.
     text_height: float
-    # No more than this many lines at once. Three lines of Chinese over a
-    # talking head is a wall, and it means the line should have been split
-    # at the cut instead.
-    max_lines: int = 2
+    # One. A subtitle is read in a glance, and a second row asks the eye to
+    # go back to the left and start again while somebody is still talking.
+    # A sentence too long for one row is a sentence that should have been
+    # two cues, which is what split_cues is for -- this is only the ceiling
+    # for the ones that will not split: no punctuation anywhere to break on.
+    # Even then it grows rather than drops a word.
+    max_lines: int = 1
 
 
 # Keyed by the same names the aspect flag uses.
@@ -119,6 +122,10 @@ def wrap(text: str, face, room: int) -> list[str]:
 
     if not text:
         return []
+    # 標點懸掛: a mark at the end of a line may sit past the margin. Without
+    # it, one comma turns a line that fits into two rows.
+    if _width(text, face) <= room:
+        return [text]
     if face.getbbox(text)[2] > room and face.getbbox(text)[2] <= room * 2:
         halved = _in_two(text, face, room)
         if halved:
@@ -126,7 +133,7 @@ def wrap(text: str, face, room: int) -> list[str]:
     lines: list[str] = []
     rest = text
     while rest:
-        if face.getbbox(rest)[2] <= room:
+        if _width(rest, face) <= room:
             lines.append(rest)
             break
         cut = len(rest)
@@ -145,6 +152,12 @@ def wrap(text: str, face, room: int) -> list[str]:
     return lines
 
 
+def _width(text: str, face) -> float:
+    """How wide it really needs to be, letting a closing mark hang."""
+
+    return face.getbbox(text.rstrip(NEVER_STARTS) or text)[2]
+
+
 def _in_two(text: str, face, room: int) -> list[str] | None:
     """Split once, as near the middle as the font allows."""
 
@@ -155,8 +168,8 @@ def _in_two(text: str, face, room: int) -> list[str] | None:
             continue
         if tail[0] in NEVER_STARTS:
             continue
-        wide_head = face.getbbox(head)[2]
-        wide_tail = face.getbbox(tail)[2]
+        wide_head = _width(head, face)
+        wide_tail = _width(tail, face)
         if wide_head > room or wide_tail > room:
             continue
         # A break after punctuation is a break the sentence already had.
@@ -165,6 +178,99 @@ def _in_two(text: str, face, room: int) -> list[str] | None:
         if best is None or score < best[0]:
             best = (score, [head, tail])
     return best[1] if best else None
+
+
+# Where a sentence is willing to be broken into separate cues, best first.
+BREAKS: tuple[str, ...] = ("。", "！", "？", "…", "，", "、", "；", "：")
+
+# A cue shorter than this reads as a flash rather than a line.
+LEAST_SECONDS = 0.7
+
+
+def split_cues(lines, face, room: int, *, least: float = LEAST_SECONDS):
+    """Break long lines into separate cues, rather than into more rows.
+
+    The transcript's idea of a line is a sentence: the median is thirteen
+    characters and the tail runs to fifty-six. Wrapping the long ones filled
+    two rows with fifty characters of Chinese over somebody's face, which is
+    not a subtitle, it is a paragraph -- and shrinking the type to make it
+    fit only made it a smaller paragraph.
+
+    There are no word timings to split on, so a piece is given the share of
+    the window its characters take up. That is approximate in a way nobody
+    can see at this length, and it is what the reader wants: one thought at
+    a time, on one row.
+    """
+
+    from montagewright.transcript import Line
+
+    out = []
+    for line in lines:
+        if _width(line.text, face) <= room:
+            out.append(line)
+            continue
+
+        pieces = _by_sense(line.text, face, room)
+        span = max(line.ends_seconds - line.starts_seconds, 0.001)
+        total = sum(len(one) for one in pieces) or 1
+        at = line.starts_seconds
+        made = []
+        for one in pieces:
+            share = span * len(one) / total
+            made.append(Line(
+                text=one, starts_seconds=at, ends_seconds=at + share,
+                heard=line.heard, speaker=line.speaker,
+            ))
+            at += share
+
+        # A piece too brief to read is joined to the one before it, which is
+        # why this is not simply "split and move on".
+        joined = []
+        for piece in made:
+            if (
+                joined
+                and piece.ends_seconds - piece.starts_seconds < least
+                # Only if the two of them still fit on one row. Joining up
+                # to two rows to avoid a brief cue traded the fault for a
+                # worse one: a wall of text instead of a quick line.
+                and _width(joined[-1].text + piece.text, face) <= room
+            ):
+                last = joined.pop()
+                joined.append(Line(
+                    text=last.text + piece.text,
+                    starts_seconds=last.starts_seconds,
+                    ends_seconds=piece.ends_seconds,
+                    heard=last.heard, speaker=last.speaker,
+                ))
+            else:
+                joined.append(piece)
+        out.extend(joined)
+    return out
+
+
+def _by_sense(text: str, face, room: int) -> list[str]:
+    """Cut a sentence where it already pauses, then where it must."""
+
+    pieces, rest = [], text
+    while _width(rest, face) > room:
+        cut = len(rest)
+        while cut > 1 and face.getbbox(rest[:cut])[2] > room:
+            cut -= 1
+        # The last place it took a breath, if that is not too far back.
+        best = max(
+            (rest.rfind(mark, 0, cut + 1) for mark in BREAKS), default=-1
+        )
+        if best >= cut * 0.45:
+            cut = best + 1
+        while cut > 1 and rest[cut:cut + 1] in NEVER_STARTS:
+            cut -= 1
+        pieces.append(rest[:cut].strip())
+        rest = rest[cut:].lstrip()
+        if not rest:
+            break
+    if rest:
+        pieces.append(rest.strip())
+    return [one for one in pieces if one]
 
 
 def draw_line(
@@ -251,6 +357,12 @@ def burn(
     width, height = int(shape.display_width), int(shape.display_height)
     area = safe_area(aspect)
 
+    # Split before drawing: the transcript's lines are sentences, and a
+    # sentence is not a cue.
+    face = _face(max(12, round(height * area.text_height)))
+    room = round(width * (1 - area.side_margin * 2))
+    lines = split_cues(lines, face, room)
+
     drawn = []
     for index, line in enumerate(lines):
         made = draw_line(
@@ -284,3 +396,15 @@ def burn(
     ]
     subprocess.run(command, check=True)
     return destination
+
+
+def as_cues(lines, aspect: str, width: int, height: int):
+    """The lines a viewer should see, whatever is going to show them.
+
+    The file and the picture had better agree, and a fifty-six character
+    cue is as unreadable in a player as it is burned into a frame.
+    """
+
+    area = safe_area(aspect)
+    face = _face(max(12, round(height * area.text_height)))
+    return split_cues(lines, face, round(width * (1 - area.side_margin * 2)))

@@ -2206,27 +2206,43 @@ def test_the_safe_area_is_a_property_of_where_the_film_is_going() -> None:
     assert safe_area("21:9") == SAFE_AREAS["9:16"]
 
 
-def test_a_subtitle_never_loses_a_word_to_fit() -> None:
-    """Cutting the overflow at max_lines dropped the last word of a
-    sentence and left a cut that looked finished."""
+def test_a_subtitle_never_loses_a_word_to_fit(tmp_path) -> None:
+    """Cutting the overflow at max_lines dropped the end of a sentence and
+    left a cut that looked finished.
 
-    from montagewright.subtitles import _face, safe_area, wrap
+    Fitting is tried in this order: split the sentence into separate cues,
+    then set it smaller, and only then let it take a third row. What is
+    never tried is saying less.
+    """
+
+    from montagewright.subtitles import _face, draw_line, safe_area, wrap
 
     area = safe_area("9:16")
-    room = round(360 * (1 - area.side_margin * 2))
-    said = "對，然後你就…你就已經濕漉漉了，然後慢慢被自己…被慢慢被下午"
-
-    # At the asked-for size it needs three lines; something has to give, and
-    # what gives is the size.
-    asked = round(640 * area.text_height)
+    room = round(1080 * (1 - area.side_margin * 2))
+    # Nowhere to break it into cues -- no punctuation anywhere -- and too
+    # long for two rows even at the smallest size this will set.
+    said = (
+        "夏天最崩潰的事情就是流汗然後又曬傷然後又中暑然後還要擠捷運"
+        "然後回到家發現冷氣壞掉真的是非常非常痛苦的一件事情啊"
+        "而且隔天起來還要再經歷一次一模一樣的事情"
+    )
+    asked = round(1920 * area.text_height)
     assert len(wrap(said, _face(asked), room)) > area.max_lines
+
+    made = draw_line(
+        said, width=1080, height=1920, area=area, into=tmp_path / "one.png",
+    )
+    assert made is not None
+    drawn, left, top = made
+    assert drawn.exists() and top > 0
+
+    # Whatever size it settled on, every character is still on the picture.
     for attempt in range(6):
         size = max(12, round(asked * (1 - attempt * 0.06)))
-        lines = wrap(said, _face(size), room)
-        if len(lines) <= area.max_lines:
+        rows = wrap(said, _face(size), room)
+        if len(rows) <= area.max_lines:
             break
-    assert len(lines) <= area.max_lines
-    assert "".join(lines) == said
+    assert "".join(rows) == said
 
 
 def test_no_line_begins_with_a_mark_that_closes_one() -> None:
@@ -2262,3 +2278,120 @@ def test_two_lines_are_balanced_rather_than_filled() -> None:
     shorter = min(face.getbbox(one)[2] for one in lines)
     longer = max(face.getbbox(one)[2] for one in lines)
     assert shorter > longer * 0.6, lines
+
+
+def test_a_long_sentence_becomes_several_cues_not_more_rows() -> None:
+    """The transcript's idea of a line is a sentence.
+
+    The median is thirteen characters and the tail runs to fifty-six.
+    Wrapping the long ones put fifty characters of Chinese over somebody's
+    face, which is not a subtitle, it is a paragraph -- and setting it
+    smaller only made it a smaller paragraph.
+    """
+
+    from montagewright.subtitles import _face, safe_area, split_cues, wrap
+    from montagewright.transcript import Line
+
+    area = safe_area("9:16")
+    face = _face(round(1920 * area.text_height))
+    room = round(1080 * (1 - area.side_margin * 2))
+    said = (
+        "哦，如果是這種…這種就是如果今天洗完澡，然後出來又是剛好冷氣"
+        "又壞掉的話，應該就是會蠻…蠻不開心、蠻不爽的呀，對。"
+    )
+
+    cues = split_cues([Line(text=said, starts_seconds=10.0,
+                            ends_seconds=17.0)], face, room)
+
+    assert len(cues) > 1
+    # Every one of them fits on a single row.
+    for cue in cues:
+        assert len(wrap(cue.text, face, room)) == 1, cue.text
+    # Nothing said twice, nothing lost, and the window is the one it had.
+    assert "".join(cue.text for cue in cues) == said
+    assert cues[0].starts_seconds == 10.0
+    assert abs(cues[-1].ends_seconds - 17.0) < 1e-6
+    # And they run in order, without gaps or overlaps.
+    for before, after in zip(cues, cues[1:]):
+        assert abs(before.ends_seconds - after.starts_seconds) < 1e-6
+
+
+def test_a_brief_cue_is_joined_only_while_it_still_fits_one_row() -> None:
+    """Two rules pull against each other, and one of them wins.
+
+    A cue too short to read is a flicker, so it gets joined to the one
+    before. But joining up to two rows traded that fault for a worse one --
+    a wall of text where a quick line was wanted. So the join happens only
+    while the result still fits on a single row, and a short cue that
+    cannot be absorbed stays as it is.
+    """
+
+    from montagewright.subtitles import _face, _width, split_cues
+    from montagewright.transcript import Line
+
+    face = _face(40)
+    room = _width("十二個字的一行寬度啊啊", face)
+    said = "好，對，是，嗯，然後呢，就這樣，真的很誇張啊我跟你講"
+    cues = split_cues(
+        [Line(text=said, starts_seconds=0.0, ends_seconds=1.2)], face, room,
+        least=0.7,
+    )
+
+    # Some joining happened: fewer cues than there are places to break.
+    assert 1 < len(cues) < said.count("，") + 1
+    # None of them overflows the row.
+    for cue in cues:
+        assert _width(cue.text, face) <= room, cue.text
+    assert "".join(cue.text for cue in cues) == said
+
+
+def test_a_shot_that_catches_part_of_a_sentence_shows_that_part() -> None:
+    """The window was clipped to the shot and the words were not.
+
+    So a shot holding one second of a ten-second sentence put the whole
+    sentence on screen for one second. There are no word timings kept, so
+    the share of the window stands in for the share of the words, and the
+    ends are nudged to where the sentence pauses.
+    """
+
+    from montagewright.transcript import Line, _within
+
+    line = Line(
+        text="對，然後你就…你就已經濕漉漉了，然後慢慢被自己…被下午的太陽弄乾",
+        starts_seconds=63.95,
+        ends_seconds=74.03,
+    )
+
+    # The shot catches only the first second of it.
+    opening = _within(line, from_seconds=63.95, to_seconds=64.95)
+    assert opening and len(opening) < len(line.text) / 3
+    assert line.text.startswith(opening.rstrip("…，"))
+
+    # Wholly inside the shot: untouched, not re-cut.
+    assert _within(line, from_seconds=60.0, to_seconds=80.0) == line.text
+
+    # A sliver too short to read is nothing, rather than two characters.
+    assert _within(line, from_seconds=63.95, to_seconds=64.05) == ""
+
+
+def test_clipping_a_line_never_inverts_the_slice() -> None:
+    """Snapping the head past the tail produced an empty string.
+
+    rfind counts from the end when given a negative start, so an unclamped
+    search window looked at the wrong part of the line -- and the subtitle
+    it produced simply vanished, which nothing would have reported.
+    """
+
+    from montagewright.transcript import Line, _within
+
+    line = Line(
+        text="對，然後你就…你就已經濕漉漉了，然後慢慢被自己…被慢慢被下午的太陽弄乾了",
+        starts_seconds=0.0,
+        ends_seconds=10.0,
+    )
+    # Every window of a reasonable size gives something or nothing on
+    # purpose; none of them gives an accidental empty string.
+    for at in range(0, 9):
+        got = _within(line, from_seconds=float(at), to_seconds=at + 2.0)
+        assert got == "" or len(got) >= 3, (at, got)
+        assert got in line.text or got.strip("…，。") in line.text, (at, got)

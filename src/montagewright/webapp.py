@@ -998,10 +998,18 @@ def create_app() -> FastAPI:
         the reader to work out which take a line came from is not one.
         """
 
+        from montagewright.subtitles import NoFontHere, as_cues
         from montagewright.transcript import to_srt
 
         run = _run(run_id)
         timed = _subtitle_lines(run)
+        aspect = (run.report() or {}).get("direction", {}).get("aspect", "9:16")
+        try:
+            timed = as_cues(timed, aspect, 1080, 1920)
+        except NoFontHere:
+            # Without a font there is nothing to measure against, and a long
+            # cue in a file is better than no file.
+            pass
         if not timed:
             raise HTTPException(404, "nothing was transcribed in this run")
         path = run.output / "subtitles.srt"

@@ -267,6 +267,67 @@ def lines_of(card: dict[str, Any]) -> list[Line]:
     ]
 
 
+# Where a clipped sentence would rather begin and end.
+_JOINTS = "。！？…，、；："
+
+
+def _within(line: Line, *, from_seconds: float, to_seconds: float) -> str:
+    """The part of a line that falls inside a window.
+
+    There are no word timings kept, so the share of the window a piece
+    occupies stands in for the share of the words -- then the ends are
+    nudged to the nearest place the sentence pauses, because a subtitle
+    starting mid-word reads as a fault in the tool rather than as a cut.
+    """
+
+    span = line.ends_seconds - line.starts_seconds
+    if span <= 0:
+        return line.text
+    before = max(0.0, (from_seconds - line.starts_seconds) / span)
+    after = max(0.0, (line.ends_seconds - to_seconds) / span)
+    if before + after < 0.08:
+        return line.text
+
+    text = line.text
+    head = round(len(text) * before)
+    tail = len(text) - round(len(text) * after)
+    if tail - head < 2:
+        return ""
+
+    reach = max(2, len(text) // 6)
+
+    def joint_near(at: int) -> int:
+        """The nearest place the sentence pauses, or -1.
+
+        rfind counts from the end when given a negative start, so an
+        unclamped window silently searched the wrong part of the line -- and
+        snapping the head past the tail produced an inverted slice, which is
+        an empty string, which is a subtitle that vanished.
+        """
+
+        low = max(0, min(at - reach, len(text)))
+        high = max(low, min(at + reach, len(text)))
+        found = [text.rfind(mark, low, high) for mark in _JOINTS]
+        return max(found)
+
+    # Only nudge an end that is actually being cut. Snapping the head of a
+    # line the shot caught from its first word moved it past the opening
+    # clause, so a sentence that started on time started two words late.
+    if before > 0.02:
+        moved = joint_near(head)
+        if 0 <= moved + 1 < tail:
+            head = moved + 1
+    if after > 0.02:
+        moved = joint_near(tail)
+        if moved + 1 > head:
+            tail = moved + 1
+
+    said = text[head:tail].strip()
+    # Two characters of a sentence, on screen for a moment, is noise. The
+    # cut caught the edge of somebody talking; the words are not the point.
+    return said if len(said) >= 3 else ""
+
+
 def against_cut(
     shots: list[dict],
     rhythm: dict[str, dict],
@@ -301,9 +362,18 @@ def against_cut(
                 continue
             if line.starts_seconds >= start + seconds:
                 continue
+            # A shot can hold part of a sentence. Clipping the window and
+            # not the words put five seconds of talking on screen for one,
+            # so the whole sentence flashed past under a shot that only
+            # caught its tail.
+            said = _within(
+                line, from_seconds=start, to_seconds=start + seconds
+            )
+            if not said:
+                continue
             timed.append(
                 Line(
-                    text=line.text,
+                    text=said,
                     starts_seconds=cursor
                     + max(0.0, line.starts_seconds - start),
                     ends_seconds=cursor

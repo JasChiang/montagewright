@@ -648,6 +648,13 @@ def command_render(args: argparse.Namespace) -> int:
             {k: v for k, v in report.rhythm_decisions.items()},
             transcripts,
         )
+        try:
+            from montagewright.subtitles import as_cues
+
+            wide, tall = (1920, 1080) if aspect >= 1.0 else (1080, 1920)
+            said = as_cues(said, args.aspect, wide, tall)
+        except Exception:
+            pass
         if said:
             (output / "subtitles.srt").write_text(
                 to_srt(said, with_speaker=True), encoding="utf-8"
