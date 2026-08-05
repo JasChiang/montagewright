@@ -1808,3 +1808,20 @@ def test_a_proxy_is_kept_where_the_cards_it_feeds_are_kept(tmp_path) -> None:
     second = _make_proxy(source, tmp_path / "b" / "C0001.mp4", library=library)
     assert second.read_bytes() == b"already encoded once"
     assert second.name == "C0001.mp4"
+
+
+def test_the_zoom_slider_does_not_redraw_the_waveform_per_pixel() -> None:
+    """Drawing a waveform decodes the whole cut.
+
+    It is cached by the width asked for, and the slider asked at a width
+    derived from its exact position -- a miss every time, two ffmpeg passes
+    over the film per pixel of drag. The width is rounded to something the
+    cache can hold, and the request waits for the drag to settle.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "Math.ceil(asked / 500) * 500" in page
+    assert "paintWavesWhenSettled" in page
+    assert "clearTimeout(wavesSoon)" in page

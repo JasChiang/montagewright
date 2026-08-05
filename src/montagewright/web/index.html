@@ -709,8 +709,15 @@ function paintRuler(total) {
   $('reel').style.width = `${total * scale}px`;
 }
 
+// Drawing a waveform means decoding the whole cut, so the answer is cached
+// by the width asked for. The zoom slider asks on every input event at a
+// width derived from the exact slider position, which is a cache miss every
+// time and two ffmpeg passes over the film per pixel of drag. Rounding to a
+// step the cache can hold, and only asking once the drag settles, turns a
+// drag from hundreds of decodes into at most a few.
 function paintWaves(total) {
-  const width = Math.max(600, Math.min(6000, Math.round(total * scale * 2)));
+  const asked = Math.max(600, Math.min(6000, Math.round(total * scale * 2)));
+  const width = Math.min(6000, Math.ceil(asked / 500) * 500);
   for (const which of ['voice', 'music']) {
     const lane = $(`lane-${which}`);
     const img = new Image();
@@ -1281,13 +1288,20 @@ function tick() {
 }
 requestAnimationFrame(tick);
 
+let wavesSoon = null;
+function paintWavesWhenSettled() {
+  clearTimeout(wavesSoon);
+  wavesSoon = setTimeout(() => paintWaves(reelSeconds()), 250);
+}
+
 $('zoom').addEventListener('input', () => {
   scale = +$('zoom').value;
-  if (blocks.length) { paintStrip(); paintWaves(reelSeconds()); }
+  // The strip is DOM and repaints at any rate; the waves are ffmpeg.
+  if (blocks.length) { paintStrip(); paintWavesWhenSettled(); }
 });
 $('fit').addEventListener('click', () => {
   if (!blocks.length) return;
-  fitScale(); paintStrip(); paintWaves(reelSeconds());
+  fitScale(); paintStrip(); paintWavesWhenSettled();
 });
 $('play').addEventListener('click', () => {
   const v = $('video');
