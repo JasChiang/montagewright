@@ -489,3 +489,29 @@ class ReviewVerdict(ModelFacing):
                 "notes alone do not justify another render"
             )
         return self
+
+
+def reframe_of(shot: dict) -> Reframe:
+    """The reframe a shot asked for, built the one way.
+
+    A pan between two subjects in one frame is the only move that needs the
+    second one, and the rebuild left it out -- so the handoff branch was
+    never reached, the move fell through to a follow with nothing to follow,
+    and a pan measured at 0.278 -> 0.696 came back as a held centre crop.
+    """
+
+    reframe = Reframe(
+        subject=Subject(
+            description=shot.get("subject", ""),
+            min_visible=1.0 if shot.get("must_be_whole") else 0.85,
+        ),
+        intent=shot.get("why", "")[:120],
+        camera_move=shot.get("camera_move", "hold"),
+        framing=shot.get("framing", "thirds"),
+        camera_energy="active",
+    )
+    if shot.get("then_subject"):
+        reframe = reframe.model_copy(
+            update={"then_subject": Subject(description=shot["then_subject"])}
+        )
+    return reframe

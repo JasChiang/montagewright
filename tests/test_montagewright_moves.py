@@ -1769,16 +1769,16 @@ def test_one_reframe_builder_for_the_run_and_for_the_rebuild() -> None:
     0.278 -> 0.696 was rebuilt as a held centre crop.
     """
 
-    from montagewright.webapp import _reframe_of
+    from montagewright.schema import reframe_of
 
-    both = _reframe_of({
+    both = reframe_of({
         "subject": "the left, black smartphone",
         "then_subject": "the right, white smartphone",
         "camera_move": "pan",
     })
     assert both.then_subject is not None
     assert both.then_subject.description == "the right, white smartphone"
-    assert _reframe_of({"subject": "a phone"}).then_subject is None
+    assert reframe_of({"subject": "a phone"}).then_subject is None
 
 
 def test_a_proxy_is_kept_where_the_cards_it_feeds_are_kept(tmp_path) -> None:

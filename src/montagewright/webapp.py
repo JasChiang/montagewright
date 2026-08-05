@@ -145,34 +145,6 @@ def _collect(run: Run) -> None:
     run.remember()
 
 
-def _reframe_of(shot: dict):
-    """The reframe a shot asked for, built the one way.
-
-    A pan between two subjects in one frame is the only move that needs the
-    second one, and the rebuild left it out -- so the handoff branch was
-    never reached, the move fell through to a follow with nothing to follow,
-    and a pan measured at 0.278 -> 0.696 came back as a held centre crop.
-    """
-
-    from montagewright.schema import Reframe, Subject
-
-    reframe = Reframe(
-        subject=Subject(
-            description=shot.get("subject", ""),
-            min_visible=1.0 if shot.get("must_be_whole") else 0.85,
-        ),
-        intent=shot.get("why", "")[:120],
-        camera_move=shot.get("camera_move", "hold"),
-        framing=shot.get("framing", "thirds"),
-        camera_energy="active",
-    )
-    if shot.get("then_subject"):
-        reframe = reframe.model_copy(
-            update={"then_subject": Subject(description=shot["then_subject"])}
-        )
-    return reframe
-
-
 class _AlreadyHave(Exception):
     """The run recorded its crops, so there is nothing to rebuild."""
 
@@ -580,7 +552,7 @@ def create_app() -> FastAPI:
         from montagewright.clipcard import card_map
         from montagewright.executor import plan_render
         from montagewright.pipeline import Report, follow_subjects, probe
-        from montagewright.schema import EDL, Clip, Reframe, Subject
+        from montagewright.schema import EDL, Clip, reframe_of
 
         report = run.report() or {}
         original = report.get("selection", {}).get("shots", [])
@@ -627,7 +599,7 @@ def create_app() -> FastAPI:
                 approx_out_seconds=start + float(entry["seconds"]),
                 in_looks_like=plan.get("subject", ""),
                 energy_intent=plan.get("energy", "medium"),
-                reframe=_reframe_of(plan),
+                reframe=reframe_of(plan),
             ))
         edl = EDL(project_id=run.run_id, clips=clips)
         paths = follow_subjects(

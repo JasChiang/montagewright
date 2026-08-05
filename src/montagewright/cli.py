@@ -749,15 +749,13 @@ def _edl_from_selection(
 ) -> tuple[EDL, dict[str, str]]:
     clips = []
     snaps: dict[str, str] = {}
-    from montagewright.webapp import _reframe_of
-
     for index, shot in enumerate(selection["shots"]):
         # Text and UI have to survive whole or they say nothing. The first
         # run cropped a Galaxy Unpacked wordmark down to "y Unpacked", which
         # is worse than not using the shot. That, and everything else a
         # reframe is made of, is decided in one place now -- the rebuild had
         # its own copy and the copy was missing a field.
-        reframe = _reframe_of(shot)
+        reframe = reframe_of(shot)
         clip_id = f"k{index:02d}"
         start = float(shot["start_seconds"])
         # What selection said this shot needs to do its job. It used to be a
@@ -935,8 +933,8 @@ def command_timeline(args: argparse.Namespace) -> int:
     from montagewright.clipcard import card_map
     from montagewright.executor import plan_render
     from montagewright.pipeline import Report, follow_subjects, probe
+    from montagewright.schema import reframe_of
     from montagewright.timeline import to_fcpxml, to_xmeml
-    from montagewright.webapp import _reframe_of
 
     output = args.output.expanduser().resolve()
     report = json.loads((output / "report.json").read_text(encoding="utf-8"))
@@ -976,7 +974,7 @@ def command_timeline(args: argparse.Namespace) -> int:
                 + float(rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)),
                 in_looks_like=shot.get("subject", ""),
                 energy_intent=shot.get("energy", "medium"),
-                reframe=_reframe_of(shot),
+                reframe=reframe_of(shot),
             )
         )
     edl = EDL(project_id=output.name, clips=clips)
