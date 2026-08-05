@@ -646,9 +646,12 @@ def create_app() -> FastAPI:
                 report.get("direction", {}).get("music_under_speech") or "duck"
             ),
         )
+        # What was rendered, from the plan that rendered it. This read a
+        # name belonging to the rebuild's own scope, so a recut that had
+        # already re-encoded every segment raised on the way to saying so.
         return JSONResponse({
             "seconds": round(result.duration_seconds, 3),
-            "shots": len(clips),
+            "shots": len(plan.segments),
         })
 
     @app.get("/api/runs/{run_id}/transcripts")

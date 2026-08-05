@@ -1825,3 +1825,77 @@ def test_the_zoom_slider_does_not_redraw_the_waveform_per_pixel() -> None:
     assert "Math.ceil(asked / 500) * 500" in page
     assert "paintWavesWhenSettled" in page
     assert "clearTimeout(wavesSoon)" in page
+
+
+def test_the_run_can_write_down_the_crops_it_used(tmp_path) -> None:
+    """The record has to survive a real path, not a plausible one.
+
+    It was written against a field name Keyframe does not have, which no
+    test touched -- so it raised only after twelve paid grounding calls, at
+    the moment the run had everything it needed and was about to render.
+    """
+
+    import json
+
+    from montagewright.executor import CropBox
+    from montagewright.pipeline import write_crops
+    from montagewright.reframe import CropPath, Keyframe
+
+    path = CropPath(keyframes=[
+        Keyframe(seconds=0.0, crop=CropBox(x=0.34, y=0.0, width=0.32, height=1.0)),
+        Keyframe(seconds=2.5, crop=CropBox(x=0.41, y=0.05, width=0.26, height=0.82)),
+    ])
+    out = tmp_path / "deep" / "crops.json"
+    write_crops({"k00": path}, out)
+
+    back = json.loads(out.read_text(encoding="utf-8"))
+    assert [k["at"] for k in back["k00"]] == [0.0, 2.5]
+    assert back["k00"][1]["w"] == 0.26
+
+
+def test_the_selection_becomes_an_edl_without_reaching_for_a_missing_name(
+    tmp_path,
+) -> None:
+    """Two runs died here on names that were not defined.
+
+    Both were a moved import, and both raised only after the run had paid for
+    cards, direction and selection -- the point where an editing tool has
+    spent everything and delivered nothing. Nothing exercised this function,
+    so nothing said so until it was expensive.
+    """
+
+    from montagewright.cli import _edl_from_selection
+
+    selection = {
+        "shots": [
+            {
+                "source_id": "C0001",
+                "subject": "the left, black smartphone",
+                "then_subject": "the right, white smartphone",
+                "camera_move": "pan",
+                "start_seconds": 1.5,
+                "seconds_needed": 3.0,
+                "why": "hand off between the two handsets",
+                "energy": "medium",
+            },
+            {
+                "source_id": "C0002",
+                "subject": "the coin beside the hinge",
+                "camera_move": "hold",
+                "start_seconds": 0.0,
+                "must_be_whole": True,
+            },
+        ]
+    }
+
+    edl, snaps = _edl_from_selection(selection, tmp_path, cards={})
+
+    assert [clip.clip_id for clip in edl.clips] == ["k00", "k01"]
+    first, second = edl.clips
+    assert first.reframe.camera_move == "pan"
+    assert first.reframe.then_subject is not None
+    assert first.approx_out_seconds - first.approx_in_seconds == 3.0
+    # No seconds_needed means the fallback length, not zero.
+    assert second.approx_out_seconds > second.approx_in_seconds
+    assert second.reframe.subject.min_visible == 1.0
+    assert snaps == {}

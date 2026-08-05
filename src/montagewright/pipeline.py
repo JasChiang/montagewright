@@ -276,6 +276,38 @@ def _seed_box(box: dict[str, Any]) -> list[int]:
     ]
 
 
+def write_crops(paths: dict[str, CropPath], destination: Path) -> None:
+    """Keep the crop paths the render actually used.
+
+    Rebuilding them later is cheap arithmetic only for a held frame whose
+    subject a card can name. A follow came out of a mask propagation that
+    needed a checkpoint and a grounding call, and neither is available after
+    the fact -- so without this the interface could only redraw every move as
+    a centred still and present that as what happened.
+    """
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            {
+                clip_id: [
+                    {
+                        "at": round(frame.seconds, 3),
+                        "x": round(frame.crop.x, 5),
+                        "y": round(frame.crop.y, 5),
+                        "w": round(frame.crop.width, 5),
+                        "h": round(frame.crop.height, 5),
+                    }
+                    for frame in path.keyframes
+                ]
+                for clip_id, path in paths.items()
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def follow_subjects(
     edl: EDL,
     sources: dict[str, Source],
@@ -939,32 +971,7 @@ def run(
         client=client,
     )
 
-    # Keep the paths the render actually used. Rebuilding them later is
-    # cheap arithmetic only for a held frame; a follow came out of a mask
-    # propagation that needed a checkpoint and a grounding call, and neither
-    # is available after the fact. Without this the interface could only ever
-    # redraw every move as a static centred box and call it what happened.
-    trail = output_dir / "work" / "crops.json"
-    trail.parent.mkdir(parents=True, exist_ok=True)
-    trail.write_text(
-        json.dumps(
-            {
-                clip_id: [
-                    {
-                        "at": round(frame.at_seconds, 3),
-                        "x": round(frame.crop.x, 5),
-                        "y": round(frame.crop.y, 5),
-                        "w": round(frame.crop.width, 5),
-                        "h": round(frame.crop.height, 5),
-                    }
-                    for frame in path.keyframes
-                ]
-                for clip_id, path in paths.items()
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    write_crops(paths, output_dir / "work" / "crops.json")
 
     plan = plan_render(
         edl, sources, target_aspect=target_aspect, crop_paths=paths

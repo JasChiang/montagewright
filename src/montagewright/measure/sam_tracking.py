@@ -1593,7 +1593,6 @@ def track_bbox_sam21(
     )
     if begins_at_shot_boundary:
         cut_scores[0] = seed_shot.boundary_score
-    masks_dir = output_dir / "masks"
     overlays_dir = output_dir / "overlays"
     samples: list[SegmentationSample] = []
     previous_areas: list[float] = []

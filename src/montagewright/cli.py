@@ -40,7 +40,7 @@ from montagewright.planner import (
     replan_shots,
     select_shots,
 )
-from montagewright.schema import EDL, Clip, Reframe, Subject
+from montagewright.schema import EDL, Clip, reframe_of
 from montagewright.uploads import (
     UploadCache,
     default_cache_path,
@@ -933,7 +933,6 @@ def command_timeline(args: argparse.Namespace) -> int:
     from montagewright.clipcard import card_map
     from montagewright.executor import plan_render
     from montagewright.pipeline import Report, follow_subjects, probe
-    from montagewright.schema import reframe_of
     from montagewright.timeline import to_fcpxml, to_xmeml
 
     output = args.output.expanduser().resolve()
