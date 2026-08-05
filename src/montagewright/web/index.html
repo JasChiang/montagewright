@@ -6,306 +6,188 @@
 <title>montagewright</title>
 <style>
   :root {
-    --bg: #f7f6f3;
-    --surface: #fff;
-    --sunken: #faf9f7;
-    --ink: #1c1b19;
-    --ink-soft: #55534e;
-    --dim: #8b8880;
-    --line: #e6e3dd;
-    --line-soft: #f0eeE9;
-    --accent: #b3452a;
-    --accent-soft: #fdf2ee;
-    --ok: #2c6a4c;
+    --bg: #f7f6f3; --surface: #fff; --sunken: #faf9f7;
+    --ink: #1c1b19; --ink-soft: #55534e; --dim: #8b8880;
+    --line: #e6e3dd; --line-soft: #f0eee9;
+    --accent: #b3452a; --accent-soft: #fdf2ee; --ok: #2c6a4c;
     --shadow: 0 1px 2px rgba(28,27,25,.04), 0 8px 24px -12px rgba(28,27,25,.10);
     --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", sans-serif;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #14140f;
-      --surface: #1c1c18;
-      --sunken: #191915;
-      --ink: #efece4;
-      --ink-soft: #b6b2a8;
-      --dim: #8a867c;
-      --line: #2e2d27;
-      --line-soft: #26251f;
-      --accent: #e08b6e;
-      --accent-soft: #2a1f19;
-      --ok: #7cc09b;
+      --bg: #131310; --surface: #1b1b17; --sunken: #181814;
+      --ink: #efece4; --ink-soft: #b6b2a8; --dim: #8a867c;
+      --line: #2e2d27; --line-soft: #26251f;
+      --accent: #e08b6e; --accent-soft: #2a1f19; --ok: #7cc09b;
       --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px -14px rgba(0,0,0,.6);
     }
   }
   * { box-sizing: border-box; }
   html { -webkit-font-smoothing: antialiased; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 15px/1.65 var(--sans);
-  }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.65 var(--sans); }
   ::selection { background: var(--accent-soft); }
 
   header {
-    padding: 30px 32px 22px;
-    border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 20;
+    padding: 14px 22px; border-bottom: 1px solid var(--line);
     background: var(--surface);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   }
-  header .inner {
-    max-width: 1060px; margin: 0 auto;
-    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
-  }
-  h1 {
-    margin: 0; font-size: 17px; font-weight: 620;
-    letter-spacing: -.01em;
-  }
+  h1 { margin: 0; font-size: 15.5px; font-weight: 620; letter-spacing: -.01em; }
   h1 .dot { color: var(--accent); }
-  header p { margin: 0; color: var(--dim); font-size: 13.5px; }
+  header .tail { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+  header .why { font-size: 12.5px; }
 
-  main { max-width: 1060px; margin: 0 auto; padding: 28px 32px 100px; }
-
+  main { padding: 18px 22px 60px; max-width: 1500px; margin: 0 auto; }
   section {
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    padding: 26px 28px;
-    margin-bottom: 18px;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; padding: 22px 24px; margin-bottom: 16px;
     box-shadow: var(--shadow);
   }
-  h2 {
-    margin: 0 0 3px; font-size: 14.5px; font-weight: 620;
-    letter-spacing: -.005em;
-  }
-  h2 + .sub { margin: 0 0 20px; color: var(--dim); font-size: 13px; }
+  h2 { margin: 0 0 3px; font-size: 14px; font-weight: 620; }
+  h2 + .sub { margin: 0 0 18px; color: var(--dim); font-size: 12.5px; }
 
-  .fields {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 18px 20px;
+  /* the editor: viewer, inspector, strip */
+  .bench { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(300px, 420px); gap: 22px; }
+  @media (max-width: 900px) { .bench { grid-template-columns: 1fr; } }
+  .viewer { display: flex; flex-direction: column; gap: 12px; }
+  video { width: 100%; max-width: 320px; border-radius: 10px; background: #000; box-shadow: var(--shadow); }
+  .stats { display: flex; gap: 26px; flex-wrap: wrap; margin-bottom: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--line-soft); }
+  .stat b { display: block; font-size: 21px; font-weight: 640; letter-spacing: -.02em; line-height: 1.3; }
+  .stat span { font-size: 11.5px; color: var(--dim); }
+  .downloads { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+  a.link { color: var(--ink-soft); font-size: 12.5px; text-decoration: none; display: inline-flex; gap: 5px; }
+  a.link::before { content: '↓'; color: var(--dim); }
+  a.link:hover { color: var(--accent); }
+
+  .inspector {
+    background: var(--sunken); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px 18px; font-size: 13.5px;
+    align-self: start; max-height: 460px; overflow: auto;
   }
-  .field { min-width: 0; }
+  .inspector:empty::after { content: '點時間軸上的一顆看它的來歷'; color: var(--dim); font-size: 13px; }
+  .ins-head { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .ins-head .mono { font-size: 12.5px; word-break: break-all; }
+  .inspector dl { margin: 14px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 9px 14px; }
+  .inspector dt { font-size: 11.5px; color: var(--dim); white-space: nowrap; padding-top: 2px; }
+  .inspector dd { margin: 0; }
+
+  /* strip */
+  .strip { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line-soft); }
+  .track {
+    display: flex; gap: 2px; height: 52px; user-select: none;
+    border-radius: 8px; overflow: hidden; background: var(--sunken); border: 1px solid var(--line);
+  }
+  .blk {
+    position: relative; min-width: 14px; cursor: pointer; padding: 7px 8px; overflow: hidden;
+    background: color-mix(in srgb, var(--ok) 13%, var(--surface));
+    border-left: 2px solid color-mix(in srgb, var(--ok) 55%, transparent);
+    transition: background .12s;
+  }
+  .blk.no { background: var(--accent-soft); border-left-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+  .blk:hover { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+  .blk.on { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .blk .lab { font-size: 10.5px; color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+  .blk .dur { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+  .blk .grip { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; }
+  .blk .grip.l { left: 0 } .blk .grip.r { right: 0 }
+  .blk .grip:hover { background: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .blk .kill { position: absolute; top: 4px; right: 4px; width: 15px; height: 15px; border-radius: 4px; display: none; place-items: center; font-size: 11px; background: var(--surface); color: var(--accent); border: 1px solid var(--line); }
+  .blk:hover .kill { display: grid; }
+  .strip .legend { display: flex; gap: 14px; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 12.5px; color: var(--dim); }
+
+  /* tabs */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
+  .tab {
+    padding: 9px 14px; border: 0; background: transparent; cursor: pointer;
+    font: inherit; font-size: 13.5px; color: var(--dim); border-radius: 8px 8px 0 0;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tab:hover { color: var(--ink-soft); background: var(--sunken); filter: none; }
+  .tab.on { color: var(--ink); font-weight: 580; border-bottom-color: var(--accent); }
+
+  /* forms */
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px 18px; }
   .field.wide { grid-column: 1 / -1; }
-  label {
-    display: block; font-size: 12.5px; font-weight: 550;
-    color: var(--ink-soft); margin-bottom: 7px; letter-spacing: .01em;
-  }
+  label { display: block; font-size: 12.5px; font-weight: 550; color: var(--ink-soft); margin-bottom: 6px; }
   input[type=text], input[type=number], input[type=file], select, textarea {
-    width: 100%; padding: 10px 12px;
-    border: 1px solid var(--line); border-radius: 9px;
-    background: var(--sunken); color: var(--ink);
-    font: inherit; font-size: 14px;
-    transition: border-color .15s, background .15s;
+    width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--sunken); color: var(--ink); font: inherit; font-size: 14px;
   }
-  input[type=text]::placeholder, textarea::placeholder { color: var(--dim); }
-  input:focus, select:focus, textarea:focus {
-    outline: none; border-color: var(--accent);
-    background: var(--surface);
-  }
-  textarea { min-height: 92px; resize: vertical; line-height: 1.6; }
-  select { cursor: pointer; }
-
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); background: var(--surface); }
+  textarea { min-height: 84px; resize: vertical; }
   button {
-    padding: 10px 18px; border: 1px solid transparent; border-radius: 9px;
-    cursor: pointer; background: var(--accent); color: #fff;
-    font: inherit; font-size: 14px; font-weight: 580;
-    transition: filter .15s, transform .05s;
+    padding: 9px 16px; border: 1px solid transparent; border-radius: 8px; cursor: pointer;
+    background: var(--accent); color: #fff; font: inherit; font-size: 13.5px; font-weight: 580;
   }
   button:hover { filter: brightness(1.07); }
-  button:active { transform: translateY(.5px); }
-  button.ghost {
-    background: transparent; color: var(--ink-soft);
-    border-color: var(--line);
-  }
+  button.ghost { background: transparent; color: var(--ink-soft); border-color: var(--line); }
   button.ghost:hover { background: var(--sunken); filter: none; }
-  button:disabled { opacity: .4; cursor: not-allowed; filter: none; }
-  button.big { padding: 12px 26px; font-size: 14.5px; border-radius: 10px; }
-
+  button:disabled { opacity: .4; cursor: not-allowed; }
   .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  .actions {
-    display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
-    margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--line-soft);
-  }
-  .check {
-    display: inline-flex; gap: 8px; align-items: center;
-    font-size: 13.5px; color: var(--ink-soft); cursor: pointer;
-    margin: 0;
-  }
+  .actions { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line-soft); }
+  .check { display: inline-flex; gap: 8px; align-items: center; font-size: 13.5px; color: var(--ink-soft); cursor: pointer; margin: 0; }
   .check input { width: auto; }
-  .hint { color: var(--dim); font-size: 12.5px; margin-top: 8px; }
-  .hint a { color: var(--ink-soft); text-decoration: none; border-bottom: 1px solid var(--line); }
-  .hint a:hover { color: var(--accent); border-color: currentColor; }
+  .hint { color: var(--dim); font-size: 12.5px; margin-top: 7px; }
+  .hint a { color: var(--ink-soft); }
 
-  /* folder picker */
-  .picker {
-    margin-top: 12px; border: 1px solid var(--line); border-radius: 11px;
-    background: var(--sunken); overflow: hidden;
-  }
-  .picker .crumb {
-    padding: 11px 14px; border-bottom: 1px solid var(--line);
-    font-family: var(--mono); font-size: 12px; color: var(--dim);
-    background: var(--surface); overflow-x: auto; white-space: nowrap;
-  }
-  .picker .listing { max-height: 260px; overflow: auto; padding: 6px; }
-  .pick {
-    display: flex; align-items: center; gap: 10px;
-    padding: 8px 10px; border-radius: 7px; cursor: pointer;
-    font-size: 13.5px; transition: background .1s;
-  }
+  /* picker */
+  .picker { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--sunken); overflow: hidden; }
+  .picker .crumb { padding: 10px 13px; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 12px; color: var(--dim); background: var(--surface); overflow-x: auto; white-space: nowrap; }
+  .picker .listing { max-height: 240px; overflow: auto; padding: 6px; }
+  .pick { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 13.5px; }
   .pick:hover { background: var(--accent-soft); }
-  .pick .ico { color: var(--dim); flex: none; width: 16px; }
+  .pick .ico { color: var(--dim); flex: none; width: 14px; }
   .pick .count { margin-left: auto; color: var(--dim); font-size: 12px; }
   .pick.file { cursor: default; color: var(--ink-soft); }
   .pick.file:hover { background: transparent; }
-  .picker .foot {
-    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
-    padding: 12px 14px; border-top: 1px solid var(--line);
-    background: var(--surface);
-  }
+  .picker .foot { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 11px 13px; border-top: 1px solid var(--line); background: var(--surface); }
 
   /* progress */
-  #log {
-    font-family: var(--mono); font-size: 12px; line-height: 1.85;
-    background: var(--sunken); border: 1px solid var(--line);
-    border-radius: 10px; padding: 16px 18px;
-    max-height: 320px; overflow: auto; white-space: pre-wrap;
-    color: var(--ink-soft);
-  }
+  #log { font-family: var(--mono); font-size: 12px; line-height: 1.85; background: var(--sunken); border: 1px solid var(--line); border-radius: 9px; padding: 14px 16px; max-height: 300px; overflow: auto; white-space: pre-wrap; color: var(--ink-soft); }
   #log .stage { color: var(--ink); font-weight: 600; }
   #log .bad { color: var(--accent); }
   #log .good { color: var(--ok); font-weight: 600; }
   #log .faint { color: var(--dim); }
   .state { font-size: 14px; font-weight: 600; display: flex; gap: 9px; align-items: center; }
-  .state::before {
-    content: ''; width: 7px; height: 7px; border-radius: 50%;
-    background: var(--accent); flex: none;
-  }
+  .state::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
   .state.done::before { background: var(--ok); }
-
-  .steps { list-style: none; margin: 0 0 18px; padding: 0; }
-  .steps li {
-    display: flex; gap: 13px; padding: 11px 0;
-    border-bottom: 1px solid var(--line-soft);
-  }
+  .steps { list-style: none; margin: 0 0 16px; padding: 0; }
+  .steps li { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
   .steps li:last-child { border-bottom: 0; }
-  .steps .mark {
-    flex: none; width: 18px; height: 18px; margin-top: 2px;
-    border-radius: 50%; border: 1.5px solid var(--line);
-    display: grid; place-items: center; font-size: 10px; color: var(--dim);
-  }
+  .steps .mark { flex: none; width: 17px; height: 17px; margin-top: 2px; border-radius: 50%; border: 1.5px solid var(--line); display: grid; place-items: center; font-size: 10px; color: var(--dim); }
   .steps li.done .mark { border-color: var(--ok); color: var(--ok); }
   .steps li.now .mark { border-color: var(--accent); color: var(--accent); }
-  /* the strip */
-  .strip { margin: 24px 0 0; padding-top: 22px; border-top: 1px solid var(--line-soft); }
-  .track {
-    display: flex; gap: 2px; height: 46px; user-select: none;
-    border-radius: 8px; overflow: hidden; background: var(--sunken);
-    border: 1px solid var(--line);
-  }
-  .blk {
-    position: relative; min-width: 12px; cursor: pointer;
-    background: color-mix(in srgb, var(--ok) 14%, var(--surface));
-    border-left: 2px solid color-mix(in srgb, var(--ok) 55%, transparent);
-    padding: 6px 7px; overflow: hidden; transition: background .12s;
-  }
-  .blk.no {
-    background: var(--accent-soft);
-    border-left-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  }
-  .blk:hover { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
-  .blk.on { outline: 2px solid var(--accent); outline-offset: -2px; }
-  .blk .lab {
-    font-size: 10.5px; color: var(--ink-soft); white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis; pointer-events: none;
-  }
-  .blk .dur { font-family: var(--mono); font-size: 10px; color: var(--dim); }
-  .blk .grip {
-    position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize;
-  }
-  .blk .grip.l { left: 0 } .blk .grip.r { right: 0 }
-  .blk .grip:hover { background: color-mix(in srgb, var(--accent) 40%, transparent); }
-  .blk .kill {
-    position: absolute; top: 3px; right: 4px; width: 15px; height: 15px;
-    border-radius: 4px; display: none; place-items: center; font-size: 11px;
-    background: var(--surface); color: var(--accent); border: 1px solid var(--line);
-  }
-  .blk:hover .kill { display: grid; }
-  .strip .legend {
-    display: flex; gap: 14px; justify-content: space-between;
-    margin-top: 8px; font-size: 12px; color: var(--dim);
-  }
   .steps li.broke .mark { border-color: var(--accent); color: var(--accent); }
   .steps li.broke .name { color: var(--accent); }
-  .fault {
-    margin: 0 0 18px; padding: 14px 16px; border-radius: 10px;
-    background: var(--accent-soft);
-    border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
-    font-size: 13.5px; color: var(--ink);
-  }
-  .fault b { display: block; margin-bottom: 5px; }
-  .fault .detail { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
-  .fault a { color: var(--accent); }
-  .steps li.now .mark::after {
-    content: ''; width: 7px; height: 7px; border-radius: 50%;
-    background: var(--accent); animation: pulse 1.4s ease-in-out infinite;
-  }
+  .steps li.now .mark::after { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
   .steps .name { font-weight: 560; font-size: 13.5px; }
   .steps li.todo .name { color: var(--dim); font-weight: 480; }
   .steps .said { color: var(--ink-soft); font-size: 12.5px; margin-top: 2px; }
   .steps li.todo .said { color: var(--dim); }
-  details#raw summary {
-    cursor: pointer; font-size: 12.5px; margin-bottom: 10px;
-    list-style: none;
-  }
+  details#raw summary { cursor: pointer; font-size: 12.5px; margin-bottom: 10px; list-style: none; }
   details#raw summary::before { content: '▸ '; }
   details#raw[open] summary::before { content: '▾ '; }
+  .fault { margin: 0 0 16px; padding: 13px 15px; border-radius: 9px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); font-size: 13.5px; }
+  .fault b { display: block; margin-bottom: 4px; }
+  .fault .detail { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
+  .fault a { color: var(--accent); }
 
-  /* results */
-  .stats {
-    display: flex; gap: 34px; flex-wrap: wrap;
-    padding-bottom: 22px; margin-bottom: 22px;
-    border-bottom: 1px solid var(--line-soft);
-  }
-  .stat b {
-    display: block; font-size: 24px; font-weight: 640;
-    letter-spacing: -.02em; line-height: 1.25;
-  }
-  .stat span { font-size: 12px; color: var(--dim); }
-  .delivery { display: flex; gap: 30px; flex-wrap: wrap; align-items: flex-start; }
-  video {
-    width: 296px; border-radius: 12px; background: #000;
-    box-shadow: var(--shadow); display: block;
-  }
-  .downloads { display: flex; flex-direction: column; gap: 7px; margin-top: 14px; }
-  a.link {
-    color: var(--ink-soft); font-size: 13px; text-decoration: none;
-    display: inline-flex; align-items: center; gap: 6px;
-  }
-  a.link::before { content: '↓'; color: var(--dim); }
-  a.link:hover { color: var(--accent); }
-
+  /* tables */
   table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-  th {
-    text-align: left; padding: 0 12px 9px; font-size: 11.5px;
-    color: var(--dim); font-weight: 600; letter-spacing: .03em;
-    text-transform: uppercase; border-bottom: 1px solid var(--line);
-  }
-  td {
-    text-align: left; padding: 11px 12px; vertical-align: top;
-    border-bottom: 1px solid var(--line-soft);
-  }
+  th { text-align: left; padding: 0 11px 8px; font-size: 11px; color: var(--dim); font-weight: 600; letter-spacing: .03em; text-transform: uppercase; border-bottom: 1px solid var(--line); }
+  td { text-align: left; padding: 10px 11px; vertical-align: top; border-bottom: 1px solid var(--line-soft); }
   tr:last-child td { border-bottom: 0; }
-  tbody tr:hover, table tr:hover { background: var(--sunken); }
+  table tr:hover { background: var(--sunken); }
   td.mono, .mono { font-family: var(--mono); font-size: 12px; }
   td.num { white-space: nowrap; color: var(--ink-soft); }
-  .tag {
-    display: inline-block; padding: 2px 8px; border-radius: 999px;
-    font-size: 11.5px; font-weight: 550; border: 1px solid var(--line);
-    color: var(--dim); white-space: nowrap;
-  }
-  .tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); background: color-mix(in srgb, var(--ok) 8%, transparent); }
-  .tag.no { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); background: var(--accent-soft); }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 550; border: 1px solid var(--line); color: var(--dim); white-space: nowrap; }
+  .tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+  .tag.no { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
   .why { color: var(--dim); font-size: 12.5px; line-height: 1.55; }
-  .scroll { overflow-x: auto; margin: 0 -4px; padding: 0 4px; }
+  .scroll { overflow-x: auto; }
   .hide { display: none !important; }
   a.shot { color: var(--ink-soft); text-decoration: none; border-bottom: 1px solid var(--line); }
   a.shot:hover { color: var(--accent); border-color: currentColor; }
@@ -313,10 +195,11 @@
 </head>
 <body>
 <header>
-  <div class="inner">
-    <h1>montagewright<span class="dot">.</span></h1>
-    <p>丟一個資料夾進來，看它怎麼剪，以及為什麼</p>
-  </div>
+  <h1>montagewright<span class="dot">.</span></h1>
+  <span class="why" id="picked"></span>
+  <span class="tail">
+    <button class="ghost" id="new-run">新的一輪</button>
+  </span>
 </header>
 
 <main>
@@ -342,12 +225,10 @@
           <a href="#" id="show-upload">還是要用上傳</a>
         </div>
       </div>
-
       <div class="field wide hide" id="upload-row">
         <label>上傳素材資料夾</label>
         <input type="file" id="rushes" webkitdirectory directory multiple>
       </div>
-
       <div class="field">
         <label>音樂</label>
         <div class="row" style="gap:8px;flex-wrap:nowrap">
@@ -357,16 +238,11 @@
       </div>
       <div class="field">
         <label>輸出比例</label>
-        <select id="aspect">
-          <option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option>
-        </select>
+        <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select>
       </div>
       <div class="field">
         <label>語音</label>
-        <select id="speech">
-          <option value="auto">自動判斷</option>
-          <option value="never">不要轉錄</option>
-        </select>
+        <select id="speech"><option value="auto">自動判斷</option><option value="never">不要轉錄</option></select>
       </div>
       <div class="field">
         <label>語言</label>
@@ -385,30 +261,19 @@
         <label>預算上限（美元）</label>
         <input type="number" id="budget" value="6" min="0.5" step="0.5">
       </div>
-
       <div class="field wide">
         <label>Brief（可留空）</label>
         <textarea id="brief" placeholder="這支片要傳達什麼、給誰看、非講不可的是什麼"></textarea>
       </div>
     </div>
-
     <div class="actions">
-      <button id="go" class="big">開始剪</button>
-      <label class="check">
-        <input type="checkbox" id="review" checked> 開啟自審與重新規劃
-      </label>
-      <span id="picked" class="why"></span>
+      <button id="go">開始剪</button>
+      <label class="check"><input type="checkbox" id="review" checked> 開啟自審與重新規劃</label>
     </div>
   </section>
 
-  <section class="hide" id="past">
-    <h2>先前的剪輯</h2>
-    <p class="sub">點開可以跟這一輪比較。重開服務也還在。</p>
-    <div class="scroll"><table id="past-table"></table></div>
-  </section>
-
   <section class="hide" id="progress">
-    <div class="row" style="justify-content:space-between;margin-bottom:16px">
+    <div class="row" style="justify-content:space-between;margin-bottom:14px">
       <span class="state" id="state">執行中</span>
       <span class="row" style="gap:8px">
         <button id="resume" class="hide">繼續跑</button>
@@ -422,8 +287,8 @@
 
   <section class="hide" id="result">
     <div class="stats" id="stats"></div>
-    <div class="delivery">
-      <div>
+    <div class="bench">
+      <div class="viewer">
         <video id="video" controls playsinline></video>
         <div class="downloads">
           <a id="download" class="link" download>完整畫質</a>
@@ -432,9 +297,7 @@
           <a id="tl-fc" class="link hide" download>Final Cut XML</a>
         </div>
       </div>
-      <div style="flex:1;min-width:280px">
-        <table id="spend"></table>
-      </div>
+      <div class="inspector" id="inspector"></div>
     </div>
     <div class="strip hide" id="strip">
       <div class="track" id="track"></div>
@@ -448,26 +311,43 @@
     </div>
   </section>
 
-  <section class="hide" id="shots">
-    <h2>每一顆用了什麼、怎麼處理</h2>
-    <p class="sub">點檔名可以單獨看那一顆——構圖問題在成片裡會被下一顆蓋過去。</p>
-    <div class="scroll"><table id="shot-table"></table></div>
+  <section class="hide" id="detail">
+    <div class="tabs">
+      <button class="tab on" data-pane="pane-shots">全部鏡頭</button>
+      <button class="tab" data-pane="pane-tx">聽到了什麼</button>
+      <button class="tab" data-pane="pane-spend">花費</button>
+      <button class="tab" data-pane="pane-aside">沒用的素材</button>
+      <button class="tab" data-pane="pane-past">先前的剪輯</button>
+    </div>
+    <div class="pane" id="pane-shots">
+      <p class="sub">點檔名可以單獨看那一顆——構圖問題在成片裡會被下一顆蓋過去。</p>
+      <div class="scroll"><table id="shot-table"></table></div>
+    </div>
+    <div class="pane hide" id="pane-tx">
+      <p class="sub">辨識器聽的、Gemini 改的、誰講的。轉錯的地方會讓後面每個決定都跟著錯。</p>
+      <div class="scroll"><table id="tx-table"></table></div>
+    </div>
+    <div class="pane hide" id="pane-spend">
+      <div class="scroll" style="max-width:560px"><table id="spend"></table></div>
+    </div>
+    <div class="pane hide" id="pane-aside">
+      <p class="sub">卡片判定不能用的，以及它給的理由。</p>
+      <div class="scroll"><table id="aside-table"></table></div>
+    </div>
+    <div class="pane hide" id="pane-past">
+      <p class="sub">點開可以跟這一輪比較。重開服務也還在。</p>
+      <div class="scroll"><table id="past-table"></table></div>
+    </div>
   </section>
 
-  <section class="hide" id="transcripts">
-    <h2>聽到了什麼</h2>
-    <p class="sub">辨識器聽的、Gemini 改的、誰講的。轉錯的地方會讓後面每個決定都跟著錯。</p>
-    <div class="scroll"><table id="tx-table"></table></div>
-  </section>
-
-  <section class="hide" id="aside">
-    <h2>沒有用的素材</h2>
-    <p class="sub">卡片判定不能用的，以及它給的理由。</p>
-    <div class="scroll"><table id="aside-table"></table></div>
-  </section>
+  <div class="hide" id="past"></div>
+  <div class="hide" id="shots"></div>
+  <div class="hide" id="transcripts"></div>
+  <div class="hide" id="aside"></div>
 </main>
 
 <script>
+
 const $ = (id) => document.getElementById(id);
 let runId = null, seen = 0, timer = null, allLines = [];
 
@@ -566,7 +446,41 @@ async function openRun(id) {
   window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
 }
 
-let blocks = [], blocksWere = [], picked = -1;
+let blocks = [], blocksWere = [], picked = -1, lastReport = null;
+
+// One shot at a time, where the eye already is. The whole table is still
+// under 全部鏡頭 for reading straight through; this is for the shot you just
+// clicked, which is the question anyone actually has in front of a cut.
+function inspect(i) {
+  const b = blocks[i];
+  if (!b || !lastReport) { $('inspector').innerHTML = ''; return; }
+  const plan = (lastReport.selection?.shots || [])[b.index] || {};
+  const rhythm = (lastReport.rhythm || {})[`k${String(b.index).padStart(2, '0')}`] || {};
+  const said = (lastReport.shots || {})[`k${String(b.index).padStart(2, '0')}`] || {};
+  const deg = (lastReport.degradations || []).filter(
+    d => d.clip_id === `k${String(b.index).padStart(2, '0')}`);
+  const moved = Math.abs(b.in_seconds - (plan.start_seconds ?? b.in_seconds)) > 0.01
+    || Math.abs(b.seconds - (rhythm.seconds ?? b.seconds)) > 0.01;
+
+  $('inspector').innerHTML = `
+    <div class="ins-head">
+      <span class="mono">${esc(b.source_id)}</span>
+      ${said.delivered === undefined ? '' :
+        `<span class="tag ${said.delivered ? 'ok' : 'no'}">${said.delivered ? '做到' : '沒做到'}</span>`}
+    </div>
+    <a class="link" href="/api/runs/${runId}/shot/${b.index}" target="_blank">單獨看這一顆</a>
+    <dl>
+      <dt>進出點</dt><dd class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds).toFixed(2)}s
+        （${b.seconds.toFixed(2)}s${moved ? '，已改動' : ''}）</dd>
+      <dt>運鏡</dt><dd>${esc(plan.camera_move || '—')}${plan.framing ? `　<span class="why">${esc(plan.framing)}</span>` : ''}</dd>
+      <dt>主體</dt><dd>${esc(plan.subject || '—')}${said.speaker ? `<div class="why">說話：${esc(said.speaker)}</div>` : ''}</dd>
+      <dt>為什麼選它</dt><dd class="why">${esc(plan.why || '—')}</dd>
+      ${rhythm.why ? `<dt>為什麼這個長度</dt><dd class="why">${esc(rhythm.why)}</dd>` : ''}
+      ${said.note ? `<dt>驗收看到</dt><dd class="why">${esc(said.note)}</dd>` : ''}
+      ${deg.length ? `<dt>降級</dt><dd>${deg.map(d =>
+        `<div class="why">${esc(d.ladder)}　<span class="tag">${esc(d.adjudication || '')}</span></div>`).join('')}</dd>` : ''}
+    </dl>`;
+}
 
 async function showStrip() {
   const data = await (await fetch(`/api/runs/${runId}/timeline-data`)).json();
@@ -575,6 +489,7 @@ async function showStrip() {
   blocksWere = JSON.parse(JSON.stringify(blocks));
   paintStrip();
   $('strip').classList.remove('hide');
+  if (blocks.length) { picked = 0; paintStrip(); inspect(0); }
 }
 
 function paintStrip() {
@@ -603,11 +518,9 @@ function wireStrip() {
     const i = +el.dataset.i;
     el.onclick = (e) => {
       if (e.target.dataset.kill !== undefined || e.target.classList.contains('grip')) return;
-      picked = i; paintStrip();
+      picked = i; paintStrip(); inspect(i);
       const at = blocks.slice(0, i).reduce((a, b) => a + b.seconds, 0);
       $('video').currentTime = at + 0.05;
-      const row = $('shot-table').querySelectorAll('tr')[blocks[i].index + 1];
-      if (row) row.scrollIntoView({ block: 'center', behavior: 'smooth' });
     };
     el.ondragstart = () => { from = i; };
     el.ondragover = (e) => e.preventDefault();
@@ -686,7 +599,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if ($('video').currentTime >= at) now = i;
       at += b.seconds;
     });
-    if (now !== picked) { picked = now; paintStrip(); }
+    if (now !== picked) { picked = now; paintStrip(); inspect(now); }
   });
 });
 
@@ -912,15 +825,27 @@ async function poll() {
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 
 function render(report) {
+  lastReport = report;
+  const howMany = (report.selection?.shots || []).length;
+  const [landed, wanted] = String(report.cuts_on_music ?? '0/0').split('/').map(Number);
+  const degraded = (report.degradations || []).length;
+  const spent = Object.values(report.spend?.by_stage || {}).reduce((a, b) => a + b, 0);
+  const target = report.target_seconds;
+  const off = target ? (report.duration_seconds ?? 0) - target : 0;
+
   const stats = [
-    ['片長', `${(report.duration_seconds ?? 0).toFixed(1)}s`, `目標 ${report.target_seconds ?? '—'}s`],
-    ['顆數', (report.selection?.shots || []).length, '鏡頭'],
-    ['對上音樂', report.cuts_on_music ?? '—', '刀'],
-    ['降級', (report.degradations || []).length, '筆，都有量測值'],
-    ['花費', '$' + Object.values(report.spend?.by_stage || {}).reduce((a, b) => a + b, 0).toFixed(2), '本輪'],
+    [`${(report.duration_seconds ?? 0).toFixed(1)}s`,
+     target ? `目標 ${target}s，${off < 0 ? '短' : '長'} ${Math.abs(off).toFixed(1)}s` : '片長'],
+    [howMany, '顆鏡頭'],
+    // "0/13" read as though every cut had missed. A film where nothing asked
+    // for a beat is not a film that missed every beat.
+    wanted ? [`${landed}/${wanted}`, '刀切在音樂事件上']
+           : [howMany, '刀的長度由內容決定'],
+    [degraded, degraded ? '處做不到原本的計畫，都記了原因' : '處沒做到計畫'],
+    ['$' + spent.toFixed(2), '本輪花費'],
   ];
-  $('stats').innerHTML = stats.map(([k, v, s]) =>
-    `<div class="stat"><b>${esc(String(v))}</b><span>${esc(k)}・${esc(s)}</span></div>`).join('');
+  $('stats').innerHTML = stats.map(([v, s]) =>
+    `<div class="stat"><b>${esc(String(v))}</b><span>${esc(s)}</span></div>`).join('');
 
   // The report nests these under by_stage alongside the cap and the running
   // total; iterating the outer object showed one row called "by_stage".
@@ -970,6 +895,23 @@ function render(report) {
     $('aside').classList.remove('hide');
   }
 }
+
+
+for (const tab of document.querySelectorAll('.tab')) {
+  tab.onclick = () => {
+    for (const t of document.querySelectorAll('.tab')) t.classList.remove('on');
+    for (const pane of document.querySelectorAll('.pane')) pane.classList.add('hide');
+    tab.classList.add('on');
+    $(tab.dataset.pane).classList.remove('hide');
+  };
+}
+
+$('new-run').addEventListener('click', () => {
+  $('setup').classList.toggle('hide');
+  if (!$('setup').classList.contains('hide')) {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+});
 </script>
 </body>
 </html>

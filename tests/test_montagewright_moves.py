@@ -1444,4 +1444,6 @@ def test_the_cut_can_be_adjusted_without_replanning_it() -> None:
         assert piece in page, piece
     # Pulling the head earlier eats into the handle rather than sliding the
     # shot, so the out-point stays where the edit put it.
-    assert "keeps its out-point" in page
+    assert "eats into the handle" in page
+    # One shot at a time, beside the viewer, instead of a table to scroll.
+    assert "function inspect" in page and 'id="inspector"' in page

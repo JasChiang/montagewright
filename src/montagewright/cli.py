@@ -767,7 +767,15 @@ def _write_report(output: Path, **parts) -> None:
     payload = {
         "direction": parts["direction"],
         "selection": parts["selection"],
-        "cuts_on_music": f"{report.aligned_cuts}/{report.total_cuts}",
+        # Against how many asked for a beat, not how many cuts there are. A
+        # speech cut where every length is content-led was reading as 0/13,
+        # which is what missing every beat would look like.
+        "cuts_on_music": (
+            f"{report.aligned_cuts}/"
+            f"{sum(1 for e in report.rhythm_decisions.values() if e.get('cut_on_beat'))}"
+            if report.rhythm_decisions
+            else f"{report.aligned_cuts}/{report.total_cuts}"
+        ),
         "shots_following": report.following_shots,
         "shots_held": report.static_shots,
         "upscales": {k: round(v, 3) for k, v in report.upscales.items()},
