@@ -19,7 +19,6 @@ dev = [
 ]
 
 [project.scripts]
-jascue-video-lab = "jascue_video_lab.cli:main"
 jascue-auto = "jascue_auto.cli:main"
 jascue-auto-web = "jascue_auto.webapp:main"
 
