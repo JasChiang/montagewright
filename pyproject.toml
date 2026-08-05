@@ -38,7 +38,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/jascue_video_lab", "src/montagewright", "scripts"]
+packages = ["src/montagewright", "scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

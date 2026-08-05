@@ -15,8 +15,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from jascue_video_lab.media import sha256_file
-from jascue_video_lab.storage import utc_now, write_json
+from montagewright.measure.media import sha256_file
+from montagewright.measure.storage import utc_now, write_json
 
 
 def read_json(path: Path) -> dict[str, Any]:

@@ -137,7 +137,7 @@ def analyse_track(path: Path) -> BeatGrid:
     would run at all. The measurement underneath is the same one.
     """
 
-    from jascue_video_lab.music import analyze_music
+    from montagewright.measure.music import analyze_music
 
     proposal = analyze_music(Path(path).expanduser().resolve())
     rate = float(proposal.master_sample_rate)

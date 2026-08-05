@@ -8,8 +8,8 @@ import json
 import subprocess
 from pathlib import Path
 
-from jascue_video_lab.models import RushesCatalog
-from jascue_video_lab.storage import read_json
+from montagewright.measure.models import RushesCatalog
+from montagewright.measure.storage import read_json
 
 
 def mmss_to_seconds(value: str) -> int:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from jascue_video_lab.geometry import (
+from montagewright.measure.geometry import (
     box_iou,
     center_distance,
     native_yxyx_to_canonical_xyxy,

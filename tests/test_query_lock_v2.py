@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from jascue_video_lab.models import (
+from montagewright.measure.models import (
     AspectConstraint,
     EvidenceAnchor,
     EvidenceApprovalSource,

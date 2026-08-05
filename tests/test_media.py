@@ -4,7 +4,7 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
-from jascue_video_lab.media import (
+from montagewright.measure.media import (
     create_analysis_proxy,
     extract_frame,
     extract_frame_at_pts,

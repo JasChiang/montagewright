@@ -215,7 +215,7 @@ def _track_subject(
 ) -> tuple[list[Observation], dict[str, int]]:
     """Propagate a Gemini seed across every analysed frame of the shot."""
 
-    from jascue_video_lab.sam_tracking import track_bbox_sam21
+    from montagewright.measure.sam_tracking import track_bbox_sam21
 
     track = track_bbox_sam21(
         video_path=source.path,

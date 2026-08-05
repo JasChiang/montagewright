@@ -9,8 +9,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from jascue_video_lab.media import extract_frame
-from jascue_video_lab.storage import read_json, write_json
+from montagewright.measure.media import extract_frame
+from montagewright.measure.storage import read_json, write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]

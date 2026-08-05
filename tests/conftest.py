@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from jascue_video_lab.models import (
+from montagewright.measure.models import (
     BoundaryPrecision,
     ContentMap,
     Entity,

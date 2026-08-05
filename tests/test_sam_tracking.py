@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-import jascue_video_lab.sam_tracking as sam_tracking
-from jascue_video_lab.media import probe_video
-from jascue_video_lab.models import (
+import montagewright.measure.sam_tracking as sam_tracking
+from montagewright.measure.media import probe_video
+from montagewright.measure.models import (
     SegmentationSample,
     SemanticIdentityStatus,
     SharedSam21BBoxSeed,
@@ -16,7 +16,7 @@ from jascue_video_lab.models import (
     SharedSam21TrackingRequest,
     TrackingState,
 )
-from jascue_video_lab.sam_tracking import (
+from montagewright.measure.sam_tracking import (
     _extract_analysis_frames,
     _normalize_shot_manifest,
     _seed_shot,
@@ -32,7 +32,7 @@ from jascue_video_lab.sam_tracking import (
     track_bbox_sam21,
     track_bboxes_shared_sam21,
 )
-from jascue_video_lab.shots import ShotBoundary, ShotManifest, ShotSegment
+from montagewright.measure.shots import ShotBoundary, ShotManifest, ShotSegment
 
 
 def test_normalized_box_to_xyxy_is_x_first() -> None:
