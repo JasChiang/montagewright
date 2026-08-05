@@ -323,6 +323,7 @@ def command_render(args: argparse.Namespace) -> int:
         checkpoint=args.sam_checkpoint,
         ledger=ledger,
         keep_voice=bool(transcripts),
+        under_speech=str(direction.get("music_under_speech") or "duck"),
         client=client,
     )
     # The direction set a length; somebody has to compare it with what came

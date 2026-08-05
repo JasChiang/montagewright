@@ -1034,3 +1034,47 @@ def test_no_music_means_no_rhythm_pass() -> None:
     assert "decide_rhythm_first and grid is not None" in inspect.getsource(
         pipeline.run
     )
+
+
+def test_how_music_sits_under_speech_is_decided_not_computed() -> None:
+    """A compressor ducks on signal and knows nothing about the film.
+
+    On a cut that is speech end to end that means the bed climbs into every
+    breath and is pushed down by the next line -- busier than sitting behind
+    it steadily. Which of the two a film wants is an editorial call.
+    """
+
+    import inspect
+
+    from jascue_auto import renderer
+    from jascue_auto.planner import PROMPTS, _direction_schema
+
+    field = _direction_schema()["properties"]["music_under_speech"]
+    assert field["enum"] == ["bed", "duck", "none"]
+    assert "music_under_speech" in _direction_schema()["required"]
+
+    prompt = (PROMPTS / "direction_zh-TW.txt").read_text(encoding="utf-8")
+    assert "music_under_speech" in prompt
+
+    source = inspect.getsource(renderer._mux_music)
+    assert 'under_speech == "bed"' in source
+    assert "sidechaincompress" in source, "ducking is still available"
+
+
+def test_the_bed_is_placed_under_the_voice_not_under_the_music() -> None:
+    """"The music minus 12" lands wherever that track was mastered.
+
+    A mastered track sits near -12 dBFS and a street interview averages
+    around -22, so a fixed subtraction put the bed at exactly the level of
+    the speech it was meant to be beneath, and the reviewer reported the
+    voice as missing from a cut that contained it.
+    """
+
+    import inspect
+
+    from jascue_auto import renderer
+
+    assert not hasattr(renderer, "MUSIC_UNDER_VOICE_DB")
+    assert renderer.BED_BELOW_VOICE_DB > 0
+    source = inspect.getsource(renderer._mux_music)
+    assert "_level(picture) - _level(music) - BED_BELOW_VOICE_DB" in source

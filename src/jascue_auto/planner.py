@@ -620,6 +620,7 @@ def _direction_schema() -> dict[str, Any]:
             "material_assessment",
             "direction",
             "target_seconds",
+            "music_under_speech",
             "aspect",
             "unusable",
         ],
@@ -635,6 +636,18 @@ def _direction_schema() -> dict[str, Any]:
             "material_assessment": {"type": "string"},
             "direction": {"type": "string"},
             "target_seconds": {"type": "number"},
+            "music_under_speech": {
+                "type": "string",
+                "enum": ["bed", "duck", "none"],
+                "description": (
+                    "有人聲的時候音樂怎麼待在底下。`bed`：穩定壓在後面，"
+                    "從頭到尾同一個音量——整支幾乎都在講話的時候要這個，"
+                    "因為每個換氣的空隙音樂都爬上來再被壓下去，比穩定襯著"
+                    "更吵。`duck`：每句話進來時退開、句子之間回來——"
+                    "說話是零星的、音樂本身有東西要聽的時候用。"
+                    "`none`：不要音樂。素材沒有人聲時這個欄位不影響結果。"
+                ),
+            },
             "aspect": {"type": "string", "enum": ["16:9", "9:16", "1:1"]},
             "music_suggestion": {"type": "string"},
             "unusable": {

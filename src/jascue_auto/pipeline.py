@@ -776,6 +776,7 @@ def run(
     decide_rhythm_first: bool = True,
     target_seconds: float = 0.0,
     keep_voice: bool = False,
+    under_speech: str = "duck",
     client: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
     """Take an EDL to a finished file.
@@ -850,6 +851,6 @@ def run(
     # opening a single shot. The segments are what that question is asked of.
     result = render(
         plan, output_dir, music=music, keep_segments=True,
-        keep_voice=keep_voice,
+        keep_voice=keep_voice, under_speech=under_speech,
     )
     return result, plan, report, edl

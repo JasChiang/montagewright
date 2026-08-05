@@ -35,9 +35,12 @@ TRUE_PEAK_CEILING_DB = -1.5
 TRUE_PEAK_CEILING_LINEAR = 10 ** (TRUE_PEAK_CEILING_DB / 20)
 PREVIEW_HEIGHT = 640
 
-# Where the bed sits before anyone speaks. Under a voice a track is
-# accompaniment, and accompaniment at full level is competition.
-MUSIC_UNDER_VOICE_DB = -12
+# How far under the voice the bed sits. Measured against the voice, not
+# subtracted from the music: a mastered track reduced by a fixed amount lands
+# wherever that track happened to be mastered, and a street interview averages
+# around -22 dBFS, which is exactly where "the music minus 12" put the bed --
+# the same level as the speech it was supposed to be under.
+BED_BELOW_VOICE_DB = 14.0
 # How the bed gets out of the way. Attack short enough to be down before the
 # first syllable lands, release long enough that it does not pump between
 # words -- a bed that comes back up inside a sentence is more distracting
@@ -107,6 +110,27 @@ def _encoder(preferred: str, fallback: str) -> str:
         check=False,
     )
     return preferred if preferred in probe.stdout else fallback
+
+
+def _level(path: Path) -> float:
+    """Mean level of a file's audio, in dBFS.
+
+    Both sides have to be measured for "under the voice" to mean anything.
+    A track mastered loud and a field recording of someone talking in traffic
+    are twenty decibels apart before anything is decided.
+    """
+
+    completed = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", str(path),
+            "-af", "volumedetect", "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    for line in completed.stderr.splitlines():
+        if "mean_volume:" in line:
+            return float(line.split("mean_volume:")[1].split("dB")[0])
+    return -20.0
 
 
 def probe_duration(path: Path) -> float:
@@ -240,6 +264,7 @@ def _mux_music(
     *,
     video_encoder: str,
     keep_voice: bool = False,
+    under_speech: str = "duck",
 ) -> Path:
     """Lay a music bed under the cut and normalise the result.
 
@@ -257,9 +282,27 @@ def _mux_music(
     """
 
     duration = probe_duration(picture)
-    if keep_voice:
+    bed_gain = (
+        _level(picture) - _level(music) - BED_BELOW_VOICE_DB
+        if keep_voice
+        else 0.0
+    )
+    if keep_voice and under_speech == "bed":
+        # Steady, all the way through. Ducking a film that is speech from end
+        # to end means the bed climbs into every breath and gets pushed down
+        # again by the next line -- busier than simply sitting behind it. Which
+        # of the two a cut wants is an editorial call, and it is made by the
+        # layer that watched the material rather than by a compressor.
         chain = (
-            f"[1:a]atrim=0:{duration:.6f},volume={MUSIC_UNDER_VOICE_DB}dB[bed];"
+            f"[1:a]atrim=0:{duration:.6f},volume={bed_gain:.2f}dB[bed];"
+            "[0:a][bed]amix=inputs=2:duration=first:normalize=0,"
+            f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
+            f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled"
+            "[out]"
+        )
+    elif keep_voice:
+        chain = (
+            f"[1:a]atrim=0:{duration:.6f},volume={bed_gain:.2f}dB[bed];"
             # The voice is the sidechain trigger, not part of the output of
             # this branch -- asplit because one copy steers the compressor
             # and the other is what anyone actually hears.
@@ -321,6 +364,7 @@ def render(
     music: Path | None = None,
     keep_segments: bool = True,
     keep_voice: bool = False,
+    under_speech: str = "duck",
 ) -> RenderResult:
     """Render a plan to a deliverable and a preview.
 
@@ -353,6 +397,7 @@ def render(
         _mux_music(
             picture, music, deliverable,
             video_encoder=video_encoder, keep_voice=keep_voice,
+            under_speech=under_speech,
         )
     else:
         shutil.copyfile(picture, deliverable)
