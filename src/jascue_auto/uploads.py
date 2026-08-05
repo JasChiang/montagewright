@@ -17,7 +17,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import os
+import shutil
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -105,6 +109,34 @@ class UploadCache:
         return uploaded.uri, False
 
 
+@contextmanager
+def _ascii_named(path: Path):
+    """Give the uploader a name it can put in a header, and clean up after.
+
+    Hardlinked rather than copied: these are proxies and previews, and
+    copying a folder of them to rename it is minutes of disk for nothing.
+    """
+
+    try:
+        path.name.encode("ascii")
+    except UnicodeEncodeError:
+        pass
+    else:
+        yield path
+        return
+
+    safe = Path(tempfile.mkdtemp(prefix="jascue-upload-"))
+    linked = safe / f"{content_hash(path)[:16]}{path.suffix}"
+    try:
+        os.link(path, linked)
+    except OSError:
+        shutil.copyfile(path, linked)
+    try:
+        yield linked
+    finally:
+        shutil.rmtree(safe, ignore_errors=True)
+
+
 def upload_now(path: Path, client: Any) -> Any:
     """Upload and wait until the file can actually be used.
 
@@ -115,7 +147,13 @@ def upload_now(path: Path, client: Any) -> Any:
     because it is one fact about the API.
     """
 
-    uploaded = client.files.upload(file=str(path))
+    # The upload puts the filename in a header, and a header is latin-1. A
+    # Chinese name -- which is most of the material this is pointed at -- came
+    # back as UnicodeEncodeError for every clip in the folder. The bytes are
+    # what is being sent; the name is not part of them.
+    path = Path(path)
+    with _ascii_named(path) as sendable:
+        uploaded = client.files.upload(file=str(sendable))
     while getattr(uploaded.state, "name", str(uploaded.state)) == "PROCESSING":
         time.sleep(2.0)
         uploaded = client.files.get(name=uploaded.name)

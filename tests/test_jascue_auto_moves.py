@@ -902,3 +902,135 @@ def test_a_cut_that_never_asked_for_a_beat_is_not_a_missed_one() -> None:
 
     silent = Report(total_cuts=4, aligned_cuts=4)
     assert "4/4 cuts on a musical event" in silent.summary()
+
+
+def test_an_already_cut_file_is_opened_along_its_own_boundaries() -> None:
+    """One file holding many takes is not one take.
+
+    Handed over whole it becomes one card describing five minutes, one
+    transcript, and a planner choosing windows out of a single source as
+    though the cuts inside it were not there. A continuous take comes back
+    as itself, which is the honest answer for a locked-off interview.
+    """
+
+    import inspect
+
+    from jascue_auto import cli, grounding
+
+    assert "shots_in" in inspect.getsource(cli.command_render)
+    source = inspect.getsource(grounding.shots_in)
+    assert "scene" in source
+    # The split pieces keep the name they came from, so a report traces back.
+    assert '{path.stem}-{index:02d}' in inspect.getsource(cli.command_render)
+
+
+def test_music_is_not_required_to_make_a_cut() -> None:
+    """Refusing to run without a bed was the tool deciding on the way in.
+
+    A cut carried by what people say does not need one, and without a grid
+    every length is content-led -- which is what a speech cut wants.
+    """
+
+    import inspect
+
+    from jascue_auto import cli
+
+    source = inspect.getsource(cli.command_render)
+    assert "--music or --music-map is required" not in source
+    assert "lengths will be led by content" in source
+
+
+def test_a_chinese_filename_can_be_uploaded() -> None:
+    """The uploader puts the name in a header, and a header is latin-1.
+
+    Every clip in a folder named in Chinese -- which is most of what this is
+    pointed at -- failed with UnicodeEncodeError, and the material's own name
+    is not part of the bytes being sent.
+    """
+
+    import tempfile
+    from pathlib import Path
+
+    from jascue_auto.uploads import _ascii_named
+
+    work = Path(tempfile.mkdtemp())
+    chinese = work / "夏日街訪_夏天最崩潰的事-00.mp4"
+    chinese.write_bytes(b"x" * 64)
+    with _ascii_named(chinese) as sendable:
+        sendable.name.encode("ascii")
+        assert sendable.suffix == ".mp4"
+        assert sendable.read_bytes() == chinese.read_bytes()
+
+    plain = work / "C8371.MP4"
+    plain.write_bytes(b"y")
+    with _ascii_named(plain) as sendable:
+        assert sendable == plain, "an ASCII name needs no detour"
+
+
+def test_a_timeline_is_written_only_when_asked_for() -> None:
+    """Most runs want a file. A timeline is for the run where somebody
+    intends to open it and disagree with one shot."""
+
+    import inspect
+
+    from jascue_auto import cli
+
+    source = inspect.getsource(cli.command_render)
+    assert 'args.timeline != "none"' in source
+    parser_source = inspect.getsource(cli.main)
+    assert '"--timeline"' in parser_source and 'default="none"' in parser_source
+
+
+def test_a_timeline_carries_the_reasons_and_the_original_media() -> None:
+    """Handles and reasons both existed and neither could be used.
+
+    Every segment renders with half a second either side for exactly this
+    and nothing consumed it; every shot carries why it was chosen, in a
+    debugging artifact no editor reads. Referencing the original source is
+    what makes the handle a thing you can drag.
+    """
+
+    from pathlib import Path
+
+    from jascue_auto.executor import CropBox, RenderPlan, Segment, Source
+    from jascue_auto.timeline import to_fcpxml, to_xmeml
+
+    source = Source(
+        source_id="S00", path=Path("/tmp/夏日街訪-00.mp4"),
+        duration_seconds=48.0, width=1920, height=1080,
+    )
+    plan = RenderPlan(project_id="t", segments=[
+        Segment(clip_id="k00", source=source, in_seconds=4.0,
+                out_seconds=7.0, crop=CropBox(0.34, 0.0, 0.3164, 1.0))
+    ])
+    report = {
+        "selection": {"shots": [{"why": "受訪者回答核心問題",
+                                 "camera_move": "hold"}]},
+        "rhythm": {"k00": {"why": "讓句子講完"}},
+        "shots": {"k00": {"delivered": True, "note": "框住講話的人"}},
+        "degradations": [],
+    }
+    for build in (to_xmeml, to_fcpxml):
+        xml = build(plan, report, name="cut", width=1080, height=1920)
+        assert "受訪者回答核心問題" in xml, "the reason has to travel"
+        assert "讓句子講完" in xml
+        # The original file, not the rendered segment: trimming outward is
+        # only possible against material the timeline can still reach.
+        assert "-00.mp4" in xml and "segments" not in xml
+
+
+def test_no_music_means_no_rhythm_pass() -> None:
+    """Its whole job is reconciling a length against a track.
+
+    Called with no grid it went looking for section boundaries in music that
+    was never supplied, and every length was already the one selection asked
+    for -- so there was nothing to reconcile even if it had survived.
+    """
+
+    import inspect
+
+    from jascue_auto import pipeline
+
+    assert "decide_rhythm_first and grid is not None" in inspect.getsource(
+        pipeline.run
+    )

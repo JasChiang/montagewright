@@ -75,6 +75,58 @@ class BeatGrid:
         return later[0] if later else None
 
 
+def shots_in(path: Path, *, threshold: float = 0.3) -> list[tuple[float, float]]:
+    """Where an already-edited piece changes shot.
+
+    A folder of rushes is one take per file. Something already cut is one
+    file holding many, and handing it over whole means one card describing
+    five minutes, one transcript, and a planner picking windows out of a
+    single source as though the cuts inside it were not there. These are
+    boundaries the material already has; nothing is being invented.
+
+    A genuinely continuous take comes back as one span, which is the honest
+    answer for a locked-off interview.
+    """
+
+    import subprocess
+
+    completed = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
+            "-filter_complex",
+            f"select='gt(scene,{threshold})',metadata=print:file=-",
+            "-an", "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    cuts = [
+        float(line.split("pts_time:")[1].split()[0])
+        for line in completed.stdout.splitlines()
+        if "pts_time:" in line
+    ]
+    duration = _duration_of(path)
+    edges = [0.0] + sorted(cuts) + [duration]
+    return [
+        (start, end)
+        for start, end in zip(edges, edges[1:])
+        if end - start >= 2.0
+    ]
+
+
+def _duration_of(path: Path) -> float:
+    import json as _json
+    import subprocess
+
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "json", str(path),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return float(_json.loads(completed.stdout)["format"]["duration"])
+
+
 def analyse_track(path: Path) -> BeatGrid:
     """Measure a track straight into a grid.
 

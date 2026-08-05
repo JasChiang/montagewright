@@ -789,7 +789,11 @@ def run(
 
     report = Report(ledger=ledger)
 
-    if decide_rhythm_first:
+    # Without music there is nothing for this pass to reconcile. Its whole
+    # job is deciding a length against a track, and every length is already
+    # the one selection asked for -- calling it with no grid asked it to
+    # describe music that is not there.
+    if decide_rhythm_first and grid is not None:
         edl, usage = decide_rhythm(
             edl,
             grid,

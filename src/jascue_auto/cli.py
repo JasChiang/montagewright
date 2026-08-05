@@ -23,7 +23,7 @@ from jascue_auto.clipcard import (
     subjects_from_card,
 )
 from jascue_auto.cost import BudgetSpent, Ledger
-from jascue_auto.grounding import analyse_track, load_beat_grid
+from jascue_auto.grounding import analyse_track, load_beat_grid, shots_in
 from jascue_auto.pipeline import probe, run
 from jascue_auto.review import (
     Round,
@@ -43,6 +43,10 @@ from jascue_auto.schema import EDL, Clip, Reframe, Subject
 from jascue_auto.uploads import UploadCache, default_cache_path
 
 ASPECTS = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5}
+
+# Long enough that it is worth asking whether this is one take or many. Under
+# it, scene detection costs more than it can save.
+SPLIT_ABOVE_SECONDS = 90.0
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV"}
 
 
@@ -96,6 +100,42 @@ def command_render(args: argparse.Namespace) -> int:
     if not sources_paths:
         raise SystemExit(f"no video files in {rushes}")
     print(f"{len(sources_paths)} clips in {rushes.name}", flush=True)
+
+    # Something already cut is one file holding many takes. Handing it over
+    # whole means one card for five minutes, one transcript, and a planner
+    # choosing windows out of a single source as though the cuts inside it
+    # were not there -- so a long file is opened along the boundaries it
+    # already has. A continuous take comes back as itself.
+    rushes_paths: list[Path] = []
+    for path in sources_paths:
+        spans = (
+            shots_in(path)
+            if _duration(path) >= SPLIT_ABOVE_SECONDS
+            else [(0.0, 0.0)]
+        )
+        if len(spans) < 2:
+            rushes_paths.append(path)
+            continue
+        print(
+            f"{path.name}: already cut, opening into {len(spans)} shots",
+            flush=True,
+        )
+        pieces = work / "shots"
+        pieces.mkdir(parents=True, exist_ok=True)
+        for index, (start, end) in enumerate(spans):
+            piece = pieces / f"{path.stem}-{index:02d}{path.suffix}"
+            if not piece.exists():
+                subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+                        "-i", str(path), "-c:v", "libx264", "-crf", "18",
+                        "-preset", "veryfast", "-c:a", "aac", str(piece),
+                    ],
+                    check=True,
+                )
+            rushes_paths.append(piece)
+    sources_paths = rushes_paths
 
     proxies = {
         path.stem: _make_proxy(path, work / "proxies" / f"{path.stem}.mp4")
@@ -242,11 +282,11 @@ def command_render(args: argparse.Namespace) -> int:
     edl, snaps = _edl_from_selection(selection, rushes, cards)
     if snaps:
         print(f"cut on action: {len(snaps)} in-points moved", flush=True)
+    found = {path.stem: path for path in sources_paths}
     sources = {
-        shot["source_id"]: probe(
-            shot["source_id"], rushes / f"{shot['source_id']}{_suffix(rushes, shot['source_id'])}"
-        )
+        shot["source_id"]: probe(shot["source_id"], found[shot["source_id"]])
         for shot in selection["shots"]
+        if shot["source_id"] in found
     }
     if args.music_map:
         grid = load_beat_grid(args.music_map)
@@ -258,7 +298,12 @@ def command_render(args: argparse.Namespace) -> int:
         print("no music map given; measuring the track", flush=True)
         grid = analyse_track(args.music)
     else:
-        raise SystemExit("--music or --music-map is required")
+        # A cut carried by what people say does not need a bed, and refusing
+        # to run without one was the tool making an editorial decision on the
+        # way in. Without a grid every length is content-led, which is what a
+        # speech cut wants anyway.
+        grid = None
+        print("no music; lengths will be led by content", flush=True)
 
     rhythm_context = _rhythm_context(selection, cards)
 
@@ -413,11 +458,10 @@ def command_render(args: argparse.Namespace) -> int:
             edl, snaps = _edl_from_selection(selection, rushes, cards)
             sources = {
                 shot["source_id"]: probe(
-                    shot["source_id"],
-                    rushes
-                    / f"{shot['source_id']}{_suffix(rushes, shot['source_id'])}",
+                    shot["source_id"], found[shot["source_id"]]
                 )
                 for shot in selection["shots"]
+                if shot["source_id"] in found
             }
             rhythm_context = _rhythm_context(selection, cards)
             try:
@@ -467,6 +511,31 @@ def command_render(args: argparse.Namespace) -> int:
         print(f"  {stage:12s} ${usd:.4f}", flush=True)
     print(f"deliverable {result.deliverable}", flush=True)
     print(f"preview     {result.preview}", flush=True)
+
+    # Off unless asked for. A rendered file is what most runs want; a
+    # timeline is for the run where somebody intends to open it and disagree
+    # with one shot, and writing one every time is clutter in every other.
+    if args.timeline != "none":
+        from jascue_auto.timeline import to_fcpxml, to_xmeml
+
+        payload = json.loads(
+            (output / "report.json").read_text(encoding="utf-8")
+        )
+        width, height = (
+            (1920, 1080) if ASPECTS[args.aspect] >= 1.0 else (1080, 1920)
+        )
+        for flavour, suffix, build in (
+            ("premiere", "xml", to_xmeml),
+            ("finalcut", "fcpxml", to_fcpxml),
+        ):
+            if args.timeline in {flavour, "both"}:
+                path = output / f"timeline.{suffix}"
+                path.write_text(
+                    build(plan, payload, name=output.name,
+                          width=width, height=height),
+                    encoding="utf-8",
+                )
+                print(f"timeline    {path}", flush=True)
     return 0
 
 
@@ -777,6 +846,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Watch the finished cut and report what it would change.",
     )
     render.add_argument("--output", type=Path, required=True)
+    render.add_argument(
+        "--timeline", choices=["none", "premiere", "finalcut", "both"],
+        default="none",
+        help="also write an editable timeline (off unless asked for)",
+    )
     render.add_argument(
         "--speech", choices=["auto", "never"], default="auto",
         help="transcribe clips whose card calls the speech content",

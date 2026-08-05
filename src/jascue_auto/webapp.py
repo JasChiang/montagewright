@@ -99,6 +99,7 @@ def create_app() -> FastAPI:
         aspect: str = Form("9:16"),
         budget: float = Form(6.0),
         review: bool = Form(True),
+        timeline: str = Form("none"),
     ) -> JSONResponse:
         if aspect not in ASPECTS:
             raise HTTPException(400, f"aspect must be one of {ASPECTS}")
@@ -136,6 +137,8 @@ def create_app() -> FastAPI:
             command += ["--brief", str(brief_path)]
         if review:
             command += ["--review"]
+        if timeline in {"premiere", "finalcut", "both"}:
+            command += ["--timeline", timeline]
         checkpoint = Path("artifacts/models/sam2.1_hiera_tiny.pt").resolve()
         if checkpoint.exists():
             command += ["--sam-checkpoint", str(checkpoint)]
@@ -194,6 +197,74 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "no deliverable yet")
         return FileResponse(
             path, media_type="video/mp4", filename=f"{run_id}.mp4"
+        )
+
+    @app.get("/api/runs/{run_id}/timeline/{flavour}")
+    def timeline(run_id: str, flavour: str):
+        suffix = {"premiere": "xml", "finalcut": "fcpxml"}.get(flavour)
+        if suffix is None:
+            raise HTTPException(400, "premiere or finalcut")
+        path = _run(run_id).output / f"timeline.{suffix}"
+        if not path.exists():
+            raise HTTPException(404, "no timeline was asked for")
+        return FileResponse(
+            path, media_type="application/xml",
+            filename=f"{run_id}.{suffix}",
+        )
+
+    @app.get("/api/runs/{run_id}/subtitles")
+    def subtitles(run_id: str):
+        """Every transcript in the run, as one SRT against the finished cut.
+
+        The lines are timed against their own source, so they are shifted
+        onto the timeline the shots landed on -- a subtitle file that needs
+        the reader to work out which take a line came from is not one.
+        """
+
+        from jascue_auto.transcript import Line, lines_of, load, to_srt
+
+        run = _run(run_id)
+        report = run.report() or {}
+        shots = report.get("selection", {}).get("shots", [])
+        rhythm = report.get("rhythm", {})
+        cards = {
+            path.stem: load(path)
+            for path in (run.output / "work" / "transcripts").glob("*.json")
+        }
+        timed: list[Line] = []
+        cursor = 0.0
+        for index, shot in enumerate(shots):
+            seconds = float(
+                rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)
+            )
+            card = cards.get(shot.get("source_id", ""))
+            start = float(shot.get("start_seconds", 0.0))
+            for line in lines_of(card or {}):
+                if line.ends_seconds <= start:
+                    continue
+                if line.starts_seconds >= start + seconds:
+                    continue
+                timed.append(
+                    Line(
+                        text=(
+                            f"{line.speaker}：{line.text}"
+                            if line.speaker
+                            else line.text
+                        ),
+                        starts_seconds=cursor
+                        + max(0.0, line.starts_seconds - start),
+                        ends_seconds=cursor
+                        + min(seconds, line.ends_seconds - start),
+                        heard=line.heard,
+                    )
+                )
+            cursor += seconds
+        if not timed:
+            raise HTTPException(404, "nothing was transcribed in this run")
+        path = run.output / "subtitles.srt"
+        path.write_text(to_srt(timed), encoding="utf-8")
+        return FileResponse(
+            path, media_type="text/plain", filename=f"{run_id}.srt"
         )
 
     @app.get("/api/runs/{run_id}/shot/{index}")
