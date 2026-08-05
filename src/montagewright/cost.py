@@ -13,6 +13,7 @@ and a hard-coded rate is a silent error the day they do.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 # USD per million tokens. Thinking tokens bill at the output rate.
 PRICING: dict[str, dict[str, float]] = {
@@ -31,6 +32,22 @@ PRICING: dict[str, dict[str, float]] = {
 
 class BudgetSpent(RuntimeError):
     """The cap is reached. Deliver what exists; do not degrade to continue."""
+
+
+class Spend(TypedDict):
+    """What a run cost, in the shape three places read it in.
+
+    It was `dict[str, object]`, which is true and useless: the CLI prints
+    by_stage sorted by value, the interface shows it per stage, and the
+    report writes it out. All three were indexing into something declared to
+    hold anything.
+    """
+
+    cap_usd: float
+    spent_usd: float
+    remaining_usd: float
+    calls: int
+    by_stage: dict[str, float]
 
 
 @dataclass
@@ -82,7 +99,7 @@ class Ledger:
                 "delivering the best cut reached so far"
             )
 
-    def summary(self) -> dict[str, object]:
+    def summary(self) -> "Spend":
         by_stage: dict[str, float] = {}
         for entry in self.entries:
             by_stage[str(entry["stage"])] = round(

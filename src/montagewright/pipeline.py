@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from montagewright.clipcard import find_subject, load_card
-from montagewright.cost import Ledger
+from montagewright.cost import Ledger, Spend
 from montagewright.executor import RenderPlan, Source, plan_render
 from montagewright.grounding import BeatGrid, apply_to_edl, ground_timeline
 from montagewright.planner import Usage, decide_rhythm, locate_subject
@@ -106,8 +106,10 @@ class Report:
             return None
         return round(self.target_seconds - self.delivered_seconds, 2)
 
-    def spend(self) -> dict[str, object]:
-        return self.ledger.summary() if self.ledger is not None else {}
+    def spend(self) -> "Spend":
+        return self.ledger.summary() if self.ledger is not None else Spend(
+            cap_usd=0.0, spent_usd=0.0, remaining_usd=0.0, calls=0, by_stage={}
+        )
 
     def summary(self) -> str:
         gap = self.duration_shortfall
@@ -446,12 +448,12 @@ def follow_subjects(
                         frames, subject.description, client=client
                     )
                     _charge(report, "subject", usage)
-                    seen = [
+                    across = [
                         float(box["centre_x"])
                         for box in boxes
                         if box.get("present") and box.get("centre_x") is not None
                     ]
-                    centres.append(sum(seen) / len(seen) if seen else 0.5)
+                    centres.append(sum(across) / len(across) if across else 0.5)
                     spans = [
                         float(box["width"])
                         for box in boxes
@@ -482,7 +484,7 @@ def follow_subjects(
                 # framing at all when the crop is otherwise full height, so
                 # aiming it blindly wastes the one chance the shot has.
                 centre_x, centre_y = 0.5, 0.5
-                seen: list[tuple[float, float]] = []
+                middles: list[tuple[float, float]] = []
                 boxes = []
                 if reframe.subject is not None and not _may_ask(client):
                     # A rebuild, with nothing to ask. Skipping the clip left
@@ -509,14 +511,14 @@ def follow_subjects(
                         frames, reframe.subject.description, client=client
                     )
                     _charge(report, "subject", usage)
-                    seen = [
+                    middles = [
                         (float(b["centre_x"]), float(b["centre_y"]))
                         for b in boxes
                         if b.get("present") and b.get("centre_x") is not None
                     ]
-                    if seen:
-                        centre_x = sum(x for x, _ in seen) / len(seen)
-                        centre_y = sum(y for _, y in seen) / len(seen)
+                    if middles:
+                        centre_x = sum(x for x, _ in middles) / len(middles)
+                        centre_y = sum(y for _, y in middles) / len(middles)
                         report.subject_notes[clip.clip_id] = (
                             f"{move} on ({centre_x:.3f}, {centre_y:.3f})"
                         )
@@ -532,7 +534,7 @@ def follow_subjects(
                     output_height=out_h,
                 )
                 subject_height = known.height if known is not None else None
-                if seen:
+                if middles:
                     heights = [
                         float(b["height"])
                         for b in boxes
@@ -639,16 +641,17 @@ def follow_subjects(
                             frames, reframe.subject.description, client=client
                         )
                         _charge(report, "subject", usage)
-                        seen = [
+                        present = [
                             b for b in boxes
                             if b.get("present") and b.get("centre_x") is not None
                         ]
-                        if seen:
+                        if present:
+                            count = len(present)
                             centre = (
-                                sum(float(b["centre_x"]) for b in seen) / len(seen),
-                                sum(float(b["centre_y"]) for b in seen) / len(seen),
-                                sum(float(b.get("width") or 0.0) for b in seen) / len(seen),
-                                sum(float(b.get("height") or 0.0) for b in seen) / len(seen),
+                                sum(float(b["centre_x"]) for b in present) / count,
+                                sum(float(b["centre_y"]) for b in present) / count,
+                                sum(float(b.get("width") or 0.0) for b in present) / count,
+                                sum(float(b.get("height") or 0.0) for b in present) / count,
                             )
                     if centre is not None:
                         cx, cy, bw, bh = centre
@@ -891,7 +894,10 @@ def split_handoffs(edl: EDL) -> EDL:
 def run(
     edl: EDL,
     sources: dict[str, Source],
-    grid: BeatGrid,
+    # A cut carried by what people say does not need a bed, and this has
+    # handled its absence since the day it stopped refusing to run without
+    # one. The signature was the last thing still claiming otherwise.
+    grid: BeatGrid | None,
     output_dir: Path,
     *,
     target_aspect: float,

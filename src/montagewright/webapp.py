@@ -199,7 +199,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/runs")
     async def start(
-        rushes: list[UploadFile] = None,
+        rushes: list[UploadFile] | None = None,
         music: UploadFile | None = None,
         source_path: str = Form(""),
         music_path: str = Form(""),

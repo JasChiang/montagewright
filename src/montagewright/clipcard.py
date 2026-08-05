@@ -481,7 +481,9 @@ def build_library(
     # the same time, so a second cut of the same rushes rewrote all of them.
     from montagewright.uploads import content_hash
     paths: dict[str, Path] = {}
-    stats = {"written": 0, "reused": 0, "failed": 0, "input": 0, "output": 0}
+    stats: dict[str, Any] = {
+        "written": 0, "reused": 0, "failed": 0, "input": 0, "output": 0,
+    }
     failures: list[str] = []
 
     total = len(proxies)

@@ -226,6 +226,23 @@ def _describe_clips(edl: EDL, context: dict[str, dict] | None = None) -> str:
     return "\n".join(lines)
 
 
+def _asked(client: Any) -> Any:
+    """The client, or a clear account of why there is nothing to ask.
+
+    These calls are the whole point of the functions that make them, so a
+    missing client is not a state to degrade through -- it is a caller
+    mistake. Reaching straight for `client.interactions` reported it as
+    `'NoneType' object has no attribute 'interactions'`, a hundred lines
+    from the call that forgot it.
+    """
+
+    if client is None:
+        raise ValueError(
+            "this pass has to ask the model and was given no client"
+        )
+    return client
+
+
 def upload_music(path: Path, client: Any) -> Any:
     """Put the track where the model can hear it.
 
@@ -328,7 +345,7 @@ def decide_rhythm(
         },
     }
 
-    interaction = client.interactions.create(**request)
+    interaction = _asked(client).interactions.create(**request)
     payload = _parse(interaction, what="rhythm pass")
     decisions = {
         entry["clip_id"]: entry for entry in payload.get("decisions", [])
@@ -550,7 +567,7 @@ def locate_subject(
             {"type": "image", "mime_type": "image/jpeg", "uri": uploaded.uri}
         )
 
-    interaction = client.interactions.create(
+    interaction = _asked(client).interactions.create(
         model=MODEL_ID,
         store=False,
         input=request_input,
@@ -786,7 +803,7 @@ def decide_direction(
     if music is not None:
         request_input.append(_attach_music(music, cache, client))
 
-    interaction = client.interactions.create(
+    interaction = _asked(client).interactions.create(
         model=MODEL_ID,
         store=False,
         input=request_input,
@@ -992,7 +1009,7 @@ def select_shots(
     ]
     selection_input += _attach_material(usable, cache, client)
 
-    interaction = client.interactions.create(
+    interaction = _asked(client).interactions.create(
         model=MODEL_ID,
         store=False,
         input=selection_input,
@@ -1072,7 +1089,7 @@ def replan_shots(
     ]
     replan_input += _attach_material(usable, cache, client)
 
-    interaction = client.interactions.create(
+    interaction = _asked(client).interactions.create(
         model=MODEL_ID,
         store=False,
         input=replan_input,

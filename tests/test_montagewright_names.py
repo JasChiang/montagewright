@@ -48,3 +48,47 @@ def test_nothing_else_pyflakes_finds_either() -> None:
 
     complaints = [line for line in _pyflakes() if "undefined name" not in line]
     assert not complaints, "\n".join(complaints)
+
+
+# Where the layers hand dicts to each other. Six bugs lived in exactly this
+# shape: a field defined, read downstream, and never filled in upstream --
+# nothing broke, the defaults looked reasonable, and a decision quietly moved
+# from the planner to a hard-coded constant. measure/ is left out on purpose:
+# it is numpy, where a checker without array stubs mostly reports on itself.
+DECIDING = (
+    "planner.py", "pipeline.py", "webapp.py", "cli.py", "schema.py",
+    "cost.py", "clipcard.py", "review.py", "executor.py", "renderer.py",
+    "reframe.py", "timeline.py", "transcript.py", "capabilities.py",
+)
+
+# google.genai does not export a symbol pyright can see. Not our code, and
+# not something this repo can fix.
+ALLOWED = ('"genai" is unknown import symbol',)
+
+
+def test_the_decision_layer_type_checks() -> None:
+    found = subprocess.run(
+        [sys.executable, "-m", "pyright", "--outputjson"]
+        + [str(PACKAGE / name) for name in DECIDING],
+        capture_output=True,
+        text=True,
+    )
+    if "No module named pyright" in found.stderr:
+        pytest.skip("pyright is not installed here")
+
+    import json
+
+    try:
+        report = json.loads(found.stdout)
+    except ValueError:  # pragma: no cover -- pyright itself failed
+        pytest.skip(f"pyright did not report: {found.stderr[:200]}")
+
+    complaints = [
+        f"{one['file'].split('montagewright/')[-1]}:"
+        f"{one['range']['start']['line'] + 1}  {one.get('rule')}  "
+        f"{one['message'].splitlines()[0]}"
+        for one in report["generalDiagnostics"]
+        if one.get("rule") != "reportMissingImports"
+        and not any(ok in one["message"] for ok in ALLOWED)
+    ]
+    assert not complaints, "\n".join(complaints)

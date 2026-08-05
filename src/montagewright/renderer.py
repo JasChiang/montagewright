@@ -390,7 +390,7 @@ def render(
 
     video_encoder = _encoder("h264_videotoolbox", "libx264")
 
-    segment_paths: list[Path] = []
+    segment_paths: list[tuple[Path, "Handles", float]] = []
     for index, segment in enumerate(plan.segments):
         destination = segment_dir / f"{index:03d}-{segment.clip_id}.mp4"
         rendered, handles = _render_segment(
