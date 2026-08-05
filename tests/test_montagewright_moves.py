@@ -2018,3 +2018,51 @@ def test_a_run_made_from_the_command_line_is_openable(tmp_path) -> None:
         web.RUNS_ROOT = was_root
         web.RUNS.clear()
         web.RUNS.update(was_runs)
+
+
+def test_a_cut_written_anywhere_can_still_be_listed(tmp_path) -> None:
+    """The interface only scans its own runs folder.
+
+    `--output ~/cut` is what the README tells people to type, and it produced
+    a film, a report and two timelines that nothing could open. The runs
+    folder gets a link to wherever the cut actually went, so every path in
+    the interface carries on believing the layout it already believes.
+    """
+
+    import montagewright.cli as command
+    import montagewright.webapp as web
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        elsewhere = tmp_path / "somewhere" / "mycut"
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "report.json").write_text("{}", encoding="utf-8")
+
+        command._make_findable(elsewhere)
+
+        link = tmp_path / "runs" / "mycut" / "out"
+        assert link.is_symlink()
+        assert link.resolve() == elsewhere.resolve()
+        assert (link / "report.json").exists()
+
+        # Twice is not two links to the same place, nor a crash.
+        command._make_findable(elsewhere)
+        assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == ["mycut"]
+    finally:
+        web.RUNS_ROOT = was
+
+
+def test_a_cut_already_in_the_runs_folder_is_left_alone(tmp_path) -> None:
+    import montagewright.cli as command
+    import montagewright.webapp as web
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        inside = tmp_path / "runs" / "abc123" / "out"
+        inside.mkdir(parents=True)
+        command._make_findable(inside)
+        assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == ["abc123"]
+    finally:
+        web.RUNS_ROOT = was

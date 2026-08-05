@@ -123,10 +123,64 @@ def _encode_proxy(source: Path, destination: Path) -> None:
     )
 
 
+def _make_findable(output: Path) -> None:
+    """Let the interface list a cut written anywhere.
+
+    It only scans its own runs folder, so `--output ~/cut` -- which is what
+    the README tells people to type -- produced a film, a report and two
+    timelines that nothing could open. Rather than teach every path in the
+    interface that a run might live elsewhere, the runs folder gets a link
+    pointing at it, and everything downstream carries on believing the
+    layout it already believes.
+    """
+
+    from montagewright.webapp import RUNS_ROOT
+
+    root = RUNS_ROOT.expanduser()
+    if output.is_relative_to(root):
+        return
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        stem = output.parent.name if output.name == "out" else output.name
+        folder = root / (stem or "cut")
+        count = 2
+        while folder.exists() and not (folder / "out").is_symlink():
+            folder = root / f"{stem}-{count}"
+            count += 1
+        folder.mkdir(parents=True, exist_ok=True)
+        link = folder / "out"
+        if link.is_symlink():
+            link.unlink()
+        if not link.exists():
+            link.symlink_to(output, target_is_directory=True)
+    except OSError:
+        # Not being listable is not a reason to refuse to cut.
+        pass
+
+
 def command_render(args: argparse.Namespace) -> int:
     rushes = args.rushes.expanduser().resolve()
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+
+    # What produced this, written before anything is attempted. The
+    # interface lists every cut in the runs folder and could only see the
+    # ones it had started itself, so a render from the command line left a
+    # report, a film and two timelines that nothing could open. Written at
+    # the end it would have covered only the runs that finished -- and the
+    # ones worth finding are the others: three died partway today, each
+    # after paying for cards, direction and selection, each resumable from
+    # what was already on disk, and none of them openable.
+    (output / "command.json").write_text(
+        json.dumps({
+            "source": str(rushes),
+            "command": [sys.executable, "-u", "-m", "montagewright.cli"]
+            + sys.argv[1:],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _make_findable(output)
+
     work = output / "work"
     # Cards and transcripts describe the material, so they belong to the
     # material rather than to one attempt at cutting it. Keeping them beside
@@ -584,18 +638,6 @@ def command_render(args: argparse.Namespace) -> int:
     ):
         print(f"  {stage:12s} ${usd:.4f}", flush=True)
     print(f"deliverable {result.deliverable}", flush=True)
-    # What produced this, beside what it produced. The web interface lists
-    # every cut in the runs folder, and it was listing only the ones it had
-    # started itself -- a run made from the command line left a report, a
-    # film and a timeline, and nothing that could open them.
-    (output / "command.json").write_text(
-        json.dumps({
-            "source": str(rushes),
-            "command": [sys.executable, "-u", "-m", "montagewright.cli"]
-            + sys.argv[1:],
-        }, ensure_ascii=False),
-        encoding="utf-8",
-    )
     print(f"preview     {result.preview}", flush=True)
 
     # Off unless asked for. A rendered file is what most runs want; a
