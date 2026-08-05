@@ -121,11 +121,18 @@ class Report:
             if gap is not None and abs(gap) >= 1.0
             else ""
         )
-        wanted = sum(
-            1
-            for entry in self.rhythm_decisions.values()
-            if entry.get("cut_on_beat")
-        ) or self.total_cuts
+        # A film where nothing asked for a beat is not a film that missed
+        # every beat. The fallback for "no rhythm pass ran" was reading a
+        # speech-led cut -- thirteen shots, every one deliberately off the
+        # grid so a sentence could finish -- as 0/13 aligned.
+        if self.rhythm_decisions:
+            wanted = sum(
+                1
+                for entry in self.rhythm_decisions.values()
+                if entry.get("cut_on_beat")
+            )
+        else:
+            wanted = self.total_cuts
         return (
             f"{self.aligned_cuts}/{wanted} cuts on a musical event "
             f"({self.total_cuts - wanted} content-led by choice), "
@@ -768,6 +775,7 @@ def run(
     ledger: Ledger | None = None,
     decide_rhythm_first: bool = True,
     target_seconds: float = 0.0,
+    keep_voice: bool = False,
     client: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
     """Take an EDL to a finished file.
@@ -836,5 +844,8 @@ def run(
     # whether any one shot came out the way it was planned -- six composition
     # faults in a row survived review of the whole thing and were found by
     # opening a single shot. The segments are what that question is asked of.
-    result = render(plan, output_dir, music=music, keep_segments=True)
+    result = render(
+        plan, output_dir, music=music, keep_segments=True,
+        keep_voice=keep_voice,
+    )
     return result, plan, report, edl

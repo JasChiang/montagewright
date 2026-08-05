@@ -604,6 +604,11 @@ class MaterialItem:
     usable_to: float = 0.0
     action: tuple[str, ...] = ()
     needs: tuple[str, ...] = ()
+    # What is said, when, and by whom. A shot chosen out of an interview is
+    # chosen because of a sentence; without the lines the planner is picking
+    # windows out of a talking head by how it looks, which is how a cut lands
+    # in the middle of an answer.
+    speech: tuple[str, ...] = ()
 
 
 def _direction_schema() -> dict[str, Any]:
@@ -688,6 +693,8 @@ def _describe_material(material: list[MaterialItem]) -> str:
             head += "\n    動作：" + "；".join(item.action)
         if item.needs:
             head += "\n    需要處理：" + "；".join(item.needs)
+        if item.speech:
+            head += "\n    說了什麼：\n      " + "\n      ".join(item.speech)
         if item.subjects:
             head += "\n    可框住的主體：" + "；".join(item.subjects)
         lines.append(head)

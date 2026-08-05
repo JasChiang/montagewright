@@ -117,6 +117,50 @@ def command_render(args: argparse.Namespace) -> int:
     for line in stats.get("failures", [])[:5]:
         print(f"  card failed — {line[:140]}", flush=True)
 
+    # Only where the speech is the content. A transcript costs a call and a
+    # minute per clip, and on b-roll it answers a question nobody asked --
+    # so the card, which already watched the clip with its audio, says which
+    # ones need one rather than a flag somebody has to remember.
+    transcripts: dict[str, dict] = {}
+    speaking = [
+        source_id for source_id in proxies
+        if (load_card(cards[source_id]) if source_id in cards else {})
+        and (load_card(cards[source_id]) or {}).get("speech") == "content"
+    ]
+    if speaking and args.speech != "never":
+        from jascue_auto.transcript import describe as transcribe
+        from jascue_auto.transcript import load as load_transcript
+        from jascue_auto.transcript import save as save_transcript
+
+        print(
+            f"speech: {len(speaking)} clips carry it as content",
+            flush=True,
+        )
+        for source_id in speaking:
+            destination = work / "transcripts" / f"{source_id}.json"
+            card = load_transcript(destination)
+            if card is None:
+                try:
+                    card, usage = transcribe(
+                        proxies[source_id], client=client,
+                        locale=args.locale, cache=cache,
+                    )
+                except Exception as error:
+                    print(
+                        f"  {source_id} — no transcript: "
+                        f"{type(error).__name__}: {error}"[:150],
+                        flush=True,
+                    )
+                    continue
+                ledger.record(
+                    "transcript",
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens + usage.thought_tokens,
+                )
+                save_transcript(card, destination)
+            transcripts[source_id] = card
+        print(f"  transcribed, running total ${ledger.spent_usd:.4f}", flush=True)
+
     material = []
     # Which takes were set aside before anything was planned, and why. The
     # card gives a reason and it was being dropped on the floor, so a run
@@ -154,6 +198,7 @@ def command_render(args: argparse.Namespace) -> int:
                     _subject_line(box, _aspect(proxy), ASPECTS[args.aspect])
                     for box in subjects_from_card(card or {})
                 ),
+                speech=_speech_lines(transcripts.get(source_id)),
             )
         )
 
@@ -232,6 +277,7 @@ def command_render(args: argparse.Namespace) -> int:
         cards=cards,
         checkpoint=args.sam_checkpoint,
         ledger=ledger,
+        keep_voice=bool(transcripts),
         client=client,
     )
     # The direction set a length; somebody has to compare it with what came
@@ -429,6 +475,26 @@ def _suffix(rushes: Path, stem: str) -> str:
         if (rushes / f"{stem}{suffix}").exists():
             return suffix
     return ".mp4"
+
+
+def _speech_lines(card: dict | None, limit: int = 40) -> tuple[str, ...]:
+    """The soundbites, as the planner needs to read them.
+
+    A window out of an interview is chosen because of a sentence, so the
+    sentence has to be visible when the choice is made -- with who said it,
+    because a shot of the person not talking is the obvious way to get this
+    wrong, and with its seconds, because they are what the shot's length is.
+    """
+
+    if not card:
+        return ()
+    from jascue_auto.transcript import lines_of
+
+    return tuple(
+        f"{line.starts_seconds:.1f}-{line.ends_seconds:.1f}s"
+        f"（{line.speaker or '未標'}）{line.text}"
+        for line in lines_of(card)[:limit]
+    )
 
 
 def _subject_line(box, source_aspect: float, target_aspect: float) -> str:
@@ -711,6 +777,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Watch the finished cut and report what it would change.",
     )
     render.add_argument("--output", type=Path, required=True)
+    render.add_argument(
+        "--speech", choices=["auto", "never"], default="auto",
+        help="transcribe clips whose card calls the speech content",
+    )
+    render.add_argument("--locale", default="zh-TW")
     render.set_defaults(handler=command_render)
 
     speak = sub.add_parser(

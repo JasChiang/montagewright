@@ -833,3 +833,72 @@ def test_music_goes_under_a_voice_rather_than_over_it() -> None:
     assert "keep_voice" in inspect.signature(renderer.render).parameters
     # The voice has to reach the output, not only the compressor's key input.
     assert "asplit" in source and "[voice][ducked]amix" in source
+
+
+def test_a_transcript_is_only_paid_for_where_speech_is_the_content() -> None:
+    """A transcript costs a call and a minute a clip.
+
+    On b-roll it answers a question nobody asked, and a flag somebody has to
+    remember is a flag somebody forgets -- so the card, which already watched
+    the clip with its audio, says which clips need one.
+    """
+
+    import inspect
+
+    from jascue_auto import cli
+    from jascue_auto.clipcard import card_schema
+
+    speech = card_schema()["properties"]["speech"]
+    assert speech["enum"] == ["none", "ambient", "content"]
+    assert "speech" in card_schema()["required"]
+
+    source = inspect.getsource(cli.command_render)
+    assert '"speech") == "content"' in source
+    assert "keep_voice=bool(transcripts)" in source
+
+
+def test_the_planner_sees_the_sentences_it_is_choosing_between() -> None:
+    """A window out of an interview is chosen because of a sentence."""
+
+    from jascue_auto.cli import _speech_lines
+    from jascue_auto.planner import MaterialItem, _describe_material
+    from jascue_auto.transcript import CARD_VERSION
+
+    lines = _speech_lines({
+        "version": CARD_VERSION,
+        "lines": [{
+            "text": "夏天最崩潰的是流汗完又下雨",
+            "speaker": "穿灰藍色T恤的受訪男子",
+            "starts_seconds": 4.0, "ends_seconds": 9.2,
+        }],
+    })
+    assert "穿灰藍色T恤的受訪男子" in lines[0]
+    assert "4.0-9.2s" in lines[0]
+
+    described = _describe_material([
+        MaterialItem(source_id="S01", duration_seconds=70.0,
+                     summary="街訪", speech=lines)
+    ])
+    assert "說了什麼" in described and "流汗完又下雨" in described
+
+
+def test_a_cut_that_never_asked_for_a_beat_is_not_a_missed_one() -> None:
+    """A speech-led cut read as 0/13 aligned.
+
+    Thirteen shots, every one deliberately off the grid so a sentence could
+    finish, and the fallback for "no rhythm pass ran" turned that into total
+    failure in the one line anyone reads.
+    """
+
+    from jascue_auto.pipeline import Report
+
+    speech = Report(total_cuts=13, aligned_cuts=0)
+    speech.rhythm_decisions = {
+        f"k{i:02d}": {"cut_on_beat": False} for i in range(13)
+    }
+    assert "0/0 cuts on a musical event (13 content-led by choice)" in (
+        speech.summary()
+    )
+
+    silent = Report(total_cuts=4, aligned_cuts=4)
+    assert "4/4 cuts on a musical event" in silent.summary()

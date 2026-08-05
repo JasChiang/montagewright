@@ -121,6 +121,7 @@ def card_schema() -> dict[str, Any]:
             "subjects",
             "action",
             "camera_motion",
+            "speech",
             "usable_from_seconds",
             "usable_to_seconds",
             "needs",
@@ -241,6 +242,19 @@ def card_schema() -> dict[str, Any]:
             "camera_moves": {
                 "type": "boolean",
                 "description": "Whether the camera itself moves in this take.",
+            },
+            "speech": {
+                "type": "string",
+                "enum": ["none", "ambient", "content"],
+                "description": (
+                    "這支素材裡的說話是不是內容本身。`content`：訪談、"
+                    "受訪者的回答、對鏡頭講話、旁白——把聲音拿掉這顆就"
+                    "沒有意義了。`ambient`：現場環境音、旁邊路人的交談、"
+                    "聽不清楚的背景人聲，剪掉不影響。`none`：沒有人聲。"
+                    "填 content 的素材後面才會去做逐字稿，那要花錢也花"
+                    "時間，所以不確定的時候看的是「這顆的意思靠不靠聲音"
+                    "成立」，不是「有沒有人在講話」。"
+                ),
             },
             "camera_motion": {
                 "type": "string",
