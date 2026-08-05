@@ -81,13 +81,32 @@
 <main>
   <section class="panel" id="setup">
     <div class="grid">
-      <div>
-        <label>素材資料夾</label>
+      <div style="grid-column:1/-1">
+        <label>素材路徑（資料夾或單一檔案，本機路徑就好）</label>
+        <input type="text" id="path" placeholder="/Users/…/rushes　或　/Users/…/一支長片.mp4">
+        <div class="why" style="margin-top:6px">
+          留空的話下面可以改用上傳。本機素材建議用路徑——上傳等於把硬碟上的檔案搬進瀏覽器再寫回去。
+          <a href="#" id="show-upload">改用上傳</a>
+        </div>
+      </div>
+      <div class="hide" id="upload-row" style="grid-column:1/-1">
+        <label>上傳素材資料夾</label>
         <input type="file" id="rushes" webkitdirectory directory multiple>
       </div>
       <div>
-        <label>音樂（沒給 map 就自己分析）</label>
-        <input type="file" id="music" accept="audio/*">
+        <label>音樂路徑（留空＝不配樂）</label>
+        <input type="text" id="music-path" placeholder="/Users/…/track.mp3">
+      </div>
+      <div>
+        <label>語音</label>
+        <select id="speech">
+          <option value="auto">自動（卡片說是內容才轉錄）</option>
+          <option value="never">不要轉錄</option>
+        </select>
+      </div>
+      <div>
+        <label>語言</label>
+        <input type="text" id="locale" value="zh-TW">
       </div>
       <div>
         <label>輸出比例</label>
@@ -122,6 +141,11 @@
     </div>
   </section>
 
+  <section class="panel hide" id="past">
+    <h2 style="margin:0 0 12px;font-size:15px">先前的剪輯</h2>
+    <div class="scroll"><table id="past-table"></table></div>
+  </section>
+
   <section class="panel hide" id="progress">
     <div class="row" style="margin:0 0 14px;justify-content:space-between">
       <strong id="state">執行中</strong>
@@ -154,6 +178,12 @@
     <div class="scroll"><table id="shot-table"></table></div>
   </section>
 
+  <section class="panel hide" id="transcripts">
+    <h2 style="margin:0 0 4px;font-size:15px">聽到了什麼</h2>
+    <p class="why" style="margin:0 0 14px">辨識器聽的、Gemini 改的、誰講的。轉錯的地方會讓後面每一個決定都跟著錯。</p>
+    <div class="scroll"><table id="tx-table"></table></div>
+  </section>
+
   <section class="panel hide" id="aside">
     <h2 style="margin:0 0 12px;font-size:15px">沒有用的素材</h2>
     <div class="scroll"><table id="aside-table"></table></div>
@@ -164,6 +194,75 @@
 const $ = (id) => document.getElementById(id);
 let runId = null, seen = 0, timer = null;
 
+$('show-upload').addEventListener('click', (e) => {
+  e.preventDefault(); $('upload-row').classList.remove('hide');
+});
+
+async function loadPast() {
+  const data = await (await fetch('/api/runs?limit=20')).json();
+  if (!data.runs.length) return;
+  $('past-table').innerHTML =
+    '<tr><th>時間</th><th>素材</th><th>片長</th><th>顆數</th><th>逐顆通過</th><th>花費</th><th></th></tr>' +
+    data.runs.map(r => `<tr>
+      <td class="mono">${new Date(r.started_at * 1000).toLocaleString('zh-TW', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>
+      <td class="mono">${esc(r.source)}</td>
+      <td class="mono">${r.seconds ? r.seconds.toFixed(1) + 's' : '—'}</td>
+      <td class="mono">${r.shots || '—'}</td>
+      <td class="mono">${r.delivered != null ? r.delivered + '/' + r.shots : '—'}</td>
+      <td class="mono">${r.spend != null ? '$' + r.spend.toFixed(2) : '—'}</td>
+      <td><a class="shot" href="#" onclick="openRun('${r.run_id}');return false">打開</a></td>
+    </tr>`).join('');
+  $('past').classList.remove('hide');
+}
+
+async function openRun(id) {
+  runId = id; seen = 0;
+  const data = await (await fetch(`/api/runs/${id}`)).json();
+  $('log').textContent = data.lines.join('\n');
+  $('progress').classList.remove('hide');
+  $('state').textContent = { running:'執行中', done:'完成', failed:'失敗', stopped:'已停止', interrupted:'中斷' }[data.state] || data.state;
+  if (data.has_video) {
+    $('video').src = `/api/runs/${id}/video`;
+    $('download').href = `/api/runs/${id}/deliverable`;
+    $('result').classList.remove('hide');
+  }
+  if (data.report) { render(data.report); showExtras(); }
+  window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
+}
+
+async function showTranscripts() {
+  const data = await (await fetch(`/api/runs/${runId}/transcripts`)).json();
+  const rows = [];
+  for (const [source, card] of Object.entries(data.sources)) {
+    rows.push(`<tr><td colspan="4" style="padding-top:16px"><strong>${esc(source)}</strong>
+      <span class="why">　${esc(card.language || '')}　${esc(card.summary)}</span></td></tr>`);
+    for (const l of card.lines) rows.push(`<tr>
+      <td class="mono">${l.starts_seconds.toFixed(1)}–${l.ends_seconds.toFixed(1)}s</td>
+      <td class="why">${esc(l.speaker)}</td>
+      <td>${esc(l.text)}</td>
+      <td class="why">${l.corrected ? '聽成：' + esc(l.heard) : ''}</td></tr>`);
+  }
+  if (!rows.length) return;
+  $('tx-table').innerHTML = '<tr><th>時間</th><th>誰</th><th>說了什麼</th><th>原始辨識</th></tr>' + rows.join('');
+  $('transcripts').classList.remove('hide');
+}
+
+function showExtras() {
+  for (const [id, flavour] of [['tl-pr','premiere'], ['tl-fc','finalcut']]) {
+    fetch(`/api/runs/${runId}/timeline/${flavour}`, { method: 'HEAD' })
+      .then(r => { if (r.ok) {
+        $(id).href = `/api/runs/${runId}/timeline/${flavour}`;
+        $(id).classList.remove('hide');
+      }});
+  }
+  fetch(`/api/runs/${runId}/subtitles`, { method: 'HEAD' }).then(r => {
+    if (r.ok) { $('subs').href = `/api/runs/${runId}/subtitles`; $('subs').classList.remove('hide'); }
+  });
+  showTranscripts();
+}
+
+loadPast();
+
 $('rushes').addEventListener('change', () => {
   const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
   $('picked').textContent = files.length ? `${files.length} 支影片` : '沒有找到影片檔';
@@ -171,10 +270,14 @@ $('rushes').addEventListener('change', () => {
 
 $('go').addEventListener('click', async () => {
   const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
-  if (!files.length) { alert('先選一個有影片的資料夾'); return; }
+  const path = $('path').value.trim();
+  if (!path && !files.length) { alert('給一個素材路徑，或改用上傳'); return; }
   const body = new FormData();
   files.forEach(f => body.append('rushes', f, f.name));
-  if ($('music').files[0]) body.append('music', $('music').files[0]);
+  body.append('source_path', path);
+  body.append('music_path', $('music-path').value.trim());
+  body.append('speech', $('speech').value);
+  body.append('locale', $('locale').value.trim());
   body.append('brief', $('brief').value);
   body.append('aspect', $('aspect').value);
   body.append('budget', $('budget').value);
@@ -224,22 +327,11 @@ async function poll() {
     if (data.has_video) {
       $('video').src = `/api/runs/${runId}/video`;
       $('download').href = `/api/runs/${runId}/deliverable`;
-      for (const [id, flavour] of [['tl-pr','premiere'], ['tl-fc','finalcut']]) {
-        fetch(`/api/runs/${runId}/timeline/${flavour}`, { method: 'HEAD' })
-          .then(r => { if (r.ok) {
-            $(id).href = `/api/runs/${runId}/timeline/${flavour}`;
-            $(id).classList.remove('hide');
-          }});
-      }
-      fetch(`/api/runs/${runId}/subtitles`, { method: 'HEAD' }).then(r => {
-        if (r.ok) {
-          $('subs').href = `/api/runs/${runId}/subtitles`;
-          $('subs').classList.remove('hide');
-        }
-      });
+      showExtras();
       $('result').classList.remove('hide');
     }
     if (data.report) render(data.report);
+    loadPast();
   }
 }
 
@@ -282,7 +374,7 @@ function render(report) {
         <td class="mono"><a class="shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a></td>
         <td class="mono">${Number(s.start_seconds ?? 0).toFixed(1)}s ／ ${Number(r.seconds ?? 0).toFixed(2)}s</td>
         <td>${esc(s.camera_move)}${s.framing ? `<div class="why">${esc(s.framing)}</div>` : ''}</td>
-        <td>${esc(s.subject)}${s.must_be_whole ? '<div class="why">要完整</div>' : ''}</td>
+        <td>${esc(s.subject)}${s.must_be_whole ? '<div class="why">要完整</div>' : ''}${v.speaker ? `<div class="why">說話：${esc(v.speaker)}</div>` : ''}</td>
         <td class="why">${esc(s.why)}${r.why ? `<div style="margin-top:5px">節奏：${esc(r.why)}</div>` : ''}</td>
         <td>${deg || '<span class="why">—</span>'}</td>
         <td>${ok}${v.note ? `<div class="why">${esc(v.note)}</div>` : ''}</td>

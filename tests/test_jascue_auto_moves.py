@@ -1200,3 +1200,27 @@ def test_dropping_the_question_depends_on_something_carrying_the_premise() -> No
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     assert "問句通常不用剪進去" not in prompt
     assert "觀眾從哪裡知道題目" in prompt
+
+
+def test_the_page_takes_a_path_and_remembers_what_it_ran() -> None:
+    """Two things a local tool should not have made anyone do.
+
+    Uploading material that is already on the disk beside the server copies
+    it into the browser to write it back out a directory away -- 836 MB of it
+    for one interview. And runs lived in a temp directory keyed by an
+    in-memory dict, so closing the server threw away every finished cut,
+    when comparing this one against the last is most of the work.
+    """
+
+    from jascue_auto.webapp import MAX_UPLOAD_BYTES, PAGE, RUNS_ROOT, create_app
+
+    paths = {r.path for r in create_app().routes if hasattr(r, "path")}
+    assert "/api/runs/{run_id}/transcripts" in paths
+    assert MAX_UPLOAD_BYTES > 0, "an uncapped upload can fill the disk"
+    assert "runs" in str(RUNS_ROOT)
+
+    page = PAGE.read_text(encoding="utf-8")
+    for control in ("source_path", "music_path", "speech", "locale"):
+        assert control in page, control
+    assert "先前的剪輯" in page
+    assert "聽到了什麼" in page
