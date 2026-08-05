@@ -740,3 +740,71 @@ def test_a_track_can_be_measured_without_a_reviewed_lock() -> None:
     source = inspect.getsource(grounding.analyse_track)
     assert "downbeat" in source and "section_boundary" in source
     assert "analyse_track" in inspect.getsource(cli.command_render)
+
+
+def test_a_transcript_is_its_own_card() -> None:
+    """Subtitling something finished has nothing to do with cutting it.
+
+    A clip card describes what a take looks like and is cached because that
+    stays true. Speech is only worth paying for when it matters, and it is
+    useful with no edit at all -- so it is a separate artifact, not more
+    fields on the clip card.
+    """
+
+    from jascue_auto import clipcard, transcript
+
+    assert "transcript" not in clipcard.card_schema()["properties"]
+    assert transcript.CARD_VERSION != clipcard.CARD_VERSION
+
+    fields = transcript._schema()["properties"]
+    assert "language" in fields, "the locale was a guess; this is the answer"
+    assert "heard" in fields["lines"]["items"]["properties"], (
+        "what the recogniser said has to survive, or a correction is invisible"
+    )
+
+
+def test_spoken_boundaries_land_on_measured_silence() -> None:
+    """The model hears where a sentence ends; the recogniser measured where
+    the sound stopped. Neither alone puts the cut in the right place."""
+
+    from jascue_auto.transcript import Word, gaps, snap
+
+    words = [
+        Word("溼", 0.0, 0.30), Word("了", 0.35, 0.62),
+        Word("回", 1.40, 1.66), Word("家", 1.70, 1.98),
+    ]
+    silences = gaps(words)
+    assert silences == [1.01]
+    assert snap(1.2, silences) == 1.01
+    # Too far to be the same boundary: a model second that lands nowhere
+    # near a pause is left alone rather than dragged across a word.
+    assert snap(3.0, silences) == 3.0
+
+
+def test_every_upload_waits_until_the_file_can_be_used() -> None:
+    """An upload returns before the service has finished with it.
+
+    The cached path waited; the uncached branch in five other modules did
+    not, so it worked on short clips and failed on the first long one with
+    "not in an ACTIVE state".
+    """
+
+    import re
+    from pathlib import Path
+
+    for module in Path("src/jascue_auto").glob("*.py"):
+        if module.name == "uploads.py":
+            continue
+        text = module.read_text(encoding="utf-8")
+        assert not re.search(r"client\.files\.upload\(", text), (
+            f"{module.name} uploads without waiting; use upload_now"
+        )
+
+
+def test_the_transcriber_is_reachable_as_its_own_command() -> None:
+    from jascue_auto.cli import main
+
+    try:
+        main(["transcribe", "--help"])
+    except SystemExit as exit_code:
+        assert exit_code.code == 0

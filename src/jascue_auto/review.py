@@ -26,6 +26,8 @@ from jascue_auto.schema import DegradationStep, Issue, ReviewVerdict
 
 from jascue_auto.planner import MAX_OUTPUT_TOKENS
 
+from jascue_auto.uploads import upload_now
+
 PROMPTS = Path(__file__).resolve().parent / "prompts"
 MAX_ROUNDS = 3
 
@@ -126,7 +128,7 @@ def review_cut(
 
     instruction = (PROMPTS / "review_zh-TW.txt").read_text(encoding="utf-8")
     if cache is None:
-        uri = client.files.upload(file=str(preview)).uri
+        uri = upload_now(preview, client).uri
     else:
         uri, _ = cache.uri_for(preview, client, mime_type="video/mp4")
 
@@ -283,7 +285,7 @@ def review_shots(
         body.append({"type": "text", "text": f"\n## {clip_id}\n\n{plan}\n"})
         path = segments[clip_id]
         if cache is None:
-            uri = client.files.upload(file=str(path)).uri
+            uri = upload_now(path, client).uri
         else:
             uri, _ = cache.uri_for(path, client, mime_type="video/mp4")
         body.append(

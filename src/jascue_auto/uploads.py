@@ -92,13 +92,7 @@ class UploadCache:
         if entry and self._live(entry, client):
             return entry["uri"], True
 
-        uploaded = client.files.upload(file=str(path))
-        while getattr(uploaded.state, "name", str(uploaded.state)) == "PROCESSING":
-            time.sleep(2.0)
-            uploaded = client.files.get(name=uploaded.name)
-        state = getattr(uploaded.state, "name", str(uploaded.state))
-        if state != "ACTIVE":
-            raise RuntimeError(f"{path.name} ended upload in state {state}")
+        uploaded = upload_now(path, client)
 
         self.entries[key] = {
             "uri": uploaded.uri,
@@ -109,3 +103,23 @@ class UploadCache:
         }
         self.save()
         return uploaded.uri, False
+
+
+def upload_now(path: Path, client: Any) -> Any:
+    """Upload and wait until the file can actually be used.
+
+    An upload comes back before the service has finished with it, and using
+    the URI in that window fails with "not in an ACTIVE state". The cached
+    path always waited; the uncached path in five other modules did not, so
+    it worked on small files and failed on the first long one. One function,
+    because it is one fact about the API.
+    """
+
+    uploaded = client.files.upload(file=str(path))
+    while getattr(uploaded.state, "name", str(uploaded.state)) == "PROCESSING":
+        time.sleep(2.0)
+        uploaded = client.files.get(name=uploaded.name)
+    state = getattr(uploaded.state, "name", str(uploaded.state))
+    if state != "ACTIVE":
+        raise RuntimeError(f"{Path(path).name} ended upload in state {state}")
+    return uploaded

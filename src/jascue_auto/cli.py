@@ -625,6 +625,61 @@ def _write_report(output: Path, **parts) -> None:
     )
 
 
+def command_transcribe(args: argparse.Namespace) -> int:
+    """Subtitle a video without touching the edit.
+
+    This is the transcript half on its own, because subtitling something
+    already finished is a real job and has nothing to do with cutting. The
+    same card feeds the editorial passes when there is an edit.
+    """
+
+    from jascue_auto.transcript import describe, lines_of, load, save, to_srt
+
+    client = _client()
+    cache = UploadCache.load(args.upload_cache or default_cache_path())
+    ledger = Ledger(cap_usd=args.budget)
+
+    sources = (
+        sorted(p for p in args.source.iterdir() if p.suffix in VIDEO_SUFFIXES)
+        if args.source.is_dir()
+        else [args.source]
+    )
+    if not sources:
+        raise SystemExit(f"no video files in {args.source}")
+
+    output = (args.output or args.source.parent).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+
+    for source in sources:
+        destination = output / f"{source.stem}.transcript.json"
+        card = load(destination)
+        if card is None:
+            card, usage = describe(
+                source, client=client, locale=args.locale, cache=cache
+            )
+            ledger.record(
+                "transcript",
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens + usage.thought_tokens,
+            )
+            save(card, destination)
+        lines = lines_of(card)
+        (output / f"{source.stem}.srt").write_text(
+            to_srt(lines), encoding="utf-8"
+        )
+        changed = sum(1 for line in lines if line.corrected)
+        print(
+            f"{source.name}: {len(lines)} lines, {changed} corrected, "
+            f"{card.get('language')} — {output / (source.stem + '.srt')}",
+            flush=True,
+        )
+        for note in card.get("uncertain", [])[:3]:
+            print(f"  unsure — {str(note)[:120]}", flush=True)
+
+    print(f"transcript spend ${ledger.spent_usd:.4f}", flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="jascue-auto")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -657,6 +712,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     render.add_argument("--output", type=Path, required=True)
     render.set_defaults(handler=command_render)
+
+    speak = sub.add_parser(
+        "transcribe", help="Subtitle a video, or a folder of them"
+    )
+    speak.add_argument("source", type=Path)
+    speak.add_argument("--locale", default="zh-TW")
+    speak.add_argument("--output", type=Path)
+    speak.add_argument("--budget", type=float, default=5.0)
+    speak.add_argument("--upload-cache", type=Path)
+    speak.set_defaults(handler=command_transcribe)
 
     args = parser.parse_args(argv)
     return args.handler(args)

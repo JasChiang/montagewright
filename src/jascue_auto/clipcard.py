@@ -26,6 +26,8 @@ from typing import Any
 
 from jascue_auto.planner import MAX_OUTPUT_TOKENS
 
+from jascue_auto.uploads import upload_now
+
 CARD_VERSION = "jascue-auto-clip-card-v1"
 
 
@@ -388,7 +390,7 @@ def describe_clip(
     instruction = (prompts / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
 
     if cache is None:
-        uploaded = client.files.upload(file=str(proxy))
+        uploaded = upload_now(proxy, client)
         uri = uploaded.uri
     else:
         uri, _ = cache.uri_for(proxy, client, mime_type="video/mp4")

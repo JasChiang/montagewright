@@ -26,7 +26,7 @@ from jascue_auto.capabilities import (
     describe_for_prompt,
 )
 from jascue_auto.grounding import BeatGrid
-from jascue_auto.uploads import UploadCache
+from jascue_auto.uploads import UploadCache, upload_now
 from jascue_auto.schema import EDL, Clip, MusicSync
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
@@ -237,7 +237,7 @@ def upload_music(path: Path, client: Any) -> Any:
     and listening to it.
     """
 
-    uploaded = client.files.upload(file=str(path))
+    uploaded = upload_now(path, client)
     while getattr(uploaded.state, "name", str(uploaded.state)) == "PROCESSING":
         time.sleep(2.0)
         uploaded = client.files.get(name=uploaded.name)
@@ -545,7 +545,7 @@ def locate_subject(
         }
     ]
     for frame in frames:
-        uploaded = client.files.upload(file=str(frame))
+        uploaded = upload_now(frame, client)
         request_input.append(
             {"type": "image", "mime_type": "image/jpeg", "uri": uploaded.uri}
         )
@@ -704,7 +704,7 @@ def _attach_material(
         if item.proxy is None or not item.proxy.exists():
             continue
         if cache is None:
-            uploaded = client.files.upload(file=str(item.proxy))
+            uploaded = upload_now(item.proxy, client)
             uri = uploaded.uri
         else:
             uri, _ = cache.uri_for(item.proxy, client, mime_type="video/mp4")
