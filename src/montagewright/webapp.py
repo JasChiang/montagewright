@@ -274,6 +274,7 @@ def create_app() -> FastAPI:
         review: bool = Form(True),
         timeline: str = Form("none"),
         speech: str = Form("auto"),
+        subtitles: str = Form("sidecar"),
         locale: str = Form("zh-TW"),
     ) -> JSONResponse:
         if aspect not in ASPECTS:
@@ -283,7 +284,18 @@ def create_app() -> FastAPI:
 
         run_id = uuid.uuid4().hex[:12]
         root = RUNS_ROOT / run_id
-        root.mkdir(parents=True, exist_ok=True)
+
+        # Made only once there is something to put in it. Creating it first
+        # meant every mistyped path left an empty folder in the runs
+        # directory that nothing would ever open or clean up.
+        made_root = False
+
+        def keep() -> Path:
+            nonlocal made_root
+            if not made_root:
+                root.mkdir(parents=True, exist_ok=True)
+                made_root = True
+            return root
 
         # A path is the ordinary case: this runs beside the material, and
         # pushing a folder of 4K through the browser to write it back to disk
@@ -294,7 +306,7 @@ def create_app() -> FastAPI:
             if not rush_dir.exists():
                 raise HTTPException(400, f"{rush_dir} is not there")
             if rush_dir.is_file():
-                holder = root / "rushes"
+                holder = keep() / "rushes"
                 holder.mkdir(parents=True, exist_ok=True)
                 link = holder / rush_dir.name
                 if not link.exists():
@@ -308,7 +320,7 @@ def create_app() -> FastAPI:
                 if path.suffix in VIDEO_SUFFIXES
             )
         else:
-            rush_dir = root / "rushes"
+            rush_dir = keep() / "rushes"
             rush_dir.mkdir(parents=True, exist_ok=True)
             kept = 0
             budgeted = MAX_UPLOAD_BYTES
@@ -336,35 +348,38 @@ def create_app() -> FastAPI:
             sys.executable, "-u", "-m", "montagewright.cli", "render",
             str(rush_dir), "--aspect", aspect,
             "--budget", str(budget),
-            "--output", str(root / "out"),
+            "--output", str(keep() / "out"),
         ]
         track = _typed_path(music_path)
         if track is not None:
             if not track.exists():
-                shutil.rmtree(root, ignore_errors=True)
+                if made_root:
+                    shutil.rmtree(root, ignore_errors=True)
                 raise HTTPException(400, f"{track} is not there")
             command += ["--music", str(track)]
         elif music is not None and music.filename:
-            track = _save(music, root / Path(music.filename).name)
+            track = _save(music, keep() / Path(music.filename).name)
             command += ["--music", str(track)]
         if speech in {"auto", "never"}:
             command += ["--speech", speech]
         if locale.strip():
             command += ["--locale", locale.strip()]
         if brief.strip():
-            brief_path = root / "brief.md"
+            brief_path = keep() / "brief.md"
             brief_path.write_text(brief, encoding="utf-8")
             command += ["--brief", str(brief_path)]
         if review:
             command += ["--review"]
         if timeline in {"premiere", "finalcut", "both"}:
             command += ["--timeline", timeline]
+        if subtitles in {"none", "sidecar", "burn"}:
+            command += ["--subtitles", subtitles]
         checkpoint = Path("artifacts/models/sam2.1_hiera_tiny.pt").resolve()
         if checkpoint.exists():
             command += ["--sam-checkpoint", str(checkpoint)]
 
         run = Run(
-            run_id=run_id, root=root, source=str(rush_dir), command=command
+            run_id=run_id, root=keep(), source=str(rush_dir), command=command
         )
         run.lines.append(f"{kept} clips from {rush_dir}")
         run.remember()

@@ -2395,3 +2395,77 @@ def test_clipping_a_line_never_inverts_the_slice() -> None:
         got = _within(line, from_seconds=float(at), to_seconds=at + 2.0)
         assert got == "" or len(got) >= 3, (at, got)
         assert got in line.text or got.strip("…，。") in line.text, (at, got)
+
+
+def test_a_refused_run_leaves_nothing_behind(tmp_path) -> None:
+    """The folder was made before the input was checked.
+
+    So every mistyped path left an empty directory in the runs folder that
+    nothing would ever open, list or clean up.
+    """
+
+    import montagewright.webapp as web
+    from fastapi.testclient import TestClient
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        client = TestClient(web.create_app())
+
+        gone = client.post("/api/runs", data={"source_path": "/no/such/one"})
+        assert gone.status_code == 400
+
+        empty = tmp_path / "no-footage"
+        empty.mkdir()
+        (empty / "notes.txt").write_text("not a video", encoding="utf-8")
+        barren = client.post("/api/runs", data={"source_path": str(empty)})
+        assert barren.status_code == 400
+
+        wrong = client.post(
+            "/api/runs", data={"source_path": "/tmp", "aspect": "3:2"}
+        )
+        assert wrong.status_code == 400
+
+        made = list((tmp_path / "runs").iterdir()) if (
+            tmp_path / "runs"
+        ).exists() else []
+        assert made == [], made
+    finally:
+        web.RUNS_ROOT = was
+
+
+def test_nothing_cut_yet_is_an_invitation_not_an_empty_editor() -> None:
+    """A black rectangle, empty tracks and an empty inspector.
+
+    That is what a first run saw, and it reads as broken rather than as new.
+    The only readable thing on the page was a line at the bottom of a drawer.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert 'id="nothing-yet"' in page
+    assert "還沒有剪過東西" in page
+    assert "function showWorkspace(" in page
+    # Off at startup, on only when a run is opened.
+    assert "showWorkspace(false);" in page
+    assert "showWorkspace(true);" in page
+
+
+def test_the_setup_offers_what_the_command_line_offers() -> None:
+    """A flag the interface cannot set is a flag most people never find."""
+
+    from pathlib import Path
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert 'id="subtitles"' in page
+    assert "body.append('subtitles'" in page
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "webapp.py"
+    ).read_text(encoding="utf-8")
+    assert 'subtitles: str = Form("sidecar")' in source
+    assert 'command += ["--subtitles", subtitles]' in source

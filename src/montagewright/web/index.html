@@ -50,6 +50,20 @@
   .crumbs .meta { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
 
   /* middle: viewer + inspector */
+  /* An editor with nothing in it -- a black rectangle, empty tracks, an
+     empty inspector -- is what this showed before anything had been cut.
+     It reads as broken rather than as new. */
+  .nothing-yet {
+    flex: 1; display: none; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; text-align: center; padding: 40px;
+    background: var(--deep); min-height: 0;
+  }
+  .nothing-yet.on { display: flex; }
+  .nothing-yet h2 { margin: 0; font-size: 19px; font-weight: 600; }
+  .nothing-yet p { margin: 0; color: var(--soft); font-size: 13.5px; line-height: 1.7; }
+  .nothing-yet p.quiet { color: var(--dim); font-size: 12px; }
+  .nothing-yet button { font-size: 14px; padding: 9px 18px; }
+
   .stage {
     display: grid; grid-template-columns: 1fr minmax(320px, 27vw);
     min-height: 0; background: var(--sunk);
@@ -337,6 +351,14 @@
     <button id="new-run">新的一輪</button>
   </div>
 
+  <div class="nothing-yet" id="nothing-yet">
+    <h2>還沒有剪過東西</h2>
+    <p>指一個放毛片的資料夾，它會看過每一支、決定怎麼剪、然後交出一支片<br>
+       跟一份說明每個決定是怎麼來的報表。</p>
+    <button id="first-run">選素材開始</button>
+    <p class="quiet">已經用命令列跑過的，也會出現在下面的「先前的剪輯」。</p>
+  </div>
+
   <div class="stage">
     <div class="screen">
       <div class="over" id="over"></div>
@@ -455,6 +477,12 @@
         <div class="field"><label>語音</label>
           <select id="speech"><option value="auto">自動判斷</option><option value="never">不要轉錄</option></select></div>
         <div class="field"><label>語言</label><input type="text" id="locale" value="zh-TW"></div>
+        <div class="field"><label>字幕</label>
+          <select id="subtitles">
+            <option value="sidecar">另存字幕檔</option>
+            <option value="burn">燒進畫面</option>
+            <option value="none">不要字幕</option>
+          </select></div>
         <div class="field"><label>可編輯時間軸</label>
           <select id="timeline">
             <option value="none">事後再產也行</option>
@@ -1054,6 +1082,9 @@ function showExtras() {
   showStrip();
 }
 
+// Start on the invitation, not on an empty editor. Opening a run turns
+// the workspace on; nothing else does.
+showWorkspace(false);
 loadPast();
 
 $('rushes').addEventListener('change', () => {
@@ -1076,6 +1107,7 @@ $('go').addEventListener('click', async () => {
   body.append('budget', $('budget').value);
   body.append('review', $('review').checked ? 'true' : 'false');
   body.append('timeline', $('timeline').value);
+  body.append('subtitles', $('subtitles').value);
 
   $('go').disabled = true;
   $('veil').classList.remove('hide');
@@ -1310,8 +1342,17 @@ function emptyRow(cols, said) {
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 
+// Nothing open, or something open. The workspace is only worth showing
+// when there is a cut in it.
+function showWorkspace(on) {
+  $('nothing-yet').classList.toggle('on', !on);
+  document.querySelector('.stage').classList.toggle('hide', !on);
+  document.querySelector('.reelwrap').classList.toggle('hide', !on);
+}
+
 function render(report) {
   lastReport = report;
+  showWorkspace(true);
   const where = (report.selection?.shots || []).length;
   $('crumb-what').textContent = lastSource || '這一輪';
   $('crumb-meta').textContent =
@@ -1421,6 +1462,8 @@ function showTab(pane) {
 for (const tab of document.querySelectorAll('.tab')) {
   tab.onclick = () => showTab(tab.dataset.pane);
 }
+
+$('first-run').addEventListener('click', () => $('new-run').click());
 
 $('new-run').addEventListener('click', () => {
   $('veil').classList.remove('hide');
