@@ -75,6 +75,69 @@ class BeatGrid:
         return later[0] if later else None
 
 
+def analyse_track(path: Path) -> BeatGrid:
+    """Measure a track straight into a grid.
+
+    The reviewed lock exists so a delivery can prove which analysis it was
+    cut against. That provenance is worth its ceremony for a delivery and is
+    pure friction for someone dropping a folder on a page to see what comes
+    out, who would otherwise have to produce a lock file before the tool
+    would run at all. The measurement underneath is the same one.
+    """
+
+    from jascue_video_lab.music import analyze_music
+
+    proposal = analyze_music(Path(path).expanduser().resolve())
+    rate = float(proposal.master_sample_rate)
+    meter = int(proposal.meter_suggestion or 4)
+
+    # The proposal calls everything a candidate because a human was meant to
+    # settle it. Nothing about the measurement changes when they do -- the
+    # review decides which to keep, not when they are.
+    cues = [
+        Cue(
+            cue_id=str(cue.cue_id),
+            time_seconds=float(cue.time_ms) / 1000.0,
+            kind=str(cue.kind).removesuffix("_candidate"),
+            strength=float(cue.strength or 0.0),
+        )
+        for cue in proposal.cues
+    ]
+    # Downbeats and section boundaries are derived while locking rather than
+    # measured, so they have to be derived here too: without them the grid
+    # has nothing a planner can name, and every "land on the chorus" resolves
+    # to nothing.
+    beats = sorted(
+        (cue for cue in cues if cue.kind == "beat"),
+        key=lambda cue: cue.time_seconds,
+    )
+    for index, beat in enumerate(beats):
+        if index % meter == 0:
+            cues.append(
+                Cue(
+                    cue_id=f"downbeat-{index // meter:05d}",
+                    time_seconds=beat.time_seconds,
+                    kind="downbeat",
+                    strength=beat.strength,
+                )
+            )
+    for section in proposal.sections:
+        cues.append(
+            Cue(
+                cue_id=str(section.label or section.section_id),
+                time_seconds=float(section.start_sample) / rate,
+                kind="section_boundary",
+                strength=float(section.confidence or 0.0),
+            )
+        )
+    return BeatGrid(
+        bpm=float(proposal.estimated_bpm or 120.0),
+        meter=meter,
+        cues=tuple(sorted(cues, key=lambda cue: cue.time_seconds)),
+        duration_seconds=float(proposal.duration_ms) / 1000.0,
+    )
+
+
 def load_beat_grid(lock_path: Path) -> BeatGrid:
     """Read a reviewed music map lock into a grid.
 

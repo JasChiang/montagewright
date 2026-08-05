@@ -23,7 +23,7 @@ from jascue_auto.clipcard import (
     subjects_from_card,
 )
 from jascue_auto.cost import BudgetSpent, Ledger
-from jascue_auto.grounding import load_beat_grid
+from jascue_auto.grounding import analyse_track, load_beat_grid
 from jascue_auto.pipeline import probe, run
 from jascue_auto.review import (
     Round,
@@ -203,9 +203,17 @@ def command_render(args: argparse.Namespace) -> int:
         )
         for shot in selection["shots"]
     }
-    grid = load_beat_grid(args.music_map) if args.music_map else None
-    if grid is None:
-        raise SystemExit("--music-map is required; run analyze-music first")
+    if args.music_map:
+        grid = load_beat_grid(args.music_map)
+    elif args.music:
+        # A reviewed lock proves which analysis a delivery was cut against.
+        # Requiring one before the tool will run at all turns "let me see
+        # what this does" into a two-step errand, and the measurement is the
+        # same either way.
+        print("no music map given; measuring the track", flush=True)
+        grid = analyse_track(args.music)
+    else:
+        raise SystemExit("--music or --music-map is required")
 
     rhythm_context = _rhythm_context(selection, cards)
 

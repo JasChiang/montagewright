@@ -708,3 +708,35 @@ def test_takes_set_aside_before_planning_say_why() -> None:
     source = inspect.getsource(cli.command_render)
     assert "unusable_reason" in source
     assert "set_aside" in inspect.getsource(cli._write_report)
+
+
+def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
+    """The question after a run is which take that is and why it looks like that."""
+
+    from jascue_auto.webapp import PAGE, create_app
+
+    paths = {r.path for r in create_app().routes if hasattr(r, "path")}
+    assert {"/api/runs", "/api/runs/{run_id}/video",
+            "/api/runs/{run_id}/shot/{index}"} <= paths
+
+    page = PAGE.read_text(encoding="utf-8")
+    for shown in ("素材檔名", "運鏡", "主體", "為什麼用這顆", "降級", "逐顆驗收"):
+        assert shown in page, shown
+
+
+def test_a_track_can_be_measured_without_a_reviewed_lock() -> None:
+    """Requiring a lock file first turns "see what this does" into an errand.
+
+    The lock proves which analysis a delivery was cut against, which is worth
+    its ceremony for a delivery and is pure friction for a trial. Downbeats
+    and section boundaries are derived while locking, so deriving them here
+    too is what keeps "land on the chorus" resolvable.
+    """
+
+    import inspect
+
+    from jascue_auto import cli, grounding
+
+    source = inspect.getsource(grounding.analyse_track)
+    assert "downbeat" in source and "section_boundary" in source
+    assert "analyse_track" in inspect.getsource(cli.command_render)
