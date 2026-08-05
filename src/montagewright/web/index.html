@@ -985,11 +985,34 @@ function render(report) {
     }).join('');
   $('detail').classList.remove('hide');
 
-  const aside = Object.entries(report.set_aside || {});
-  $('aside-table').innerHTML = '<tr><th>檔名</th><th>卡片說的理由</th></tr>'
-    + (aside.length
-       ? aside.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="why">${esc(v)}</td></tr>`).join('')
-       : emptyRow(2, '每一支素材都可以用，沒有被放到一邊的。'));
+  // Three different ways a clip does not reach the film, and only the
+  // rarest of them was on screen -- so a run that ruled out three takes and
+  // passed over sixty more said "every clip was usable".
+  const rows = [];
+  for (const [name, why] of Object.entries(report.set_aside || {})) {
+    rows.push([name, '卡片判定不能用', why]);
+  }
+  for (const entry of report.direction?.unusable || []) {
+    rows.push([
+      entry.source_id, '定調排除',
+      entry.reason + (entry.superseded_by ? `（由 ${entry.superseded_by} 取代）` : ''),
+    ]);
+  }
+  const spoken = new Set(rows.map(r => r[0]));
+  const used = new Set((report.selection?.shots || []).map(s => s.source_id));
+  for (const name of (report.material_ids || [])) {
+    if (!used.has(name) && !spoken.has(name)) {
+      rows.push([name, '選片沒挑', '可以用，但這一支片沒有它的位置']);
+    }
+  }
+  $('aside-table').innerHTML =
+    '<tr><th>檔名</th><th>怎麼沒用到</th><th>理由</th></tr>'
+    + (rows.length
+       ? rows.map(([name, how, why]) => `<tr>
+           <td class="mono">${esc(name)}</td>
+           <td><span class="tag">${esc(how)}</span></td>
+           <td class="why">${esc(why)}</td></tr>`).join('')
+       : emptyRow(3, '每一支素材都用上了。'));
 }
 
 

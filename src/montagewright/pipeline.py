@@ -144,6 +144,19 @@ class Report:
         )
 
 
+def _may_ask(client: Any) -> bool:
+    """Whether a grounding call is available at all.
+
+    Rebuilding a plan for a timeline or a recut has no key and needs none:
+    the subject positions are in the cards. A shot the cards cannot answer
+    falls through to a centred frame, which the executor records -- the same
+    answer it gives when nothing could be located, rather than an exception
+    from a path that was only ever meant to draw a crop.
+    """
+
+    return client is not None
+
+
 def _afford(report: "Report") -> None:
     """Stop before a paid call rather than after it.
 
@@ -357,6 +370,8 @@ def follow_subjects(
                 centres = []
                 widths = []
                 for subject in (reframe.subject, reframe.then_subject):
+                    if not _may_ask(client):
+                        continue
                     _afford(report)
                     boxes, usage = locate_subject(
                         frames, subject.description, client=client
@@ -405,6 +420,8 @@ def follow_subjects(
                         clip.approx_out_seconds,
                         work,
                     )
+                    if not _may_ask(client):
+                        continue
                     _afford(report)
                     boxes, usage = locate_subject(
                         frames, reframe.subject.description, client=client
@@ -533,6 +550,8 @@ def follow_subjects(
                             clip.approx_out_seconds,
                             work,
                         )
+                        if not _may_ask(client):
+                            continue
                         _afford(report)
                         boxes, usage = locate_subject(
                             frames, reframe.subject.description, client=client
@@ -604,6 +623,8 @@ def follow_subjects(
                 frames, times = _sample_frames(
                     source, clip.approx_in_seconds, clip.approx_out_seconds, work
                 )
+                if not _may_ask(client):
+                    continue
                 _afford(report)
                 boxes, usage = locate_subject(
                     frames, reframe.subject.description, client=client

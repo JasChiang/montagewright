@@ -417,28 +417,33 @@ def create_app() -> FastAPI:
             cursor += seconds
         return JSONResponse({"blocks": blocks, "seconds": round(cursor, 3)})
 
-    @app.post("/api/runs/{run_id}/recut")
-    async def recut(run_id: str, request: Request) -> JSONResponse:
-        """Render an amended running order. No model calls, so no cost.
+    def _rebuild(run: Run, wanted: list[dict] | None = None):
+        """The render plan again, from what the report already records.
 
-        Everything that was decided stays decided -- the crop, the subject,
-        the move. This moves cuts and drops shots, which is the part a person
-        wants after watching it once and does not want to re-plan a whole
-        film for.
+        Nothing here costs anything: the subject positions come out of the
+        cards, so this is arithmetic. It is what lets a timeline be asked for
+        after the fact, and a running order be changed without re-planning
+        the film.
         """
 
-        from montagewright.executor import Source, plan_render
-        from montagewright.pipeline import follow_subjects, probe, Report
-        from montagewright.renderer import render as render_cut
+        from montagewright.executor import plan_render
+        from montagewright.pipeline import Report, follow_subjects, probe
         from montagewright.schema import EDL, Clip, Reframe, Subject
 
-        run = _run(run_id)
         report = run.report() or {}
-        wanted = (await request.json()).get("shots", [])
-        if not wanted:
-            raise HTTPException(400, "nothing left to cut")
-
         original = report.get("selection", {}).get("shots", [])
+        rhythm = report.get("rhythm", {})
+        if wanted is None:
+            wanted = [
+                {
+                    "index": i,
+                    "in_seconds": float(shot.get("start_seconds", 0.0)),
+                    "seconds": float(
+                        rhythm.get(f"k{i:02d}", {}).get("seconds", 0.0)
+                    ),
+                }
+                for i, shot in enumerate(original)
+            ]
         aspect = ASPECTS.get(
             report.get("direction", {}).get("aspect", "9:16"), 9 / 16
         )
@@ -447,7 +452,6 @@ def create_app() -> FastAPI:
             for path in (Path.home() / ".cache" / "montagewright"
                          / "library" / "cards").glob("*.json")
         }
-
         clips, sources = [], {}
         for index, entry in enumerate(wanted):
             plan = original[int(entry["index"])]
@@ -483,16 +487,34 @@ def create_app() -> FastAPI:
                     camera_energy="active",
                 ),
             ))
-
-        edl = EDL(project_id=run_id, clips=clips)
-        fresh = Report()
+        edl = EDL(project_id=run.run_id, clips=clips)
         paths = follow_subjects(
-            edl, sources, target_aspect=aspect, report=fresh,
+            edl, sources, target_aspect=aspect, report=Report(),
             cards=cards, checkpoint=None, client=None,
         )
-        plan = plan_render(
-            edl, sources, target_aspect=aspect, crop_paths=paths
+        return (
+            plan_render(edl, sources, target_aspect=aspect, crop_paths=paths),
+            report, aspect,
         )
+
+    @app.post("/api/runs/{run_id}/recut")
+    async def recut(run_id: str, request: Request) -> JSONResponse:
+        """Render an amended running order. No model calls, so no cost.
+
+        Everything that was decided stays decided -- the crop, the subject,
+        the move. This moves cuts and drops shots, which is the part a person
+        wants after watching it once and does not want to re-plan a whole
+        film for.
+        """
+
+        from montagewright.renderer import render as render_cut
+
+        run = _run(run_id)
+        wanted = (await request.json()).get("shots", [])
+        if not wanted:
+            raise HTTPException(400, "nothing left to cut")
+        plan, report, _ = _rebuild(run, wanted)
+
         # The bed and whether the voice survives were decided when the run
         # was set up; a recut is a different running order, not a different
         # film, so both carry over.
@@ -639,9 +661,22 @@ def create_app() -> FastAPI:
         suffix = {"premiere": "xml", "finalcut": "fcpxml"}.get(flavour)
         if suffix is None:
             raise HTTPException(400, "premiere or finalcut")
-        path = _run(run_id).output / f"timeline.{suffix}"
+        run = _run(run_id)
+        path = run.output / f"timeline.{suffix}"
         if not path.exists():
-            raise HTTPException(404, "no timeline was asked for")
+            # Built on request. Asking for one up front and finding out
+            # afterwards that you wanted it meant running the whole thing
+            # again, and everything it needs is already written down.
+            from montagewright.timeline import to_fcpxml, to_xmeml
+
+            plan, report, aspect = _rebuild(run)
+            width, height = (1920, 1080) if aspect >= 1.0 else (1080, 1920)
+            build = to_xmeml if flavour == "premiere" else to_fcpxml
+            path.write_text(
+                build(plan, report, name=run.output.name,
+                      width=width, height=height),
+                encoding="utf-8",
+            )
         return FileResponse(
             path, media_type="application/xml",
             filename=f"{run_id}.{suffix}",

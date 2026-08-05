@@ -1503,7 +1503,7 @@ def test_an_empty_panel_says_what_empty_means() -> None:
 
     page = PAGE.read_text(encoding="utf-8")
     assert "emptyRow" in page
-    assert "每一支素材都可以用" in page
+    assert "每一支素材都用上了" in page
     assert "這一輪沒有做逐字稿" in page
     assert "還沒有跑過任何一輪" in page
 
@@ -1546,3 +1546,26 @@ def test_the_slowest_stage_reports_each_shot() -> None:
     # How long the current stage has been going, so waiting reads as waiting.
     assert "stepSince" in page and "已經 ${since(" in page
     assert "CPU 沒有動是正常的" in page
+
+
+def test_every_way_a_clip_misses_the_film_is_shown() -> None:
+    """Only the rarest of three was on screen.
+
+    A card can call a take unusable, the direction can rule one out, and
+    selection can simply pass one over -- and the last of those is how most
+    of a folder does not reach the film. Showing only the first made a run
+    that ruled out three takes and passed over sixty report that every clip
+    had been usable.
+    """
+
+    import inspect
+
+    from montagewright import cli
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    for how in ("卡片判定不能用", "定調排除", "選片沒挑"):
+        assert how in page, how
+    # "Passed over" can only be told from what was on the table.
+    assert "material_ids" in page
+    assert "material_ids" in inspect.getsource(cli._write_report)

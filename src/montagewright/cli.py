@@ -531,6 +531,7 @@ def command_render(args: argparse.Namespace) -> int:
         output,
         snaps=snaps,
         set_aside=set_aside,
+        material_ids=[item.source_id for item in material],
         rounds=rounds,
         shot_verdicts=shot_verdicts,
         stopped_because=stopped,
@@ -807,6 +808,10 @@ def _write_report(output: Path, **parts) -> None:
         "spend": report.spend(),
         "cut_on_action": parts.get("snaps", {}),
         "set_aside": parts.get("set_aside", {}),
+        # Everything that was on the table. Without it there is no way to
+        # say which clips were simply passed over, which is how most of a
+        # folder does not reach the film.
+        "material_ids": parts.get("material_ids", []),
         "rhythm": report.rhythm_decisions,
         # Per shot, against the plan that asked for it. The whole-cut verdict
         # below answers a different question and has never once caught a
@@ -895,6 +900,90 @@ def command_transcribe(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_timeline(args: argparse.Namespace) -> int:
+    """Write a timeline for a cut that already exists.
+
+    Choosing the flavour before the run and finding out afterwards that you
+    wanted one meant running the whole thing again. Everything a timeline
+    needs is in the report and the material, and rebuilding the plan costs
+    nothing -- the subject positions come out of the cards.
+    """
+
+    from montagewright.executor import plan_render
+    from montagewright.pipeline import Report, follow_subjects, probe
+    from montagewright.timeline import to_fcpxml, to_xmeml
+
+    output = args.output.expanduser().resolve()
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    shots = report.get("selection", {}).get("shots", [])
+    rhythm = report.get("rhythm", {})
+    aspect = ASPECTS.get(report.get("direction", {}).get("aspect", "9:16"), 9 / 16)
+    library = (args.library or default_library()).expanduser()
+    cards = {p.stem: p for p in (library / "cards").glob("*.json")}
+
+    hunting = [output / "work" / "shots"] + (
+        [args.rushes.expanduser()] if args.rushes else []
+    )
+    clips, sources = [], {}
+    for index, shot in enumerate(shots):
+        source_id = shot["source_id"]
+        if source_id not in sources:
+            match = next(
+                (
+                    path
+                    for folder in hunting if folder.exists()
+                    for path in folder.iterdir()
+                    if path.stem == source_id
+                ),
+                None,
+            )
+            if match is None:
+                raise SystemExit(
+                    f"cannot find {source_id}; pass --rushes with its folder"
+                )
+            sources[source_id] = probe(source_id, match)
+        start = float(shot.get("start_seconds", 0.0))
+        clips.append(
+            Clip(
+                clip_id=f"k{index:02d}", source_id=source_id,
+                approx_in_seconds=start,
+                approx_out_seconds=start
+                + float(rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)),
+                in_looks_like=shot.get("subject", ""),
+                energy_intent=shot.get("energy", "medium"),
+                reframe=Reframe(
+                    subject=Subject(
+                        description=shot.get("subject", ""),
+                        min_visible=1.0 if shot.get("must_be_whole") else 0.85,
+                    ),
+                    intent=shot.get("why", "")[:120],
+                    camera_move=shot.get("camera_move", "hold"),
+                    framing=shot.get("framing", "thirds"),
+                    camera_energy="active",
+                ),
+            )
+        )
+    edl = EDL(project_id=output.name, clips=clips)
+    paths = follow_subjects(
+        edl, sources, target_aspect=aspect, report=Report(),
+        cards=cards, checkpoint=None, client=None,
+    )
+    plan = plan_render(edl, sources, target_aspect=aspect, crop_paths=paths)
+    width, height = (1920, 1080) if aspect >= 1.0 else (1080, 1920)
+    for flavour, suffix, build in (
+        ("premiere", "xml", to_xmeml), ("finalcut", "fcpxml", to_fcpxml)
+    ):
+        if args.flavour in {flavour, "both"}:
+            path = output / f"timeline.{suffix}"
+            path.write_text(
+                build(plan, report, name=output.name,
+                      width=width, height=height),
+                encoding="utf-8",
+            )
+            print(f"timeline    {path}", flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="montagewright")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -951,6 +1040,20 @@ def main(argv: list[str] | None = None) -> int:
     speak.add_argument("--budget", type=float, default=5.0)
     speak.add_argument("--upload-cache", type=Path)
     speak.set_defaults(handler=command_transcribe)
+
+    lay = sub.add_parser(
+        "timeline", help="Write a timeline for a cut that already exists"
+    )
+    lay.add_argument("output", type=Path)
+    lay.add_argument(
+        "--flavour", choices=["premiere", "finalcut", "both"], default="both"
+    )
+    lay.add_argument(
+        "--rushes", type=Path,
+        help="where the sources are, if they are not under the output",
+    )
+    lay.add_argument("--library", type=Path)
+    lay.set_defaults(handler=command_timeline)
 
     args = parser.parse_args(argv)
     return args.handler(args)
