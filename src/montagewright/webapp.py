@@ -185,6 +185,19 @@ def _transcript_map(run) -> dict:
     }
 
 
+def _subtitle_words(run) -> "list":
+    """The measured words, on the cut's own clock."""
+
+    from montagewright.transcript import words_against_cut
+
+    report = run.report() or {}
+    return words_against_cut(
+        report.get("selection", {}).get("shots", []),
+        report.get("rhythm", {}),
+        _transcript_map(run),
+    )
+
+
 def _subtitle_lines(run, *, edits: bool = True) -> "list":
     """What should appear on screen, edits included.
 
@@ -970,7 +983,7 @@ def create_app() -> FastAPI:
         return JSONResponse({"lines": len(kept)})
 
     @app.post("/api/runs/{run_id}/burn-subtitles")
-    def burn_subtitles(run_id: str) -> JSONResponse:
+    def burn_subtitles(run_id: str, look: str = "plain") -> JSONResponse:
         """Put the words on the picture, using the lines as they now read.
 
         Costs nothing: the transcript was paid for once and the corrections
@@ -980,6 +993,7 @@ def create_app() -> FastAPI:
         """
 
         from montagewright.subtitles import NoFontHere, burn
+        from montagewright.subtitles import look as looks_like
 
         run = _run(run_id)
         said = _subtitle_lines(run)
@@ -1000,11 +1014,13 @@ def create_app() -> FastAPI:
             made = burn(
                 source, said, run.output / "deliverable-subtitled.mp4",
                 aspect=aspect, work=run.output / "work" / "subs",
+                style=looks_like(look), words=_subtitle_words(run),
             )
         except NoFontHere as error:
             raise HTTPException(422, str(error))
         return JSONResponse({
             "file": made.name, "lines": len(said), "aspect": aspect,
+            "look": look,
         })
 
     @app.get("/api/runs/{run_id}/burned")

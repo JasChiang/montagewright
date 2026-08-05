@@ -641,7 +641,9 @@ def command_render(args: argparse.Namespace) -> int:
     # same lines the timeline shows, so what was corrected in the interface
     # is what gets burned.
     if transcripts and args.subtitles != "none":
-        from montagewright.transcript import against_cut, to_srt
+        from montagewright.transcript import (
+            against_cut, to_srt, words_against_cut,
+        )
 
         said = against_cut(
             selection["shots"],
@@ -672,6 +674,12 @@ def command_render(args: argparse.Namespace) -> int:
                         result.deliverable, said,
                         output / "deliverable-subtitled.mp4",
                         aspect=args.aspect, work=work / "subs",
+                        style=typeset.look(args.subtitle_look),
+                        words=words_against_cut(
+                            selection["shots"],
+                            report.rhythm_decisions,
+                            transcripts,
+                        ),
                     )
                     print(f"burned in   {burned}", flush=True)
                 except NoFontHere as error:
@@ -1149,6 +1157,12 @@ def main(argv: list[str] | None = None) -> int:
             "sidecar writes an SRT beside the cut; burn also puts the words "
             "on the picture, inside the safe area for the delivery aspect"
         ),
+    )
+    render.add_argument(
+        "--subtitle-look", choices=["plain", "speakers", "spoken", "plate"],
+        default="plain",
+        help="how burned subtitles look: plain, a colour per speaker, "
+             "filling as it is said, or on a plate",
     )
     render.add_argument(
         "--subtitle-font", type=Path,

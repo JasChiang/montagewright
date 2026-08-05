@@ -440,6 +440,39 @@ def against_cut(
     return timed
 
 
+def words_against_cut(
+    shots: list[dict],
+    rhythm: dict[str, dict],
+    cards: Mapping[str, dict | None],
+) -> list[Word]:
+    """Every measured word, moved onto the timeline the shots landed on.
+
+    The same shift the lines get. Without it the words stay in the time of
+    the take they were spoken in, and a subtitle asked to fill as it is said
+    fills to the rhythm of a completely different part of the interview.
+    """
+
+    moved: list[Word] = []
+    cursor = 0.0
+    for index, shot in enumerate(shots):
+        seconds = float(rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0))
+        card = cards.get(str(shot.get("source_id", "")))
+        start = float(shot.get("start_seconds", 0.0))
+        for word in words_in(card or {}):
+            if word.ends_seconds <= start:
+                continue
+            if word.starts_seconds >= start + seconds:
+                continue
+            moved.append(Word(
+                text=word.text,
+                starts_seconds=cursor + max(0.0, word.starts_seconds - start),
+                ends_seconds=cursor + min(seconds, word.ends_seconds - start),
+                confidence=word.confidence,
+            ))
+        cursor += seconds
+    return moved
+
+
 def _schema() -> dict[str, Any]:
     """Flat, and with no field the model has to invent a number for."""
 

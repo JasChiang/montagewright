@@ -70,6 +70,11 @@ class Style:
     outline_alpha: int = 205
     # A share of the type size, so it holds at any frame height.
     outline_width: float = 0.09
+    # Colour the words already spoken, so the line fills as it is said.
+    # The recogniser timed every character, so this is measured rather than
+    # paced -- which is the difference between reading along and watching a
+    # progress bar.
+    spoken: tuple[int, int, int] | None = None
     # A plate behind the words, for footage too busy for an outline alone.
     plate: tuple[int, int, int] | None = None
     plate_alpha: int = 150
@@ -473,6 +478,7 @@ def draw_line(
     into: Path,
     style: Style | None = None,
     ink: tuple[int, int, int] | None = None,
+    said_upto: int = 0,
 ) -> tuple[Path, int, int] | None:
     """One subtitle as a transparent image, plus where to put it.
 
@@ -520,6 +526,7 @@ def draw_line(
             fill=(*style.plate, style.plate_alpha),
         )
     ink = ink or style.fill
+    seen = 0
     for index, one in enumerate(lines):
         at_x = (canvas.width - face.getbbox(one)[2]) // 2
         at_y = edge * 2 + index * step
@@ -527,12 +534,56 @@ def draw_line(
             (at_x, at_y), one, font=face, fill=(*ink, 255),
             stroke_width=edge, stroke_fill=(*style.outline, style.outline_alpha),
         )
+        # The part already spoken, drawn over the top in its own colour.
+        # Drawn as a prefix of the same string at the same origin, so the
+        # letters cannot drift by a pixel against the ones underneath.
+        if style.spoken is not None and said_upto > seen:
+            cut = min(len(one), said_upto - seen)
+            if cut > 0:
+                pen.text(
+                    (at_x, at_y), one[:cut], font=face,
+                    fill=(*style.spoken, 255), stroke_width=edge,
+                    stroke_fill=(*style.outline, style.outline_alpha),
+                )
+        seen += len(one)
 
     into.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(into)
     left = (width - canvas.width) // 2
     top = round(height * (1 - area.up_from_bottom)) - canvas.height
     return into, max(0, left), max(0, top)
+
+
+def spans_in(text: str, words, at: float, until: float):
+    """Match a cue's characters to the words that were measured.
+
+    The recogniser times Chinese per character, so a cue is a run of them
+    with the punctuation put back by the correction pass. Walking both at
+    once and consuming a word only when it matches the next characters
+    keeps the two in step through anything inserted between them; the
+    punctuation simply belongs to the character before it.
+
+    Returns (end_index, seconds) pairs: how much of the line has been said
+    by when. Empty when the words do not line up, which is the signal to
+    draw the cue as one piece rather than to guess.
+    """
+
+    inside = [w for w in words if w.ends_seconds > at and w.starts_seconds < until]
+    marks: list[tuple[int, float]] = []
+    where = 0
+    for word in inside:
+        said = word.text.strip()
+        if not said:
+            continue
+        found = text.find(said, where)
+        if found < 0:
+            continue
+        where = found + len(said)
+        # Punctuation after a word is revealed with it.
+        while where < len(text) and text[where] in NEVER_STARTS:
+            where += 1
+        marks.append((where, word.ends_seconds))
+    return marks if len(marks) >= 2 else []
 
 
 def burn(
@@ -543,6 +594,7 @@ def burn(
     aspect: str,
     work: Path,
     style: Style | None = None,
+    words=None,
 ) -> Path:
     """Composite the lines onto the picture, each over its own window.
 
@@ -576,29 +628,51 @@ def burn(
 
     drawn = []
     for index, line in enumerate(lines):
-        made = draw_line(
-            line.text, width=width, height=height, area=area,
-            into=work / f"sub-{index:04d}.png",
-            style=style,
-            ink=palette.get(getattr(line, "speaker", "")) or style.fill,
-        )
-        if made is not None:
-            drawn.append((made, line))
+        ink = palette.get(getattr(line, "speaker", "")) or style.fill
+
+        # One picture per cue, unless the words were measured and the line
+        # is meant to fill as it is said -- then one per character, each
+        # shown for exactly as long as that character took.
+        states: list[tuple[int, float, float]] = [
+            (0, line.starts_seconds, line.ends_seconds)
+        ]
+        if style.spoken is not None and words:
+            marks = spans_in(
+                line.text, words, line.starts_seconds, line.ends_seconds
+            )
+            if marks:
+                states = []
+                upto, since = 0, line.starts_seconds
+                for reached, when in marks:
+                    if when > since:
+                        states.append((upto, since, when))
+                    upto, since = reached, when
+                states.append((upto, since, line.ends_seconds))
+
+        for part, (upto, since, until) in enumerate(states):
+            if until <= since:
+                continue
+            made = draw_line(
+                line.text, width=width, height=height, area=area,
+                into=work / f"sub-{index:04d}-{part:03d}.png",
+                style=style, ink=ink, said_upto=upto,
+            )
+            if made is not None:
+                drawn.append((made, since, until))
     if not drawn:
         raise ValueError("no lines with anything on them")
 
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                "-i", str(picture)]
-    for (path, _, _), _ in drawn:
+    for (path, _, _), _, _ in drawn:
         command += ["-i", str(path)]
 
     steps, tag = [], "0:v"
-    for index, ((_, left, top), line) in enumerate(drawn):
+    for index, ((_, left, top), since, until) in enumerate(drawn):
         nxt = f"v{index}"
         steps.append(
             f"[{tag}][{index + 1}:v]overlay={left}:{top}:"
-            f"enable='between(t,{line.starts_seconds:.3f},"
-            f"{line.ends_seconds:.3f})'[{nxt}]"
+            f"enable='between(t,{since:.3f},{until:.3f})'[{nxt}]"
         )
         tag = nxt
     command += [
@@ -621,3 +695,20 @@ def as_cues(lines, aspect: str, width: int, height: int):
     area = safe_area(aspect)
     face = _face(max(12, round(height * area.text_height)))
     return split_cues(lines, face, round(width * (1 - area.side_margin * 2)))
+
+
+# The looks worth offering by name. Anything finer is a Style, which is
+# what these are made of.
+LOOKS: dict[str, Style] = {
+    "plain": Style(),
+    # An interview with more than one person in it.
+    "speakers": Style(by_speaker=True),
+    # The one social video mostly uses: the line fills as it is said.
+    "spoken": Style(spoken=(255, 214, 90)),
+    # For footage too busy for an outline to hold on its own.
+    "plate": Style(plate=(16, 15, 13), plate_alpha=165, outline_width=0.05),
+}
+
+
+def look(name: str) -> Style:
+    return LOOKS.get(name, LOOKS["plain"])

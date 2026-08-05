@@ -2576,3 +2576,52 @@ def test_the_regional_face_and_a_weight_that_reads_over_a_picture() -> None:
             continue  # another machine, another font; nothing to assert
         assert family.endswith(region), (lang, family)
         assert style in ("Medium", "Semibold"), (lang, style)
+
+
+def test_the_words_move_onto_the_cut_with_the_lines() -> None:
+    """Otherwise a line asked to fill as it is said fills to the rhythm of
+    a completely different part of the interview."""
+
+    from montagewright.transcript import words_against_cut
+
+    cards = {"A": {"words": [
+        {"text": "在", "starts_seconds": 10.0, "ends_seconds": 10.3},
+        {"text": "夏", "starts_seconds": 10.3, "ends_seconds": 10.6},
+        # Spoken in the take, outside the part that was used.
+        {"text": "後", "starts_seconds": 30.0, "ends_seconds": 30.4},
+    ]}}
+    moved = words_against_cut(
+        [{"source_id": "A", "start_seconds": 10.0}],
+        {"k00": {"seconds": 2.0}},
+        cards,
+    )
+    assert [word.text for word in moved] == ["在", "夏"]
+    assert moved[0].starts_seconds == 0.0
+    assert abs(moved[1].starts_seconds - 0.3) < 1e-6
+
+
+def test_a_cue_fills_at_the_speed_it_was_actually_said() -> None:
+    """Character by character, against measured timings rather than a pace.
+
+    That is the difference between reading along and watching a progress
+    bar. When the two cannot be lined up, the cue is drawn whole rather
+    than guessed at.
+    """
+
+    from montagewright.subtitles import spans_in
+    from montagewright.transcript import Word
+
+    said = "在夏天讓你最崩潰的事情是什麼？"
+    words = [
+        Word(text=ch, starts_seconds=i * 0.3, ends_seconds=(i + 1) * 0.3)
+        for i, ch in enumerate("在夏天讓你最崩潰的事情是什麼")
+    ]
+    marks = spans_in(said, words, 0.0, 5.0)
+
+    assert len(marks) == len(words)
+    # Each mark says how much of the line has been said by when.
+    assert marks[0] == (1, 0.3)
+    # The question mark is revealed with the character before it.
+    assert marks[-1][0] == len(said)
+    # Nothing measurable in this window: draw it in one piece.
+    assert spans_in(said, words, 90.0, 95.0) == []
