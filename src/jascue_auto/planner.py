@@ -777,6 +777,7 @@ def decide_direction(
             "type": "text",
             "text": (
                 f"{prompt}\n\n## 剪輯 brief\n\n{brief}\n\n"
+                f"## 執行層做得到什麼\n\n{describe_for_prompt()}\n\n"
                 f"## 素材（{len(material)} 支，依序附上影片）\n\n{listing}\n"
             ),
         }

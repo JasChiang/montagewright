@@ -767,22 +767,23 @@ def test_a_transcript_is_its_own_card() -> None:
     )
 
 
-def test_spoken_boundaries_land_on_measured_silence() -> None:
-    """The model hears where a sentence ends; the recogniser measured where
-    the sound stopped. Neither alone puts the cut in the right place."""
+def test_spoken_boundaries_land_on_a_measured_break() -> None:
+    """The model hears where a sentence ends; the recogniser marked where the
+    sound broke. Neither alone puts the cut in the right place."""
 
     from jascue_auto.transcript import Word, gaps, snap
 
     words = [
-        Word("溼", 0.0, 0.30), Word("了", 0.35, 0.62),
-        Word("回", 1.40, 1.66), Word("家", 1.70, 1.98),
+        Word("溼", 0.0, 0.30), Word("了", 0.30, 0.62),
+        Word("。", 0.62, 1.01),
+        Word("回", 1.01, 1.66), Word("家", 1.66, 1.98),
     ]
-    silences = gaps(words)
-    assert silences == [1.01]
-    assert snap(1.2, silences) == 1.01
-    # Too far to be the same boundary: a model second that lands nowhere
-    # near a pause is left alone rather than dragged across a word.
-    assert snap(3.0, silences) == 3.0
+    breaks = gaps(words)
+    assert breaks == [1.01]
+    assert snap(1.2, breaks) == 1.01
+    # Too far to be the same boundary: a model second that lands nowhere near
+    # a break is left alone rather than dragged across a word.
+    assert snap(3.0, breaks) == 3.0
 
 
 def test_every_upload_waits_until_the_file_can_be_used() -> None:
@@ -1078,3 +1079,43 @@ def test_the_bed_is_placed_under_the_voice_not_under_the_music() -> None:
     assert renderer.BED_BELOW_VOICE_DB > 0
     source = inspect.getsource(renderer._mux_music)
     assert "_level(picture) - _level(music) - BED_BELOW_VOICE_DB" in source
+
+
+def test_pauses_come_from_the_punctuation_the_recogniser_wrote() -> None:
+    """The space between words is always zero; the punctuation is not.
+
+    The transcriber segments a stream continuously, so each word's end is the
+    next word's start -- ninety-five per cent of inter-word gaps in one
+    interview were exactly 0.000s, and pause candidates built on them found
+    four points in seventy seconds. A 。 is the recogniser saying it heard a
+    break, and the token carries that break's span.
+    """
+
+    from jascue_auto.transcript import Word, gaps, snap_end
+
+    words = [
+        Word("行", 12.9, 13.14),
+        Word("。", 13.14, 13.50),   # the break itself, 0.36s of it
+        Word("對", 13.50, 13.68),
+    ]
+    assert gaps(words) == [13.5]
+    # The out-point was landing on the last syllable's nominal end, which is
+    # where the pause starts -- the word's decay is still to come.
+    assert snap_end(13.14, gaps(words)) == 13.5
+    # Never backwards: the pause before the final word is often the nearer one.
+    assert snap_end(13.60, [13.5]) == 13.60
+
+
+def test_the_direction_only_promises_what_the_tools_can_do() -> None:
+    """It asked for keyword titles and jump cuts, and nothing downstream
+    speaks either -- so the reviewer reported the film as failing to do what
+    the film had asked of itself."""
+
+    import inspect
+
+    from jascue_auto import planner
+    from jascue_auto.planner import PROMPTS
+
+    assert "describe_for_prompt()" in inspect.getsource(planner.decide_direction)
+    prompt = (PROMPTS / "direction_zh-TW.txt").read_text(encoding="utf-8")
+    assert "只承諾做得到的事" in prompt

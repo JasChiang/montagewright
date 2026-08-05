@@ -27,10 +27,22 @@ struct Utterance: Codable {
     let words: [Word]
 }
 
+struct Silence: Codable {
+    let starts_seconds: Double
+    let ends_seconds: Double
+}
+
 struct Payload: Codable {
     let locale: String
     let duration_seconds: Double
     let utterances: [Utterance]
+    // Where nobody is speaking, from the system's own detector. Not derivable
+    // from the word timings: the transcriber segments a stream continuously,
+    // so each word's end is the next word's start and the gaps between them
+    // are all zero. And not derivable from level either -- this material is a
+    // street, where traffic never falls below the threshold a quiet room
+    // would put every breath under.
+    let silences: [Silence]
 }
 
 enum Failure: Error, CustomStringConvertible {
@@ -84,7 +96,34 @@ func transcribe(path: String, locale wanted: String) async throws -> Payload {
         try await request.downloadAndInstall()
     }
 
-    let analyzer = SpeechAnalyzer(modules: [transcriber])
+    let detector = SpeechDetector(
+        detectionOptions: .init(sensitivityLevel: .high),
+        reportResults: true
+    )
+    let analyzer = SpeechAnalyzer(modules: [transcriber, detector])
+
+    var silences: [Silence] = []
+    let listening = Task {
+        var quietFrom: Double? = nil
+        for try await result in detector.results {
+            let at = result.range.start.seconds
+            if result.speechDetected {
+                if let from = quietFrom, at - from >= 0.05 {
+                    silences.append(
+                        Silence(starts_seconds: from, ends_seconds: at)
+                    )
+                }
+                quietFrom = nil
+            } else if quietFrom == nil {
+                quietFrom = at
+            }
+        }
+        if let from = quietFrom {
+            silences.append(
+                Silence(starts_seconds: from, ends_seconds: from)
+            )
+        }
+    }
 
     var utterances: [Utterance] = []
     let collecting = Task {
@@ -122,11 +161,13 @@ func transcribe(path: String, locale wanted: String) async throws -> Payload {
     _ = try await analyzer.analyzeSequence(from: file)
     try await analyzer.finalizeAndFinishThroughEndOfInput()
     try await collecting.value
+    try await listening.value
 
     return Payload(
         locale: locale.identifier(.bcp47),
         duration_seconds: Double(file.length) / file.fileFormat.sampleRate,
-        utterances: utterances
+        utterances: utterances,
+        silences: silences.sorted { $0.starts_seconds < $1.starts_seconds }
     )
 }
 

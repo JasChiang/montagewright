@@ -139,23 +139,52 @@ def words_of(payload: dict[str, Any]) -> list[Word]:
     return sorted(words, key=lambda word: word.starts_seconds)
 
 
-def gaps(words: list[Word], *, at_least: float = 0.35) -> list[float]:
-    """Silences long enough to be somewhere a cut could go.
+# The recogniser writes these where it heard a break, and gives each one a
+# span of its own.
+BREAKS = "，。？！、…,.?!"
 
-    A pause is not a sentence ending -- hesitating, thinking and being
-    interrupted all make pauses, and cutting on one of those reads as a
-    mistake. This says where the speaker stopped, not where a thought did;
-    which of them is a boundary is a question for whoever can hear the
-    sentence, and the answers get snapped back onto these.
+
+def gaps(words: list[Word], *, at_least: float = 0.35) -> list[float]:
+    """Where the speaker stopped, from the recogniser's own punctuation.
+
+    Not from the space between words: the transcriber segments a stream
+    continuously, so each word's end is the next word's start and every gap
+    between them is exactly zero -- ninety-five per cent of them in one
+    seventy-second interview. Nothing about silence can be recovered from
+    subtracting those.
+
+    The punctuation can. A 。 or ， is the recogniser saying it heard a break,
+    and the token carries the span of that break -- between a tenth of a
+    second and nearly a whole one. Those spans are the pauses, measured,
+    already in hand.
+
+    A pause is still not a sentence ending: hesitating, thinking and being
+    interrupted all make pauses. Which of these is a boundary is for whoever
+    can hear the sentence; their answer is snapped onto these.
     """
 
-    found = []
-    for earlier, later in zip(words, words[1:]):
-        if later.starts_seconds - earlier.ends_seconds >= at_least:
-            found.append(
-                round((earlier.ends_seconds + later.starts_seconds) / 2.0, 3)
-            )
-    return found
+    return [
+        round(word.ends_seconds, 3)
+        for word in words
+        if word.text in BREAKS
+        and word.ends_seconds - word.starts_seconds >= at_least / 4.0
+    ]
+
+
+def snap_end(seconds: float, candidates: list[float], *, within: float = 1.0) -> float:
+    """Put an out-point after the pause, never before it.
+
+    Every candidate here is the far edge of a break the recogniser marked, so
+    the cut lands where the sound has finished rather than where the last
+    syllable nominally ended. Taking the nearest instead of the next one is
+    what clipped the final word: the pause before it is closer than the pause
+    after it about half the time, and choosing it eats the word.
+    """
+
+    later = [point for point in candidates if point >= seconds - 0.02]
+    if not later:
+        return seconds
+    return later[0] if later[0] - seconds <= within else seconds
 
 
 def snap(seconds: float, candidates: list[float], *, within: float = 0.6) -> float:
@@ -371,7 +400,7 @@ def describe(
             "heard": str(entry.get("heard", "")).strip(),
             "speaker": str(entry.get("speaker", "")).strip(),
             "starts_seconds": round(snap(start, silences), 3),
-            "ends_seconds": round(snap(end, silences), 3),
+            "ends_seconds": round(snap_end(end, silences), 3),
         })
 
     card = {
