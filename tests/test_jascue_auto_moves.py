@@ -1184,3 +1184,19 @@ def test_a_replan_renders_the_same_way_the_first_pass_did() -> None:
         "both renders go through one definition"
     )
     assert source.count("= cut(") == 2
+
+
+def test_dropping_the_question_depends_on_something_carrying_the_premise() -> None:
+    """"The answer implies the question" holds only when a title says it.
+
+    Written as a flat rule it removed every host line from a street-interview
+    Shorts that has no text cards, so the opening became a punchline with
+    nothing to be the punchline of -- "來月經吧" is only startling after
+    somebody asks what the worst thing about summer is.
+    """
+
+    from jascue_auto.planner import PROMPTS
+
+    prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
+    assert "問句通常不用剪進去" not in prompt
+    assert "觀眾從哪裡知道題目" in prompt
