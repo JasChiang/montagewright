@@ -2518,3 +2518,43 @@ def test_characters_the_font_cannot_spell_are_named() -> None:
 
     assert cannot_spell("夏天最崩潰的事") == ""
     assert "😀" in cannot_spell("好熱😀真的")
+
+
+def test_one_shot_can_be_turned_down_without_re_planning_anything() -> None:
+    """Levelling makes every speaker the same loudness.
+
+    That is not the same as every speaker being right: one of them stood
+    next to a road. The gain belongs to the segment, survives a re-cut, and
+    costs nothing because nothing has to be decided again.
+    """
+
+    from pathlib import Path
+
+    from montagewright.executor import Segment, Source
+    from montagewright.webapp import PAGE
+
+    made = Segment(
+        clip_id="k00",
+        source=Source(source_id="A", path=Path("/nowhere.mp4"), width=1920,
+                      height=1080, duration_seconds=10.0),
+        in_seconds=0.0, out_seconds=2.0,
+    )
+    assert made.gain_db == 0.0
+
+    renderer = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "renderer.py"
+    ).read_text(encoding="utf-8")
+    assert 'f"volume={segment.gain_db:.2f}dB"' in renderer
+    # Silence costs a filter nobody needs.
+    assert "abs(segment.gain_db) > 0.01" in renderer
+
+    web = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "webapp.py"
+    ).read_text(encoding="utf-8")
+    assert 'gains[f"k{index:02d}"]' in web
+    assert "segment.gain_db = gains.get(segment.clip_id, 0.0)" in web
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert 'id="gain"' in page and "gain_db: b.gain_db || 0" in page

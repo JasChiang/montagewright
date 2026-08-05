@@ -190,6 +190,11 @@ def _render_segment(
     # as their own file, so a transition or a nudge has material without the
     # timeline paying for it -- the concat stays frame-exact because every
     # segment is already the length it is meant to be.
+    audio = (
+        ["-af", f"volume={segment.gain_db:.2f}dB"]
+        if abs(segment.gain_db) > 0.01 else []
+    )
+
     head = min(HANDLE_SECONDS, segment.in_seconds)
     tail = min(
         HANDLE_SECONDS,
@@ -205,6 +210,7 @@ def _render_segment(
     ]
     if filters:
         command += ["-vf", ",".join(filters)]
+    command += audio
     command += [
         "-c:v", video_encoder, "-b:v", "12M",
         "-c:a", "aac", "-b:a", "192k",
@@ -223,6 +229,7 @@ def _render_segment(
                 "-i", str(segment.source.path),
             ]
             + (["-vf", ",".join(filters)] if filters else [])
+            + audio
             + [
                 "-c:v", video_encoder, "-b:v", "12M",
                 "-c:a", "aac", "-b:a", "192k",

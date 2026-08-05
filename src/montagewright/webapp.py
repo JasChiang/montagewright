@@ -664,6 +664,7 @@ def create_app() -> FastAPI:
                     "seconds": float(
                         rhythm.get(f"k{i:02d}", {}).get("seconds", 0.0)
                     ),
+                    "gain_db": 0.0,
                 }
                 for i, shot in enumerate(original)
             ]
@@ -674,7 +675,7 @@ def create_app() -> FastAPI:
             run.output / "work" / "proxies",
             default_library() / "cards",
         )
-        clips, sources = [], {}
+        clips, sources, gains = [], {}, {}
         for index, entry in enumerate(wanted):
             plan = original[int(entry["index"])]
             source_id = plan["source_id"]
@@ -692,6 +693,7 @@ def create_app() -> FastAPI:
                     raise HTTPException(404, f"{source_id} is gone")
                 sources[source_id] = probe(source_id, match)
             start = float(entry["in_seconds"])
+            gains[f"k{index:02d}"] = float(entry.get("gain_db", 0.0) or 0.0)
             clips.append(Clip(
                 clip_id=f"k{index:02d}", source_id=source_id,
                 approx_in_seconds=start,
@@ -705,10 +707,13 @@ def create_app() -> FastAPI:
             edl, sources, target_aspect=aspect, report=Report(),
             cards=cards, checkpoint=None, client=None,
         )
-        return (
-            plan_render(edl, sources, target_aspect=aspect, crop_paths=paths),
-            report, aspect,
+        plan = plan_render(
+            edl, sources, target_aspect=aspect, crop_paths=paths
         )
+        # A shot somebody turned down stays turned down through a re-cut.
+        for segment in plan.segments:
+            segment.gain_db = gains.get(segment.clip_id, 0.0)
+        return plan, report, aspect
 
     @app.post("/api/runs/{run_id}/recut")
     async def recut(run_id: str, request: Request) -> JSONResponse:

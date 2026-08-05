@@ -103,6 +103,10 @@ class Segment:
     # Set when the camera follows a subject. `crop` stays populated with the
     # opening position so anything reading a single box still works.
     crop_path: "CropPath | None" = None
+    # How much louder or quieter this shot is than it was recorded, in dB.
+    # Levelling makes every speaker the same loudness, which is not the same
+    # as every speaker being right: one of them stood next to a road.
+    gain_db: float = 0.0
 
     @property
     def duration_seconds(self) -> float:

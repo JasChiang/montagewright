@@ -145,6 +145,8 @@
   }
   dl.facts dd { margin: 3px 0 0; font-size: 13px; }
   dl.facts dd.why, .why { color: var(--soft); font-size: 12.5px; line-height: 1.6; }
+  dd.gainrow { display: flex; align-items: center; gap: 9px; }
+  dd.gainrow input { flex: 1; min-width: 0; }
   .nothing { color: var(--dim); font-size: 12.5px; padding: 22px 0; }
 
   /* reel */
@@ -726,6 +728,12 @@ function inspect(i) {
     <dl>
       <dt>進出點</dt><dd class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds).toFixed(2)}s
         （${b.seconds.toFixed(2)}s${moved ? '，已改動' : ''}）</dd>
+      <dt>這一顆的音量</dt><dd class="gainrow">
+        <input type="range" id="gain" min="-18" max="12" step="0.5"
+               value="${b.gain_db || 0}">
+        <span class="mono" id="gain-said">${(b.gain_db || 0) > 0 ? '+' : ''}${(b.gain_db || 0).toFixed(1)} dB</span>
+        <button class="bare" id="gain-off">歸零</button>
+      </dd>
       <dt>運鏡</dt><dd>${esc(plan.camera_move || '—')}${plan.framing ? `　<span class="why">${esc(plan.framing)}</span>` : ''}</dd>
       <dt>主體</dt><dd>${esc(plan.subject || '—')}${said.speaker ? `<div class="why">說話：${esc(said.speaker)}</div>` : ''}</dd>
       <dt>它宣告要做什麼</dt><dd class="why">${esc(plan.why || '—')}</dd>
@@ -733,6 +741,7 @@ function inspect(i) {
       ${said.note ? `<dt>驗收實際看到</dt><dd class="why">${esc(said.note)}</dd>` : ''}
       ${deg.length ? `<dt>做不到的地方</dt><dd>${deg.map(tellDegradation).join('')}</dd>` : ''}
     </dl>`;
+  wireGain(i);
 }
 
 async function showStrip() {
@@ -816,6 +825,27 @@ async function loadSubs() {
     subsEdited = !!data.edited;
   } catch (error) { subs = []; }
   paintSubs();
+}
+
+// Levelling makes every speaker the same loudness, which is not the same
+// as every speaker being right -- one of them stood next to a road.
+function wireGain(i) {
+  const slider = $('gain'), said = $('gain-said'), off = $('gain-off');
+  if (!slider) return;
+  const show = () => {
+    const at = blocks[i].gain_db || 0;
+    slider.value = at;
+    said.textContent = `${at > 0 ? '+' : ''}${at.toFixed(1)} dB`;
+    paintStrip();
+  };
+  slider.oninput = () => {
+    blocks[i].gain_db = +slider.value;
+    said.textContent = `${slider.value > 0 ? '+' : ''}${(+slider.value).toFixed(1)} dB`;
+    // Only the strip's "changed" marker needs to know; re-rendering is
+    // what the button is for.
+    $('recut').classList.remove('hide');
+  };
+  off.onclick = () => { blocks[i].gain_db = 0; show(); };
 }
 
 function paintSubs() {
@@ -962,7 +992,9 @@ function paintStrip() {
          title="${esc(b.source_id)}　${esc(b.subject)}">
       <div class="grip l" data-edge="l" data-i="${i}"></div>
       <div class="lab">${esc(b.source_id)}</div>
-      <div class="dur">${b.seconds.toFixed(1)}s</div>
+      <div class="dur">${b.seconds.toFixed(1)}s${
+        b.gain_db ? ` ${b.gain_db > 0 ? '+' : ''}${b.gain_db.toFixed(1)}dB` : ''
+      }</div>
       <div class="kill" data-kill="${i}">×</div>
       <div class="grip r" data-edge="r" data-i="${i}"></div>
     </div>`;
@@ -1066,7 +1098,8 @@ $('recut').addEventListener('click', async () => {
   const res = await fetch(`/api/runs/${runId}/recut`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ shots: blocks.map(b => ({
-      index: b.index, in_seconds: b.in_seconds, seconds: b.seconds })) }),
+      index: b.index, in_seconds: b.in_seconds, seconds: b.seconds,
+      gain_db: b.gain_db || 0 })) }),
   });
   $('recut').disabled = false;
   if (!res.ok) { $('strip-note').textContent = '失敗：' + (await res.text()).slice(0, 120); return; }
