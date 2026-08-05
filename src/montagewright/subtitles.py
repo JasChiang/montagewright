@@ -35,6 +35,10 @@ NEVER_STARTS = "，。、！？：；）」』】》,.!?;:)]}"
 # Where to look when the system cannot be asked. Ordered by preference; a
 # machine with none of them and no fontconfig cannot burn Chinese subtitles,
 # and is told so rather than shown boxes.
+#
+# Every one of these is a guess with a shelf life. PingFang used to sit in
+# /System/Library/Fonts and does not any more, which is the whole reason
+# fontconfig is asked first.
 FONTS: tuple[str, ...] = (
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -100,11 +104,13 @@ CHOSEN: str | None = None
 def _asked_of_the_system(lang: str) -> list[str]:
     """Candidate font files, ranked, from fontconfig if it is installed.
 
-    A hard-coded list of paths is a guess about somebody else's machine. It
-    was also wrong on this one in both directions: it missed the font the
-    system would have named, and the font the system names first --
-    PingFang -- is one FreeType cannot open, so asking has to be the start
-    of the search rather than the end of it.
+    A hard-coded list of paths is a guess about somebody else's machine, and
+    it was wrong on this one: /System/Library/Fonts/PingFang.ttc does not
+    exist. Apple moved the CJK faces into on-demand assets under
+    /System/Library/AssetsV2, where the file is perfectly ordinary and opens
+    without complaint. Native applications never noticed because Core Text
+    is asked for a font by name and finds it wherever it lives; only
+    something reaching for a path can be wrong about where that is.
     """
 
     try:
