@@ -283,10 +283,20 @@ def follow_subjects(
     paths: dict[str, CropPath] = {}
     with tempfile.TemporaryDirectory() as raw_work:
         work = Path(raw_work)
-        for clip in edl.clips:
+        total = len(edl.clips)
+        for index, clip in enumerate(edl.clips, start=1):
             reframe = clip.reframe
             if reframe is None:
                 continue
+            # This stage is a grounding call and sometimes a SAM propagation
+            # per shot, and the propagation writes a progress bar with
+            # carriage returns that never reaches a log. Minutes could pass
+            # with the last line still being about the music.
+            print(
+                f"  subject {index}/{total}  {clip.clip_id}  "
+                f"{reframe.camera_move}",
+                flush=True,
+            )
             source = sources[clip.source_id]
             move = reframe.camera_move
             card = (

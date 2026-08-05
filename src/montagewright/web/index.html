@@ -345,7 +345,7 @@
 <script>
 
 const $ = (id) => document.getElementById(id);
-let runId = null, seen = 0, timer = null, allLines = [];
+let runId = null, seen = 0, timer = null, ticker = null, allLines = [];
 
 let picking = '', pickTarget = 'path', pickKind = 'video';
 
@@ -699,7 +699,7 @@ $('go').addEventListener('click', async () => {
     $('go').disabled = false; return;
   }
   runId = (await res.json()).run_id;
-  seen = 0; allLines = []; $('log').textContent = '';
+  seen = 0; allLines = []; stepWas = -1; $('log').textContent = '';
   // Whatever is on screen belongs to the last run. Leaving it there while a
   // new one writes cards reads as though the new one already finished.
   for (const id of ['result', 'detail', 'fault']) $(id).classList.add('hide');
@@ -709,6 +709,7 @@ $('go').addEventListener('click', async () => {
   for (const id of ['subs', 'tl-pr', 'tl-fc']) $(id).classList.add('hide');
   $('video').removeAttribute('src');
   timer = setInterval(poll, 1200);
+  ticker = setInterval(() => { if (allLines.length) paintSteps(allLines); }, 1000);
   poll();
 });
 
@@ -718,8 +719,10 @@ $('resume').addEventListener('click', async () => {
   $('resume').classList.add('hide');
   $('fault').classList.add('hide');
   $('state').textContent = '執行中';
-  clearInterval(timer);
+  stepWas = -1;
+  clearInterval(timer); clearInterval(ticker);
   timer = setInterval(poll, 1200);
+  ticker = setInterval(() => { if (allLines.length) paintSteps(allLines); }, 1000);
 });
 
 $('stop').addEventListener('click', async () => {
@@ -740,7 +743,7 @@ const STEPS = [
   ['selection',  '挑鏡頭',     '用哪幾顆、從第幾秒進、多長、什麼運鏡、框住誰',
                  l => /^selection:|^cut on action/.test(l)],
   ['subject',    '找主體與裁切', 'Gemini 指出是哪一個，SAM 逐幀追出在哪裡，算出裁切路徑',
-                 l => /^no music map|frame loading|propagate/.test(l)],
+                 l => /^no music map|^\s*subject \d+\/|frame loading|propagate/.test(l)],
   ['review',     '驗收',       '先逐顆對照它自己的計畫，再看整支',
                  l => /^shots:|^review \d/.test(l)],
   ['replan',     '重新規劃',    '沒做到的那幾顆換個做法，其他不動',
@@ -748,6 +751,13 @@ const STEPS = [
   ['done',       '完成',       '影片、報表、以及你要的時間軸',
                  l => /^deliverable/.test(l)],
 ];
+
+let stepSince = 0, stepWas = -1;
+
+function since(seconds) {
+  if (seconds < 60) return `${seconds | 0} 秒`;
+  return `${(seconds / 60) | 0} 分 ${(seconds % 60) | 0} 秒`;
+}
 
 function paintSteps(lines) {
   let reached = -1;
@@ -766,8 +776,13 @@ function paintSteps(lines) {
     const state = i < reached ? 'done'
       : i === reached ? (running ? 'now' : broke ? 'broke' : 'done')
       : 'todo';
-    const note = notes[key] && state !== 'todo'
+    let note = notes[key] && state !== 'todo'
       ? `<div class="said mono" style="color:var(--dim)">${esc(notes[key])}</div>` : '';
+    if (state === 'now') {
+      if (i !== stepWas) { stepWas = i; stepSince = Date.now(); }
+      note += `<div class="why">已經 ${since((Date.now() - stepSince) / 1000)}`
+        + `——這一步大多在等 Gemini 回應，CPU 沒有動是正常的</div>`;
+    }
     return `<li class="${state}">
       <span class="mark">${state === 'done' ? '✓' : ''}</span>
       <div><div class="name">${name}</div><div class="said">${said}</div>${note}</div>
@@ -814,7 +829,7 @@ function showFault(lines) {
 }
 
 function classify(line) {
-  if (/^\s+card \d+\//.test(line)) return 'faint';
+  if (/^\s+(card|subject|replan) \d*\/?/.test(line)) return 'faint';
   if (/error|Traceback|failed|refused/i.test(line)) return 'bad';
   if (/^(cards|direction|selection|shots|review|replan|cut on action|set aside|no music map)/.test(line)) return 'stage';
   if (/delivered what they planned/.test(line)) return 'good';
@@ -843,7 +858,7 @@ async function poll() {
   }
 
   if (data.state !== 'running') {
-    clearInterval(timer); $('go').disabled = false;
+    clearInterval(timer); clearInterval(ticker); $('go').disabled = false;
     if (data.has_video) {
       $('video').src = `/api/runs/${runId}/video`;
       $('download').href = `/api/runs/${runId}/deliverable`;

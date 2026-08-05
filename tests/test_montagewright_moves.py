@@ -1523,3 +1523,26 @@ def test_earlier_runs_are_grouped_by_the_material() -> None:
     assert all("source_path" in row for row in listed)
     page = PAGE.read_text(encoding="utf-8")
     assert "bySource" in page and "支剪成" in page
+
+
+def test_the_slowest_stage_reports_each_shot() -> None:
+    """A grounding call and sometimes a propagation, per shot.
+
+    SAM writes its progress with carriage returns that never reach a log, so
+    minutes passed with the last visible line still being about the music --
+    and a process at 0% CPU waiting on the network looks exactly like a hung
+    one from the page.
+    """
+
+    import inspect
+
+    from montagewright import pipeline
+    from montagewright.webapp import PAGE
+
+    assert "subject {index}/{total}" in inspect.getsource(
+        pipeline.follow_subjects
+    )
+    page = PAGE.read_text(encoding="utf-8")
+    # How long the current stage has been going, so waiting reads as waiting.
+    assert "stepSince" in page and "已經 ${since(" in page
+    assert "CPU 沒有動是正常的" in page
