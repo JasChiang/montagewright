@@ -6,326 +6,326 @@
 <title>montagewright</title>
 <style>
   :root {
-    --bg: #f7f6f3; --surface: #fff; --sunken: #faf9f7;
-    --ink: #1c1b19; --ink-soft: #55534e; --dim: #8b8880;
-    --line: #e6e3dd; --line-soft: #f0eee9;
-    --accent: #b3452a; --accent-soft: #fdf2ee; --ok: #2c6a4c;
-    --shadow: 0 1px 2px rgba(28,27,25,.04), 0 8px 24px -12px rgba(28,27,25,.10);
+    --bg: #f4f3f0; --panel: #fff; --sunk: #eceae5; --deep: #e2dfd8;
+    --ink: #1a1917; --soft: #56534d; --dim: #8d8a82;
+    --line: #dedbd4; --hair: #eae7e1;
+    --accent: #b3452a; --wash: #fbf0ec; --ok: #2c6a4c;
     --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", sans-serif;
+    --rail: 58px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #131310; --surface: #1b1b17; --sunken: #181814;
-      --ink: #efece4; --ink-soft: #b6b2a8; --dim: #8a867c;
-      --line: #2e2d27; --line-soft: #26251f;
-      --accent: #e08b6e; --accent-soft: #2a1f19; --ok: #7cc09b;
-      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px -14px rgba(0,0,0,.6);
+      --bg: #100f0d; --panel: #191815; --sunk: #131210; --deep: #0d0c0a;
+      --ink: #efece4; --soft: #b4b0a6; --dim: #86827a;
+      --line: #2b2a24; --hair: #221f1b;
+      --accent: #e08b6e; --wash: #271c17; --ok: #7cc09b;
     }
   }
   * { box-sizing: border-box; }
-  html { -webkit-font-smoothing: antialiased; }
-  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.65 var(--sans); }
-  ::selection { background: var(--accent-soft); }
-
-  header {
-    position: sticky; top: 0; z-index: 20;
-    padding: 14px 22px; border-bottom: 1px solid var(--line);
-    background: var(--surface);
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.6 var(--sans); -webkit-font-smoothing: antialiased;
+    overflow: hidden;
   }
-  h1 { margin: 0; font-size: 15.5px; font-weight: 620; letter-spacing: -.01em; }
-  h1 .dot { color: var(--accent); }
-  header .tail { margin-left: auto; display: flex; gap: 10px; align-items: center; }
-  header .why { font-size: 12.5px; }
+  ::selection { background: var(--wash); }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
 
-  main { padding: 18px 22px 60px; max-width: 1500px; margin: 0 auto; }
-  section {
-    background: var(--surface); border: 1px solid var(--line);
-    border-radius: 12px; padding: 22px 24px; margin-bottom: 16px;
-    box-shadow: var(--shadow);
+  .app { display: grid; grid-template-rows: var(--rail) 1fr auto; height: 100%; }
+
+  /* toolbar */
+  .bar {
+    display: flex; align-items: center; gap: 14px; padding: 0 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
   }
-  h2 { margin: 0 0 3px; font-size: 14px; font-weight: 620; }
-  h2 + .sub { margin: 0 0 18px; color: var(--dim); font-size: 12.5px; }
+  .brand { font-size: 14.5px; font-weight: 640; letter-spacing: -.01em; }
+  .brand .dot { color: var(--accent); }
+  .bar .sep { width: 1px; height: 22px; background: var(--line); }
+  .bar .grow { flex: 1; }
+  .crumbs { display: flex; gap: 9px; align-items: baseline; min-width: 0; }
+  .crumbs .what { font-size: 13px; font-weight: 560; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .crumbs .meta { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
 
-  /* the editor: viewer, inspector, strip */
-  .bench { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(300px, 420px); gap: 22px; }
-  @media (max-width: 900px) { .bench { grid-template-columns: 1fr; } }
-  .viewer { display: flex; flex-direction: column; gap: 12px; }
-  video { width: 100%; max-width: 320px; border-radius: 10px; background: #000; box-shadow: var(--shadow); }
-  .stats { display: flex; gap: 26px; flex-wrap: wrap; margin-bottom: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--line-soft); }
-  .stat b { display: block; font-size: 21px; font-weight: 640; letter-spacing: -.02em; line-height: 1.3; }
-  .stat span { font-size: 11.5px; color: var(--dim); }
-  .downloads { display: flex; flex-wrap: wrap; gap: 6px 16px; }
-  a.link { color: var(--ink-soft); font-size: 12.5px; text-decoration: none; display: inline-flex; gap: 5px; }
+  /* middle: viewer + inspector */
+  .stage {
+    display: grid; grid-template-columns: 1fr minmax(320px, 27vw);
+    min-height: 0; background: var(--sunk);
+  }
+  @media (max-width: 940px) { .stage { grid-template-columns: 1fr; } }
+  .screen {
+    display: grid; place-items: center; min-height: 0; min-width: 0;
+    padding: 20px; position: relative; background: var(--deep);
+    overflow: hidden;
+  }
+  /* The take is 16:9 and the cut is 9:16, so whichever is showing has to be
+     the one that fits -- letting the wider one size the box pushed it over
+     the reel. */
+  .frame { position: relative; display: flex; min-width: 0; min-height: 0;
+           max-width: 100%; max-height: 100%; }
+  .screen video {
+    max-width: 100%; max-height: 100%; width: auto; height: auto;
+    border-radius: 6px; background: #000; display: block; object-fit: contain;
+  }
+  .cropbox {
+    position: absolute; border: 1.5px solid var(--accent); border-radius: 2px;
+    box-shadow: 0 0 0 9999px rgba(16,15,13,.55); pointer-events: none;
+  }
+  .cropbox::after {
+    content: attr(data-say); position: absolute; left: 0; top: -19px;
+    font-size: 10px; font-family: var(--mono); color: #fff;
+    background: var(--accent); padding: 1px 5px; border-radius: 3px; white-space: nowrap;
+  }
+  .peek { position: absolute; left: 18px; bottom: 16px; display: flex; gap: 2px; }
+  .peek button { font-size: 11.5px; border-radius: 6px; }
+  .peek button.on { color: var(--ink); background: var(--panel); }
+  .screen .over {
+    position: absolute; left: 18px; top: 16px; display: flex; gap: 18px;
+    font-size: 11.5px; color: var(--dim); pointer-events: none;
+  }
+  .screen .over b { color: var(--soft); font-weight: 600; }
+
+  .side {
+    background: var(--panel); border-left: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .side .head {
+    padding: 13px 16px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  }
+  .side .head .who { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .side .body { overflow: auto; padding: 4px 16px 18px; flex: 1; min-height: 0; }
+  .side:empty::after { content: ''; }
+
+  dl.facts { margin: 0; }
+  dl.facts dt {
+    font-size: 10.5px; color: var(--dim); letter-spacing: .04em;
+    text-transform: uppercase; margin-top: 15px;
+  }
+  dl.facts dd { margin: 3px 0 0; font-size: 13px; }
+  dl.facts dd.why, .why { color: var(--soft); font-size: 12.5px; line-height: 1.6; }
+  .nothing { color: var(--dim); font-size: 12.5px; padding: 22px 0; }
+
+  /* reel */
+  .reelwrap { background: var(--panel); border-top: 1px solid var(--line); }
+  .reelbar {
+    display: flex; align-items: center; gap: 12px; padding: 8px 16px;
+    border-bottom: 1px solid var(--hair); font-size: 12px; color: var(--dim);
+  }
+  .reelbar .grow { flex: 1; }
+  .zoom { display: flex; align-items: center; gap: 7px; }
+  .zoom input[type=range] { width: 110px; accent-color: var(--accent); }
+  .vol { display: flex; align-items: center; gap: 7px; }
+  .vol input[type=range] { width: 78px; accent-color: var(--accent); }
+  .scroller { overflow-x: auto; overflow-y: hidden; }
+  .reel { position: relative; min-width: 100%; }
+  .ruler {
+    position: relative; height: 20px; background: var(--sunk);
+    border-bottom: 1px solid var(--line); font-family: var(--mono);
+    font-size: 9.5px; color: var(--dim);
+  }
+  .ruler span { position: absolute; top: 4px; transform: translateX(3px); }
+  .ruler i { position: absolute; top: 10px; bottom: 0; width: 1px; background: var(--line); }
+  .track { position: relative; height: 54px; background: var(--sunk); border-bottom: 1px solid var(--hair); }
+  .blk {
+    position: absolute; top: 3px; bottom: 3px; overflow: hidden; cursor: pointer;
+    background: var(--panel); border: 1px solid var(--line);
+    border-left: 2px solid color-mix(in srgb, var(--ok) 60%, transparent);
+    border-radius: 4px; padding: 5px 7px; transition: background .1s;
+  }
+  .blk.no { border-left-color: var(--accent); background: var(--wash); }
+  .blk:hover { background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+  .blk.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .blk .lab { font-size: 10.5px; color: var(--soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+  .blk .dur { font-family: var(--mono); font-size: 9.5px; color: var(--dim); }
+  .blk .grip { position: absolute; top: 0; bottom: 0; width: 8px; cursor: ew-resize; }
+  .blk .grip.l { left: -1px } .blk .grip.r { right: -1px }
+  .blk .grip:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .blk .kill {
+    position: absolute; top: 3px; right: 3px; width: 14px; height: 14px;
+    border-radius: 3px; display: none; place-items: center; font-size: 10px;
+    background: var(--panel); color: var(--accent); border: 1px solid var(--line);
+  }
+  .blk:hover .kill { display: grid; }
+  .lane { position: relative; height: 34px; background: var(--sunk); border-bottom: 1px solid var(--hair); }
+  .lane:last-of-type { border-bottom: 0; }
+  .lane .name {
+    position: absolute; left: 7px; top: 2px; z-index: 3; font-size: 9.5px;
+    color: var(--dim); background: var(--sunk); padding: 0 4px; border-radius: 3px;
+    pointer-events: none;
+  }
+  .lane img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .5; }
+  .lane.silent { display: grid; place-items: center; font-size: 10.5px; color: var(--dim); }
+  .playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--accent); z-index: 6; cursor: ew-resize; }
+  .playhead::before {
+    content: ''; position: absolute; top: 0; left: -4px; width: 9px; height: 9px;
+    background: var(--accent); clip-path: polygon(0 0, 100% 0, 50% 100%);
+  }
+  .playhead::after { content: ''; position: absolute; top: 0; bottom: 0; left: -5px; width: 11px; }
+
+  /* tabs drawer */
+  .drawer { background: var(--panel); border-top: 1px solid var(--line); }
+  .tabs { display: flex; gap: 2px; padding: 0 12px; align-items: stretch; }
+  .tab {
+    padding: 9px 13px; border: 0; background: transparent; cursor: pointer;
+    font: inherit; font-size: 12.5px; color: var(--dim);
+    border-bottom: 2px solid transparent;
+  }
+  .tab:hover { color: var(--soft); }
+  .tab.on { color: var(--ink); font-weight: 580; border-bottom-color: var(--accent); }
+  .tabs .grow { flex: 1; }
+  .panes { max-height: 40vh; overflow: auto; border-top: 1px solid var(--hair); }
+  .panes.shut { display: none; }
+  .pane { padding: 16px 18px 22px; }
+  .pane .sub { margin: 0 0 14px; color: var(--dim); font-size: 12.5px; }
+
+  /* modal */
+  .veil {
+    position: fixed; inset: 0; background: rgba(20,19,17,.4);
+    display: grid; place-items: center; z-index: 40; padding: 22px;
+    backdrop-filter: blur(2px);
+  }
+  .sheet {
+    background: var(--panel); border-radius: 14px; width: min(880px, 100%);
+    max-height: 90vh; overflow: auto; padding: 26px 28px;
+    box-shadow: 0 24px 60px -20px rgba(0,0,0,.4);
+  }
+  .sheet h2 { margin: 0 0 3px; font-size: 15px; }
+  .sheet .sub { margin: 0 0 20px; color: var(--dim); font-size: 12.5px; }
+
+  /* forms & bits */
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 15px 16px; }
+  .field.wide { grid-column: 1 / -1; }
+  label { display: block; font-size: 12px; font-weight: 550; color: var(--soft); margin-bottom: 6px; }
+  input[type=text], input[type=number], input[type=file], select, textarea {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--sunk); color: var(--ink); font: inherit; font-size: 13.5px;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); background: var(--panel); }
+  textarea { min-height: 78px; resize: vertical; }
+  button {
+    padding: 8px 15px; border: 1px solid transparent; border-radius: 7px; cursor: pointer;
+    background: var(--accent); color: #fff; font: inherit; font-size: 13px; font-weight: 570;
+  }
+  button:hover { filter: brightness(1.08); }
+  button.ghost { background: transparent; color: var(--soft); border-color: var(--line); }
+  button.ghost:hover { background: var(--sunk); filter: none; }
+  button.bare { background: transparent; color: var(--dim); border: 0; padding: 5px 8px; }
+  button.bare:hover { color: var(--ink); filter: none; }
+  button:disabled { opacity: .4; cursor: not-allowed; filter: none; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .actions { display: flex; gap: 13px; align-items: center; flex-wrap: wrap; margin-top: 20px; padding-top: 17px; border-top: 1px solid var(--hair); }
+  .check { display: inline-flex; gap: 7px; align-items: center; font-size: 13px; color: var(--soft); cursor: pointer; margin: 0; }
+  .check input { width: auto; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .hint a { color: var(--soft); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 550; border: 1px solid var(--line); color: var(--dim); white-space: nowrap; }
+  .tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+  .tag.no { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 0 10px 7px; font-size: 10.5px; color: var(--dim); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; border-bottom: 1px solid var(--line); }
+  td { padding: 9px 10px; vertical-align: top; border-bottom: 1px solid var(--hair); }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover, table tr:hover { background: var(--sunk); }
+  td.mono, .mono { font-family: var(--mono); font-size: 11.5px; }
+  .scroll { overflow-x: auto; }
+  .hide { display: none !important; }
+  a.link { color: var(--soft); font-size: 12.5px; text-decoration: none; display: inline-flex; gap: 5px; }
   a.link::before { content: '↓'; color: var(--dim); }
   a.link:hover { color: var(--accent); }
+  a.shot { color: var(--soft); text-decoration: none; border-bottom: 1px solid var(--line); cursor: pointer; }
+  a.shot:hover { color: var(--accent); }
 
-  .inspector {
-    background: var(--sunken); border: 1px solid var(--line);
-    border-radius: 10px; padding: 16px 18px; font-size: 13.5px;
-    align-self: start; max-height: 460px; overflow: auto;
-  }
-  .inspector:empty::after { content: '點時間軸上的一顆看它的來歷'; color: var(--dim); font-size: 13px; }
-  .ins-head { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
-  .ins-head .mono { font-size: 12.5px; word-break: break-all; }
-  .inspector dl { margin: 14px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 9px 14px; }
-  .inspector dt { font-size: 11.5px; color: var(--dim); white-space: nowrap; padding-top: 2px; }
-  .inspector dd { margin: 0; }
-
-  /* strip */
-  .strip { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line-soft); }
-  .reel { position: relative; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--sunken); }
-  .ruler {
-    position: relative; height: 20px; border-bottom: 1px solid var(--line);
-    background: var(--surface); font-family: var(--mono); font-size: 9.5px; color: var(--dim);
-  }
-  .ruler span { position: absolute; top: 4px; transform: translateX(2px); }
-  .ruler i { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); }
-  .lane { position: relative; height: 40px; border-bottom: 1px solid var(--line-soft); }
-  .lane:last-child { border-bottom: 0; }
-  .lane .name {
-    position: absolute; left: 6px; top: 3px; z-index: 3;
-    font-size: 9.5px; color: var(--dim); background: var(--sunken);
-    padding: 0 4px; border-radius: 3px; pointer-events: none;
-  }
-  .lane img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .55; }
-  .lane.silent { display: grid; place-items: center; font-size: 11px; color: var(--dim); }
-  .playhead {
-    position: absolute; top: 0; bottom: 0; width: 1px; background: var(--accent);
-    pointer-events: none; z-index: 5;
-  }
-  .playhead::before {
-    content: ''; position: absolute; top: 0; left: -3px;
-    border-left: 3.5px solid transparent; border-right: 3.5px solid transparent;
-    border-top: 5px solid var(--accent);
-  }
-  .track {
-    position: relative; display: flex; gap: 2px; height: 52px; user-select: none;
-    overflow: hidden; background: var(--sunken);
-    border-bottom: 1px solid var(--line-soft);
-  }
-  .blk {
-    position: relative; min-width: 14px; cursor: pointer; padding: 7px 8px; overflow: hidden;
-    background: color-mix(in srgb, var(--ok) 13%, var(--surface));
-    border-left: 2px solid color-mix(in srgb, var(--ok) 55%, transparent);
-    transition: background .12s;
-  }
-  .blk.no { background: var(--accent-soft); border-left-color: color-mix(in srgb, var(--accent) 55%, transparent); }
-  .blk:hover { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
-  .blk.on { outline: 2px solid var(--accent); outline-offset: -2px; }
-  .blk .lab { font-size: 10.5px; color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-  .blk .dur { font-family: var(--mono); font-size: 10px; color: var(--dim); }
-  .blk .grip { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; }
-  .blk .grip.l { left: 0 } .blk .grip.r { right: 0 }
-  .blk .grip:hover { background: color-mix(in srgb, var(--accent) 40%, transparent); }
-  .blk .kill { position: absolute; top: 4px; right: 4px; width: 15px; height: 15px; border-radius: 4px; display: none; place-items: center; font-size: 11px; background: var(--surface); color: var(--accent); border: 1px solid var(--line); }
-  .blk:hover .kill { display: grid; }
-  .strip .legend { display: flex; gap: 14px; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 12.5px; color: var(--dim); }
-
-  /* tabs */
-  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
-  .tab {
-    padding: 9px 14px; border: 0; background: transparent; cursor: pointer;
-    font: inherit; font-size: 13.5px; color: var(--dim); border-radius: 8px 8px 0 0;
-    border-bottom: 2px solid transparent; margin-bottom: -1px;
-  }
-  .tab:hover { color: var(--ink-soft); background: var(--sunken); filter: none; }
-  .tab.on { color: var(--ink); font-weight: 580; border-bottom-color: var(--accent); }
-
-  /* forms */
-  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px 18px; }
-  .field.wide { grid-column: 1 / -1; }
-  label { display: block; font-size: 12.5px; font-weight: 550; color: var(--ink-soft); margin-bottom: 6px; }
-  input[type=text], input[type=number], input[type=file], select, textarea {
-    width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
-    background: var(--sunken); color: var(--ink); font: inherit; font-size: 14px;
-  }
-  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); background: var(--surface); }
-  textarea { min-height: 84px; resize: vertical; }
-  button {
-    padding: 9px 16px; border: 1px solid transparent; border-radius: 8px; cursor: pointer;
-    background: var(--accent); color: #fff; font: inherit; font-size: 13.5px; font-weight: 580;
-  }
-  button:hover { filter: brightness(1.07); }
-  button.ghost { background: transparent; color: var(--ink-soft); border-color: var(--line); }
-  button.ghost:hover { background: var(--sunken); filter: none; }
-  button:disabled { opacity: .4; cursor: not-allowed; }
-  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  .actions { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line-soft); }
-  .check { display: inline-flex; gap: 8px; align-items: center; font-size: 13.5px; color: var(--ink-soft); cursor: pointer; margin: 0; }
-  .check input { width: auto; }
-  .hint { color: var(--dim); font-size: 12.5px; margin-top: 7px; }
-  .hint a { color: var(--ink-soft); }
-
-  /* picker */
-  .picker { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--sunken); overflow: hidden; }
-  .picker .crumb { padding: 10px 13px; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 12px; color: var(--dim); background: var(--surface); overflow-x: auto; white-space: nowrap; }
-  .picker .listing { max-height: 240px; overflow: auto; padding: 6px; }
-  .pick { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 13.5px; }
-  .pick:hover { background: var(--accent-soft); }
+  /* picker, progress, fault — unchanged in kind */
+  .picker { margin-top: 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--sunk); overflow: hidden; }
+  .picker .crumb { padding: 9px 12px; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; color: var(--dim); background: var(--panel); overflow-x: auto; white-space: nowrap; }
+  .picker .listing { max-height: 230px; overflow: auto; padding: 5px; }
+  .pick { display: flex; align-items: center; gap: 9px; padding: 6px 9px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .pick:hover { background: var(--wash); }
   .pick .ico { color: var(--dim); flex: none; width: 14px; }
-  .pick .count { margin-left: auto; color: var(--dim); font-size: 12px; }
-  .pick.file { cursor: default; color: var(--ink-soft); }
+  .pick .count { margin-left: auto; color: var(--dim); font-size: 11.5px; }
+  .pick.file { cursor: default; color: var(--soft); }
   .pick.file:hover { background: transparent; }
-  .picker .foot { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 11px 13px; border-top: 1px solid var(--line); background: var(--surface); }
-
-  /* progress */
-  #log { font-family: var(--mono); font-size: 12px; line-height: 1.85; background: var(--sunken); border: 1px solid var(--line); border-radius: 9px; padding: 14px 16px; max-height: 300px; overflow: auto; white-space: pre-wrap; color: var(--ink-soft); }
+  .picker .foot { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border-top: 1px solid var(--line); background: var(--panel); }
+  #log { font-family: var(--mono); font-size: 11.5px; line-height: 1.8; background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 13px 15px; max-height: 260px; overflow: auto; white-space: pre-wrap; color: var(--soft); }
   #log .stage { color: var(--ink); font-weight: 600; }
   #log .bad { color: var(--accent); }
   #log .good { color: var(--ok); font-weight: 600; }
   #log .faint { color: var(--dim); }
-  .state { font-size: 14px; font-weight: 600; display: flex; gap: 9px; align-items: center; }
-  .state::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+  .state { font-size: 13.5px; font-weight: 600; display: flex; gap: 8px; align-items: center; }
+  .state::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
   .state.done::before { background: var(--ok); }
-  .steps { list-style: none; margin: 0 0 16px; padding: 0; }
-  .steps li { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+  .steps { list-style: none; margin: 0 0 14px; padding: 0; }
+  .steps li { display: flex; gap: 11px; padding: 9px 0; border-bottom: 1px solid var(--hair); }
   .steps li:last-child { border-bottom: 0; }
-  .steps .mark { flex: none; width: 17px; height: 17px; margin-top: 2px; border-radius: 50%; border: 1.5px solid var(--line); display: grid; place-items: center; font-size: 10px; color: var(--dim); }
+  .steps .mark { flex: none; width: 16px; height: 16px; margin-top: 2px; border-radius: 50%; border: 1.5px solid var(--line); display: grid; place-items: center; font-size: 9.5px; color: var(--dim); }
   .steps li.done .mark { border-color: var(--ok); color: var(--ok); }
-  .steps li.now .mark { border-color: var(--accent); color: var(--accent); }
-  .steps li.broke .mark { border-color: var(--accent); color: var(--accent); }
+  .steps li.now .mark, .steps li.broke .mark { border-color: var(--accent); color: var(--accent); }
   .steps li.broke .name { color: var(--accent); }
-  .steps li.now .mark::after { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+  .steps li.now .mark::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
-  .steps .name { font-weight: 560; font-size: 13.5px; }
-  .steps li.todo .name { color: var(--dim); font-weight: 480; }
-  .steps .said { color: var(--ink-soft); font-size: 12.5px; margin-top: 2px; }
+  .steps .name { font-weight: 560; font-size: 13px; }
+  .steps li.todo .name { color: var(--dim); font-weight: 470; }
+  .steps .said { color: var(--soft); font-size: 12px; margin-top: 2px; }
   .steps li.todo .said { color: var(--dim); }
-  details#raw summary { cursor: pointer; font-size: 12.5px; margin-bottom: 10px; list-style: none; }
+  details#raw summary { cursor: pointer; font-size: 12px; margin-bottom: 9px; list-style: none; }
   details#raw summary::before { content: '▸ '; }
   details#raw[open] summary::before { content: '▾ '; }
-  .fault { margin: 0 0 16px; padding: 13px 15px; border-radius: 9px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); font-size: 13.5px; }
+  .fault { margin: 0 0 15px; padding: 12px 14px; border-radius: 8px; background: var(--wash); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); font-size: 13px; }
   .fault b { display: block; margin-bottom: 4px; }
-  .fault .detail { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
+  .fault .detail { font-family: var(--mono); font-size: 11.5px; color: var(--soft); }
   .fault a { color: var(--accent); }
-
-  /* tables */
-  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-  th { text-align: left; padding: 0 11px 8px; font-size: 11px; color: var(--dim); font-weight: 600; letter-spacing: .03em; text-transform: uppercase; border-bottom: 1px solid var(--line); }
-  td { text-align: left; padding: 10px 11px; vertical-align: top; border-bottom: 1px solid var(--line-soft); }
-  tr:last-child td { border-bottom: 0; }
-  table tr:hover { background: var(--sunken); }
-  td.mono, .mono { font-family: var(--mono); font-size: 12px; }
-  td.num { white-space: nowrap; color: var(--ink-soft); }
-  .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 550; border: 1px solid var(--line); color: var(--dim); white-space: nowrap; }
-  .tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
-  .tag.no { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
-  .why { color: var(--dim); font-size: 12.5px; line-height: 1.55; }
-  .scroll { overflow-x: auto; }
-  .hide { display: none !important; }
-  a.shot { color: var(--ink-soft); text-decoration: none; border-bottom: 1px solid var(--line); }
-  a.shot:hover { color: var(--accent); border-color: currentColor; }
 </style>
 </head>
 <body>
-<header>
-  <h1>montagewright<span class="dot">.</span></h1>
-  <span class="why" id="picked"></span>
-  <span class="tail">
-    <button class="ghost" id="new-run">新的一輪</button>
-  </span>
-</header>
+<div class="app">
 
-<main>
-  <section id="setup">
-    <div class="fields">
-      <div class="field wide">
-        <label>素材</label>
-        <div class="row" style="gap:8px;flex-wrap:nowrap">
-          <input type="text" id="path" placeholder="點「瀏覽」選一個資料夾，或直接貼路徑">
-          <button type="button" class="ghost" id="browse" style="white-space:nowrap">瀏覽…</button>
-        </div>
-        <div class="picker hide" id="picker">
-          <div class="crumb" id="crumb"></div>
-          <div class="listing" id="listing"></div>
-          <div class="foot">
-            <button type="button" id="use-here">用這個資料夾</button>
-            <button type="button" class="ghost" id="close-picker">關閉</button>
-            <span class="why" id="picker-note"></span>
-          </div>
-        </div>
-        <div class="hint">
-          本機素材用路徑就好——上傳等於把硬碟上的檔案搬進瀏覽器再寫回去。
-          <a href="#" id="show-upload">還是要用上傳</a>
-        </div>
-      </div>
-      <div class="field wide hide" id="upload-row">
-        <label>上傳素材資料夾</label>
-        <input type="file" id="rushes" webkitdirectory directory multiple>
-      </div>
-      <div class="field">
-        <label>音樂</label>
-        <div class="row" style="gap:8px;flex-wrap:nowrap">
-          <input type="text" id="music-path" placeholder="留空＝不配樂">
-          <button type="button" class="ghost" id="browse-music" style="white-space:nowrap">瀏覽…</button>
-        </div>
-      </div>
-      <div class="field">
-        <label>輸出比例</label>
-        <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select>
-      </div>
-      <div class="field">
-        <label>語音</label>
-        <select id="speech"><option value="auto">自動判斷</option><option value="never">不要轉錄</option></select>
-      </div>
-      <div class="field">
-        <label>語言</label>
-        <input type="text" id="locale" value="zh-TW">
-      </div>
-      <div class="field">
-        <label>可編輯時間軸</label>
-        <select id="timeline">
-          <option value="none">不需要</option>
-          <option value="premiere">Premiere／Resolve</option>
-          <option value="finalcut">Final Cut</option>
-          <option value="both">兩種都要</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>預算上限（美元）</label>
-        <input type="number" id="budget" value="6" min="0.5" step="0.5">
-      </div>
-      <div class="field wide">
-        <label>Brief（可留空）</label>
-        <textarea id="brief" placeholder="這支片要傳達什麼、給誰看、非講不可的是什麼"></textarea>
-      </div>
-    </div>
-    <div class="actions">
-      <button id="go">開始剪</button>
-      <label class="check"><input type="checkbox" id="review" checked> 開啟自審與重新規劃</label>
-    </div>
-  </section>
+  <div class="bar">
+    <span class="brand">montagewright<span class="dot">.</span></span>
+    <span class="sep"></span>
+    <span class="crumbs">
+      <span class="what" id="crumb-what">還沒有打開任何一輪</span>
+      <span class="meta" id="crumb-meta"></span>
+    </span>
+    <span class="grow"></span>
+    <span id="picked" class="meta"></span>
+    <button class="ghost" id="open-past">先前的剪輯</button>
+    <button id="new-run">新的一輪</button>
+  </div>
 
-  <section class="hide" id="progress">
-    <div class="row" style="justify-content:space-between;margin-bottom:14px">
-      <span class="state" id="state">執行中</span>
-      <span class="row" style="gap:8px">
-        <button id="resume" class="hide">繼續跑</button>
-        <button class="ghost" id="stop">停止</button>
-      </span>
-    </div>
-    <div class="fault hide" id="fault"></div>
-    <ol class="steps" id="steps"></ol>
-    <details id="raw"><summary class="why">原始輸出</summary><div id="log"></div></details>
-  </section>
-
-  <section class="hide" id="result">
-    <div class="stats" id="stats"></div>
-    <div class="bench">
-      <div class="viewer">
-        <video id="video" controls playsinline></video>
-        <div class="downloads">
-          <a id="download" class="link" download>完整畫質</a>
-          <a id="subs" class="link hide" download>字幕 SRT</a>
-          <a id="tl-pr" class="link hide" download>Premiere XML</a>
-          <a id="tl-fc" class="link hide" download>Final Cut XML</a>
-        </div>
+  <div class="stage">
+    <div class="screen">
+      <div class="over" id="over"></div>
+      <div class="frame" id="frame">
+        <video id="video" playsinline></video>
+        <video id="raw-video" playsinline controls preload="metadata" class="hide"></video>
+        <div class="cropbox hide" id="cropbox"></div>
       </div>
-      <div class="inspector" id="inspector"></div>
+      <div class="peek">
+        <button class="bare on" id="see-cut">成片</button>
+        <button class="bare" id="see-raw">原素材＋裁切框</button>
+      </div>
     </div>
-    <div class="strip hide" id="strip">
+    <aside class="side">
+      <div class="head" id="ins-head"><span class="who">這一顆</span></div>
+      <div class="body" id="inspector"></div>
+    </aside>
+  </div>
+
+  <div class="reelwrap">
+    <div class="reelbar">
+      <button class="bare" id="play">▶︎</button>
+      <span class="mono" id="clock">0:00 / 0:00</span>
+      <span class="vol">音量 <input type="range" id="vol" min="0" max="1" step="0.05" value="1"></span>
+      <span class="grow" id="strip-note">拖邊緣改進出點，拖方塊換順序，× 刪掉</span>
+      <span class="zoom">縮放 <input type="range" id="zoom" min="6" max="120" step="1" value="24"></span>
+      <button class="ghost" id="fit">符合寬度</button>
+      <button class="ghost" id="undo-cut">還原</button>
+      <button id="recut" class="hide">重新輸出</button>
+    </div>
+    <div class="scroller" id="scroller">
       <div class="reel" id="reel">
         <div class="ruler" id="ruler"></div>
         <div class="track" id="track"></div>
@@ -333,48 +333,127 @@
         <div class="lane" id="lane-music"><span class="name">音樂</span></div>
         <div class="playhead" id="playhead" style="left:0"></div>
       </div>
-      <div class="legend">
-        <span id="strip-note">拖邊緣改進出點，拖方塊換順序，× 刪掉</span>
-        <span class="row" style="gap:8px">
-          <button type="button" class="ghost" id="undo-cut" style="padding:5px 11px;font-size:12.5px">還原</button>
-          <button type="button" id="recut" class="hide" style="padding:5px 13px;font-size:12.5px">重新輸出</button>
-        </span>
-      </div>
     </div>
-  </section>
+  </div>
 
-  <section class="hide" id="detail">
+  <div class="drawer">
     <div class="tabs">
       <button class="tab on" data-pane="pane-shots">全部鏡頭</button>
       <button class="tab" data-pane="pane-tx">聽到了什麼</button>
       <button class="tab" data-pane="pane-spend">花費</button>
       <button class="tab" data-pane="pane-aside">沒用的素材</button>
       <button class="tab" data-pane="pane-past">先前的剪輯</button>
+      <span class="grow"></span>
+      <button class="bare" id="fold">收起</button>
     </div>
-    <div class="pane" id="pane-shots">
-      <p class="sub">點檔名可以單獨看那一顆——構圖問題在成片裡會被下一顆蓋過去。</p>
-      <div class="scroll"><table id="shot-table"></table></div>
+    <div class="panes" id="panes">
+      <div class="pane" id="pane-shots">
+        <p class="sub">點一列會選到時間軸上那一顆；點檔名單獨看它。</p>
+        <div class="scroll"><table id="shot-table"></table></div>
+      </div>
+      <div class="pane hide" id="pane-tx">
+        <p class="sub">辨識器聽的、Gemini 改的、誰講的。轉錯的地方會讓後面每個決定都跟著錯。</p>
+        <div class="scroll"><table id="tx-table"></table></div>
+      </div>
+      <div class="pane hide" id="pane-spend">
+        <div class="scroll" style="max-width:520px"><table id="spend"></table></div>
+      </div>
+      <div class="pane hide" id="pane-aside">
+        <p class="sub">沒有進到成片的素材，以及是在哪一步被放下的。</p>
+        <div class="scroll"><table id="aside-table"></table></div>
+      </div>
+      <div class="pane hide" id="pane-past">
+        <p class="sub">照素材分組。點開可以跟這一輪比較。</p>
+        <div class="scroll"><table id="past-table"></table></div>
+      </div>
     </div>
-    <div class="pane hide" id="pane-tx">
-      <p class="sub">辨識器聽的、Gemini 改的、誰講的。轉錯的地方會讓後面每個決定都跟著錯。</p>
-      <div class="scroll"><table id="tx-table"></table></div>
-    </div>
-    <div class="pane hide" id="pane-spend">
-      <div class="scroll" style="max-width:560px"><table id="spend"></table></div>
-    </div>
-    <div class="pane hide" id="pane-aside">
-      <p class="sub">卡片判定不能用的，以及它給的理由。</p>
-      <div class="scroll"><table id="aside-table"></table></div>
-    </div>
-    <div class="pane hide" id="pane-past">
-      <p class="sub">點開可以跟這一輪比較。重開服務也還在。</p>
-      <div class="scroll"><table id="past-table"></table></div>
-    </div>
-  </section>
+  </div>
+</div>
 
-</main>
+<div class="veil hide" id="veil">
+  <div class="sheet" id="sheet">
+    <div id="setup">
+      <h2>新的一輪</h2>
+      <p class="sub">指到素材，其餘留空也能跑。</p>
+      <div class="fields">
+        <div class="field wide">
+          <label>素材</label>
+          <div class="row" style="gap:8px;flex-wrap:nowrap">
+            <input type="text" id="path" placeholder="點「瀏覽」選一個資料夾，或直接貼路徑">
+            <button type="button" class="ghost" id="browse" style="white-space:nowrap">瀏覽…</button>
+          </div>
+          <div class="picker hide" id="picker">
+            <div class="crumb" id="crumb"></div>
+            <div class="listing" id="listing"></div>
+            <div class="foot">
+              <button type="button" id="use-here">用這個資料夾</button>
+              <button type="button" class="ghost" id="close-picker">關閉</button>
+              <span class="why" id="picker-note"></span>
+            </div>
+          </div>
+          <div class="hint">本機素材用路徑就好——上傳等於把硬碟上的檔案搬進瀏覽器再寫回去。
+            <a href="#" id="show-upload">還是要用上傳</a></div>
+        </div>
+        <div class="field wide hide" id="upload-row">
+          <label>上傳素材資料夾</label>
+          <input type="file" id="rushes" webkitdirectory directory multiple>
+        </div>
+        <div class="field">
+          <label>音樂</label>
+          <div class="row" style="gap:8px;flex-wrap:nowrap">
+            <input type="text" id="music-path" placeholder="留空＝不配樂">
+            <button type="button" class="ghost" id="browse-music" style="white-space:nowrap">瀏覽…</button>
+          </div>
+        </div>
+        <div class="field"><label>輸出比例</label>
+          <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select></div>
+        <div class="field"><label>語音</label>
+          <select id="speech"><option value="auto">自動判斷</option><option value="never">不要轉錄</option></select></div>
+        <div class="field"><label>語言</label><input type="text" id="locale" value="zh-TW"></div>
+        <div class="field"><label>可編輯時間軸</label>
+          <select id="timeline">
+            <option value="none">事後再產也行</option>
+            <option value="premiere">Premiere／Resolve</option>
+            <option value="finalcut">Final Cut</option>
+            <option value="both">兩種都要</option>
+          </select></div>
+        <div class="field"><label>預算上限（美元）</label>
+          <input type="number" id="budget" value="6" min="0.5" step="0.5"></div>
+        <div class="field wide"><label>Brief（可留空）</label>
+          <textarea id="brief" placeholder="這支片要傳達什麼、給誰看、非講不可的是什麼"></textarea></div>
+      </div>
+      <div class="actions">
+        <button id="go">開始剪</button>
+        <label class="check"><input type="checkbox" id="review" checked> 開啟自審與重新規劃</label>
+        <span class="grow"></span>
+        <button class="ghost" id="close-sheet">關閉</button>
+      </div>
+    </div>
+
+    <div id="progress" class="hide" style="margin-top:26px">
+      <div class="row" style="justify-content:space-between;margin-bottom:13px">
+        <span class="state" id="state">執行中</span>
+        <span class="row" style="gap:8px">
+          <button id="resume" class="hide">繼續跑</button>
+          <button class="ghost" id="stop">停止</button>
+        </span>
+      </div>
+      <div class="fault hide" id="fault"></div>
+      <ol class="steps" id="steps"></ol>
+      <details id="raw"><summary class="why">原始輸出</summary><div id="log"></div></details>
+    </div>
+  </div>
+</div>
+
+<div class="hide" id="result"></div>
+<div class="hide" id="detail"></div>
+<div class="hide" id="strip"></div>
+<a class="hide" id="download"></a><a class="hide" id="subs"></a>
+<a class="hide" id="tl-pr"></a><a class="hide" id="tl-fc"></a>
+<div class="hide" id="stats"></div>
 
 <script>
+
 
 const $ = (id) => document.getElementById(id);
 let runId = null, seen = 0, timer = null, ticker = null, allLines = [];
@@ -567,24 +646,40 @@ async function showStrip() {
   };
 }
 
+// Pixels per second. Everything on the reel is positioned from this, so the
+// tracks line up with each other and with the clock -- a strip laid out by
+// proportion cannot.
+let scale = 24;
+
+function reelSeconds() {
+  return blocks.reduce((a, b) => a + b.seconds, 0) || 1;
+}
+
+function fitScale() {
+  const room = ($('scroller').clientWidth || 900) - 2;
+  scale = Math.max(4, room / reelSeconds());
+  $('zoom').value = Math.min(120, Math.max(6, scale));
+}
+
+function clock(seconds) {
+  const m = (seconds / 60) | 0, s = seconds % 60;
+  return `${m}:${String(s | 0).padStart(2, '0')}`;
+}
+
 function paintRuler(total) {
-  // A tick every few seconds, chosen so the labels do not collide at
-  // whatever width the panel happens to be.
-  const px = $('reel').offsetWidth || 900;
-  const step = [1, 2, 5, 10, 15, 30, 60].find(n => total / n <= px / 56) || 60;
+  const step = [0.5, 1, 2, 5, 10, 15, 30, 60].find(n => n * scale >= 58) || 60;
   const marks = [];
-  for (let at = 0; at <= total; at += step) {
-    const left = (at / total) * 100;
-    marks.push(`<i style="left:${left}%"></i>`
-      + `<span style="left:${left}%">${
-        at >= 60 ? `${(at / 60) | 0}:${String((at % 60) | 0).padStart(2, '0')}`
-                 : `${at | 0}s`}</span>`);
+  for (let at = 0; at <= total + 0.001; at += step) {
+    marks.push(`<i style="left:${at * scale}px"></i>`
+      + `<span style="left:${at * scale}px">${
+        at >= 60 ? clock(at) : `${+at.toFixed(1)}s`}</span>`);
   }
   $('ruler').innerHTML = marks.join('');
+  $('reel').style.width = `${total * scale}px`;
 }
 
 function paintWaves(total) {
-  const width = Math.max(600, Math.round(($('reel').offsetWidth || 900) * 2));
+  const width = Math.max(600, Math.min(6000, Math.round(total * scale * 2)));
   for (const which of ['voice', 'music']) {
     const lane = $(`lane-${which}`);
     const img = new Image();
@@ -602,24 +697,29 @@ function paintWaves(total) {
 }
 
 function paintStrip() {
-  const total = blocks.reduce((a, b) => a + b.seconds, 0) || 1;
+  const total = reelSeconds();
   paintRuler(total);
-  $('track').innerHTML = blocks.map((b, i) => `
+  let at = 0;
+  $('track').innerHTML = blocks.map((b, i) => {
+    const left = at * scale; at += b.seconds;
+    return `
     <div class="blk ${b.delivered === false ? 'no' : ''} ${i === picked ? 'on' : ''}"
-         style="flex:${b.seconds} 0 0" data-i="${i}" draggable="true"
+         style="left:${left}px;width:${b.seconds * scale - 2}px" data-i="${i}" draggable="true"
          title="${esc(b.source_id)}　${esc(b.subject)}">
       <div class="grip l" data-edge="l" data-i="${i}"></div>
       <div class="lab">${esc(b.source_id)}</div>
       <div class="dur">${b.seconds.toFixed(1)}s</div>
       <div class="kill" data-kill="${i}">×</div>
       <div class="grip r" data-edge="r" data-i="${i}"></div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   wireStrip();
   const changed = JSON.stringify(blocks) !== JSON.stringify(blocksWere);
   $('recut').classList.toggle('hide', !changed);
   $('strip-note').textContent = changed
     ? `${blocks.length} 顆，共 ${total.toFixed(1)}s——按「重新輸出」套用（不用錢）`
     : '拖邊緣改進出點，拖方塊換順序，× 刪掉';
+  movePlayhead();
 }
 
 function wireStrip() {
@@ -629,6 +729,7 @@ function wireStrip() {
     el.onclick = (e) => {
       if (e.target.dataset.kill !== undefined || e.target.classList.contains('grip')) return;
       picked = i; paintStrip(); inspect(i);
+      if (peeking) peek(true);
       const at = blocks.slice(0, i).reduce((a, b) => a + b.seconds, 0);
       $('video').currentTime = at + 0.05;
     };
@@ -654,7 +755,7 @@ function wireStrip() {
       const i = +grip.dataset.i, edge = grip.dataset.edge;
       const b = blocks[i], startX = e.clientX;
       const was = { in: b.in_seconds, sec: b.seconds };
-      const perPx = (blocks.reduce((a, x) => a + x.seconds, 0)) / $('track').offsetWidth;
+      const perPx = 1 / scale;
       const move = (ev) => {
         const d = (ev.clientX - startX) * perPx;
         if (edge === 'l') {
@@ -711,7 +812,10 @@ document.addEventListener('DOMContentLoaded', () => {
       if ($('video').currentTime >= at) now = i;
       at += b.seconds;
     });
-    if (now !== picked) { picked = now; paintStrip(); inspect(now); }
+    if (now !== picked) {
+      picked = now; paintStrip(); inspect(now);
+      if (peeking) peek(true);
+    }
   });
   addEventListener('resize', () => { if (blocks.length) paintStrip(); });
 });
@@ -773,8 +877,9 @@ $('go').addEventListener('click', async () => {
   body.append('timeline', $('timeline').value);
 
   $('go').disabled = true;
+  $('veil').classList.remove('hide');
   $('progress').classList.remove('hide');
-  $('log').textContent = '上傳中…\n';
+  $('log').textContent = '準備中…\n';
   const res = await fetch('/api/runs', { method: 'POST', body });
   if (!res.ok) {
     $('log').textContent = '啟動失敗：' + (await res.text());
@@ -1112,11 +1217,147 @@ for (const tab of document.querySelectorAll('.tab')) {
 }
 
 $('new-run').addEventListener('click', () => {
-  $('setup').classList.toggle('hide');
-  if (!$('setup').classList.contains('hide')) {
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }
+  $('veil').classList.remove('hide');
+  $('setup').classList.remove('hide');
 });
+
+
+function movePlayhead() {
+  $('playhead').style.left = `${($('video').currentTime || 0) * scale}px`;
+  $('clock').textContent =
+    `${clock($('video').currentTime || 0)} / ${clock(reelSeconds())}`;
+}
+
+$('zoom').addEventListener('input', () => {
+  scale = +$('zoom').value;
+  if (blocks.length) { paintStrip(); paintWaves(reelSeconds()); }
+});
+$('fit').addEventListener('click', () => {
+  if (!blocks.length) return;
+  fitScale(); paintStrip(); paintWaves(reelSeconds());
+});
+$('play').addEventListener('click', () => {
+  const v = $('video');
+  if (v.paused) { v.play(); $('play').textContent = '❙❙'; }
+  else { v.pause(); $('play').textContent = '▶︎'; }
+});
+$('vol').addEventListener('input', () => { $('video').volume = +$('vol').value; });
+
+// Dragging the playhead scrubs. A timeline you cannot drag is a diagram.
+$('playhead').addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  const box = $('reel').getBoundingClientRect();
+  const move = (ev) => {
+    const at = Math.max(0, Math.min((ev.clientX - box.left) / scale, reelSeconds()));
+    $('video').currentTime = at;
+    movePlayhead();
+  };
+  const up = () => {
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+  };
+  document.addEventListener('mousemove', move);
+  document.addEventListener('mouseup', up);
+});
+
+addEventListener('keydown', (e) => {
+  if (/input|textarea/i.test(e.target.tagName)) return;
+  if (e.code === 'Space') { e.preventDefault(); $('play').click(); }
+  if (e.key === 'ArrowLeft') $('video').currentTime -= e.shiftKey ? 1 : 1 / 30;
+  if (e.key === 'ArrowRight') $('video').currentTime += e.shiftKey ? 1 : 1 / 30;
+});
+
+$('fold').addEventListener('click', () => {
+  const shut = $('panes').classList.toggle('shut');
+  $('fold').textContent = shut ? '展開' : '收起';
+});
+$('open-past').addEventListener('click', () => {
+  $('panes').classList.remove('shut');
+  $('fold').textContent = '收起';
+  showTab('pane-past');
+});
+$('close-sheet').addEventListener('click', () => $('veil').classList.add('hide'));
+$('veil').addEventListener('click', (e) => {
+  if (e.target === $('veil')) $('veil').classList.add('hide');
+});
+
+
+// --- verifying the crop and the follow ---------------------------------
+// A report saying "push_in on (0.507, 0.484)" is a claim. Playing the take
+// underneath with the box drawn on it is the claim being checked, which is
+// what this whole tool is for.
+let peeking = false;
+
+function cropAt(block, seconds) {
+  const keys = block.crop || [];
+  if (!keys.length) return null;
+  if (keys.length === 1) return keys[0];
+  const t = Math.max(0, Math.min(seconds, keys[keys.length - 1].at));
+  for (let i = 1; i < keys.length; i++) {
+    if (t <= keys[i].at) {
+      const a = keys[i - 1], b = keys[i];
+      const span = (b.at - a.at) || 1;
+      // The render eases between these; a straight line here is close enough
+      // to show where the frame is, and is honest about being an indication.
+      const p = (t - a.at) / span;
+      return {
+        x: a.x + (b.x - a.x) * p, y: a.y + (b.y - a.y) * p,
+        w: a.w + (b.w - a.w) * p, h: a.h + (b.h - a.h) * p,
+      };
+    }
+  }
+  return keys[keys.length - 1];
+}
+
+function drawCrop() {
+  const b = blocks[picked];
+  if (!peeking || !b) { $('cropbox').classList.add('hide'); return; }
+  const raw = $('raw-video');
+  const box = cropAt(b, raw.currentTime - b.in_seconds);
+  if (!box || !raw.videoWidth) { $('cropbox').classList.add('hide'); return; }
+  const shown = raw.getBoundingClientRect();
+  const holder = $('frame').getBoundingClientRect();
+  const el = $('cropbox');
+  el.classList.remove('hide');
+  el.style.left = `${shown.left - holder.left + box.x * shown.width}px`;
+  el.style.top = `${shown.top - holder.top + box.y * shown.height}px`;
+  el.style.width = `${box.w * shown.width}px`;
+  el.style.height = `${box.h * shown.height}px`;
+  el.dataset.say = `${(b.crop || []).length > 1 ? '跟拍中' : '定住'}　`
+    + `${Math.round(box.w * 100)}% 寬`;
+}
+
+function peek(on) {
+  peeking = on;
+  $('see-cut').classList.toggle('on', !on);
+  $('see-raw').classList.toggle('on', on);
+  $('video').classList.toggle('hide', on);
+  $('raw-video').classList.toggle('hide', !on);
+  if (!on) { $('cropbox').classList.add('hide'); return; }
+  const b = blocks[picked];
+  if (!b) return;
+  const raw = $('raw-video');
+  const want = `/api/runs/${runId}/source/${b.index}`;
+  if (raw.getAttribute('src') !== want) {
+    raw.setAttribute('src', want);
+    raw.load();
+  } else if (raw.readyState) {
+    raw.currentTime = b.in_seconds;
+  }
+  drawCrop();
+}
+
+$('see-cut').addEventListener('click', () => peek(false));
+$('see-raw').addEventListener('click', () => peek(true));
+$('raw-video').addEventListener('timeupdate', drawCrop);
+for (const when of ['loadedmetadata', 'loadeddata', 'seeked', 'canplay']) {
+  $('raw-video').addEventListener(when, () => {
+    const b = blocks[picked];
+    if (when === 'loadedmetadata' && b) $('raw-video').currentTime = b.in_seconds;
+    drawCrop();
+  });
+}
+addEventListener('resize', drawCrop);
 </script>
 </body>
 </html>

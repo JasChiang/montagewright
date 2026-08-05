@@ -33,7 +33,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".aiff", ".MP3", ".M4A", ".WAV"}
-ASPECTS = ("9:16", "16:9", "1:1", "4:5")
+# The names a request may ask for, and what each one is as a ratio. These
+# were two different shapes with one name -- a tuple to validate against and
+# a dict to look up -- and the lookup silently returned nothing.
+ASPECTS = {"9:16": 9 / 16, "16:9": 16 / 9, "1:1": 1.0, "4:5": 4 / 5}
 PAGE = Path(__file__).resolve().parent / "web" / "index.html"
 
 # Runs live somewhere they survive a restart. They were in a temp directory
@@ -193,7 +196,9 @@ def create_app() -> FastAPI:
         locale: str = Form("zh-TW"),
     ) -> JSONResponse:
         if aspect not in ASPECTS:
-            raise HTTPException(400, f"aspect must be one of {ASPECTS}")
+            raise HTTPException(
+                400, f"aspect must be one of {sorted(ASPECTS)}"
+            )
 
         run_id = uuid.uuid4().hex[:12]
         root = RUNS_ROOT / run_id
@@ -436,6 +441,31 @@ def create_app() -> FastAPI:
         verdicts = report.get("shots", {})
 
         found: dict[str, float] = {}
+        crops: dict[str, list] = {}
+        try:
+            plan, _, _ = _rebuild(run)
+            for segment in plan.segments:
+                path = segment.crop_path
+                keys = (
+                    [(k.seconds, k.crop) for k in path.keyframes]
+                    if path is not None
+                    else ([(0.0, segment.crop)] if segment.crop else [])
+                )
+                crops[segment.clip_id] = [
+                    {
+                        "at": round(at, 3), "x": round(box.x, 5),
+                        "y": round(box.y, 5), "w": round(box.width, 5),
+                        "h": round(box.height, 5),
+                    }
+                    for at, box in keys
+                ]
+        except Exception as error:
+            # The reel is still useful without the boxes, but a silent except
+            # here is how "0/13 have a crop path" looked like a fact about the
+            # cut rather than a broken lookup.
+            print(f"timeline-data: no crop paths ({error})", flush=True)
+            crops = {}
+
         blocks, cursor = [], 0.0
         for index, shot in enumerate(shots):
             key = f"k{index:02d}"
@@ -456,6 +486,10 @@ def create_app() -> FastAPI:
                 )
             blocks.append({
                 "clip_id": key,
+                # Where the crop actually sat, keyframe by keyframe. Without
+                # it "it followed the subject" is a claim in a report; with
+                # it you can watch the box move over the original.
+                "crop": crops.get(key, []),
                 "source_id": source_id,
                 "at": round(cursor, 3),
                 "seconds": round(seconds, 3),
@@ -794,6 +828,34 @@ def create_app() -> FastAPI:
         return FileResponse(
             path, media_type="text/plain", filename=f"{run_id}.srt"
         )
+
+    @app.get("/api/runs/{run_id}/source/{index}")
+    def source_clip(run_id: str, index: int):
+        """The take this shot was cut from, uncropped.
+
+        Checking that a crop followed anything means seeing what it was
+        moving across. The rendered segment cannot show that -- it is the
+        answer, not the working.
+        """
+
+        run = _run(run_id)
+        report = run.report() or {}
+        shots = report.get("selection", {}).get("shots", [])
+        if index >= len(shots):
+            raise HTTPException(404, "no such shot")
+        source_id = shots[index]["source_id"]
+        match = next(
+            (
+                path for path in
+                list((run.output / "work" / "shots").glob("*"))
+                + list(Path(run.source).glob("*"))
+                if path.stem == source_id
+            ),
+            None,
+        )
+        if match is None:
+            raise HTTPException(404, f"{source_id} is gone")
+        return FileResponse(match, media_type="video/mp4")
 
     @app.get("/api/runs/{run_id}/shot/{index}")
     def shot(run_id: str, index: int):

@@ -1607,3 +1607,26 @@ def test_a_run_is_found_after_a_restart_without_asking_for_the_list() -> None:
     source = inspect.getsource(webapp.create_app)
     guts = source[source.index("def _run(run_id"):]
     assert "recall()" in guts[:400]
+
+
+def test_the_crop_can_be_checked_against_the_take_it_came_from() -> None:
+    """"push_in on (0.507, 0.484)" is a claim in a report.
+
+    Playing the take underneath with the box drawn on it is that claim being
+    checked, which is the whole job here. The rendered segment cannot show it
+    -- it is the answer, not the working.
+    """
+
+    from montagewright.webapp import PAGE, create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app()
+    paths = {r.path for r in app.routes if hasattr(r, "path")}
+    assert "/api/runs/{run_id}/source/{index}" in paths
+
+    # The crop path travels with the timeline, keyframe by keyframe.
+    page = PAGE.read_text(encoding="utf-8")
+    assert "cropAt" in page and "drawCrop" in page
+    assert "原素材＋裁切框" in page
+    # A single box is a hold; several is a follow, and it says which.
+    assert "跟拍中" in page and "定住" in page
