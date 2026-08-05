@@ -1779,3 +1779,32 @@ def test_one_reframe_builder_for_the_run_and_for_the_rebuild() -> None:
     assert both.then_subject is not None
     assert both.then_subject.description == "the right, white smartphone"
     assert _reframe_of({"subject": "a phone"}).then_subject is None
+
+
+def test_a_proxy_is_kept_where_the_cards_it_feeds_are_kept(tmp_path) -> None:
+    """Re-encoding seventy-four 4K files to ask the first question.
+
+    A proxy is a pure function of the bytes it was made from -- the same
+    reason the card built from it is content-addressed and shared. Keeping it
+    in the output directory meant a second cut of the same rushes paid the
+    whole encode again before anything was decided.
+    """
+
+    from montagewright.cli import _make_proxy
+    from montagewright.uploads import content_hash
+
+    library = tmp_path / "library"
+    source = tmp_path / "C0001.MP4"
+    source.write_bytes(b"pretend this is a take")
+
+    kept = library / "proxies" / f"{content_hash(source)[:20]}.mp4"
+    kept.parent.mkdir(parents=True)
+    kept.write_bytes(b"already encoded once")
+
+    first = _make_proxy(source, tmp_path / "a" / "C0001.mp4", library=library)
+    assert first.read_bytes() == b"already encoded once"
+
+    # A second run over the same rushes finds it too, under its own name.
+    second = _make_proxy(source, tmp_path / "b" / "C0001.mp4", library=library)
+    assert second.read_bytes() == b"already encoded once"
+    assert second.name == "C0001.mp4"

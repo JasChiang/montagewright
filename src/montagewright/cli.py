@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -66,17 +67,51 @@ def _client():
     return genai.Client(api_key=key, http_options=_http_options(types))
 
 
-def _make_proxy(source: Path, destination: Path) -> Path:
+def _make_proxy(
+    source: Path, destination: Path, *, library: Path | None = None
+) -> Path:
     """A small copy for the model to watch.
 
     Sending 4K masters would cost more than the rest of the run put together
     and tell the model nothing extra: it is judging what is in the frame, not
     how sharp it is.
+
+    A proxy is a pure function of the bytes it was made from, so it is kept
+    where the cards it feeds are kept -- named for those bytes, shared across
+    runs. It used to live in the output directory, which meant a second cut
+    of the same rushes re-encoded seventy-four 4K files before it could ask
+    the first question. The run still gets one under the source's own name,
+    because everything downstream looks it up that way; it is just a link
+    now.
     """
 
     if destination.exists():
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if library is not None:
+        from montagewright.uploads import content_hash
+
+        kept = library / "proxies" / f"{content_hash(source)[:20]}.mp4"
+        if kept.exists():
+            try:
+                destination.hardlink_to(kept)
+            except OSError:
+                shutil.copy2(kept, destination)
+            return destination
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        _encode_proxy(source, kept)
+        try:
+            destination.hardlink_to(kept)
+        except OSError:
+            shutil.copy2(kept, destination)
+        return destination
+
+    _encode_proxy(source, destination)
+    return destination
+
+
+def _encode_proxy(source: Path, destination: Path) -> None:
     subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -86,7 +121,6 @@ def _make_proxy(source: Path, destination: Path) -> Path:
         ],
         check=True,
     )
-    return destination
 
 
 def command_render(args: argparse.Namespace) -> int:
@@ -147,7 +181,9 @@ def command_render(args: argparse.Namespace) -> int:
     sources_paths = rushes_paths
 
     proxies = {
-        path.stem: _make_proxy(path, work / "proxies" / f"{path.stem}.mp4")
+        path.stem: _make_proxy(
+            path, work / "proxies" / f"{path.stem}.mp4", library=library
+        )
         for path in sources_paths
     }
     def wrote(index: int, total: int, source_id: str) -> None:
