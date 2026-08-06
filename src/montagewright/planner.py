@@ -56,7 +56,12 @@ THINKING_HIGH = "high"
 # a twenty-two shot rhythm answer stopped mid-token at 8192 and took every
 # length in the film with it. Sizing this per call was solving the wrong
 # problem -- there was never a reason to ration it.
-MAX_OUTPUT_TOKENS = 32768
+#
+# The model's own ceiling, since half of it was still a ration. Thinking is
+# spent from this same budget before a single character of the answer is
+# written, so a pass at thinking_level high is really two claims on one
+# allowance -- and the one that loses is the answer.
+MAX_OUTPUT_TOKENS = 65536
 
 
 class PlannerError(RuntimeError):
@@ -384,6 +389,23 @@ def _apply(edl: EDL, decisions: dict[str, dict[str, Any]]) -> EDL:
 
 
 def _parse(interaction: Any, *, what: str) -> dict[str, Any]:
+    # The API says so itself rather than leaving it to be inferred from the
+    # shape of the text: a run that hit the ceiling comes back `incomplete`.
+    # Worth checking first, because thinking is spent from the output budget
+    # before the answer starts -- exhaust it and there is no text at all, no
+    # truncated JSON to recognise, and the failure reads as the model simply
+    # declining to answer.
+    if getattr(interaction, "status", None) == "incomplete":
+        usage = getattr(interaction, "usage", None) or {}
+        if not isinstance(usage, dict):
+            usage = getattr(usage, "__dict__", {}) or {}
+        thought = usage.get("total_thought_tokens") or 0
+        raise PlannerError(
+            f"the {what} ran out of output budget "
+            f"({thought} tokens went on thinking, ceiling is "
+            f"{MAX_OUTPUT_TOKENS})"
+        )
+
     text = getattr(interaction, "output_text", None)
     if not text:
         raise PlannerError(f"the {what} returned no text")

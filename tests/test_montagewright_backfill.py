@@ -415,3 +415,49 @@ def test_the_resolution_key_is_the_one_the_api_reads():
         type="video", mime_type="video/mp4", uri="files/x", resolution="low"
     )
     assert part.resolution == "low"
+
+
+# --- thinking is spent from the answer's budget --------------------------
+
+def test_a_pass_that_spent_its_budget_thinking_says_so():
+    """An exhausted budget produces no text at all.
+
+    Not truncated JSON -- nothing. The old message was "returned no text",
+    which reads as the model declining to answer rather than as a ceiling
+    to raise. The API marks the run `incomplete`; that is worth reading
+    instead of guessing from the shape of the output.
+    """
+
+    import pytest
+
+    from montagewright.planner import PlannerError, _parse
+
+    class Ran:
+        status = "incomplete"
+        output_text = ""
+        usage = {"total_thought_tokens": 45, "total_output_tokens": 0}
+
+    with pytest.raises(PlannerError) as raised:
+        _parse(Ran(), what="selection")
+
+    assert "output budget" in str(raised.value)
+    assert "45" in str(raised.value)
+
+
+def test_a_finished_pass_is_parsed_normally():
+    from montagewright.planner import _parse
+
+    class Ran:
+        status = "completed"
+        output_text = '{"shots": []}'
+        usage = {}
+
+    assert _parse(Ran(), what="selection") == {"shots": []}
+
+
+def test_the_ceiling_is_the_models_own():
+    # 65536 for gemini-3.6-flash. Half of it was still a ration, and the
+    # billing is on what is produced rather than on what is allowed.
+    from montagewright.planner import MAX_OUTPUT_TOKENS
+
+    assert MAX_OUTPUT_TOKENS == 65536
