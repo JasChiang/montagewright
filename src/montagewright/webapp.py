@@ -929,10 +929,16 @@ def create_app() -> FastAPI:
 
             plan, report, aspect = _rebuild(run)
             width, height = (1920, 1080) if aspect >= 1.0 else (1080, 1920)
+            # The bed this cut was laid over, so the timeline carries it
+            # too rather than opening as a silent film.
+            bed = None
+            if "--music" in run.command:
+                maybe = Path(run.command[run.command.index("--music") + 1])
+                bed = maybe if maybe.exists() else None
             build = to_xmeml if flavour == "premiere" else to_fcpxml
             path.write_text(
                 build(plan, report, name=run.output.name,
-                      width=width, height=height),
+                      width=width, height=height, music=bed),
                 encoding="utf-8",
             )
         return FileResponse(

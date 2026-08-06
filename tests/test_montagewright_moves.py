@@ -2937,3 +2937,85 @@ def test_the_sequence_format_is_a_shape_not_a_preset_name() -> None:
     for asset in root.iter("asset"):
         assert asset.get("format") in shapes, asset.get("id")
     assert root.find(".//sequence").get("format") in shapes
+
+
+def test_keyframes_are_on_the_clip_s_own_clock() -> None:
+    """A clip's clock starts at its source in-point, not at zero.
+
+    Written from zero, a move began before the shot did and ended before it
+    ended -- so the head and tail of every moving shot rendered with no
+    transform, which for a 16:9 source in a 9:16 sequence is the picture
+    letterboxed in black. That is the black somebody saw.
+    """
+
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+
+    from montagewright.executor import CropBox, RenderPlan, Segment, Source
+    from montagewright.reframe import CropPath, Keyframe
+    from montagewright.timeline import to_fcpxml
+
+    where = Source(source_id="A", path=Path("/rushes/A.mp4"),
+                   duration_seconds=30.0, width=3840, height=2160)
+    moving = Segment(
+        clip_id="k00", source=where, in_seconds=4.0, out_seconds=7.0,
+        crop=CropBox(x=0.10, y=0.0, width=0.32, height=1.0),
+        crop_path=CropPath(keyframes=[
+            Keyframe(seconds=0.0,
+                     crop=CropBox(x=0.10, y=0.0, width=0.32, height=1.0)),
+            Keyframe(seconds=3.0,
+                     crop=CropBox(x=0.55, y=0.0, width=0.32, height=1.0)),
+        ]),
+    )
+    root = ET.fromstring(to_fcpxml(
+        RenderPlan(project_id="p", segments=[moving]), {},
+        name="p", width=1080, height=1920,
+    ))
+
+    def ticks(stamp: str) -> float:
+        top, _, bottom = stamp.rstrip("s").partition("/")
+        return float(top) / float(bottom or 1)
+
+    clip = root.find(".//asset-clip")
+    began, ran = ticks(clip.get("start")), ticks(clip.get("duration"))
+    for frame in root.iter("keyframe"):
+        at = ticks(frame.get("time"))
+        assert began - 1e-6 <= at <= began + ran + 1e-6, (
+            f"keyframe at {at} is outside the clip's {began}..{began + ran}"
+        )
+    # And they span it, rather than sitting in a corner of it.
+    times = sorted({ticks(f.get("time")) for f in root.iter("keyframe")})
+    assert abs(times[0] - began) < 1e-6
+    assert abs(times[-1] - (began + ran)) < 1e-6
+
+
+def test_the_timeline_carries_the_bed(tmp_path) -> None:
+    """It opened as a silent film with no sign there had been a track."""
+
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+
+    from montagewright.executor import CropBox, RenderPlan, Segment, Source
+    from montagewright.timeline import to_fcpxml
+
+    track = tmp_path / "bed.m4a"
+    track.write_bytes(b"pretend this is music")
+    where = Source(source_id="A", path=Path("/rushes/A.mp4"),
+                   duration_seconds=20.0, width=3840, height=2160)
+    root = ET.fromstring(to_fcpxml(
+        RenderPlan(project_id="p", segments=[
+            Segment(clip_id="k00", source=where, in_seconds=0.0,
+                    out_seconds=3.0,
+                    crop=CropBox(x=0.34, y=0.0, width=0.32, height=1.0)),
+        ]),
+        {}, name="p", width=1080, height=1920, music=track,
+    ))
+
+    bed = [
+        one for one in root.iter("asset-clip")
+        if one.get("audioRole") == "music"
+    ]
+    assert len(bed) == 1
+    assert bed[0].get("lane") == "-1"       # under the picture
+    assert bed[0].get("offset") == "0s"
+    assert bed[0].get("ref") in {a.get("id") for a in root.iter("asset")}

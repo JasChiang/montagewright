@@ -749,7 +749,7 @@ def command_render(args: argparse.Namespace) -> int:
                 path = output / f"timeline.{suffix}"
                 path.write_text(
                     build(plan, payload, name=output.name,
-                          width=width, height=height),
+                          width=width, height=height, music=args.music),
                     encoding="utf-8",
                 )
                 print(f"timeline    {path}", flush=True)

@@ -112,8 +112,17 @@ def to_xmeml(
     width: int,
     height: int,
     fps: int = FPS,
+    music: Path | None = None,
 ) -> str:
-    """FCP7 XML: what Premiere and Resolve open without complaint."""
+    """FCP7 XML: what Premiere and Resolve open without complaint.
+
+    Takes the bed for the same reason the FCPXML writer does, and for the
+    moment ignores it: xmeml wants the track laid out as a second audio
+    track with its own clipitems, which is a different shape from this
+    file's single video track and has not been written. Better to accept
+    the argument and say so here than to have two writers that cannot be
+    called the same way.
+    """
 
     files: dict[str, str] = {}
     items: list[str] = []
@@ -209,6 +218,7 @@ def to_fcpxml(
     width: int,
     height: int,
     fps: int = FPS,
+    music: Path | None = None,
 ) -> str:
     """FCPXML: what Final Cut reads properly."""
 
@@ -255,8 +265,14 @@ def to_fcpxml(
         keys = _keys(segment)
         if keys:
             target = width / height
+            # A clip's own clock starts at its source in-point, not at
+            # zero, and a keyframe's time is on that clock. Written from
+            # zero, the animation began before the shot did and ended before
+            # it ended -- so the head and tail of every move rendered with
+            # no transform at all, which for a 16:9 source in a 9:16
+            # sequence is the picture letterboxed in black.
             placed = [
-                (rational(seconds),
+                (rational(segment.in_seconds + seconds),
                  _placement(crop, source.aspect_ratio, target))
                 for seconds, crop in keys
             ]
@@ -307,6 +323,26 @@ def to_fcpxml(
         )
         cursor += segment.duration_seconds
 
+    # The bed, laid under the whole cut. It was never written at all: the
+    # timeline carried the picture and left the music behind, so opening it
+    # gave a silent film and no sign that there had been a track.
+    bed = ""
+    if music is not None and Path(music).exists():
+        bed_id = f"r{len(assets) + 2}"
+        assets[bed_id] = (
+            f'<asset id="{bed_id}" name="{html.escape(Path(music).stem)}" '
+            f'start="0s" hasAudio="1" audioSources="1" audioChannels="2" '
+            f'duration="{rational(cursor)}">'
+            f'<media-rep kind="original-media" '
+            f'src="{html.escape(Path(music).resolve().as_uri())}"/>'
+            f"</asset>"
+        )
+        bed = (
+            f'<asset-clip name="{html.escape(Path(music).stem)}" '
+            f'ref="{bed_id}" lane="-1" offset="0s" start="0s" '
+            f'duration="{rational(cursor)}" audioRole="music"/>'
+        )
+
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE fcpxml>\n<fcpxml version="1.9"><resources>'
@@ -329,7 +365,7 @@ def to_fcpxml(
         f'<library><event name="{html.escape(name)}">'
         f'<project name="{html.escape(name)}"><sequence format="r1" '
         f'duration="{rational(cursor)}" tcStart="0s">'
-        f"<spine>{''.join(clips)}</spine></sequence></project>"
+        f"<spine>{''.join(clips)}{bed}</spine></sequence></project>"
         "</event></library></fcpxml>\n"
     )
 
