@@ -31,6 +31,7 @@ from pathlib import Path
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from montagewright.renderer import probe_duration
 from montagewright.uploads import default_library
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
@@ -1158,6 +1159,35 @@ def create_app() -> FastAPI:
         if match is None:
             raise HTTPException(404, f"{source_id} is gone")
         return FileResponse(match, media_type="video/mp4")
+
+    @app.get("/api/runs/{run_id}/thumb/{index}")
+    def thumb(run_id: str, index: int, at: float = 0.35):
+        """A frame from a shot, for recognising it by sight.
+
+        A list of filenames is not how anybody knows which take is which.
+        Kept on disk once made: pulling a frame is cheap, doing it for every
+        shot on every repaint is not.
+        """
+
+        run = _run(run_id)
+        made = run.output / "work" / "thumbs" / f"{index:03d}.jpg"
+        if not made.exists():
+            segment = next(
+                (run.output / "segments").glob(f"{index:03d}-*.mp4"), None
+            )
+            if segment is None or "handles" in segment.name:
+                raise HTTPException(404, "no such shot")
+            made.parent.mkdir(parents=True, exist_ok=True)
+            length = probe_duration(segment)
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-ss", f"{max(0.0, length * at):.3f}", "-i", str(segment),
+                 "-frames:v", "1", "-vf", "scale=-2:180", str(made)],
+                check=False,
+            )
+        if not made.exists():
+            raise HTTPException(404, "could not read a frame")
+        return FileResponse(made, media_type="image/jpeg")
 
     @app.get("/api/runs/{run_id}/shot/{index}")
     def shot(run_id: str, index: int):
