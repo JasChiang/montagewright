@@ -2813,3 +2813,32 @@ def test_push_room_is_read_from_the_file_that_gets_cut(tmp_path) -> None:
     ).read_text(encoding="utf-8")
     assert "originals = {path.stem: path for path in sources_paths}" in source
     assert "originals.get(source_id, proxy)" in source
+
+
+def test_a_finished_cut_can_be_taken_away() -> None:
+    """The interface could make a film, show it, prove the crop followed
+    something -- and offer no way to get any of it out.
+
+    The download links lived in the drawer along the bottom, and the drawer
+    was deleted when the layout became columns. Nothing failed, nothing was
+    reported: the routes stayed, and the only thing that went was every way
+    of reaching them.
+    """
+
+    from montagewright.webapp import PAGE, create_app
+
+    paths = {r.path for r in create_app().routes if hasattr(r, "path")}
+    assert {
+        "/api/runs/{run_id}/deliverable",
+        "/api/runs/{run_id}/timeline/{flavour}",
+        "/api/runs/{run_id}/subtitles",
+        "/api/runs/{run_id}/burned",
+    } <= paths
+
+    page = PAGE.read_text(encoding="utf-8")
+    for reached in ("/deliverable", "/timeline/premiere", "/timeline/finalcut",
+                    "/subtitles", "/burned"):
+        assert reached in page, reached
+    # Offered only when there is one -- a link that answers 404 reads as a
+    # fault rather than as an absence.
+    assert "$('dl-srt').classList.toggle('hide', !spoken)" in page
