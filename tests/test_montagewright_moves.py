@@ -3019,3 +3019,75 @@ def test_the_timeline_carries_the_bed(tmp_path) -> None:
     assert bed[0].get("lane") == "-1"       # under the picture
     assert bed[0].get("offset") == "0s"
     assert bed[0].get("ref") in {a.get("id") for a in root.iter("asset")}
+
+
+def test_frames_are_not_pulled_when_there_is_nothing_to_ask() -> None:
+    """Sampling frames runs ffmpeg over the take.
+
+    Three branches did it and then checked whether a client existed to send
+    them to -- so rebuilding a plan, which never has a client, extracted
+    frames for every shot and discarded all of them. Opening a finished cut
+    took eight and a half seconds of that before anything appeared.
+    """
+
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "pipeline.py"
+    ).read_text(encoding="utf-8")
+
+    lines = source.splitlines()
+    # Every place frames are pulled has a check that asking is possible
+    # close above it -- never only below it.
+    sites = [
+        i for i, line in enumerate(lines)
+        if "_sample_frames(" in line and not line.lstrip().startswith("def ")
+    ]
+    assert sites, "the sampling calls moved; this guard needs rewriting"
+    for at in sites:
+        # Above for a guard clause or the branch it sits in, just below for
+        # the conditional form -- `_sample_frames(...) if _may_ask(...)`.
+        near = "\n".join(lines[max(0, at - 30):at + 8])
+        assert "_may_ask(client)" in near, (
+            f"line {at + 1} pulls frames with no check for a client:"
+            f"\n{near}"
+        )
+
+
+def test_a_file_is_measured_once(tmp_path) -> None:
+    """Reading a file's shape costs an ffprobe -- a whole process.
+
+    Drawing the timeline asked for the same dozen sources every time, which
+    was most of the second and a half before a cut appeared.
+    """
+
+    import montagewright.pipeline as works
+
+    calls = []
+    real = works.subprocess.run
+
+    def counted(command, *args, **kw):
+        if command and command[0] == "ffprobe":
+            calls.append(command[-1])
+        return real(command, *args, **kw)
+
+    made = tmp_path / "one.mp4"
+    import subprocess as sp
+    sp.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=1",
+            str(made)], check=True)
+
+    works.subprocess.run = counted
+    try:
+        first = works.probe("A", made)
+        again = works.probe("A", made)
+        # A second id for the same bytes is still not a second ffprobe.
+        other = works.probe("B", made)
+    finally:
+        works.subprocess.run = real
+
+    assert len(calls) == 1, calls
+    assert first.duration_seconds == again.duration_seconds
+    assert other.source_id == "B"
+    assert other.duration_seconds == first.duration_seconds

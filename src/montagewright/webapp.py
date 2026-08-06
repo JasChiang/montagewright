@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 import shutil
 import subprocess
 import sys
@@ -620,24 +621,38 @@ def create_app() -> FastAPI:
             print(f"timeline-data: no crop paths ({error})", flush=True)
             crops = {}
 
+        # How long each source runs, which is how far a shot can be pulled
+        # out. Reading it costs an ffprobe -- a whole process each -- and
+        # they do not depend on one another, so they are read at once
+        # rather than a dozen in a row. That was a second and a half before
+        # anything appeared on opening a finished cut.
+        where = list((run.output / "work" / "shots").glob("*")) + list(
+            Path(run.source).glob("*") if Path(run.source).exists() else []
+        )
+        by_stem = {path.stem: path for path in where}
+        wanted = {
+            shot.get("source_id", "") for shot in shots
+        } - {"" } - set(found)
+
+        def measure(source_id: str) -> tuple[str, float]:
+            match = by_stem.get(source_id)
+            if match is None:
+                return source_id, 0.0
+            try:
+                return source_id, probe(source_id, match).duration_seconds
+            except Exception:
+                return source_id, 0.0
+
+        if wanted:
+            with ThreadPoolExecutor(max_workers=8) as crew:
+                for source_id, length in crew.map(measure, sorted(wanted)):
+                    found[source_id] = length
+
         blocks, cursor = [], 0.0
         for index, shot in enumerate(shots):
             key = f"k{index:02d}"
             seconds = float(rhythm.get(key, {}).get("seconds", 0.0))
             source_id = shot.get("source_id", "")
-            if source_id not in found:
-                match = next(
-                    (
-                        path for path in
-                        list((run.output / "work" / "shots").glob("*"))
-                        + list(Path(run.source).glob("*"))
-                        if path.stem == source_id
-                    ),
-                    None,
-                )
-                found[source_id] = (
-                    probe(source_id, match).duration_seconds if match else 0.0
-                )
             blocks.append({
                 "clip_id": key,
                 # Which shot of the report this is, which is what the take

@@ -186,8 +186,30 @@ def _charge(report: "Report", stage: str, usage: Usage) -> None:
         )
 
 
+# What a file is does not change while it sits there, and reading it costs
+# an ffprobe -- a whole process, tens of milliseconds. Opening a finished cut
+# asked for the same dozen files every time the timeline was drawn, which is
+# most of the second and a half it took before anything appeared.
+_PROBED: dict[tuple[str, int, int], "Source"] = {}
+
+
 def probe(source_id: str, path: Path) -> Source:
     import json
+
+    try:
+        stat = path.stat()
+        seen = (str(path), stat.st_size, int(stat.st_mtime))
+    except OSError:
+        seen = None
+    if seen is not None and seen in _PROBED:
+        kept = _PROBED[seen]
+        # The same file may be known by more than one id across runs.
+        return (
+            kept if kept.source_id == source_id
+            else Source(source_id=source_id, path=kept.path,
+                        duration_seconds=kept.duration_seconds,
+                        width=kept.width, height=kept.height)
+        )
 
     completed = subprocess.run(
         [
@@ -201,13 +223,16 @@ def probe(source_id: str, path: Path) -> Source:
     )
     payload = json.loads(completed.stdout)
     stream = payload["streams"][0]
-    return Source(
+    found = Source(
         source_id=source_id,
         path=path,
         duration_seconds=float(payload["format"]["duration"]),
         width=int(stream["width"]),
         height=int(stream["height"]),
     )
+    if seen is not None:
+        _PROBED[seen] = found
+    return found
 
 
 def _sample_frames(
@@ -432,8 +457,17 @@ def follow_subjects(
                 # measured, because a nine-box position is a hint about which
                 # subject is meant, not a coordinate to aim at -- aiming at it
                 # overshoots the subject and lands on background.
-                frames, _ = _sample_frames(
-                    source, clip.approx_in_seconds, clip.approx_out_seconds, work
+                # Pulling frames means running ffmpeg over the take. Doing
+                # it before asking whether there is anything to ask meant a
+                # rebuild -- which never has a client -- extracted frames
+                # for every shot and threw them all away: eight and a half
+                # seconds before a finished cut would open.
+                frames = (
+                    _sample_frames(
+                        source, clip.approx_in_seconds,
+                        clip.approx_out_seconds, work,
+                    )[0]
+                    if _may_ask(client) else []
                 )
                 centres = []
                 widths = []
@@ -637,14 +671,14 @@ def follow_subjects(
                         # of the trajectory is the placement that keeps the
                         # subject inside for all of it, rather than framing
                         # where it started and letting it walk out.
+                        if not _may_ask(client):
+                            continue
                         frames, _ = _sample_frames(
                             source,
                             clip.approx_in_seconds,
                             clip.approx_out_seconds,
                             work,
                         )
-                        if not _may_ask(client):
-                            continue
                         _afford(report)
                         boxes, usage = locate_subject(
                             frames, reframe.subject.description, client=client
@@ -714,11 +748,11 @@ def follow_subjects(
                 frames = []
                 report.subject_notes[clip.clip_id] = f"card: {known.label}"
             else:
+                if not _may_ask(client):
+                    continue
                 frames, times = _sample_frames(
                     source, clip.approx_in_seconds, clip.approx_out_seconds, work
                 )
-                if not _may_ask(client):
-                    continue
                 _afford(report)
                 boxes, usage = locate_subject(
                     frames, reframe.subject.description, client=client
