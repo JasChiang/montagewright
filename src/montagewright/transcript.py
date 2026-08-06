@@ -579,19 +579,21 @@ def describe(
     interaction = client.interactions.create(
         model=model_id or MODEL_ID,
         store=False,
+        # The video first, the question after it: Google's guidance for a
+        # single video is to put the text last.
         input=[
+            {
+                "type": "video",
+                "mime_type": "video/mp4",
+                "uri": uri,
+                "resolution": "low",
+            },
             {
                 "type": "text",
                 "text": (
                     f"{instruction}\n\n## 辨識器給的逐字稿"
                     f"（{locale}，秒數 + 字）\n\n{rough}\n"
                 ),
-            },
-            {
-                "type": "video",
-                "mime_type": "video/mp4",
-                "uri": uri,
-                "resolution": "low",
             },
         ],
         generation_config={

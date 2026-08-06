@@ -139,18 +139,20 @@ def review_cut(
         model=model_id,
         store=False,
         input=[
+        # The video first, the question after it: Google's guidance for a
+        # single video is to put the text last.
+            {
+                "type": "video",
+                "mime_type": "video/mp4",
+                "uri": uri,
+                "resolution": "low",
+            },
             {
                 "type": "text",
                 "text": (
                     f"{instruction}\n\n## 剪輯 brief\n\n{brief}\n\n"
                     f"## 這支片的創意定調\n\n{direction}\n"
                 ),
-            },
-            {
-                "type": "video",
-                "mime_type": "video/mp4",
-                "uri": uri,
-                "resolution": "low",
             },
         ],
         generation_config={"thinking_level": "high", "max_output_tokens": MAX_OUTPUT_TOKENS},

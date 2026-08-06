@@ -580,14 +580,17 @@ def describe_clip(
     interaction = client.interactions.create(
         model=model_id or MODEL_ID,
         store=False,
+        # The video first, the question after it. Google's own guidance for
+        # a single video is to put the text last, and this had it the other
+        # way round since the card writer was first written.
         input=[
-            {"type": "text", "text": instruction},
             {
                 "type": "video",
                 "mime_type": "video/mp4",
                 "uri": uri,
                 "resolution": "low",
             },
+            {"type": "text", "text": instruction},
         ],
         generation_config={"thinking_level": "low", "max_output_tokens": MAX_OUTPUT_TOKENS},
         response_format={
