@@ -67,7 +67,11 @@
   .nothing-yet {
     flex: 1; display: none; flex-direction: column; align-items: center;
     justify-content: center; gap: 14px; text-align: center; padding: 40px;
-    background: var(--deep); min-height: 0;
+    min-height: 0; overflow: auto;
+    background:
+      radial-gradient(1100px 520px at 50% -10%,
+        color-mix(in srgb, var(--accent) 7%, transparent), transparent 70%),
+      var(--deep);
   }
   .nothing-yet.on { display: flex; }
   .nothing-yet h2 { margin: 0; font-size: 19px; font-weight: 600; }
@@ -75,9 +79,13 @@
   .nothing-yet p.quiet { color: var(--dim); font-size: 12px; }
   .nothing-yet button { font-size: 14px; padding: 9px 18px; }
   .cold-past {
-    width: min(760px, 100%); max-height: 42vh; overflow: auto;
-    margin-top: 10px; text-align: left;
+    width: min(820px, 100%); margin-top: 22px; text-align: left;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 4px 16px 8px;
+    box-shadow: 0 10px 34px rgba(0,0,0,.16);
   }
+  .cold-past table { font-size: 12.5px; }
+  .cold-past td, .cold-past th { padding: 8px 8px; }
   .cold-past:empty { display: none; }
 
   /* The shape an editing application has had for thirty years, because it
@@ -88,14 +96,25 @@
      and reading it meant losing sight of the picture. */
   .work {
     display: grid;
-    grid-template-columns: minmax(250px, 21vw) 1fr minmax(280px, 23vw);
+    grid-template-columns:
+      var(--left, 21vw) 5px 1fr 5px var(--right, 23vw);
     min-height: 0; background: var(--sunk);
   }
+  /* Somewhere to take hold of. Every panel in an editing application is
+     resizable because no two people weigh the picture against the paperwork
+     the same way. */
+  .grip {
+    background: var(--line); cursor: col-resize; position: relative;
+  }
+  .grip::after {
+    content: ''; position: absolute; inset: 0 -3px; z-index: 5;
+  }
+  .grip:hover, .grip.holding { background: var(--accent); }
   .work > * { min-width: 0; min-height: 0; }
   .stage { display: grid; min-height: 0; min-width: 0; }
   @media (max-width: 1100px) {
-    .work { grid-template-columns: 1fr minmax(260px, 30vw); }
-    .browser { display: none; }
+    .work { grid-template-columns: 1fr 5px minmax(260px, 30vw); }
+    .browser, #grip-left { display: none; }
   }
 
   .browser {
@@ -129,6 +148,12 @@
      containing block whose own height is auto, which is to say it does not
      resolve at all -- the take ran three times the height of the box and the
      crop box drawn on it landed off the top of the screen. */
+  /* Side by side: the take with the box on it, and what came out of it.
+     Toggling between them answers "where did the crop sit"; showing both
+     answers "did it pick the right thing", which is the question. */
+  .frame.both { gap: 14px; }
+  .frame.both video { max-width: calc(50% - 7px); }
+  .frame.both #video, .frame.both #raw-video { display: block; }
   .frame { position: relative; display: flex; align-items: center;
            justify-content: center; width: 100%; height: 100%;
            min-width: 0; min-height: 0; }
@@ -181,20 +206,31 @@
   .side .head {
     padding: 13px 16px; border-bottom: 1px solid var(--line);
     display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+    background: linear-gradient(180deg, var(--panel), var(--sunk));
   }
   .side .head .who { font-family: var(--mono); font-size: 12px; word-break: break-all; }
   .side .body { overflow: auto; padding: 4px 16px 18px; flex: 1; min-height: 0; }
   .side:empty::after { content: ''; }
 
   dl.facts { margin: 0; }
+  /* Labels recede, answers carry. It read as one undifferentiated column
+     of sentences because every line had the same weight and colour. */
+  dl.facts { margin: 0; }
   dl.facts dt {
-    font-size: 10px; color: var(--dim); letter-spacing: .06em;
-    text-transform: uppercase; margin-top: 16px; font-weight: 600;
+    font-size: 10px; color: var(--dim); letter-spacing: .07em;
+    text-transform: uppercase; font-weight: 600;
+    margin: 18px 0 0; padding-bottom: 5px;
+    border-bottom: 1px solid var(--hair);
   }
-  dl.facts dt:first-of-type { margin-top: 4px; }
-  dl.facts dd {
-    margin: 4px 0 0; font-size: 13px; padding-left: 10px;
-    border-left: 2px solid var(--hair);
+  dl.facts dt:first-of-type { margin-top: 2px; }
+  dl.facts dd { margin: 7px 0 0; font-size: 13px; line-height: 1.55; }
+  dl.facts dd.why, .why { color: var(--soft); font-size: 12.5px; line-height: 1.62; }
+  /* The one number a person changes by hand deserves to look like a
+     control rather than another fact. */
+  dd.gainrow {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--sunk); border: 1px solid var(--hair);
+    border-radius: 8px; padding: 8px 10px;
   }
   dl.facts dd.why, .why { color: var(--soft); font-size: 12.5px; line-height: 1.6; }
 
@@ -255,7 +291,6 @@
   }
   .figures summary::before { content: '▸ '; }
   .figures[open] summary::before { content: '▾ '; }
-  dd.gainrow { display: flex; align-items: center; gap: 9px; }
   dd.gainrow input { flex: 1; min-width: 0; }
   .nothing { color: var(--dim); font-size: 12.5px; padding: 22px 0; }
 
@@ -569,6 +604,8 @@
       </div>
     </div>
 
+    <div class="grip" id="grip-left" title="拖動調整寬度"></div>
+
     <div class="stage">
       <div class="screen">
         <div class="over" id="over"></div>
@@ -582,9 +619,12 @@
         <div class="peek">
           <button class="bare on" id="see-cut">成片</button>
           <button class="bare" id="see-raw">原素材＋裁切框</button>
+          <button class="bare" id="see-both">並排</button>
         </div>
       </div>
     </div>
+
+    <div class="grip" id="grip-right" title="拖動調整寬度"></div>
 
     <aside class="side">
       <div class="head" id="ins-head"><span class="who">這一顆</span></div>
@@ -873,6 +913,9 @@ async function openRun(id, where) {
 }
 
 let blocks = [], blocksWere = [], picked = -1, lastReport = null;
+// Both at once. peeking stays true so the take keeps loading and the box
+// keeps being drawn; this only says the cut is on screen as well.
+let beside = false;
 // 'recorded' means these are the boxes the render used. 'rebuilt' means the
 // run predates keeping them and they were worked out again from the cards,
 // which lands on the middle of frame wherever a card cannot name the
@@ -1346,8 +1389,11 @@ document.addEventListener('DOMContentLoaded', () => {
       at += b.seconds;
     });
     if (now !== picked) {
-      picked = now; paintStrip(); inspect(now); markShot(now);
-      if (peeking) peek(true);
+      // Only the selection moved. Repainting the strip here rebuilt every
+      // block, and every block carries a picture -- so crossing a cut while
+      // scrubbing reloaded twelve images.
+      picked = now; markPicked(); inspect(now); markShot(now);
+      if (peeking) peek(peeking, beside);
     }
     mirrorRaw();
   });
@@ -1655,6 +1701,13 @@ const SETTLED = {
                   '這一輪沒跑到驗收——沒開自審，或提前停了'],
 };
 
+// Move the highlight without rebuilding the blocks under it.
+function markPicked() {
+  for (const el of $('track').querySelectorAll('.blk')) {
+    el.classList.toggle('on', +el.dataset.i === picked);
+  }
+}
+
 // Which shot the list is pointing at, so the three columns agree.
 function markShot(i) {
   for (const card of document.querySelectorAll('.shotcard')) {
@@ -1687,6 +1740,36 @@ function emptyRow(cols, said) {
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+
+// Column widths are the reader's, not mine, and they survive a reload.
+for (const [grip, which, side] of [
+  ['grip-left', '--left', 'left'], ['grip-right', '--right', 'right'],
+]) {
+  const kept = localStorage.getItem(`mw-${which}`);
+  if (kept) document.documentElement.style.setProperty(which, kept);
+  $(grip).addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    $(grip).classList.add('holding');
+    const move = (ev) => {
+      const room = document.querySelector('.work').getBoundingClientRect();
+      const wide = side === 'left'
+        ? ev.clientX - room.left
+        : room.right - ev.clientX;
+      const held = `${Math.max(180, Math.min(wide, room.width * 0.45))}px`;
+      document.documentElement.style.setProperty(which, held);
+      localStorage.setItem(`mw-${which}`, held);
+    };
+    const up = () => {
+      $(grip).classList.remove('holding');
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      // The picture and the boxes drawn on it are placed in pixels.
+      forgetPlacement(); drawCrop(); showBurnt(); paintStrip();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
 
 // Nothing open, or something open. The workspace is only worth showing
 // when there is a cut in it.
@@ -1933,14 +2016,28 @@ $('vol').addEventListener('input', () => { $('video').volume = +$('vol').value; 
 $('playhead').addEventListener('mousedown', (e) => {
   e.preventDefault();
   const box = $('reel').getBoundingClientRect();
+  const cut = $('video');
+  let wanted = cut.currentTime, pending = false;
+
+  // A mousemove fires up to a hundred times a second and each assignment to
+  // currentTime is an exact seek -- a full decode from the preceding
+  // keyframe. Asking for a hundred of those a second is how the picture
+  // goes black between them. fastSeek lands on the nearest keyframe, which
+  // is what scrubbing wants; the exact frame is fetched when the drag ends.
+  const apply = () => {
+    pending = false;
+    if (cut.fastSeek) cut.fastSeek(wanted); else cut.currentTime = wanted;
+  };
   const move = (ev) => {
-    const at = Math.max(0, Math.min((ev.clientX - box.left) / scale, reelSeconds()));
-    $('video').currentTime = at;
+    wanted = Math.max(0, Math.min(
+      (ev.clientX - box.left) / scale, reelSeconds()));
     movePlayhead();
+    if (!pending) { pending = true; requestAnimationFrame(apply); }
   };
   const up = () => {
     document.removeEventListener('mousemove', move);
     document.removeEventListener('mouseup', up);
+    cut.currentTime = wanted;
   };
   document.addEventListener('mousemove', move);
   document.addEventListener('mouseup', up);
@@ -2123,12 +2220,15 @@ function drawCrop() {
   el.dataset.say = cropSays(b, box);
 }
 
-function peek(on) {
+function peek(on, both) {
   peeking = on;
-  $('see-cut').classList.toggle('on', !on);
-  $('see-raw').classList.toggle('on', on);
-  $('video').classList.toggle('hide', on);
-  $('raw-video').classList.toggle('hide', !on);
+  beside = !!both;
+  $('see-cut').classList.toggle('on', !on && !both);
+  $('see-raw').classList.toggle('on', on && !both);
+  $('see-both').classList.toggle('on', both);
+  $('frame').classList.toggle('both', both);
+  $('video').classList.toggle('hide', on && !both);
+  $('raw-video').classList.toggle('hide', !on && !both);
   forgetPlacement();
   if (!on) { $('cropbox').classList.add('hide'); return; }
   const b = blocks[picked];
@@ -2145,8 +2245,9 @@ function peek(on) {
   drawCrop();
 }
 
-$('see-cut').addEventListener('click', () => peek(false));
-$('see-raw').addEventListener('click', () => peek(true));
+$('see-cut').addEventListener('click', () => peek(false, false));
+$('see-raw').addEventListener('click', () => peek(true, false));
+$('see-both').addEventListener('click', () => peek(true, true));
 $('raw-video').addEventListener('timeupdate', drawCrop);
 for (const when of ['loadedmetadata', 'loadeddata', 'seeked', 'canplay']) {
   $('raw-video').addEventListener(when, () => {
