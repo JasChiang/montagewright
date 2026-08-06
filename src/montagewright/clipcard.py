@@ -399,6 +399,27 @@ def clip_seconds(path: Path) -> float:
         return 0.0
 
 
+# How far past the measured end a timestamp may land and still be believed.
+#
+# Gemini samples video at one frame a second, so what it can say is roughly
+# integer seconds -- on a clip lasting 12.012s the last frame it holds is at
+# 12, and "the action ends at 13" is a rounding artefact rather than a
+# mistake. A tolerance of half a second, which is what this had first, threw
+# that away and deleted a real action.
+#
+# There is a lot of room to be generous here: the smallest possible MM:SS
+# collision is 1:01 written as 101 on a clip just past a minute, which
+# overshoots by forty seconds. Anything between one second and forty is not a
+# notation problem, and nothing has produced one yet.
+#
+# The proxy is also about 0.1s longer than the file it was made from, since
+# re-encoding pads the tail. Cards describe the proxy and the edit cuts the
+# original, so a usable_to taken at face value can sit a frame past the end
+# of the source. The renderer clamps there; it is noted here because this is
+# where the two clocks are closest to being confused for each other.
+SLOP = 1.5
+
+
 def _as_mmss(value: float) -> float | None:
     """Read a number back as the MM:SS it was probably written from.
 
@@ -453,10 +474,10 @@ def times_on_receipt(card: dict[str, Any], duration: float) -> dict[str, Any]:
         except (TypeError, ValueError):
             return []
         out = []
-        if 0 <= plain <= duration + 0.5:
+        if 0 <= plain <= duration + SLOP:
             out.append(min(plain, duration))
         again = _as_mmss(plain)
-        if again is not None and again <= duration + 0.5 and again not in out:
+        if again is not None and again <= duration + SLOP and again not in out:
             out.append(min(again, duration))
         return out
 

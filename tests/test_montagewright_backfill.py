@@ -273,3 +273,35 @@ def test_a_clip_whose_length_is_unknown_is_not_second_guessed():
     was = _card(usable_to_seconds=1.53)
 
     assert times_on_receipt(dict(was), 0.0) == was
+
+
+def test_a_timestamp_rounded_up_past_the_end_is_kept_not_deleted():
+    """Gemini samples at one frame a second, so it answers in whole seconds.
+
+    On a clip lasting 12.012s the last frame it holds is at 12, and "ends at
+    13" is that rounding rather than a mistake. Half a second of tolerance,
+    which is what this had first, deleted the action instead.
+    """
+
+    from montagewright.clipcard import times_on_receipt
+
+    got = times_on_receipt(
+        _card(action=[{"what": "x", "starts_seconds": 10.0, "ends_seconds": 13.0}]),
+        12.012,
+    )
+
+    assert [(a["starts_seconds"], a["ends_seconds"]) for a in got["action"]] == [
+        (10.0, 12.012)
+    ]
+
+
+def test_the_slop_is_nowhere_near_a_notation_error():
+    # The smallest possible MM:SS collision is 1:01 as 101 on a clip just
+    # past a minute, overshooting by forty seconds. Rounding is one second.
+    from montagewright.clipcard import SLOP, times_on_receipt
+
+    assert SLOP < 40
+
+    got = times_on_receipt(_card(usable_to_seconds=101.0), 61.0)
+
+    assert got["usable_to_seconds"] == 61.0
