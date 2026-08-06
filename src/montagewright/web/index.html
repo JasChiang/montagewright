@@ -1628,12 +1628,27 @@ function saveSubs() {
   clearTimeout(subsSaving);
   subsSaving = setTimeout(async () => {
     try {
-      await fetch(`/api/runs/${runId}/subtitle-track`, {
+      const got = await fetch(`/api/runs/${runId}/subtitle-track`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ lines: subs }),
       });
       subsEdited = true;
+      // The server puts edited text back on the recogniser's clock, so a
+      // line whose length changed comes back at a different moment. Take
+      // those times: the ones held here are the ones from before the edit,
+      // and keeping them would draw the caption where it no longer is.
+      // Only the times -- the text on screen is what is being typed into.
+      const back = (await got.json()).timed || [];
+      if (back.length === subs.length) {
+        let moved = false;
+        back.forEach((one, i) => {
+          if (subs[i].at !== one.at || subs[i].until !== one.until) moved = true;
+          subs[i].at = one.at;
+          subs[i].until = one.until;
+        });
+        if (moved) { paintSubs(); paintCues(); }
+      }
     } catch (error) { /* the lines are still on screen */ }
   }, 400);
 }

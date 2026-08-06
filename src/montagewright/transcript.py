@@ -542,6 +542,9 @@ def describe(
 ) -> tuple[dict[str, Any], Any]:
     """Hear it locally, then have the words corrected against the picture."""
 
+    # Imported here, not at the top: backfill reads Word from this module,
+    # so a module-level import would close the circle.
+    from montagewright.backfill import across_lines, what_was_heard
     from montagewright.planner import (
         MAX_OUTPUT_TOKENS,
         MODEL_ID,
@@ -602,23 +605,35 @@ def describe(
     )
     payload = _parse(interaction, what="transcript")
 
-    # The model heard where the sentences end; the recogniser measured where
-    # the sound stopped. Neither alone puts a cut in the right place.
+    # The model knows the words and where a sentence ends. The recogniser
+    # knows when. Take each from the one that has it: the corrected lines are
+    # aligned back onto the measured per-word clock, and the model's own
+    # timestamps are dropped unread. They were never checkable by looking --
+    # a wrong one and a right one are the same plausible number -- and the
+    # recogniser's are, because it got them from the audio.
+    said = [
+        str(entry.get("text", "")).strip()
+        for entry in payload.get("lines", []) or []
+    ]
+    timings = across_lines(said, words)
+
     lines = []
-    for entry in payload.get("lines", []) or []:
-        try:
-            start = float(entry["starts_seconds"])
-            end = float(entry["ends_seconds"])
-        except (KeyError, TypeError, ValueError):
-            continue
+    for entry, text, (start, end, _) in zip(
+        payload.get("lines", []) or [], said, timings
+    ):
         if end <= start:
             continue
         lines.append({
-            "text": str(entry.get("text", "")).strip(),
-            "heard": str(entry.get("heard", "")).strip(),
+            "text": text,
+            # Not what the model says it heard -- what the recogniser
+            # actually produced across this span. Asked to correct errors
+            # and quote them unchanged in one breath, the model corrects
+            # both: in one interview it reported 髮 where the recogniser
+            # had said 發, erasing the only evidence the field carries.
+            "heard": what_was_heard(words, start, end),
             "speaker": str(entry.get("speaker", "")).strip(),
-            "starts_seconds": round(snap(start, silences), 3),
-            "ends_seconds": round(snap_end(end, silences), 3),
+            "starts_seconds": round(start, 3),
+            "ends_seconds": round(end, 3),
         })
 
     card = {

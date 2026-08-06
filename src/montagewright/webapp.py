@@ -237,6 +237,56 @@ def _subtitle_lines(run, *, edits: bool = True) -> "list":
     )
 
 
+def _retimed(run, kept: list[dict]) -> list[dict]:
+    """Put a person's edits back on the recogniser's clock.
+
+    Someone fixing a caption is fixing the words, and the browser sends back
+    whatever times the line already had. That is right until the edit
+    changes how long the line takes to say -- a product name corrected from
+    three characters to six, a line split in two -- and then the words are
+    right and sit at the wrong moment.
+
+    So the edited text is aligned against the measured per-word timings,
+    exactly as a machine correction is. Whatever a person left alone keeps
+    the timing it was measured with; only what they actually changed moves.
+    Editing a caption should not silently re-time the ones around it.
+
+    If the words are not available -- an older card that never stored
+    them -- the times sent are kept as they are. A caption that does not
+    move is better than one moved by a guess.
+    """
+
+    from montagewright.backfill import across_lines
+    from montagewright.transcript import words_against_cut
+
+    report = run.report() or {}
+    # Narrowly caught on purpose. A card that is missing or unreadable is a
+    # normal thing to meet and means "no measured words here". Anything
+    # else -- a shape that changed under this, a name that moved -- should
+    # come out as a failure, because a broad catch here would turn a broken
+    # re-timing into edits that silently keep whatever times they arrived
+    # with, which looks exactly like working.
+    try:
+        words = words_against_cut(
+            report.get("selection", {}).get("shots", []),
+            report.get("rhythm", {}),
+            _transcript_map(run),
+        )
+    except (OSError, ValueError, KeyError):
+        return kept
+    if not words or not kept:
+        return kept
+
+    timings = across_lines([one["text"] for one in kept], words)
+    out = []
+    for one, (start, end, _) in zip(kept, timings):
+        if end > start:
+            one = dict(one, at=round(start, 3), until=round(end, 3))
+        out.append(one)
+    out.sort(key=lambda one: one["at"])
+    return out
+
+
 def _safe_area_of(report: dict) -> dict:
     from montagewright.subtitles import safe_area
 
@@ -1050,12 +1100,22 @@ def create_app() -> FastAPI:
             if str(one.get("text", "")).strip()
         ]
         kept.sort(key=lambda one: one["at"])
+        kept = _retimed(run, kept)
         destination = run.output / "work" / "subtitles.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(
             json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        return JSONResponse({"lines": len(kept)})
+        # The re-timed lines go back, not just a count. The browser sent the
+        # times the lines used to have; if it keeps them it will draw the
+        # captions at moments the server has already moved them off.
+        return JSONResponse({
+            "lines": len(kept),
+            "timed": [
+                {"at": one["at"], "until": one["until"], "text": one["text"]}
+                for one in kept
+            ],
+        })
 
     @app.post("/api/runs/{run_id}/burn-subtitles")
     def burn_subtitles(
