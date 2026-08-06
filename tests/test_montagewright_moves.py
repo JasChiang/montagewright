@@ -2897,3 +2897,43 @@ def test_final_cut_will_parse_what_we_write() -> None:
         frames = list(one.iter("keyframe"))
         assert len(frames) == 2
         assert all(f.get("time") and f.get("value") for f in frames)
+
+
+def test_the_sequence_format_is_a_shape_not_a_preset_name() -> None:
+    """Final Cut warned that the sequence's format was an unexpected value.
+
+    FFVideoFormat is the prefix Apple gives its built-in presets --
+    FFVideoFormat1080p30 and the like -- so a bare "FFVideoFormat" sent it
+    looking for a preset that does not exist. A custom size does not claim
+    to be a preset; it states its dimensions. And every asset names a format
+    of its own, or Final Cut is left to work out the shape of the media by
+    opening it.
+    """
+
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+
+    from montagewright.executor import CropBox, RenderPlan, Segment, Source
+    from montagewright.timeline import to_fcpxml
+
+    where = Source(source_id="A", path=Path("/rushes/A.mp4"),
+                   duration_seconds=20.0, width=3840, height=2160)
+    made = to_fcpxml(
+        RenderPlan(project_id="p", segments=[
+            Segment(clip_id="k00", source=where, in_seconds=0.0,
+                    out_seconds=2.0,
+                    crop=CropBox(x=0.34, y=0.0, width=0.32, height=1.0)),
+        ]),
+        {}, name="p", width=1080, height=1920,
+    )
+    root = ET.fromstring(made)
+
+    shapes = {one.get("id"): one for one in root.iter("format")}
+    assert all(one.get("name") is None for one in shapes.values())
+    # The sequence's own shape, and one for the media it cuts from.
+    assert shapes["r1"].get("width") == "1080"
+    assert any(one.get("width") == "3840" for one in shapes.values())
+
+    for asset in root.iter("asset"):
+        assert asset.get("format") in shapes, asset.get("id")
+    assert root.find(".//sequence").get("format") in shapes

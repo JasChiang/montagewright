@@ -218,6 +218,11 @@ def to_fcpxml(
     assets: dict[str, str] = {}
     clips: list[str] = []
     cursor = 0.0
+    # One format per distinct source geometry, and the sequence's own. An
+    # asset with no format leaves Final Cut to guess what shape the media
+    # is, which it does by opening the file -- and guesses wrongly when the
+    # file is not where the XML says.
+    shapes: dict[tuple[int, int], str] = {}
 
     for index, segment in enumerate(plan.segments):
         source = segment.source
@@ -231,9 +236,13 @@ def to_fcpxml(
             None,
         )
         if existing is None:
+            shape = (int(source.width), int(source.height))
+            if shape not in shapes:
+                shapes[shape] = f"f{len(shapes) + 1}"
             assets[asset_id] = (
                 f'<asset id="{asset_id}" name="{html.escape(source.path.stem)}" '
                 f'start="0s" hasVideo="1" hasAudio="1" '
+                f'format="{shapes[shape]}" audioSources="1" audioChannels="2" '
                 f'duration="{rational(source.duration_seconds)}">'
                 f'<media-rep kind="original-media" '
                 f'src="{html.escape(source.path.resolve().as_uri())}"/>'
@@ -301,9 +310,22 @@ def to_fcpxml(
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE fcpxml>\n<fcpxml version="1.9"><resources>'
-        f'<format id="r1" name="FFVideoFormat" width="{width}" '
-        f'height="{height}" frameDuration="1001/{fps * 1001}s"/>'
-        f"{''.join(assets.values())}</resources>"
+        # No name. FFVideoFormat is the prefix Apple gives its built-in
+        # presets -- FFVideoFormat1080p30 and the like -- so a bare
+        # "FFVideoFormat" sends Final Cut looking for a preset that does not
+        # exist, and it warns that the sequence's format is an unexpected
+        # value. A custom size does not claim to be a preset; it states its
+        # own dimensions and says what colour it is in.
+        f'<format id="r1" width="{width}" height="{height}" '
+        f'frameDuration="1001/{fps * 1001}s" '
+        f'colorSpace="1-1-1 (Rec. 709)"/>'
+        + "".join(
+            f'<format id="{ident}" width="{shape[0]}" height="{shape[1]}" '
+            f'frameDuration="1001/{fps * 1001}s" '
+            f'colorSpace="1-1-1 (Rec. 709)"/>'
+            for shape, ident in shapes.items()
+        )
+        + f"{''.join(assets.values())}</resources>"
         f'<library><event name="{html.escape(name)}">'
         f'<project name="{html.escape(name)}"><sequence format="r1" '
         f'duration="{rational(cursor)}" tcStart="0s">'
