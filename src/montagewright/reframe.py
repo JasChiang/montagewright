@@ -345,6 +345,30 @@ PLACEMENT: dict[str, float] = {
 }
 
 
+def travel_room(source_aspect: float, target_aspect: float) -> tuple[float, float]:
+    """How far a crop of this aspect can move across this source, per axis.
+
+    Returned as fractions of the source frame, horizontal first. Zero means
+    the crop already spans that axis and a move along it has nowhere to go --
+    which is not a rare corner: delivering 9:16 from 16:9 leaves 0.684 across
+    and exactly nothing vertically, so a tilt is impossible for the whole of
+    the usual case, and delivering an aspect the source already is leaves
+    nothing in either direction.
+
+    The planner is told this for the same reason it is told `push_room`:
+    otherwise it asks for a move nobody can deliver and finds out afterwards,
+    in a degradation, having spent the shot.
+    """
+
+    if source_aspect <= 0 or target_aspect <= 0:
+        return 0.0, 0.0
+    if source_aspect > target_aspect:
+        crop_width, crop_height = target_aspect / source_aspect, 1.0
+    else:
+        crop_width, crop_height = 1.0, source_aspect / target_aspect
+    return max(0.0, 1.0 - crop_width), max(0.0, 1.0 - crop_height)
+
+
 def zoom_budget(
     *,
     source_width: int,

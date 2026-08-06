@@ -653,6 +653,14 @@ class MaterialItem:
     # already tighter, or not push. Not told it, it asks for a move nobody
     # can deliver and finds out afterwards, in a degradation.
     push_room: float = 1.0
+    # How far a crop can travel across this clip, per axis, as a fraction of
+    # the frame. Same argument as push_room, and a sharper one: delivering
+    # 9:16 from 16:9 leaves nothing at all vertically, so `tilt` cannot be
+    # delivered for the whole of the usual case -- and the menu offered it
+    # anyway, with the shortfall arriving as a degradation after the shot had
+    # been spent on it.
+    pan_room: float = 0.0
+    tilt_room: float = 0.0
     action: tuple[str, ...] = ()
     needs: tuple[str, ...] = ()
     # What is said, when, and by whom. A shot chosen out of an interview is
@@ -762,6 +770,21 @@ def _describe_material(material: list[MaterialItem]) -> str:
             facts.append("推近沒有空間：這支的解析度只夠滿版，推了就會糊")
         else:
             facts.append(f"最多推近 {item.push_room:.2f}×")
+        # Which way a move can go at all, before one is chosen. Zero is not a
+        # warning, it is "this move has nowhere to happen".
+        if item.pan_room > 0.02 or item.tilt_room > 0.02:
+            room = []
+            if item.pan_room > 0.02:
+                room.append(f"橫向可移 {item.pan_room:.0%} 畫面寬")
+            else:
+                room.append("橫向沒有空間，pan 做不到")
+            if item.tilt_room > 0.02:
+                room.append(f"縱向可移 {item.tilt_room:.0%} 畫面高")
+            else:
+                room.append("縱向沒有空間，tilt 做不到")
+            facts.append("、".join(room))
+        else:
+            facts.append("這個交付比例下橫向縱向都沒有空間，pan 跟 tilt 都做不到")
         head = f"- {item.source_id}（{'、'.join(facts)}）：{item.summary}"
         if item.action:
             head += "\n    動作：" + "；".join(item.action)

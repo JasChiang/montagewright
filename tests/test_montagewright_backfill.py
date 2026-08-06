@@ -533,3 +533,54 @@ def test_the_prompt_no_longer_carries_a_second_copy_of_the_listing():
     ).read_text(encoding="utf-8")
 
     assert "依序附上影片" not in text
+
+
+# --- a move needs somewhere to happen ------------------------------------
+
+def test_travel_room_is_zero_where_the_crop_already_spans_the_frame():
+    """Delivering 9:16 from 16:9 leaves nothing vertically.
+
+    Which makes `tilt` impossible for the whole of the usual case -- and the
+    menu offered it anyway, the shortfall arriving as a degradation after the
+    shot had been spent.
+    """
+
+    from montagewright.reframe import travel_room
+
+    across, up = travel_room(16 / 9, 1080 / 1920)
+    assert round(across, 3) == 0.684
+    assert up == 0.0
+
+    # And an aspect the source already is has nowhere to go either way.
+    assert travel_room(16 / 9, 16 / 9) == (0.0, 0.0)
+
+    # The axis flips when the source is the tall one.
+    across, up = travel_room(9 / 16, 1920 / 1080)
+    assert across == 0.0 and round(up, 3) == 0.684
+
+
+def test_the_planner_is_told_which_moves_have_nowhere_to_go():
+    from montagewright.planner import MaterialItem, _describe_material
+
+    said = _describe_material([
+        MaterialItem(
+            source_id="a", duration_seconds=10.0, summary="x",
+            push_room=1.5, pan_room=0.684, tilt_room=0.0,
+        )
+    ])
+
+    assert "橫向可移 68%" in said
+    assert "tilt 做不到" in said
+
+
+def test_a_source_already_at_the_delivery_aspect_says_neither_move_works():
+    from montagewright.planner import MaterialItem, _describe_material
+
+    said = _describe_material([
+        MaterialItem(
+            source_id="a", duration_seconds=10.0, summary="x",
+            push_room=1.0, pan_room=0.0, tilt_room=0.0,
+        )
+    ])
+
+    assert "pan 跟 tilt 都做不到" in said

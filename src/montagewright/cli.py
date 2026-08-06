@@ -67,6 +67,26 @@ def _client():
     return genai.Client(api_key=key, http_options=_http_options(types))
 
 
+def _travel(proxy: Path, target_aspect: float) -> tuple[float, float]:
+    """Horizontal and vertical room to move, as fractions of the frame.
+
+    The proxy is fine for this one, unlike `push_room`: this is a question
+    about shape, and the proxy keeps the shape of what it was made from.
+    """
+
+    from montagewright.measure.media import probe_video
+    from montagewright.reframe import travel_room
+
+    try:
+        shape = probe_video(proxy).video
+        wide, tall = int(shape.display_width), int(shape.display_height)
+    except Exception:
+        return 0.0, 0.0
+    if not wide or not tall:
+        return 0.0, 0.0
+    return travel_room(wide / tall, target_aspect)
+
+
 def _push_room(proxy: Path, target_aspect: float) -> float:
     """How far this source can be pushed into, as a zoom factor.
 
@@ -407,6 +427,8 @@ def command_render(args: argparse.Namespace) -> int:
                 push_room=_push_room(
                     originals.get(source_id, proxy), ASPECTS[args.aspect]
                 ),
+                pan_room=_travel(proxy, ASPECTS[args.aspect])[0],
+                tilt_room=_travel(proxy, ASPECTS[args.aspect])[1],
                 action=tuple(
                     f"{beat.what} {beat.starts_seconds:.1f}-{beat.ends_seconds:.1f}s"
                     for beat in action_beats(card or {})[:4]
