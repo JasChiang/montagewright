@@ -390,7 +390,23 @@
   .zoom input[type=range] { width: 110px; accent-color: var(--accent); }
   .vol { display: flex; align-items: center; gap: 7px; }
   .vol input[type=range] { width: 78px; accent-color: var(--accent); }
-  .scroller { overflow-x: auto; overflow-y: hidden; }
+  /* A visible scrollbar. macOS hides its overlay scrollbars until
+     something moves, so a reel wider than the window gave no sign that
+     there was any more of the film to the right of what you could see. */
+  .scroller {
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: var(--dim) var(--sunk);
+  }
+  .scroller::-webkit-scrollbar { height: 11px; }
+  .scroller::-webkit-scrollbar-track {
+    background: var(--sunk); border-top: 1px solid var(--hair);
+  }
+  .scroller::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--dim) 70%, transparent);
+    border-radius: 6px; border: 2px solid var(--sunk);
+  }
+  .scroller::-webkit-scrollbar-thumb:hover { background: var(--soft); }
   /* As wide as the film is long. min-width:100% stretched it to the window
      whenever the cut was shorter than the screen, so the waveform lanes drew
      forty seconds of audio across the full width while the shots -- laid out
@@ -2234,6 +2250,18 @@ $('burn').addEventListener('click', async () => {
     button.textContent = said;
   }
 });
+
+// A wheel across the timeline moves along the film. Vertical wheels with
+// shift held do the same, which is what every editor's hand already does.
+$('scroller').addEventListener('wheel', (e) => {
+  const sc = $('scroller');
+  if (sc.scrollWidth <= sc.clientWidth) return;
+  const by = Math.abs(e.deltaX) > Math.abs(e.deltaY)
+    ? e.deltaX : (e.shiftKey ? e.deltaY : 0);
+  if (!by) return;
+  e.preventDefault();
+  sc.scrollLeft += by;
+}, { passive: false });
 
 $('zoom').addEventListener('input', () => {
   zoomedByHand = true;
