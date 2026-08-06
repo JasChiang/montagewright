@@ -712,3 +712,37 @@ LOOKS: dict[str, Style] = {
 
 def look(name: str) -> Style:
     return LOOKS.get(name, LOOKS["plain"])
+
+
+def fonts_here(lang: str = "zh-tw") -> list[dict]:
+    """Every font on this machine that can set this language.
+
+    Offered so nobody has to type a path. Names come from the font's own
+    name table, which is what the system indexes them by; the path is
+    carried alongside because FreeType can only be handed one of those.
+    """
+
+    try:
+        found = subprocess.run(
+            ["fc-list", "-f", "%{family[0]}\t%{file}\n", f":lang={lang}"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    seen: dict[str, str] = {}
+    for row in found.stdout.splitlines():
+        family, _, path = row.partition("\t")
+        family, path = family.strip(), path.strip()
+        # Names beginning with a dot are the interface variants the system
+        # keeps for itself, and LastResort is the font of last resort --
+        # the one that draws the boxes.
+        if not family or not path or family.startswith("."):
+            continue
+        if "LastResort" in path:
+            continue
+        seen.setdefault(family, path)
+    return [
+        {"family": family, "file": path}
+        for family, path in sorted(seen.items())
+    ]

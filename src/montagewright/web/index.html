@@ -424,6 +424,7 @@
         <option value="speakers">依說話者上色</option>
         <option value="plate">加底色塊</option>
       </select>
+      <select class="hide" id="font"><option value="">系統預設字型</option></select>
       <button class="ghost hide" id="burn">燒進畫面</button>
       <button id="recut" class="hide">重新輸出</button>
     </div>
@@ -519,6 +520,15 @@
             <option value="burn">燒進畫面</option>
             <option value="none">不要字幕</option>
           </select></div>
+        <div class="field"><label>字幕樣式</label>
+          <select id="setup-look">
+            <option value="plain">一般</option>
+            <option value="spoken">講到哪亮到哪</option>
+            <option value="speakers">依說話者上色</option>
+            <option value="plate">加底色塊</option>
+          </select></div>
+        <div class="field"><label>字幕字型</label>
+          <select id="setup-font"><option value="">用系統預設</option></select></div>
         <div class="field"><label>可編輯時間軸</label>
           <select id="timeline">
             <option value="none">事後再產也行</option>
@@ -858,6 +868,7 @@ function paintSubs() {
   const lane = $('lane-subs');
   $('burn').classList.toggle('hide', !subs.length);
   $('look').classList.toggle('hide', !subs.length);
+  $('font').classList.toggle('hide', !subs.length);
   lane.classList.toggle('silent', !subs.length);
   if (!subs.length) {
     lane.innerHTML = '這支片沒有語音，所以沒有字幕';
@@ -1174,6 +1185,25 @@ function showExtras() {
 
 // Start on the invitation, not on an empty editor. Opening a run turns
 // the workspace on; nothing else does.
+// What this machine can set subtitles in. Asked once; a font is not
+// installed halfway through an afternoon.
+(async () => {
+  try {
+    const got = await fetch('/api/fonts');
+    const list = (await got.json()).fonts || [];
+    for (const where of ['font', 'setup-font']) {
+      const box = $(where);
+      if (!box) continue;
+      for (const one of list) {
+        const item = document.createElement('option');
+        item.value = one.file;
+        item.textContent = one.family;
+        box.appendChild(item);
+      }
+    }
+  } catch (error) { /* the default still works */ }
+})();
+
 showWorkspace(false);
 loadPast();
 
@@ -1198,6 +1228,8 @@ $('go').addEventListener('click', async () => {
   body.append('review', $('review').checked ? 'true' : 'false');
   body.append('timeline', $('timeline').value);
   body.append('subtitles', $('subtitles').value);
+  body.append('subtitle_look', $('setup-look').value);
+  body.append('subtitle_font', $('setup-font').value);
 
   $('go').disabled = true;
   $('veil').classList.remove('hide');
@@ -1607,7 +1639,8 @@ $('burn').addEventListener('click', async () => {
   button.textContent = '燒進畫面中…';
   try {
     const got = await fetch(
-      `/api/runs/${runId}/burn-subtitles?look=${$('look').value}`,
+      `/api/runs/${runId}/burn-subtitles?look=${$('look').value}`
+      + `&font=${encodeURIComponent($('font').value)}`,
       { method: 'POST' },
     );
     const answer = await got.json();

@@ -288,6 +288,8 @@ def create_app() -> FastAPI:
         timeline: str = Form("none"),
         speech: str = Form("auto"),
         subtitles: str = Form("sidecar"),
+        subtitle_look: str = Form("plain"),
+        subtitle_font: str = Form(""),
         locale: str = Form("zh-TW"),
     ) -> JSONResponse:
         if aspect not in ASPECTS:
@@ -387,6 +389,10 @@ def create_app() -> FastAPI:
             command += ["--timeline", timeline]
         if subtitles in {"none", "sidecar", "burn"}:
             command += ["--subtitles", subtitles]
+        if subtitle_look in {"plain", "speakers", "spoken", "plate"}:
+            command += ["--subtitle-look", subtitle_look]
+        if subtitle_font and Path(subtitle_font).exists():
+            command += ["--subtitle-font", subtitle_font]
         checkpoint = Path("artifacts/models/sam2.1_hiera_tiny.pt").resolve()
         if checkpoint.exists():
             command += ["--sam-checkpoint", str(checkpoint)]
@@ -917,6 +923,18 @@ def create_app() -> FastAPI:
             filename=f"{run_id}.{suffix}",
         )
 
+    @app.get("/api/fonts")
+    def fonts(lang: str = "zh-tw") -> JSONResponse:
+        """What this machine can set subtitles in.
+
+        A flag on the command line is a flag most people never find, and
+        typing a path to a font is worse than that.
+        """
+
+        from montagewright.subtitles import fonts_here
+
+        return JSONResponse({"fonts": fonts_here(lang)})
+
     @app.get("/api/runs/{run_id}/subtitle-track")
     def subtitle_track(run_id: str) -> JSONResponse:
         """The subtitles as a track, so they can be read against the picture.
@@ -983,7 +1001,9 @@ def create_app() -> FastAPI:
         return JSONResponse({"lines": len(kept)})
 
     @app.post("/api/runs/{run_id}/burn-subtitles")
-    def burn_subtitles(run_id: str, look: str = "plain") -> JSONResponse:
+    def burn_subtitles(
+        run_id: str, look: str = "plain", font: str = ""
+    ) -> JSONResponse:
         """Put the words on the picture, using the lines as they now read.
 
         Costs nothing: the transcript was paid for once and the corrections
@@ -992,6 +1012,7 @@ def create_app() -> FastAPI:
         one gets posted is not this tool's decision.
         """
 
+        from montagewright import subtitles as typeset
         from montagewright.subtitles import NoFontHere, burn
         from montagewright.subtitles import look as looks_like
 
@@ -1010,6 +1031,8 @@ def create_app() -> FastAPI:
         if source is None:
             raise HTTPException(404, "this run has no finished cut")
         aspect = (run.report() or {}).get("direction", {}).get("aspect", "9:16")
+        # Set for this render only; the next one asks again.
+        was, typeset.CHOSEN = typeset.CHOSEN, (font or None)
         try:
             made = burn(
                 source, said, run.output / "deliverable-subtitled.mp4",
@@ -1018,6 +1041,8 @@ def create_app() -> FastAPI:
             )
         except NoFontHere as error:
             raise HTTPException(422, str(error))
+        finally:
+            typeset.CHOSEN = was
         return JSONResponse({
             "file": made.name, "lines": len(said), "aspect": aspect,
             "look": look,

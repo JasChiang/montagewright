@@ -2625,3 +2625,43 @@ def test_a_cue_fills_at_the_speed_it_was_actually_said() -> None:
     assert marks[-1][0] == len(said)
     # Nothing measurable in this window: draw it in one piece.
     assert spans_in(said, words, 90.0, 95.0) == []
+
+
+def test_the_interface_offers_the_fonts_this_machine_has() -> None:
+    """A flag on the command line is a flag most people never find, and
+    typing a path to a font file is worse than that."""
+
+    from pathlib import Path
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    # Both places a subtitle gets set: before a run, and when burning one.
+    assert 'id="setup-font"' in page and 'id="font"' in page
+    assert 'id="setup-look"' in page and 'id="look"' in page
+    assert "fetch('/api/fonts')" in page
+    assert "body.append('subtitle_font'" in page
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "webapp.py"
+    ).read_text(encoding="utf-8")
+    assert '@app.get("/api/fonts")' in source
+    assert 'command += ["--subtitle-font", subtitle_font]' in source
+    # A chosen font applies to one render and does not leak into the next.
+    assert "was, typeset.CHOSEN = typeset.CHOSEN, (font or None)" in source
+    assert "typeset.CHOSEN = was" in source
+
+
+def test_the_font_list_leaves_out_what_nobody_should_pick() -> None:
+    """LastResort is the font that draws the boxes, and the dotted names
+    are interface variants the system keeps for itself."""
+
+    from montagewright.subtitles import fonts_here
+
+    found = fonts_here()
+    if not found:
+        return  # no fontconfig on this machine; nothing to check
+    assert all(not one["family"].startswith(".") for one in found)
+    assert all("LastResort" not in one["file"] for one in found)
+    assert len({one["family"] for one in found}) == len(found)
