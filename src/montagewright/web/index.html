@@ -34,7 +34,13 @@
   ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
 
-  .app { display: grid; grid-template-rows: var(--rail) 1fr auto; height: 100%; }
+  .app {
+    display: grid; grid-template-rows: var(--rail) 1fr 5px var(--reel, auto);
+    height: 100%;
+  }
+  .reelwrap { min-height: 0; overflow: hidden; display: flex;
+              flex-direction: column; }
+  .reelwrap .scroller { flex: 1; min-height: 0; }
 
   /* toolbar */
   .bar {
@@ -84,8 +90,34 @@
     border-radius: 12px; padding: 4px 16px 8px;
     box-shadow: 0 10px 34px rgba(0,0,0,.16);
   }
-  .cold-past table { font-size: 12.5px; }
-  .cold-past td, .cold-past th { padding: 8px 8px; }
+  .cold-past .folder {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    padding: 16px 4px 10px;
+  }
+  .cold-past .folder h3 { margin: 0; font-size: 14px; }
+  .cold-past .folder + .cuts { margin-bottom: 6px; }
+  .cuts {
+    display: grid; gap: 10px;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  }
+  .cut {
+    display: flex; gap: 10px; align-items: center; text-decoration: none;
+    color: inherit; padding: 8px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--sunk);
+    transition: border-color .12s, transform .12s;
+  }
+  .cut:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .cut.bad { opacity: .72; }
+  .cut .poster {
+    width: 46px; height: 62px; border-radius: 6px; overflow: hidden;
+    background: var(--deep); flex: 0 0 auto; display: grid;
+    place-items: center;
+  }
+  .cut .poster img { width: 100%; height: 100%; object-fit: cover; }
+  .cut .poster .none { font-size: 10px; color: var(--dim); text-align: center; }
+  .cut .lines { min-width: 0; }
+  .cut .big { font-size: 14px; font-weight: 600; }
+  .cut .why { font-size: 11.5px; }
   .cold-past:empty { display: none; }
 
   /* The shape an editing application has had for thirty years, because it
@@ -103,13 +135,27 @@
   /* Somewhere to take hold of. Every panel in an editing application is
      resizable because no two people weigh the picture against the paperwork
      the same way. */
+  /* Five pixels of hairline is a thing nobody can find. A divider needs to
+     look like something you may take hold of, and to forgive a few pixels
+     of aim. */
   .grip {
     background: var(--line); cursor: col-resize; position: relative;
+    transition: background .12s;
   }
-  .grip::after {
-    content: ''; position: absolute; inset: 0 -3px; z-index: 5;
+  .grip::after { content: ''; position: absolute; inset: 0 -5px; z-index: 20; }
+  .grip::before {
+    content: ''; position: absolute; left: 50%; top: 50%; z-index: 21;
+    width: 3px; height: 30px; margin: -15px 0 0 -1.5px; border-radius: 2px;
+    background: var(--dim); opacity: .55;
   }
   .grip:hover, .grip.holding { background: var(--accent); }
+  .grip:hover::before, .grip.holding::before { background: #fff; opacity: 1; }
+
+  .grip.flat { cursor: row-resize; height: 5px; width: auto; }
+  .grip.flat::after { inset: -5px 0; }
+  .grip.flat::before {
+    width: 30px; height: 3px; margin: -1.5px 0 0 -15px;
+  }
   .work > * { min-width: 0; min-height: 0; }
   .stage { display: grid; min-height: 0; min-width: 0; }
   @media (max-width: 1100px) {
@@ -237,14 +283,14 @@
   /* A shot is recognised by its picture. A column of filenames is not how
      anybody knows which take is which. */
   .shotcard {
-    padding: 10px 8px; border-radius: 9px; cursor: pointer;
-    border: 1px solid transparent; margin-bottom: 2px;
+    padding: 12px 10px; border-radius: 10px; cursor: pointer;
+    border: 1px solid transparent; margin-bottom: 4px;
   }
   .shotcard:hover { background: var(--sunk); }
   .shotcard.on { background: var(--sunk); border-color: var(--line); }
   .shotcard .head { display: flex; gap: 10px; align-items: flex-start; }
   .shotcard .thumb {
-    width: 52px; height: 68px; object-fit: cover; border-radius: 5px;
+    width: 74px; height: 96px; object-fit: cover; border-radius: 6px;
     background: var(--deep); flex: 0 0 auto;
     box-shadow: 0 1px 3px rgba(0,0,0,.28);
   }
@@ -270,8 +316,8 @@
   /* Two lines of reasoning, then a click. A paragraph per shot is what
      turned twelve shots into something to scroll past. */
   .line2 {
-    margin-top: 4px; overflow: hidden; display: -webkit-box;
-    -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    margin-top: 7px; overflow: hidden; display: -webkit-box;
+    -webkit-line-clamp: 3; -webkit-box-orient: vertical;
   }
   .opener {
     font-size: 11.5px; color: var(--dim); background: none;
@@ -632,7 +678,9 @@
     </aside>
   </div>
 
-  <div class="reelwrap">
+  <div class="grip flat" id="grip-reel" title="拖動調整時間軸高度"></div>
+
+  <div class="reelwrap" id="reelwrap">
     <div class="reelbar">
       <button class="bare" id="play">▶︎</button>
       <span class="mono" id="clock">0:00 / 0:00</span>
@@ -873,10 +921,48 @@ async function loadPast() {
       document.querySelector(`.tab[data-pane="${id}"]`).classList.add('hide');
     }
     showTab('pane-past');
-    $('cold-past').innerHTML =
-      '<table>' + $('past-table').innerHTML + '</table>';
+    $('cold-past').innerHTML = coldCards(data.runs);
     wirePast($('cold-past'));
   }
+}
+
+// A project chooser, the way an editing application opens: each cut as a
+// card carrying its own first frame. A table of timestamps and numbers is
+// a spreadsheet, and it makes every cut look like every other one.
+function coldCards(runs) {
+  const bySource = new Map();
+  for (const r of runs) {
+    const key = r.source_path || r.source || '（未知）';
+    if (!bySource.has(key)) bySource.set(key, []);
+    bySource.get(key).push(r);
+  }
+  const out = [];
+  for (const [where, made] of bySource) {
+    out.push(`<div class="folder">
+      <h3>${esc(where.split('/').pop())}</h3>
+      <span class="why">${esc(where)}</span>
+    </div><div class="cuts">` + made.map(r => {
+      const when = new Date(r.started_at * 1000).toLocaleString('zh-TW',
+        {month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit'});
+      const bad = r.state !== 'done';
+      return `<a class="cut ${bad ? 'bad' : ''}" href="#"
+         data-open="${r.run_id}" data-where="${esc(where.split('/').pop())}">
+        <div class="poster">${r.seconds
+          ? `<img loading="lazy" alt="" src="/api/runs/${r.run_id}/thumb/0">`
+          : `<span class="none">${({running:'執行中', failed:'失敗',
+              stopped:'已停止', interrupted:'中斷'})[r.state] || '沒有畫面'}</span>`}
+        </div>
+        <div class="lines">
+          <div class="big">${r.seconds ? r.seconds.toFixed(1) + 's' : '—'}
+            <span class="why">${r.shots ? `　${r.shots} 顆` : ''}</span></div>
+          <div class="why">${when}${
+            r.spend != null ? `　·　$${r.spend.toFixed(2)}` : ''}</div>
+          ${r.delivered != null ? `<div class="why">逐顆通過 ${r.delivered}/${r.shots}</div>` : ''}
+        </div>
+      </a>`;
+    }).join('') + '</div>');
+  }
+  return out.join('');
 }
 
 // The open links work wherever the table is shown.
@@ -1740,6 +1826,31 @@ function emptyRow(cols, said) {
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+
+// How tall the timeline is, dragged from the line above it.
+{
+  const kept = localStorage.getItem('mw---reel');
+  if (kept) document.documentElement.style.setProperty('--reel', kept);
+  $('grip-reel').addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    $('grip-reel').classList.add('holding');
+    const move = (ev) => {
+      const tall = Math.max(120, Math.min(
+        innerHeight - ev.clientY, innerHeight * 0.7));
+      const held = `${Math.round(tall)}px`;
+      document.documentElement.style.setProperty('--reel', held);
+      localStorage.setItem('mw---reel', held);
+    };
+    const up = () => {
+      $('grip-reel').classList.remove('holding');
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      forgetPlacement(); drawCrop(); showBurnt();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
 
 // Column widths are the reader's, not mine, and they survive a reload.
 for (const [grip, which, side] of [
