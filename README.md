@@ -16,7 +16,36 @@ montagewright-web                         # 同一件事，網頁上看得到過
 
 如果有人想研究 AI 剪輯但沒什麼頭緒，這裡是我把雲端跟地端接起來的做法。整套東西的判斷只有一句話：看得懂才答得出來的問題交給模型，要量才知道的問題交給程式。
 
-畫面這邊，先把毛片壓成 proxy 讓 Gemini 整支連聲音看完，寫成一張 Clip Card，記下這顆拍到什麼、可以框住的東西在哪、什麼動作發生在第幾秒。卡片刻意不看 brief，所以只要素材沒變就一直有效，同一批素材想剪成別的主題不用再重看一遍。要重新構圖成 9:16 的話，再用 Gemini 的物件偵測抽幾張靜幀問「左邊那台深色手機」在哪，然後把那個框交給 SAM 2.1 往前後傳播，追出每一幀的位置。哪一台是深色的是語意問題，它在第幾格的哪裡是幾何問題，剛好各自交給擅長的那一邊。
+畫面這邊，先把毛片壓成 proxy 讓 Gemini 整支連聲音看完，寫成一張 Clip Card。實際長這樣（省略了幾筆）：
+
+```jsonc
+{
+  "summary": "Cameras pan horizontally back and forth showing standing foldable phones (white and purple) against a white background.",
+  "composition": "horizontal",        // 內容橫向鋪開，會跟直式裁切打架
+  "usable_from_seconds": 0.0,
+  "usable_to_seconds": 27.2,          // 開頭在甩、結尾鏡頭移開的部分不算
+  "speech": "ambient",                // 不是 content，所以不會去做逐字稿
+  "camera_moves": true,
+  "camera_motion": "左右平移展示白與紫色兩款對折手機機背鏡頭模組與鉸鏈細節",
+  "subjects": [
+    { "label": "the white foldable phone",
+      "centre_x": 0.65, "centre_y": 0.52, "width": 0.45, "height": 0.9,
+      "moves": true, "at_seconds": 2.0 },
+    { "label": "the purple foldable phone", ... }
+  ],
+  "action": [
+    { "what": "the camera pans right showing the purple phone",
+      "starts_seconds": 2.5, "ends_seconds": 4.5 }, ...
+  ],
+  "needs": [
+    { "what": "crop", "why": "畫面左側有大量留白，若要進行直式構圖或聚焦產品需重新裁切置中" }
+  ]
+}
+```
+
+有幾個欄位是踩過坑之後才加的。`camera_motion` 是因為素材自己在動的時候，再疊一層數位運鏡兩邊會打架，不如框住不動讓它演完。`speech` 決定要不要為這支付一次逐字稿的錢，判準是「這顆的意思靠不靠聲音成立」，不是「有沒有人在講話」。主體的 `label` 一定要能跟旁邊長得像的東西分開（「左邊那台白色的」而不是「那台手機」），`at_seconds` 則是記下這個框是看第幾秒說的 —— 東西在動的時候，位置只在那一刻成立。
+
+卡片刻意不看 brief，所以只要素材沒變就一直有效，同一批素材想剪成別的主題不用再重看一遍。要重新構圖成 9:16 的話，再用 Gemini 的物件偵測抽幾張靜幀問「左邊那台深色手機」在哪，然後把那個框交給 SAM 2.1 往前後傳播，追出每一幀的位置。哪一台是深色的是語意問題，它在第幾格的哪裡是幾何問題，剛好各自交給擅長的那一邊。
 
 聲音也是同一個道理：時間要量，文字要懂。Apple SpeechTranscriber 每個字都有自己的起訖時間，但中文常常聽錯；Gemini 聽得懂，可是給不出可以核對的秒數，畢竟時間戳這種東西錯的跟對的長得一模一樣。所以我讓 Gemini 獨立看一次影片給一份逐字稿，再把正確的字回填到辨識器量到的時間上去，模型自己報的秒數一律不採用。
 
@@ -109,7 +138,9 @@ montagewright render ~/rushes --aspect 9:16 --output ~/cut
 | 5 分半街訪，含逐字稿與重新規劃 | 13 | 48.6s | **$0.81** |
 | 同一支再剪一次 | 16 | 46.1s | **$0.46** |
 
-第一次最貴，之後就便宜很多。卡片、逐字稿跟 proxy 都是用檔案內容的 hash 快取的，同一批素材再剪第二支不用重付，也不用重新編碼。
+第一次最貴，之後就便宜很多，因為卡片跟逐字稿都是用檔案內容的 hash 快取的，素材沒變就整個階段跳過，proxy 也不用重新編碼。
+
+上傳的檔案另外用 Gemini File API 存 48 小時，同樣以內容 hash 當 key，所以第二次規劃呼叫不用重傳（實測 76 秒對上第一次的 600 秒）。不過省下來的是傳輸時間而不是 token —— 定調跟選片每次都會把那些 proxy 重看一遍，input token 照算。
 
 ## 網頁介面
 
