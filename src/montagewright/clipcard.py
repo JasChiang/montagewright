@@ -383,6 +383,139 @@ def find_subject(card: dict[str, Any], description: str) -> SubjectBox | None:
     return None
 
 
+def clip_seconds(path: Path) -> float:
+    """How long this clip is, measured rather than asked about."""
+
+    import subprocess
+
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(out.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def _as_mmss(value: float) -> float | None:
+    """Read a number back as the MM:SS it was probably written from.
+
+    `1:53` comes back either as `1.53` or as `153`, depending on whether the
+    colon became a decimal point or vanished. Both are recoverable, and both
+    are only worth trying when the plain reading has already failed.
+    """
+
+    for minutes, seconds in (
+        (int(value), round((value - int(value)) * 100)),   # 1.53 -> 1m 53s
+        (int(value) // 100, int(value) % 100),             # 110  -> 1m 10s
+    ):
+        if 0 < minutes < 60 and 0 <= seconds < 60:
+            return minutes * 60 + seconds
+    return None
+
+
+def times_on_receipt(card: dict[str, Any], duration: float) -> dict[str, Any]:
+    """Put the card's seconds back on a clock that matches the file.
+
+    Gemini reads video in MM:SS, and the card asks for plain seconds -- so on
+    any clip past a minute the two notations collide. Both clips over a minute
+    in this library came back wrong, in opposite directions: a 71.1s take said
+    `usable_to: 110.0`, which is 1:10 with the colon dropped, and a 113.4s take
+    said `usable_to: 1.53`, which is 1:53 with the colon turned into a decimal
+    point. The second is the dangerous one, because 1.53 is smaller than the
+    duration and so passes every range check while claiming a two-minute take
+    is usable for a second and a half.
+
+    This is the same shape as the subject boxes arriving in 0..1000 space
+    whatever the field says, and it gets the same treatment: the model answers
+    in its own units, and the conversion happens here, against a duration that
+    was measured locally rather than asked for.
+
+    Anything still out of range afterwards is dropped rather than clamped. A
+    missing action is a static shot, which is a fine thing to be; an action at
+    a wrong second puts a cut in the wrong place.
+    """
+
+    if duration <= 0:
+        return card
+
+    def readings(value: Any) -> list[float]:
+        """Every way of reading this number that lands inside the clip.
+
+        Plain seconds first, so an unambiguous number keeps its obvious
+        meaning and only a number that cannot be what it says gets reread.
+        """
+
+        try:
+            plain = float(value)
+        except (TypeError, ValueError):
+            return []
+        out = []
+        if 0 <= plain <= duration + 0.5:
+            out.append(min(plain, duration))
+        again = _as_mmss(plain)
+        if again is not None and again <= duration + 0.5 and again not in out:
+            out.append(min(again, duration))
+        return out
+
+    def span(
+        raw_start: Any, raw_end: Any, least: float
+    ) -> tuple[float, float] | None:
+        """The start and end of one interval, read the same way at both ends.
+
+        A span is what makes the notation visible: 1.1 and 1.13 are both
+        readable as plain seconds, and read that way they describe a
+        thirty-millisecond action, which is not a thing that happens. Read as
+        MM:SS they are 1:10 to 1:13, which is. So the readings are scored
+        together, mixed ones are penalised, and a degenerate span loses to a
+        real one -- but if the plain reading is the only one available it is
+        kept whatever its length, because a genuinely short window is the
+        model's to report.
+        """
+
+        starts = readings(raw_start) or [0.0]
+        ends = readings(raw_end)
+        pairs = [
+            ((i != j, max(i, j), i + j), s, e)
+            for i, s in enumerate(starts)
+            for j, e in enumerate(ends)
+            if e > s
+        ]
+        if not pairs:
+            return None
+        real = [one for one in pairs if one[2] - one[1] >= least]
+        return min(real or pairs)[1:]
+
+    # A usable window is judged against the clip: a couple of seconds out of
+    # two minutes is the shape MM:SS-as-a-decimal leaves behind.
+    window = span(
+        card.get("usable_from_seconds"),
+        card.get("usable_to_seconds"),
+        max(1.0, duration * 0.1),
+    ) or (0.0, duration)
+    card["usable_from_seconds"] = round(window[0], 3)
+    card["usable_to_seconds"] = round(window[1], 3)
+
+    kept = []
+    for beat in card.get("action") or []:
+        # The same floor `action_beats` uses. Below it a beat cannot place a
+        # cut anyway, so there is nothing to preserve by keeping it.
+        found = span(beat.get("starts_seconds"), beat.get("ends_seconds"), 0.25)
+        if found is None:
+            continue
+        kept.append(
+            dict(beat, starts_seconds=round(found[0], 3), ends_seconds=round(found[1], 3))
+        )
+    card["action"] = kept
+
+    for subject in card.get("subjects") or []:
+        found = readings(subject.get("at_seconds"))
+        subject["at_seconds"] = round(found[0] if found else 0.0, 3)
+    return card
+
+
 def describe_clip(
     proxy: Path,
     *,
@@ -402,6 +535,20 @@ def describe_clip(
 
     prompts = Path(__file__).resolve().parent / "prompts"
     instruction = (prompts / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
+
+    # The card asks for "the whole length" without ever saying what it is, and
+    # the model reads video in MM:SS -- so it was converting a notation it was
+    # never told to convert, against a total it had to guess. Both are stated
+    # here now, and checked again on receipt.
+    duration = clip_seconds(proxy)
+    if duration > 0:
+        instruction += (
+            f"\n\n## 這支素材的長度\n\n"
+            f"{duration:.1f} 秒（也就是 {int(duration) // 60}:"
+            f"{duration - 60 * (int(duration) // 60):04.1f}）。\n"
+            f"所有秒數欄位都要填**從頭算起的純秒數**，不要用「分:秒」。"
+            f"例如 1 分 53 秒要寫 113.0，不能寫 1.53 也不能寫 153。\n"
+        )
 
     if cache is None:
         uploaded = upload_now(proxy, client)
@@ -431,6 +578,7 @@ def describe_clip(
     # The model answers boxes in its native 0..1000 space for some clips
     # whatever the field says, so the conversion happens on receipt.
     card["subjects"] = _to_frame_fractions(card.get("subjects", []))
+    card = times_on_receipt(card, duration)
     return card, Usage.from_interaction(interaction)
 
 

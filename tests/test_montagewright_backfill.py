@@ -177,3 +177,99 @@ def test_an_edit_saved_from_the_browser_comes_back_on_the_measured_clock(
         web.RUNS_ROOT = was
         web._transcript_map = held
         web.RUNS.pop("r1", None)
+
+
+# --- Gemini reads video in MM:SS; the card asks for seconds ---------------
+
+def _card(**over):
+    base = {
+        "usable_from_seconds": 0.0, "usable_to_seconds": 10.0,
+        "action": [], "subjects": [],
+    }
+    base.update(over)
+    return base
+
+
+def test_a_colon_that_became_a_decimal_point_is_read_back():
+    """1:53 arrived as 1.53 on a clip lasting 113.4 seconds.
+
+    The dangerous case: 1.53 is inside the clip, so it passes every range
+    check while claiming a two-minute take is usable for a second and a half.
+    """
+
+    from montagewright.clipcard import times_on_receipt
+
+    got = times_on_receipt(_card(usable_to_seconds=1.53), 113.4)
+
+    assert got["usable_to_seconds"] == 113.0
+
+
+def test_a_colon_that_vanished_is_read_back():
+    # 1:10 arrived as 110 on a clip lasting 71.1 seconds.
+    from montagewright.clipcard import times_on_receipt
+
+    got = times_on_receipt(_card(usable_to_seconds=110.0), 71.1)
+
+    assert got["usable_to_seconds"] == 70.0
+
+
+def test_both_ends_of_an_action_are_read_the_same_way():
+    # 1.1 and 1.13 are each readable as plain seconds, and read that way they
+    # describe a 30ms action. Read as MM:SS they are 1:10 to 1:13.
+    from montagewright.clipcard import times_on_receipt
+
+    got = times_on_receipt(
+        _card(action=[{"what": "x", "starts_seconds": 1.1, "ends_seconds": 1.13}]),
+        113.4,
+    )
+
+    assert [(a["starts_seconds"], a["ends_seconds"]) for a in got["action"]] == [
+        (70.0, 73.0)
+    ]
+
+
+def test_a_clip_that_never_had_the_problem_is_left_alone():
+    from montagewright.clipcard import times_on_receipt
+
+    was = _card(
+        usable_to_seconds=27.2,
+        action=[{"what": "x", "starts_seconds": 2.5, "ends_seconds": 4.5}],
+        subjects=[{"label": "x", "at_seconds": 2.0}],
+    )
+
+    got = times_on_receipt(dict(was), 27.2)
+
+    assert got["usable_from_seconds"] == 0.0 and got["usable_to_seconds"] == 27.2
+    assert got["action"] == was["action"]
+
+
+def test_a_genuinely_short_window_is_the_models_to_report():
+    # Five usable seconds out of a hundred is a strong claim, but it is a
+    # claim -- and 5.0 has no MM:SS reading that lands inside the clip, so
+    # there is nothing to prefer over it.
+    from montagewright.clipcard import times_on_receipt
+
+    got = times_on_receipt(_card(usable_to_seconds=5.0), 100.0)
+
+    assert got["usable_to_seconds"] == 5.0
+
+
+def test_an_action_that_cannot_be_read_into_the_clip_is_dropped():
+    # Not clamped. A missing action is a static shot, which is a fine thing
+    # to be; an action at a wrong second puts a cut in the wrong place.
+    from montagewright.clipcard import times_on_receipt
+
+    got = times_on_receipt(
+        _card(action=[{"what": "x", "starts_seconds": 400.0, "ends_seconds": 480.0}]),
+        30.0,
+    )
+
+    assert got["action"] == []
+
+
+def test_a_clip_whose_length_is_unknown_is_not_second_guessed():
+    from montagewright.clipcard import times_on_receipt
+
+    was = _card(usable_to_seconds=1.53)
+
+    assert times_on_receipt(dict(was), 0.0) == was
