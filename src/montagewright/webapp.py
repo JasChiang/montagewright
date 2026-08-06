@@ -235,6 +235,18 @@ def _subtitle_lines(run, *, edits: bool = True) -> "list":
     )
 
 
+def _safe_area_of(report: dict) -> dict:
+    from montagewright.subtitles import safe_area
+
+    area = safe_area(report.get("direction", {}).get("aspect", "9:16"))
+    return {
+        "up_from_bottom": area.up_from_bottom,
+        "side_margin": area.side_margin,
+        "text_height": area.text_height,
+        "max_lines": area.max_lines,
+    }
+
+
 class _AlreadyHave(Exception):
     """The run recorded its crops, so there is nothing to rebuild."""
 
@@ -656,6 +668,10 @@ def create_app() -> FastAPI:
             # the same shape as evidence, and this view exists to be
             # evidence -- so it has to say which it is holding.
             "crops_are": "recorded" if recorded else "rebuilt",
+            # The same band the burn uses. The preview draws subtitles over
+            # the picture so they can be corrected against it, and a second
+            # opinion about where they sit would make that preview a lie.
+            "safe_area": _safe_area_of(report),
         })
 
     def _rebuild(run: Run, wanted: list[dict] | None = None):
@@ -924,7 +940,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/fonts")
-    def fonts(lang: str = "zh-tw") -> JSONResponse:
+    def fonts(lang: str = "", run_id: str = "") -> JSONResponse:
         """What this machine can set subtitles in.
 
         A flag on the command line is a flag most people never find, and
@@ -933,7 +949,26 @@ def create_app() -> FastAPI:
 
         from montagewright.subtitles import fonts_here
 
-        return JSONResponse({"fonts": fonts_here(lang)})
+        # The language of the cut, not the language this was written in.
+        # Asking for Chinese faces while somebody cuts a Japanese interview
+        # hands them a list with nothing they want in it.
+        if not lang and run_id:
+            run = RUNS.get(run_id)
+            if run is not None:
+                lang = next(
+                    (
+                        str(card.get("language") or "")
+                        for card in _transcript_map(run).values()
+                        if card.get("language")
+                    ),
+                    "",
+                )
+                if not lang and "--locale" in run.command:
+                    lang = run.command[run.command.index("--locale") + 1]
+        return JSONResponse({
+            "lang": lang or "zh-tw",
+            "fonts": fonts_here(lang or "zh-tw"),
+        })
 
     @app.get("/api/runs/{run_id}/subtitle-track")
     def subtitle_track(run_id: str) -> JSONResponse:

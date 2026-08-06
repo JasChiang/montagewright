@@ -2639,7 +2639,7 @@ def test_the_interface_offers_the_fonts_this_machine_has() -> None:
     # Both places a subtitle gets set: before a run, and when burning one.
     assert 'id="setup-font"' in page and 'id="font"' in page
     assert 'id="setup-look"' in page and 'id="look"' in page
-    assert "fetch('/api/fonts')" in page
+    assert "'/api/fonts'" in page and "function loadFonts(" in page
     assert "body.append('subtitle_font'" in page
 
     source = (
@@ -2665,3 +2665,57 @@ def test_the_font_list_leaves_out_what_nobody_should_pick() -> None:
     assert all(not one["family"].startswith(".") for one in found)
     assert all("LastResort" not in one["file"] for one in found)
     assert len({one["family"] for one in found}) == len(found)
+
+
+def test_the_preview_places_subtitles_where_the_burn_will() -> None:
+    """Correcting wording without seeing it in place is guessing.
+
+    So the player draws each cue over the picture as it plays -- and it is
+    driven by the band the render actually uses, sent with the timeline. A
+    second opinion about where the words sit would make the preview a lie
+    about the thing it exists to preview.
+    """
+
+    from pathlib import Path
+
+    from montagewright.subtitles import safe_area
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert 'id="burnt"' in page and "function showBurnt(" in page
+    # The client reads the server's numbers rather than keeping its own.
+    assert "safeArea = data.safe_area" in page
+    for field in ("side_margin", "text_height", "up_from_bottom"):
+        assert f"safeArea.{field}" in page
+    # Nothing is placed against an element that has not loaded: before
+    # metadata it is 300x150, which set a whole line at four pixels.
+    assert "if (!video.videoWidth) { box.classList.add('hide'); return; }" in page
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "webapp.py"
+    ).read_text(encoding="utf-8")
+    assert '"safe_area": _safe_area_of(report)' in source
+
+    # And the numbers it sends are the ones the burn is built from.
+    from montagewright.webapp import _safe_area_of
+
+    for aspect in ("9:16", "16:9", "1:1", "4:5"):
+        sent = _safe_area_of({"direction": {"aspect": aspect}})
+        band = safe_area(aspect)
+        assert sent["up_from_bottom"] == band.up_from_bottom
+        assert sent["side_margin"] == band.side_margin
+        assert sent["text_height"] == band.text_height
+
+
+def test_the_font_list_follows_the_language_of_the_cut() -> None:
+    """Offering Chinese faces to somebody cutting a Japanese interview is a
+    list with nothing they want in it."""
+
+    from montagewright.subtitles import fonts_here
+
+    chinese = {one["family"] for one in fonts_here("zh-tw")}
+    japanese = {one["family"] for one in fonts_here("ja")}
+    if not chinese or not japanese:
+        return  # no fontconfig here
+    assert chinese != japanese

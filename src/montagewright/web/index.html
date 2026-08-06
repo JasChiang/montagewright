@@ -102,6 +102,19 @@
     max-width: 100%; max-height: 100%; width: auto; height: auto;
     border-radius: 6px; background: #000; display: block; object-fit: contain;
   }
+  /* The subtitle as it will be burned, over the picture it will be burned
+     onto. Correcting wording without seeing it in place is guessing at how
+     much room it takes and whether it lands on somebody's face. */
+  .burnt {
+    position: absolute; z-index: 4; text-align: center;
+    pointer-events: none; color: #fff; font-weight: 600;
+    line-height: 1.34; white-space: pre-wrap;
+    text-shadow:
+      0 0 3px rgba(0,0,0,.9), 0 0 3px rgba(0,0,0,.9),
+      1px 1px 0 rgba(0,0,0,.85), -1px -1px 0 rgba(0,0,0,.85),
+      1px -1px 0 rgba(0,0,0,.85), -1px 1px 0 rgba(0,0,0,.85);
+  }
+
   .cropbox {
     position: absolute; border: 1.5px solid var(--accent); border-radius: 2px;
     box-shadow: 0 0 0 9999px rgba(16,15,13,.55); pointer-events: none;
@@ -395,6 +408,7 @@
         <video id="video" playsinline></video>
         <video id="raw-video" playsinline muted preload="auto" class="hide"></video>
         <div class="cropbox hide" id="cropbox"></div>
+        <div class="burnt hide" id="burnt"></div>
       </div>
       <div class="warn hide" id="crop-warn">這一輪沒有留下裁切紀錄，框是事後從素材卡重算的，不等於實際裁切</div>
       <div class="peek">
@@ -769,6 +783,7 @@ async function showStrip() {
   // shot's reasoning and the recut asked to re-cut the wrong take.
   blocks = data.blocks;
   cropsAre = data.crops_are || 'recorded';
+  safeArea = data.safe_area || null;
   $('crop-warn').classList.toggle('hide', cropsAre !== 'rebuilt');
   blocksWere = JSON.parse(JSON.stringify(blocks));
   paintStrip();
@@ -780,6 +795,7 @@ async function showStrip() {
   // button lit over an empty player.
   if (peeking) peek(true);
   loadSubs();
+  loadFonts(runId);
   // Clicking anywhere on the reel is a seek, which is what a timeline is for.
   $('reel').onclick = (e) => {
     if (e.target.closest('.blk')) return;
@@ -864,6 +880,42 @@ function wireGain(i) {
   off.onclick = () => { blocks[i].gain_db = 0; show(); };
 }
 
+let safeArea = null;
+
+// Where the burn will put the words, on the picture as it is now. Driven
+// by the same band the render uses rather than a guess that happens to
+// look close.
+function showBurnt() {
+  const box = $('burnt');
+  const video = peeking ? $('raw-video') : $('video');
+  if (!subs.length || !safeArea || peeking || video.classList.contains('hide')) {
+    box.classList.add('hide');
+    return;
+  }
+  const at = $('video').currentTime || 0;
+  const now = subs.find(line => at >= line.at && at < line.until);
+  if (!now) { box.classList.add('hide'); return; }
+
+  // Before metadata the element is its default 300x150, and sizing type
+  // against that put a whole line at four and a half pixels.
+  if (!video.videoWidth) { box.classList.add('hide'); return; }
+  const shown = video.getBoundingClientRect();
+  const holder = $('frame').getBoundingClientRect();
+  if (!shown.height) { box.classList.add('hide'); return; }
+
+  box.classList.remove('hide');
+  box.textContent = now.text;
+  const side = shown.width * safeArea.side_margin;
+  box.style.left = `${shown.left - holder.left + side}px`;
+  box.style.width = `${shown.width - side * 2}px`;
+  box.style.fontSize = `${shown.height * safeArea.text_height}px`;
+  // Measured from the bottom, so a second line grows upward into the
+  // picture rather than down into whatever the player draws there.
+  box.style.bottom =
+    `${holder.bottom - shown.bottom + shown.height * safeArea.up_from_bottom}px`;
+  box.style.top = 'auto';
+}
+
 function paintSubs() {
   const lane = $('lane-subs');
   $('burn').classList.toggle('hide', !subs.length);
@@ -919,7 +971,7 @@ function wireSubs() {
       el.removeAttribute('contenteditable');
       const said = el.textContent.trim();
       if (said && said !== subs[i].text) { subs[i].text = said; saveSubs(); }
-      paintSubs();
+      paintSubs(); showBurnt();
     };
 
     el.onkeydown = (e) => {
@@ -947,7 +999,7 @@ function wireSubs() {
           } else {
             subs[i].until = Math.max(subs[i].at + 0.2, was.until + by);
           }
-          paintSubs();
+          paintSubs(); showBurnt();
         };
         const up = () => {
           document.removeEventListener('mousemove', move);
@@ -1185,24 +1237,33 @@ function showExtras() {
 
 // Start on the invitation, not on an empty editor. Opening a run turns
 // the workspace on; nothing else does.
-// What this machine can set subtitles in. Asked once; a font is not
-// installed halfway through an afternoon.
-(async () => {
+// What this machine can set subtitles in, for the language of the cut --
+// offering Chinese faces to somebody cutting a Japanese interview is a
+// list with nothing they want in it.
+async function loadFonts(forRun) {
   try {
-    const got = await fetch('/api/fonts');
+    const got = await fetch(
+      '/api/fonts' + (forRun ? `?run_id=${forRun}` : '')
+    );
     const list = (await got.json()).fonts || [];
     for (const where of ['font', 'setup-font']) {
       const box = $(where);
       if (!box) continue;
+      const held = box.value;
+      box.innerHTML = box.options[0]
+        ? `<option value="">${box.options[0].textContent}</option>` : '';
       for (const one of list) {
         const item = document.createElement('option');
         item.value = one.file;
         item.textContent = one.family;
         box.appendChild(item);
       }
+      box.value = held;
     }
   } catch (error) { /* the default still works */ }
-})();
+}
+
+loadFonts('');
 
 showWorkspace(false);
 loadPast();
@@ -1621,7 +1682,9 @@ function movePlayhead() {
 // timeupdate fires about four times a second, which reads as a stutter on a
 // zoomed reel; this follows the frame.
 function tick() {
-  if (!$('video').paused) { movePlayhead(); mirrorRaw(); drawCrop(); }
+  if (!$('video').paused) {
+    movePlayhead(); mirrorRaw(); drawCrop(); showBurnt();
+  }
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);
@@ -1911,6 +1974,9 @@ addEventListener('resize', () => { forgetPlacement(); drawCrop(); });
 $('raw-video').addEventListener('loadedmetadata', () => {
   forgetPlacement(); drawCrop();
 });
+$('video').addEventListener('loadedmetadata', showBurnt);
+$('video').addEventListener('timeupdate', showBurnt);
+addEventListener('resize', showBurnt);
 </script>
 </body>
 </html>
