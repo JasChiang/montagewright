@@ -3091,3 +3091,29 @@ def test_a_file_is_measured_once(tmp_path) -> None:
     assert first.duration_seconds == again.duration_seconds
     assert other.source_id == "B"
     assert other.duration_seconds == first.duration_seconds
+
+
+def test_the_subtitle_panel_has_the_operations_captioning_needs() -> None:
+    """A lane you can drag is not an editor.
+
+    Four things come up over and over when captioning: put a line in, cut
+    one in two where the speaker paused, join two that were split too
+    finely, and take one out. Everything else is typing.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert 'id="pane-subs"' in page
+    for control in ("cue-add", "cue-split", "cue-join", "cue-del"):
+        assert f"$('{control}')" in page, control
+
+    # Timecodes are editable, not only draggable.
+    assert "function unstamp(" in page and "function stamp(" in page
+    # A cue may not end before it starts.
+    assert "Math.min(want, subs[i].until - 0.1)" in page
+    assert "Math.max(want, subs[i].at + 0.1)" in page
+    # Splitting lands on a pause, near by, and never leaves a sliver.
+    assert "Math.max(2, Math.min(cut, line.text.length - 2))" in page
+    # The line being spoken is marked without rebuilding rows being typed in.
+    assert "function followCue()" in page

@@ -206,6 +206,47 @@
   .browser .pane:not(.hide) { display: block; }
   .browser .scroll { overflow: visible; }
   .browser .sub { margin: 10px 0 6px; }
+
+  /* Subtitles get a working area, not only a lane to drag. Everything an
+     edit needs is one place: the words, when they show, and the four
+     operations that actually come up -- add, split, join, remove. */
+  .subbar {
+    display: flex; gap: 5px; align-items: center; flex-wrap: wrap;
+    padding: 10px 0 8px; border-bottom: 1px solid var(--hair);
+    position: sticky; top: 0; background: var(--panel); z-index: 3;
+  }
+  .subbar button { font-size: 11.5px; padding: 4px 8px; }
+  .cue-row {
+    display: grid; grid-template-columns: auto 1fr; gap: 4px 10px;
+    padding: 9px 8px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .cue-row:hover { background: var(--sunk); }
+  .cue-row.on { background: var(--sunk); border-color: var(--accent); }
+  /* The line being spoken right now, so the list follows the film. */
+  .cue-row.live { border-left: 3px solid var(--accent); }
+  .cue-row .times {
+    display: flex; flex-direction: column; gap: 2px;
+    font-family: var(--mono); font-size: 10.5px; color: var(--dim);
+  }
+  .cue-row .times input {
+    width: 62px; background: transparent; border: 1px solid transparent;
+    border-radius: 4px; color: inherit; font: inherit; padding: 1px 3px;
+  }
+  .cue-row .times input:hover { border-color: var(--line); }
+  .cue-row .times input:focus {
+    border-color: var(--accent); background: var(--deep); outline: none;
+  }
+  .cue-row .said {
+    font-size: 13px; line-height: 1.5; border-radius: 5px;
+    padding: 2px 4px; min-height: 20px;
+  }
+  .cue-row .said:focus {
+    background: var(--deep); outline: 1px solid var(--accent);
+  }
+  .cue-row .who {
+    grid-column: 2; font-size: 11px; color: var(--dim);
+  }
   /* A narrow column: the head of a shot wraps instead of overflowing. */
   .browser .shotcard .head { gap: 6px 10px; }
   .browser .shotcard .subject { flex-basis: 100%; }
@@ -750,6 +791,7 @@
     <div class="browser">
       <div class="tabs">
         <button class="tab on" data-pane="pane-shots">鏡頭</button>
+        <button class="tab" data-pane="pane-subs">字幕</button>
         <button class="tab" data-pane="pane-tx">逐字稿</button>
         <button class="tab" data-pane="pane-aside">沒用的</button>
         <button class="tab" data-pane="pane-spend">花費</button>
@@ -758,6 +800,18 @@
         <div class="pane" id="pane-shots">
           <p class="sub">點一顆會跳到時間軸上那一段。</p>
           <div class="scroll"><div id="shot-list"></div></div>
+        </div>
+        <div class="pane hide" id="pane-subs">
+          <div class="subbar">
+            <button class="ghost" id="cue-add" title="在播放頭插入一句">＋ 一句</button>
+            <button class="ghost" id="cue-split" title="在播放頭切成兩句">切開</button>
+            <button class="ghost" id="cue-join" title="與下一句合併">合併</button>
+            <button class="ghost" id="cue-del" title="刪掉這一句">刪掉</button>
+            <span class="grow"></span>
+            <span class="why" id="cue-count"></span>
+          </div>
+          <p class="sub">點一句跳過去，點文字直接改。時間碼也可以改。</p>
+          <div class="scroll"><div id="cue-list"></div></div>
         </div>
         <div class="pane hide" id="pane-tx">
           <p class="sub">辨識器聽的、Gemini 改的、誰講的。</p>
@@ -1379,6 +1433,92 @@ function showBurnt() {
   box.style.top = 'auto';
 }
 
+// Which cue the editor is working on. Separate from which one is being
+// spoken: you scrub away to look at something and come back, and the line
+// you were editing should still be the line you were editing.
+let cue = -1;
+
+function stamp(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds - m * 60;
+  return `${m}:${s.toFixed(2).padStart(5, '0')}`;
+}
+
+function unstamp(said, fallback) {
+  const bits = String(said).trim().split(':');
+  const value = bits.length > 1
+    ? (parseFloat(bits[0]) || 0) * 60 + (parseFloat(bits[1]) || 0)
+    : parseFloat(bits[0]);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function paintCues() {
+  const list = $('cue-list');
+  if (!list) return;
+  $('cue-count').textContent = subs.length ? `${subs.length} 句` : '';
+  if (!subs.length) {
+    list.innerHTML = '<p class="why">這支片沒有語音，所以沒有字幕。</p>';
+    return;
+  }
+  const at = $('video').currentTime || 0;
+  list.innerHTML = subs.map((line, i) => {
+    const live = at >= line.at && at < line.until;
+    const changed = line.derived && line.derived !== line.text;
+    return `<div class="cue-row ${i === cue ? 'on' : ''} ${live ? 'live' : ''}"
+                 data-i="${i}">
+      <div class="times">
+        <input data-edge="at" data-i="${i}" value="${stamp(line.at)}">
+        <input data-edge="until" data-i="${i}" value="${stamp(line.until)}">
+      </div>
+      <div class="said" contenteditable="true" data-i="${i}"
+           spellcheck="false">${esc(line.text)}</div>
+      ${line.speaker || changed ? `<div class="who">${
+        esc(line.speaker || '')}${changed ? '　·　改過' : ''}</div>` : ''}
+    </div>`;
+  }).join('');
+  wireCues();
+}
+
+function wireCues() {
+  for (const row of $('cue-list').querySelectorAll('.cue-row')) {
+    const i = +row.dataset.i;
+    row.onmousedown = (e) => {
+      if (e.target.closest('input, .said')) return;
+      cue = i;
+      $('video').currentTime = subs[i].at + 0.01;
+      movePlayhead(); showBurnt(); paintCues();
+    };
+  }
+  for (const box of $('cue-list').querySelectorAll('.said')) {
+    const i = +box.dataset.i;
+    box.onfocus = () => { cue = i; };
+    box.onblur = () => {
+      const said = box.textContent.trim();
+      if (said && said !== subs[i].text) { subs[i].text = said; saveSubs(); }
+      paintSubs(); showBurnt();
+    };
+    box.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); box.blur(); }
+      if (e.key === 'Escape') { box.textContent = subs[i].text; box.blur(); }
+    };
+  }
+  for (const field of $('cue-list').querySelectorAll('.times input')) {
+    const i = +field.dataset.i, edge = field.dataset.edge;
+    field.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') field.blur();
+    };
+    field.onblur = () => {
+      const want = unstamp(field.value, subs[i][edge]);
+      // A cue that ends before it starts is not an edit, it is a typo.
+      if (edge === 'at') subs[i].at = Math.min(want, subs[i].until - 0.1);
+      else subs[i].until = Math.max(want, subs[i].at + 0.1);
+      saveSubs(); paintSubs(); paintCues(); showBurnt();
+    };
+  }
+}
+
 function paintSubs() {
   const lane = $('lane-subs');
   $('burn').classList.toggle('hide', !subs.length);
@@ -1434,7 +1574,7 @@ function wireSubs() {
       el.removeAttribute('contenteditable');
       const said = el.textContent.trim();
       if (said && said !== subs[i].text) { subs[i].text = said; saveSubs(); }
-      paintSubs(); showBurnt();
+      paintSubs(); paintCues(); showBurnt();
     };
 
     el.onkeydown = (e) => {
@@ -2498,6 +2638,104 @@ function wireExports(report) {
   $('dl-burned').classList.toggle('hide', !subsEdited && !spoken);
   $('dl-burned').href = `/api/runs/${runId}/burned`;
 }
+
+// The four operations captioning actually needs. Everything else is
+// typing, which the list already does.
+// Move the "being spoken" marker without rebuilding rows somebody may be
+// typing in.
+let liveCue = -1;
+function followCue() {
+  if (!subs.length) return;
+  const at = $('video').currentTime || 0;
+  const now = subs.findIndex(line => at >= line.at && at < line.until);
+  if (now === liveCue) return;
+  liveCue = now;
+  for (const row of document.querySelectorAll('.cue-row')) {
+    row.classList.toggle('live', +row.dataset.i === now);
+  }
+}
+
+function pickedCue() {
+  if (cue >= 0 && cue < subs.length) return cue;
+  const at = $('video').currentTime || 0;
+  const live = subs.findIndex(line => at >= line.at && at < line.until);
+  return live;
+}
+
+function afterCues(select) {
+  saveSubs(); paintSubs(); paintCues(); showBurnt();
+  if (select != null) cue = Math.max(0, Math.min(select, subs.length - 1));
+}
+
+$('cue-add').addEventListener('click', () => {
+  const at = $('video').currentTime || 0;
+  // Up to two seconds, but never over the line that follows.
+  const next = subs.find(line => line.at > at);
+  const until = Math.min(at + 2, next ? next.at : at + 2, reelSeconds());
+  if (until - at < 0.2) return;
+  subs.push({ at, until, text: '新的一句', speaker: '', heard: '', derived: '' });
+  subs.sort((a, b) => a.at - b.at);
+  afterCues(subs.findIndex(line => line.at === at));
+});
+
+$('cue-split').addEventListener('click', () => {
+  const i = pickedCue();
+  if (i < 0) return;
+  const line = subs[i];
+  const at = $('video').currentTime || 0;
+  if (at <= line.at + 0.15 || at >= line.until - 0.15) return;
+
+  // Split the words where the time splits them, then step back to a place
+  // the sentence already pauses -- cutting a caption mid-word reads as
+  // damage rather than as an edit.
+  const share = (at - line.at) / (line.until - line.at);
+  const wanted = Math.round(line.text.length * share);
+  const marks = '，。、！？；：…,.!?;: ';
+  // The nearest pause, and only if it is genuinely near. Searching forward
+  // before backward, six characters out, made a split at the middle of a
+  // sentence run to the question mark at its end and leave one character
+  // behind -- which is not a caption, it is a mistake with a timecode.
+  let cut = wanted;
+  for (let step = 1; step <= 3; step++) {
+    if (marks.includes(line.text[wanted - step] || '')) {
+      cut = wanted - step + 1; break;
+    }
+    if (marks.includes(line.text[wanted + step - 1] || '')) {
+      cut = wanted + step; break;
+    }
+  }
+  // Never leave a sliver on either side.
+  cut = Math.max(2, Math.min(cut, line.text.length - 2));
+
+  const tail = {
+    at, until: line.until, text: line.text.slice(cut).trim(),
+    speaker: line.speaker, heard: '', derived: '',
+  };
+  subs[i] = { ...line, until: at, text: line.text.slice(0, cut).trim() };
+  subs.splice(i + 1, 0, tail);
+  afterCues(i + 1);
+});
+
+$('cue-join').addEventListener('click', () => {
+  const i = pickedCue();
+  if (i < 0 || i >= subs.length - 1) return;
+  const next = subs[i + 1];
+  subs[i] = {
+    ...subs[i],
+    until: next.until,
+    text: `${subs[i].text}${next.text}`,
+    heard: `${subs[i].heard || ''}${next.heard || ''}`,
+  };
+  subs.splice(i + 1, 1);
+  afterCues(i);
+});
+
+$('cue-del').addEventListener('click', () => {
+  const i = pickedCue();
+  if (i < 0) return;
+  subs.splice(i, 1);
+  afterCues(Math.min(i, subs.length - 1));
+});
 
 $('show-keys').addEventListener('click', () => $('keys').classList.toggle('hide'));
 
