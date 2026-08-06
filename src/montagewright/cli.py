@@ -144,10 +144,26 @@ def _make_proxy(
 
 
 def _encode_proxy(source: Path, destination: Path) -> None:
+    """Shrink the frame, keep the clock.
+
+    This forced 15fps for a while, which nothing asked for. Gemini samples
+    video at one frame a second whatever it is given, so the extra frames
+    were never looked at; SAM tracks the original rather than this file, at
+    its own rate; and the only thing left watching a proxy at full speed is
+    the web preview, which is happier at the source rate anyway.
+
+    What the resampling did cost was a clock that no longer matched. At
+    15fps a duration has to land on a multiple of 1/15, so a 12.012s take
+    came out 12.133s -- and cards describe this file while the edit cuts the
+    original, which left two clocks a tenth of a second apart for no reason.
+    Dropping the flag makes them the same to the millisecond, for about nine
+    percent more bytes and no extra encoding time.
+    """
+
     subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(source), "-vf", "scale=640:-2", "-r", "15",
+            "-i", str(source), "-vf", "scale=640:-2",
             "-c:v", "libx264", "-crf", "30", "-preset", "veryfast",
             "-c:a", "aac", "-b:a", "64k", str(destination),
         ],
