@@ -35,13 +35,14 @@
   ::-webkit-scrollbar-track { background: transparent; }
 
   .app {
-    display: grid; grid-template-rows: var(--rail) 1fr 5px var(--reel, auto);
+    /* A real default, not auto: an auto row whose flex child may collapse
+       to nothing sizes itself to the transport bar and clips every track
+       out of sight. */
+    display: grid; grid-template-rows: var(--rail) 1fr 5px var(--reel, 282px);
     height: 100%;
   }
-  /* Never taller than what it holds. */
-  .reelwrap { max-height: max-content; }
-  .reelwrap { min-height: 0; overflow: hidden; display: flex;
-              flex-direction: column; }
+
+  .reelwrap { min-height: 0; display: flex; flex-direction: column; }
   .reelwrap .scroller { flex: 1; min-height: 0; overflow: auto; }
 
   /* toolbar */
@@ -1113,14 +1114,29 @@ async function showStrip() {
   blocksWere = JSON.parse(JSON.stringify(blocks));
   paintStrip();
   $('strip').classList.remove('hide');
-  if (blocks.length) { picked = 0; paintStrip(); inspect(0); paintWaves(
-    blocks.reduce((a, b) => a + b.seconds, 0) || 1); }
+  if (blocks.length) {
+    picked = 0;
+    // The whole film across the width, without being asked.
+    zoomedByHand = false;
+    fitScale();
+    paintStrip(); inspect(0);
+    paintWaves(blocks.reduce((a, b) => a + b.seconds, 0) || 1);
+  }
   // The take can be asked for before the reel has loaded, and peek can only
   // find one through a block. It used to give up quietly and leave the
   // button lit over an empty player.
   if (peeking) peek(true);
   loadSubs();
   loadFonts(runId);
+  requestAnimationFrame(() => {
+    const needs = reelNeeds();
+    const now = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue('--reel'));
+    if (!now || now < 120 || now > needs) {
+      document.documentElement.style.setProperty('--reel', `${needs}px`);
+      localStorage.setItem('mw---reel', `${needs}px`);
+    }
+  });
   // Clicking anywhere on the reel is a seek, which is what a timeline is for.
   $('reel').onclick = (e) => {
     if (e.target.closest('.blk')) return;
@@ -1139,10 +1155,20 @@ function reelSeconds() {
   return blocks.reduce((a, b) => a + b.seconds, 0) || 1;
 }
 
+// Whether the zoom is the one the film chose or the one a person chose.
+// The reel fitting its own width is the sensible default; a button to ask
+// for what should already have happened is a button doing the tool's job.
+let zoomedByHand = false;
+
 function fitScale() {
   const room = ($('scroller').clientWidth || 900) - 2;
   scale = Math.max(4, room / reelSeconds());
   $('zoom').value = Math.min(120, Math.max(6, scale));
+}
+
+function fitIfUntouched() {
+  if (zoomedByHand || !blocks.length) return;
+  fitScale(); paintStrip(); paintWavesWhenSettled();
 }
 
 function clock(seconds) {
@@ -1529,7 +1555,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     mirrorRaw();
   });
-  addEventListener('resize', () => { if (blocks.length) paintStrip(); });
+  addEventListener('resize', () => {
+  if (!blocks.length) return;
+  if (zoomedByHand) paintStrip(); else fitIfUntouched();
+});
 });
 
 async function showTranscripts() {
@@ -1873,21 +1902,34 @@ function emptyRow(cols, said) {
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 
+// Everything the timeline has to show, in pixels.
+function reelNeeds() {
+  const bar = document.querySelector('.reelbar');
+  return Math.ceil((bar ? bar.getBoundingClientRect().height : 0)
+    + $('reel').scrollHeight + 2);
+}
+
 // How tall the timeline is, dragged from the line above it.
 {
   const kept = localStorage.getItem('mw---reel');
+  // A height stored before the tracks changed can be too small to show
+  // them at all, and a timeline with nothing visible in it looks broken
+  // rather than small.
   if (kept) document.documentElement.style.setProperty('--reel', kept);
   $('grip-reel').addEventListener('mousedown', (e) => {
     e.preventDefault();
     $('grip-reel').classList.add('holding');
     const move = (ev) => {
-      // An editing application's timeline is as tall as its tracks. You
-      // may take room away from it to see more of the picture; stretching
-      // it past what it holds only makes a void, which is what dragging it
-      // down used to do.
-      const holds = $('reelwrap').scrollHeight;
+      // An editing application's timeline is as tall as its tracks: room
+      // may be taken from it to see more of the picture, but stretching it
+      // past what it holds only makes a void.
+      //
+      // Measured from the tracks themselves. Asking the wrapper meant
+      // asking an element with overflow:hidden how tall its contents were
+      // -- once it had been made small it answered "small", so it could
+      // never be made big again, and the tracks stayed clipped out of sight.
       const tall = Math.max(120, Math.min(
-        innerHeight - ev.clientY, holds, innerHeight * 0.7));
+        innerHeight - ev.clientY, reelNeeds(), innerHeight * 0.7));
       const held = `${Math.round(tall)}px`;
       document.documentElement.style.setProperty('--reel', held);
       localStorage.setItem('mw---reel', held);
@@ -1926,7 +1968,8 @@ for (const [grip, which, side] of [
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
       // The picture and the boxes drawn on it are placed in pixels.
-      forgetPlacement(); drawCrop(); showBurnt(); paintStrip();
+      forgetPlacement(); drawCrop(); showBurnt();
+      if (zoomedByHand) paintStrip(); else fitIfUntouched();
     };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
@@ -2162,12 +2205,14 @@ $('burn').addEventListener('click', async () => {
 });
 
 $('zoom').addEventListener('input', () => {
+  zoomedByHand = true;
   scale = +$('zoom').value;
   // The strip is DOM and repaints at any rate; the waves are ffmpeg.
   if (blocks.length) { paintStrip(); paintWavesWhenSettled(); }
 });
 $('fit').addEventListener('click', () => {
   if (!blocks.length) return;
+  zoomedByHand = false;
   fitScale(); paintStrip(); paintWavesWhenSettled();
 });
 $('play').addEventListener('click', () => {
