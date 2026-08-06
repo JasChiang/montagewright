@@ -305,3 +305,73 @@ def test_the_slop_is_nowhere_near_a_notation_error():
     got = times_on_receipt(_card(usable_to_seconds=101.0), 61.0)
 
     assert got["usable_to_seconds"] == 61.0
+
+
+# --- the proxy is a smaller copy, never a larger one ----------------------
+
+def _clip(tmp_path, width, height, name="in.mp4"):
+    import subprocess
+
+    made = tmp_path / name
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", f"testsrc2=size={width}x{height}:rate=30:duration=1",
+         "-c:v", "libx264", "-crf", "28", "-pix_fmt", "yuv420p", str(made)],
+        check=True,
+    )
+    return made
+
+
+def _size(path):
+    import subprocess
+
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return tuple(int(one) for one in out.split(","))
+
+
+def test_a_clip_narrower_than_the_proxy_width_is_left_alone(tmp_path):
+    """`scale=640` is a demand, not a limit.
+
+    Handed a 320x240 clip it produced a 640x480 one -- bigger than the file
+    it came from, blurrier than the picture it describes, and no more use to
+    a model that caps the frame at 70 tokens regardless.
+    """
+
+    from montagewright.cli import _encode_proxy
+
+    small = _clip(tmp_path, 320, 240)
+    made = tmp_path / "out.mp4"
+    _encode_proxy(small, made)
+
+    assert _size(made) == (320, 240)
+
+
+def test_a_clip_wider_than_the_proxy_width_is_shrunk_to_it(tmp_path):
+    from montagewright.cli import _encode_proxy
+
+    big = _clip(tmp_path, 1920, 1080)
+    made = tmp_path / "out.mp4"
+    _encode_proxy(big, made)
+
+    assert _size(made) == (640, 360)
+
+
+def test_the_proxy_keeps_the_length_it_was_made_from(tmp_path):
+    """Forcing a frame rate made the duration land on a multiple of it.
+
+    Cards describe the proxy and the edit cuts the original, so the two ran
+    a tenth of a second apart until the rate was left alone.
+    """
+
+    from montagewright.cli import _encode_proxy
+    from montagewright.clipcard import clip_seconds
+
+    source = _clip(tmp_path, 1920, 1080)
+    made = tmp_path / "out.mp4"
+    _encode_proxy(source, made)
+
+    assert abs(clip_seconds(made) - clip_seconds(source)) < 0.005

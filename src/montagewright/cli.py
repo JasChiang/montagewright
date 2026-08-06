@@ -158,12 +158,27 @@ def _encode_proxy(source: Path, destination: Path) -> None:
     original, which left two clocks a tenth of a second apart for no reason.
     Dropping the flag makes them the same to the millisecond, for about nine
     percent more bytes and no extra encoding time.
+
+    The width is capped rather than set, because `scale=640` is a demand and
+    not a limit: handed a 320x240 clip it produced a 640x480 one, larger than
+    the file it came from and blurrier than the picture it describes. Nothing
+    is gained by enlarging a proxy -- the API caps each video frame at 70
+    tokens whatever it is sent, so the extra pixels are discarded before the
+    model ever sees them.
+
+    `-2` rounds the height to the nearest even number, which H.264 requires,
+    so the aspect can shift by up to one pixel. 16:9 and 4:3 divide cleanly
+    and come out exact; the worst measured case is a 3840x1600 source at
+    0.25%, since a short proxy gives that one pixel more to be worth. It only
+    reaches anything through the card's own subject boxes, and only when
+    those are used without a client to ask again -- the grounding and
+    tracking path never touches this file.
     """
 
     subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(source), "-vf", "scale=640:-2",
+            "-i", str(source), "-vf", "scale='min(640,iw)':-2",
             "-c:v", "libx264", "-crf", "30", "-preset", "veryfast",
             "-c:a", "aac", "-b:a", "64k", str(destination),
         ],
