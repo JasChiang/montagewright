@@ -1172,10 +1172,19 @@ def create_app() -> FastAPI:
         run = _run(run_id)
         made = run.output / "work" / "thumbs" / f"{index:03d}.jpg"
         if not made.exists():
+            # Every shot has two files, the cut and the one with handles,
+            # and a glob returns whichever it likes first. Rejecting the
+            # handles file rather than passing over it lost the frame for
+            # every shot whose handles happened to be listed first.
             segment = next(
-                (run.output / "segments").glob(f"{index:03d}-*.mp4"), None
+                (
+                    path for path in
+                    sorted((run.output / "segments").glob(f"{index:03d}-*.mp4"))
+                    if "handles" not in path.name
+                ),
+                None,
             )
-            if segment is None or "handles" in segment.name:
+            if segment is None:
                 raise HTTPException(404, "no such shot")
             made.parent.mkdir(parents=True, exist_ok=True)
             length = probe_duration(segment)
