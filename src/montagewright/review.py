@@ -150,7 +150,7 @@ def review_cut(
                 "type": "video",
                 "mime_type": "video/mp4",
                 "uri": uri,
-                "media_resolution": "low",
+                "resolution": "low",
             },
         ],
         generation_config={"thinking_level": "high", "max_output_tokens": MAX_OUTPUT_TOKENS},
@@ -296,7 +296,7 @@ def review_shots(
                 "type": "video",
                 "mime_type": "video/mp4",
                 "uri": uri,
-                "media_resolution": "low",
+                "resolution": "low",
             }
         )
 

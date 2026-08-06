@@ -375,3 +375,43 @@ def test_the_proxy_keeps_the_length_it_was_made_from(tmp_path):
     _encode_proxy(source, made)
 
     assert abs(clip_seconds(made) - clip_seconds(source)) < 0.005
+
+
+def test_the_resolution_key_is_the_one_the_api_reads():
+    """The knob has to be connected to something.
+
+    Every video part carried `media_resolution`, which the Interactions API
+    does not define -- its field is `resolution`. The SDK dropped it on the
+    floor and forwarded the unknown key, so five call sites looked like they
+    were controlling frame detail and were not. It went unnoticed because
+    `low` and the default are both 70 tokens a frame for video, so the
+    setting that never applied would not have changed anything if it had.
+
+    Checked against the SDK rather than a string, so the day the field is
+    renamed this fails here instead of silently in a paid call.
+    """
+
+    import re
+    from pathlib import Path
+
+    from google.genai._gaos.types.interactions.videocontent import VideoContent
+
+    root = Path(__file__).resolve().parents[1] / "src" / "montagewright"
+    sending = [
+        path for path in root.rglob("*.py")
+        if re.search(r'"type":\s*"video"', path.read_text(encoding="utf-8"))
+    ]
+    assert sending, "no video parts found; this test has lost its subject"
+
+    for path in sending:
+        text = path.read_text(encoding="utf-8")
+        assert '"media_resolution"' not in text, (
+            f"{path.name} sets media_resolution, which the Interactions API "
+            f"ignores; the field is `resolution`"
+        )
+
+    # And the key that is used actually lands on the model's own field.
+    part = VideoContent(
+        type="video", mime_type="video/mp4", uri="files/x", resolution="low"
+    )
+    assert part.resolution == "low"

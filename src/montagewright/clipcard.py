@@ -586,7 +586,7 @@ def describe_clip(
                 "type": "video",
                 "mime_type": "video/mp4",
                 "uri": uri,
-                "media_resolution": "low",
+                "resolution": "low",
             },
         ],
         generation_config={"thinking_level": "low", "max_output_tokens": MAX_OUTPUT_TOKENS},

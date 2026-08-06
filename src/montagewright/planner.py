@@ -766,7 +766,7 @@ def _attach_material(
                 "type": "video",
                 "mime_type": "video/mp4",
                 "uri": uri,
-                "media_resolution": "low",
+                "resolution": "low",
             }
         )
     return attached
