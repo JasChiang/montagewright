@@ -342,6 +342,15 @@
   .ins-row { display: flex; gap: 7px; align-items: center; flex-wrap: wrap;
              font-size: 11.5px; color: var(--dim); }
 
+  .cue-text {
+    width: 100%; min-height: 92px; resize: vertical; font: inherit;
+    font-size: 14px; line-height: 1.6; padding: 10px 12px;
+    border-radius: 9px; border: 1px solid var(--line);
+    background: var(--sunk); color: var(--ink); margin-bottom: 14px;
+  }
+  .cue-text:focus { outline: none; border-color: var(--accent); }
+  select.wide { width: 100%; }
+
   .ins-part { margin-top: 18px; }
   .ins-part h4 {
     margin: 0 0 8px; font-size: 10px; letter-spacing: .07em;
@@ -351,13 +360,13 @@
   /* The section that failed says so with a colour, not only with words. */
   .ins-part.off h4 { color: var(--accent); border-bottom-color: var(--accent); }
   .ins-part p { margin: 7px 0 0; }
-  .ins-part .pairs {
+  /* Scoped to .ins-part, so the same markup in the cue inspector ran its
+     labels and answers together into one line of prose. */
+  .pairs {
     display: grid; grid-template-columns: auto 1fr; gap: 5px 12px;
     align-items: baseline; font-size: 13px;
   }
-  .ins-part .pairs > span:nth-child(odd) {
-    color: var(--dim); font-size: 11.5px;
-  }
+  .pairs > span:nth-child(odd) { color: var(--dim); font-size: 11.5px; }
   .ins-part i { font-style: normal; }
   .gainrow {
     display: flex; align-items: center; gap: 9px; margin-top: 10px;
@@ -856,6 +865,7 @@
     <aside class="side">
       <div class="head" id="ins-head"><span class="who">這一顆</span></div>
       <div class="body" id="inspector"></div>
+      <div class="body hide" id="cue-inspector"></div>
     </aside>
   </div>
 
@@ -870,14 +880,6 @@
       <button class="ghost" id="fit">符合寬度</button>
       <button class="ghost" id="show-keys" title="鍵盤操作">?</button>
       <span class="grow" id="strip-note"></span>
-      <select class="hide" id="look">
-        <option value="plain">一般</option>
-        <option value="spoken">講到哪亮到哪</option>
-        <option value="speakers">依說話者上色</option>
-        <option value="plate">加底色塊</option>
-      </select>
-      <select class="hide" id="font"><option value="">系統預設字型</option></select>
-      <button class="ghost hide" id="burn">燒進畫面</button>
       <button class="ghost" id="undo-cut">還原</button>
       <button id="recut" class="hide">重新輸出</button>
     </div>
@@ -1197,6 +1199,11 @@ let cropsAre = 'recorded';
 // under 全部鏡頭 for reading straight through; this is for the shot you just
 // clicked, which is the question anyone actually has in front of a cut.
 function inspect(i) {
+  // Choosing a shot is choosing away from a caption.
+  cue = -1;
+  $('cue-inspector').classList.add('hide');
+  $('inspector').classList.remove('hide');
+  $('ins-head').querySelector('.who').textContent = '這一顆';
   const b = blocks[i];
   if (!b || !lastReport) { $('inspector').innerHTML = ''; return; }
   const plan = (lastReport.selection?.shots || [])[b.index] || {};
@@ -1374,6 +1381,11 @@ async function loadSubs() {
     subsEdited = !!data.edited;
   } catch (error) { subs = []; }
   paintSubs();
+  paintCues();
+  // The tab is only worth offering when somebody spoke.
+  const tab = document.querySelector('.tab[data-pane="pane-subs"]');
+  if (tab) tab.classList.toggle('hide', !subs.length);
+  showBurnt();
 }
 
 // Levelling makes every speaker the same loudness, which is not the same
@@ -1486,7 +1498,7 @@ function wireCues() {
       if (e.target.closest('input, .said')) return;
       cue = i;
       $('video').currentTime = subs[i].at + 0.01;
-      movePlayhead(); showBurnt(); paintCues();
+      movePlayhead(); showBurnt(); paintCues(); inspectCue();
     };
   }
   for (const box of $('cue-list').querySelectorAll('.said')) {
@@ -1520,10 +1532,10 @@ function wireCues() {
 }
 
 function paintSubs() {
+  // The style controls moved into the inspector, where they are built with
+  // the cue they belong to. Reaching for them here found nothing and threw,
+  // which took the whole strip down with it -- no subtitles, no cue list.
   const lane = $('lane-subs');
-  $('burn').classList.toggle('hide', !subs.length);
-  $('look').classList.toggle('hide', !subs.length);
-  $('font').classList.toggle('hide', !subs.length);
   lane.classList.toggle('silent', !subs.length);
   if (!subs.length) {
     lane.innerHTML = '這支片沒有語音，所以沒有字幕';
@@ -1549,44 +1561,34 @@ function wireSubs() {
   for (const el of $('lane-subs').querySelectorAll('.cue')) {
     const i = +el.dataset.i;
 
+    // The timeline says when, the panel says what. Typing a sentence into
+    // a twenty-pixel block on a time ruler was the editor I had before
+    // there was a panel, and leaving it there gave two places to do one
+    // thing, in the worse of the two. Clicking goes to the line; asking to
+    // edit hands it to the panel, where it can be read.
     el.onclick = (e) => {
       if (e.target.closest('.edge')) return;
-      // Clicking a line takes you to it. Reading a subtitle without the
-      // frame under it is how a correct line gets "fixed".
       $('video').currentTime = subs[i].at + 0.01;
-      movePlayhead();
+      movePlayhead(); showBurnt();
       for (const other of $('lane-subs').querySelectorAll('.cue')) {
         other.classList.remove('on');
       }
       el.classList.add('on');
+      cue = i;
+      paintCues(); inspectCue();
     };
 
     el.ondblclick = (e) => {
       if (e.target.closest('.edge')) return;
-      el.setAttribute('contenteditable', 'true');
-      el.textContent = subs[i].text;
-      el.focus();
-      document.getSelection().selectAllChildren(el);
-    };
-
-    el.onblur = () => {
-      if (el.getAttribute('contenteditable') !== 'true') return;
-      el.removeAttribute('contenteditable');
-      const said = el.textContent.trim();
-      if (said && said !== subs[i].text) { subs[i].text = said; saveSubs(); }
-      paintSubs(); paintCues(); showBurnt();
-    };
-
-    el.onkeydown = (e) => {
-      if (el.getAttribute('contenteditable') !== 'true') return;
-      if (e.key === 'Enter') { e.preventDefault(); el.blur(); }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        el.removeAttribute('contenteditable');
-        paintSubs();
+      cue = i;
+      showTab('pane-subs');
+      paintCues();
+      const row = $('cue-list').querySelector(`.said[data-i="${i}"]`);
+      if (row) {
+        row.closest('.cue-row').scrollIntoView({ block: 'center' });
+        row.focus();
+        document.getSelection().selectAllChildren(row);
       }
-      // Typing in a subtitle is not a keyboard shortcut.
-      e.stopPropagation();
     };
 
     for (const grip of el.querySelectorAll('.edge')) {
@@ -2450,8 +2452,12 @@ function paintWavesWhenSettled() {
   wavesSoon = setTimeout(() => paintWaves(reelSeconds()), 250);
 }
 
-$('burn').addEventListener('click', async () => {
+// Rebuilt with the inspector each time a cue is selected, so the handler
+// is attached then rather than once at load.
+function wireBurn() {
   const button = $('burn');
+  if (!button) return;
+  button.onclick = async () => {
   button.disabled = true;
   const said = button.textContent;
   button.textContent = '燒進畫面中…';
@@ -2474,7 +2480,8 @@ $('burn').addEventListener('click', async () => {
     button.disabled = false;
     button.textContent = said;
   }
-});
+  };
+}
 
 // A wheel over the timeline moves along the film -- any wheel, in any
 // direction. There is nothing to scroll vertically here, so requiring shift
@@ -2655,6 +2662,58 @@ function followCue() {
   }
 }
 
+// The selected cue, in the place every editing application puts the thing
+// you have selected: the inspector. The list on the left is every line;
+// this is the one you are working on, with room to read it and the controls
+// that decide how it will look. Those were in the transport bar, which is
+// for moving through the film, not for choosing a typeface.
+function inspectCue() {
+  const showing = cue >= 0 && cue < subs.length
+    && !$('pane-subs').classList.contains('hide');
+  $('cue-inspector').classList.toggle('hide', !showing);
+  $('inspector').classList.toggle('hide', showing);
+  $('ins-head').querySelector('.who').textContent = showing ? '這一句' : '這一顆';
+  if (!showing) return;
+
+  const line = subs[cue];
+  $('cue-inspector').innerHTML = `
+    <textarea id="cue-text" class="cue-text" spellcheck="false"
+      >${esc(line.text)}</textarea>
+    <div class="pairs">
+      <span>出現</span><span class="mono">${stamp(line.at)} → ${stamp(line.until)}
+        <i class="why">${(line.until - line.at).toFixed(2)}s</i></span>
+      ${line.speaker ? `<span>說話</span><span>${esc(line.speaker)}</span>` : ''}
+      ${line.heard && line.heard !== line.text
+        ? `<span>聽到</span><span class="why">${esc(line.heard)}</span>` : ''}
+    </div>
+
+    <section class="ins-part">
+      <h4>整支片的字幕怎麼呈現</h4>
+      <div class="pairs">
+        <span>樣式</span><span><select id="look" class="wide">
+          <option value="plain">一般</option>
+          <option value="spoken">講到哪亮到哪</option>
+          <option value="speakers">依說話者上色</option>
+          <option value="plate">加底色塊</option>
+        </select></span>
+        <span>字型</span><span><select id="font" class="wide">
+          <option value="">系統預設字型</option></select></span>
+      </div>
+      <button class="ghost" id="burn" style="margin-top:10px">燒進畫面</button>
+      <p class="why">燒好的是另一支檔案，原本那支留著。</p>
+    </section>`;
+
+  $('cue-text').oninput = () => {
+    const said = $('cue-text').value.trim();
+    if (!said || said === subs[cue].text) return;
+    subs[cue].text = said;
+    saveSubs(); paintSubs(); showBurnt();
+  };
+  $('cue-text').onkeydown = (e) => e.stopPropagation();
+  wireBurn();
+  loadFonts(runId);
+}
+
 function pickedCue() {
   if (cue >= 0 && cue < subs.length) return cue;
   const at = $('video').currentTime || 0;
@@ -2665,6 +2724,7 @@ function pickedCue() {
 function afterCues(select) {
   saveSubs(); paintSubs(); paintCues(); showBurnt();
   if (select != null) cue = Math.max(0, Math.min(select, subs.length - 1));
+  inspectCue();
 }
 
 $('cue-add').addEventListener('click', () => {
