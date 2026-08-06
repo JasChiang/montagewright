@@ -1230,8 +1230,10 @@ def test_the_page_takes_a_path_and_remembers_what_it_ran() -> None:
     page = PAGE.read_text(encoding="utf-8")
     for control in ("source_path", "music_path", "speech", "locale"):
         assert control in page, control
-    assert "先前的剪輯" in page
-    assert "聽到了什麼" in page
+    # The panes the browser column offers. They were drawer tabs with longer
+    # names when the drawer ran the width of the screen.
+    assert "pane-past" in page and "先前" in page
+    assert "pane-tx" in page and "逐字稿" in page
 
 
 def test_a_folder_can_be_clicked_instead_of_typed() -> None:
