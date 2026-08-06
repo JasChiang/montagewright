@@ -246,26 +246,43 @@ def to_fcpxml(
         keys = _keys(segment)
         if keys:
             target = width / height
-            positions, scales = [], []
-            for seconds, crop in keys:
-                scale, offset_x, offset_y = _placement(
-                    crop, source.aspect_ratio, target
+            placed = [
+                (rational(seconds),
+                 _placement(crop, source.aspect_ratio, target))
+                for seconds, crop in keys
+            ]
+            if len(placed) == 1:
+                # A still frame is two attributes. It was written as <param>
+                # elements carrying a time, which is not a thing FCPXML has:
+                # Final Cut refused the whole file with "no declaration for
+                # attribute time of element param" and imported nothing.
+                _, (scale, offset_x, offset_y) = placed[0]
+                adjust = (
+                    f'<adjust-transform '
+                    f'position="{offset_x * width:.3f} {offset_y * height:.3f}" '
+                    f'scale="{scale:.5f} {scale:.5f}"/>'
                 )
-                at = rational(seconds)
-                positions.append(
-                    f'<param name="position" '
-                    f'value="{offset_x * width:.3f} {offset_y * height:.3f}" '
-                    f'time="{at}"/>'
+            else:
+                # A move is keyframes, and keyframes live inside a
+                # keyframeAnimation inside the param they belong to.
+                moves = []
+                for name, pick in (
+                    ("position",
+                     lambda p: f"{p[1] * width:.3f} {p[2] * height:.3f}"),
+                    ("scale", lambda p: f"{p[0]:.5f} {p[0]:.5f}"),
+                ):
+                    frames = "".join(
+                        f'<keyframe time="{at}" value="{pick(where)}"/>'
+                        for at, where in placed
+                    )
+                    moves.append(
+                        f'<param name="{name}">'
+                        f"<keyframeAnimation>{frames}</keyframeAnimation>"
+                        f"</param>"
+                    )
+                adjust = (
+                    "<adjust-transform>" + "".join(moves) + "</adjust-transform>"
                 )
-                scales.append(
-                    f'<param name="scale" value="{scale:.5f} {scale:.5f}" '
-                    f'time="{at}"/>'
-                )
-            adjust = (
-                "<adjust-transform>"
-                f"{''.join(positions)}{''.join(scales)}"
-                "</adjust-transform>"
-            )
 
         notes = "".join(
             f'<marker start="{rational(cursor)}" duration="{rational(0.1)}" '

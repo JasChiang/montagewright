@@ -2842,3 +2842,58 @@ def test_a_finished_cut_can_be_taken_away() -> None:
     # Offered only when there is one -- a link that answers 404 reads as a
     # fault rather than as an absence.
     assert "$('dl-srt').classList.toggle('hide', !spoken)" in page
+
+
+def test_final_cut_will_parse_what_we_write() -> None:
+    """It refused the whole file and imported nothing.
+
+    "No declaration for attribute time of element param" -- because the
+    keyframes were written as <param time="..."/>, which is not a thing
+    FCPXML has. A still frame is two attributes on adjust-transform; a move
+    is keyframes inside a keyframeAnimation inside the param they belong to.
+    """
+
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+
+    from montagewright.executor import CropBox, RenderPlan, Segment, Source
+    from montagewright.reframe import CropPath, Keyframe
+    from montagewright.timeline import to_fcpxml
+
+    where = Source(source_id="A", path=Path("/rushes/A.mp4"),
+                   duration_seconds=20.0, width=3840, height=2160)
+    still = Segment(clip_id="k00", source=where, in_seconds=0.0,
+                    out_seconds=2.0,
+                    crop=CropBox(x=0.34, y=0.0, width=0.32, height=1.0))
+    moving = Segment(
+        clip_id="k01", source=where, in_seconds=3.0, out_seconds=6.0,
+        crop=CropBox(x=0.10, y=0.0, width=0.32, height=1.0),
+        crop_path=CropPath(keyframes=[
+            Keyframe(seconds=0.0,
+                     crop=CropBox(x=0.10, y=0.0, width=0.32, height=1.0)),
+            Keyframe(seconds=3.0,
+                     crop=CropBox(x=0.55, y=0.0, width=0.32, height=1.0)),
+        ]),
+    )
+    made = to_fcpxml(
+        RenderPlan(project_id="p", segments=[still, moving]), {},
+        name="p", width=1080, height=1920,
+    )
+
+    root = ET.fromstring(made)
+    assert not [
+        one for one in root.iter("param") if "time" in one.attrib
+    ], "param carries no time attribute in FCPXML"
+
+    adjusts = list(root.iter("adjust-transform"))
+    assert len(adjusts) == 2
+    # The still one says it in attributes.
+    assert adjusts[0].get("position") and adjusts[0].get("scale")
+    assert list(adjusts[0]) == []
+    # The moving one wraps its keyframes.
+    named = {one.get("name") for one in adjusts[1].iter("param")}
+    assert named == {"position", "scale"}
+    for one in adjusts[1].iter("param"):
+        frames = list(one.iter("keyframe"))
+        assert len(frames) == 2
+        assert all(f.get("time") and f.get("value") for f in frames)
