@@ -728,6 +728,12 @@ def _direction_schema() -> dict[str, Any]:
     }
 
 
+def _describe_one(item: MaterialItem) -> str:
+    """One clip's line, so it can be written beside its own footage."""
+
+    return _describe_material([item])
+
+
 def _describe_material(material: list[MaterialItem]) -> str:
     """The card's measurements alongside the description.
 
@@ -772,7 +778,22 @@ def _describe_material(material: list[MaterialItem]) -> str:
 def _attach_material(
     material: list[MaterialItem], cache: UploadCache | None, client: Any
 ) -> list[dict[str, Any]]:
-    """Attach every proxy that exists, reusing anything already uploaded."""
+    """Each clip's description, then that clip's own footage.
+
+    The listing used to be one block inside the prompt and the proxies a run
+    of parts after it, leaving the model to match the third line against the
+    third video by counting. That worked -- checked at seventy-four, the tail
+    of the list is read and the positions come back right -- but it rested on
+    two sequences agreeing, and they are built separately. A proxy that
+    failed to encode is skipped here while its line stays in the listing, and
+    from that clip on every description sits against the wrong picture.
+    Nothing raises. The plan comes back full of shots chosen for reasons
+    belonging to their neighbours.
+
+    Writing the id beside its own footage removes the assumption rather than
+    documenting it: a skipped clip now takes its description with it. This is
+    the shape `review_shots` has always used, for the same reason.
+    """
 
     attached: list[dict[str, Any]] = []
     for item in material:
@@ -783,6 +804,12 @@ def _attach_material(
             uri = uploaded.uri
         else:
             uri, _ = cache.uri_for(item.proxy, client, mime_type="video/mp4")
+        attached.append(
+            {
+                "type": "text",
+                "text": f"\n{_describe_one(item)}\n",
+            }
+        )
         attached.append(
             {
                 "type": "video",
@@ -825,7 +852,6 @@ def decide_direction(
     if client is None:
         client = _default_client()
 
-    listing = _describe_material(material)
     prompt = (PROMPTS / "direction_zh-TW.txt").read_text(encoding="utf-8")
     request_input: list[dict[str, Any]] = [
         {
@@ -833,7 +859,7 @@ def decide_direction(
             "text": (
                 f"{prompt}\n\n## 剪輯 brief\n\n{brief}\n\n"
                 f"## 執行層做得到什麼\n\n{describe_for_prompt()}\n\n"
-                f"## 素材（{len(material)} 支，依序附上影片）\n\n{listing}\n"
+                f"## 素材\n\n以下 {len(material)} 支，每一支的說明就寫在它自己那段影片前面。\n"
             ),
         }
     ]
@@ -1029,7 +1055,6 @@ def select_shots(
         if item.source_id
         not in {entry["source_id"] for entry in direction.get("unusable", [])}
     ]
-    listing = _describe_material(usable)
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     selection_input: list[dict[str, Any]] = [
         {
@@ -1041,7 +1066,7 @@ def select_shots(
                     f"輸出 {direction['aspect']}。\n\n"
                     f"## 剪輯 brief\n\n{brief}\n\n"
                     f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
-                    f"## 可用素材（{len(usable)} 支，依序附上影片）\n\n{listing}\n"
+                    f"## 可用素材\n\n以下 {len(usable)} 支，每一支的說明就寫在它自己那段影片前面。\n"
             ),
         }
     ]
@@ -1120,8 +1145,8 @@ def replan_shots(
                 + f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
                 + (f"## 這支片其他顆在講什麼\n\n{context}\n\n" if context else "")
                 + f"## 要重新規劃的鏡頭\n\n{problems}\n\n"
-                f"## 可用素材（{len(usable)} 支，依序附上影片）\n\n"
-                f"{_describe_material(usable)}\n"
+                f"## 可用素材\n\n以下 {len(usable)} 支，"
+                f"每一支的說明就寫在它自己那段影片前面。\n"
             ),
         }
     ]

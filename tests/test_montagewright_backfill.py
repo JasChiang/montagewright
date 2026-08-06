@@ -461,3 +461,75 @@ def test_the_ceiling_is_the_models_own():
     from montagewright.planner import MAX_OUTPUT_TOKENS
 
     assert MAX_OUTPUT_TOKENS == 65536
+
+
+# --- a description belongs beside its own footage ------------------------
+
+def _material(tmp_path, ids, missing=()):
+    from montagewright.planner import MaterialItem
+
+    out = []
+    for one in ids:
+        proxy = tmp_path / f"{one}.mp4"
+        if one not in missing:
+            proxy.write_bytes(b"not really a video")
+        out.append(
+            MaterialItem(
+                source_id=one, duration_seconds=10.0, summary=f"{one} 的內容",
+                proxy=proxy, composition="horizontal",
+            )
+        )
+    return out
+
+
+class _Cache:
+    def uri_for(self, path, client, *, mime_type):
+        return f"files/{path.stem}", None
+
+
+def test_each_clip_is_described_next_to_its_own_video(tmp_path):
+    from montagewright.planner import _attach_material
+
+    parts = _attach_material(_material(tmp_path, ["a", "b", "c"]), _Cache(), None)
+
+    # text, video, text, video, text, video -- and each text names the clip
+    # whose uri follows it.
+    assert [one["type"] for one in parts] == ["text", "video"] * 3
+    for said, shown in zip(parts[::2], parts[1::2]):
+        assert shown["uri"].split("/")[-1] in said["text"]
+
+
+def test_a_missing_proxy_takes_its_description_with_it(tmp_path):
+    """The failure this shape exists to prevent.
+
+    With the listing in the prompt and the videos after it, a clip that
+    failed to encode was skipped among the videos while its line stayed in
+    the listing -- so every clip after it was described against the wrong
+    picture, and nothing raised.
+    """
+
+    from montagewright.planner import _attach_material
+
+    parts = _attach_material(
+        _material(tmp_path, ["a", "b", "c"], missing={"b"}), _Cache(), None
+    )
+
+    assert [one["type"] for one in parts] == ["text", "video"] * 2
+    assert "b" not in "".join(
+        one["text"] for one in parts if one["type"] == "text"
+    ).replace("的內容", "")
+    for said, shown in zip(parts[::2], parts[1::2]):
+        assert shown["uri"].split("/")[-1] in said["text"]
+
+
+def test_the_prompt_no_longer_carries_a_second_copy_of_the_listing():
+    # Described twice is worse than described once in the wrong place: the
+    # two copies can disagree, and only one of them sits by the footage.
+    from pathlib import Path
+
+    text = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "planner.py"
+    ).read_text(encoding="utf-8")
+
+    assert "依序附上影片" not in text
