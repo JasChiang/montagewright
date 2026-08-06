@@ -619,6 +619,18 @@ class MaterialItem:
     # 1.8s the cut actually used.
     usable_from: float = 0.0
     usable_to: float = 0.0
+    # How far this particular source can be pushed into before the delivered
+    # frame is being enlarged past what the direction will accept. 1.0 means
+    # no room at all. Measured from this file's own dimensions against the
+    # chosen aspect, so a 4K take and a 1080 one say different things -- it
+    # is not a rule, it is a fact about this clip.
+    #
+    # It exists here because the execution layer was answering an editorial
+    # question on its own: whether a shot is worth softening for. Told the
+    # number, the planner can push to the limit, choose a take that is
+    # already tighter, or not push. Not told it, it asks for a move nobody
+    # can deliver and finds out afterwards, in a degradation.
+    push_room: float = 1.0
     action: tuple[str, ...] = ()
     needs: tuple[str, ...] = ()
     # What is said, when, and by whom. A shot chosen out of an interview is
@@ -718,6 +730,10 @@ def _describe_material(material: list[MaterialItem]) -> str:
             facts.append(
                 f"可用區間 {item.usable_from:.1f}–{item.usable_to:.1f}s"
             )
+        if item.push_room <= 1.02:
+            facts.append("推近沒有空間：這支的解析度只夠滿版，推了就會糊")
+        else:
+            facts.append(f"最多推近 {item.push_room:.2f}×")
         head = f"- {item.source_id}（{'、'.join(facts)}）：{item.summary}"
         if item.action:
             head += "\n    動作：" + "；".join(item.action)

@@ -983,7 +983,10 @@ function coldCards(runs) {
       return `<a class="cut ${bad ? 'bad' : ''}" href="#"
          data-open="${r.run_id}" data-where="${esc(where.split('/').pop())}">
         <div class="poster">${r.seconds
-          ? `<img loading="lazy" alt="" src="/api/runs/${r.run_id}/thumb/0">`
+          ? `<img loading="lazy" alt="" src="/api/runs/${r.run_id}/thumb/0"
+                 onerror="this.replaceWith(Object.assign(
+                   document.createElement('span'),
+                   {className:'none', textContent:'沒有畫面'}))">`
           : `<span class="none">${({running:'執行中', failed:'失敗',
               stopped:'已停止', interrupted:'中斷'})[r.state] || '沒有畫面'}</span>`}
         </div>
@@ -1939,6 +1942,9 @@ function showWorkspace(on) {
   $('nothing-yet').classList.toggle('on', !on);
   document.querySelector('.work').classList.toggle('hide', !on);
   document.querySelector('.reelwrap').classList.toggle('hide', !on);
+  // The handle between them is a sibling of both, so it stayed behind --
+  // a divider floating at the bottom of a page with nothing to divide.
+  $('grip-reel').classList.toggle('hide', !on);
   // Earlier cuts are the one thing worth reading before there is a run, so
   // they move to the middle of the empty page rather than hiding with the
   // rest of the browser.

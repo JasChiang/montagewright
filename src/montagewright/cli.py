@@ -67,6 +67,38 @@ def _client():
     return genai.Client(api_key=key, http_options=_http_options(types))
 
 
+def _push_room(proxy: Path, target_aspect: float) -> float:
+    """How far this source can be pushed into, as a zoom factor.
+
+    Read off the file that will actually be cut, so it is a fact about this
+    clip rather than a rule about clips. A 4K take at 9:16 has room for
+    about 1.5x; a 1080 one has none, and saying so is what stops a push
+    being asked for where it cannot be given.
+
+    Not the proxy: that is 640 pixels wide and would report that nothing
+    anywhere can be pushed into.
+    """
+
+    from montagewright.executor import delivery_size
+    from montagewright.measure.media import probe_video
+    from montagewright.reframe import zoom_budget
+
+    try:
+        shape = probe_video(proxy).video
+        wide = int(shape.display_width)
+        tall = int(shape.display_height)
+    except Exception:
+        return 1.0
+    if not wide or not tall:
+        return 1.0
+    out_w, out_h = delivery_size(target_aspect)
+    budget = zoom_budget(
+        source_width=wide, source_height=tall, source_aspect=wide / tall,
+        target_aspect=target_aspect, output_width=out_w, output_height=out_h,
+    )
+    return round(1.0 / max(budget, 1e-6), 2)
+
+
 def _make_proxy(
     source: Path, destination: Path, *, library: Path | None = None
 ) -> Path:
@@ -240,6 +272,10 @@ def command_render(args: argparse.Namespace) -> int:
         )
         for path in sources_paths
     }
+    # The originals, by source id. How far a shot can be pushed into is a
+    # fact about the file that will be cut, and the proxy is 640 pixels wide
+    # -- asking it says every clip has no room at all.
+    originals = {path.stem: path for path in sources_paths}
     def wrote(index: int, total: int, source_id: str) -> None:
         print(f"  card {index}/{total}  {source_id}", flush=True)
 
@@ -337,6 +373,9 @@ def command_render(args: argparse.Namespace) -> int:
                 camera_motion=str((card or {}).get("camera_motion", "") or ""),
                 usable_from=float((card or {}).get("usable_from_seconds", 0.0)),
                 usable_to=float((card or {}).get("usable_to_seconds", 0.0)),
+                push_room=_push_room(
+                    originals.get(source_id, proxy), ASPECTS[args.aspect]
+                ),
                 action=tuple(
                     f"{beat.what} {beat.starts_seconds:.1f}-{beat.ends_seconds:.1f}s"
                     for beat in action_beats(card or {})[:4]

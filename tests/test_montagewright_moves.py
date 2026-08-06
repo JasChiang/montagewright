@@ -2770,3 +2770,46 @@ def test_a_segment_is_scaled_to_the_delivery_not_to_its_own_crop() -> None:
     # Both paths -- the moving crop and the still one -- land on one size.
     assert renderer.count('f"scale={output_size[0]}:{output_size[1]}"') == 2
     assert "keyframes[0].crop.to_pixels(" not in renderer
+
+
+def test_the_planner_is_told_how_far_each_clip_can_be_pushed() -> None:
+    """The execution layer was answering an editorial question alone.
+
+    How far a shot may push before it softens is measured from that file's
+    own dimensions -- it is a fact about the clip, not a rule about clips.
+    Nobody was telling the planner, so it asked for pushes that could not be
+    given and found out afterwards, in a degradation, with a constant in the
+    executor deciding how much softness was acceptable.
+    """
+
+    from montagewright.planner import MaterialItem, _describe_material
+
+    said = _describe_material([
+        MaterialItem(source_id="BIG", duration_seconds=6.2, summary="4K",
+                     push_room=1.52),
+        MaterialItem(source_id="SMALL", duration_seconds=4.0, summary="1080p",
+                     push_room=1.0),
+    ])
+    assert "最多推近 1.52×" in said
+    assert "推近沒有空間" in said
+
+    # And the prompt says what to do about it, or the number is decoration.
+    from montagewright.planner import PROMPTS
+
+    prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
+    assert "最多推近" in prompt
+    assert "不要對沒有空間的素材下推近" in prompt
+
+
+def test_push_room_is_read_from_the_file_that_gets_cut(tmp_path) -> None:
+    """The proxy is 640 pixels wide and would report that nothing anywhere
+    can be pushed into."""
+
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "cli.py"
+    ).read_text(encoding="utf-8")
+    assert "originals = {path.stem: path for path in sources_paths}" in source
+    assert "originals.get(source_id, proxy)" in source
