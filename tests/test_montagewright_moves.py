@@ -2727,3 +2727,46 @@ def test_the_font_list_follows_the_language_of_the_cut() -> None:
     if not chinese or not japanese:
         return  # no fontconfig here
     assert chinese != japanese
+
+
+def test_the_zoom_budget_guards_the_size_that_is_actually_delivered() -> None:
+    """It was calibrated against an output that never existed.
+
+    zoom_budget assumed 1080x1920 while the renderer scaled every segment to
+    whatever the opening crop happened to measure -- 1214x2160 off a 4K
+    source at 9:16. So a push the report called 1.35x enlargement was 1.52x
+    on disk, and the one number deciding how far a shot may push was
+    protecting a file nobody was making.
+    """
+
+    from montagewright.executor import delivery_size
+    from montagewright.reframe import MAX_UPSCALE, zoom_budget
+
+    for aspect, expected in (
+        (9 / 16, (1080, 1920)), (16 / 9, (1920, 1080)),
+        (1.0, (1080, 1080)), (0.8, (1080, 1350)),
+    ):
+        assert delivery_size(aspect) == expected
+
+    wide, tall = delivery_size(9 / 16)
+    budget = zoom_budget(
+        source_width=3840, source_height=2160, source_aspect=3840 / 2160,
+        target_aspect=9 / 16, output_width=wide, output_height=tall,
+    )
+    # The tightest crop this allows, delivered at that size, enlarges by
+    # exactly the budget -- not by half as much again.
+    base_w = (9 / 16) / (3840 / 2160) * 3840
+    tightest = base_w * budget
+    assert abs((wide / tightest) - MAX_UPSCALE) < 0.01
+
+
+def test_a_segment_is_scaled_to_the_delivery_not_to_its_own_crop() -> None:
+    from pathlib import Path
+
+    renderer = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "renderer.py"
+    ).read_text(encoding="utf-8")
+    # Both paths -- the moving crop and the still one -- land on one size.
+    assert renderer.count('f"scale={output_size[0]}:{output_size[1]}"') == 2
+    assert "keyframes[0].crop.to_pixels(" not in renderer

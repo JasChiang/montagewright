@@ -113,12 +113,36 @@ class Segment:
         return self.out_seconds - self.in_seconds
 
 
+# What a delivery actually measures, per shape. Every segment is scaled to
+# this, and zoom_budget is calibrated against it -- the two have to be the
+# same number or the budget is guarding an output that does not exist.
+DELIVERY_SIZES: dict[str, tuple[int, int]] = {
+    "9:16": (1080, 1920),
+    "4:5": (1080, 1350),
+    "1:1": (1080, 1080),
+    "16:9": (1920, 1080),
+}
+
+
+def delivery_size(target_aspect: float) -> tuple[int, int]:
+    """The nearest standard size for this shape."""
+
+    best, gap = (1080, 1920), None
+    for wide, tall in DELIVERY_SIZES.values():
+        off = abs((wide / tall) - target_aspect)
+        if gap is None or off < gap:
+            best, gap = (wide, tall), off
+    return best
+
+
 @dataclass
 class RenderPlan:
     """Everything the renderer needs, plus an honest account of the cost."""
 
     project_id: str
     segments: list[Segment]
+    # Pixels, not "whatever the first crop happened to measure".
+    output_size: tuple[int, int] = (1080, 1920)
     degradations: list[DegradationStep] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -182,6 +206,7 @@ def plan_render(
     *,
     target_aspect: float | None = None,
     crop_paths: "dict[str, CropPath] | None" = None,
+    output_size: "tuple[int, int] | None" = None,
 ) -> RenderPlan:
     """Compile an EDL into segments. Never returns fewer than it was given.
 
@@ -235,6 +260,7 @@ def plan_render(
         segments=segments,
         degradations=degradations,
         notes=notes,
+        output_size=output_size or delivery_size(target_aspect or 9 / 16),
     )
 
 

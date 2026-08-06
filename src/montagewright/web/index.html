@@ -38,6 +38,8 @@
     display: grid; grid-template-rows: var(--rail) 1fr 5px var(--reel, auto);
     height: 100%;
   }
+  /* Never taller than what it holds. */
+  .reelwrap { max-height: max-content; }
   .reelwrap { min-height: 0; overflow: hidden; display: flex;
               flex-direction: column; }
   .reelwrap .scroller { flex: 1; min-height: 0; overflow: auto; }
@@ -1876,8 +1878,13 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s ?? 
     e.preventDefault();
     $('grip-reel').classList.add('holding');
     const move = (ev) => {
+      // An editing application's timeline is as tall as its tracks. You
+      // may take room away from it to see more of the picture; stretching
+      // it past what it holds only makes a void, which is what dragging it
+      // down used to do.
+      const holds = $('reelwrap').scrollHeight;
       const tall = Math.max(120, Math.min(
-        innerHeight - ev.clientY, innerHeight * 0.7));
+        innerHeight - ev.clientY, holds, innerHeight * 0.7));
       const held = `${Math.round(tall)}px`;
       document.documentElement.style.setProperty('--reel', held);
       localStorage.setItem('mw---reel', held);

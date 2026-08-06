@@ -157,7 +157,8 @@ def probe_duration(path: Path) -> float:
 
 
 def _render_segment(
-    segment: Segment, destination: Path, *, video_encoder: str
+    segment: Segment, destination: Path, *, video_encoder: str,
+    output_size: tuple[int, int] = (1080, 1920),
 ) -> tuple[Path, "Handles"]:
     """Cut one shot, cropping if the plan asked for it."""
 
@@ -178,13 +179,11 @@ def _render_segment(
         # A zoom changes the crop size per frame, so the output has to be
         # pinned to one resolution or the encoder sees a stream that changes
         # shape mid-shot.
-        out_w, out_h = segment.crop_path.keyframes[0].crop.to_pixels(
-            source.width, source.height
-        )[2:]
-        filters.append(f"scale={out_w}:{out_h}")
+        filters.append(f"scale={output_size[0]}:{output_size[1]}")
     elif segment.crop is not None:
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)
         filters.append(f"crop={width}:{height}:{x}:{y}")
+        filters.append(f"scale={output_size[0]}:{output_size[1]}")
 
     # The delivered segment is cut exactly. Handles are written alongside it
     # as their own file, so a transition or a nudge has material without the
@@ -424,7 +423,8 @@ def render(
     for index, segment in enumerate(plan.segments):
         destination = segment_dir / f"{index:03d}-{segment.clip_id}.mp4"
         rendered, handles = _render_segment(
-            segment, destination, video_encoder=video_encoder
+            segment, destination, video_encoder=video_encoder,
+            output_size=plan.output_size,
         )
         segment_paths.append((rendered, handles, segment.duration_seconds))
 

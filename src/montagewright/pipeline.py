@@ -25,7 +25,9 @@ from typing import Any
 
 from montagewright.clipcard import find_subject, load_card
 from montagewright.cost import Ledger, Spend
-from montagewright.executor import RenderPlan, Source, plan_render
+from montagewright.executor import (
+    RenderPlan, Source, delivery_size, plan_render,
+)
 from montagewright.grounding import BeatGrid, apply_to_edl, ground_timeline
 from montagewright.planner import Usage, decide_rhythm, locate_subject
 from montagewright.reframe import (
@@ -316,7 +318,7 @@ def follow_subjects(
     *,
     target_aspect: float,
     report: Report,
-    output_size: tuple[int, int] = (1080, 1920),
+    output_size: tuple[int, int] | None = None,
     cards: dict[str, Path] | None = None,
     checkpoint: Path | None = None,
     client: Any | None = None,
@@ -327,6 +329,13 @@ def follow_subjects(
     right answer rather than a failure -- the deadband decides that, not a
     threshold anyone has to tune.
     """
+
+    # The size the film is actually delivered at, so the zoom budget guards
+    # the enlargement that really happens. It used to assume 1080x1920 while
+    # the renderer scaled each segment to whatever the opening crop measured
+    # -- 1214x2160 off a 4K source -- so a push reported as 1.35x was 1.52x
+    # on disk, and the limit was protecting an output that did not exist.
+    output_size = output_size or delivery_size(target_aspect)
 
     paths: dict[str, CropPath] = {}
     with tempfile.TemporaryDirectory() as raw_work:
@@ -980,7 +989,8 @@ def run(
     write_crops(paths, output_dir / "work" / "crops.json")
 
     plan = plan_render(
-        edl, sources, target_aspect=target_aspect, crop_paths=paths
+        edl, sources, target_aspect=target_aspect, crop_paths=paths,
+        output_size=delivery_size(target_aspect),
     )
     report.degradations.extend(plan.degradations)
 
