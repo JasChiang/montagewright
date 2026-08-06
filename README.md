@@ -80,22 +80,54 @@ Gemini 回覆時會一併標出**每一句是誰講的**，而且用看得出來
 
 ## 流程
 
-```
- 1. proxy          每支素材壓一份小檔（640px / 15fps）給模型看
- 2. clip cards     每支寫一張卡片：內容、主體位置、動作起訖、需要什麼處理
- 3. transcripts    只有卡片說「聲音是內容」的素材才做逐字稿
- 4. direction      看完全部 + 音樂 + brief → 調性、長度、比例、音樂怎麼鋪
- 5. selection      → 用哪幾顆、從第幾秒進、多長、什麼運鏡、為什麼
- 6. rhythm         → 配合音樂微調長度與切點
- 7. subject        主體在哪：卡片有就用，沒有就即時定位一次
- 8. track          SAM 逐幀追蹤（會動的主體才做）
- 9. reframe        算出裁切路徑
-10. render         分段渲染 → 串接 → 混音 → 預覽
-11. review         先逐顆對照它自己的計畫，再看整支
-12. replan         沒做到的那幾顆重新規劃，其他不動，然後重跑 7–11
+十二個階段，其中八個要付錢給 Gemini。虛線框的有條件才跑，`◈` 是內容定址快取。
+
+```mermaid
+flowchart TD
+    RUSH["毛片 → proxy 640px ◈<br/><small>已剪過的先拆回鏡頭</small>"]:::local
+    CARD["Clip Card ◈<br/><small>每支素材 ×1，跨專案共用</small>"]:::paid
+    ASR["Apple ASR ◈<br/><small>每字時間 · 唯一的時鐘</small>"]:::localopt
+    FIX["逐字修正<br/><small>看影片改同音字，秒數不採用</small>"]:::paidopt
+    DIR["定調<br/><small>長度 · 比例 · 排除哪些素材</small>"]:::paid
+    SEL["選片<br/><small>哪幾顆 · 進出點 · 什麼運鏡</small>"]:::paid
+    RHY["節奏<br/><small>聽音樂改長度，有配樂才跑</small>"]:::paidopt
+    GND["主體定位<br/><small>抽靜態格問框，有運鏡才跑</small>"]:::paidopt
+    SAM["SAM 逐幀追蹤<br/><small>本機 propagation → 裁切路徑</small>"]:::localopt
+    REN["渲染<br/><small>ffmpeg 分段 → 串接 → 混音</small>"]:::local
+    REV["審查<br/><small>看單顆 + 看整片</small>"]:::paidopt
+    OUT["交付<br/><small>mp4 · 字幕 · report · FCPXML</small>"]:::local
+
+    RUSH --> CARD --> ASR --> FIX --> DIR --> SEL --> RHY --> GND --> SAM --> REN --> REV --> OUT
+    REV -. "沒交付的那幾顆重新規劃" .-> GND
+
+    classDef paid stroke:#D08A2E,stroke-width:2px
+    classDef local stroke:#4E9A94,stroke-width:2px
+    classDef paidopt stroke:#D08A2E,stroke-width:2px,stroke-dasharray:5 4
+    classDef localopt stroke:#4E9A94,stroke-width:2px,stroke-dasharray:5 4
 ```
 
-**丟一支已經剪過的長片進來**，第 1 步之前會先照原本的場景切點拆開；如果是一鏡到底，就保持原樣。
+審查是一個迴圈：它只把「沒做到自己計畫」的那幾顆送回去重新規劃，其他不動，然後從主體定位重跑。每一輪都是先渲染才審查，所以任何時候停下來都留著一支完整的片。
+
+**丟一支已經剪過的長片進來**，第一步之前會先照原本的場景切點拆開；如果是一鏡到底，就保持原樣。
+
+### 每個階段實際看到什麼
+
+規劃階段不是只讀卡片文字 —— **定調跟選片都會把所有 proxy 一起附上去重看**。卡片是索引，影片才是判斷依據。
+
+| 階段 | 誰在做 | 看到什麼 |
+|---|---|---|
+| Clip Card | Gemini | proxy 影片 |
+| Apple ASR | 本機 | 音軌 |
+| 逐字修正 | Gemini | proxy 影片 |
+| 定調 | Gemini | 全部 proxy + 音樂 + brief |
+| 選片 | Gemini | 全部 proxy + 卡片 + 逐字稿 |
+| 節奏 | Gemini | 音樂本體 + EDL |
+| 主體定位 | Gemini | 抽出來的靜態畫格 |
+| SAM 追蹤 | 本機 | proxy 全幀 |
+| 渲染 | 本機 | 原始檔 + 裁切路徑 |
+| 審查 | Gemini | 渲染出來的單顆與成片 |
+
+選片原本只讀文字摘要，從沒看過任何一顆。改成附上影片之後它從十一顆變成挑十七顆，並且講出了摘要裡沒有的東西 —— 預覽畫面上的半顆愛心手勢、0.3 公尺的景深讀數、被折起來拿著的手機。**摘要是在還沒人知道這支片要講什麼的時候寫的，所以它省略掉的，正好就是選片需要的。**
 
 外部服務只有 Gemini（3.6 Flash，用 `responseSchema` 綁結構化輸出、`thinking_level: high`）。SAM、語音辨識、節拍分析、ffmpeg 全部在本機跑。上傳過的 proxy 用內容 hash 快取 48 小時，重跑不用重傳；proxy 本身也是內容定址的，同一批素材剪第二次不用重新編碼。
 
