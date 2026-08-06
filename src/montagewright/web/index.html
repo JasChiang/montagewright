@@ -285,6 +285,30 @@
   .ins-subject { font-size: 13.5px; font-weight: 600; line-height: 1.4; }
   .ins-row { display: flex; gap: 7px; align-items: center; flex-wrap: wrap;
              font-size: 11.5px; color: var(--dim); }
+
+  .ins-part { margin-top: 18px; }
+  .ins-part h4 {
+    margin: 0 0 8px; font-size: 10px; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--dim); font-weight: 600;
+    padding-bottom: 5px; border-bottom: 1px solid var(--hair);
+  }
+  /* The section that failed says so with a colour, not only with words. */
+  .ins-part.off h4 { color: var(--accent); border-bottom-color: var(--accent); }
+  .ins-part p { margin: 7px 0 0; }
+  .ins-part .pairs {
+    display: grid; grid-template-columns: auto 1fr; gap: 5px 12px;
+    align-items: baseline; font-size: 13px;
+  }
+  .ins-part .pairs > span:nth-child(odd) {
+    color: var(--dim); font-size: 11.5px;
+  }
+  .ins-part i { font-style: normal; }
+  .gainrow {
+    display: flex; align-items: center; gap: 9px; margin-top: 10px;
+    background: var(--sunk); border: 1px solid var(--hair);
+    border-radius: 8px; padding: 8px 10px;
+  }
+  .gainrow input { flex: 1; min-width: 0; }
   .side:empty::after { content: ''; }
 
   dl.facts { margin: 0; }
@@ -317,6 +341,7 @@
   }
   .shotcard:hover { background: var(--sunk); }
   .shotcard.on { background: var(--sunk); border-color: var(--line); }
+  .shotcard:has(.tag.no) .thumb { outline: 2px solid var(--accent); }
   .shotcard .head { display: flex; gap: 10px; align-items: flex-start; }
   .shotcard .thumb {
     width: 74px; height: 96px; object-fit: cover; border-radius: 6px;
@@ -454,7 +479,15 @@
       rgba(20,19,17,.78) 100%);
   }
   .blk > * { position: relative; }
-  .blk.no { border-left-color: var(--accent); }
+  /* A shot that did not do what it said it would, visible without being
+     clicked on. A timeline is for scanning; if trouble only shows in a
+     panel, it is found by luck. */
+  .blk.no { border-left-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .blk .flag {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 3px; padding: 0 4px; margin-right: 4px;
+    font-size: 9.5px; line-height: 1.5;
+  }
   .blk:hover { box-shadow: 0 0 0 1px var(--accent); }
   .blk.on { border-color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent); }
   .blk .lab {
@@ -671,6 +704,8 @@
       <dt>F</dt><dd>時間軸符合寬度</dd>
       <dt>Delete</dt><dd>刪掉這一顆</dd>
       <dt>⌘Z</dt><dd>還原</dd>
+      <dt>滾輪</dt><dd>沿著片子前後移動</dd>
+      <dt>⌘ 滾輪</dt><dd>以游標為中心縮放時間軸</dd>
       <dt>?</dt><dd>開關這張表</dd>
     </dl>
   </div>
@@ -753,7 +788,7 @@
       <span class="zoom">縮放 <input type="range" id="zoom" min="6" max="120" step="1" value="24"></span>
       <button class="ghost" id="fit">符合寬度</button>
       <button class="ghost" id="show-keys" title="鍵盤操作">?</button>
-      <span class="grow" id="strip-note">拖邊緣改進出點，拖方塊換順序，× 刪掉</span>
+      <span class="grow" id="strip-note"></span>
       <select class="hide" id="look">
         <option value="plain">一般</option>
         <option value="spoken">講到哪亮到哪</option>
@@ -1111,22 +1146,43 @@ function inspect(i) {
     ${said.delivered === false ? `<div class="why" style="margin-top:6px">
       「沒做到」的意思是：逐顆驗收單獨看了這一顆，認為它沒有做到下面那句宣告。
       不是畫面壞掉，是計畫跟結果對不起來。</div>` : ''}
-    <dl>
-      <dt>進出點</dt><dd class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds).toFixed(2)}s
-        （${b.seconds.toFixed(2)}s${moved ? '，已改動' : ''}）</dd>
-      <dt>這一顆的音量</dt><dd class="gainrow">
+    <!-- Two sides, because that is what this tool is: every shot makes a
+         claim and then gets checked against it. Interleaving the plan with
+         the verdict made both read as one undifferentiated column of
+         sentences, and hid the one relationship worth seeing. -->
+    <section class="ins-part">
+      <h4>它打算做什麼</h4>
+      <div class="pairs">
+        <span>運鏡</span><span>${esc(plan.camera_move || '—')}${
+          plan.framing ? ` <i class="why">${esc(plan.framing)}</i>` : ''}</span>
+        <span>主體</span><span>${esc(plan.subject || '—')}</span>
+        ${said.speaker ? `<span>說話</span><span>${esc(said.speaker)}</span>` : ''}
+      </div>
+      <p class="why">${esc(plan.why || '—')}</p>
+      ${rhythm.why ? `<p class="why"><i>為什麼這個長度：</i>${esc(rhythm.why)}</p>` : ''}
+    </section>
+
+    <section class="ins-part ${said.delivered === false ? 'off' : ''}">
+      <h4>實際做到什麼</h4>
+      ${said.note ? `<p class="why">${esc(said.note)}</p>`
+        : '<p class="why">逐顆驗收沒有單獨看這一顆。</p>'}
+      ${deg.length ? `<div class="degs">${deg.map(tellDegradation).join('')}</div>` : ''}
+    </section>
+
+    <section class="ins-part">
+      <h4>你可以改的</h4>
+      <div class="pairs">
+        <span>進出點</span><span class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds).toFixed(2)}s
+          <i class="why">${b.seconds.toFixed(2)}s${moved ? '，已改動' : ''}</i></span>
+      </div>
+      <div class="gainrow">
+        <span class="why">音量</span>
         <input type="range" id="gain" min="-18" max="12" step="0.5"
                value="${b.gain_db || 0}">
         <span class="mono" id="gain-said">${(b.gain_db || 0) > 0 ? '+' : ''}${(b.gain_db || 0).toFixed(1)} dB</span>
         <button class="bare" id="gain-off">歸零</button>
-      </dd>
-      <dt>運鏡</dt><dd>${esc(plan.camera_move || '—')}${plan.framing ? `　<span class="why">${esc(plan.framing)}</span>` : ''}</dd>
-      <dt>主體</dt><dd>${esc(plan.subject || '—')}${said.speaker ? `<div class="why">說話：${esc(said.speaker)}</div>` : ''}</dd>
-      <dt>它宣告要做什麼</dt><dd class="why">${esc(plan.why || '—')}</dd>
-      ${rhythm.why ? `<dt>為什麼這個長度</dt><dd class="why">${esc(rhythm.why)}</dd>` : ''}
-      ${said.note ? `<dt>驗收實際看到</dt><dd class="why">${esc(said.note)}</dd>` : ''}
-      ${deg.length ? `<dt>做不到的地方</dt><dd>${deg.map(tellDegradation).join('')}</dd>` : ''}
-    </dl>`;
+      </div>
+    </section>`;
   wireGain(i);
 }
 
@@ -1444,7 +1500,7 @@ function paintStrip() {
          data-i="${i}" draggable="true"
          title="${esc(b.source_id)}　${esc(b.subject)}">
       <div class="grip l" data-edge="l" data-i="${i}"></div>
-      <div class="lab">${esc(b.source_id)}</div>
+      <div class="lab">${b.delivered === false ? '<b class="flag">!</b>' : ''}${esc(b.source_id)}</div>
       <div class="dur">${b.seconds.toFixed(1)}s${
         b.gain_db ? ` ${b.gain_db > 0 ? '+' : ''}${b.gain_db.toFixed(1)}dB` : ''
       }</div>
@@ -1456,9 +1512,11 @@ function paintStrip() {
   paintSubs();
   const changed = JSON.stringify(blocks) !== JSON.stringify(blocksWere);
   $('recut').classList.toggle('hide', !changed);
+  // Only worth saying when there is something to say. A permanent line of
+  // instructions is a tool explaining itself instead of being usable.
   $('strip-note').textContent = changed
-    ? `${blocks.length} 顆，共 ${total.toFixed(1)}s——按「重新輸出」套用（不用錢）`
-    : '拖邊緣改進出點，拖方塊換順序，× 刪掉';
+    ? `${blocks.length} 顆，共 ${total.toFixed(1)}s —— 按「重新輸出」套用（不用錢）`
+    : '';
   movePlayhead();
 }
 
@@ -2251,13 +2309,31 @@ $('burn').addEventListener('click', async () => {
   }
 });
 
-// A wheel across the timeline moves along the film. Vertical wheels with
-// shift held do the same, which is what every editor's hand already does.
+// A wheel over the timeline moves along the film -- any wheel, in any
+// direction. There is nothing to scroll vertically here, so requiring shift
+// meant the obvious gesture did nothing at all and the way to move needed
+// explaining. Holding cmd or ctrl zooms instead, around the pointer, which
+// is where every timeline puts it.
 $('scroller').addEventListener('wheel', (e) => {
   const sc = $('scroller');
+
+  if (e.ctrlKey || e.metaKey) {
+    if (!blocks.length) return;
+    e.preventDefault();
+    const box = sc.getBoundingClientRect();
+    const under = (sc.scrollLeft + e.clientX - box.left) / scale;
+    zoomedByHand = true;
+    scale = Math.max(4, Math.min(scale * (e.deltaY < 0 ? 1.12 : 0.89), 400));
+    $('zoom').value = Math.min(120, Math.max(6, scale));
+    paintStrip(); paintWavesWhenSettled();
+    // Keep whatever was under the pointer under the pointer.
+    sc.scrollLeft = under * scale - (e.clientX - box.left);
+    movePlayhead();
+    return;
+  }
+
   if (sc.scrollWidth <= sc.clientWidth) return;
-  const by = Math.abs(e.deltaX) > Math.abs(e.deltaY)
-    ? e.deltaX : (e.shiftKey ? e.deltaY : 0);
+  const by = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
   if (!by) return;
   e.preventDefault();
   sc.scrollLeft += by;

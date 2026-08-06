@@ -727,7 +727,7 @@ def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
     page = PAGE.read_text(encoding="utf-8")
     for shown in (
         "shotcard", "s.source_id", "s.camera_move", "s.subject", "s.why",
-        "tellDegradation", "驗收實際看到",
+        "tellDegradation", "實際做到什麼",
     ):
         assert shown in page, shown
 
