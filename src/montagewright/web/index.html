@@ -933,8 +933,7 @@
 <div class="hide" id="result"></div>
 <div class="hide" id="detail"></div>
 <div class="hide" id="strip"></div>
-<a class="hide" id="download"></a><a class="hide" id="subs"></a>
-<a class="hide" id="tl-pr"></a><a class="hide" id="tl-fc"></a>
+<a class="hide" id="download"></a>
 <div class="hide" id="stats"></div>
 
 <script>
@@ -1694,17 +1693,15 @@ async function showTranscripts() {
   $('detail').classList.remove('hide');
 }
 
+// Everything a run needs, asked for at once. These do not depend on one
+// another and were being awaited in a line.
+//
+// It also used to probe for the two timeline files with HEAD requests, to
+// decide whether to reveal links to them -- links whose elements I had
+// already deleted, so the answers went nowhere. And that endpoint builds
+// the XML when it is missing, so simply opening a cut quietly rebuilt both
+// timelines every time, off screen, for nobody.
 function showExtras() {
-  for (const [id, flavour] of [['tl-pr','premiere'], ['tl-fc','finalcut']]) {
-    fetch(`/api/runs/${runId}/timeline/${flavour}`, { method: 'HEAD' })
-      .then(r => { if (r.ok) {
-        $(id).href = `/api/runs/${runId}/timeline/${flavour}`;
-        $(id).classList.remove('hide');
-      }});
-  }
-  fetch(`/api/runs/${runId}/subtitles`, { method: 'HEAD' }).then(r => {
-    if (r.ok) { $('subs').href = `/api/runs/${runId}/subtitles`; $('subs').classList.remove('hide'); }
-  });
   showTranscripts();
   showStrip();
 }
@@ -1783,7 +1780,8 @@ $('go').addEventListener('click', async () => {
   for (const pane of ['pane-tx', 'pane-aside']) {
     $(pane).classList.add('hide');
   }
-  for (const id of ['subs', 'tl-pr', 'tl-fc']) $(id).classList.add('hide');
+  // The exports belong to a finished cut, and a new run has none yet.
+  $('export').parentElement.classList.add('hide');
   $('video').removeAttribute('src');
   timer = setInterval(poll, 1200);
   ticker = setInterval(() => { if (allLines.length) paintSteps(allLines); }, 1000);
