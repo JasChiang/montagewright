@@ -42,7 +42,18 @@
     height: 100%;
   }
 
-  .reelwrap { min-height: 0; display: flex; flex-direction: column; }
+  /* min-width: 0, or this refuses to be narrower than the reel inside it.
+     A grid item's default is min-width: auto -- it will not shrink below
+     its content -- so a reel still laid out at the pixels-per-second of a
+     wider window forced the entire page to that width, and every column
+     went with it. The scroller exists precisely so the reel may be wider
+     than the window; it cannot do that job while its parent grows to fit. */
+  .reelwrap {
+    min-height: 0; min-width: 0; display: flex; flex-direction: column;
+  }
+  .reelwrap .scroller { min-width: 0; }
+  .app > * { min-width: 0; }
+  .work { min-width: 0; }
   .reelwrap .scroller { flex: 1; min-height: 0; overflow: auto; }
 
   /* toolbar */
@@ -403,8 +414,11 @@
      height out stretched every frame on the picture track and made the
      sound a sliver -- the room belongs to however many tracks there are,
      not to the ones that happen to exist. */
+  /* The picture track takes the room, up to a point; the sound lanes keep
+     their height, because a taller waveform says nothing a shorter one does
+     not. Beyond that the space stays empty rather than stretching anything. */
   .track {
-    position: relative; height: 76px; flex: 0 0 auto;
+    position: relative; flex: 1 1 auto; min-height: 76px; max-height: 340px;
     background: var(--sunk); border-bottom: 1px solid var(--hair);
   }
   /* The frame it starts on, behind its own name. A row of identical boxes
@@ -1920,16 +1934,13 @@ function reelNeeds() {
     e.preventDefault();
     $('grip-reel').classList.add('holding');
     const move = (ev) => {
-      // An editing application's timeline is as tall as its tracks: room
-      // may be taken from it to see more of the picture, but stretching it
-      // past what it holds only makes a void.
-      //
-      // Measured from the tracks themselves. Asking the wrapper meant
-      // asking an element with overflow:hidden how tall its contents were
-      // -- once it had been made small it answered "small", so it could
-      // never be made big again, and the tracks stayed clipped out of sight.
+      // Take as much as you want, up to most of the window. I capped this
+      // at the height of the tracks, reasoning that a timeline should not
+      // stretch past what it holds -- but wanting a bigger filmstrip is a
+      // perfectly good reason to drag it taller, and the picture track
+      // grows into whatever it is given.
       const tall = Math.max(120, Math.min(
-        innerHeight - ev.clientY, reelNeeds(), innerHeight * 0.7));
+        innerHeight - ev.clientY, innerHeight * 0.82));
       const held = `${Math.round(tall)}px`;
       document.documentElement.style.setProperty('--reel', held);
       localStorage.setItem('mw---reel', held);
@@ -1945,12 +1956,32 @@ function reelNeeds() {
   });
 }
 
+// Column widths are kept in pixels, and a pixel is not a fixed share of the
+// window: zoom the page in and the viewport shrinks in CSS pixels while the
+// stored widths do not, so two columns that fitted comfortably overflow it
+// and shove the layout sideways. Held to a share of whatever the window is
+// now, on load and whenever it changes.
+function keepColumnsInside() {
+  const room = document.documentElement.clientWidth;
+  for (const which of ['--left', '--right']) {
+    const now = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue(which));
+    if (!now) continue;
+    const held = Math.max(180, Math.min(now, room * 0.34));
+    if (Math.abs(held - now) > 0.5) {
+      document.documentElement.style.setProperty(which, `${held}px`);
+    }
+  }
+}
+addEventListener('resize', keepColumnsInside);
+
 // Column widths are the reader's, not mine, and they survive a reload.
 for (const [grip, which, side] of [
   ['grip-left', '--left', 'left'], ['grip-right', '--right', 'right'],
 ]) {
   const kept = localStorage.getItem(`mw-${which}`);
   if (kept) document.documentElement.style.setProperty(which, kept);
+  keepColumnsInside();
   $(grip).addEventListener('mousedown', (e) => {
     e.preventDefault();
     $(grip).classList.add('holding');
@@ -2210,10 +2241,19 @@ $('zoom').addEventListener('input', () => {
   // The strip is DOM and repaints at any rate; the waves are ffmpeg.
   if (blocks.length) { paintStrip(); paintWavesWhenSettled(); }
 });
+// The one control that puts the view back. It used to only reset the
+// reel's pixels-per-second, so a layout knocked sideways by page zoom --
+// columns stored in pixels, a window that shrank under them -- could not be
+// recovered by the button that looks like it should recover it.
 $('fit').addEventListener('click', () => {
+  keepColumnsInside();
+  const needs = reelNeeds();
+  document.documentElement.style.setProperty('--reel', `${needs}px`);
+  localStorage.setItem('mw---reel', `${needs}px`);
   if (!blocks.length) return;
   zoomedByHand = false;
   fitScale(); paintStrip(); paintWavesWhenSettled();
+  forgetPlacement(); drawCrop(); showBurnt();
 });
 $('play').addEventListener('click', () => {
   const v = $('video');
