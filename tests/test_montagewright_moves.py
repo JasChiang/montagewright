@@ -721,8 +721,14 @@ def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
     assert {"/api/runs", "/api/runs/{run_id}/video",
             "/api/runs/{run_id}/shot/{index}"} <= paths
 
+    # What each shot is and why it looks like that. These used to be column
+    # headings; the table became rows when it turned out seven columns of
+    # very different lengths made every shot six hundred pixels tall.
     page = PAGE.read_text(encoding="utf-8")
-    for shown in ("素材", "運鏡", "主體", "為什麼用這顆", "做不到的地方", "逐顆驗收"):
+    for shown in (
+        "shotcard", "s.source_id", "s.camera_move", "s.subject", "s.why",
+        "tellDegradation", "驗收看到",
+    ):
         assert shown in page, shown
 
 
