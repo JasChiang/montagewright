@@ -121,3 +121,53 @@ def test_the_check_would_notice_a_renamed_field():
         "material_notes",
         "supersedes",
     }
+
+
+def test_the_microphone_is_not_offered_as_evidence_of_who_is_speaking():
+    """It was, and in an interview it points the other way.
+
+    The prompt listed three cues for identifying a speaker -- whose mouth is
+    moving, who is holding the microphone, who the camera is on -- and two of
+    them are unreliable in exactly the material this runs on. The microphone
+    in a street interview is held by the person asking and extended toward
+    the person answering, so "who holds it" identifies the one not talking;
+    the camera is on the listener during every reaction shot.
+
+    This matters beyond the label. Selection is told to frame whoever is
+    speaking using these same words, so a wrong attribution becomes a talking
+    shot pointed at the wrong person.
+    """
+
+    prompt = (PROMPTS / "transcript_zh-TW.txt").read_text(encoding="utf-8")
+    speaking = prompt[prompt.index("## 誰在講"):]
+    speaking = speaking[: speaking.index("## 切成字幕")]
+
+    # The microphone and the camera are named as traps, not as evidence.
+    assert "拿著麥克風的人通常不是正在講的那個" in speaking
+    assert "鏡頭對著誰不代表誰在講" in speaking
+    # And the reliable cue is the one that does not need the picture at all.
+    assert "最可靠的線索是這段話本身" in speaking
+    # Not knowing is an available answer, because guessing here is invisible.
+    assert "uncertain" in speaking
+
+    # The schema says the same thing: a model reads the field description
+    # even when the prompt scrolls past.
+    from montagewright.transcript import _schema
+
+    said = _schema()["properties"]["lines"]["items"]["properties"]["speaker"]
+    assert "麥克風都不是證據" in said["description"]
+
+
+def test_a_talking_shot_is_checked_against_who_is_talking():
+    """The prompt called it the most obvious error and nothing looked for it.
+
+    Neither reviewer mentioned the speaker. The one that watches a single
+    shot against its own plan is the only one that can see it -- in a
+    finished cut the next shot covers it in a second and a half.
+    """
+
+    shots = (PROMPTS / "shotreview_zh-TW.txt").read_text(encoding="utf-8")
+    assert "正在講話的那一個" in shots
+    assert "delivered` 就是 false" in shots
+    # Off-screen speech is not the same fault, or every voiceover fails.
+    assert "不在畫面裡" in shots
