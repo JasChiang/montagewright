@@ -1194,3 +1194,36 @@ def test_a_three_look_plan_actually_reaches_the_look_builder(monkeypatch):
         "the looks branch is catching it first"
     )
     assert len(called["stops"]) == 3
+
+
+def test_a_command_line_run_that_crashed_is_not_listed_as_done(tmp_path):
+    """The note beside the output is written before the work starts.
+
+    So its presence says the run began. A run that died partway was picked
+    up as "done" with no shots, no spend and no film -- indistinguishable
+    from one that worked.
+    """
+
+    import json
+
+    import montagewright.webapp as web
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        for name, finished in (("worked", True), ("crashed", False)):
+            here = web.RUNS_ROOT / name / "out"
+            here.mkdir(parents=True)
+            (here / "command.json").write_text("{}", encoding="utf-8")
+            if finished:
+                (here / "report.json").write_text(
+                    json.dumps({"shots": []}), encoding="utf-8"
+                )
+        web.RUNS.clear()
+        web.recall()
+
+        assert web.RUNS["worked"].state == "done"
+        assert web.RUNS["crashed"].state == "interrupted"
+    finally:
+        web.RUNS_ROOT = was
+        web.RUNS.clear()

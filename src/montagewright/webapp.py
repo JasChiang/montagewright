@@ -130,7 +130,21 @@ def recall() -> None:
         except (OSError, json.JSONDecodeError):
             continue
         if not note.exists():
-            saved.setdefault("state", "done")
+            # A run started from the command line leaves only the note beside
+            # its output, and that note is written before the work begins --
+            # so "it exists" says the run started, not that it finished. A
+            # run that crashed looked identical to one that worked, listed as
+            # done with no shots, no spend and no film.
+            #
+            # The report is written at the end, so its absence is the
+            # difference. `interrupted` already means this and already offers
+            # to pick the run up again, which is the useful thing to do with
+            # one.
+            saved.setdefault(
+                "state",
+                "done" if (folder / "out" / "report.json").exists()
+                else "interrupted",
+            )
             saved.setdefault(
                 "started_at", (folder / "out").stat().st_mtime
             )
