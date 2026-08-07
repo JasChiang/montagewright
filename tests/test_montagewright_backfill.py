@@ -640,15 +640,26 @@ def test_a_push_follows_a_subject_that_moves_while_the_frame_closes():
     )
 
 
-def test_a_push_with_no_track_is_exactly_what_it_was_before():
-    # The static case has to stay untouched: two keyframes, aimed at the
-    # point it was given.
-    without = _zoom()
+def test_a_push_given_no_track_aims_where_it_was_told_to():
+    """Passing no track has to change nothing about a static push.
 
-    assert len(without.keyframes) == 2
-    assert without.keyframes[0].crop.x == round(
-        _zoom(track=None).keyframes[0].crop.x, 10
-    )
+    This asserted "two keyframes" when it was written, which was an
+    implementation detail rather than the property -- a later change gave
+    every designed move a rest at each end, and the test failed for a
+    reason that had nothing to do with what it was guarding.
+    """
+
+    without = _zoom()
+    explicit_none = _zoom(track=None)
+
+    assert [
+        (one.seconds, one.crop.x, one.crop.width) for one in without.keyframes
+    ] == [
+        (one.seconds, one.crop.x, one.crop.width)
+        for one in explicit_none.keyframes
+    ]
+    # Aimed at the centre it was given, not at the middle of the frame.
+    assert without.keyframes[0].crop.x == _zoom(centre_x=0.5).keyframes[0].crop.x
 
 
 def test_a_subject_that_only_jitters_is_not_chased():
@@ -760,3 +771,90 @@ def test_selection_is_told_a_row_needs_two_endpoints():
 
     assert "then_subject" in prompt
     assert "就要給兩個端點" in prompt
+
+
+# --- a move has to arrive somewhere and stay there -----------------------
+
+def _handoff(seconds, energy="calm", degradations=None):
+    from montagewright.reframe import build_handoff_path
+
+    return build_handoff_path(
+        source_aspect=16 / 9, target_aspect=1080 / 1920,
+        duration_seconds=seconds, from_centre=0.15, to_centre=0.85,
+        from_width=0.10, to_width=0.10, energy=energy,
+        clip_id="k00", degradations=degradations,
+    )
+
+
+def _centre(keyframe):
+    return keyframe.crop.x + keyframe.crop.width / 2
+
+
+def test_a_designed_move_rests_at_both_ends():
+    """Two keyframes means moving in every frame of the shot.
+
+    That is a pan with its first and last seconds cut off, and it reads as
+    one: the eye never gets a still frame to recognise where it started or
+    where it ended up.
+    """
+
+    path = _handoff(5.0, energy="active")
+
+    assert len(path.keyframes) == 4
+    # Still at the start, still at the end, travelling in between.
+    assert _centre(path.keyframes[0]) == _centre(path.keyframes[1])
+    assert _centre(path.keyframes[2]) == _centre(path.keyframes[3])
+    assert path.keyframes[1].seconds > 0.0
+    assert path.keyframes[2].seconds < 5.0
+
+
+def test_a_move_that_cannot_cross_in_the_time_says_so():
+    """It used to stop partway and report nothing.
+
+    A 1.2s calm pan across 0.700 of frame arrived 43% of the way, and the
+    destination -- usually the point of the shot -- never appeared.
+    """
+
+    degradations = []
+    _handoff(1.2, energy="calm", degradations=degradations)
+
+    assert [one.ladder_other for one in degradations] == [
+        "move_does_not_fit_the_time"
+    ]
+    measured = degradations[0].measured
+    assert measured["needed_speed_vw_s"] > measured["max_speed_vw_s"]
+
+
+def test_a_move_with_room_to_spare_reports_nothing():
+    degradations = []
+    _handoff(5.0, energy="active", degradations=degradations)
+
+    assert degradations == []
+
+
+def test_a_shot_too_short_to_rest_in_still_moves():
+    # Settling is capped at a share of the shot, so a brief take is not all
+    # settling and no move.
+    path = _handoff(0.6, energy="active")
+
+    assert _centre(path.keyframes[-1]) > _centre(path.keyframes[0])
+
+
+def test_a_push_rests_too():
+    # Same argument: a push that starts on the first frame and ends on the
+    # last reads as cut out of a longer one.
+    from montagewright.reframe import build_zoom_path, zoom_budget
+
+    budget = zoom_budget(
+        source_width=3840, source_height=2160, source_aspect=16 / 9,
+        target_aspect=1080 / 1920, output_width=1080, output_height=1920,
+    )
+    path = build_zoom_path(
+        source_aspect=16 / 9, target_aspect=1080 / 1920, duration_seconds=4.0,
+        direction="push_in", centre_x=0.5, centre_y=0.5, energy="active",
+        framing="fill", budget=budget, subject_height=0.35,
+    )
+
+    assert len(path.keyframes) == 4
+    assert path.keyframes[0].crop.width == path.keyframes[1].crop.width
+    assert path.keyframes[2].crop.width == path.keyframes[3].crop.width

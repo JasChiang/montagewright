@@ -246,6 +246,97 @@ def build_sweep_path(
     )
 
 
+# The shortest pause that reads as the camera having arrived. Below this the
+# eye registers a slowing rather than a stop, which is not the same thing --
+# the point of resting is that the subject gets a moment of stillness to be
+# looked at, not that the move decelerates politely.
+SETTLE_SECONDS = 0.35
+
+# And never more than this share of the shot at each end, so a short take is
+# not all settling and no move.
+SETTLE_SHARE = 0.25
+
+
+def _with_rest(
+    keyframes: list[Keyframe],
+    duration_seconds: float,
+    energy: CameraEnergy,
+    *,
+    clip_id: str = "",
+    degradations: list[DegradationStep] | None = None,
+) -> CropPath:
+    """Let a designed move arrive somewhere and stay there for a moment.
+
+    A path of two keyframes, one at zero and one at the end, is moving in
+    every frame of the shot. That is not a pan: it is a pan with its first
+    and last seconds cut off, and it reads as one -- the eye never gets a
+    still frame to recognise where it started or where it ended up.
+
+    So the move rests at both ends and travels in between. This is craft
+    rather than intent, which is why it happens here and is not another field
+    for the planner to fill: nobody is asked to choose the easing curve
+    either. What is the planner's is the total length, and when settling plus
+    travelling will not fit inside it at a speed this energy allows, that is
+    said rather than absorbed.
+
+    Absorbing it is what happened before. `_limit_speed` clamped the speed
+    and the camera simply stopped partway: a 1.2s calm pan across 0.700 of
+    frame arrived 43% of the way and no degradation was recorded. The
+    destination -- usually the point of the shot -- never appeared at all.
+    """
+
+    if len(keyframes) != 2 or duration_seconds <= 0:
+        return CropPath(keyframes)
+
+    start, end = keyframes[0].crop, keyframes[-1].crop
+    # How far the frame changes, whichever way it changes. A push keeps its
+    # centre and alters its size, so measuring only translation reported a
+    # zoom as motionless and left it resting nowhere.
+    travelled = max(
+        abs((end.x + end.width / 2) - (start.x + start.width / 2)),
+        abs((end.y + end.height / 2) - (start.y + start.height / 2)),
+        abs(end.width - start.width),
+        abs(end.height - start.height),
+    )
+    if travelled < DEADBAND:
+        return CropPath(keyframes)
+
+    settle = min(SETTLE_SECONDS, duration_seconds * SETTLE_SHARE)
+    moving = duration_seconds - settle * 2
+    if moving <= 0:
+        return CropPath(keyframes)
+
+    ceiling = ENERGY_LIMITS[energy]["max_speed"]
+    if degradations is not None and travelled / moving > ceiling + 1e-6:
+        degradations.append(
+            DegradationStep(
+                clip_id=clip_id,
+                ladder="other",
+                ladder_other="move_does_not_fit_the_time",
+                trigger=(
+                    "the move cannot rest at both ends and still cross the "
+                    "distance inside this shot at this energy, so it arrives "
+                    "short of where it was aimed"
+                ),
+                measured={
+                    "travel_vw": round(travelled, 4),
+                    "seconds_moving": round(moving, 3),
+                    "needed_speed_vw_s": round(travelled / moving, 4),
+                    "max_speed_vw_s": ceiling,
+                },
+            )
+        )
+
+    rested = [
+        Keyframe(0.0, start),
+        Keyframe(settle, start),
+        Keyframe(settle + moving, end),
+        Keyframe(duration_seconds, end),
+    ]
+    limited, _ = _limit_speed(rested, ENERGY_LIMITS[energy])
+    return CropPath(limited)
+
+
 def build_handoff_path(
     *,
     source_aspect: float,
@@ -256,6 +347,8 @@ def build_handoff_path(
     from_width: float = 0.0,
     to_width: float = 0.0,
     energy: CameraEnergy = "calm",
+    clip_id: str = "",
+    degradations: list[DegradationStep] | None = None,
 ) -> CropPath:
     """Carry the eye from one subject to another inside one shot.
 
@@ -313,14 +406,16 @@ def build_handoff_path(
     start_x = centred_on(from_centre, from_width)
     end_x = centred_on(to_centre, to_width)
 
-    path = CropPath(
+    return _with_rest(
         [
             Keyframe(0.0, CropBox(start_x, y, crop_width, crop_height)),
             Keyframe(duration_seconds, CropBox(end_x, y, crop_width, crop_height)),
-        ]
+        ],
+        duration_seconds,
+        energy,
+        clip_id=clip_id,
+        degradations=degradations,
     )
-    limited, _ = _limit_speed(path.keyframes, ENERGY_LIMITS[energy])
-    return CropPath(limited)
 
 
 # How far the delivered frame may be enlarged past what the source supplies.
@@ -608,11 +703,17 @@ def build_zoom_path(
 
     moving = [one for one in (track or []) if 0.0 <= one[0] <= duration_seconds]
     if len(moving) < 2:
-        return CropPath(
+        # A push that starts on the first frame and ends on the last reads as
+        # cut out of a longer one, the same as a pan that never rests.
+        return _with_rest(
             [
                 Keyframe(0.0, box(first, centre_x, centre_y)),
                 Keyframe(duration_seconds, box(last, centre_x, centre_y)),
-            ]
+            ],
+            duration_seconds,
+            energy,
+            clip_id=clip_id,
+            degradations=degradations,
         )
 
     moving.sort()

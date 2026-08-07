@@ -423,6 +423,44 @@ def follow_subjects(
             )
             if reframe.subject is not None and card is not None:
                 crop_width = target_aspect / source.aspect_ratio
+                # A promise that the subject must be whole, on a subject no
+                # crop of this source can hold, with a move that does not
+                # travel across it. The three cannot all be true, and the
+                # planner was told the fraction when it made the promise --
+                # the wordmark it marked whole could only ever show 51%.
+                #
+                # Said here rather than left to be discovered in the output,
+                # because a contradiction between two fields of one plan is
+                # visible before anything is rendered, and the reviewer that
+                # would otherwise find it costs a paid call and a round.
+                # Not corrected: which of the three to give up is the
+                # planner's to choose.
+                if (
+                    known is not None
+                    and known.width > crop_width
+                    and reframe.subject.min_visible >= 0.99
+                    and reframe.camera_move not in {"pan", "tilt"}
+                ):
+                    report.degradations.append(
+                        DegradationStep(
+                            clip_id=clip.clip_id,
+                            ladder="other",
+                            ladder_other="whole_subject_promised_without_a_move",
+                            trigger=(
+                                "the subject was declared whole, no crop of "
+                                f"this source can hold it, and {reframe.camera_move} "
+                                "does not travel across it -- one of the three "
+                                "has to give"
+                            ),
+                            measured={
+                                "subject_width_vw": round(known.width, 4),
+                                "widest_crop_vw": round(crop_width, 4),
+                                "most_visible_fraction": round(
+                                    crop_width / known.width, 4
+                                ),
+                            },
+                        )
+                    )
                 if known is not None and known.width > crop_width:
                     report.degradations.append(
                         DegradationStep(
