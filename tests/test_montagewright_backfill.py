@@ -1128,3 +1128,69 @@ def test_only_one_place_knows_what_shape_a_shot_is_written_in():
         "through schema.looks_of / subject_of / move_of_shot:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_a_three_look_plan_actually_reaches_the_look_builder(monkeypatch):
+    """The wiring, not the parts.
+
+    build_look_path had seven tests and _measure_looks three, and every one
+    passed while the branch that calls them was unreachable: the
+    two-subject pan sat above it, and `then_subject` is set exactly when
+    there is a second look, so it caught every pan first. Three watches went
+    on losing their middle stop.
+
+    Testing the pieces is not testing that anything calls them.
+    """
+
+    from montagewright import pipeline
+    from montagewright.executor import Source
+    from montagewright.schema import Clip, EDL, reframe_of
+
+    called = {}
+
+    def look_path(stops, **kw):
+        from montagewright.reframe import CropBox, CropPath, Keyframe
+
+        called["stops"] = stops
+        return CropPath([Keyframe(0.0, CropBox(0.0, 0.0, 0.3, 1.0))])
+
+    def located(frames, description, *, client):
+        class Used:
+            input_tokens = output_tokens = thought_tokens = 0
+
+        return [{
+            "present": True, "centre_x": {"A": 0.2, "B": 0.5, "C": 0.8}[description],
+            "centre_y": 0.5, "width": 0.1, "height": 0.3, "frame_index": 0,
+        }], Used()
+
+    monkeypatch.setattr(pipeline, "build_look_path", look_path)
+    monkeypatch.setattr(pipeline, "locate_subject", located)
+    monkeypatch.setattr(pipeline, "_sample_frames", lambda *a, **k: ([], []))
+    monkeypatch.setattr(pipeline, "_may_ask", lambda client: True)
+
+    # Built the way production builds it. Constructing a Reframe by hand
+    # gave one with no `then_subject`, and `then_subject` is precisely what
+    # the shadowing branch tested for -- so the test passed with the bug
+    # reintroduced. A fake that does not have the shape of the real thing
+    # cannot catch a bug about that shape.
+    clip = Clip(
+        clip_id="k00", source_id="s", approx_in_seconds=0.0,
+        approx_out_seconds=5.0,
+        reframe=reframe_of({
+            "looks": [{"at": "A"}, {"at": "B"}, {"at": "C"}], "why": "x",
+        }),
+    )
+    pipeline.follow_subjects(
+        EDL(project_id="t", clips=[clip]),
+        {"s": Source(source_id="s", path=None, duration_seconds=5.0,
+                     width=3840, height=2160)},
+        target_aspect=1080 / 1920,
+        report=pipeline.Report(),
+        client=object(),
+    )
+
+    assert "stops" in called, (
+        "a three-look plan never reached build_look_path -- something above "
+        "the looks branch is catching it first"
+    )
+    assert len(called["stops"]) == 3

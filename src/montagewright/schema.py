@@ -294,7 +294,16 @@ class Reframe(ModelFacing):
 
     @model_validator(mode="after")
     def empty_frames_need_a_direction(self) -> "Reframe":
-        if self.subject is None and self.pan_hint == "none" and not self.intent:
+        # `looks` counts as saying what to attend to. This predates them and
+        # only knew about `subject`, so a reframe built from looks alone --
+        # which is the shape everything is moving to -- failed validation for
+        # having no subject, while carrying three.
+        if (
+            not self.looks
+            and self.subject is None
+            and self.pan_hint == "none"
+            and not self.intent
+        ):
             raise ValueError(
                 "a subjectless reframe needs a pan_hint or a stated intent"
             )
