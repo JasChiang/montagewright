@@ -119,11 +119,20 @@ def review_cut(
     brief: str,
     direction: str,
     client: Any,
+    wanted_seconds: float = 0.0,
+    delivered_seconds: float = 0.0,
     cache: Any = None,
     ledger: Ledger | None = None,
     model_id: str = "gemini-3.6-flash",
 ) -> ReviewVerdict:
-    """One pass over a finished cut."""
+    """One pass over a finished cut.
+
+    The length is given because nothing else was checking it. Three planning
+    layers each made a defensible call and delivered 17.9 seconds against 30,
+    and the only trace was a number in the report that no stage read. The
+    reviewer already judges whether this works as a film; whether it is the
+    film that was asked for is the same question.
+    """
 
     if ledger is not None:
         ledger.check()
@@ -131,6 +140,19 @@ def review_cut(
     instruction = (PROMPTS / "review_zh-TW.txt").read_text(
         encoding="utf-8"
     ).replace("{limits}", describe_limits_for_prompt())
+    if wanted_seconds > 0 and delivered_seconds > 0:
+        off = delivered_seconds - wanted_seconds
+        instruction += (
+            f"\n\n## 長度\n\n這支片要 {wanted_seconds:.0f} 秒，"
+            f"交出來是 {delivered_seconds:.1f} 秒"
+            + (
+                f"，差 {off:+.1f} 秒。差得多就是一個要修的問題——"
+                "不是把每顆按比例縮放，是有顆不該在裡面，或有顆給得不夠。"
+                if abs(off) > max(1.5, wanted_seconds * 0.12)
+                else "，在範圍內。"
+            )
+            + "\n"
+        )
     if cache is None:
         uri = upload_now(preview, client).uri
     else:

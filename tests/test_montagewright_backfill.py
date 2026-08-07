@@ -1688,3 +1688,49 @@ def test_a_length_the_caller_fixed_is_not_a_length_to_decide():
     # Overwritten rather than trusted: a pass that occasionally does not
     # repeat the number would silently change the film's length.
     assert 'decided["target_seconds"] = seconds' in said
+
+
+def test_the_reviewer_is_told_the_length_that_was_asked_for():
+    """Nothing else was checking it.
+
+    Three planning layers each made a defensible call and delivered 17.9
+    seconds against 30, and the only trace was a number in report.json that
+    no stage read. Now that a caller can fix the length with --seconds, an
+    unchecked target is a promise nobody keeps.
+    """
+
+    import inspect
+
+    from montagewright.review import review_cut
+
+    said = inspect.getsource(review_cut)
+    assert "wanted_seconds" in said and "delivered_seconds" in said
+    # Named as something to fix rather than something to scale away.
+    assert "有顆不該在裡面，或有顆給得不夠" in said
+
+
+def test_a_length_close_enough_is_not_raised_as_a_fault():
+    # 29.1 against 30 is a cut that landed. Calling that a problem trains
+    # the reviewer to spend rounds on arithmetic.
+    import inspect
+
+    from montagewright.review import review_cut
+
+    said = inspect.getsource(review_cut)
+    assert "max(1.5, wanted_seconds * 0.12)" in said
+    assert "在範圍內" in said
+
+
+def test_nothing_truncates_the_cut_to_the_target():
+    """A target is honoured by planning or missed, never enforced.
+
+    Cutting the film to length in the executor would be the execution layer
+    answering an editorial question -- which shot goes -- and the report
+    would describe a plan that was not what ran.
+    """
+
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "montagewright"
+    for name in ("grounding.py", "executor.py", "renderer.py"):
+        assert "target_seconds" not in (root / name).read_text(encoding="utf-8")
