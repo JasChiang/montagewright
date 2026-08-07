@@ -1309,7 +1309,14 @@ function inspect(i) {
     <section class="ins-part">
       <h4>它打算做什麼</h4>
       <div class="pairs">
-        <span>運鏡</span><span>${esc(plan.camera_move || '—')}</span>
+        <!-- Off the block, not off the plan. A shot has not carried
+             `camera_move` since it started saying what to look at instead;
+             the move is what a list of looks turns out to be, and the
+             server already worked that out with the one reader that knows.
+             Read from the plan it was a missing field, printed as an em
+             dash, so a shot that pushed in reported no move at all. -->
+        <span>運鏡</span><span>${esc(MOVES[b.camera_move] || b.camera_move || '—')}${
+          plan.frame ? `<i class="why">　宣告${plan.frame === 'travels' ? '會動' : '不動'}</i>` : ''}</span>
         <span>畫面停在</span><span>${
           (plan.looks && plan.looks.length)
             ? plan.looks.map(one =>

@@ -4029,3 +4029,26 @@ def test_a_call_waits_as_long_as_that_call_is_worth():
     assert inspect.signature(planner.ask).parameters[
         "patience_seconds"
     ].default is None
+
+
+def test_the_inspector_names_the_move_the_shot_actually_makes():
+    """A shot has not carried `camera_move` since the looks refactor.
+
+    The panel read it off the plan, where it stopped existing, and printed an
+    em dash -- so a shot that pushed in reported no move at all, in the panel
+    whose job is saying what was planned. The server had the answer the whole
+    time: the block carries it, worked out by the one reader that knows how
+    to turn a list of looks into a move name.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    said = page[page.index("<span>運鏡</span>"):]
+    said = said[: said.index("</span>", said.index("${")) + 7]
+    assert "b.camera_move" in said
+    assert "plan.camera_move" not in page
+
+    # And the declaration sits beside it, so a plan that said it would move
+    # and did not is visible without opening the report.
+    assert "plan.frame" in said
