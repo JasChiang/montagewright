@@ -858,3 +858,92 @@ def test_a_push_rests_too():
     assert len(path.keyframes) == 4
     assert path.keyframes[0].crop.width == path.keyframes[1].crop.width
     assert path.keyframes[2].crop.width == path.keyframes[3].crop.width
+
+
+# --- one builder for every shape a list of looks can be -----------------
+
+WIDE, TIGHT = 0.3164, 0.20
+
+
+def _looks(stops, seconds=4.0, degradations=None):
+    from montagewright.reframe import build_look_path
+
+    return build_look_path(
+        stops, source_aspect=16 / 9, target_aspect=1080 / 1920,
+        duration_seconds=seconds, energy="active", clip_id="k00",
+        degradations=degradations,
+    )
+
+
+def _mids(path):
+    return [round(k.crop.x + k.crop.width / 2, 2) for k in path.keyframes]
+
+
+def test_one_look_is_a_hold():
+    path = _looks([(0.0, 0.5, 0.5, WIDE)])
+
+    assert path.is_static
+
+
+def test_two_looks_are_a_move_that_rests_at_both_ends():
+    path = _looks([(0.0, 0.2, 0.5, WIDE), (0.0, 0.8, 0.5, WIDE)])
+
+    assert _mids(path) == [0.2, 0.2, 0.8, 0.8]
+
+
+def test_two_looks_at_one_thing_are_a_push():
+    path = _looks([(0.0, 0.5, 0.5, WIDE), (0.0, 0.5, 0.5, TIGHT)])
+
+    widths = [round(k.crop.width, 2) for k in path.keyframes]
+    assert widths == [0.32, 0.32, 0.20, 0.20]
+    assert _mids(path) == [0.5, 0.5, 0.5, 0.5]
+
+
+def test_three_looks_stop_on_the_way():
+    """The shape the old menu could not express at all.
+
+    `then_subject` named exactly two endpoints, so a row of three watches
+    had no way to be introduced one at a time.
+    """
+
+    path = _looks(
+        [(0.6, 0.15, 0.5, WIDE), (0.6, 0.5, 0.5, WIDE), (0.8, 0.85, 0.5, WIDE)],
+        seconds=5.0,
+    )
+
+    assert len(path.keyframes) == 6
+    assert _mids(path) == [0.16, 0.16, 0.5, 0.5, 0.84, 0.84]
+
+
+def test_a_move_and_a_push_at_once():
+    # Needed a builder of its own before; now it is just two looks that
+    # disagree about both position and size.
+    path = _looks([(0.0, 0.2, 0.5, WIDE), (0.0, 0.8, 0.5, TIGHT)])
+
+    assert _mids(path)[0] != _mids(path)[-1]
+    assert path.keyframes[0].crop.width > path.keyframes[-1].crop.width
+
+
+def test_too_many_looks_for_the_time_is_reported():
+    degradations = []
+    _looks(
+        [(0.6, 0.15, 0.5, WIDE), (0.6, 0.5, 0.5, WIDE), (0.8, 0.85, 0.5, WIDE)],
+        seconds=2.0, degradations=degradations,
+    )
+
+    assert [one.ladder_other for one in degradations] == [
+        "looks_do_not_fit_the_time"
+    ]
+    measured = degradations[0].measured
+    assert measured["needed_speed_vw_s"] > measured["max_speed_vw_s"]
+
+
+def test_resting_never_eats_the_whole_shot():
+    # Three looks asking for a second each, in a shot lasting two.
+    path = _looks(
+        [(1.0, 0.15, 0.5, WIDE), (1.0, 0.5, 0.5, WIDE), (1.0, 0.85, 0.5, WIDE)],
+        seconds=2.0,
+    )
+
+    assert _mids(path)[0] < _mids(path)[-1]
+    assert path.keyframes[-1].seconds <= 2.0

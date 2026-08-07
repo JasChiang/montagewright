@@ -337,6 +337,127 @@ def _with_rest(
     return CropPath(limited)
 
 
+def build_look_path(
+    stops: list[tuple[float, float, float, float]],
+    *,
+    source_aspect: float,
+    target_aspect: float,
+    duration_seconds: float,
+    energy: CameraEnergy = "calm",
+    clip_id: str = "",
+    degradations: list[DegradationStep] | None = None,
+) -> CropPath:
+    """Walk a shot through the places it looks, resting at each.
+
+    `stops` is one entry per look, already measured: seconds to rest, the
+    subject's centre across and down, and the crop width that framing asks
+    for. Everything semantic was decided upstream; everything geometric was
+    measured here. This only has to route between them.
+
+    One stop is a hold. Two are a move. More stop on the way. A stop whose
+    crop width differs from the one before it is a push or a pull, and one
+    that also moves is both -- which needed a separate builder before, and
+    is now what happens when two looks disagree about size.
+
+    Time is shared out in order: every stop gets the rest it asked for, and
+    what is left over is divided between the journeys in proportion to how
+    far each has to go. When the rests alone exceed the shot, they are scaled
+    down together rather than the last ones being dropped -- a shot that
+    cannot afford to stop everywhere should look hurried everywhere, not
+    complete and then truncated.
+    """
+
+    if not stops:
+        return CropPath([])
+    if duration_seconds <= 0:
+        duration_seconds = 1e-3
+
+    def box(centre_x: float, centre_y: float, width: float) -> CropBox:
+        height = min(1.0, width * source_aspect / target_aspect)
+        width = min(1.0, width)
+        x = min(max(centre_x - width / 2.0, 0.0), max(0.0, 1.0 - width))
+        y = min(max(centre_y - height / 2.0, 0.0), max(0.0, 1.0 - height))
+        return CropBox(x, y, width, height)
+
+    boxes = [box(cx, cy, w) for _, cx, cy, w in stops]
+    if len(boxes) == 1:
+        return CropPath([Keyframe(0.0, boxes[0])])
+
+    rests = [max(0.0, one[0]) or SETTLE_SECONDS for one in stops]
+    # Never let resting eat the whole shot; leave at least as much for
+    # travelling as for standing still.
+    if sum(rests) > duration_seconds * (1.0 - SETTLE_SHARE * 2):
+        room = duration_seconds * (1.0 - SETTLE_SHARE * 2)
+        scale = room / sum(rests) if sum(rests) > 0 else 0.0
+        rests = [one * scale for one in rests]
+
+    spans = [
+        max(
+            abs((b.x + b.width / 2) - (a.x + a.width / 2)),
+            abs((b.y + b.height / 2) - (a.y + a.height / 2)),
+            abs(b.width - a.width),
+        )
+        for a, b in zip(boxes, boxes[1:])
+    ]
+    left = max(duration_seconds - sum(rests), 1e-6)
+    total = sum(spans)
+    legs = [
+        left * (one / total) if total > 1e-9 else left / len(spans)
+        for one in spans
+    ]
+
+    ceiling = ENERGY_LIMITS[energy]["max_speed"]
+    hurried = [
+        (index, span, leg)
+        for index, (span, leg) in enumerate(zip(spans, legs))
+        if leg > 1e-9 and span / leg > ceiling + 1e-6
+    ]
+    if hurried and degradations is not None:
+        worst = max(hurried, key=lambda one: one[1] / one[2])
+        degradations.append(
+            DegradationStep(
+                clip_id=clip_id,
+                ladder="other",
+                ladder_other="looks_do_not_fit_the_time",
+                trigger=(
+                    f"this shot looks at {len(stops)} things and cannot rest "
+                    f"on each and still travel between them in the time it "
+                    f"has, so the frame arrives short of the last one"
+                ),
+                measured={
+                    "looks": float(len(stops)),
+                    "seconds": round(duration_seconds, 3),
+                    "resting_seconds": round(sum(rests), 3),
+                    "needed_speed_vw_s": round(worst[1] / worst[2], 4),
+                    "max_speed_vw_s": ceiling,
+                },
+            )
+        )
+
+    keyframes: list[Keyframe] = []
+    at = 0.0
+    for index, crop in enumerate(boxes):
+        keyframes.append(Keyframe(round(at, 4), crop))
+        at += rests[index]
+        keyframes.append(Keyframe(round(at, 4), crop))
+        if index < len(legs):
+            at += legs[index]
+    limited, _ = _limit_speed(keyframes, ENERGY_LIMITS[energy])
+    return CropPath(_dedupe(limited))
+
+
+def _dedupe(keyframes: list[Keyframe]) -> list[Keyframe]:
+    """Drop keyframes that land on the same moment as the one before."""
+
+    kept = [keyframes[0]]
+    for one in keyframes[1:]:
+        if one.seconds - kept[-1].seconds > 1e-4:
+            kept.append(one)
+        else:
+            kept[-1] = one
+    return kept
+
+
 def build_handoff_path(
     *,
     source_aspect: float,
