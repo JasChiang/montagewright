@@ -3594,3 +3594,88 @@ def test_the_timeline_is_written_from_what_the_render_did():
     rebuilding = rebuilding[: rebuilding.index("plan = plan_render(")]
     assert 'abs(covered - float(entry["seconds"])) <= 0.05' in rebuilding
     assert "if stale:" in rebuilding
+
+
+def test_a_walking_subject_is_followed_rather_than_averaged():
+    """The looks path collapsed every observation into a mean.
+
+    Frames are pulled across the shot and the boxes come back one per frame,
+    and all of them were reduced to one point before anything downstream saw
+    them -- so a subject that walked across the frame was handed on as a
+    place in the middle of its own path, and a shot planned to follow it held
+    there while the subject left.
+    """
+
+    from montagewright.reframe import build_look_path
+
+    walked = [(0.0, 0.20, 0.5), (1.0, 0.50, 0.5), (2.0, 0.80, 0.5)]
+    common = dict(
+        source_aspect=16 / 9, target_aspect=9 / 16, duration_seconds=2.0,
+        energy="dynamic",
+    )
+    # One look, resting the whole shot, on something that does not stay put.
+    stops = [(2.0, 0.50, 0.5, 0.3164)]
+
+    followed = build_look_path(stops, tracks=[walked], **common)
+    centres = [k.crop.x + k.crop.width / 2 for k in followed.keyframes]
+    assert len(followed.keyframes) >= 3, followed.keyframes
+    assert centres == sorted(centres)
+    assert max(centres) - min(centres) > 0.25, centres
+
+    # Without the track it is the old behaviour: one place, held.
+    held = build_look_path(stops, **common)
+    still = {round(k.crop.x, 4) for k in held.keyframes}
+    assert len(still) == 1
+
+    # A subject that barely moved is not chased -- below the deadband the
+    # frame would only jitter, and holding is what it should look like.
+    from montagewright.reframe import DEADBAND
+
+    twitch = [(0.0, 0.50, 0.5), (1.0, 0.50 + DEADBAND / 4, 0.5)]
+    steady = build_look_path(stops, tracks=[twitch], **common)
+    assert max(k.crop.x for k in steady.keyframes) - min(
+        k.crop.x for k in steady.keyframes
+    ) < DEADBAND
+
+
+def test_a_track_is_read_where_the_frame_is_actually_looking():
+    """The window a stop occupies is not the whole shot.
+
+    The frame arrives at a subject partway through and leaves before the end,
+    so sampling the track into the window by position would run the subject's
+    movement at the wrong speed.
+    """
+
+    from montagewright.reframe import _across
+
+    track = [(0.0, 0.0, 0.5), (1.0, 0.5, 0.5), (2.0, 1.0, 0.5)]
+
+    # A window over the second half sees the second half of the walk.
+    across = _across(track, 1.0, 2.0)
+    assert [round(one[0], 3) for one in across] == [1.0, 2.0]
+    assert [round(one[1], 3) for one in across] == [0.5, 1.0]
+
+    # Edges are pinned and interior samples kept, so the shape survives.
+    whole = _across(track, 0.0, 2.0)
+    assert [round(one[0], 3) for one in whole] == [0.0, 1.0, 2.0]
+
+    # A window past either end clamps rather than extrapolating.
+    assert round(_across(track, 3.0, 4.0)[0][1], 3) == 1.0
+
+
+def test_the_production_path_hands_the_tracks_to_the_builder():
+    """A guard on the builder alone guards the wrong caller."""
+
+    import inspect
+
+    from montagewright import pipeline
+
+    source = inspect.getsource(pipeline.follow_subjects)
+    call = source[source.index("build_look_path("):]
+    assert "tracks=tracks" in call[: call.index(")\n")]
+
+    # And the sampler's timestamps reach the measurement, which is what
+    # makes a box tie to a moment. They were being dropped by the caller.
+    measuring = inspect.getsource(pipeline._measure_looks)
+    assert "frames, times = _sample_frames(" in measuring
+    assert "frame_index" in measuring

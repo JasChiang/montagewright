@@ -1031,7 +1031,7 @@ def _measured(monkeypatch, looks, places):
         clip_id = "k00"
         approx_in_seconds, approx_out_seconds = 0.0, 6.0
 
-    stops, missing = pipeline._measure_looks(
+    stops, missing, tracks = pipeline._measure_looks(
         looks,
         Source(source_id="s", path=None, duration_seconds=6.0,
                width=3840, height=2160),
@@ -1098,7 +1098,7 @@ def test_a_subject_nobody_can_find_is_named_rather_than_guessed(monkeypatch):
         clip_id = "k00"
         approx_in_seconds, approx_out_seconds = 0.0, 6.0
 
-    stops, missing = pipeline._measure_looks(
+    stops, missing, tracks = pipeline._measure_looks(
         [Look(at="the ghost")],
         Source(source_id="s", path=None, duration_seconds=6.0,
                width=3840, height=2160),

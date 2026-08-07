@@ -401,6 +401,7 @@ def build_look_path(
     source_height: int = 0,
     output_width: int = 0,
     output_height: int = 0,
+    tracks: "list[list[tuple[float, float, float]]] | None" = None,
 ) -> CropPath:
     """Walk a shot through the places it looks, resting at each.
 
@@ -476,8 +477,29 @@ def build_look_path(
             )
 
     boxes = [box(cx, cy, w) for _, cx, cy, w in stops]
-    if len(boxes) == 1:
+    walking = [
+        one for one in (tracks or []) if one and len(one) > 1
+    ]
+    if len(boxes) == 1 and not walking:
         return CropPath([Keyframe(0.0, boxes[0])])
+    if len(boxes) == 1:
+        # One look at something that does not stay put. This used to return
+        # here, which is the case a follow most obviously is: a single
+        # subject, walking, for the whole shot. It came out as a held frame
+        # on the middle of the walk.
+        return CropPath(
+            _dedupe(
+                _limit_speed(
+                    [
+                        Keyframe(round(when, 4), box(cx, cy, boxes[0].width))
+                        for when, cx, cy in _across(
+                            walking[0], 0.0, duration_seconds
+                        )
+                    ],
+                    ENERGY_LIMITS[energy],
+                )[0]
+            )
+        )
 
     rests = [max(0.0, one[0]) or SETTLE_SECONDS for one in stops]
     # Never let resting eat the whole shot; leave at least as much for
@@ -533,13 +555,62 @@ def build_look_path(
     keyframes: list[Keyframe] = []
     at = 0.0
     for index, crop in enumerate(boxes):
-        keyframes.append(Keyframe(round(at, 4), crop))
+        seen = tracks[index] if tracks and index < len(tracks) else None
+        # Resting on a subject that is walking is not the same as resting on
+        # a place. Where a stop has a track, the frame stays on the subject
+        # for as long as it is looking at it; where it has none -- a static
+        # thing, or a card-derived box with one position -- the crop is held,
+        # which is what this did for every stop before.
+        if seen and len(seen) > 1:
+            keyframes.extend(
+                Keyframe(round(when, 4), box(cx, cy, crop.width))
+                for when, cx, cy in _across(seen, at, at + rests[index])
+            )
+        else:
+            keyframes.append(Keyframe(round(at, 4), crop))
+            keyframes.append(Keyframe(round(at + rests[index], 4), crop))
         at += rests[index]
-        keyframes.append(Keyframe(round(at, 4), crop))
         if index < len(legs):
             at += legs[index]
     limited, _ = _limit_speed(keyframes, ENERGY_LIMITS[energy])
     return CropPath(_dedupe(limited))
+
+
+def _across(
+    track: list[tuple[float, float, float]], start: float, end: float
+) -> list[tuple[float, float, float]]:
+    """Where the subject is, at each moment the frame is looking at it.
+
+    The track is in shot time and so is the window, but they are not the same
+    span: the frame arrives at a subject partway through a shot and leaves
+    before it ends. Sampling the whole track into a shorter window would run
+    the subject's movement at the wrong speed, so this reads the track where
+    the window actually sits and pins the edges.
+    """
+
+    if end <= start:
+        return [(start, track[0][1], track[0][2])]
+
+    def at(when: float) -> tuple[float, float]:
+        if when <= track[0][0]:
+            return track[0][1], track[0][2]
+        if when >= track[-1][0]:
+            return track[-1][1], track[-1][2]
+        for before, after in zip(track, track[1:]):
+            if before[0] <= when <= after[0]:
+                span = max(after[0] - before[0], 1e-9)
+                share = (when - before[0]) / span
+                return (
+                    before[1] + (after[1] - before[1]) * share,
+                    before[2] + (after[2] - before[2]) * share,
+                )
+        return track[-1][1], track[-1][2]
+
+    moments = sorted(
+        {start, end}
+        | {one[0] for one in track if start < one[0] < end}
+    )
+    return [(when, *at(when)) for when in moments]
 
 
 def _dedupe(keyframes: list[Keyframe]) -> list[Keyframe]:

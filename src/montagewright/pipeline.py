@@ -32,6 +32,7 @@ from montagewright.grounding import BeatGrid, apply_to_edl, ground_timeline
 from montagewright.planner import Usage, decide_rhythm, locate_subject
 from montagewright.reframe import (
     CropPath,
+    DEADBAND,
     Keyframe,
     achieved_upscale,
     zoom_budget,
@@ -293,12 +294,24 @@ def _track_subject(
 
 def _measure_looks(
     looks, source, clip, work: Path, report, client, target_aspect: float
-) -> tuple[list[tuple[float, float, float, float]], str]:
+) -> tuple[
+    list[tuple[float, float, float, float]],
+    str,
+    list[list[tuple[float, float, float]]],
+]:
     """Turn each look into a place on the frame, measured rather than assumed.
 
     One grounding call per distinct subject, so two looks at the same thing
     -- which is how a push in is written -- are located once and paid for
     once.
+
+    Returns where each look settles, anything that could not be found, and
+    where each subject was at every moment it was sampled. The last was being
+    averaged away: the frames are pulled across the shot and the boxes came
+    back one per frame, and all of them were collapsed into a mean before
+    anything downstream saw them. So a subject that walked across the frame
+    was handed on as one point in the middle of its own path, and a shot
+    planned to follow it held on a place it passed through.
 
     The crop width comes from framing: `fill` closes toward the subject
     within the source's own budget, and the others take the widest crop
@@ -313,17 +326,23 @@ def _measure_looks(
     # over the take, and a guard that lives only in the caller stops being a
     # guard the moment this is called from anywhere else.
     if not _may_ask(client):
-        return [], ""
+        return [], "", []
 
-    frames, _ = _sample_frames(
+    frames, times = _sample_frames(
         source, clip.approx_in_seconds, clip.approx_out_seconds, work
     )
+    # Shot time, not source time: everything downstream of here counts from
+    # the cut. These came back from the sampler and were being dropped on the
+    # floor by the caller, which is why a box could not be tied to a moment.
+    moments = [at - clip.approx_in_seconds for at in times]
     if target_aspect < source.aspect_ratio:
         base, base_height = target_aspect / source.aspect_ratio, 1.0
     else:
         base, base_height = 1.0, source.aspect_ratio / target_aspect
     seen: dict[str, tuple[float, float, float]] = {}
+    walked: dict[str, list[tuple[float, float, float]]] = {}
     stops: list[tuple[float, float, float, float]] = []
+    tracks: list[list[tuple[float, float, float]]] = []
     missing: list[str] = []
     for look in looks:
         if look.at not in seen:
@@ -337,11 +356,27 @@ def _measure_looks(
             if not found:
                 missing.append(look.at)
                 continue
+            # Kept as a path as well as a place. The mean is still what a
+            # stop settles on -- it is the right answer for something that
+            # is not going anywhere, and it is what the framing and the
+            # travel between stops are computed from -- but it is no longer
+            # all that is known.
             seen[look.at] = (
                 sum(float(one["centre_x"]) for one in found) / len(found),
                 sum(float(one["centre_y"]) for one in found) / len(found),
                 sum(float(one.get("height") or 0.0) for one in found) / len(found),
             )
+            walked[look.at] = sorted(
+                (
+                    moments[int(one["frame_index"])],
+                    float(one["centre_x"]),
+                    float(one["centre_y"]),
+                )
+                for one in found
+                if 0 <= int(one.get("frame_index", -1)) < len(moments)
+            )
+        if look.at not in seen:
+            continue
         centre_x, centre_y, tall = seen[look.at]
         width = base
         if look.framing == "fill" and tall > 0.0:
@@ -349,13 +384,26 @@ def _measure_looks(
             width = base * max(0.2, min(0.9, tall / 0.66))
         height = min(1.0, base_height * (width / base) if base > 0 else base_height)
         share = PLACEMENT.get(look.framing, 0.5)
+        lift = height * (0.5 - share)
         stops.append((
             max(0.0, float(look.seconds)),
             centre_x,
-            centre_y + height * (0.5 - share),
+            centre_y + lift,
             width,
         ))
-    return stops, "、".join(missing)
+        # A subject that barely moved is not worth chasing: below the
+        # deadband the frame would only jitter, and a held frame is what it
+        # should look like anyway.
+        path = walked.get(look.at) or []
+        spread = max(
+            (max(one[axis] for one in path) - min(one[axis] for one in path))
+            for axis in (1, 2)
+        ) if len(path) > 1 else 0.0
+        tracks.append(
+            [(when, x, y + lift) for when, x, y in path]
+            if spread > DEADBAND else []
+        )
+    return stops, "、".join(missing), tracks
 
 
 def _seed_box(box: dict[str, Any]) -> list[int]:
@@ -611,7 +659,7 @@ def follow_subjects(
             # to go, so a row of three watches lost its middle stop with
             # nothing recorded.
             if len(reframe.looks) >= 2 and _may_ask(client):
-                stops, missing = _measure_looks(
+                stops, missing, tracks = _measure_looks(
                     reframe.looks, source, clip, work, report, client,
                     target_aspect,
                 )
@@ -636,6 +684,11 @@ def follow_subjects(
                         source_height=source.height,
                         output_width=out_w,
                         output_height=out_h,
+                        # Where each subject went while the frame was looking
+                        # at it. Without these a stop is a place, and a shot
+                        # planned to follow somebody walking held on a point
+                        # halfway along the walk.
+                        tracks=tracks,
                     )
                     tightest = min(
                         paths[clip.clip_id].keyframes,
