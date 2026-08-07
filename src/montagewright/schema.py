@@ -233,6 +233,11 @@ class Look(ModelFacing):
 class Reframe(ModelFacing):
     """What the camera should attend to, never where to put the crop."""
 
+    # Where each look was measured to be, when the card knew. Centre across,
+    # centre down, and the crop width its framing asks for -- enough to work
+    # out how far the frame has to travel, and so how long this shot needs,
+    # before anything is grounded. Empty when the card could not place them.
+    look_boxes: list[tuple[float, float, float]] = Field(default_factory=list)
     looks: list[Look] = Field(
         default_factory=list,
         description=(

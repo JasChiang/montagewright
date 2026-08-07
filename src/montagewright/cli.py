@@ -1030,6 +1030,26 @@ def _rhythm_context(
     return context
 
 
+def _look_boxes(card: dict, reframe) -> list[tuple[float, float, float]]:
+    """Each look's measured place, or nothing if any of them is unknown.
+
+    All or none: a half-known path gives a travel distance that is wrong in
+    a way nobody can see, and a floor computed from it would be confidently
+    too small. Unknown falls back to the move's declared minimum.
+    """
+
+    out: list[tuple[float, float, float]] = []
+    for look in reframe.looks:
+        box = find_subject(card, look.at)
+        if box is None:
+            return []
+        # The crop this framing asks for, as a share of the frame. `fill`
+        # closes toward the subject; the rest take what there is.
+        width = min(1.0, max(0.2, box.height / 0.66)) if look.framing == "fill" else 1.0
+        out.append((box.centre_x, box.centre_y, width))
+    return out
+
+
 def _edl_from_selection(
     selection: dict, rushes: Path, cards: dict[str, Path]
 ) -> tuple[EDL, dict[str, str]]:
@@ -1054,6 +1074,14 @@ def _edl_from_selection(
             start, note = snap_to_action(card, start, wanted)
             if note:
                 snaps[clip_id] = note
+            # Where the card already measured each look. This is what makes
+            # "how long does this shot need" a fact about this shot rather
+            # than a constant per move: the distance between two watches on
+            # one table is not the distance between two models on a stage,
+            # and neither is 2.5 seconds.
+            reframe = reframe.model_copy(
+                update={"look_boxes": _look_boxes(card, reframe)}
+            )
         clips.append(
             Clip(
                 clip_id=clip_id,

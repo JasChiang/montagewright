@@ -1336,3 +1336,64 @@ def test_the_providers_own_cap_is_this_project_s_budget(monkeypatch):
     # Pace is the SDK's to retry, so it keeps its own type.
     with pytest.raises(TooFast):
         ask(Client(TooFast()))
+
+
+# --- how long a shot needs is a fact about that shot --------------------
+
+def test_the_floor_comes_from_the_shot_not_from_the_move_name():
+    """`min_seconds` said every pan needs 2.5 seconds.
+
+    One number for every pan on every clip ever, while the real floor for
+    the same word runs from about a second to over five: it forbade a short
+    pan across a narrow gap and permitted a long one that could not arrive.
+    """
+
+    from montagewright.reframe import seconds_needed_for
+
+    W = 0.3164
+    near = seconds_needed_for([(0, 0.4, 0.5, W), (0, 0.6, 0.5, W)], "active")
+    far = seconds_needed_for([(0, 0.15, 0.5, W), (0, 0.85, 0.5, W)], "active")
+    three = seconds_needed_for(
+        [(0, 0.15, 0.5, W), (0, 0.5, 0.5, W), (0, 0.85, 0.5, W)], "active"
+    )
+
+    assert near < far < three
+    # And the same shot needs longer when it was asked to move calmly.
+    assert seconds_needed_for(
+        [(0, 0.15, 0.5, W), (0, 0.85, 0.5, W)], "calm"
+    ) > far
+
+
+def test_time_the_planner_asked_for_is_counted_in():
+    # A shot that stops to be read needs the reading time on top of the
+    # travel; a two-second look is two seconds whatever the distance.
+    from montagewright.reframe import seconds_needed_for
+
+    W = 0.3164
+    quick = seconds_needed_for([(0, 0.2, 0.5, W), (0, 0.8, 0.5, W)], "active")
+    read = seconds_needed_for([(1, 0.2, 0.5, W), (1, 0.8, 0.5, W)], "active")
+
+    assert read - quick > 1.0
+
+
+def test_an_unknown_distance_is_not_a_zero_one(tmp_path):
+    """All the looks or none.
+
+    A half-known path gives a travel distance that is wrong in a way nobody
+    can see, and a floor built on it would be confidently too small.
+    """
+
+    from montagewright.cli import _look_boxes
+    from montagewright.schema import reframe_of
+
+    card = {
+        "subjects": [{
+            "label": "the left watch", "centre_x": 0.2, "centre_y": 0.5,
+            "width": 0.1, "height": 0.3, "moves": False, "at_seconds": 0.0,
+        }],
+    }
+    both = reframe_of({"looks": [{"at": "the left watch"}, {"at": "a ghost"}]})
+    one = reframe_of({"looks": [{"at": "the left watch"}]})
+
+    assert _look_boxes(card, both) == []
+    assert len(_look_boxes(card, one)) == 1

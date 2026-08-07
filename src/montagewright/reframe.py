@@ -337,6 +337,43 @@ def _with_rest(
     return CropPath(limited)
 
 
+def seconds_needed_for(
+    stops: list[tuple[float, float, float, float]],
+    energy: CameraEnergy = "calm",
+) -> float:
+    """The least time this shot can do what it was asked to do.
+
+    Measured from the shot rather than looked up per move. `min_seconds` said
+    a pan needs 2.5 seconds, which is one number for every pan on every clip
+    ever -- and the real floor is the rests plus the distance divided by the
+    speed this energy allows, which for the same word ranges from about a
+    second to over two depending on how far the frame has to go and how many
+    places it stops. A constant is wrong in both directions: it forbids a
+    short pan across a narrow gap and permits a long one that cannot arrive.
+
+    Nothing in here is tuned to any particular footage. The distances come
+    from where the subjects were measured to be, and the speed ceiling is a
+    property of the energy the shot asked for.
+    """
+
+    if len(stops) < 2:
+        # A held frame needs long enough to be seen and no longer, which is
+        # not a geometric question -- the planner answers it.
+        return stops[0][0] if stops else 0.0
+
+    resting = sum(max(0.0, one[0]) or SETTLE_SECONDS for one in stops)
+    ceiling = ENERGY_LIMITS[energy]["max_speed"]
+    travelling = 0.0
+    for before, after in zip(stops, stops[1:]):
+        gap = max(
+            abs(after[1] - before[1]),
+            abs(after[2] - before[2]),
+            abs(after[3] - before[3]),
+        )
+        travelling += gap / ceiling
+    return round(resting + travelling, 3)
+
+
 def build_look_path(
     stops: list[tuple[float, float, float, float]],
     *,

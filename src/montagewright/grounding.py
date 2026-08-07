@@ -265,6 +265,32 @@ def _requested_duration(clip: Clip, grid: BeatGrid | None) -> float:
     return clip.approx_out_seconds - clip.approx_in_seconds
 
 
+def _floor_for(clip: Clip) -> float:
+    """The least time this clip's own move can happen in.
+
+    Estimated from the card's subject positions, which are what is known
+    before grounding runs. A clip whose looks cannot be located falls back to
+    the move's declared floor, because an unknown distance is not a zero one.
+    """
+
+    from montagewright.capabilities import MOVE_FLOORS
+    from montagewright.reframe import seconds_needed_for
+
+    reframe = clip.reframe
+    if reframe is None or len(reframe.looks) < 2:
+        return 0.0
+
+    seen = reframe.look_boxes
+    if not seen or len(seen) < len(reframe.looks):
+        return MOVE_FLOORS.get(reframe.camera_move, 0.0)
+
+    stops = [
+        (one.seconds, where[0], where[1], where[2])
+        for one, where in zip(reframe.looks, seen)
+    ]
+    return seconds_needed_for(stops, reframe.camera_energy)
+
+
 def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
     """Lay the clips out in time.
 
@@ -278,17 +304,25 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
     grounded: list[GroundedClip] = []
     cursor = 0.0
 
-    from montagewright.capabilities import MOVE_FLOORS
-
     for clip in edl.clips:
         wanted = _requested_duration(clip, grid)
         move = clip.reframe.camera_move if clip.reframe else "hold"
-        floor = MOVE_FLOORS.get(move, 0.0)
+        # What this shot needs, from this shot -- the rests it asked for plus
+        # the distance between its looks at the speed its energy allows. The
+        # flat per-move number this replaced said every pan needs 2.5s, and
+        # the real floor for the same word runs from about one second to over
+        # five: it forbade a short pan across a narrow gap and permitted a
+        # long one that could never arrive.
+        #
+        # Distances come from where the card measured the subjects, so this
+        # is the estimate available before anything is grounded. The executor
+        # measures again and reports against what it finds.
+        floor = _floor_for(clip)
         # Not a correction. The move stays as asked and runs in the time it
         # was given; this says it will not read, so the report and the review
         # round see it instead of a shot that quietly arrives too fast.
         too_short = (
-            f"{move} needs about {floor:g}s to register and has "
+            f"{move} across this shot needs about {floor:.1f}s and has "
             f"{wanted:.2f}s"
             if floor > 0.0 and wanted < floor - 1e-6
             else None
