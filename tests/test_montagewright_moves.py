@@ -4269,3 +4269,57 @@ def test_two_looks_that_landed_in_the_same_place_are_reported():
     held: list = []
     build_look_path([(1.0, 0.5, 0.5, 0.3164)], degradations=held, **common)
     assert held == []
+
+
+def test_a_named_music_point_is_actually_resolved():
+    """`resolve_sync_point` existed from the first day and nothing called it.
+
+    A shot asked to land on a named section was placed by `nearest_cue` like
+    every other -- which finds the event nearest the requested length, and
+    the requested length is the thing being overridden. The planner named a
+    moment in the music and got the moment nearest to where it would have cut
+    anyway.
+    """
+
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.schema import EDL, Clip, MusicSync
+
+    grid = BeatGrid(bpm=120.0, meter=4, duration_seconds=40.0, cues=tuple(
+        [Cue(cue_id="section_001", time_seconds=0.0, kind="section_boundary"),
+         Cue(cue_id="section_002", time_seconds=12.0, kind="section_boundary")]
+        + [Cue(cue_id=f"b{i:03d}", time_seconds=i * 0.5,
+               kind="downbeat" if i % 4 == 0 else "beat") for i in range(80)]
+    ))
+
+    def cut(sync_to=None, hold=4.0):
+        return EDL(project_id="p", clips=[Clip(
+            clip_id="k00", source_id="C1",
+            approx_in_seconds=0.0, approx_out_seconds=hold,
+            music_sync=MusicSync(cut_on_beat=True, sync_to=sync_to),
+        )])
+
+    # Asked for four seconds and for the section at twelve: the section wins.
+    landed = ground_timeline(cut(sync_to="section_002"), grid).clips[0]
+    assert abs(landed.duration_seconds - 12.0) < 1e-6
+    assert landed.landed_on == "section_002"
+
+    # Without it, four seconds is what it gets, on the grid.
+    plain = ground_timeline(cut(), grid).clips[0]
+    assert abs(plain.duration_seconds - 4.0) < 0.5
+
+    # A name this track does not have is a note, not a crash -- the planner
+    # described intent the material cannot serve.
+    missing = ground_timeline(cut(sync_to="chorus_1_start"), grid).clips[0]
+    assert abs(missing.duration_seconds - 4.0) < 0.5
+    assert "chorus_1_start" in (missing.note or "")
+
+    # And a point already behind this shot cannot be reached backwards.
+    late = EDL(project_id="p", clips=[
+        Clip(clip_id="k00", source_id="C1", approx_in_seconds=0.0,
+             approx_out_seconds=20.0, music_sync=MusicSync(cut_on_beat=True)),
+        Clip(clip_id="k01", source_id="C1", approx_in_seconds=0.0,
+             approx_out_seconds=4.0,
+             music_sync=MusicSync(cut_on_beat=True, sync_to="section_002")),
+    ])
+    second = ground_timeline(late, grid).clips[1]
+    assert "before this shot begins" in (second.note or "")

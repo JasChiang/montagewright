@@ -405,7 +405,41 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         landed: str | None = None
         note: str | None = None
 
-        if grid is not None and clip.music_sync.cut_on_beat:
+        # A named point is an instruction, not a hint. `resolve_sync_point`
+        # has been here since the grid was written and nothing ever called
+        # it, so a shot asked to land on `chorus_1_start` was placed by
+        # `nearest_cue` like any other -- which finds the nearest event to
+        # the requested length, and the requested length is exactly the
+        # thing being overridden. The planner named a moment in the music;
+        # the answer is that moment, or a note saying the track has no such
+        # moment.
+        wanted_point: float | None = None
+        if grid is not None and clip.music_sync.sync_to:
+            wanted_point = resolve_sync_point(grid, clip.music_sync.sync_to)
+            if wanted_point is None:
+                note = (
+                    f"no point called '{clip.music_sync.sync_to}' in this "
+                    f"track; placed on the nearest event instead"
+                )
+            elif wanted_point <= cursor + 1e-6:
+                note = (
+                    f"'{clip.music_sync.sync_to}' sits at "
+                    f"{wanted_point:.2f}s, before this shot begins; placed "
+                    f"on the nearest event instead"
+                )
+                wanted_point = None
+
+        if wanted_point is not None:
+            end = wanted_point
+            landed = clip.music_sync.sync_to
+            asked_for = cursor + wanted
+            if abs(end - asked_for) > grid.seconds_per_beat:
+                note = (
+                    f"held to '{clip.music_sync.sync_to}' at {end:.2f}s, "
+                    f"{abs(end - asked_for):.2f}s from the "
+                    f"{wanted:.2f}s this shot asked for"
+                )
+        elif grid is not None and clip.music_sync.cut_on_beat:
             cue = grid.nearest_cue(end)
             if cue is not None and cue.time_seconds > cursor + 1e-6:
                 drift = abs(cue.time_seconds - end)

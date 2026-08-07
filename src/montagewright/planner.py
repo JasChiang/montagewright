@@ -198,8 +198,14 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
                         "sync_to": {
                             "type": "string",
                             "description": (
-                                "Named point to coincide with, when one "
-                                "matters. Omit otherwise."
+                                "要對到音樂上的哪一個具名位置。**只能寫上面"
+                                "「Section boundaries」列出來的名字**"
+                                "（`section_002` 這種），寫別的會找不到，"
+                                "本機會退回照長度找最近的事件並在報表記一筆。\n"
+                                "填了這個，這一刀就會落在那個位置上，"
+                                "`hold_seconds` 讓位——所以只在那個時刻本身"
+                                "是理由的時候填：鼓組進來、副歌開始、樂曲收掉。"
+                                "只是想對拍就不要填，那是 `cut_on_beat` 的事。"
                             ),
                         },
                         "rhythm_reason": {
