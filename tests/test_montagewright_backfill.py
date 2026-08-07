@@ -1227,3 +1227,31 @@ def test_a_command_line_run_that_crashed_is_not_listed_as_done(tmp_path):
     finally:
         web.RUNS_ROOT = was
         web.RUNS.clear()
+
+
+def test_a_run_without_a_report_can_still_be_opened():
+    """The state most worth inspecting was the one that would not open.
+
+    showWorkspace(true) was called only from render(), and render() only
+    runs when the API returns a report -- so a crashed run left the cold
+    page covering the workspace, and clicking its card did nothing. The log,
+    the fault, the resume button and whatever film it managed to render all
+    live inside `.work`, hidden.
+    """
+
+    from pathlib import Path
+
+    page = (
+        Path(__file__).resolve().parents[1] / "src" / "montagewright"
+        / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    opening = page[page.index("async function openRun("):]
+    opening = opening[: opening.index("\n}\n")]
+    shows = opening.index("showWorkspace(true)")
+    guarded = opening.index("if (data.report)")
+
+    assert shows < guarded, (
+        "the workspace is only revealed once a report exists, so a run that "
+        "crashed cannot be opened"
+    )

@@ -1167,6 +1167,13 @@ async function openRun(id, where) {
   const data = await (await fetch(`/api/runs/${id}`)).json();
   $('log').textContent = data.lines.join('\n');
   allLines = data.lines;
+  // Opening a run shows the workspace, whether or not it finished. This
+  // only happened inside render(), which only runs when there is a report
+  // -- so a run that crashed could not be opened at all: the progress log,
+  // the fault, the resume button and the film it did manage to render all
+  // live inside `.work`, which stayed hidden behind the cold page. Clicking
+  // the card did nothing at all, which is the worst way to say "unfinished".
+  showWorkspace(true);
   $('progress').classList.remove('hide');
   $('state').textContent = { running:'執行中', done:'完成', failed:'失敗', stopped:'已停止', interrupted:'中斷' }[data.state] || data.state;
   if (data.has_video) {
