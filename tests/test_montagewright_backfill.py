@@ -988,3 +988,107 @@ def test_a_plan_written_before_looks_still_says_what_it_meant():
     assert [one.at for one in was.looks] == [
         "the left handset", "the right handset"
     ]
+
+
+def _measured(monkeypatch, looks, places):
+    """Run _measure_looks against fake grounding, counting the calls."""
+
+    from montagewright import pipeline
+    from montagewright.executor import Source
+
+    asked = []
+
+    def located(frames, description, *, client):
+        asked.append(description)
+
+        class Used:
+            input_tokens = output_tokens = thought_tokens = 0
+
+        return [{
+            "present": True, "centre_x": places[description], "centre_y": 0.5,
+            "width": 0.1, "height": 0.3, "frame_index": 0,
+        }], Used()
+
+    monkeypatch.setattr(pipeline, "locate_subject", located)
+    monkeypatch.setattr(pipeline, "_sample_frames", lambda *a, **k: ([], []))
+    monkeypatch.setattr(pipeline, "_may_ask", lambda client: True)
+
+    class Clip:
+        clip_id = "k00"
+        approx_in_seconds, approx_out_seconds = 0.0, 6.0
+
+    stops, missing = pipeline._measure_looks(
+        looks,
+        Source(source_id="s", path=None, duration_seconds=6.0,
+               width=3840, height=2160),
+        Clip(), None, pipeline.Report(), object(), 1080 / 1920,
+    )
+    return stops, missing, asked
+
+
+def test_three_looks_reach_the_renderer_as_three_stops(monkeypatch):
+    """They used to be truncated to two with nothing recorded.
+
+    `pan` read `subject` and `then_subject`; a third look had nowhere to go,
+    so a row of three watches lost its middle stop silently.
+    """
+
+    from montagewright.schema import Look
+
+    stops, missing, _ = _measured(
+        monkeypatch,
+        [Look(at="A", seconds=0.6), Look(at="B", seconds=0.6),
+         Look(at="C", seconds=0.8)],
+        {"A": 0.15, "B": 0.5, "C": 0.85},
+    )
+
+    assert missing == ""
+    assert [round(one[1], 2) for one in stops] == [0.15, 0.5, 0.85]
+    assert [one[0] for one in stops] == [0.6, 0.6, 0.8]
+
+
+def test_one_subject_looked_at_twice_is_measured_once(monkeypatch):
+    # Two looks at one thing is how a push is written, and grounding the
+    # same description twice would buy one answer twice.
+    from montagewright.schema import Look
+
+    stops, _, asked = _measured(
+        monkeypatch,
+        [Look(at="A", framing="thirds"), Look(at="A", framing="fill")],
+        {"A": 0.4},
+    )
+
+    assert asked == ["A"]
+    assert len(stops) == 2
+    # Same place, tighter crop -- which is what a push in is.
+    assert stops[0][1] == stops[1][1]
+    assert stops[1][3] < stops[0][3]
+
+
+def test_a_subject_nobody_can_find_is_named_rather_than_guessed(monkeypatch):
+    from montagewright import pipeline
+    from montagewright.executor import Source
+    from montagewright.schema import Look
+
+    def nothing(frames, description, *, client):
+        class Used:
+            input_tokens = output_tokens = thought_tokens = 0
+
+        return [{"present": False}], Used()
+
+    monkeypatch.setattr(pipeline, "locate_subject", nothing)
+    monkeypatch.setattr(pipeline, "_sample_frames", lambda *a, **k: ([], []))
+    monkeypatch.setattr(pipeline, "_may_ask", lambda client: True)
+
+    class Clip:
+        clip_id = "k00"
+        approx_in_seconds, approx_out_seconds = 0.0, 6.0
+
+    stops, missing = pipeline._measure_looks(
+        [Look(at="the ghost")],
+        Source(source_id="s", path=None, duration_seconds=6.0,
+               width=3840, height=2160),
+        Clip(), None, pipeline.Report(), object(), 1080 / 1920,
+    )
+
+    assert stops == [] and missing == "the ghost"

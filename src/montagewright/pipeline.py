@@ -39,6 +39,7 @@ from montagewright.reframe import (
     build_crop_path,
     build_handoff_path,
     build_sweep_path,
+    build_look_path,
     build_tilt_path,
     build_zoom_path,
     observations_from_sam,
@@ -288,6 +289,73 @@ def _track_subject(
     return observations_from_sam(
         track, clip_start_seconds=clip.approx_in_seconds
     )
+
+
+def _measure_looks(
+    looks, source, clip, work: Path, report, client, target_aspect: float
+) -> tuple[list[tuple[float, float, float, float]], str]:
+    """Turn each look into a place on the frame, measured rather than assumed.
+
+    One grounding call per distinct subject, so two looks at the same thing
+    -- which is how a push in is written -- are located once and paid for
+    once.
+
+    The crop width comes from framing: `fill` closes toward the subject
+    within the source's own budget, and the others take the widest crop
+    there is and place the subject inside it. The vertical centre is nudged
+    so the subject lands on the line its framing asks for rather than in the
+    middle of the crop, which is what makes a held frame read as composed.
+    """
+
+    from montagewright.reframe import PLACEMENT
+
+    # Checked here as well as at the call site. Pulling frames runs ffmpeg
+    # over the take, and a guard that lives only in the caller stops being a
+    # guard the moment this is called from anywhere else.
+    if not _may_ask(client):
+        return [], ""
+
+    frames, _ = _sample_frames(
+        source, clip.approx_in_seconds, clip.approx_out_seconds, work
+    )
+    if target_aspect < source.aspect_ratio:
+        base, base_height = target_aspect / source.aspect_ratio, 1.0
+    else:
+        base, base_height = 1.0, source.aspect_ratio / target_aspect
+    seen: dict[str, tuple[float, float, float]] = {}
+    stops: list[tuple[float, float, float, float]] = []
+    missing: list[str] = []
+    for look in looks:
+        if look.at not in seen:
+            _afford(report)
+            boxes, usage = locate_subject(frames, look.at, client=client)
+            _charge(report, "subject", usage)
+            found = [
+                one for one in boxes
+                if one.get("present") and one.get("centre_x") is not None
+            ]
+            if not found:
+                missing.append(look.at)
+                continue
+            seen[look.at] = (
+                sum(float(one["centre_x"]) for one in found) / len(found),
+                sum(float(one["centre_y"]) for one in found) / len(found),
+                sum(float(one.get("height") or 0.0) for one in found) / len(found),
+            )
+        centre_x, centre_y, tall = seen[look.at]
+        width = base
+        if look.framing == "fill" and tall > 0.0:
+            # The same reach a push used to compute, bounded the same way.
+            width = base * max(0.2, min(0.9, tall / 0.66))
+        height = min(1.0, base_height * (width / base) if base > 0 else base_height)
+        share = PLACEMENT.get(look.framing, 0.5)
+        stops.append((
+            max(0.0, float(look.seconds)),
+            centre_x,
+            centre_y + height * (0.5 - share),
+            width,
+        ))
+    return stops, "、".join(missing)
 
 
 def _seed_box(box: dict[str, Any]) -> list[int]:
@@ -556,6 +624,49 @@ def follow_subjects(
                 )
                 report.following_shots += 1
                 continue
+
+            # Every shot that settles somewhere more than once, whatever the
+            # move turned out to be called. One builder walks the list; the
+            # older branches below stay for a single look, where following a
+            # moving subject still needs the tracker.
+            #
+            # Three looks used to be silently truncated to two -- `pan` read
+            # `subject` and `then_subject` and there was nowhere for a third
+            # to go, so a row of three watches lost its middle stop with
+            # nothing recorded.
+            if len(reframe.looks) >= 2 and _may_ask(client):
+                stops, missing = _measure_looks(
+                    reframe.looks, source, clip, work, report, client,
+                    target_aspect,
+                )
+                if missing:
+                    report.subject_notes[clip.clip_id] = (
+                        f"could not find {missing} in any sampled frame"[:160]
+                    )
+                if len(stops) >= 2:
+                    out_w, out_h = output_size
+                    paths[clip.clip_id] = build_look_path(
+                        stops,
+                        source_aspect=source.aspect_ratio,
+                        target_aspect=target_aspect,
+                        duration_seconds=duration,
+                        energy=reframe.camera_energy,
+                        clip_id=clip.clip_id,
+                        degradations=report.degradations,
+                    )
+                    tightest = min(
+                        paths[clip.clip_id].keyframes,
+                        key=lambda one: one.crop.width,
+                    ).crop
+                    report.upscales[clip.clip_id] = achieved_upscale(
+                        tightest,
+                        source_width=source.width,
+                        source_height=source.height,
+                        output_width=out_w,
+                        output_height=out_h,
+                    )
+                    report.following_shots += 1
+                    continue
 
             if move in {"push_in", "pull_out"}:
                 # Push toward the subject, not toward the middle of the frame.
