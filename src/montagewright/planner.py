@@ -344,8 +344,20 @@ def _is_spend_cap(error: Exception) -> bool:
     return "spend" in said or "spending cap" in said or "billing" in said
 
 
-def ask(client: Any, **request: Any) -> Any:
+def ask(client: Any, *, patience_seconds: float | None = None, **request: Any) -> Any:
     """Make one model call, and say what happened in this project's terms.
+
+    `patience_seconds` is how long this particular call is worth waiting for.
+    The client carries one ceiling for every call it makes, and that ceiling
+    was sized for the largest of them -- a planning pass carrying seventy-four
+    proxies, measured at six hundred seconds. Applying the same twenty-five
+    minutes to a call about one short clip means a single wedged request
+    costs twenty-five minutes before anything notices.
+
+    Which is not hypothetical: a card call stopped returning at clip sixty of
+    seventy-four, held an open connection with no bytes moving, and had spent
+    over half an hour there when it was killed by hand. The ceiling had not
+    fired because it had not yet been reached.
 
     The provider has a cap of its own, and hitting it arrived as a raw
     traceback out of the SDK -- so a run that had already rendered a film,
@@ -359,6 +371,8 @@ def ask(client: Any, **request: Any) -> Any:
 
     from montagewright.cost import BudgetSpent
 
+    if patience_seconds is not None:
+        request["timeout"] = float(patience_seconds)
     try:
         return _asked(client).interactions.create(**request)
     except Exception as error:

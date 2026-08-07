@@ -3997,3 +3997,35 @@ def test_the_planner_is_offered_spans_and_not_files():
     for field in ("start_offset_seconds", "seconds_needed"):
         assert shot["properties"][field]["type"] == "string"
     assert shot["properties"]["looks"]["items"]["properties"]["seconds"]["type"] == "string"
+
+
+def test_a_call_waits_as_long_as_that_call_is_worth():
+    """One ceiling for every call is the largest call's ceiling.
+
+    Twenty-five minutes was sized for a planning pass carrying seventy-four
+    proxies, measured at six hundred seconds. The card pass inherited it and
+    then wedged at clip sixty of seventy-four -- an open connection with no
+    bytes moving, still waiting half an hour later, because the ceiling had
+    not been reached rather than because nothing was wrong.
+    """
+
+    import inspect
+
+    from montagewright import clipcard, planner
+
+    assert "patience_seconds" in inspect.signature(planner.ask).parameters
+    passed = inspect.getsource(planner.ask)
+    assert 'request["timeout"] = float(patience_seconds)' in passed
+
+    # A call about one short clip does not wait as long as one about the
+    # whole shoot.
+    card = inspect.getsource(clipcard.describe_clip)
+    assert "patience_seconds=" in card
+    seconds = float(card.split("patience_seconds=")[1].split(",")[0])
+    assert seconds < planner.REQUEST_TIMEOUT_MS / 1000.0
+
+    # And the default is unchanged, so the long calls it was sized for keep it.
+    assert planner.ask.__defaults__ is None
+    assert inspect.signature(planner.ask).parameters[
+        "patience_seconds"
+    ].default is None

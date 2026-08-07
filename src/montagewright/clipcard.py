@@ -738,6 +738,12 @@ def describe_clip(
             },
             {"type": "text", "text": instruction},
         ],
+        # One short clip. Anything past this is not a slow answer, it is a
+        # call that has stopped coming back -- and seventy-four of these run
+        # in a row, so the cost of finding that out late is paid once per
+        # clip. The library is written as it goes, so the retry after a
+        # timeout starts from the one that hung.
+        patience_seconds=300.0,
         generation_config={
             # Describing what is in a frame is recognition and needs little
             # deliberation. Deciding whether a take failed -- whether an
