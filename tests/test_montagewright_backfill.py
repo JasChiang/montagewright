@@ -769,8 +769,10 @@ def test_selection_is_told_a_row_needs_two_endpoints():
         / "prompts" / "selection_zh-TW.txt"
     ).read_text(encoding="utf-8")
 
-    assert "then_subject" in prompt
-    assert "就要給兩個端點" in prompt
+    # Said in the looks vocabulary now: the field it named was replaced by
+    # `looks` shortly after this test was written.
+    assert "就要給兩個落點" in prompt
+    assert "在 `looks` 裡填起點跟終點" in prompt
 
 
 # --- a move has to arrive somewhere and stay there -----------------------
@@ -1446,3 +1448,37 @@ def test_the_planner_is_shown_each_shot_s_measured_floor():
         reframe=reframe_of({"looks": [{"at": "A"}, {"at": "B"}], "why": "x"}),
     )
     assert _needs_at_least(bare) == 0.0
+
+
+def test_no_prompt_teaches_a_field_the_schema_does_not_have():
+    """The selection prompt spent an hour describing `then_subject`.
+
+    It was added to explain how to read across a wide subject, the schema
+    was replaced with `looks` shortly after, and the prompt kept teaching a
+    field that no longer existed -- the same shape as the bug it had been
+    added to fix, which was a prompt recommending an impossible combination.
+    """
+
+    import re
+    from pathlib import Path
+
+    from montagewright.planner import _selection_schema
+
+    shot = _selection_schema(["C1"])["properties"]["shots"]["items"]
+    real = set(shot["properties"]) | set(
+        shot["properties"]["looks"]["items"]["properties"]
+    )
+
+    prompts = Path(__file__).resolve().parents[1] / "src" / "montagewright" / "prompts"
+    retired = {"then_subject", "camera_move"}
+    offenders = []
+    for name in ("selection_zh-TW.txt", "replan_zh-TW.txt"):
+        text = (prompts / name).read_text(encoding="utf-8")
+        for field in sorted(retired | {"subject"}):
+            if field in real:
+                continue
+            # Backticked, so `camera_moves` in prose does not count.
+            if re.search(rf"`{field}`", text):
+                offenders.append(f"{name} still teaches `{field}`")
+
+    assert not offenders, "\n  ".join(offenders)

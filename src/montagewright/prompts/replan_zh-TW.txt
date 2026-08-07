@@ -23,7 +23,9 @@
 
 ## 你要輸出
 
-只輸出這幾顆的新規劃，欄位跟選片時一樣：`source_id`、`start_seconds`、`subject`、`must_be_whole`、`energy`、`camera_move`、`framing`、`seconds_needed`、`why`。
+只輸出這幾顆的新規劃，欄位跟選片時一樣：`source_id`、`start_seconds`、`looks`、`energy`、`seconds_needed`、`why`。
+
+`looks` 是這一顆畫面依序停在哪裡，每個落點有 `at`（看什麼）、`seconds`（停多久）、`framing`。一個落點是定住，兩個是從第一個帶到第二個，兩個指向同一個東西但 framing 不同就是推近。沒有另外的運鏡欄位要選。
 
 `why` 要說出你這次為什麼認為它會成立——用畫面上的東西說，不要只說「已修正」。
 
