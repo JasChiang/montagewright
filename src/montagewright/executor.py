@@ -107,6 +107,15 @@ class Segment:
     # Levelling makes every speaker the same loudness, which is not the same
     # as every speaker being right: one of them stood next to a road.
     gain_db: float = 0.0
+    # The stretch of the source this segment may not leave, when the card
+    # named one. The renderer writes handles either side of every cut so an
+    # editor opening the timeline can pull a shot longer; those were bounded
+    # by the file, so half a second before a take is half a second of the
+    # camera still being aimed, and half a second after it is often somebody
+    # saying "again". A handle nobody can use is worse than none, because it
+    # is there to be trusted.
+    usable_from_seconds: float = 0.0
+    usable_to_seconds: float = 0.0
 
     @property
     def duration_seconds(self) -> float:
@@ -255,6 +264,8 @@ def plan_render(
                 out_seconds=out_seconds,
                 crop=crop,
                 crop_path=path,
+                usable_from_seconds=clip.usable_from_seconds,
+                usable_to_seconds=clip.usable_to_seconds,
             )
         )
 
@@ -280,6 +291,33 @@ def _resolve_times(
 
     in_seconds = max(0.0, clip.approx_in_seconds)
     out_seconds = min(source.duration_seconds, clip.approx_out_seconds)
+
+    # Past the end of what the take is worth using is a different fault from
+    # past the end of the file, and it was not being noticed at all -- the
+    # only question asked here was whether the time existed. It is recorded
+    # rather than repaired, because shortening a shot to stay inside the
+    # window changes the length the rhythm pass chose, and which of those to
+    # give up is a judgement. The shot reviewer sees this one and the film is
+    # still delivered.
+    window = clip.usable_window
+    if window is not None and out_seconds > window[1] + 1e-6:
+        degradations.append(
+            DegradationStep(
+                clip_id=clip.clip_id,
+                ladder="other",
+                ladder_other="ran_past_the_usable_take",
+                trigger=(
+                    "the cut runs past the point the card said this take "
+                    "stops being usable, so the tail is whatever follows it "
+                    "-- a reset, a repositioned camera, somebody walking in"
+                ),
+                measured={
+                    "out_seconds": round(out_seconds, 3),
+                    "usable_to": round(window[1], 3),
+                    "overrun_seconds": round(out_seconds - window[1], 3),
+                },
+            )
+        )
 
     if out_seconds <= in_seconds:
         # The window fell outside the material. Keep whatever tail exists

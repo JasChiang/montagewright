@@ -3732,3 +3732,160 @@ def test_every_look_that_promised_whole_is_checked_not_only_the_first():
     assert "look.must_be_whole" in later
     assert "find_subject(card, look.at)" in later
     assert "box.width <= crop_width" in later
+
+
+def test_the_usable_window_is_a_constraint_not_a_hint():
+    """The card said where a take is worth cutting into and nothing read it.
+
+    Outside the card itself, `usable_from_seconds` reached exactly two
+    places: a dataclass field, and the line of prompt text built from it. A
+    planner told "可用區間 4.2–8.5s" and choosing 2.0 was contradicted by
+    nothing, so the shot opened on the camera still swinging -- the case the
+    field was added for.
+    """
+
+    from montagewright.cli import _edl_from_selection
+    from pathlib import Path
+    import json
+    import tempfile
+
+    card = {
+        "version": "x", "summary": "", "usable": True,
+        "usable_from_seconds": 4.2, "usable_to_seconds": 8.5,
+        "subjects": [], "action": [],
+    }
+    with tempfile.TemporaryDirectory() as work:
+        where = Path(work) / "c.json"
+        where.write_text(json.dumps(card), encoding="utf-8")
+        selection = {"shots": [{
+            "source_id": "C017", "start_seconds": 0.0, "seconds_needed": 3.0,
+            "frame": "settles", "energy": "medium", "why": "",
+            "looks": [{"at": "a", "seconds": 1.0, "framing": "thirds"}],
+        }]}
+        # load_card checks the version, so point the reader at a real one.
+        from montagewright import clipcard
+
+        was, clipcard.CARD_VERSION = clipcard.CARD_VERSION, "x"
+        try:
+            edl, _ = _edl_from_selection(selection, Path(work), {"C017": where})
+        finally:
+            clipcard.CARD_VERSION = was
+
+    clip = edl.clips[0]
+    assert clip.approx_in_seconds >= 4.2, clip.approx_in_seconds
+    assert clip.approx_out_seconds <= 8.5 + 1e-6, clip.approx_out_seconds
+    # And it travels with the clip, because the layers below decide lengths.
+    assert clip.usable_window == (4.2, 8.5)
+
+
+def test_reaching_a_beat_is_not_a_reason_to_run_into_the_reset():
+    """Rhythm stretches shots to land on music and knew only the file length."""
+
+    from montagewright.grounding import apply_to_edl
+    from montagewright.schema import EDL, Clip
+
+    clip = Clip(
+        clip_id="k00", source_id="C017",
+        approx_in_seconds=4.2, approx_out_seconds=6.0,
+        usable_from_seconds=4.2, usable_to_seconds=8.5,
+    )
+
+    class _Entry:
+        def __init__(self, clip, seconds):
+            self.clip, self.duration_seconds = clip, seconds
+
+    class _Timeline:
+        def __init__(self, clips):
+            self.clips = clips
+
+    # Asked for six seconds from 4.2, which ends at 10.2 -- past the take.
+    stretched = apply_to_edl(
+        EDL(project_id="p", clips=[clip]), _Timeline([_Entry(clip, 6.0)])
+    )
+    assert stretched.clips[0].approx_out_seconds == 8.5
+
+    # Inside the window it is left alone.
+    kept = apply_to_edl(
+        EDL(project_id="p", clips=[clip]), _Timeline([_Entry(clip, 2.0)])
+    )
+    assert kept.clips[0].approx_out_seconds == 6.2
+
+
+def test_an_overrun_is_recorded_rather_than_silently_delivered():
+    """The executor's only question was whether the time existed in the file.
+
+    A second of a reset and a second of a take are the same second to it.
+    """
+
+    from montagewright.executor import _resolve_times
+    from montagewright.schema import Clip
+
+    clip = Clip(
+        clip_id="k00", source_id="C017",
+        approx_in_seconds=4.0, approx_out_seconds=9.5,
+        usable_from_seconds=4.0, usable_to_seconds=8.5,
+    )
+
+    class _Source:
+        duration_seconds = 30.0
+
+    found: list = []
+    _resolve_times(clip, _Source(), found, [])
+    assert [one.ladder_other for one in found] == ["ran_past_the_usable_take"]
+    assert found[0].measured["overrun_seconds"] == 1.0
+
+    # No window, no complaint: most material has never been given one.
+    plain = clip.model_copy(update={"usable_to_seconds": 0.0})
+    quiet: list = []
+    _resolve_times(plain, _Source(), quiet, [])
+    assert quiet == []
+
+
+def test_a_handle_does_not_open_onto_the_part_nobody_should_see():
+    """Handles were bounded by the file, which is the wrong boundary.
+
+    Half a second before a take is the camera being aimed; half a second
+    after it is often somebody saying "again". A handle exists to be pulled,
+    so one that opens onto a reset is worse than none.
+    """
+
+    import inspect
+
+    from montagewright import renderer
+
+    source = inspect.getsource(renderer)
+    cutting = source[source.index("first = segment.usable_from_seconds"):]
+    cutting = cutting[: cutting.index("command = [")]
+    assert "segment.in_seconds - first" in cutting
+    assert "last - segment.out_seconds" in cutting
+    # Falls back to the file when nothing said otherwise.
+    assert "or source.duration_seconds" in cutting
+
+
+def test_an_action_snap_cannot_land_outside_the_take():
+    """Actions are recorded across the whole clip, resets included.
+
+    The camera being repositioned is a movement, and so is somebody walking
+    in to reset a prop -- so the correction that exists to land a cut on a
+    gesture could move it over the take's own boundary, on purpose.
+    """
+
+    from montagewright.clipcard import snap_to_action
+
+    card = {"action": [
+        {"what": "the hand reaches in", "starts_seconds": 5.0, "ends_seconds": 6.0},
+        {"what": "somebody resets the prop", "starts_seconds": 9.0,
+         "ends_seconds": 10.0},
+    ]}
+
+    # Unbounded, the nearest action to 8.6 is the reset.
+    loose, _ = snap_to_action(card, 8.6, 2.0)
+    assert loose == 9.0
+
+    # Bounded by the take, the reset is not a candidate at all.
+    held, note = snap_to_action(card, 8.6, 2.0, within=(4.2, 8.5))
+    assert held == 8.6 and note is None
+
+    # And a gesture inside the window is still snapped to.
+    moved, note = snap_to_action(card, 5.4, 2.0, within=(4.2, 8.5))
+    assert moved == 5.0 and note

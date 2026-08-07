@@ -194,11 +194,15 @@ def _render_segment(
         if abs(segment.gain_db) > 0.01 else []
     )
 
-    head = min(HANDLE_SECONDS, segment.in_seconds)
-    tail = min(
-        HANDLE_SECONDS,
-        max(0.0, source.duration_seconds - segment.out_seconds),
-    )
+    # Handles reach back to the start of the file and forward to its end,
+    # which is the wrong boundary: half a second before a take is usually the
+    # camera still being aimed, and half a second after it is often somebody
+    # saying "again". A handle exists to be pulled, so one that opens onto a
+    # reset is worse than none.
+    first = segment.usable_from_seconds
+    last = segment.usable_to_seconds or source.duration_seconds
+    head = min(HANDLE_SECONDS, max(0.0, segment.in_seconds - first))
+    tail = min(HANDLE_SECONDS, max(0.0, last - segment.out_seconds))
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         # Seeking before -i decodes from the preceding keyframe, which is both

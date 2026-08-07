@@ -1134,8 +1134,19 @@ def _edl_from_selection(
         # the length started from a constant.
         wanted = float(shot.get("seconds_needed") or 0.0) or 4.0
         card = load_card(cards[shot["source_id"]]) if shot["source_id"] in cards else None
+        window = _usable_window(card)
+        if window is not None:
+            # The card said where this take is worth cutting into and until
+            # now that answer only ever reached a line of prompt text. A
+            # planner reading "可用區間 4.2–8.5s" and choosing 2.0 was not
+            # contradicted by anything, so the shot began on the camera still
+            # swinging -- which is the case the field was added for.
+            first, last = window
+            room = max(0.0, last - first)
+            wanted = min(wanted, room) if room > 0 else wanted
+            start = min(max(start, first), max(first, last - wanted))
         if card is not None:
-            start, note = snap_to_action(card, start, wanted)
+            start, note = snap_to_action(card, start, wanted, within=window)
             if note:
                 snaps[clip_id] = note
             # Where the card already measured each look. This is what makes
@@ -1155,9 +1166,26 @@ def _edl_from_selection(
                 in_looks_like=subject_of(shot),
                 energy_intent=shot.get("energy", "medium"),
                 reframe=reframe,
+                # Carried on the clip so the layers after this one can see
+                # it. Rhythm stretches shots to land on beats and the
+                # executor asks only whether the time exists in the file;
+                # neither could tell a second of usable take from a second
+                # of somebody resetting a prop.
+                usable_from_seconds=(window[0] if window else 0.0),
+                usable_to_seconds=(window[1] if window else 0.0),
             )
         )
     return EDL(project_id=rushes.name, clips=clips), snaps
+
+
+def _usable_window(card: dict | None) -> tuple[float, float] | None:
+    """The stretch of a take the card judged worth cutting into."""
+
+    if not card:
+        return None
+    first = float(card.get("usable_from_seconds", 0.0) or 0.0)
+    last = float(card.get("usable_to_seconds", 0.0) or 0.0)
+    return (first, last) if last > first else None
 
 
 def _write_report(output: Path, **parts) -> None:

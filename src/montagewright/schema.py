@@ -408,6 +408,28 @@ class Clip(ModelFacing):
             "fingerprint alignment exists; unused today."
         ),
     )
+    # The stretch of this source that was judged worth cutting into, carried
+    # with the clip rather than left on the card.
+    #
+    # The card has always said where a take becomes usable and where it stops
+    # being usable, and until now that answer reached exactly two places: a
+    # line of prompt text, and the dataclass that builds that line. Nothing
+    # downstream could see it, so it was advice. The in-point could be
+    # snapped onto an action outside it, the length could be stretched past
+    # it to reach a beat, and the executor's only question was whether the
+    # time existed in the file.
+    #
+    # Zero for either end means nobody said, and nothing is enforced.
+    usable_from_seconds: float = Field(default=0.0, ge=0.0)
+    usable_to_seconds: float = Field(default=0.0, ge=0.0)
+
+    @property
+    def usable_window(self) -> "tuple[float, float] | None":
+        """The bounds a cut of this clip may not leave, if they are known."""
+
+        if self.usable_to_seconds <= self.usable_from_seconds:
+            return None
+        return (self.usable_from_seconds, self.usable_to_seconds)
 
     @model_validator(mode="after")
     def out_follows_in(self) -> "Clip":

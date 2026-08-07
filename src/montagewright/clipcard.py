@@ -84,7 +84,11 @@ def action_beats(card: dict[str, Any]) -> list[Beat]:
 
 
 def snap_to_action(
-    card: dict[str, Any], wanted_start: float, duration: float
+    card: dict[str, Any],
+    wanted_start: float,
+    duration: float,
+    *,
+    within: tuple[float, float] | None = None,
 ) -> tuple[float, str | None]:
     """Move a planned in-point onto the nearest action that contains it.
 
@@ -93,9 +97,23 @@ def snap_to_action(
     movement starts. This only moves the in-point when there is an action
     close enough to be the one meant -- half the shot's length -- so a static
     shot keeps the timing it was given.
+
+    `within` is the stretch the card said was worth cutting into. Actions are
+    recorded across the whole take, including the parts nobody should use --
+    the camera being repositioned is a movement, and so is somebody walking
+    in to reset a prop -- so without this the correction that exists to land
+    a cut on a gesture could land it on the wrong side of the take's own
+    boundary, and moved it there on purpose.
     """
 
     beats = action_beats(card)
+    if within is not None:
+        first, last = within
+        beats = [
+            beat for beat in beats
+            if beat.starts_seconds >= first - 1e-6
+            and beat.starts_seconds + duration <= last + 1e-6
+        ]
     if not beats:
         return wanted_start, None
 

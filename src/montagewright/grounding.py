@@ -411,12 +411,18 @@ def apply_to_edl(edl: EDL, timeline: GroundedTimeline) -> EDL:
         if wanted is None:
             rewritten.append(clip)
             continue
+        out = clip.approx_in_seconds + wanted
+        # Not past the end of what the take is worth using. Reaching a beat
+        # is a good reason to hold a shot longer and it is not a good enough
+        # one to run into the part where the camera is being repositioned or
+        # somebody says "again" -- and the layer that clamps lengths below
+        # this one only knows how long the file is, so a second of a reset
+        # and a second of a take look identical to it.
+        window = clip.usable_window
+        if window is not None and out > window[1]:
+            out = max(clip.approx_in_seconds + 1e-3, window[1])
         rewritten.append(
-            clip.model_copy(
-                update={
-                    "approx_out_seconds": clip.approx_in_seconds + wanted
-                }
-            )
+            clip.model_copy(update={"approx_out_seconds": out})
         )
     return edl.model_copy(update={"clips": rewritten})
 
