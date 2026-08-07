@@ -1267,6 +1267,11 @@ let cropsAre = 'recorded';
 // One shot at a time, where the eye already is. The whole table is still
 // under 全部鏡頭 for reading straight through; this is for the shot you just
 // clicked, which is the question anyone actually has in front of a cut.
+// The move is read off the block, not off the plan. A shot has not carried
+// camera_move since it started saying what to look at instead: the move is
+// what a list of looks turns out to be, worked out server-side by the one
+// reader that knows how. Read from the plan it was a missing key printed as
+// an em dash, so a shot that pushed in reported no move at all.
 function inspect(i) {
   // Choosing a shot is choosing away from a caption.
   cue = -1;
@@ -1309,12 +1314,6 @@ function inspect(i) {
     <section class="ins-part">
       <h4>它打算做什麼</h4>
       <div class="pairs">
-        <!-- Off the block, not off the plan. A shot has not carried
-             `camera_move` since it started saying what to look at instead;
-             the move is what a list of looks turns out to be, and the
-             server already worked that out with the one reader that knows.
-             Read from the plan it was a missing field, printed as an em
-             dash, so a shot that pushed in reported no move at all. -->
         <span>運鏡</span><span>${esc(MOVES[b.camera_move] || b.camera_move || '—')}${
           plan.frame ? `<i class="why">　宣告${plan.frame === 'travels' ? '會動' : '不動'}</i>` : ''}</span>
         <span>畫面停在</span><span>${
