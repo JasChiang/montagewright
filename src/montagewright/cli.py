@@ -436,6 +436,8 @@ def command_render(args: argparse.Namespace) -> int:
                 composition=(card or {}).get("composition", ""),
                 camera_moves=bool((card or {}).get("camera_moves", False)),
                 camera_motion=str((card or {}).get("camera_motion", "") or ""),
+                shot_size=str((card or {}).get("shot_size", "") or ""),
+                facing=str((card or {}).get("facing", "") or ""),
                 usable_from=float((card or {}).get("usable_from_seconds", 0.0)),
                 usable_to=float((card or {}).get("usable_to_seconds", 0.0)),
                 push_room=_push_room(

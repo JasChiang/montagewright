@@ -634,6 +634,14 @@ class MaterialItem:
     # take's own move bring a third one in from the right -- a decision that
     # needs to know what the move reveals, which a boolean cannot say.
     camera_motion: str = ""
+    # Two facts a crop cannot measure and an edit needs before it orders
+    # anything. Size, because two neighbouring shots at the same size read as
+    # a jump rather than a cut; and which way the subject faces, because two
+    # shots facing the same way read as both people addressing the same side
+    # of the room. Both come free with the card -- the model is already
+    # watching the clip -- and neither can be derived from geometry.
+    shot_size: str = ""
+    facing: str = ""
     # Which stretch is worth cutting into, what happens where, and what the
     # material was judged to need. Selection picks a start second, and it was
     # picking one blind: a shot whose first second is the camera still
@@ -755,6 +763,10 @@ def _describe_material(material: list[MaterialItem]) -> str:
         facts = [f"{item.duration_seconds:.1f}s"]
         if item.composition:
             facts.append(f"構圖{item.composition}")
+        if item.shot_size:
+            facts.append(f"景別{item.shot_size}")
+        if item.facing and item.facing != "flat":
+            facts.append(f"朝向{item.facing}")
         if item.camera_motion:
             facts.append(f"素材自己的運鏡：{item.camera_motion}")
         elif item.camera_moves:

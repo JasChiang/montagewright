@@ -657,3 +657,65 @@ def test_a_subject_that_only_jitters_is_not_chased():
     still = [(3.0 * i / 4, 0.5 + 0.001 * i, 0.5) for i in range(5)]
 
     assert len(_zoom(track=still).keyframes) == 2
+
+
+# --- what a crop cannot measure ------------------------------------------
+
+def test_the_card_asks_for_shot_size_and_facing():
+    """Neither is derivable from geometry, and both decide what can follow
+    what: two neighbouring shots at the same size read as a jump, and two
+    facing the same way read as both people addressing the same side."""
+
+    from montagewright.clipcard import card_schema
+
+    schema = card_schema()
+
+    assert "shot_size" in schema["required"]
+    assert "facing" in schema["required"]
+    assert schema["properties"]["shot_size"]["enum"] == [
+        "wide", "medium", "close", "extreme_close"
+    ]
+    assert schema["properties"]["facing"]["enum"] == [
+        "left", "right", "toward", "away", "flat"
+    ]
+
+
+def test_the_planner_is_shown_size_and_facing():
+    from montagewright.planner import MaterialItem, _describe_material
+
+    said = _describe_material([
+        MaterialItem(
+            source_id="a", duration_seconds=10.0, summary="x",
+            shot_size="close", facing="right",
+        )
+    ])
+
+    assert "景別close" in said and "朝向right" in said
+
+
+def test_a_shot_with_no_direction_says_nothing_about_direction():
+    # `flat` is "no direction to preserve", which is not a fact worth a line
+    # in a listing the planner has to read seventy-four of.
+    from montagewright.planner import MaterialItem, _describe_material
+
+    said = _describe_material([
+        MaterialItem(
+            source_id="a", duration_seconds=10.0, summary="x",
+            shot_size="wide", facing="flat",
+        )
+    ])
+
+    assert "朝向" not in said
+
+
+def test_selection_is_told_what_to_do_with_them():
+    # A field nobody is told to use is a field nobody fills honestly.
+    from pathlib import Path
+
+    prompt = (
+        Path(__file__).resolve().parents[1] / "src" / "montagewright"
+        / "prompts" / "selection_zh-TW.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "景別太接近會跳" in prompt
+    assert "銀幕方向" in prompt or "朝向決定" in prompt

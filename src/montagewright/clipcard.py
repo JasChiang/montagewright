@@ -121,6 +121,8 @@ def card_schema() -> dict[str, Any]:
             "subjects",
             "action",
             "camera_motion",
+            "shot_size",
+            "facing",
             "speech",
             "usable_from_seconds",
             "usable_to_seconds",
@@ -242,6 +244,34 @@ def card_schema() -> dict[str, Any]:
             "camera_moves": {
                 "type": "boolean",
                 "description": "Whether the camera itself moves in this take.",
+            },
+            "shot_size": {
+                "type": "string",
+                "enum": ["wide", "medium", "close", "extreme_close"],
+                "description": (
+                    "主體在畫面裡佔多大。`wide`：主體連同它所在的環境，"
+                    "人是全身或更遠。`medium`：主體是畫面主角但還看得到周圍，"
+                    "人約半身。`close`：主體填滿大部分畫面，人是肩上。"
+                    "`extreme_close`：只有一個局部——鏡頭模組、鉸鏈、"
+                    "螢幕上的一個數字、眼睛。\n"
+                    "這是剪接會用到的事實：兩顆景別太接近接在一起會跳，"
+                    "而一段戲通常要從遠往近推進。看的是主體佔畫面的比例，"
+                    "不是攝影機離它多遠。"
+                ),
+            },
+            "facing": {
+                "type": "string",
+                "enum": ["left", "right", "toward", "away", "flat"],
+                "description": (
+                    "主體朝向或移動的方向，從觀眾的角度看。`left`／`right`："
+                    "人面向那一側、或東西往那一側走。`toward`：朝鏡頭來。"
+                    "`away`：離鏡頭去。`flat`：正對鏡頭、對稱擺放、"
+                    "或看不出方向。\n"
+                    "這是銀幕方向：兩顆都朝右的對談鏡頭接在一起，"
+                    "觀眾會以為兩個人在對同一邊說話；一個往右走的東西"
+                    "下一顆變成往左，會讀成它掉頭了。這件事只有看畫面"
+                    "才知道，量不出來。"
+                ),
             },
             "speech": {
                 "type": "string",
