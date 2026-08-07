@@ -169,12 +169,85 @@ class Subject(ModelFacing):
     )
 
 
+class Look(ModelFacing):
+    """One thing the frame settles on, and how long it stays there.
+
+    The primitive the camera vocabulary is built from, rather than a menu of
+    named moves. A shot is an ordered list of these: one look is a hold, two
+    are a move from the first to the second, three are a move that stops on
+    the way. What the moves used to be named is now what a list of looks
+    happens to describe, and the executor labels it afterwards.
+
+    That matters because the named menu could express nonsense. `pan` with
+    one static subject was a legal combination and an impossible instruction
+    -- a move and its targets were separate fields, so they could disagree.
+    A list of looks cannot disagree with itself: a look is somewhere the
+    frame goes.
+
+    Nothing here is geometry. The model says what to look at and how long to
+    look; local code measures where that is and how fast to travel. Handing
+    it coordinates has been tried three times in this project -- nine-box
+    positions, timestamps, 0..1000 boxes -- and it has invented plausible
+    answers every time.
+    """
+
+    at: str = Field(
+        description=(
+            "What the frame settles on, named so a detector can be pointed "
+            "at it and told apart from anything similar beside it. Two "
+            "handsets on a table need 'the left, grey one', not 'the "
+            "handset'. Use the same wording twice to look at one thing "
+            "again at a different framing -- that is what a push in is."
+        )
+    )
+    seconds: float = Field(
+        default=0.0,
+        description=(
+            "How long the frame rests here before moving on. Zero lets local "
+            "code choose a floor that reads as a stop at all. This is the "
+            "judgement worth making: a two-word logo needs less than a row "
+            "of three handsets, and only someone who has watched the shot "
+            "knows which this is."
+        ),
+    )
+    framing: str = Field(
+        default="thirds",
+        description=(
+            "Where this subject sits, and how tightly. `thirds` and `centre` "
+            "place it in the space available; `fill` closes in until it "
+            "carries the frame. Two looks at the same subject, the first "
+            "`thirds` and the second `fill`, is a push in."
+        ),
+    )
+    must_be_whole: bool = Field(
+        default=False,
+        description=(
+            "True only when partial clipping destroys the meaning -- rendered "
+            "text, a UI state, a readout. A subject wider than any crop of "
+            "its source cannot be whole and still, so this and a single look "
+            "is a contradiction local code will report rather than resolve."
+        ),
+    )
+
+
 class Reframe(ModelFacing):
     """What the camera should attend to, never where to put the crop."""
 
+    looks: list[Look] = Field(
+        default_factory=list,
+        description=(
+            "Where the frame goes, in order. One look holds on it; two move "
+            "from the first to the second; more stop on the way. Empty means "
+            "no subject at all -- a landscape or an empty frame -- and then "
+            "`pan_hint` says which way to drift."
+        ),
+    )
     subject: Subject | None = Field(
         default=None,
-        description="Null for a landscape or empty frame; set pan_hint instead.",
+        description=(
+            "The first look, kept so anything reading a single subject still "
+            "works. Derived from `looks`; not filled by the planner."
+        ),
     )
     pan_hint: Literal["left", "right", "up", "down", "none"] = Field(
         default="none",
@@ -500,18 +573,55 @@ def reframe_of(shot: dict) -> Reframe:
     and a pan measured at 0.278 -> 0.696 came back as a held centre crop.
     """
 
-    reframe = Reframe(
-        subject=Subject(
-            description=shot.get("subject", ""),
-            min_visible=1.0 if shot.get("must_be_whole") else 0.85,
+    looks = [
+        Look(
+            at=str(one.get("at", "")),
+            seconds=float(one.get("seconds", 0.0) or 0.0),
+            framing=str(one.get("framing", "thirds") or "thirds"),
+            must_be_whole=bool(one.get("must_be_whole", False)),
+        )
+        for one in (shot.get("looks") or [])
+        if str(one.get("at", "")).strip()
+    ]
+    if not looks:
+        # A plan written before looks existed, or one that named no subject.
+        # The old fields say the same thing in a longer way, so read them
+        # that way rather than keeping two paths through the executor.
+        named = str(shot.get("subject", "") or "").strip()
+        if named:
+            framing = str(shot.get("framing", "thirds") or "thirds")
+            move = str(shot.get("camera_move", "hold") or "hold")
+            looks = [
+                Look(
+                    at=named,
+                    framing="thirds" if move == "push_in" else framing,
+                    must_be_whole=bool(shot.get("must_be_whole")),
+                )
+            ]
+            if shot.get("then_subject"):
+                looks.append(Look(at=str(shot["then_subject"]), framing=framing))
+            elif move in {"push_in", "pull_out"}:
+                # The same thing, seen closer. A pull out is that reversed.
+                tight = Look(at=named, framing="fill",
+                             must_be_whole=bool(shot.get("must_be_whole")))
+                looks = [tight, looks[0]] if move == "pull_out" else [looks[0], tight]
+
+    first = looks[0] if looks else None
+    return Reframe(
+        looks=looks,
+        subject=(
+            Subject(
+                description=first.at,
+                min_visible=1.0 if first.must_be_whole else 0.85,
+            )
+            if first is not None
+            else None
+        ),
+        then_subject=(
+            Subject(description=looks[1].at) if len(looks) > 1 else None
         ),
         intent=shot.get("why", "")[:120],
-        camera_move=shot.get("camera_move", "hold"),
-        framing=shot.get("framing", "thirds"),
+        camera_move=str(shot.get("camera_move", "hold") or "hold"),
+        framing=str(shot.get("framing", "thirds") or "thirds"),
         camera_energy="active",
     )
-    if shot.get("then_subject"):
-        reframe = reframe.model_copy(
-            update={"then_subject": Subject(description=shot["then_subject"])}
-        )
-    return reframe
