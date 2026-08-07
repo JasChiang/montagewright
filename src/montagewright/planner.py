@@ -22,7 +22,6 @@ from typing import Any
 
 from montagewright.capabilities import (
     INTENT_NAMES,
-    MOVE_NAMES,
     describe_for_prompt,
 )
 from montagewright.grounding import BeatGrid
@@ -942,9 +941,8 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                     "required": [
                         "source_id",
                         "start_seconds",
-                        "subject",
+                        "looks",
                         "energy",
-                        "camera_move",
                         "seconds_needed",
                         "why",
                     ],
@@ -964,78 +962,105 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                                 "a count with too many shots in it."
                             ),
                         },
-                        "subject": {
-                            "type": "string",
+                        "looks": {
+                            "type": "array",
+                            "minItems": 1,
                             "description": (
-                                "What this shot is about. When the material "
-                                "listing shows 可框住的主體 for this clip and "
-                                "one of them is what the shot is about, copy "
-                                "that label exactly -- the position of that "
-                                "subject is already measured and free to "
-                                "reuse, and any rewording of it, including "
-                                "into another language, throws the "
-                                "measurement away and has to buy it back. "
-                                "Only describe one in your own words when the "
-                                "listing has none that fits, and then say it "
-                                "so it can be told from anything similar in "
-                                "the same frame: 'the left, darker handset', "
-                                "not 'the handset'."
+                                "Where the frame goes in this shot, in order. "
+                                "One entry holds on one thing. Two move from "
+                                "the first to the second. Three stop on the "
+                                "way -- three handsets introduced in turn. "
+                                "Two entries naming the same thing at "
+                                "different framing is a push in, or a pull "
+                                "out written the other way round.\n"
+                                "There is no separate move to choose. What "
+                                "used to be called hold, pan, tilt, push in "
+                                "and pull out are all just what a list of "
+                                "looks turns out to be, and local code works "
+                                "out which one it made and reports it. It "
+                                "also measures where each subject is and how "
+                                "fast the frame may travel -- none of that "
+                                "is yours to give.\n"
+                                "What is yours is what to look at and how "
+                                "long to look, and the second is a real "
+                                "judgement: a two-word logo is read faster "
+                                "than a row of three watches. Every entry "
+                                "costs time, and `seconds_needed` has to "
+                                "hold all of them plus the travel between."
                             ),
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["at", "seconds", "framing"],
+                                "properties": {
+                                    "at": {
+                                        "type": "string",
+                                        "description": (
+                                            "What the frame settles on. When "
+                                            "the material listing shows "
+                                            "可框住的主體 for this clip and one "
+                                            "of them is what you mean, copy "
+                                            "that label exactly -- its "
+                                            "position is already measured and "
+                                            "free to reuse, and rewording it, "
+                                            "including into another language, "
+                                            "throws that away and has to buy "
+                                            "it back. Otherwise describe it "
+                                            "so it can be told from anything "
+                                            "similar in the same frame: 'the "
+                                            "left, darker handset', not 'the "
+                                            "handset'."
+                                        ),
+                                    },
+                                    "seconds": {
+                                        "type": "number",
+                                        "description": (
+                                            "How long the frame rests here "
+                                            "before moving on. 0 lets local "
+                                            "code use a floor that reads as a "
+                                            "stop at all. Give a real number "
+                                            "when this thing needs reading "
+                                            "rather than noticing."
+                                        ),
+                                    },
+                                    "framing": {
+                                        "type": "string",
+                                        "enum": list(INTENT_NAMES),
+                                        "description": (
+                                            "Where this subject sits and how "
+                                            "tightly. `fill` closes in until "
+                                            "it carries the frame; the others "
+                                            "place it in the space there is. "
+                                            "Negative space is a composition, "
+                                            "not a shortfall."
+                                        ),
+                                    },
+                                    "must_be_whole": {
+                                        "type": "boolean",
+                                        "description": (
+                                            "True only when partial cropping "
+                                            "destroys this: rendered text, a "
+                                            "logo, a UI state, a readout. "
+                                            "Half a wordmark is not a tighter "
+                                            "shot of a wordmark, it is an "
+                                            "unreadable one. This states a "
+                                            "requirement and does not fulfil "
+                                            "one -- no crop shrinks a subject "
+                                            "to fit. A subject wider than any "
+                                            "crop of its source has to be "
+                                            "read across in two looks, or "
+                                            "found in a tighter take, or "
+                                            "accepted partial with this false."
+                                        ),
+                                    },
+                                },
+                            },
                         },
                         "energy": {
                             "type": "string",
                             "enum": ["low", "medium", "high"],
                         },
-                        "must_be_whole": {
-                            "type": "boolean",
-                            "description": (
-                                "True when partial cropping destroys this "
-                                "subject: rendered text, a logo, a UI state, "
-                                "a readout. Half a wordmark is not a tighter "
-                                "shot of a wordmark, it is an unreadable one. "
-                                "False for anything that still reads when its "
-                                "edges leave frame -- a person, a held "
-                                "product, a face in a group. This states a "
-                                "requirement; it does not fulfil one. No "
-                                "crop can shrink a subject to fit, so the "
-                                "plan has to satisfy it: travel across the "
-                                "subject, choose a take where it is narrower, "
-                                "or set this false and accept a partial view."
-                            ),
-                        },
-                        "framing": {
-                            "type": "string",
-                            "enum": list(INTENT_NAMES),
-                            "description": (
-                                "Where the subject sits when it does not fill "
-                                "the output ratio. Empty frame is a "
-                                "composition, not a shortfall."
-                            ),
-                        },
-                        "camera_move": {
-                            "type": "string",
-                            "enum": list(MOVE_NAMES),
-                            "description": (
-                                "How the frame should move. Pick from what "
-                                "the execution layer can do; the menu is in "
-                                "the instructions above."
-                            ),
-                        },
                         "why": {"type": "string"},
-                        "then_subject": {
-                            "type": "string",
-                            "description": (
-                                "When the shot should carry the eye from one "
-                                "subject to a second one -- two handsets "
-                                "compared, a row of models introduced in turn "
-                                "-- name the second subject here, described "
-                                "so it can be told from the first. Local code "
-                                "splits the shot in two and frames each half "
-                                "on its own subject, because a camera that "
-                                "changes target mid-move loses both. Omit "
-                                "when one subject carries the whole shot."
-                            ),
-                        },
                     },
                 },
             },

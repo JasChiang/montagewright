@@ -416,7 +416,12 @@ def test_the_menu_hands_the_timing_judgement_to_the_planner() -> None:
 
     menu = describe_for_prompt()
     assert "seconds_needed" in menu
-    assert "本機不會替你補時間" in menu
+    # The property, not the wording: length is the planner's call and the
+    # executor reports a shortfall rather than quietly padding it. This
+    # asserted one sentence verbatim and broke when the menu was rewritten
+    # around looks, though nothing it guards had changed.
+    assert "照實記一筆" in menu or "照實回報" in menu
+    assert "只有看過這顆畫面的人知道" in menu
     assert "至少" not in menu
 
 
@@ -539,9 +544,11 @@ def test_must_be_whole_is_described_as_a_requirement_not_a_lever() -> None:
 
     from montagewright.planner import PROMPTS, _selection_schema
 
+    # Lives on each look now rather than on the shot: a shot can settle on
+    # a wordmark that must be whole and then on a face that need not be.
     described = _selection_schema(["C1"])["properties"]["shots"]["items"][
         "properties"
-    ]["must_be_whole"]["description"]
+    ]["looks"]["items"]["properties"]["must_be_whole"]["description"]
     assert "does not fulfil" in described
 
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")

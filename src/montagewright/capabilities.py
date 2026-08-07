@@ -15,6 +15,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# The shortest rest that reads as the frame having stopped rather than
+# slowed. Mirrors reframe.SETTLE_SECONDS, stated here because this is what
+# the planner is told and the two must not drift.
+SETTLE_SECONDS = 0.35
+
 
 @dataclass(frozen=True)
 class Capability:
@@ -120,30 +125,44 @@ INTENT_NAMES: tuple[str, ...] = tuple(name for name, _ in FRAMING_INTENTS)
 
 
 def describe_for_prompt() -> str:
-    """The menu as the planner reads it."""
+    """The vocabulary as the planner reads it.
 
-    lines = ["本機執行層目前做得到這些運鏡，請從中選："]
-    for move in CAMERA_MOVES:
-        subject = "需要指定主體" if move.needs_subject else "不需要主體"
-        lines.append(
-            f"- `{move.name}`（{subject}，短於 {move.min_seconds:g} 秒就"
-            f"不成立）：{move.when}"
-        )
-    lines.append(
-        "選了做不到的組合——例如對靜止主體選 follow——本機會照實記錄實際"
-        "做到什麼，不會假裝執行了。"
-    )
-    lines.append("")
-    lines.append(
-        "括號裡的秒數是這個運鏡在技術上還算得上運鏡的底線，不是它需要多久。"
-        "需要多久你看素材決定：鏡頭要走多遠、路上有幾樣東西要讓觀眾看進去、"
-        "字有多長要讀完。同樣是橫掃，兩個字的 logo 跟一排三台手機需要的時間"
-        "差很多。你看得到這顆畫面，所以把這個判斷寫進 `seconds_needed`。"
-        "時間不夠的運鏡看不懂——三台手機橫掃只有 1.5 秒，觀眾還沒看到第二台"
-        "就切了。本機不會替你補時間，只會在做不到的時候照實回報。"
-    )
-    lines.append("")
-    lines.append("主體沒有填滿輸出比例時，它擺哪裡由你決定（framing）：")
+    This used to be a menu of five named moves and it is now one shape,
+    because the menu kept needing another entry -- settling at the ends, a
+    stop on the way, a push that follows its subject -- and each one was a
+    code change for something an editor would just do. What was missing was
+    a primitive, not features.
+    """
+
+    lines = [
+        "一顆鏡頭 = 一串「畫面停在哪裡」的清單（`looks`），照順序走。",
+        "",
+        "- **一個落點**：停在它上面不動。",
+        "- **兩個落點**：從第一個帶到第二個。",
+        "- **三個以上**：中途停下來，一個一個看過去。",
+        "- **兩個落點指向同一個東西、但 framing 不同**：那就是推近"
+        "（`thirds` → `fill`）；反過來寫就是拉遠。",
+        "",
+        "沒有另外一個「運鏡」欄位要選。以前叫做定住、橫搖、直搖、推近、"
+        "拉遠的那些，現在都只是一串落點碰巧長成的樣子——本機會判斷它變成"
+        "了哪一種並記錄下來。上下還是左右也不用你講，量了兩個落點在哪裡"
+        "就知道了。",
+        "",
+        "本機負責的是：每個落點實際在畫面的哪個位置、鏡頭走多快、"
+        "兩端跟中途各停多久才算真的停下來、以及走不完的時候照實回報。"
+        "這些都不要寫進計畫裡。",
+        "",
+        "你負責的是**看什麼**跟**看多久**。第二個是真的判斷：兩個字的 logo "
+        "比一排三只手錶讀得快，而只有看過這顆畫面的人知道是哪一種。"
+        "每個落點都要花時間，`seconds_needed` 要含得下全部落點加上"
+        "中間的路程——落點太多而時間不夠，本機會照實記一筆，然後鏡頭"
+        "會走不到最後那個落點。",
+        "",
+        "落點沒有填 `seconds` 的話，本機會給一個「還算得上停頓」的下限"
+        f"（{SETTLE_SECONDS:g} 秒）。那是技術底線，不是建議長度。",
+        "",
+        "主體沒有填滿輸出比例時，它擺哪裡由 `framing` 決定：",
+    ]
     for name, when in FRAMING_INTENTS:
         lines.append(f"- `{name}`：{when}")
     lines.append(
