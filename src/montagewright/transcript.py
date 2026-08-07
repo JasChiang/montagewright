@@ -28,7 +28,12 @@ from typing import Any
 from montagewright.planner import ask
 from montagewright.uploads import upload_now
 
-CARD_VERSION = "montagewright-transcript-v1"
+# v2: heard from the master rather than from the proxy's 64 kbps re-encode,
+# the picture read at high resolution, and the correction given the readings
+# the recogniser considered rather than only its first choice. A v1
+# transcript is a different answer to a different question, so it is not
+# reused -- unlike a proxy or a card, these are cheap to get again.
+CARD_VERSION = "montagewright-transcript-v2"
 TOOL = Path(__file__).resolve().parents[2] / "tools" / "transcribe" / "transcribe"
 
 # Below this a "word" is usually the recogniser splitting one syllable, and a
@@ -139,6 +144,41 @@ def words_of(payload: dict[str, Any]) -> list[Word]:
                 )
             )
     return sorted(words, key=lambda word: word.starts_seconds)
+
+
+def hesitations(payload: dict[str, Any]) -> list[tuple[float, float, str, list[str]]]:
+    """Stretches the recogniser had more than one reading for.
+
+    It has always produced these and was never asked for them. The prompt
+    already points the correction at the low-confidence words -- which is a
+    good marker, the two characters misheard in one interview came back at
+    0.72 and 0.79 with everything around them above 0.99 -- but a marker
+    says only that the recogniser was unsure, not what it was unsure
+    between. So the correction had to invent a replacement out of the
+    picture and the sense, when the candidates it should be choosing from
+    came out of the audio and were sitting in the same result.
+
+    Choosing between readings is a judgement. Inventing one is a guess in
+    the same clothes, and the difference does not show in the output.
+    """
+
+    found: list[tuple[float, float, str, list[str]]] = []
+    for utterance in payload.get("utterances", []) or []:
+        others = [
+            str(one).strip()
+            for one in (utterance.get("alternatives") or [])
+            if str(one).strip()
+        ]
+        said = str(utterance.get("text", "")).strip()
+        if not others or not said:
+            continue
+        try:
+            start = float(utterance["starts_seconds"])
+            end = float(utterance["ends_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        found.append((start, end, said, others))
+    return found
 
 
 # The recogniser writes these where it heard a break, and gives each one a
@@ -588,6 +628,19 @@ def describe(
         for word in words
     )
 
+    # The readings it weighed and did not pick. Sent as its own block rather
+    # than woven into the word list, because they belong to a stretch of
+    # speech and not to a word: the recogniser's second reading of a phrase
+    # can split it differently from its first.
+    weighed = hesitations(heard)
+    considered = ""
+    if weighed:
+        considered = "\n## 辨識器猶豫過的地方（同一段它也考慮過這些讀法）\n\n" + "\n".join(
+            f"{start:.2f}–{end:.2f}  {said}"
+            f"　也可能是：{'／'.join(others[:4])}"
+            for start, end, said, others in weighed
+        ) + "\n"
+
     if cache is None:
         uri = upload_now(source, client).uri
     else:
@@ -619,7 +672,7 @@ def describe(
                 "type": "text",
                 "text": (
                     f"{instruction}\n\n## 辨識器給的逐字稿"
-                    f"（{locale}，秒數 + 字）\n\n{rough}\n"
+                    f"（{locale}，秒數 + 字）\n\n{rough}\n{considered}"
                 ),
             },
         ],

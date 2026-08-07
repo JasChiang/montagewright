@@ -1879,3 +1879,77 @@ def test_the_source_is_read_off_the_command_that_ran():
     assert web._ran_with(Ran(), "render", after=False) == "/rushes/clip"
     assert web._ran_with(Ran(), "--music") == "/music/track.mp3"
     assert web._ran_with(Ran(), "--brief") == ""
+
+
+def test_the_readings_the_recogniser_weighed_reach_the_correction():
+    """It always had them and was never asked.
+
+    The prompt points the correction at the low-confidence words, which is a
+    good marker -- but a marker says the recogniser was unsure, not what it
+    was unsure between. So the correction invented a replacement out of the
+    picture and the sense while the candidates it should have been choosing
+    from came out of the audio and sat unread in the same result.
+    """
+
+    from montagewright.transcript import hesitations
+
+    payload = {
+        "utterances": [
+            {
+                "text": "有場",
+                "starts_seconds": 1.0,
+                "ends_seconds": 1.6,
+                "alternatives": ["有廠", "有唱"],
+                "words": [],
+            },
+            {
+                "text": "所以你是",
+                "starts_seconds": 1.6,
+                "ends_seconds": 2.4,
+                "alternatives": [],
+                "words": [],
+            },
+        ]
+    }
+    weighed = hesitations(payload)
+    assert weighed == [(1.0, 1.6, "有場", ["有廠", "有唱"])]
+
+    # A transcript from before this was recorded simply has none.
+    assert hesitations({"utterances": [{"text": "x", "starts_seconds": 0.0,
+                                        "ends_seconds": 1.0}]}) == []
+    assert hesitations({}) == []
+
+
+def test_the_recogniser_is_asked_for_its_other_readings():
+    """The option exists, is off by default, and costs nothing to turn on."""
+
+    from pathlib import Path
+
+    swift = (
+        Path(__file__).resolve().parents[1] / "tools" / "transcribe"
+        / "Transcribe.swift"
+    ).read_text(encoding="utf-8")
+    assert "reportingOptions: [.alternativeTranscriptions]" in swift
+    assert "result.alternatives" in swift
+    # Not the first reading again under another name, and not repeated.
+    assert "said != text" in swift and "!others.contains(said)" in swift
+
+    # A stretch with alternatives reaches the prompt as its own block: they
+    # belong to a span of speech, not to a word, because a second reading of
+    # a phrase can split it differently from the first.
+    import inspect
+
+    from montagewright import transcript
+
+    building = inspect.getsource(transcript.describe)
+    assert "hesitations(heard)" in building
+    assert "{considered}" in building
+
+    prompt = (
+        Path(transcript.__file__).resolve().parent
+        / "prompts" / "transcript_zh-TW.txt"
+    ).read_text(encoding="utf-8")
+    assert "辨識器猶豫過的地方" in prompt
+    # And that a candidate is evidence, not an answer.
+    assert "候選是從聲音來的" in prompt
+    assert "不是正確答案的保證" in prompt

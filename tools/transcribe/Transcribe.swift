@@ -25,6 +25,14 @@ struct Utterance: Codable {
     let starts_seconds: Double
     let ends_seconds: Double
     let words: [Word]
+    // The other readings the recogniser considered for this stretch. It has
+    // always had them and was never asked: the correction pass was being
+    // told "this word is uncertain" without being told what the uncertainty
+    // was between, so it had to invent a replacement from the picture and
+    // the sense rather than choose between candidates that came out of the
+    // audio. Choosing is a judgement; inventing is a guess wearing the same
+    // clothes.
+    let alternatives: [String]
 }
 
 struct Silence: Codable {
@@ -83,7 +91,7 @@ func transcribe(path: String, locale wanted: String) async throws -> Payload {
     let transcriber = SpeechTranscriber(
         locale: locale,
         transcriptionOptions: [],
-        reportingOptions: [],
+        reportingOptions: [.alternativeTranscriptions],
         attributeOptions: [.audioTimeRange, .transcriptionConfidence]
     )
 
@@ -147,12 +155,21 @@ func transcribe(path: String, locale wanted: String) async throws -> Payload {
             let text = String(attributed.characters)
                 .trimmingCharacters(in: .whitespaces)
             guard !text.isEmpty else { continue }
+            var others: [String] = []
+            for other in result.alternatives {
+                let said = String(other.characters)
+                    .trimmingCharacters(in: .whitespaces)
+                if !said.isEmpty && said != text && !others.contains(said) {
+                    others.append(said)
+                }
+            }
             utterances.append(
                 Utterance(
                     text: text,
                     starts_seconds: result.range.start.seconds,
                     ends_seconds: (result.range.start + result.range.duration).seconds,
-                    words: words
+                    words: words,
+                    alternatives: others
                 )
             )
         }
