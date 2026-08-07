@@ -19,6 +19,7 @@ require the paired schema to define it.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -258,3 +259,92 @@ def test_the_correction_is_told_where_the_second_listener_is_wrong():
     # And the listening prompt fights for the disfluencies in the first place.
     heard = (PROMPTS / "hearing_zh-TW.txt").read_text(encoding="utf-8")
     assert "贅字、口頭禪、結巴、重複" in heard
+
+
+# Every schema a model answers, and the fields in each that are a time.
+def _time_fields(schema: dict, path: str = ""):
+    if not isinstance(schema, dict):
+        return
+    for key, child in (schema.get("properties") or {}).items():
+        here = f"{path}.{key}" if path else key
+        if isinstance(child, dict) and TIMEY.search(key):
+            yield here, child
+        yield from _time_fields(child, here)
+    yield from _time_fields(schema.get("items"), path + "[]")
+
+
+TIMEY = re.compile(r"second|_at$|^at$|^from$|^to$|hold|dur", re.I)
+
+# `at` on a look is what the frame settles on, described in words, and
+# `sync_to` names a section rather than a moment. Both read as times and are
+# not; nothing else in any schema gets to be an exception.
+NOT_A_TIME = {"shots[].looks[].at", "decisions[].sync_to"}
+
+ANSWERED = [
+    ("clip card", lambda: clipcard.card_schema()),
+    ("direction", lambda: planner._direction_schema()),
+    ("selection", lambda: planner._selection_schema(["A:s00"])),
+    ("rhythm", lambda: planner._rhythm_schema(["k00"])),
+    ("subject", lambda: planner._subject_schema(3)),
+    ("review", lambda: review._verdict_schema()),
+    ("shot review", lambda: review._shot_schema(["k00"])),
+    ("hearing", lambda: transcript._hearing_schema()),
+    ("transcript", lambda: transcript._schema()),
+]
+
+
+@pytest.mark.parametrize("name,build", ANSWERED, ids=[one for one, _ in ANSWERED])
+def test_every_time_a_model_writes_is_a_clock_reading(name, build):
+    """A number is two readings; `1:53` is one.
+
+    Gemini reads video in MM:SS, so a field asking for bare seconds is asking
+    it to convert -- and both ways it gets that wrong are silent. A 71.1s take
+    said its usable range ended at `110.0`, which is 1:10 with the colon
+    dropped. A 113.4s take said `1.53`, which is 1:53 with the colon turned
+    into a point, and that one passes every range check on the way through
+    while claiming two minutes of material is good for a second and a half.
+
+    The rule is the whole rule: everything through a model is a clock, and
+    anything else is converted here. Sub-second precision is not lost by
+    this, because a model watching video at a frame a second never had any --
+    what precision exists is measured locally and applied after.
+    """
+
+    numeric = [
+        path for path, field in _time_fields(build())
+        if path not in NOT_A_TIME and field.get("type") != "string"
+    ]
+    assert not numeric, (
+        f"{name} asks the model for {numeric} as a number; times that go "
+        f"through a model are M:SS, and local code converts"
+    )
+
+
+def test_one_reader_turns_every_one_of_them_back_into_seconds():
+    """The conversion happens at the boundary, not at each reader.
+
+    Downstream wants floats and should not learn a notation to get them, so
+    each pass normalises its own answer as it parses it -- the same move
+    `expand_spans` makes for the span itself.
+    """
+
+    import inspect
+
+    from montagewright import planner, review, transcript
+
+    for where in (
+        planner.expand_spans,          # selection and replan
+        planner.decide_direction,      # target length
+        planner._apply,                # rhythm holds and music positions
+        review.review_cut,             # where in the cut an issue sits
+    ):
+        assert "seconds_of" in inspect.getsource(where), where.__name__
+
+    # And the card, whose times are read straight off the stored JSON.
+    assert "seconds_of" in inspect.getsource(clipcard.times_on_receipt)
+    assert "seconds_of" in inspect.getsource(clipcard.action_beats)
+    # The transcript pass asks for no times at all, which is the same rule
+    # taken to its end.
+    assert "second" not in json.dumps(
+        transcript._schema()["properties"]["lines"], ensure_ascii=False
+    )

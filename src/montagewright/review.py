@@ -61,10 +61,12 @@ def _verdict_schema() -> dict[str, Any]:
                     "properties": {
                         "clip_id": {"type": "string"},
                         "at_seconds": {
-                            "type": "number",
+                            "type": "string",
                             "description": (
-                                "Roughly where in the cut. Rough is fine -- "
-                                "local code snaps it."
+                                "片子裡大概哪個位置，寫成 M:SS（`0:12`）。"
+                                "大概就好，本機會對到最近的一顆上。"
+                                "不要寫成秒數——一分鐘以上的片子，`1:12` "
+                                "會變成 112 或 1.12，兩種讀法都落在片長內。"
                             ),
                         },
                         "issue_type": {
@@ -195,6 +197,13 @@ def review_cut(
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens + usage.thought_tokens,
         )
+    # A point in the finished film, so it comes back as a clock reading and
+    # is resolved here rather than by the model that has to write it.
+    from montagewright.spans import seconds_of
+
+    for issue in payload.get("issues") or []:
+        if isinstance(issue, dict) and "at_seconds" in issue:
+            issue["at_seconds"] = seconds_of(issue["at_seconds"])
     return ReviewVerdict.model_validate(payload)
 
 

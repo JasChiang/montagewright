@@ -3992,5 +3992,8 @@ def test_the_planner_is_offered_spans_and_not_files():
     # The two fields it used to be free to write are gone from the contract.
     assert "source_id" not in shot["properties"]
     assert "start_seconds" not in shot["properties"]
-    # And the offset that remains is bounded at the schema level too.
-    assert shot["properties"]["start_offset_seconds"]["minimum"] == 0.0
+    # And every time it writes is a clock reading, like every other time
+    # that goes through a model here.
+    for field in ("start_offset_seconds", "seconds_needed"):
+        assert shot["properties"][field]["type"] == "string"
+    assert shot["properties"]["looks"]["items"]["properties"]["seconds"]["type"] == "string"

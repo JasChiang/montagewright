@@ -123,13 +123,24 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
                     "additionalProperties": False,
                     "required": ["from_seconds", "to_seconds"],
                     "properties": {
-                        "from_seconds": {"type": "number"},
-                        "to_seconds": {"type": "number"},
+                        # M:SS, like every other point in a piece of media
+                        # this asks a model to find. A two-minute track is
+                        # long enough for `1:30` to come back as 130 or 1.3
+                        # -- both readings land inside a track that length,
+                        # so neither can be caught by checking the range.
+                        "from_seconds": {
+                            "type": "string",
+                            "description": "曲子裡的位置，寫成 M:SS（`0:48`）。",
+                        },
+                        "to_seconds": {
+                            "type": "string",
+                            "description": "同樣是 M:SS。",
+                        },
                     },
                 },
             },
             "music_from_seconds": {
-                "type": "number",
+                "type": "string",
                 "description": (
                     "Where in the track this film should sit, in seconds "
                     "from the start of the file. A thirty-second cut almost "
@@ -137,7 +148,8 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
                     "piece -- an intro is written to have no energy yet, and "
                     "using it means the picture carries the whole film "
                     "alone. Pick the part with the energy this cut needs, "
-                    "usually a section boundary the analysis found. Local "
+                    "usually a section boundary the analysis found. 寫成 "
+                    "M:SS（`1:12`），不要寫成秒數。Local "
                     "code takes exactly as much as the picture is long from "
                     "wherever you point, and will not run past the end of "
                     "the track. Leave 0 only when the opening really is "
@@ -165,13 +177,15 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
                             ),
                         },
                         "hold_seconds": {
-                            "type": "number",
+                            "type": "string",
                             "description": (
                                 "How long this shot wants to be on screen, "
                                 "judged from what happens in it. Local code "
                                 "snaps this to a musical event when "
                                 "cut_on_beat is true, so it is a judgement "
-                                "about the material, not a final timing."
+                                "about the material, not a final timing。\n"
+                                "寫成 M:SS（`0:03`）。本機會把它對到音樂"
+                                "事件上，精確到零點幾秒是本機的事。"
                             ),
                         },
                         "beats": {
@@ -507,10 +521,14 @@ def _apply(
     music_from: Any = None,
     music_spans: Any = None,
 ) -> EDL:
+    # One reader for every clock this answer carries: the hold on each shot
+    # and the two ends of every stretch of music.
+    from montagewright.spans import seconds_of
+
     rewritten: list[Clip] = []
     for clip in edl.clips:
         decision = decisions[clip.clip_id]
-        hold = float(decision["hold_seconds"])
+        hold = seconds_of(decision.get("hold_seconds")) or 0.0
         rewritten.append(
             clip.model_copy(
                 update={
@@ -525,16 +543,16 @@ def _apply(
             )
         )
     update: dict[str, Any] = {"clips": rewritten}
-    try:
-        start = float(music_from)
-    except (TypeError, ValueError):
-        start = 0.0
+    start = seconds_of(music_from) or 0.0
     if start > 0.0:
         update["music_from_seconds"] = round(start, 3)
     spans = []
     for one in music_spans or []:
         try:
-            began, ended = float(one["from_seconds"]), float(one["to_seconds"])
+            began = seconds_of(one.get("from_seconds"))
+            ended = seconds_of(one.get("to_seconds"))
+            if began is None or ended is None:
+                continue
         except (KeyError, TypeError, ValueError):
             continue
         if ended > began >= 0.0:
@@ -863,7 +881,10 @@ def _direction_schema() -> dict[str, Any]:
             },
             "material_assessment": {"type": "string"},
             "direction": {"type": "string"},
-            "target_seconds": {"type": "number"},
+            "target_seconds": {
+                "type": "string",
+                "description": "成片目標長度，寫成 M:SS（`0:30`、`1:00`）。",
+            },
             "music_under_speech": {
                 "type": "string",
                 "enum": ["bed", "duck", "none"],
@@ -1136,6 +1157,9 @@ def decide_direction(
         },
     )
     decided = _parse(interaction, what="direction pass")
+    from montagewright.spans import seconds_of
+
+    decided["target_seconds"] = seconds_of(decided.get("target_seconds")) or 0.0
     if seconds > 0:
         # Overwritten rather than trusted. It is told the number and mostly
         # repeats it; a pass that occasionally does not would silently make
@@ -1195,18 +1219,18 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                         # stretch is not in this list to be named.
                         "span_id": {"type": "string", "enum": span_ids},
                         "start_offset_seconds": {
-                            "type": "number",
-                            "minimum": 0.0,
+                            "type": "string",
                             "description": (
                                 "從這個片段的**開頭**算起第幾秒進。0 就是"
                                 "從片段開頭進，那通常是對的——片段的邊界"
                                 "已經是修過的了。只有在同一個片段裡有好幾"
                                 "個動作、你要的是後面那個時才需要往後移。"
-                                "超出片段的值會被收回片段內。"
+                                "超出片段的值會被收回片段內。寫成 M:SS，"
+                                "從片段開頭進就寫 `0:00`。"
                             ),
                         },
                         "seconds_needed": {
-                            "type": "number",
+                            "type": "string",
                             "description": (
                                 "How many seconds this shot needs to do the "
                                 "job you picked it for: the gesture playing "
@@ -1215,7 +1239,8 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                                 "how long they run is one decision -- these "
                                 "are what your list adds up to, so a count "
                                 "that leaves each shot less than it needs is "
-                                "a count with too many shots in it."
+                                "a count with too many shots in it。\n"
+                                "寫成 M:SS（`0:03`）。"
                             ),
                         },
                         "frame": {
@@ -1292,7 +1317,7 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                                         ),
                                     },
                                     "seconds": {
-                                        "type": "number",
+                                        "type": "string",
                                         "description": (
                                             "How long the frame rests here "
                                             "before moving on. 0 lets local "
@@ -1452,14 +1477,26 @@ def expand_spans(chosen: dict[str, Any], offered: "list[Any]") -> None:
     here against bounds it cannot reach past.
     """
 
+    from montagewright.spans import seconds_of
+
     by_id = {one.span_id: one for one in offered}
     for shot in chosen.get("shots") or []:
+        # Every time this answer carries is a clock reading, and this is
+        # where they stop being one. Converting at the boundary rather than
+        # at each reader is the same move `expand_spans` makes for the span
+        # itself: fourteen places downstream want a float, and none of them
+        # should have to know what notation it arrived in.
+        shot["start_offset_seconds"] = seconds_of(
+            shot.get("start_offset_seconds")
+        ) or 0.0
+        shot["seconds_needed"] = seconds_of(shot.get("seconds_needed")) or 0.0
+        for look in shot.get("looks") or []:
+            look["seconds"] = seconds_of(look.get("seconds")) or 0.0
         span = by_id.get(str(shot.get("span_id", "")))
         if span is None:
             continue
         start, _ = span.at(
-            float(shot.get("start_offset_seconds", 0.0) or 0.0),
-            float(shot.get("seconds_needed", 0.0) or 0.0),
+            shot["start_offset_seconds"], shot["seconds_needed"]
         )
         shot["source_id"] = span.source_id
         shot["start_seconds"] = round(start, 3)
