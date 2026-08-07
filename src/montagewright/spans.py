@@ -26,12 +26,19 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-# `1:07`, `0:00`, `12:04`, and `01:07` -- the minutes may be padded or not,
-# because both are the same reading and neither is worth rejecting an answer
-# over. Also a bare `7`, because a model told six times to write a clock will
-# occasionally write a number anyway, and below a minute there is no colon
-# that could have been lost.
-CLOCK = re.compile(r"^\s*(?:(\d{1,3}):)?([0-5]?\d(?:\.\d+)?)\s*$")
+# One part is seconds, two are minutes and seconds, three are hours, minutes
+# and seconds. Counting the colons rather than pattern-matching the whole
+# thing, because the alternative needs two optional groups in one expression
+# and then depends on which way the engine happens to be greedy.
+#
+# All three are wanted. `72:15` and `1:12:15` are the same moment and both
+# get written: minutes that keep counting past sixty is what a player shows,
+# an hour field is what a model reaches for on a long file, and there is no
+# reading of either that means anything else. An hour-long locked-off
+# interview is not a strange thing to be handed, and it is not scene-split
+# into pieces first, because it has no scene changes.
+SECONDS = re.compile(r"^\d{1,2}(?:\.\d+)?$")
+MINUTES = re.compile(r"^\d{1,3}$")
 
 # A decimal point in a string with no colon in it. `1.53` is either a second
 # and a half or 1:53 with the colon turned into a point, and both readings
@@ -95,14 +102,25 @@ def seconds_of(value: Any) -> float | None:
     # held to the notation.
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
-    written = str(value or "")
+    written = str(value or "").strip()
     if LOOSE.match(written):
         return None
-    found = CLOCK.match(written)
-    if not found:
+    parts = written.split(":")
+    if not parts or len(parts) > 3:
         return None
-    minutes, seconds = found.groups()
-    return int(minutes or 0) * 60 + float(seconds)
+    # The last part is always seconds and is the only one allowed a decimal;
+    # everything before it is a whole count. Sixty or more seconds means the
+    # colon is not where it looks like it is, so the reading is refused.
+    if not SECONDS.match(parts[-1]) or float(parts[-1]) >= 60.0:
+        return None
+    if any(not MINUTES.match(one) for one in parts[:-1]):
+        return None
+    if len(parts) == 3 and float(parts[1]) >= 60.0:
+        return None
+    total = float(parts[-1])
+    for place, one in enumerate(reversed(parts[:-1]), start=1):
+        total += int(one) * (60 ** place)
+    return total
 
 
 def spans_of(card: dict[str, Any] | None, source_id: str, duration: float) -> list[Span]:

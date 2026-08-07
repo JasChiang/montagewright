@@ -563,7 +563,7 @@ def _hearing_schema() -> dict[str, Any]:
                         "from": {
                             "type": "string",
                             "description": (
-                                "這一塊大約從哪裡開始，M:SS。只用來對位，"
+                                "這一塊大約從哪裡開始，MM:SS。只用來對位，"
                                 "不會變成字幕時間，抓大概就好。"
                             ),
                         },

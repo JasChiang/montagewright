@@ -218,6 +218,20 @@ def test_a_clock_reading_has_only_one_meaning():
     assert seconds_of("01:07") == 67.0
     assert seconds_of("0:3") == 3.0
 
+    # Past ten minutes, and past an hour, which an interview shot on a locked
+    # off camera reaches without ever being scene-split into pieces. Minutes
+    # that keep counting and an hours field are the same moment and both get
+    # written, so both are read.
+    assert seconds_of("12:04") == 724.0
+    assert seconds_of("72:15") == seconds_of("1:12:15") == 4335.0
+    assert seconds_of("2:00:00") == 7200.0
+
+    # Sixty in a place that only goes to fifty-nine means the colon is not
+    # where it looks like it is.
+    assert seconds_of("1:60") is None
+    assert seconds_of("1:60:00") is None
+    assert seconds_of("1:2:3:4") is None
+
     # A bare number below a minute is still read, because a model told six
     # times to write a clock will occasionally write one anyway, and there is
     # no colon that could have been lost from it.

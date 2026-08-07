@@ -123,18 +123,18 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
                     "additionalProperties": False,
                     "required": ["from_seconds", "to_seconds"],
                     "properties": {
-                        # M:SS, like every other point in a piece of media
+                        # MM:SS, like every other point in a piece of media
                         # this asks a model to find. A two-minute track is
                         # long enough for `1:30` to come back as 130 or 1.3
                         # -- both readings land inside a track that length,
                         # so neither can be caught by checking the range.
                         "from_seconds": {
                             "type": "string",
-                            "description": "曲子裡的位置，寫成 M:SS（`0:48`）。",
+                            "description": "曲子裡的位置，寫成 MM:SS（`0:48`）。",
                         },
                         "to_seconds": {
                             "type": "string",
-                            "description": "同樣是 M:SS。",
+                            "description": "同樣是 MM:SS。",
                         },
                     },
                 },
@@ -149,7 +149,7 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
                     "using it means the picture carries the whole film "
                     "alone. Pick the part with the energy this cut needs, "
                     "usually a section boundary the analysis found. 寫成 "
-                    "M:SS（`1:12`），不要寫成秒數。Local "
+                    "MM:SS（`1:12`），不要寫成秒數。Local "
                     "code takes exactly as much as the picture is long from "
                     "wherever you point, and will not run past the end of "
                     "the track. Leave 0 only when the opening really is "
@@ -184,7 +184,7 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
                                 "snaps this to a musical event when "
                                 "cut_on_beat is true, so it is a judgement "
                                 "about the material, not a final timing。\n"
-                                "寫成 M:SS（`0:03`）。本機會把它對到音樂"
+                                "寫成 MM:SS（`0:03`）。本機會把它對到音樂"
                                 "事件上，精確到零點幾秒是本機的事。"
                             ),
                         },
@@ -883,7 +883,7 @@ def _direction_schema() -> dict[str, Any]:
             "direction": {"type": "string"},
             "target_seconds": {
                 "type": "string",
-                "description": "成片目標長度，寫成 M:SS（`0:30`、`1:00`）。",
+                "description": "成片目標長度，寫成 MM:SS（`0:30`、`1:00`）。",
             },
             "music_under_speech": {
                 "type": "string",
@@ -1225,7 +1225,7 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                                 "從片段開頭進，那通常是對的——片段的邊界"
                                 "已經是修過的了。只有在同一個片段裡有好幾"
                                 "個動作、你要的是後面那個時才需要往後移。"
-                                "超出片段的值會被收回片段內。寫成 M:SS，"
+                                "超出片段的值會被收回片段內。寫成 MM:SS，"
                                 "從片段開頭進就寫 `0:00`。"
                             ),
                         },
@@ -1240,7 +1240,7 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                                 "are what your list adds up to, so a count "
                                 "that leaves each shot less than it needs is "
                                 "a count with too many shots in it。\n"
-                                "寫成 M:SS（`0:03`）。"
+                                "寫成 MM:SS（`0:03`）。"
                             ),
                         },
                         "frame": {

@@ -218,7 +218,7 @@ def card_schema() -> dict[str, Any]:
                         "from": {
                             "type": "string",
                             "description": (
-                                "這一段從哪裡開始，寫成 M:SS 或 MM:SS，"
+                                "這一段從哪裡開始，寫成 MM:SS 或 MM:SS，"
                                 "例如 0:00、1:07。**不要寫成小數秒。**"
                                 "你看到的影片時間就是這個格式，換算成 73.5 "
                                 "這種數字反而會出錯——之前 1:10 被寫成 110、"
@@ -229,7 +229,7 @@ def card_schema() -> dict[str, Any]:
                         },
                         "to": {
                             "type": "string",
-                            "description": "這一段到哪裡結束，同樣是 M:SS。",
+                            "description": "這一段到哪裡結束，同樣是 MM:SS。",
                         },
                         "status": {
                             "type": "string",
@@ -309,7 +309,7 @@ def card_schema() -> dict[str, Any]:
                         "from": {
                             "type": "string",
                             "description": (
-                                "動作開始的那一刻，寫成 M:SS——手還沒碰到"
+                                "動作開始的那一刻，寫成 MM:SS——手還沒碰到"
                                 "之前、東西還沒開始動之前。跟上面的片段一樣"
                                 "用時鐘寫法，不要寫小數秒。"
                             ),
@@ -421,7 +421,7 @@ def card_schema() -> dict[str, Any]:
                         "seen_at": {
                             "type": "string",
                             "description": (
-                                "你是看第幾秒說出這個位置的，寫成 M:SS。"
+                                "你是看第幾秒說出這個位置的，寫成 MM:SS。"
                                 "攝影機或主體"
                                 "在動的時候，位置只在那一刻成立——後面要拿"
                                 "這個框去框別的時間點，得先知道它是什麼時候"
