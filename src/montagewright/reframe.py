@@ -524,6 +524,37 @@ def build_look_path(
         for one in spans
     ]
 
+    # Two stops that measured to the same place is a move that goes nowhere.
+    # It reads as a plan being carried out -- there are two looks, the frame
+    # travels, the report says so -- and on screen it is a hold. It happens
+    # when both looks describe the same thing rather than its two ends: a
+    # wordmark asked to be read across came back as a frame drifting from
+    # "y Unpa" to "acked", which is a fifth of the title in shot throughout.
+    #
+    # Said here because this is where the distance is known. The planner was
+    # told to describe both ends so they can be told apart, and whether they
+    # were is not a fact about the words -- it is a fact about where they
+    # turned out to be.
+    if degradations is not None and sum(spans) < DEADBAND:
+        degradations.append(
+            DegradationStep(
+                clip_id=clip_id,
+                ladder="other",
+                ladder_other="looks_landed_on_the_same_place",
+                trigger=(
+                    f"this shot asks for {len(stops)} looks and they measured "
+                    "to within a hair of each other, so the frame travels "
+                    "nowhere -- the two ends were probably described as the "
+                    "same thing rather than as its edges"
+                ),
+                measured={
+                    "looks": float(len(stops)),
+                    "total_travel_vw": round(sum(spans), 4),
+                    "deadband_vw": DEADBAND,
+                },
+            )
+        )
+
     ceiling = ENERGY_LIMITS[energy]["max_speed"]
     hurried = [
         (index, span, leg)

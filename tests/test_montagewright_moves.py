@@ -4227,3 +4227,45 @@ def test_the_replan_is_checked_for_the_same_disagreement_as_the_selection():
     # And the caller prints them, next to the replan lines they belong to.
     rendering = inspect.getsource(cli.command_render)
     assert 'replanned.get("frame_disagreements")' in rendering
+
+
+def test_two_looks_that_landed_in_the_same_place_are_reported():
+    """A move that goes nowhere reads as a plan being carried out.
+
+    There are two looks, the frame travels, the report says `pan`. On screen
+    it is a hold. It happens when both looks describe the same thing instead
+    of its two ends -- a wordmark asked to be read across came back as a
+    frame drifting from "y Unpa" to "acked", a fifth of the title in shot
+    throughout, and every layer agreed it had swept.
+
+    Not catchable by comparing the plan against itself: it has the two looks
+    it promised. Only the measurement knows they are the same place.
+    """
+
+    from montagewright.reframe import DEADBAND, build_look_path
+
+    common = dict(source_aspect=16 / 9, target_aspect=9 / 16,
+                  duration_seconds=4.0, energy="active", clip_id="k15")
+
+    nowhere: list = []
+    build_look_path(
+        [(0.5, 0.50, 0.5, 0.3164), (0.5, 0.505, 0.5, 0.3164)],
+        degradations=nowhere, **common,
+    )
+    assert [one.ladder_other for one in nowhere] == ["looks_landed_on_the_same_place"]
+    assert nowhere[0].measured["total_travel_vw"] < DEADBAND
+
+    # A real journey says nothing.
+    somewhere: list = []
+    build_look_path(
+        [(0.5, 0.20, 0.5, 0.3164), (0.5, 0.80, 0.5, 0.3164)],
+        degradations=somewhere, **common,
+    )
+    assert "looks_landed_on_the_same_place" not in [
+        one.ladder_other for one in somewhere
+    ]
+
+    # And a shot that only ever asked for one look is not a failed move.
+    held: list = []
+    build_look_path([(1.0, 0.5, 0.5, 0.3164)], degradations=held, **common)
+    assert held == []
