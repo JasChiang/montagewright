@@ -4129,3 +4129,74 @@ def test_the_spend_cap_reads_the_same_on_an_upload():
         where = Path(handle.name)
     with pytest.raises(BudgetSpent):
         uploads.upload_now(where, _Capped())
+
+
+def _grid(bpm=120.0, bars=8):
+    """A clean grid: downbeat every four beats, accents on the third."""
+
+    from montagewright.grounding import BeatGrid, Cue
+
+    period = 60.0 / bpm
+    cues = []
+    for beat in range(bars * 4):
+        at = round(beat * period, 6)
+        kind = "downbeat" if beat % 4 == 0 else (
+            "accent" if beat % 4 == 2 else "beat"
+        )
+        cues.append(Cue(cue_id=f"c{beat:03d}", time_seconds=at, kind=kind))
+    return BeatGrid(bpm=bpm, meter=4, cues=tuple(cues),
+                    duration_seconds=bars * 4 * period)
+
+
+def test_a_cut_lands_on_the_downbeat_rather_than_the_nearest_beat():
+    """Nearest by distance is almost never the right musical event.
+
+    The cue list runs three hundred beats against seventy-six downbeats, so
+    the closest one is usually an ordinary beat. On a finished cut that put
+    every one of the first six shots on the fourth beat of its bar -- one
+    beat before the bar turned over, every time -- and the report called it
+    sixteen cuts out of sixteen landed on a musical event, which was true and
+    said nothing.
+    """
+
+    grid = _grid()
+    period = 60.0 / 120.0
+
+    # Just past the third beat of a bar. The nearest cue is that beat; the
+    # downbeat is half a beat further and is what an editor would cut on.
+    wanted = 3 * period + 0.05
+    landed = grid.nearest_cue(wanted)
+    assert landed.kind == "downbeat"
+    assert landed.time_seconds == round(4 * period, 6)
+
+    # An accent beats a plain beat by the same rule.
+    landed = grid.nearest_cue(1 * period + 0.05)
+    assert landed.kind == "accent"
+
+    # Nothing is dragged. Halfway between the second and third beats of a
+    # bar, every downbeat is more than a beat away, so none is reached for --
+    # a downbeat two beats off is a different edit, not this edit placed
+    # better. The accent inside the window still beats the plain beat.
+    landed = grid.nearest_cue(2.5 * period)
+    assert landed.kind == "accent"
+    assert landed.time_seconds == round(2 * period, 6)
+
+    # And a section boundary outranks a downbeat, because that is where the
+    # music itself changes.
+    from montagewright.grounding import BeatGrid, Cue
+
+    both = BeatGrid(bpm=120.0, meter=4, duration_seconds=10.0, cues=(
+        Cue(cue_id="d", time_seconds=1.00, kind="downbeat"),
+        Cue(cue_id="s", time_seconds=1.10, kind="section_boundary"),
+    ))
+    assert both.nearest_cue(1.02).kind == "section_boundary"
+
+
+def test_the_preference_covers_every_cuttable_kind():
+    """A kind nobody ranked would sort last by accident rather than by choice."""
+
+    from montagewright.grounding import CUTTABLE, CUT_PREFERENCE
+
+    assert set(CUT_PREFERENCE) == set(CUTTABLE)
+    assert CUT_PREFERENCE["downbeat"] < CUT_PREFERENCE["beat"]
+    assert CUT_PREFERENCE["section_boundary"] < CUT_PREFERENCE["downbeat"]

@@ -25,6 +25,17 @@ from montagewright.schema import EDL, Clip
 # clip has to land somewhere even when no accent falls there.
 CUTTABLE = frozenset({"section_boundary", "downbeat", "accent", "beat"})
 
+# Which of them a cut would rather land on, when several are within reach.
+# Every one of these is a musical event and they are not interchangeable: a
+# bar resolves on its downbeat, and a cut on the beat before it changes the
+# picture while the music is still leaning forward.
+CUT_PREFERENCE = {
+    "section_boundary": 0,
+    "downbeat": 1,
+    "accent": 2,
+    "beat": 3,
+}
+
 
 @dataclass(frozen=True)
 class Cue:
@@ -88,11 +99,47 @@ class BeatGrid:
         return round(max(0.0, round(seconds / span) * span), 3)
 
     def nearest_cue(self, seconds: float) -> Cue | None:
+        """The best place to cut near here, which is not the closest one.
+
+        This took the nearest cue by distance and nothing else, and the cue
+        list is roughly three hundred beats against seventy-six downbeats, so
+        the nearest one is almost always an ordinary beat. Measured on a
+        finished cut: every one of the first six shots ended on the fourth
+        beat of its bar -- one beat before the bar turned over, every time.
+        The report called that sixteen cuts out of sixteen landed on a
+        musical event, which was true and told nobody anything.
+
+        A cut one beat early does not read as slightly early. The bar has not
+        resolved, so the picture changes while the music is still leaning
+        forward, and the whole film feels like it is pulling against the
+        track rather than sitting on it.
+
+        So a stronger event half a beat further away wins. Within one beat
+        either side -- close enough that no length changes much -- the order
+        is section, downbeat, accent, beat, and distance only breaks ties.
+        Outside that window nothing is preferred, because a downbeat two
+        beats away is a different edit, not the same edit placed better.
+        """
+
         candidates = self.cuttable()
         if not candidates:
             return None
+        room = self.seconds_per_beat
+        near = [
+            cue for cue in candidates
+            if abs(cue.time_seconds - seconds) <= room + 1e-6
+        ]
+        if not near:
+            return min(
+                candidates, key=lambda cue: abs(cue.time_seconds - seconds)
+            )
         return min(
-            candidates, key=lambda cue: abs(cue.time_seconds - seconds)
+            near,
+            key=lambda cue: (
+                CUT_PREFERENCE.get(cue.kind, len(CUT_PREFERENCE)),
+                -cue.strength,
+                abs(cue.time_seconds - seconds),
+            ),
         )
 
     def cue_after(self, seconds: float) -> Cue | None:
