@@ -531,6 +531,12 @@ def build_zoom_path(
     direction: str,
     centre_x: float = 0.5,
     centre_y: float = 0.5,
+    # Where the subject is over time, when that was measured. A push is the
+    # one move whose frame shrinks, so a subject that walks while it happens
+    # is being squeezed out of a closing window -- aiming at the mean of five
+    # samples puts it against one edge at the start and outside the frame at
+    # the end. Given a track, the push follows.
+    track: list[tuple[float, float, float]] | None = None,
     energy: CameraEnergy = "calm",
     framing: str = "thirds",
     budget: float = 0.0,
@@ -589,20 +595,74 @@ def build_zoom_path(
     close = (base_width * tight, base_height * tight)
     first, last = (wide, close) if direction == "push_in" else (close, wide)
 
-    def box(size: tuple[float, float]) -> CropBox:
+    def box(size: tuple[float, float], at_x: float, at_y: float) -> CropBox:
         width, height = size
         # Put the subject on the intended line of the crop rather than in the
         # middle of it. A centred subject splits its negative space evenly
         # above and below, which reads as an untouched frame; placing it on
         # the lower third gathers that space into one piece of air above.
         share = PLACEMENT.get(framing, 0.5)
-        x = min(max(centre_x - width / 2.0, 0.0), max(0.0, 1.0 - width))
-        y = min(max(centre_y - height * share, 0.0), max(0.0, 1.0 - height))
+        x = min(max(at_x - width / 2.0, 0.0), max(0.0, 1.0 - width))
+        y = min(max(at_y - height * share, 0.0), max(0.0, 1.0 - height))
         return CropBox(x, y, width, height)
 
-    return CropPath(
-        [Keyframe(0.0, box(first)), Keyframe(duration_seconds, box(last))]
+    moving = [one for one in (track or []) if 0.0 <= one[0] <= duration_seconds]
+    if len(moving) < 2:
+        return CropPath(
+            [
+                Keyframe(0.0, box(first, centre_x, centre_y)),
+                Keyframe(duration_seconds, box(last, centre_x, centre_y)),
+            ]
+        )
+
+    moving.sort()
+    spread = max(
+        max(x for _, x, _ in moving) - min(x for _, x, _ in moving),
+        max(y for _, _, y in moving) - min(y for _, _, y in moving),
     )
+    if spread < DEADBAND:
+        # Measured and barely moving. A track that only jitters would make the
+        # push wander, which reads worse than aiming at one point does.
+        return CropPath(
+            [
+                Keyframe(0.0, box(first, centre_x, centre_y)),
+                Keyframe(duration_seconds, box(last, centre_x, centre_y)),
+            ]
+        )
+
+    # One keyframe per measurement: the size ramps across the shot, the aim
+    # comes from where the subject was at that moment.
+    raw: list[Keyframe] = []
+    for seconds, at_x, at_y in moving:
+        share = seconds / duration_seconds if duration_seconds > 0 else 0.0
+        size = (
+            first[0] + (last[0] - first[0]) * share,
+            first[1] + (last[1] - first[1]) * share,
+        )
+        raw.append(Keyframe(seconds, box(size, at_x, at_y)))
+    if raw[0].seconds > 1e-6:
+        raw.insert(0, Keyframe(0.0, box(first, moving[0][1], moving[0][2])))
+    if raw[-1].seconds < duration_seconds - 1e-6:
+        raw.append(Keyframe(duration_seconds, box(last, moving[-1][1], moving[-1][2])))
+
+    limited, _ = _limit_speed(raw, ENERGY_LIMITS[energy])
+    if degradations is not None:
+        degradations.append(
+            DegradationStep(
+                clip_id=clip_id,
+                ladder="other",
+                ladder_other="zoom_followed_subject",
+                trigger=(
+                    "the subject moved while the frame was closing, so the "
+                    "push follows it rather than aiming at where it averaged"
+                ),
+                measured={
+                    "subject_spread_vw": round(spread, 4),
+                    "samples": float(len(moving)),
+                },
+            )
+        )
+    return CropPath(_smooth(limited))
 
 
 def visible_fraction(crop: CropBox, observation: Observation) -> float:

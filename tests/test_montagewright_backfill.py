@@ -594,3 +594,66 @@ def test_a_source_already_at_the_delivery_aspect_says_neither_move_works():
     ])
 
     assert "pan 跟 tilt 都做不到" in said
+
+
+# --- a push is the one move whose frame shrinks --------------------------
+
+def _zoom(**over):
+    from montagewright.reframe import build_zoom_path, zoom_budget
+
+    budget = zoom_budget(
+        source_width=3840, source_height=2160, source_aspect=16 / 9,
+        target_aspect=1080 / 1920, output_width=1080, output_height=1920,
+    )
+    args = dict(
+        source_aspect=16 / 9, target_aspect=1080 / 1920, duration_seconds=3.0,
+        direction="push_in", centre_x=0.5, centre_y=0.5, energy="active",
+        framing="fill", budget=budget, subject_height=0.35, clip_id="k00",
+    )
+    args.update(over)
+    return build_zoom_path(**args)
+
+
+def _where(crop, subject_x):
+    """Where the subject sits inside the crop: 0 is the left edge, 1 the right."""
+
+    return (subject_x - crop.x) / crop.width
+
+
+def test_a_push_follows_a_subject_that_moves_while_the_frame_closes():
+    """Aiming at the mean of five samples loses a walking subject.
+
+    Measured before this: a subject crossing from 0.35 to 0.65 starts hard
+    against the left edge and finishes at 1.22 -- outside the frame -- and
+    nothing recorded that it had happened.
+    """
+
+    walk = [(3.0 * i / 4, 0.35 + 0.30 * i / 4, 0.5) for i in range(5)]
+    degradations = []
+
+    path = _zoom(track=walk, degradations=degradations)
+
+    assert round(_where(path.keyframes[0].crop, 0.35), 2) == 0.5
+    assert round(_where(path.keyframes[-1].crop, 0.65), 2) == 0.5
+    assert any(
+        one.ladder_other == "zoom_followed_subject" for one in degradations
+    )
+
+
+def test_a_push_with_no_track_is_exactly_what_it_was_before():
+    # The static case has to stay untouched: two keyframes, aimed at the
+    # point it was given.
+    without = _zoom()
+
+    assert len(without.keyframes) == 2
+    assert without.keyframes[0].crop.x == round(
+        _zoom(track=None).keyframes[0].crop.x, 10
+    )
+
+
+def test_a_subject_that_only_jitters_is_not_chased():
+    # A track that wanders by less than the deadband would make the push
+    # wobble, which reads worse than aiming at one point.
+    still = [(3.0 * i / 4, 0.5 + 0.001 * i, 0.5) for i in range(5)]
+
+    assert len(_zoom(track=still).keyframes) == 2

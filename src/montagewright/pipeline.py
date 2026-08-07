@@ -529,6 +529,7 @@ def follow_subjects(
                 centre_x, centre_y = 0.5, 0.5
                 middles: list[tuple[float, float]] = []
                 boxes = []
+                sampled_at: list[float] = []
                 if reframe.subject is not None and not _may_ask(client):
                     # A rebuild, with nothing to ask. Skipping the clip left
                     # no path at all, and the executor fell back to a centred
@@ -543,7 +544,11 @@ def follow_subjects(
                             f"from the card"
                         )
                 elif reframe.subject is not None:
-                    frames, _ = _sample_frames(
+                    # The sample times were being discarded here. They are
+                    # what turns five positions into a path: without them a
+                    # push can only aim at their mean, and a subject that
+                    # walks is squeezed out of the closing frame.
+                    frames, sampled_at = _sample_frames(
                         source,
                         clip.approx_in_seconds,
                         clip.approx_out_seconds,
@@ -585,6 +590,18 @@ def follow_subjects(
                     ]
                     if heights:
                         subject_height = sum(heights) / len(heights)
+                track = []
+                for box in boxes:
+                    index = int(box.get("frame_index", -1))
+                    if not box.get("present") or box.get("centre_x") is None:
+                        continue
+                    if not 0 <= index < len(sampled_at):
+                        continue
+                    track.append((
+                        sampled_at[index] - clip.approx_in_seconds,
+                        float(box["centre_x"]),
+                        float(box["centre_y"]),
+                    ))
                 path = build_zoom_path(
                     source_aspect=source.aspect_ratio,
                     target_aspect=target_aspect,
@@ -592,6 +609,7 @@ def follow_subjects(
                     direction=move,
                     centre_x=centre_x,
                     centre_y=centre_y,
+                    track=track or None,
                     energy=reframe.camera_energy,
                     framing=reframe.framing,
                     budget=budget,
