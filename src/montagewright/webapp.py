@@ -188,6 +188,31 @@ def _collect(run: Run) -> None:
     run.remember()
 
 
+def _ran_with(run, flag: str, *, after: bool = True) -> str:
+    """What this run was given for a flag, or the folder it was pointed at."""
+
+    command = run.command or []
+    if flag not in command:
+        return ""
+    at = command.index(flag)
+    if not after:
+        # The rushes are the positional argument straight after `render`.
+        return command[at + 1] if at + 1 < len(command) else ""
+    return command[at + 1] if at + 1 < len(command) else ""
+
+
+def _brief_of(run) -> str:
+    """The brief this run was written against, if it was kept."""
+
+    said = _ran_with(run, "--brief")
+    if not said:
+        return ""
+    try:
+        return Path(said).read_text(encoding="utf-8")[:4000]
+    except OSError:
+        return ""
+
+
 def _transcript_map(run) -> dict:
     """Which transcript belongs to which source, for this run.
 
@@ -972,6 +997,13 @@ def create_app() -> FastAPI:
             "total_lines": len(run.lines),
             "report": run.report() if run.state != "running" else None,
             "has_video": (run.output / "preview.mp4").exists(),
+            # What this run was made from, so another round of the same
+            # material does not have to be pointed at it again. Opening a
+            # cut and asking for a new round is the ordinary way to try a
+            # different length, and it was starting from an empty form.
+            "source_path": _ran_with(run, "render", after=False),
+            "music_path": _ran_with(run, "--music"),
+            "brief_text": _brief_of(run),
         })
 
     @app.post("/api/runs/{run_id}/resume")

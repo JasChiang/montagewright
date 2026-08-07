@@ -1028,6 +1028,7 @@
 
 const $ = (id) => document.getElementById(id);
 let runId = null, seen = 0, timer = null, ticker = null, allLines = [], lastSource = '';
+let openedFrom = { source: '', music: '', brief: '' };
 
 let picking = '', pickTarget = 'path', pickKind = 'video';
 
@@ -1195,6 +1196,11 @@ async function openRun(id, where) {
   const data = await (await fetch(`/api/runs/${id}`)).json();
   $('log').textContent = data.lines.join('\n');
   allLines = data.lines;
+  openedFrom = {
+    source: data.source_path || '',
+    music: data.music_path || '',
+    brief: data.brief_text || '',
+  };
   // Opening a run shows the workspace, whether or not it finished. This
   // only happened inside render(), which only runs when there is a report
   // -- so a run that crashed could not be opened at all: the progress log,
@@ -2486,6 +2492,19 @@ for (const tab of document.querySelectorAll('.tab')) {
 $('first-run').addEventListener('click', () => $('new-run').click());
 
 $('new-run').addEventListener('click', () => {
+  // Another round of the same material is the ordinary reason to open this,
+  // so it starts from what the open run was made from rather than empty.
+  // Only where nothing has been typed -- a half-filled form belongs to
+  // whoever was filling it.
+  if (openedFrom.source && !$('path').value.trim()) {
+    $('path').value = openedFrom.source;
+  }
+  if (openedFrom.music && !$('music-path').value.trim()) {
+    $('music-path').value = openedFrom.music;
+  }
+  if (openedFrom.brief && !$('brief').value.trim()) {
+    $('brief').value = openedFrom.brief;
+  }
   $('veil').classList.remove('hide');
   $('setup').classList.remove('hide');
 });

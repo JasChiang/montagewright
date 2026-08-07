@@ -1831,3 +1831,39 @@ def test_a_card_from_an_older_shape_is_not_loaded(tmp_path):
 
     assert load_card(stale) is None
     assert load_card(current) is not None
+
+
+def test_a_new_round_starts_from_what_the_open_run_was_made_from():
+    """Opening a cut and asking for another round is how you try a length.
+
+    The form started empty, so the answer to "will it use the footage I
+    already pointed at" was no -- it would refuse for having no material,
+    after the material had been sitting in the run that was open.
+    """
+
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "montagewright"
+    served = (root / "webapp.py").read_text(encoding="utf-8")
+    page = (root / "web" / "index.html").read_text(encoding="utf-8")
+
+    assert '"source_path": _ran_with(run, "render", after=False)' in served
+    assert '"music_path": _ran_with(run, "--music")' in served
+    assert "openedFrom = {" in page
+    # Only where nothing has been typed: a half-filled form belongs to
+    # whoever was filling it.
+    assert "!$('path').value.trim()" in page
+
+
+def test_the_source_is_read_off_the_command_that_ran():
+    import montagewright.webapp as web
+
+    class Ran:
+        command = [
+            "python", "-m", "montagewright.cli", "render", "/rushes/clip",
+            "--aspect", "9:16", "--music", "/music/track.mp3",
+        ]
+
+    assert web._ran_with(Ran(), "render", after=False) == "/rushes/clip"
+    assert web._ran_with(Ran(), "--music") == "/music/track.mp3"
+    assert web._ran_with(Ran(), "--brief") == ""
