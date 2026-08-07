@@ -138,15 +138,23 @@ def test_the_microphone_is_not_offered_as_evidence_of_who_is_speaking():
     shot pointed at the wrong person.
     """
 
+    # The listening pass is the one that can see anybody, so that is where
+    # the cues live now. The correction pass never gets the video.
+    heard = (PROMPTS / "hearing_zh-TW.txt").read_text(encoding="utf-8")
+    assert "拿著麥克風的人通常不是正在講的那個" in heard
+    assert "鏡頭對著誰不代表誰在講" in heard
+    # And the reliable cue is the one that does not need the picture at all.
+    assert "判斷以話的內容為準" in heard
+
     prompt = (PROMPTS / "transcript_zh-TW.txt").read_text(encoding="utf-8")
     speaking = prompt[prompt.index("## 誰在講"):]
     speaking = speaking[: speaking.index("## 切成字幕")]
 
-    # The microphone and the camera are named as traps, not as evidence.
-    assert "拿著麥克風的人通常不是正在講的那個" in speaking
-    assert "鏡頭對著誰不代表誰在講" in speaking
-    # And the reliable cue is the one that does not need the picture at all.
-    assert "最可靠的線索是這段話本身" in speaking
+    # What is left for the correction is the case the blocks cannot answer:
+    # the recogniser merges two voices with no pause between them into one
+    # stretch, and only the words say where the turn changed.
+    assert "以**話的內容**為準" in speaking
+    assert "換人的地方一定要斷行" in speaking
     # Not knowing is an available answer, because guessing here is invisible.
     assert "uncertain" in speaking
 
@@ -171,3 +179,82 @@ def test_a_talking_shot_is_checked_against_who_is_talking():
     assert "delivered` 就是 false" in shots
     # Off-screen speech is not the same fault, or every voiceover fails.
     assert "不在畫面裡" in shots
+
+
+def test_the_second_listener_never_sees_the_first_ones_answer():
+    """Order, not count, is what the split is for.
+
+    Shown a transcript and asked to fix it, a model agrees with any line that
+    reads well -- and the errors hardest to catch are exactly the ones that
+    read well: a plausible word that is not the word that was said. Only a
+    listener that has not seen the answer can disagree with it.
+    """
+
+    import inspect
+
+    from montagewright import transcript
+
+    source = inspect.getsource(transcript.describe)
+    listening = source[source.index("listening = ask("):source.index("listened = _parse")]
+    # The video goes to the first call and the recogniser's words do not.
+    assert '"type": "video"' in listening
+    assert "hearing_zh-TW.txt" in listening
+    assert "rough" not in listening
+
+    # The second call carries no media at all: everything the picture had to
+    # say was said by the first one.
+    correcting = source[source.index("instruction = "):source.index("payload = _parse")]
+    assert '"type": "video"' not in correcting
+    assert "uri" not in correcting
+    assert "rough" in correcting and "said_by_ear" in correcting
+
+    # And the recogniser's clock reaches neither of them.
+    assert "starts_seconds" not in source[source.index("rough = "):source.index("listening = ask(")]
+
+
+def test_the_terms_the_video_pass_harvested_reach_the_correction():
+    """The working version of an idea that failed one layer lower.
+
+    Feeding the recogniser a vocabulary through `contextualStrings` was
+    measured and did nothing -- byte-identical output with words that were in
+    the audio and had been misheard. The same idea at the correction layer
+    works, because that is a model that reads what it is given, and the terms
+    come from the pass that just watched the clip including whatever was
+    written on screen.
+    """
+
+    import inspect
+
+    from montagewright import transcript
+
+    source = inspect.getsource(transcript.describe)
+    assert 'listened.get("terms")' in source
+    assert "專有名詞" in source
+
+    schema = transcript._hearing_schema()["properties"]
+    assert "terms" in schema
+    assert "辨識器很可能聽錯" in schema["terms"]["description"]
+
+    prompt = (PROMPTS / "transcript_zh-TW.txt").read_text(encoding="utf-8")
+    assert "專有名詞清單" in prompt
+
+
+def test_the_correction_is_told_where_the_second_listener_is_wrong():
+    """A second opinion that is trusted everywhere is a second set of errors.
+
+    It is the better witness on soundalikes and the worse one on disfluency:
+    it tidies stutters and false starts away, and a caption that has been
+    tidied no longer matches the sound it sits on.
+    """
+
+    prompt = (PROMPTS / "transcript_zh-TW.txt").read_text(encoding="utf-8")
+    second = prompt[prompt.index("## 另一個聽眾"):]
+    second = second[: second.index("## 誰在講")]
+
+    assert "盲聽" in second
+    assert "永遠不要為了跟它一致而刪掉重複的字" in second
+    assert "不要從它那裡引進辨識器完全沒有的整句話" in second
+
+    # And the listening prompt fights for the disfluencies in the first place.
+    heard = (PROMPTS / "hearing_zh-TW.txt").read_text(encoding="utf-8")
+    assert "贅字、口頭禪、結巴、重複" in heard

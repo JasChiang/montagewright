@@ -28,12 +28,14 @@ from typing import Any
 from montagewright.planner import ask
 from montagewright.uploads import upload_now
 
-# v2: heard from the master rather than from the proxy's 64 kbps re-encode,
-# the picture read at high resolution, and the correction given the readings
-# the recogniser considered rather than only its first choice. A v1
-# transcript is a different answer to a different question, so it is not
-# reused -- unlike a proxy or a card, these are cheap to get again.
-CARD_VERSION = "montagewright-transcript-v2"
+# v3: two listenings rather than one. The recogniser's timings never reach
+# the model at all now, a second pass hears the video without being shown
+# what the first heard, and the correction reconciles two texts with no media
+# in front of it. v2 heard the master instead of the proxy's 64 kbps
+# re-encode and gained the recogniser's alternative readings. Each is a
+# different answer to a different question, so none is reused -- unlike a
+# proxy or a card, these are cheap to get again.
+CARD_VERSION = "montagewright-transcript-v3"
 TOOL = Path(__file__).resolve().parents[2] / "tools" / "transcribe" / "transcribe"
 
 # Below this a "word" is usually the recogniser splitting one syllable, and a
@@ -514,6 +516,86 @@ def words_against_cut(
     return moved
 
 
+def _hearing_schema() -> dict[str, Any]:
+    """What a second listener heard, before it is shown the first one's answer.
+
+    Kept apart from the correction pass on purpose. A model handed the
+    recogniser's transcript and asked to fix it will agree with any line that
+    reads well -- and the errors hardest to catch are exactly the ones that
+    read well, a plausible word that is not the word that was said. Only a
+    listener that has not seen the answer can disagree with it.
+
+    Its timestamps are rough and are used as such. They order the blocks and
+    say roughly where each one sits; the clock still comes from the
+    recogniser's measured per-word timings, which this never sees.
+    """
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["language", "blocks", "terms", "summary"],
+        "properties": {
+            "language": {
+                "type": "string",
+                "description": (
+                    "BCP-47 for what is actually spoken. The recogniser was "
+                    "run with a guess; this is the answer."
+                ),
+            },
+            "summary": {"type": "string"},
+            "terms": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "語音辨識器很可能聽錯的詞：人名、品牌、產品名、地名、"
+                    "專業術語、固定詞組。照實際說的拼寫。你剛看完整支影片"
+                    "包含畫面上的字，這是最有把握寫出這些詞的時刻。"
+                ),
+            },
+            "blocks": {
+                "type": "array",
+                "description": "說了什麼，照順序，一塊 3 到 7 秒。",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["from", "to", "speaker", "said"],
+                    "properties": {
+                        "from": {
+                            "type": "string",
+                            "description": (
+                                "這一塊大約從哪裡開始，M:SS。只用來對位，"
+                                "不會變成字幕時間，抓大概就好。"
+                            ),
+                        },
+                        "to": {"type": "string"},
+                        "speaker": {
+                            "type": "string",
+                            "description": (
+                                "誰在講，用畫面上分辨得出來的描述："
+                                "「戴帽子的主持人」、「穿灰藍上衣的受訪男子」。"
+                                "以話的內容為準——問句是問的人講的；鏡頭對"
+                                "著誰、誰握著麥克風都不是證據。"
+                            ),
+                        },
+                        "said": {
+                            "type": "string",
+                            "description": (
+                                "這一塊逐字說了什麼。贅字、結巴、重複、改口"
+                                "全部留著，夾雜其他語言照原樣寫。順稿順掉的"
+                                "每一個字都是一段對不回時間的聲音。"
+                            ),
+                        },
+                        "unclear": {
+                            "type": "string",
+                            "description": "聽不清楚的地方，沒有就留空。",
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
 def _schema() -> dict[str, Any]:
     """Flat, and with no field the model has to invent a number for."""
 
@@ -617,18 +699,19 @@ def describe(
     heard = hear(audio or source, locale=locale)
     words = words_of(heard)
     silences = gaps(words)
-    # The recogniser's own confidence marks where it struggled, and it is a
-    # good marker: the two characters it got wrong in one interview came back
-    # at 0.72 and 0.79 with everything around them above 0.99. Passing it
-    # points the correction at the places worth looking.
+    # What the recogniser wrote, without a single timestamp on it. Its
+    # confidence stays, because that is a statement about itself rather than
+    # about the clock, and it is a good one -- the two characters misheard in
+    # one interview came back at 0.72 and 0.79 with everything around them
+    # above 0.99.
     rough = "\n".join(
-        f"{word.starts_seconds:.2f} {word.text}"
+        f"{index}. {word.text}"
         + (
             f"  ←不確定 {word.confidence:.2f}"
             if word.confidence is not None and word.confidence < 0.9
             else ""
         )
-        for word in words
+        for index, word in enumerate(words)
     )
 
     # The readings it weighed and did not pick. Sent as its own block rather
@@ -649,13 +732,18 @@ def describe(
     else:
         uri, _ = cache.uri_for(source, client, mime_type="video/mp4")
 
-    instruction = (PROMPTS / "transcript_zh-TW.txt").read_text(encoding="utf-8")
-    interaction = ask(
+    # First listening: the video, and nothing the recogniser said. Two calls
+    # rather than one because the order matters more than the count -- shown
+    # a transcript first, a model agrees with any line that reads well, and
+    # the errors hardest to catch are exactly the ones that read well. Only a
+    # listener that has not seen the answer can disagree with it.
+    #
+    # The upload is shared, so the second call adds no bytes and the file
+    # cache already holds this proxy from the card pass.
+    listening = ask(
         client,
         model=model_id or MODEL_ID,
         store=False,
-        # The video first, the question after it: Google's guidance for a
-        # single video is to put the text last.
         input=[
             {
                 "type": "video",
@@ -693,12 +781,52 @@ def describe(
             },
             {
                 "type": "text",
-                "text": (
-                    f"{instruction}\n\n## 辨識器給的逐字稿"
-                    f"（{locale}，秒數 + 字）\n\n{rough}\n{considered}"
-                ),
+                "text": (PROMPTS / "hearing_zh-TW.txt").read_text(encoding="utf-8"),
             },
         ],
+        generation_config={
+            "thinking_level": "high",
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        },
+        response_format={
+            "mime_type": "application/json",
+            "schema": _hearing_schema(),
+        },
+    )
+    listened = _parse(listening, what="hearing")
+    usage = Usage.from_interaction(listening)
+
+    # Second listening: two transcripts of one piece of audio, and no media
+    # at all. Everything the picture had to say was said by the call above --
+    # who is speaking, what is written on screen, which words a recogniser
+    # would mangle -- and the question left is which of two readings of the
+    # same sound is right, which is a question about two texts.
+    said_by_ear = "\n".join(
+        f"[{one.get('from', '')}–{one.get('to', '')}] "
+        f"{one.get('speaker', '')}：{one.get('said', '')}"
+        + (f"　（聽不清楚：{one['unclear']}）" if one.get("unclear") else "")
+        for one in listened.get("blocks") or []
+    )
+    terms = [str(one).strip() for one in listened.get("terms") or [] if str(one).strip()]
+    glossary = (
+        "\n## 這支片裡的專有名詞（照這樣寫，遇到同音的普通詞優先用這個）\n\n"
+        + "、".join(terms) + "\n"
+        if terms else ""
+    )
+
+    instruction = (PROMPTS / "transcript_zh-TW.txt").read_text(encoding="utf-8")
+    interaction = ask(
+        client,
+        model=model_id or MODEL_ID,
+        store=False,
+        input=[{
+            "type": "text",
+            "text": (
+                f"{instruction}\n\n## 辨識器聽到的（照順序，沒有時間）"
+                f"\n\n{rough}\n{considered}"
+                f"\n## 另一個聽眾聽到的\n\n{said_by_ear}\n{glossary}"
+            ),
+        }],
         generation_config={
             "thinking_level": "high",
             "max_output_tokens": MAX_OUTPUT_TOKENS,
@@ -709,6 +837,12 @@ def describe(
         },
     )
     payload = _parse(interaction, what="transcript")
+    spent = Usage.from_interaction(interaction)
+    usage = Usage(
+        input_tokens=usage.input_tokens + spent.input_tokens,
+        output_tokens=usage.output_tokens + spent.output_tokens,
+        thought_tokens=usage.thought_tokens + spent.thought_tokens,
+    )
 
     # The model knows the words and where a sentence ends. The recogniser
     # knows when. Take each from the one that has it: the corrected lines are
@@ -767,4 +901,4 @@ def describe(
             for word in words
         ],
     }
-    return card, Usage.from_interaction(interaction)
+    return card, usage
