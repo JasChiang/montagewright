@@ -374,6 +374,7 @@ def create_app() -> FastAPI:
         music_path: str = Form(""),
         brief: str = Form(""),
         aspect: str = Form("9:16"),
+        seconds: float = Form(0.0),
         budget: float = Form(6.0),
         review: bool = Form(True),
         timeline: str = Form("none"),
@@ -456,6 +457,8 @@ def create_app() -> FastAPI:
             "--budget", str(budget),
             "--output", str(keep() / "out"),
         ]
+        if seconds > 0:
+            command += ["--seconds", str(seconds)]
         track = _typed_path(music_path)
         if track is not None:
             if not track.exists():
@@ -777,7 +780,14 @@ def create_app() -> FastAPI:
                 "note": verdicts.get(key, {}).get("note", ""),
             })
             cursor += seconds
+        # Where the bed came from. The rhythm pass decides it and nothing
+        # else showed it, so "why does the music sound like that" had no
+        # answer on the page -- and the whole point of choosing a section is
+        # that it is audible.
+        edl = report.get("edl") or {}
         return JSONResponse({
+            "music_from_seconds": float(edl.get("music_from_seconds") or 0.0),
+            "music_spans": edl.get("music_spans") or [],
             "blocks": blocks,
             "seconds": round(cursor, 3),
             # Whether these boxes are what the render used or the best that

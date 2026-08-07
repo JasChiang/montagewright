@@ -1051,7 +1051,12 @@ def decide_direction(
     # everything else; this is the slot the film has to fit.
     fixed = (
         f"## 片長\n\n這支片就是 {seconds:g} 秒，不是你要決定的事。"
-        f"`target_seconds` 填 {seconds:g}，其他決定都在這個長度裡面做。\n\n"
+        f"`target_seconds` 填 {seconds:g}，其他決定都在這個長度裡面做。"
+        # The brief is prose and may say a different number. Both reach the
+        # model, so which one wins has to be said rather than left to be
+        # inferred -- a flag that quietly contradicts the brief makes the
+        # reasoning wrong even when the output length is right.
+        "\nbrief 裡如果提到別的長度，以這裡為準，那句話當作沒寫。\n\n"
         if seconds > 0 else ""
     )
     request_input: list[dict[str, Any]] = [

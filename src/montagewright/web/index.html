@@ -958,6 +958,10 @@
             <button type="button" class="ghost" id="browse-music" style="white-space:nowrap">瀏覽…</button>
           </div>
         </div>
+        <div class="field"><label>片長（秒）</label>
+          <input type="number" id="seconds" min="0" step="1" placeholder="讓它自己決定">
+          <div class="why">留空的話由定調決定。填了就是這支片的長度，
+            brief 裡寫的長度會被蓋掉。</div></div>
         <div class="field"><label>輸出比例</label>
           <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select></div>
         <div class="field"><label>語音</label>
@@ -1334,6 +1338,8 @@ async function showStrip() {
     zoomedByHand = false;
     fitScale();
     paintStrip(); inspect(0);
+    musicFrom = data.music_from_seconds || 0;
+    musicSpans = data.music_spans || [];
     paintWaves(blocks.reduce((a, b) => a + b.seconds, 0) || 1);
   }
   // The take can be asked for before the reel has loaded, and peek can only
@@ -1692,6 +1698,18 @@ function saveSubs() {
   }, 400);
 }
 
+// Where the bed was cut from, on the track that plays it. The rhythm pass
+// chooses a section and that choice is the most audible thing in the cut,
+// so a lane labelled only 音樂 leaves "why does it sound like that"
+// unanswerable from the page.
+function musicName() {
+  if (musicSpans && musicSpans.length) {
+    return `音樂 · 接了 ${musicSpans.length} 段`;
+  }
+  if (musicFrom > 0.05) return `音樂 · 從 ${clock(musicFrom)}`;
+  return '音樂';
+}
+
 function paintWaves(total) {
   const asked = Math.max(600, Math.min(6000, Math.round(total * scale * 2)));
   const width = Math.min(6000, Math.ceil(asked / 500) * 500);
@@ -1701,7 +1719,7 @@ function paintWaves(total) {
     img.onload = () => {
       lane.classList.remove('silent');
       lane.innerHTML =
-        `<span class="name">${which === 'voice' ? '人聲' : '音樂'}</span>`;
+        `<span class="name">${which === 'voice' ? '人聲' : musicName()}</span>`;
       lane.appendChild(img);
     };
     img.onerror = () => {
@@ -1959,6 +1977,7 @@ $('go').addEventListener('click', async () => {
   body.append('locale', $('locale').value.trim());
   body.append('brief', $('brief').value);
   body.append('aspect', $('aspect').value);
+  body.append('seconds', $('seconds').value || '0');
   body.append('budget', $('budget').value);
   body.append('review', $('review').checked ? 'true' : 'false');
   body.append('timeline', $('timeline').value);
@@ -2508,6 +2527,7 @@ function tick() {
 requestAnimationFrame(tick);
 
 let wavesSoon = null;
+let musicFrom = 0, musicSpans = [];
 function paintWavesWhenSettled() {
   clearTimeout(wavesSoon);
   wavesSoon = setTimeout(() => paintWaves(reelSeconds()), 250);

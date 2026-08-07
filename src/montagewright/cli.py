@@ -1103,9 +1103,17 @@ def _write_report(output: Path, **parts) -> None:
     """The account of what was decided and what it cost."""
 
     report = parts["report"]
+    plan = parts.get("plan")
     payload = {
         "direction": parts["direction"],
         "selection": parts["selection"],
+        # Which part of the track was used. Decided by the rhythm pass and
+        # otherwise invisible: the bed sounding right or wrong is the most
+        # audible thing in a cut and nothing recorded where it came from.
+        "edl": {
+            "music_from_seconds": getattr(plan, "music_from_seconds", 0.0),
+            "music_spans": list(getattr(plan, "music_spans", []) or []),
+        },
         # Against how many asked for a beat, not how many cuts there are. A
         # speech cut where every length is content-led was reading as 0/13,
         # which is what missing every beat would look like.

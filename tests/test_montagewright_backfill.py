@@ -1734,3 +1734,50 @@ def test_nothing_truncates_the_cut_to_the_target():
     root = Path(__file__).resolve().parents[1] / "src" / "montagewright"
     for name in ("grounding.py", "executor.py", "renderer.py"):
         assert "target_seconds" not in (root / name).read_text(encoding="utf-8")
+
+
+def test_the_page_says_which_part_of_the_track_was_used():
+    """The rhythm pass chooses a section and the choice is audible.
+
+    Nothing recorded it, so "why does the music sound like that" had no
+    answer on the page -- and it is the field to look at to know whether
+    choosing a section works at all.
+    """
+
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "montagewright"
+    served = (root / "webapp.py").read_text(encoding="utf-8")
+    page = (root / "web" / "index.html").read_text(encoding="utf-8")
+    written = (root / "cli.py").read_text(encoding="utf-8")
+
+    assert '"music_from_seconds": float(edl.get("music_from_seconds")' in served
+    assert '"music_from_seconds": getattr(plan, "music_from_seconds"' in written
+    assert "function musicName()" in page
+    assert "音樂 · 從" in page
+
+
+def test_a_fixed_length_reaches_the_run_from_the_page():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "montagewright"
+    served = (root / "webapp.py").read_text(encoding="utf-8")
+    page = (root / "web" / "index.html").read_text(encoding="utf-8")
+
+    assert 'seconds: float = Form(0.0)' in served
+    assert '"--seconds"' in served
+    assert 'id="seconds"' in page
+    assert "body.append('seconds'" in page
+
+
+def test_the_brief_and_the_flag_cannot_quietly_disagree():
+    # Both reach the model. Which wins has to be said rather than inferred:
+    # a flag that silently contradicts the brief makes the reasoning wrong
+    # even when the output length comes out right.
+    import inspect
+
+    from montagewright.planner import decide_direction
+
+    assert "brief 裡如果提到別的長度，以這裡為準" in inspect.getsource(
+        decide_direction
+    )
