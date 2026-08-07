@@ -130,6 +130,18 @@ def recall() -> None:
         except (OSError, json.JSONDecodeError):
             continue
         if not note.exists():
+            # A run from the command line keeps its own log beside the
+            # output; without it the page shows a state and nothing else.
+            spare_log = folder / "out" / "run.log"
+            if spare_log.exists() and not saved.get("log"):
+                try:
+                    saved["log"] = [
+                        line for line in
+                        spare_log.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ][-500:]
+                except OSError:
+                    pass
             # A run started from the command line leaves only the note beside
             # its output, and that note is written before the work begins --
             # so "it exists" says the run started, not that it finished. A

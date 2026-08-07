@@ -214,6 +214,39 @@ def _encode_proxy(source: Path, destination: Path) -> None:
     )
 
 
+def _tee_output(destination: Path) -> None:
+    """Send everything printed to the terminal and to a file.
+
+    Line buffered, because the point is to be readable while the run is
+    still going.
+    """
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle = destination.open("a", encoding="utf-8", buffering=1)
+
+    class Both:
+        def __init__(self, first, second):
+            self.first, self.second = first, second
+
+        def write(self, text):
+            self.first.write(text)
+            try:
+                self.second.write(text)
+            except (OSError, ValueError):
+                pass
+            return len(text)
+
+        def flush(self):
+            self.first.flush()
+            try:
+                self.second.flush()
+            except (OSError, ValueError):
+                pass
+
+    sys.stdout = Both(sys.stdout, handle)
+    sys.stderr = Both(sys.stderr, handle)
+
+
 def _make_findable(output: Path) -> None:
     """Let the interface list a cut written anywhere.
 
@@ -262,6 +295,13 @@ def command_render(args: argparse.Namespace) -> int:
     # ones worth finding are the others: three died partway today, each
     # after paying for cards, direction and selection, each resumable from
     # what was already on disk, and none of them openable.
+    # Everything printed also goes beside the output, so a run started here
+    # can be read in the interface. The note said which command produced the
+    # run and the interface could offer to resume it -- but with no log there
+    # was nothing on the page except the word "中斷", which reads as broken
+    # rather than as unfinished.
+    _tee_output(output / "run.log")
+
     (output / "command.json").write_text(
         json.dumps({
             "source": str(rushes),
