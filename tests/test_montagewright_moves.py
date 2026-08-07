@@ -4200,3 +4200,30 @@ def test_the_preference_covers_every_cuttable_kind():
     assert set(CUT_PREFERENCE) == set(CUTTABLE)
     assert CUT_PREFERENCE["downbeat"] < CUT_PREFERENCE["beat"]
     assert CUT_PREFERENCE["section_boundary"] < CUT_PREFERENCE["downbeat"]
+
+
+def test_the_replan_is_checked_for_the_same_disagreement_as_the_selection():
+    """One check, two paths, and only one of them had it.
+
+    A replan is where a shot that failed for want of a move is most likely to
+    be answered with the word rather than the thing. It happened on the first
+    round of the first film that reached this loop: the reasoning said the
+    frame would sweep across the wordmark, the looks named one place, and the
+    executor held -- so the next review reported the same clipped title and
+    the round was spent.
+    """
+
+    import inspect
+
+    from montagewright import cli, planner
+
+    replanning = inspect.getsource(planner.replan_shots)
+    assert "frame_disagreements(" in replanning
+    # After the spans are expanded, so a shot is in its final shape.
+    assert replanning.index("expand_spans(") < replanning.index(
+        "frame_disagreements("
+    )
+
+    # And the caller prints them, next to the replan lines they belong to.
+    rendering = inspect.getsource(cli.command_render)
+    assert 'replanned.get("frame_disagreements")' in rendering

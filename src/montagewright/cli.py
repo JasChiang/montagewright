@@ -805,6 +805,8 @@ def command_render(args: argparse.Namespace) -> int:
                       flush=True,
                   )
                   selection["shots"][index] = new
+              for note in replanned.get("frame_disagreements") or []:
+                  print(f"  {note}", flush=True)
               # Everything downstream is rebuilt from the amended selection, so
               # the next round renders a different film rather than re-reading
               # the same one.

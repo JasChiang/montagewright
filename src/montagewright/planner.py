@@ -1630,6 +1630,12 @@ def replan_shots(
     )
     again = _parse(interaction, what="replan pass")
     expand_spans(again, offered)
+    # The same check the selection pass runs, on the path that was left
+    # without it. A replan is where a shot that failed for want of a move is
+    # most likely to be answered with the word and not the thing -- the
+    # reviewer just said the frame showed half a wordmark, and "改為橫向掃過
+    # 運鏡" in the reasoning is not two looks.
+    again["frame_disagreements"] = frame_disagreements(again.get("shots") or [])
     return again, Usage.from_interaction(
         interaction
     )
