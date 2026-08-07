@@ -3413,3 +3413,73 @@ def test_the_production_path_passes_the_output_size_to_the_looks_builder():
     call = call[: call.index(")\n")]
     for given in ("source_width=", "source_height=", "output_width=", "output_height="):
         assert given in call, given
+
+
+def test_an_approving_film_review_does_not_bury_a_shot_that_missed():
+    """Two reviewers, two questions, and only one verdict was being read.
+
+    A run finished with three shots that did not do what they planned,
+    forty-five degradations and five seconds missing -- and the whole-film
+    reviewer said "approve (0 issues)", which returned before the shot
+    reviewer's findings were even collected. The replan loop those findings
+    exist to drive had never run.
+    """
+
+    from montagewright.review import Round, ReviewVerdict, should_continue
+
+    approved = Round(
+        index=1,
+        verdict=ReviewVerdict(verdict="approve", overall="looks good", issues=[]),
+        actionable=[],
+    )
+
+    # Nothing missed: an approval still ends the loop.
+    assert should_continue([approved]) == (False, "approved")
+
+    # Something missed: the film reviewer cannot see a promise it was never
+    # told about, so its approval is not a veto over the shot reviewer.
+    keep, why = should_continue([approved], undelivered=3)
+    assert keep and "3" in why
+
+    # And the limits still win, or a shot nobody can fix spends the budget
+    # one replan at a time.
+    from montagewright.review import MAX_ROUNDS
+
+    capped = [approved] * MAX_ROUNDS
+    assert should_continue(capped, undelivered=3)[0] is False
+
+
+def test_the_shot_verdicts_are_collected_before_the_gate_that_reads_them():
+    """The ordering is the bug, so the ordering is what is asserted."""
+
+    import inspect
+
+    from montagewright import cli
+
+    source = inspect.getsource(cli.command_render)
+    assert source.index("failing = [") < source.rindex("should_continue(")
+    # Both gates read it. The one at the top of the loop decides whether a
+    # replanned cut is looked at again, and reading a pre-replan verdict
+    # there would stop on it.
+    assert source.count("undelivered=undelivered") == 2
+
+
+def test_the_takes_the_direction_ruled_out_are_accounted_for():
+    """`set_aside` answered "why is this take missing" for one of two ways.
+
+    The cards' `usable: false` was recorded; the direction's `unusable` list
+    was applied to selection and written down nowhere, so a run that removed
+    five clips reported none set aside and seventy-four in play.
+    """
+
+    import inspect
+
+    from montagewright import cli
+
+    source = inspect.getsource(cli.command_render)
+    ruling = source[source.index('for entry in direction.get("unusable"'):]
+    ruling = ruling[: ruling.index("chose = ")]
+    assert "set_aside[source_id]" in ruling
+    assert "superseded_by" in ruling
+    # And it happens after the direction exists, not before it.
+    assert source.index("set_aside: dict[str, str] = {}") < source.index(ruling[:40])

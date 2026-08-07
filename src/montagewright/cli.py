@@ -535,6 +535,22 @@ def command_render(args: argparse.Namespace) -> int:
         f"{len(direction.get('unusable', []))} ruled out",
         flush=True,
     )
+    # The direction's rulings belong on the same list as the cards'. Both
+    # answer "why is this take not in the film", selection is handed only
+    # what survives both, and only one of them was being written down -- so
+    # a run that ruled out five clips reported none set aside and seventy-four
+    # in play, and the interface had no answer for where they went.
+    #
+    # The reasons are better than the cards' as well: a card sees one clip
+    # and can only say it failed, while the direction has seen all of them
+    # and can say which take supersedes this one.
+    for entry in direction.get("unusable", []) or []:
+        source_id = str(entry.get("source_id", ""))
+        if not source_id:
+            continue
+        why = str(entry.get("reason") or "no reason given")
+        better = str(entry.get("superseded_by") or "")
+        set_aside[source_id] = f"{why}（改用 {better}）" if better else why
 
     chose = _asked(asked, json.dumps(direction, sort_keys=True, ensure_ascii=False))
     selection = _decided(work, "selection", chose)
@@ -631,6 +647,11 @@ def command_render(args: argparse.Namespace) -> int:
 
     rounds: list[Round] = []
     shot_verdicts: dict[str, dict] = {}
+    # Carried across iterations because both gates need it: the one at the
+    # top of the loop decides whether a replanned cut gets looked at again,
+    # and it would otherwise re-read a verdict from before the replan and
+    # stop on it.
+    undelivered = 0
     stopped = "review not requested"
     # Whatever happens in here, the account of the run still gets written.
     # It used to be written once at the very end, so a crash anywhere after
@@ -649,7 +670,9 @@ def command_render(args: argparse.Namespace) -> int:
           # Every round renders before it reviews, so a stopping condition
           # always leaves a finished film rather than a half-planned one.
           while True:
-              keep_going, stopped = should_continue(rounds, ledger=ledger)
+              keep_going, stopped = should_continue(
+                  rounds, ledger=ledger, undelivered=undelivered
+              )
               if not keep_going:
                   break
               # Two questions, two viewings. The shots say whether each one did
@@ -713,9 +736,11 @@ def command_render(args: argparse.Namespace) -> int:
                   f"({len(verdict.issues)} issues) — {verdict.overall[:70]}",
                   flush=True,
               )
-              keep_going, stopped = should_continue(rounds, ledger=ledger)
-              if not keep_going:
-                  break
+              # Worked out before the gate, not after it. The shot reviewer's
+              # findings used to be computed on the far side of an early
+              # return, so an approving film reviewer threw them away
+              # unread -- and the loop it gates is the only thing that can
+              # act on them.
               failing = [
                   (index, shot, shot_verdicts[f"k{index:02d}"].get("note", ""))
                   for index, shot in enumerate(selection["shots"])
@@ -723,6 +748,12 @@ def command_render(args: argparse.Namespace) -> int:
                       "delivered", True
                   )
               ]
+              undelivered = len(failing)
+              keep_going, stopped = should_continue(
+                  rounds, ledger=ledger, undelivered=undelivered
+              )
+              if not keep_going:
+                  break
               if not failing:
                   # The cut reviewer wants a change nobody can point at a shot.
                   stopped = (

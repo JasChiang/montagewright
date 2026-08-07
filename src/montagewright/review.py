@@ -380,19 +380,36 @@ def actionable_keys(verdict: ReviewVerdict) -> tuple[str, ...]:
 
 
 def should_continue(
-    rounds: list[Round], *, ledger: Ledger | None = None
+    rounds: list[Round], *, ledger: Ledger | None = None, undelivered: int = 0
 ) -> tuple[bool, str]:
-    """Decide whether another round is worth rendering."""
+    """Decide whether another round is worth rendering.
+
+    Two reviewers report here and they answer different questions. The shot
+    reviewer watches one shot against its own plan; the film reviewer watches
+    the whole cut. An approval from the second used to end the loop before
+    the first was consulted, so a run finished with three shots that did not
+    do what they said they would, forty-five degradations and five seconds
+    missing off the length -- and a verdict of "approve (0 issues)".
+
+    That is not the film reviewer being wrong. It is watching a finished cut
+    and cannot see a promise it was never told about; a shot that was meant
+    to read a wordmark and instead held on half of one looks like a
+    considered composition from the outside. The two verdicts are both
+    correct and only one of them was being read.
+    """
 
     if not rounds:
         return True, "not started"
     latest = rounds[-1]
-    if latest.verdict.verdict == "approve":
-        return False, "approved"
-    if not latest.actionable:
-        return False, "nothing actionable was raised"
+
+    # The limits come first, because everything below them is a reason to go
+    # round again and a run has to be able to stop. Ordering the shot
+    # reviewer above the round cap would let a shot nobody can fix spend the
+    # budget one replan at a time.
     if len(rounds) >= MAX_ROUNDS:
         return False, f"reached the {MAX_ROUNDS}-round cap"
+    if ledger is not None and ledger.remaining_usd <= 0:
+        return False, "budget spent"
     if len(rounds) >= 2:
         previous = set(rounds[-2].actionable)
         current = set(latest.actionable)
@@ -401,8 +418,13 @@ def should_continue(
             # twice means the change did not land, and a third render will
             # not make it land either.
             return False, "no progress between rounds"
-    if ledger is not None and ledger.remaining_usd <= 0:
-        return False, "budget spent"
+
+    if undelivered:
+        return True, f"{undelivered} shots did not do what they planned"
+    if latest.verdict.verdict == "approve":
+        return False, "approved"
+    if not latest.actionable:
+        return False, "nothing actionable was raised"
     return True, "continuing"
 
 
