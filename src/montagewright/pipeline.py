@@ -576,6 +576,35 @@ def follow_subjects(
                 if card is not None and reframe.subject is not None
                 else None
             )
+            # Two moves stacked. The selection prompt has said since it was
+            # written that a take which moves on its own does not want a
+            # digital move on top -- the real one is real and the added one
+            # is a crop sliding -- and until the span carried the role there
+            # was nothing downstream holding the fact needed to check it.
+            #
+            # Reported rather than repaired: which of the two to give up is
+            # editorial. Dropping the digital move would quietly change what
+            # the shot shows, and dropping the shot would quietly change the
+            # film.
+            if (
+                reframe.planned_to_move
+                and reframe.source_motion_role in {"authored", "subject_follow"}
+            ):
+                report.degradations.append(
+                    DegradationStep(
+                        clip_id=clip.clip_id,
+                        ladder="other",
+                        ladder_other="digital_move_on_a_moving_take",
+                        trigger=(
+                            "this take already moves on its own "
+                            f"({reframe.source_motion_role}) and the plan "
+                            "asks the frame to travel as well, so the two "
+                            "movements are added together on screen"
+                        ),
+                        measured={"looks": float(len(reframe.looks))},
+                    )
+                )
+
             # Every look, not only the first. `reframe.subject` is built from
             # `looks[0]`, so a shot that settles on a face and then on a
             # wordmark that has to be whole had the promise on the second one

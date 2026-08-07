@@ -294,6 +294,12 @@ class Reframe(ModelFacing):
     # standing still is a held frame -- both are the plan happening, and
     # without this every settled shot was recorded as a downgraded follow.
     planned_to_move: bool = False
+    # What the source camera was already doing. `authored` and
+    # `subject_follow` mean the take moves on its own, which is the case the
+    # selection prompt calls out -- two moves stacked fight each other, and
+    # the real one wins because it is real. Nothing downstream held this, so
+    # the warning was advice with no way to check it.
+    source_motion_role: str = "locked"
     camera_energy: CameraEnergy = Field(
         default="calm",
         description=(
@@ -775,4 +781,5 @@ def reframe_of(shot: dict) -> Reframe:
         planned_to_move=(
             str(shot.get("frame", "")) == "travels" or len(looks) > 1
         ),
+        source_motion_role=str(shot.get("source_motion_role", "locked") or "locked"),
     )

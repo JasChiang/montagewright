@@ -348,3 +348,65 @@ def test_one_reader_turns_every_one_of_them_back_into_seconds():
     assert "second" not in json.dumps(
         transcript._schema()["properties"]["lines"], ensure_ascii=False
     )
+
+
+def test_the_card_version_moves_when_anything_about_the_card_moves():
+    """It hashed the top-level required names and nothing else.
+
+    So `segments` could change shape, an enum could gain a value, a unit
+    could flip from seconds to a clock reading, and every cached card stayed
+    valid while meaning something different. All three happened.
+    """
+
+    import hashlib
+    import json as _json
+
+    from montagewright import clipcard
+
+    was = clipcard.CARD_VERSION
+    assert was.startswith("montagewright-clip-card-")
+
+    # The digest covers the whole schema and the prompt beside it.
+    shape = _json.dumps(clipcard.card_schema(), sort_keys=True, ensure_ascii=False)
+    prompt = (PROMPTS / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
+    expected = hashlib.sha256((shape + prompt).encode("utf-8")).hexdigest()[:8]
+    assert was.endswith(expected)
+
+    # A nested change moves it, which the old version could not see.
+    deeper = _json.loads(shape)
+    deeper["properties"]["segments"]["items"]["properties"]["status"]["enum"].append("maybe")
+    moved = hashlib.sha256(
+        (_json.dumps(deeper, sort_keys=True, ensure_ascii=False) + prompt)
+        .encode("utf-8")
+    ).hexdigest()[:8]
+    assert moved != expected
+
+
+def test_a_missing_answer_is_not_a_no():
+    """`camera_moves` was optional and the reader defaulted it to False.
+
+    So "the model did not say" and "the camera is still" were the same
+    value, on the field that decides whether a digital move is stacked on a
+    take that already moves.
+    """
+
+    assert "camera_moves" in clipcard.card_schema()["required"]
+
+
+def test_a_decision_is_keyed_on_the_material_it_was_made_from():
+    """Source ids, brief, aspect and a music path -- and nothing else.
+
+    So a card rewritten with better segments, or a span boundary moved, left
+    the key identical and the next run reused a selection made against
+    material that no longer had that shape.
+    """
+
+    import inspect
+
+    from montagewright import cli
+
+    keyed = inspect.getsource(cli.command_render)
+    keyed = keyed[keyed.index("catalogue = _asked("):keyed.index("direction = _decided(")]
+    assert "CARD_VERSION" in keyed
+    assert "span_id" in keyed
+    assert "starts_seconds" in keyed and "ends_seconds" in keyed

@@ -29,6 +29,8 @@ from montagewright.spans import seconds_of
 
 from montagewright.uploads import upload_now
 
+PROMPTS = Path(__file__).resolve().parent / "prompts"
+
 def _card_version() -> str:
     """A version that changes when the card's shape does.
 
@@ -44,9 +46,17 @@ def _card_version() -> str:
     """
 
     import hashlib
+    import json
 
-    shape = ",".join(sorted(card_schema()["required"]))
-    return f"montagewright-clip-card-{hashlib.sha256(shape.encode()).hexdigest()[:8]}"
+    # The whole schema and the prompt that goes with it, not the top-level
+    # required names. Those caught a field being added and nothing else:
+    # segments could change shape, an enum could gain a value, a unit could
+    # flip from seconds to a clock reading, and every cached card stayed
+    # valid while meaning something different. All of those happened.
+    shape = json.dumps(card_schema(), sort_keys=True, ensure_ascii=False)
+    prompt = (PROMPTS / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
+    digest = hashlib.sha256((shape + prompt).encode("utf-8")).hexdigest()[:8]
+    return f"montagewright-clip-card-{digest}"
 
 
 CARD_VERSION = ""  # set below, once card_schema is defined
@@ -163,6 +173,7 @@ def card_schema() -> dict[str, Any]:
             "subjects",
             "action",
             "camera_motion",
+            "camera_moves",
             "shot_size",
             "facing",
             "speech",
@@ -213,7 +224,7 @@ def card_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["from", "to", "status", "why"],
+                    "required": ["from", "to", "status", "why", "motion_role"],
                     "properties": {
                         "from": {
                             "type": "string",
@@ -251,6 +262,37 @@ def card_schema() -> dict[str, Any]:
                                 "reject 的說明為什麼不能用；eligible 說這一"
                                 "段裡發生了什麼。兩種都要寫，因為後面挑片"
                                 "的人只看得到這句話。"
+                            ),
+                        },
+                        "motion_role": {
+                            "type": "string",
+                            "enum": [
+                                "locked", "authored", "subject_follow",
+                                "handheld_texture", "setup_reframe",
+                                "disturbance", "unknown",
+                            ],
+                            "description": (
+                                "這一段的攝影機運動是什麼意思。上面附了本機"
+                                "量到的位移區間——**位移有沒有發生是量出來的，"
+                                "不用你判斷；你要判斷的是它為什麼在動。**\n"
+                                "`locked`：沒有位移。\n"
+                                "`authored`：刻意的運鏡，移動本身帶出新東西"
+                                "——揭示畫面外的第二樣東西、沿著產品看過去、"
+                                "推進到細節。**觀眾因為這個移動多看到了什麼**"
+                                "就是判準。\n"
+                                "`subject_follow`：相機在跟住一個會動的主體，"
+                                "構圖大致維持。\n"
+                                "`handheld_texture`：整段一致的小幅手持感，"
+                                "那是質感不是缺陷。\n"
+                                "`setup_reframe`：攝影機從一個還沒完成的構圖"
+                                "移到準備好的構圖，或從完成的構圖離開。"
+                                "**觀眾沒有因此多看到任何東西**——那是拍攝"
+                                "準備，不是內容。\n"
+                                "`disturbance`：碰撞、突發甩動、失控後恢復。\n"
+                                "`unknown`：證據不足以判斷。\n"
+                                "`setup_reframe` 跟 `disturbance` 的片段後面"
+                                "選片會拿不到，所以那兩個等於「這段剪不進去」。"
+                                "拿不準就填 `unknown`，不要猜。"
                             ),
                         },
                     },
@@ -688,6 +730,7 @@ def describe_clip(
     cache=None,
     model_id: str | None = None,
     thinking: str = "low",
+    motion: "list[Any] | None" = None,
 ) -> tuple[dict[str, Any], Any]:
     """Watch one clip and write its card.
 
@@ -724,6 +767,17 @@ def describe_clip(
             f"（{duration:.1f} 秒）。\n"
             f"時間一律寫成 MM:SS，最後一段要到這裡為止。\n"
         )
+        # The half it cannot see. Video reaches it at a frame a second, and
+        # camera shake is what happens between frames, so "is this stable"
+        # is not a question the picture it was given can answer -- it
+        # answered "固定鏡頭，畫面穩定清晰" about a take whose first three
+        # seconds are the operator still finding the frame. Measured here
+        # and handed over as intervals with ids, so the model is asked what
+        # the movement means and never whether it happened.
+        if motion:
+            from montagewright.motion import describe as describe_motion
+
+            instruction += f"\n\n## 攝影機運動\n\n{describe_motion(motion)}\n"
 
     if cache is None:
         uploaded = upload_now(proxy, client)
@@ -806,6 +860,7 @@ def build_library(
     cache=None,
     model_id: str | None = None,
     progress=None,
+    motion_of=None,
 ) -> tuple[dict[str, Path], dict[str, Any]]:
     """Write a card for every asset that does not already have one.
 
@@ -837,6 +892,7 @@ def build_library(
         try:
             card, usage = describe_clip(
                 proxy, client=client, cache=cache, model_id=model_id,
+                motion=motion_of(source_id) if motion_of else None,
                 # Cutting a take into what survives and what does not is a
                 # judgement -- whether an action finished, whether "again"
                 # was a line or an instruction -- and low turns out to mean

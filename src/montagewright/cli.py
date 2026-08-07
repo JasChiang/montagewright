@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from montagewright.clipcard import (
+    CARD_VERSION,
     action_beats,
     build_library,
     find_subject,
@@ -379,8 +380,26 @@ def command_render(args: argparse.Namespace) -> int:
     def wrote(index: int, total: int, source_id: str) -> None:
         print(f"  card {index}/{total}  {source_id}", flush=True)
 
+    # The half the model cannot see. Measured off the original rather than
+    # the proxy -- shake survives scaling but the proxy was re-encoded, and
+    # this is about the file that will be cut. Content addressed, so seventy
+    # four clips are measured once ever, about three seconds each.
+    from montagewright.motion import cached as motion_for
+
+    def motion_of(source_id: str):
+        original = originals.get(source_id)
+        if original is None:
+            return None
+        try:
+            return motion_for(original, _duration(original), library)
+        except Exception as error:
+            print(f"  {source_id} — no motion measured: {error}"[:120], flush=True)
+            return None
+
+    print(f"measuring camera motion across {len(proxies)} clips", flush=True)
     cards, stats = build_library(
-        proxies, library / "cards", client=client, cache=cache, progress=wrote
+        proxies, library / "cards", client=client, cache=cache, progress=wrote,
+        motion_of=motion_of,
     )
     ledger.record(
         "clip_cards",
@@ -517,9 +536,24 @@ def command_render(args: argparse.Namespace) -> int:
             print(f"  {source_id} — {why[:110]}", flush=True)
 
     brief = args.brief.read_text(encoding="utf-8") if args.brief else ""
+    # What was decided has to be keyed on everything it was decided from.
+    # This was source ids, brief, aspect and the music path -- so a card
+    # rewritten with better segments, a span boundary moved, or a schema
+    # changed left the same key, and the next run reused a selection made
+    # against material that no longer exists in that shape. The card version
+    # already moves when the card's shape does, and the span ids move when
+    # its answers do; both belong here.
+    catalogue = _asked(*(
+        f"{item.source_id}|{CARD_VERSION}|"
+        + ",".join(
+            f"{one.span_id}:{one.starts_seconds:.3f}-{one.ends_seconds:.3f}"
+            for one in item.spans
+        )
+        for item in sorted(material, key=lambda one: one.source_id)
+    ))
     asked = _asked(
-        ",".join(sorted(item.source_id for item in material)),
-        brief, args.aspect, str(args.music or ""),
+        catalogue, brief, args.aspect, str(args.music or ""),
+        f"seconds={args.seconds or 0}",
     )
     direction = _decided(work, "direction", asked)
     if direction is None:

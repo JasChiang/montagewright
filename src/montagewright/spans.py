@@ -53,6 +53,10 @@ LOOSE = re.compile(r"^\s*\d+\.\d+\s*$")
 # can cut into is worse than a gap, because it can be chosen.
 LEAST_SECONDS = 0.4
 
+# Roles that mean the camera was being got ready rather than used. A segment
+# carrying one of these is not offered, however clean its picture is.
+REFUSED = frozenset({"setup_reframe", "disturbance", "unknown"})
+
 
 @dataclass(frozen=True)
 class Span:
@@ -63,6 +67,12 @@ class Span:
     starts_seconds: float
     ends_seconds: float
     why: str = ""
+    # What the camera was doing here, as the card read it against the local
+    # measurement. Carried because the executor has to know whether the
+    # source is already moving before it adds a move of its own -- the
+    # selection prompt has warned about stacking them since it was written
+    # and nothing downstream held the fact needed to check.
+    motion_role: str = "locked"
 
     @property
     def seconds(self) -> float:
@@ -139,6 +149,16 @@ def spans_of(card: dict[str, Any] | None, source_id: str, duration: float) -> li
     for index, entry in enumerate(written):
         if str(entry.get("status", "")) != "eligible":
             continue
+        # A camera moving from one unfinished framing to a ready one, or
+        # recovering from a knock, is not a take -- it is the gap between
+        # two of them, and the viewer gains nothing from watching it. Those
+        # get no id, which is the only way a plan cannot ask for them.
+        #
+        # `unknown` is refused for the same reason and a different one: the
+        # model said it could not tell, and choosing anyway would turn "I do
+        # not know" into "yes".
+        if str(entry.get("motion_role", "")) in REFUSED:
+            continue
         first = seconds_of(entry.get("from"))
         last = seconds_of(entry.get("to"))
         if first is None or last is None:
@@ -154,6 +174,7 @@ def spans_of(card: dict[str, Any] | None, source_id: str, duration: float) -> li
                 starts_seconds=round(first, 3),
                 ends_seconds=round(last, 3),
                 why=str(entry.get("why", "")),
+                motion_role=str(entry.get("motion_role", "locked") or "locked"),
             )
         )
     if not kept and not written and duration > LEAST_SECONDS:

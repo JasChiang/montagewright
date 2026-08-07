@@ -1526,6 +1526,7 @@ def expand_spans(chosen: dict[str, Any], offered: "list[Any]") -> None:
         # of take from a second of somebody resetting a prop.
         shot["usable_from_seconds"] = span.starts_seconds
         shot["usable_to_seconds"] = span.ends_seconds
+        shot["source_motion_role"] = span.motion_role
 
 
 def frame_disagreements(shots: list[dict[str, Any]]) -> list[str]:

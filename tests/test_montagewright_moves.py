@@ -4379,3 +4379,84 @@ def test_cuts_are_placed_against_the_music_that_is_playing():
     assert any(abs(c.time_seconds - 4.0) < 1e-6 for c in joined.cues)
     # And nothing from the discarded middle survives.
     assert not any(14.0 < c.time_seconds < 40.0 for c in joined.cues)
+
+
+def test_the_camera_motion_the_model_cannot_see_is_measured():
+    """A frame a second cannot show what happens between frames.
+
+    Asked whether a take is stable, Gemini answered "固定鏡頭…畫面穩定清晰"
+    about one whose first three seconds are the operator still finding the
+    frame. Not carelessly -- the question cannot be answered from a series of
+    individually sharp stills.
+    """
+
+    from montagewright.motion import MotionInterval, describe
+
+    found = [
+        MotionInterval("m00", 0.0, 2.5, "moving", 0.31, 0.42, settles=True),
+        MotionInterval("m01", 2.5, 9.5, "still", 0.001, 0.002, settles=False),
+    ]
+    said = describe(found)
+    # Ids, so an answer can point at one rather than invent a second.
+    assert "m00" in said and "m01" in said
+    # Clock readings, like every other time a model reads here.
+    assert "0:00.0" in said and "0:02.5" in said
+    # And it says the movement happened, never whether it was any good.
+    assert "位移" in said
+    for judgement in ("不能用", "reject", "壞", "失敗"):
+        assert judgement not in said
+
+
+def test_a_setup_reframe_is_not_offered_as_a_span():
+    """The camera getting ready is the gap between takes, not a take.
+
+    C8340's card described one of its stretches as 攝影機構圖調整 -- the
+    operator moving from one framing to another -- marked it eligible, and a
+    replan chose it to escape an overexposed opening. Nothing gains a viewer
+    anything there.
+    """
+
+    from montagewright.spans import spans_of
+
+    def card(role):
+        return {"usable": True, "segments": [
+            {"from": "0:00", "to": "0:05", "status": "eligible",
+             "why": "x", "motion_role": role},
+        ]}
+
+    for allowed in ("locked", "authored", "subject_follow", "handheld_texture"):
+        assert spans_of(card(allowed), "C1", 5.0), allowed
+    # Getting ready, recovering from a knock, and "I cannot tell" are all
+    # refused -- the last because choosing anyway turns a no into a yes.
+    for refused in ("setup_reframe", "disturbance", "unknown"):
+        assert spans_of(card(refused), "C1", 5.0) == [], refused
+
+    # The role travels with the span, because the executor needs it.
+    assert spans_of(card("authored"), "C1", 5.0)[0].motion_role == "authored"
+
+
+def test_a_digital_move_on_a_take_that_already_moves_is_reported():
+    """The prompt has warned about this since it was written.
+
+    Two movements stacked fight each other and the real one wins. The warning
+    was advice: `camera_motion` reached the selection prompt and no field
+    downstream held it, so there were never two halves to compare.
+    """
+
+    import inspect
+
+    from montagewright import pipeline
+    from montagewright.schema import reframe_of
+
+    # It reaches the reframe from the span the planner named.
+    shot = {
+        "looks": [{"at": "a"}, {"at": "b"}],
+        "frame": "travels", "source_motion_role": "authored",
+    }
+    built = reframe_of(shot)
+    assert built.planned_to_move and built.source_motion_role == "authored"
+
+    checking = inspect.getsource(pipeline.follow_subjects)
+    assert "digital_move_on_a_moving_take" in checking
+    # A locked take is not flagged for having a move added to it.
+    assert 'in {"authored", "subject_follow"}' in checking
