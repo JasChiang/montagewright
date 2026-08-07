@@ -26,10 +26,20 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-# `1:07`, `0:00`, `12:04`. Also plain seconds, because a model told six times
-# to write M:SS will occasionally write 67 anyway, and the reading is not in
-# doubt when there is no colon to have been lost.
+# `1:07`, `0:00`, `12:04`, and `01:07` -- the minutes may be padded or not,
+# because both are the same reading and neither is worth rejecting an answer
+# over. Also a bare `7`, because a model told six times to write a clock will
+# occasionally write a number anyway, and below a minute there is no colon
+# that could have been lost.
 CLOCK = re.compile(r"^\s*(?:(\d{1,3}):)?([0-5]?\d(?:\.\d+)?)\s*$")
+
+# A decimal point in a string with no colon in it. `1.53` is either a second
+# and a half or 1:53 with the colon turned into a point, and both readings
+# are plausible -- which is the ambiguity this whole notation exists to
+# remove, so it is refused rather than guessed at. It cost a 113.4s take its
+# entire usable range once, reading two minutes of material as 1.5 seconds
+# while passing every range check on the way.
+LOOSE = re.compile(r"^\s*\d+\.\d+\s*$")
 
 # A segment shorter than this is not a shot, it is a boundary that landed a
 # little off. Kept out of the catalogue rather than repaired: a span nobody
@@ -80,9 +90,15 @@ def seconds_of(value: Any) -> float | None:
     Asking for the notation the model already reads makes both unwritable.
     """
 
-    if isinstance(value, (int, float)):
+    # A real number is a resolved one: this reads its own output back, and
+    # by then the ambiguity has been settled. Only what a model typed is
+    # held to the notation.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
-    found = CLOCK.match(str(value or ""))
+    written = str(value or "")
+    if LOOSE.match(written):
+        return None
+    found = CLOCK.match(written)
     if not found:
         return None
     minutes, seconds = found.groups()

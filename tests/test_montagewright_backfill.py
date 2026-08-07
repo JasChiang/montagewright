@@ -213,11 +213,30 @@ def test_a_clock_reading_has_only_one_meaning():
     assert seconds_of("0:00") == 0.0
     assert seconds_of("12:04") == 724.0
 
-    # A bare number is still read, because a model told six times to write
-    # M:SS will occasionally write 67 -- and with no colon to have been lost
-    # there is no second reading to weigh it against.
-    assert seconds_of(67) == 67.0
-    assert seconds_of("67") is None  # two digits past 59 is not a clock
+    # Padded or not is the same reading, and neither is worth refusing an
+    # answer over.
+    assert seconds_of("01:07") == 67.0
+    assert seconds_of("0:3") == 3.0
+
+    # A bare number below a minute is still read, because a model told six
+    # times to write a clock will occasionally write one anyway, and there is
+    # no colon that could have been lost from it.
+    assert seconds_of("3") == 3.0
+    assert seconds_of("67") is None   # two digits past 59 is not a clock
+    assert seconds_of("110") is None  # 1:10 with the colon dropped
+
+    # And the other half of that collision, which the first pass at this let
+    # through: a decimal point with no colon beside it is either a second and
+    # a half or 1:53 with the colon turned into a point. Both readings are
+    # plausible, which is the ambiguity the notation exists to remove, so it
+    # is refused rather than guessed at.
+    assert seconds_of("1.53") is None
+    assert seconds_of("3.5") is None
+
+    # A real number is a resolved one -- this reads its own output back, and
+    # by then there is nothing left to settle.
+    assert seconds_of(1.53) == 1.53
+    assert seconds_of(113.0) == 113.0
 
     assert seconds_of("") is None
     assert seconds_of("about a minute") is None
