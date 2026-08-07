@@ -947,3 +947,44 @@ def test_resting_never_eats_the_whole_shot():
 
     assert _mids(path)[0] < _mids(path)[-1]
     assert path.keyframes[-1].seconds <= 2.0
+
+
+def test_the_move_is_read_off_the_looks_not_taken_from_the_plan():
+    """Removing camera_move from the schema made every shot a hold.
+
+    reframe_of still read the field, the new schema no longer sends it, and
+    the default was "hold" -- so the whole cut would have rendered
+    motionless with nothing raising. The name is now observed rather than
+    chosen, which is also why it cannot disagree with the looks.
+    """
+
+    from montagewright.schema import reframe_of
+
+    def move(looks):
+        return reframe_of({"looks": looks, "why": "x"}).camera_move
+
+    assert move([{"at": "the coin"}]) == "hold"
+    assert move([{"at": "the left one"}, {"at": "the right one"}]) == "pan"
+    assert move(
+        [{"at": "the coin", "framing": "thirds"},
+         {"at": "the coin", "framing": "fill"}]
+    ) == "push_in"
+    assert move(
+        [{"at": "the table", "framing": "fill"},
+         {"at": "the table", "framing": "thirds"}]
+    ) == "pull_out"
+    assert move([{"at": "a"}, {"at": "b"}, {"at": "c"}]) == "pan"
+
+
+def test_a_plan_written_before_looks_still_says_what_it_meant():
+    from montagewright.schema import reframe_of
+
+    was = reframe_of({
+        "subject": "the left handset", "camera_move": "pan",
+        "then_subject": "the right handset", "why": "x",
+    })
+
+    assert was.camera_move == "pan"
+    assert [one.at for one in was.looks] == [
+        "the left handset", "the right handset"
+    ]

@@ -564,6 +564,34 @@ class ReviewVerdict(ModelFacing):
         return self
 
 
+def move_of(looks: "list[Look]") -> str:
+    """What a list of looks turns out to be, in the old vocabulary.
+
+    The names are no longer chosen; they are observed. That is the whole
+    point of the change -- a move and its targets cannot disagree when one is
+    read off the other -- but the names still have to exist, because the
+    report, the interface and the reviewer all speak them.
+
+    The axis is guessed rather than measured here, since nothing at this
+    point knows where either subject is. The executor measures both centres
+    and moves along whichever axis they actually differ on; this is only the
+    label, and it is corrected once the boxes are known.
+    """
+
+    if len(looks) < 2:
+        return "hold"
+    tightness = {"fill": 2, "thirds": 1, "centre": 1}
+    if all(one.at == looks[0].at for one in looks):
+        first = tightness.get(looks[0].framing, 1)
+        last = tightness.get(looks[-1].framing, 1)
+        if last > first:
+            return "push_in"
+        if last < first:
+            return "pull_out"
+        return "hold"
+    return "pan"
+
+
 def reframe_of(shot: dict) -> Reframe:
     """The reframe a shot asked for, built the one way.
 
@@ -621,7 +649,15 @@ def reframe_of(shot: dict) -> Reframe:
             Subject(description=looks[1].at) if len(looks) > 1 else None
         ),
         intent=shot.get("why", "")[:120],
-        camera_move=str(shot.get("camera_move", "hold") or "hold"),
-        framing=str(shot.get("framing", "thirds") or "thirds"),
+        # Read off the looks rather than taken from the plan. A plan written
+        # before looks existed still carries the old field, and it is only
+        # trusted when the looks cannot say -- otherwise the two could
+        # disagree, which is the whole thing this replaced.
+        camera_move=(
+            move_of(looks) if looks
+            else str(shot.get("camera_move", "hold") or "hold")
+        ),
+        framing=(looks[0].framing if looks else
+                 str(shot.get("framing", "thirds") or "thirds")),
         camera_energy="active",
     )
