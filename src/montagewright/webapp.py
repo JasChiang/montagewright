@@ -1297,21 +1297,33 @@ def create_app() -> FastAPI:
             path, media_type="text/plain", filename=f"{run_id}.srt"
         )
 
-    @app.get("/api/runs/{run_id}/source/{index}")
-    def source_clip(run_id: str, index: int):
+    @app.get("/api/runs/{run_id}/source/{which}")
+    def source_clip(run_id: str, which: str):
         """The take this shot was cut from, uncropped.
 
         Checking that a crop followed anything means seeing what it was
         moving across. The rendered segment cannot show that -- it is the
         answer, not the working.
+
+        Addressed by source id, falling back to the shot's position. It was
+        the position alone, which meant the URL changed at every cut even
+        when the next shot came out of the same file -- so the browser
+        dropped a take it already had and fetched it again under a new name.
+        Two shots from one take now resolve to one URL, which is also the
+        only way its cache can help: at one to two seconds a shot, a reload
+        per cut is a reload per second.
         """
 
         run = _run(run_id)
         report = run.report() or {}
         shots = report.get("selection", {}).get("shots", [])
-        if index >= len(shots):
+        known = {str(shot.get("source_id", "")) for shot in shots}
+        if which in known:
+            source_id = which
+        elif which.isdigit() and int(which) < len(shots):
+            source_id = shots[int(which)]["source_id"]
+        else:
             raise HTTPException(404, "no such shot")
-        source_id = shots[index]["source_id"]
 
         # The proxy, when there is one. This view exists to show where the
         # crop sat, and the proxy is the same framing at a five-hundredth of

@@ -1667,7 +1667,7 @@ def test_the_crop_can_be_checked_against_the_take_it_came_from() -> None:
 
     app = create_app()
     paths = {r.path for r in app.routes if hasattr(r, "path")}
-    assert "/api/runs/{run_id}/source/{index}" in paths
+    assert "/api/runs/{run_id}/source/{which}" in paths
 
     # The crop path travels with the timeline, keyframe by keyframe.
     page = PAGE.read_text(encoding="utf-8")
@@ -1753,7 +1753,19 @@ def test_a_block_carries_the_shot_it_came_from() -> None:
     from montagewright.webapp import PAGE
 
     page = PAGE.read_text(encoding="utf-8")
-    assert "/source/${b.index}" in page
+    # Addressed by the take now. The position was the bug this test was
+    # written for and then became one of its own: it changes at every cut
+    # even when the next shot comes out of the same file, so the browser
+    # dropped a take it already had and fetched it again under a new name.
+    assert "/source/${encodeURIComponent(b.source_id)}" in page
+    # The endpoint still answers to a position, because a block carries one
+    # and an older page may still ask that way.
+    from montagewright import webapp
+
+    import inspect
+
+    resolve = inspect.getsource(webapp.create_app)
+    assert "which.isdigit()" in resolve
     source = (
         Path(__file__).resolve().parents[1]
         / "src" / "montagewright" / "webapp.py"
@@ -3483,3 +3495,43 @@ def test_the_takes_the_direction_ruled_out_are_accounted_for():
     assert "superseded_by" in ruling
     # And it happens after the direction exists, not before it.
     assert source.index("set_aside: dict[str, str] = {}") < source.index(ruling[:40])
+
+
+def test_the_side_by_side_pane_keeps_its_layout_while_a_take_reloads():
+    """The flash was the page relaying out, not the video going black.
+
+    `width:auto` lays a video out from its own intrinsic size, and a video
+    whose src is being swapped has none -- it falls back to 300x150 until
+    metadata arrives. In a centred flex row that resized both halves and
+    re-centred the pair, so the whole picture area jumped and jumped back at
+    every cut. It never happened on the finished cut because that is one
+    element whose src never changes.
+    """
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+
+    # Each half owns its width whatever the element inside it currently
+    # knows about itself.
+    assert ".frame.both > .half {" in page
+    assert "flex: 1 1 0" in page
+    # And is invisible to layout otherwise, so single-pane mode is unchanged.
+    assert ".frame > .half { display: contents; }" in page
+
+    # A second element to swap to, so crossing a cut does not call load().
+    assert 'id="raw-next"' in page
+    assert "function showTake(" in page and "function warmNext(" in page
+    # Swapped by exchanging which one answers to the visible id, because
+    # everything else on the page looks the take up that way.
+    swap = page[page.index("function showTake("):]
+    swap = swap[: swap.index("\n}\n")]
+    assert "spare.id = 'raw-video'" in swap
+    assert "raw.id = 'raw-next'" in swap
+    # Only reloads when nothing already has it.
+    assert swap.index("spare.getAttribute('src') === want") < swap.index("raw.load()")
+
+    # Listeners are bound to the pane, not to one element: the two swap, and
+    # a listener attached to the element would follow the wrong one.
+    assert "$('raw-video').addEventListener" not in page
+    assert "$('frame').addEventListener" in page

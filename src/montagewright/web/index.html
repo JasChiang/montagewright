@@ -271,6 +271,25 @@
   .frame.both { gap: 14px; }
   .frame.both video { max-width: calc(50% - 7px); }
   .frame.both #video, .frame.both #raw-video { display: block; }
+  /* Side by side, each half owns its width whatever the element inside it
+     currently knows about itself. `width:auto` means a video is laid out
+     from its own intrinsic size, and a video whose source is being swapped
+     has none -- it falls back to 300x150 until metadata arrives. In a
+     centred flex row that resizes both halves and re-centres the pair, so
+     crossing a cut made the whole picture area jump and jump back. Which is
+     why it only ever happened here: the finished cut is one element whose
+     src never changes, so nothing it contains ever stops knowing its size. */
+  /* Invisible to layout until both halves are showing, so single-pane mode
+     is laid out exactly as it was before the wrappers existed. */
+  .frame > .half { display: contents; }
+  .frame.both > .half {
+    flex: 1 1 0; min-width: 0; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .frame.both > .half > video { max-width: 100%; max-height: 100%; }
+  /* Only the one holding the take is doubled, and only one of the pair is
+     ever visible. The other is loading what the next cut needs. */
+  video.waiting { position: absolute; opacity: 0; pointer-events: none; }
   .frame { position: relative; display: flex; align-items: center;
            justify-content: center; width: 100%; height: 100%;
            min-width: 0; min-height: 0; }
@@ -872,8 +891,14 @@
       <div class="screen">
         <div class="over" id="over"></div>
         <div class="frame" id="frame">
-          <video id="video" playsinline></video>
-          <video id="raw-video" playsinline muted preload="auto" class="hide"></video>
+          <div class="half"><video id="video" playsinline></video></div>
+          <div class="half">
+            <video id="raw-video" playsinline muted preload="auto" class="hide"></video>
+            <!-- The take the next cut will want, fetched while this one is
+                 still playing. Swapping to an element that already has its
+                 metadata is the difference between a cut and a blank frame. -->
+            <video id="raw-next" playsinline muted preload="auto" class="waiting"></video>
+          </div>
           <div class="cropbox hide" id="cropbox"></div>
           <div class="burnt hide" id="burnt"></div>
         </div>
@@ -3054,6 +3079,45 @@ function drawCrop() {
   el.dataset.say = cropSays(b, box);
 }
 
+// Addressed by the take, not by the shot's position in the reel. Two shots
+// cut from one file are one URL, so crossing between them loads nothing and
+// the browser's cache can help when the film comes back to a take it has
+// already shown.
+function takeUrl(b) {
+  return b ? `/api/runs/${runId}/source/${encodeURIComponent(b.source_id)}` : '';
+}
+
+// Hand the visible element to the one that has already loaded what is
+// wanted. `load()` empties a video: it loses its picture and its intrinsic
+// size until metadata arrives, which at one to two seconds a shot was a
+// blank frame roughly once a second.
+function showTake(want) {
+  const raw = $('raw-video');
+  if (raw.getAttribute('src') === want) return raw;
+  const spare = $('raw-next');
+  if (spare.getAttribute('src') === want && spare.readyState) {
+    raw.classList.add('waiting');
+    spare.classList.remove('waiting');
+    raw.id = 'raw-next';
+    spare.id = 'raw-video';
+    spare.muted = true;
+    return spare;
+  }
+  raw.setAttribute('src', want);
+  raw.load();
+  return raw;
+}
+
+// Fetch what the next cut will want while this one is still playing.
+function warmNext() {
+  const next = takeUrl(blocks[picked + 1]);
+  const spare = $('raw-next');
+  if (!next || next === takeUrl(blocks[picked])) return;
+  if (spare.getAttribute('src') === next) return;
+  spare.setAttribute('src', next);
+  spare.load();
+}
+
 function peek(on, both) {
   peeking = on;
   beside = !!both;
@@ -3067,14 +3131,10 @@ function peek(on, both) {
   if (!on) { $('cropbox').classList.add('hide'); return; }
   const b = blocks[picked];
   if (!b) return;
-  const raw = $('raw-video');
-  const want = `/api/runs/${runId}/source/${b.index}`;
-  if (raw.getAttribute('src') !== want) {
-    raw.setAttribute('src', want);
-    raw.load();
-  } else if (raw.readyState) {
-    raw.currentTime = b.in_seconds;
-  }
+  const raw = showTake(takeUrl(b));
+  raw.classList.toggle('hide', !on && !both);
+  if (raw.readyState) raw.currentTime = b.in_seconds;
+  warmNext();
   mirrorRaw();
   drawCrop();
 }
@@ -3082,18 +3142,22 @@ function peek(on, both) {
 $('see-cut').addEventListener('click', () => peek(false, false));
 $('see-raw').addEventListener('click', () => peek(true, false));
 $('see-both').addEventListener('click', () => peek(true, true));
-$('raw-video').addEventListener('timeupdate', drawCrop);
+// Bound to the pane rather than to one element, because the two swap places.
+$('frame').addEventListener('timeupdate', event => {
+  if (event.target.id === 'raw-video') drawCrop();
+}, true);
 for (const when of ['loadedmetadata', 'loadeddata', 'seeked', 'canplay']) {
-  $('raw-video').addEventListener(when, () => {
+  $('frame').addEventListener(when, event => {
+    if (event.target.id !== 'raw-video') return;
     const b = blocks[picked];
-    if (when === 'loadedmetadata' && b) $('raw-video').currentTime = b.in_seconds;
+    if (when === 'loadedmetadata') {
+      if (b) event.target.currentTime = b.in_seconds;
+      forgetPlacement();
+    }
     drawCrop();
-  });
+  }, true);
 }
 addEventListener('resize', () => { forgetPlacement(); drawCrop(); });
-$('raw-video').addEventListener('loadedmetadata', () => {
-  forgetPlacement(); drawCrop();
-});
 $('video').addEventListener('loadedmetadata', showBurnt);
 $('video').addEventListener('timeupdate', showBurnt);
 addEventListener('resize', showBurnt);
