@@ -277,6 +277,47 @@ def _concat(
 MUSIC_FADE_SECONDS = 1.5
 
 
+# Long enough to hide a join, short enough that neither side is smeared. A
+# butt splice between two pieces of music clicks even on a phrase line,
+# because the waveform does not happen to be at zero.
+MUSIC_JOIN_SECONDS = 0.12
+
+
+def _spliced(
+    spans: "list[tuple[float, float]]", duration: float
+) -> tuple[str, str]:
+    """Play these pieces of the track in order, joined and trimmed to fit.
+
+    A two-minute piece cut to thirty seconds keeps its shape this way: the
+    opening, the part with the energy, the ending, with the middle taken out.
+    The alternative is half a piece that stops.
+
+    Each piece is taken whole and they are crossfaded into each other, which
+    is the join an editor makes -- a butt splice clicks even on a phrase line,
+    since the waveform is not at zero just because the bar is. What comes out
+    is then trimmed to the picture, so a set of spans that overshoots is
+    shortened rather than refused.
+    """
+
+    parts = []
+    for index, (began, ended) in enumerate(spans):
+        parts.append(
+            f"[1:a]atrim={began:.6f}:{ended:.6f},asetpts=PTS-STARTPTS[m{index}];"
+        )
+    chain = "".join(parts)
+    current = "[m0]"
+    for index in range(1, len(spans)):
+        nxt = f"[j{index}]"
+        chain += (
+            f"{current}[m{index}]acrossfade="
+            f"d={MUSIC_JOIN_SECONDS}:c1=tri:c2=tri{nxt};"
+        )
+        current = nxt
+    # Trailing semicolon belongs to the caller's chain, and the label has to
+    # come off so this reads as one filter run like the simple case does.
+    return chain, f"{current}atrim=0:{duration:.6f},asetpts=PTS-STARTPTS"
+
+
 def _mux_music(
     picture: Path,
     music: Path,
@@ -286,6 +327,7 @@ def _mux_music(
     keep_voice: bool = False,
     under_speech: str = "duck",
     music_from_seconds: float = 0.0,
+    music_spans: "list[tuple[float, float]] | None" = None,
     fade_out_seconds: float = MUSIC_FADE_SECONDS,
 ) -> Path:
     """Lay a music bed under the cut and normalise the result.
@@ -311,7 +353,13 @@ def _mux_music(
     if start > 0.0:
         spare = max(0.0, (probe_duration(music) or 0.0) - duration)
         start = min(start, spare)
-    began = f"atrim={start:.6f}:{start + duration:.6f},asetpts=PTS-STARTPTS"
+    # The bed as one chain ending in [bed], because a spliced one has to
+    # take [1:a] several times and cannot be written as a suffix.
+    if music_spans:
+        before, tail = _spliced(music_spans, duration)
+    else:
+        before = ""
+        tail = f"[1:a]atrim={start:.6f}:{start + duration:.6f},asetpts=PTS-STARTPTS"
     # And it ends rather than stopping. A bed cut off mid-phrase is the most
     # audible thing in a finished cut; a second and a half of fade is what
     # makes it sound like an ending.
@@ -332,7 +380,7 @@ def _mux_music(
         # of the two a cut wants is an editorial call, and it is made by the
         # layer that watched the material rather than by a compressor.
         chain = (
-            f"[1:a]{began}{fade},volume={bed_gain:.2f}dB[bed];"
+            f"{before}{tail}{fade},volume={bed_gain:.2f}dB[bed];"
             f"[0:a]{VOICE_LEVELLER}[voice];"
             "[voice][bed]amix=inputs=2:duration=first:normalize=0,"
             f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
@@ -341,7 +389,7 @@ def _mux_music(
         )
     elif keep_voice:
         chain = (
-            f"[1:a]{began}{fade},volume={bed_gain:.2f}dB[bed];"
+            f"{before}{tail}{fade},volume={bed_gain:.2f}dB[bed];"
             # The voice is the sidechain trigger, not part of the output of
             # this branch -- asplit because one copy steers the compressor
             # and the other is what anyone actually hears.
@@ -356,7 +404,7 @@ def _mux_music(
         )
     else:
         chain = (
-            f"[1:a]{began}{fade},"
+            f"{before}{tail}{fade},"
             f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
             # loudnorm in one pass predicts its true peak rather than
             # measuring it, and overshoots often enough to matter: this cut
@@ -462,6 +510,7 @@ def render(
             video_encoder=video_encoder, keep_voice=keep_voice,
             under_speech=under_speech,
             music_from_seconds=plan.music_from_seconds,
+            music_spans=plan.music_spans or None,
         )
     else:
         shutil.copyfile(picture, deliverable)

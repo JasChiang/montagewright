@@ -518,7 +518,8 @@ def command_render(args: argparse.Namespace) -> int:
     if direction is None:
         ledger.check()
         direction, usage_direction = decide_direction(
-            material, brief=brief, music=args.music, cache=cache, client=client
+            material, brief=brief, music=args.music,
+            seconds=args.seconds, cache=cache, client=client
         )
         ledger.record(
             "direction",
@@ -1335,6 +1336,13 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--music", type=Path)
     render.add_argument("--music-map", type=Path)
     render.add_argument("--aspect", choices=sorted(ASPECTS), default="9:16")
+    render.add_argument(
+        "--seconds", type=float, default=0.0,
+        help="how long the finished cut should be. Without it the direction "
+             "pass picks a length, which is the right default when nobody "
+             "has a slot to fill and the wrong one when they do -- writing "
+             "'make it 15 seconds' in the brief is a request, not a number.",
+    )
     render.add_argument("--sam-checkpoint", type=Path)
     render.add_argument(
         "--budget",

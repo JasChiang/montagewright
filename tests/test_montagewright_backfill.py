@@ -1578,9 +1578,9 @@ def test_the_bed_ends_rather_than_stopping(tmp_path):
     assert MUSIC_FADE_SECONDS > 0
     said = inspect.getsource(_mux_music)
     assert "afade=t=out" in said
-    # Both mixes -- with a voice under it and without -- get the same
-    # treatment, since the one that had neither was the b-roll case.
-    assert said.count("{began}{fade}") >= 2
+    # Every mix gets it -- with a voice under the bed and without -- since
+    # the one that had neither is the b-roll case, which is most of them.
+    assert said.count("{tail}{fade}") >= 2
 
 
 def test_a_start_past_the_end_of_the_track_is_pulled_back():
@@ -1610,3 +1610,81 @@ def test_the_rhythm_pass_is_told_it_can_choose_the_section():
     ).read_text(encoding="utf-8")
     assert "music_from_seconds" in prompt
     assert "intro 就是寫成還沒有能量的" in prompt
+
+
+def test_a_join_lands_on_a_phrase_line(tmp_path):
+    """A splice anywhere else in the bar is audible however clean it is."""
+
+    from montagewright.grounding import BeatGrid, Cue
+
+    grid = BeatGrid(
+        bpm=117, meter=4, duration_seconds=155.0,
+        cues=(
+            Cue("section-001", 16.4, "section_boundary"),
+            Cue("section-002", 57.9, "section_boundary"),
+        ),
+    )
+
+    # A boundary the analyser actually found wins over the grid, because it
+    # is where the music itself changes.
+    assert grid.on_phrase(15.0) == 16.4
+    assert grid.on_phrase(58.5) == 57.9
+    # With nothing near, it lands on a four-bar line.
+    span = grid.phrase_seconds()
+    assert abs(grid.on_phrase(100.0) % span) < 0.01
+
+
+def test_pieces_of_the_track_are_played_in_order_and_cut_to_the_picture(tmp_path):
+    """Three spans of a real track render, joined, at the picture's length.
+
+    A chain that parses is not a chain that produces audio -- the first
+    version read `[1:a][1:a]atrim=`, because a spliced bed takes its input
+    more than once and cannot be written as a suffix on one label.
+    """
+
+    import subprocess
+
+    from montagewright.renderer import _mux_music, _spliced
+
+    before, tail = _spliced([(1.0, 3.0), (6.0, 8.0)], 3.0)
+    assert before.count("[1:a]") == 2
+    assert "acrossfade" in before
+    assert tail.startswith("[j1]")
+
+    music = tmp_path / "track.wav"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "sine=f=330:d=12:r=48000", str(music)], check=True,
+    )
+    picture = tmp_path / "pic.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "color=c=black:s=160x90:r=25:d=3",
+         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "3",
+         "-c:v", "libx264", "-c:a", "aac", "-shortest", str(picture)],
+        check=True,
+    )
+    made = tmp_path / "out.mp4"
+    _mux_music(picture, music, made, video_encoder="libx264",
+               music_spans=[(1.0, 3.0), (6.0, 8.0)])
+
+    got = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(made)],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert abs(float(got) - 3.0) < 0.2
+
+
+def test_a_length_the_caller_fixed_is_not_a_length_to_decide():
+    # Writing "make it 15 seconds" in the brief is a request the direction
+    # pass weighs; --seconds is the slot the film has to fit.
+    import inspect
+
+    from montagewright.planner import decide_direction
+
+    said = inspect.getsource(decide_direction)
+    assert "這支片就是" in said
+    # Overwritten rather than trusted: a pass that occasionally does not
+    # repeat the number would silently change the film's length.
+    assert 'decided["target_seconds"] = seconds' in said

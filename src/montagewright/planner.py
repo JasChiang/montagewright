@@ -100,6 +100,34 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
         "additionalProperties": False,
         "required": ["decisions"],
         "properties": {
+            "music_spans": {
+                "type": "array",
+                "description": (
+                    "Pieces of the track to play in order, when one "
+                    "continuous stretch will not do. A two-minute piece cut "
+                    "to thirty seconds keeps its shape this way: the opening, "
+                    "then the part with the energy, then the ending, with the "
+                    "middle taken out -- rather than half a piece that stops. "
+                    "Each entry is where to start and where to leave, in "
+                    "seconds of the file.\n"
+                    "Local code moves every edge onto a phrase line, because "
+                    "a join anywhere else in the bar is audible however clean "
+                    "the splice, and crossfades briefly across it. It also "
+                    "trims or pads what you give to the length of the "
+                    "picture. Leave this out for one continuous stretch and "
+                    "use `music_from_seconds` instead -- most cuts want that, "
+                    "and every join is a risk."
+                ),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["from_seconds", "to_seconds"],
+                    "properties": {
+                        "from_seconds": {"type": "number"},
+                        "to_seconds": {"type": "number"},
+                    },
+                },
+            },
             "music_from_seconds": {
                 "type": "number",
                 "description": (
@@ -464,7 +492,11 @@ def decide_rhythm(
         )
 
     return (
-        _apply(edl, decisions, payload.get("music_from_seconds")),
+        _apply(
+            edl, decisions,
+            payload.get("music_from_seconds"),
+            payload.get("music_spans"),
+        ),
         Usage.from_interaction(interaction),
     )
 
@@ -473,6 +505,7 @@ def _apply(
     edl: EDL,
     decisions: dict[str, dict[str, Any]],
     music_from: Any = None,
+    music_spans: Any = None,
 ) -> EDL:
     rewritten: list[Clip] = []
     for clip in edl.clips:
@@ -498,6 +531,16 @@ def _apply(
         start = 0.0
     if start > 0.0:
         update["music_from_seconds"] = round(start, 3)
+    spans = []
+    for one in music_spans or []:
+        try:
+            began, ended = float(one["from_seconds"]), float(one["to_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ended > began >= 0.0:
+            spans.append((round(began, 3), round(ended, 3)))
+    if spans:
+        update["music_spans"] = spans
     return edl.model_copy(update=update)
 
 
@@ -988,6 +1031,7 @@ def decide_direction(
     *,
     brief: str,
     music: Path | None = None,
+    seconds: float = 0.0,
     cache: UploadCache | None = None,
     client: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
@@ -1002,11 +1046,19 @@ def decide_direction(
         client = _default_client()
 
     prompt = (PROMPTS / "direction_zh-TW.txt").read_text(encoding="utf-8")
+    # A length somebody asked for is not a length to decide. Writing "make it
+    # 15 seconds" in the brief is a request the direction pass weighs against
+    # everything else; this is the slot the film has to fit.
+    fixed = (
+        f"## 片長\n\n這支片就是 {seconds:g} 秒，不是你要決定的事。"
+        f"`target_seconds` 填 {seconds:g}，其他決定都在這個長度裡面做。\n\n"
+        if seconds > 0 else ""
+    )
     request_input: list[dict[str, Any]] = [
         {
             "type": "text",
             "text": (
-                f"{prompt}\n\n## 剪輯 brief\n\n{brief}\n\n"
+                f"{prompt}\n\n{fixed}## 剪輯 brief\n\n{brief}\n\n"
                 f"## 執行層做得到什麼\n\n{describe_for_prompt()}\n\n"
                 f"## 素材\n\n以下 {len(material)} 支，每一支的說明就寫在它自己那段影片前面。\n"
             ),
@@ -1030,9 +1082,13 @@ def decide_direction(
             "schema": _direction_schema(),
         },
     )
-    return _parse(interaction, what="direction pass"), Usage.from_interaction(
-        interaction
-    )
+    decided = _parse(interaction, what="direction pass")
+    if seconds > 0:
+        # Overwritten rather than trusted. It is told the number and mostly
+        # repeats it; a pass that occasionally does not would silently make
+        # the film a different length than the one that was asked for.
+        decided["target_seconds"] = seconds
+    return decided, Usage.from_interaction(interaction)
 
 
 def _selection_schema(source_ids: list[str]) -> dict[str, Any]:

@@ -146,6 +146,7 @@ class RenderPlan:
     # Where in the track the bed starts, carried from the EDL so the renderer
     # does not have to know about planning to lay music that is not the intro.
     music_from_seconds: float = 0.0
+    music_spans: list[tuple[float, float]] = field(default_factory=list)
     degradations: list[DegradationStep] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -265,6 +266,7 @@ def plan_render(
         notes=notes,
         output_size=output_size or delivery_size(target_aspect or 9 / 16),
         music_from_seconds=getattr(edl, "music_from_seconds", 0.0),
+        music_spans=list(getattr(edl, "music_spans", []) or []),
     )
 
 

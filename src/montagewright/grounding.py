@@ -60,6 +60,33 @@ class BeatGrid:
     def cuttable(self) -> tuple[Cue, ...]:
         return tuple(cue for cue in self.cues if cue.kind in CUTTABLE)
 
+    def phrase_seconds(self, bars: int = 4) -> float:
+        """How long a musical phrase runs, in seconds.
+
+        Four bars by default, which is what most popular music is built in.
+        A join anywhere else in the bar is audible however clean the splice.
+        """
+
+        return self.seconds_per_beat * self.meter * max(1, bars)
+
+    def on_phrase(self, seconds: float, *, bars: int = 4) -> float:
+        """The nearest phrase line to this moment.
+
+        Where a cut inside the music has to land. A section boundary is
+        better still when there is one close by -- the analyser found those
+        from energy, so they are where the music itself changes -- and this
+        falls back to the grid when there is not.
+        """
+
+        near = [
+            point for point in self.named_points.values()
+            if abs(point - seconds) <= self.phrase_seconds(bars) / 2
+        ]
+        if near:
+            return min(near, key=lambda point: abs(point - seconds))
+        span = self.phrase_seconds(bars)
+        return round(max(0.0, round(seconds / span) * span), 3)
+
     def nearest_cue(self, seconds: float) -> Cue | None:
         candidates = self.cuttable()
         if not candidates:

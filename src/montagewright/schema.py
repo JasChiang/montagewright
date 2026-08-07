@@ -478,6 +478,9 @@ class EDL(ModelFacing):
     # -- written to have no energy yet, so the picture carried the film on
     # its own. Decided by the rhythm pass, which can hear the track.
     music_from_seconds: float = 0.0
+    # Pieces of the track played in order, when one stretch will not carry
+    # the film. Every edge gets moved onto a phrase line before it is used.
+    music_spans: list[tuple[float, float]] = Field(default_factory=list)
     style_decision: StyleDecision | None = Field(
         default=None,
         description=(
