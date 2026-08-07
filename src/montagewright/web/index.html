@@ -2904,10 +2904,32 @@ function across(centre) {
   return '偏右';
 }
 
+// What the boxes actually did, read off the keyframes rather than off the
+// plan. This label used to print `camera_move`, which is what was asked
+// for -- so a pan that degraded to a hold drew a motionless box captioned
+// 橫搖, in the one view whose entire job is checking whether the move
+// happened. The plan is still worth showing when the two disagree, because
+// that gap is the interesting part; it is just not the headline.
+function cropDid(keys) {
+  if (!keys || keys.length < 2) return 'hold';
+  const first = keys[0];
+  const last = keys[keys.length - 1];
+  const zoom = first.w / last.w;
+  if (zoom > 1.03) return 'push_in';
+  if (zoom < 0.97) return 'pull_out';
+  const movedX = Math.abs((last.x + last.w / 2) - (first.x + first.w / 2));
+  const movedY = Math.abs((last.y + last.h / 2) - (first.y + first.h / 2));
+  if (movedX < 0.01 && movedY < 0.01) return 'hold';
+  return movedY > movedX ? 'tilt' : 'pan';
+}
+
 function cropSays(b, box) {
-  const move = (cropsAre === 'rebuilt' ? '推測 ' : '')
-    + (MOVES[b.camera_move] || b.camera_move || '定住');
   const keys = b.crop || [];
+  const did = cropDid(keys);
+  const planned = b.camera_move || 'hold';
+  let move = MOVES[did] || did;
+  if (planned !== did) move += `（計畫${MOVES[planned] || planned}）`;
+  if (cropsAre === 'rebuilt') move = '推測 ' + move;
   const here = across(box.x + box.w / 2);
   if (keys.length < 2) return `${move}　${here}`;
   const from = across(keys[0].x + keys[0].w / 2);

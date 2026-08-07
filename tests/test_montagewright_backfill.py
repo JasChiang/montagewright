@@ -719,3 +719,44 @@ def test_selection_is_told_what_to_do_with_them():
 
     assert "景別太接近會跳" in prompt
     assert "銀幕方向" in prompt or "朝向決定" in prompt
+
+
+def test_the_overlay_reports_the_move_that_happened():
+    """The crop overlay exists to check whether the move happened.
+
+    It printed `camera_move`, which is what was asked for -- so a pan that
+    degraded to a hold drew a motionless box captioned 橫搖, in the one view
+    whose whole job is catching exactly that.
+    """
+
+    from pathlib import Path
+
+    page = (
+        Path(__file__).resolve().parents[1] / "src" / "montagewright"
+        / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    assert "function cropDid(" in page
+    # The label is built from what the keyframes did, and only mentions the
+    # plan when the two disagree.
+    assert "const did = cropDid(keys);" in page
+    assert "if (planned !== did)" in page
+
+
+def test_selection_is_told_a_row_needs_two_endpoints():
+    """A pan with one static subject is the one combination that cannot work.
+
+    The prompt advised `pan` for a subject too wide to frame without saying
+    it needs both ends named, so a row of watches came back as one subject,
+    could not be followed, and rendered as a hold.
+    """
+
+    from pathlib import Path
+
+    prompt = (
+        Path(__file__).resolve().parents[1] / "src" / "montagewright"
+        / "prompts" / "selection_zh-TW.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "then_subject" in prompt
+    assert "就要給兩個端點" in prompt
