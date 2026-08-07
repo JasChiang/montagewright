@@ -58,6 +58,63 @@ class BeatGrid:
     def seconds_per_beat(self) -> float:
         return 60.0 / self.bpm
 
+    def as_heard(
+        self,
+        music_from_seconds: float = 0.0,
+        music_spans: "list[tuple[float, float]] | None" = None,
+    ) -> "BeatGrid":
+        """The same music, timed against the film instead of the file.
+
+        Grounding counts from zero at the first frame and asks this grid
+        where the nearest musical event is. The cues are stamped in the
+        track's own time, and the bed does not have to start at the track's
+        beginning -- the rhythm pass is told outright that a thirty-second
+        cut rarely wants the first thirty seconds of a two-minute piece.
+
+        Nothing joined the two. Pick a start of 0:30 and the film's fourth
+        second was matched against the track's fourth second while the
+        thirty-fourth was playing, so every cut was placed against music that
+        was not sounding. It never showed because the pass has so far always
+        left the start at zero -- and the field exists to be moved.
+
+        A cue that is not in what gets played is dropped rather than shifted
+        to where it would have been. It is not audible, so it is not a place
+        to cut.
+        """
+
+        spans = [
+            (float(a), float(b)) for a, b in (music_spans or [])
+            if float(b) > float(a)
+        ]
+        if not spans:
+            first = max(0.0, float(music_from_seconds))
+            if first <= 0.0:
+                return self
+            spans = [(first, first + self.duration_seconds)]
+
+        moved: list[Cue] = []
+        played = 0.0
+        for begins, ends in spans:
+            for cue in self.cues:
+                if begins - 1e-6 <= cue.time_seconds <= ends + 1e-6:
+                    moved.append(
+                        Cue(
+                            cue_id=cue.cue_id,
+                            time_seconds=round(
+                                played + cue.time_seconds - begins, 6
+                            ),
+                            kind=cue.kind,
+                            strength=cue.strength,
+                        )
+                    )
+            played += ends - begins
+        return BeatGrid(
+            bpm=self.bpm,
+            meter=self.meter,
+            cues=tuple(sorted(moved, key=lambda one: one.time_seconds)),
+            duration_seconds=played,
+        )
+
     @property
     def named_points(self) -> dict[str, float]:
         """Section names the planner may target by name."""
@@ -376,6 +433,15 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
     """
 
     grounded: list[GroundedClip] = []
+    # The grid measured the file; grounding counts from the first frame. When
+    # the bed does not start at the track's beginning those are two different
+    # clocks, and every cue lookup below is in film time.
+    if grid is not None:
+        grid = grid.as_heard(
+            getattr(edl, "music_from_seconds", 0.0),
+            list(getattr(edl, "music_spans", []) or []),
+        )
+
     cursor = 0.0
 
     for clip in edl.clips:

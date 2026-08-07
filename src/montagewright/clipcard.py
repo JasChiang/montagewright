@@ -702,18 +702,27 @@ def describe_clip(
     prompts = Path(__file__).resolve().parent / "prompts"
     instruction = (prompts / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
 
-    # The card asks for "the whole length" without ever saying what it is, and
-    # the model reads video in MM:SS -- so it was converting a notation it was
-    # never told to convert, against a total it had to guess. Both are stated
-    # here now, and checked again on receipt.
+    # The card asks for "the whole length" without ever saying what it is, so
+    # the total is stated here rather than guessed at.
+    #
+    # This used to end by demanding plain seconds -- "1 分 53 秒要寫 113.0" --
+    # which was right when the card took numbers and became the exact
+    # opposite of the truth the day it took clock readings. It is appended
+    # after the prompt file, so it was the last thing the model read, and a
+    # model that obeyed it would have had every segment refused by
+    # `seconds_of` (a decimal with no colon is two readings, so it is not
+    # taken) and the card would have fallen back to "the whole take stands".
+    # Segmentation would have switched itself off in silence. It did not
+    # happen because the field descriptions won, which is luck rather than
+    # design.
     duration = clip_seconds(proxy)
     if duration > 0:
+        minutes = int(duration) // 60
         instruction += (
             f"\n\n## 這支素材的長度\n\n"
-            f"{duration:.1f} 秒（也就是 {int(duration) // 60}:"
-            f"{duration - 60 * (int(duration) // 60):04.1f}）。\n"
-            f"所有秒數欄位都要填**從頭算起的純秒數**，不要用「分:秒」。"
-            f"例如 1 分 53 秒要寫 113.0，不能寫 1.53 也不能寫 153。\n"
+            f"{minutes}:{duration - 60 * minutes:04.1f}"
+            f"（{duration:.1f} 秒）。\n"
+            f"時間一律寫成 MM:SS，最後一段要到這裡為止。\n"
         )
 
     if cache is None:

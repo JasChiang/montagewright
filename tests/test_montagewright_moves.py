@@ -4323,3 +4323,59 @@ def test_a_named_music_point_is_actually_resolved():
     ])
     second = ground_timeline(late, grid).clips[1]
     assert "before this shot begins" in (second.note or "")
+
+
+def test_cuts_are_placed_against_the_music_that_is_playing():
+    """The grid measures the file; grounding counts from the first frame.
+
+    Those are the same clock only when the bed starts at the track's
+    beginning, and the rhythm pass is told outright that a thirty-second cut
+    rarely wants the first thirty seconds of a two-minute piece. Pick 0:30 and
+    the film's fourth second was matched against the track's fourth second
+    while the thirty-fourth was sounding -- every cut placed against music
+    nobody could hear. It never showed because that field has so far always
+    been left at zero, and it exists to be moved.
+    """
+
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.schema import EDL, Clip, MusicSync
+
+    # A downbeat every two seconds, for a minute.
+    grid = BeatGrid(bpm=120.0, meter=4, duration_seconds=60.0, cues=tuple(
+        Cue(cue_id=f"d{i:02d}", time_seconds=i * 2.0, kind="downbeat")
+        for i in range(30)
+    ))
+
+    def film(music_from=0.0, spans=None):
+        edl = EDL(project_id="p", clips=[Clip(
+            clip_id="k00", source_id="C1", approx_in_seconds=0.0,
+            approx_out_seconds=4.2, music_sync=MusicSync(cut_on_beat=True),
+        )])
+        if music_from:
+            edl = edl.model_copy(update={"music_from_seconds": music_from})
+        if spans:
+            edl = edl.model_copy(update={"music_spans": spans})
+        return ground_timeline(edl, grid).clips[0]
+
+    # From the top, 4.2s lands on the downbeat at 4.0.
+    assert abs(film().duration_seconds - 4.0) < 1e-6
+
+    # Starting the bed at 30.5s, the film's downbeats fall on the half
+    # second: what is heard at film time 3.5 is the track's 34.0.
+    shifted = film(music_from=30.5)
+    assert abs(shifted.duration_seconds - 3.5) < 1e-6
+
+    # A cue outside what gets played is not a place to cut, because it is
+    # not audible -- so it is dropped rather than moved to where it would
+    # have been.
+    heard = grid.as_heard(30.5)
+    assert min(c.time_seconds for c in heard.cues) >= 0.0
+    assert heard.duration_seconds > 0
+
+    # Spliced music maps through the joins in order.
+    joined = grid.as_heard(0.0, [(10.0, 14.0), (40.0, 44.0)])
+    assert joined.duration_seconds == 8.0
+    # The track's 40.0 is the fourth second of the film.
+    assert any(abs(c.time_seconds - 4.0) < 1e-6 for c in joined.cues)
+    # And nothing from the discarded middle survives.
+    assert not any(14.0 < c.time_seconds < 40.0 for c in joined.cues)
