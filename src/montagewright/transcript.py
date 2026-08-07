@@ -658,15 +658,35 @@ def describe(
                 "type": "video",
                 "mime_type": "video/mp4",
                 "uri": uri,
-                # The one pass that has to read small print. It is told to
-                # take product names, model numbers and anything on a screen
-                # from the picture rather than from memory, and at low each
-                # frame is capped at seventy tokens -- not enough to read a
-                # model number off a display. Video is sampled at one frame a
-                # second whatever is sent, so the whole difference on a
-                # twenty-second interview is about four thousand tokens, and
-                # only clips whose speech is content ever come through here.
-                "resolution": "high",
+                # Low, deliberately, and this has been argued once already.
+                #
+                # The picture is here mostly for `speaker`: who is saying
+                # this line, described by how they look. That is not a note
+                # -- selection is told to put the frame on whoever is
+                # speaking, using the same words, because a talking shot
+                # framed on the person not talking is the most obvious error
+                # this makes. Telling a hat from a microphone from a
+                # grey-blue shirt does not need detail.
+                #
+                # The one job that does is reading small print off a screen,
+                # for the product names and model numbers the prompt says to
+                # take from the picture rather than from memory. High
+                # quadruples the cap on each frame, from seventy tokens to
+                # two hundred and eighty, and video is sampled at one frame a
+                # second however long the clip is: measured across the seven
+                # pieces of one 326-second interview that is 22,610 tokens
+                # against 90,440, so about ten cents a run rather than the
+                # four thousand tokens a short clip suggested.
+                #
+                # And it would buy nothing on either batch to hand. Material
+                # with wordmarks and model numbers on screen is product
+                # footage, whose speech is rarely content, so it never
+                # reaches this pass at all; the material that does reach it
+                # is people talking outdoors with no text in frame. Worth
+                # revisiting for a clip that is both, which would want the
+                # card to record whether there is text on screen so this can
+                # be asked per clip instead of guessed for all of them.
+                "resolution": "low",
             },
             {
                 "type": "text",
