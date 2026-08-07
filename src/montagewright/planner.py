@@ -100,6 +100,22 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
         "additionalProperties": False,
         "required": ["decisions"],
         "properties": {
+            "music_from_seconds": {
+                "type": "number",
+                "description": (
+                    "Where in the track this film should sit, in seconds "
+                    "from the start of the file. A thirty-second cut almost "
+                    "never wants the first thirty seconds of a two-minute "
+                    "piece -- an intro is written to have no energy yet, and "
+                    "using it means the picture carries the whole film "
+                    "alone. Pick the part with the energy this cut needs, "
+                    "usually a section boundary the analysis found. Local "
+                    "code takes exactly as much as the picture is long from "
+                    "wherever you point, and will not run past the end of "
+                    "the track. Leave 0 only when the opening really is "
+                    "where this film should start."
+                ),
+            },
             "decisions": {
                 "type": "array",
                 "items": {
@@ -447,10 +463,17 @@ def decide_rhythm(
             "length"
         )
 
-    return _apply(edl, decisions), Usage.from_interaction(interaction)
+    return (
+        _apply(edl, decisions, payload.get("music_from_seconds")),
+        Usage.from_interaction(interaction),
+    )
 
 
-def _apply(edl: EDL, decisions: dict[str, dict[str, Any]]) -> EDL:
+def _apply(
+    edl: EDL,
+    decisions: dict[str, dict[str, Any]],
+    music_from: Any = None,
+) -> EDL:
     rewritten: list[Clip] = []
     for clip in edl.clips:
         decision = decisions[clip.clip_id]
@@ -468,7 +491,14 @@ def _apply(edl: EDL, decisions: dict[str, dict[str, Any]]) -> EDL:
                 }
             )
         )
-    return edl.model_copy(update={"clips": rewritten})
+    update: dict[str, Any] = {"clips": rewritten}
+    try:
+        start = float(music_from)
+    except (TypeError, ValueError):
+        start = 0.0
+    if start > 0.0:
+        update["music_from_seconds"] = round(start, 3)
+    return edl.model_copy(update=update)
 
 
 def _parse(interaction: Any, *, what: str) -> dict[str, Any]:

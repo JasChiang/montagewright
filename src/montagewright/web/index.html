@@ -524,17 +524,21 @@
      their height, because a taller waveform says nothing a shorter one does
      not. Beyond that the space stays empty rather than stretching anything. */
   .track {
-    position: relative; flex: 1 1 auto; min-height: 76px; max-height: 340px;
+    position: relative; flex: 1 1 auto; min-height: 104px; max-height: 340px;
     background: var(--sunk); border-bottom: 1px solid var(--hair);
   }
   /* The frame it starts on, behind its own name. A row of identical boxes
      tells you nothing about the film; a row of pictures is the film. */
+  /* Butt-joined, the way clips sit in a sequence. They had a 2px gap and
+     rounded corners, which draws a continuous cut as though it had holes in
+     it -- and a gap in a timeline means something specific. The join is a
+     line, not a space. */
   .blk {
-    position: absolute; top: 3px; bottom: 3px; overflow: hidden; cursor: pointer;
+    position: absolute; top: 0; bottom: 0; overflow: hidden; cursor: pointer;
     background: var(--panel) center/cover no-repeat;
-    border: 1px solid var(--line);
+    border-right: 1px solid var(--sunk);
     border-left: 2px solid color-mix(in srgb, var(--ok) 60%, transparent);
-    border-radius: 4px; padding: 5px 7px; transition: box-shadow .1s;
+    padding: 5px 7px; transition: box-shadow .1s;
   }
   /* Text over a photograph needs its own ground to stand on. */
   .blk::before {
@@ -564,6 +568,17 @@
     font-family: var(--mono); font-size: 9.5px;
     color: rgba(255,255,255,.85); text-shadow: 0 1px 2px rgba(0,0,0,.7);
   }
+  /* Where the frame stops, on the clip. An editing application draws
+     keyframes on the clip that carries them, and a shot settling on three
+     watches in turn looked identical here to one that never moves. */
+  .blk .stops {
+    position: absolute; left: 7px; right: 7px; bottom: 4px;
+    display: flex; justify-content: space-between; pointer-events: none;
+  }
+  .blk .stops i {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: rgba(255,255,255,.9); box-shadow: 0 0 3px rgba(0,0,0,.6);
+  }
   .blk .grip { position: absolute; top: 0; bottom: 0; width: 8px; cursor: ew-resize; }
   .blk .grip.l { left: -1px } .blk .grip.r { right: -1px }
   .blk .grip:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
@@ -574,17 +589,26 @@
   }
   .blk:hover .kill { display: grid; }
   .lane {
-    position: relative; height: 40px; flex: 0 0 auto;
+    position: relative; height: 30px; flex: 0 0 auto;
     background: var(--sunk); border-bottom: 1px solid var(--hair);
   }
   .lane:last-of-type { border-bottom: 0; }
-  .lane .name {
-    position: absolute; left: 7px; top: 2px; z-index: 3; font-size: 9.5px;
-    color: var(--dim); background: var(--sunk); padding: 0 4px; border-radius: 3px;
-    pointer-events: none;
+  /* Every track says what it is. The video track said nothing at all, so
+     the only labelled things on the timeline were the two that happen to
+     have waveforms. A full header column would have to sit outside the
+     horizontal scroll, which is a bigger change than the gap it closes. */
+  .lane .name, .track .name {
+    position: absolute; left: 0; top: 0; z-index: 6;
+    font-size: 9.5px; color: var(--dim); pointer-events: none;
+    background: var(--panel); border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line); border-radius: 0 0 3px 0;
+    padding: 1px 6px;
   }
   .lane img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .5; }
-  .lane.silent { display: grid; place-items: center; font-size: 10.5px; color: var(--dim); }
+  /* An empty track in an editing application is empty. This centred a
+     sentence across the whole lane, which reads as content. */
+  .lane.silent { background: var(--sunk); }
+  .lane.silent .name { color: color-mix(in srgb, var(--dim) 60%, transparent); }
   .lane.subs { height: 44px; }
   /* Every other lane draws a waveform behind its name. This one draws
      opaque blocks, and the first line of a cut usually starts at zero. */
@@ -1555,7 +1579,8 @@ function paintSubs() {
   const lane = $('lane-subs');
   lane.classList.toggle('silent', !subs.length);
   if (!subs.length) {
-    lane.innerHTML = '這支片沒有語音，所以沒有字幕';
+    lane.innerHTML = '<span class="name">字幕</span>';
+    lane.classList.add('silent');
     return;
   }
   lane.innerHTML = `<span class="name">字幕</span>` + subs.map((line, i) => {
@@ -1681,7 +1706,8 @@ function paintWaves(total) {
     };
     img.onerror = () => {
       lane.classList.add('silent');
-      lane.innerHTML = which === 'voice' ? '這支片沒有保留原音' : '這支片沒有配樂';
+      lane.innerHTML =
+        `<span class="name">${which === 'voice' ? '人聲' : '音樂'}</span>`;
     };
     img.src = `/api/runs/${runId}/waveform/${which}?width=${width}`;
   }
@@ -1691,11 +1717,11 @@ function paintStrip() {
   const total = reelSeconds();
   paintRuler(total);
   let at = 0;
-  $('track').innerHTML = blocks.map((b, i) => {
+  $('track').innerHTML = '<span class="name">畫面</span>' + blocks.map((b, i) => {
     const left = at * scale; at += b.seconds;
     return `
     <div class="blk ${b.delivered === false ? 'no' : ''} ${i === picked ? 'on' : ''}"
-         style="left:${left}px;width:${b.seconds * scale - 2}px;
+         style="left:${left}px;width:${b.seconds * scale}px;
                 background-image:url(/api/runs/${runId}/thumb/${b.index})"
          data-i="${i}" draggable="true"
          title="${esc(b.source_id)}　${esc(b.subject)}">
@@ -1704,6 +1730,9 @@ function paintStrip() {
       <div class="dur">${b.seconds.toFixed(1)}s${
         b.gain_db ? ` ${b.gain_db > 0 ? '+' : ''}${b.gain_db.toFixed(1)}dB` : ''
       }</div>
+      ${(b.looks && b.looks.length > 1) ? `<div class="stops">${
+        b.looks.map(() => '<i></i>').join('')
+      }</div>` : ''}
       <div class="kill" data-kill="${i}">×</div>
       <div class="grip r" data-edge="r" data-i="${i}"></div>
     </div>`;

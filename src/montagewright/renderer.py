@@ -271,6 +271,12 @@ def _concat(
     return destination
 
 
+# Long enough to read as an ending rather than a glitch, short enough not to
+# eat the last shot. A bed that simply stops mid-phrase is the most audible
+# thing in an otherwise finished cut.
+MUSIC_FADE_SECONDS = 1.5
+
+
 def _mux_music(
     picture: Path,
     music: Path,
@@ -279,6 +285,8 @@ def _mux_music(
     video_encoder: str,
     keep_voice: bool = False,
     under_speech: str = "duck",
+    music_from_seconds: float = 0.0,
+    fade_out_seconds: float = MUSIC_FADE_SECONDS,
 ) -> Path:
     """Lay a music bed under the cut and normalise the result.
 
@@ -296,6 +304,22 @@ def _mux_music(
     """
 
     duration = probe_duration(picture)
+    # From wherever the rhythm pass pointed, not from zero. Taking the first
+    # thirty seconds of a two-minute track means scoring the film with the
+    # intro, which is written to have no energy yet.
+    start = max(0.0, float(music_from_seconds))
+    if start > 0.0:
+        spare = max(0.0, (probe_duration(music) or 0.0) - duration)
+        start = min(start, spare)
+    began = f"atrim={start:.6f}:{start + duration:.6f},asetpts=PTS-STARTPTS"
+    # And it ends rather than stopping. A bed cut off mid-phrase is the most
+    # audible thing in a finished cut; a second and a half of fade is what
+    # makes it sound like an ending.
+    fade = (
+        f",afade=t=out:st={max(0.0, duration - fade_out_seconds):.3f}"
+        f":d={min(fade_out_seconds, duration):.3f}"
+        if fade_out_seconds > 0.0 else ""
+    )
     bed_gain = (
         _level(picture) - _level(music) - BED_BELOW_VOICE_DB
         if keep_voice
@@ -308,7 +332,7 @@ def _mux_music(
         # of the two a cut wants is an editorial call, and it is made by the
         # layer that watched the material rather than by a compressor.
         chain = (
-            f"[1:a]atrim=0:{duration:.6f},volume={bed_gain:.2f}dB[bed];"
+            f"[1:a]{began}{fade},volume={bed_gain:.2f}dB[bed];"
             f"[0:a]{VOICE_LEVELLER}[voice];"
             "[voice][bed]amix=inputs=2:duration=first:normalize=0,"
             f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
@@ -317,7 +341,7 @@ def _mux_music(
         )
     elif keep_voice:
         chain = (
-            f"[1:a]atrim=0:{duration:.6f},volume={bed_gain:.2f}dB[bed];"
+            f"[1:a]{began}{fade},volume={bed_gain:.2f}dB[bed];"
             # The voice is the sidechain trigger, not part of the output of
             # this branch -- asplit because one copy steers the compressor
             # and the other is what anyone actually hears.
@@ -332,7 +356,7 @@ def _mux_music(
         )
     else:
         chain = (
-            f"[1:a]atrim=0:{duration:.6f},"
+            f"[1:a]{began}{fade},"
             f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
             # loudnorm in one pass predicts its true peak rather than
             # measuring it, and overshoots often enough to matter: this cut
@@ -437,6 +461,7 @@ def render(
             picture, music, deliverable,
             video_encoder=video_encoder, keep_voice=keep_voice,
             under_speech=under_speech,
+            music_from_seconds=plan.music_from_seconds,
         )
     else:
         shutil.copyfile(picture, deliverable)

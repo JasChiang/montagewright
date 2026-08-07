@@ -473,6 +473,11 @@ class EDL(ModelFacing):
 
     edl_version: Literal["montagewright-edl-v1"] = "montagewright-edl-v1"
     project_id: str
+    # Where in the track this film sits. A thirty-second cut of a two-minute
+    # piece used to always take the first thirty seconds, which is the intro
+    # -- written to have no energy yet, so the picture carried the film on
+    # its own. Decided by the rhythm pass, which can hear the track.
+    music_from_seconds: float = 0.0
     style_decision: StyleDecision | None = Field(
         default=None,
         description=(

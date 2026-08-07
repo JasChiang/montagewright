@@ -1508,3 +1508,105 @@ def test_the_music_lane_is_drawn_over_the_span_the_cut_uses(tmp_path):
         "the cut's own length has to be measured before the report is "
         "consulted, because a crashed run has a film and no report"
     )
+
+
+# --- the music is edited too --------------------------------------------
+
+def test_the_bed_starts_where_the_rhythm_pass_pointed(tmp_path):
+    """A 30s cut of a 2m35s track always took the first 30 seconds.
+
+    Which is the intro -- written to have no energy yet -- so the picture
+    carried the whole film alone, and no amount of pacing helped because
+    there was nothing underneath it.
+    """
+
+    import subprocess
+
+    from montagewright.renderer import _mux_music
+
+    music = tmp_path / "track.wav"
+    # Silent for the first eight seconds, then a tone. Silence rather than a
+    # quiet intro because the chain ends in loudnorm, which pulls any two
+    # real signals to the same loudness -- the first version of this test
+    # measured -13.1 dB either way and proved nothing.
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=8",
+         "-f", "lavfi", "-i", "sine=f=220:d=8:r=48000",
+         "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
+         str(music)],
+        check=True,
+    )
+    picture = tmp_path / "pic.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "color=c=black:s=160x90:r=25:d=4",
+         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "4",
+         "-c:v", "libx264", "-c:a", "aac", "-shortest", str(picture)],
+        check=True,
+    )
+
+    def loudness(path):
+        out = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-t", "2", "-i", str(path),
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        line = next(l for l in out.stderr.splitlines() if "mean_volume" in l)
+        return float(line.split("mean_volume:")[1].split("dB")[0])
+
+    intro = tmp_path / "from-intro.mp4"
+    chorus = tmp_path / "from-chorus.mp4"
+    _mux_music(picture, music, intro, video_encoder="libx264",
+               music_from_seconds=0.0, fade_out_seconds=0.0)
+    _mux_music(picture, music, chorus, video_encoder="libx264",
+               music_from_seconds=9.0, fade_out_seconds=0.0)
+
+    # Starting at zero scores the film with the silence; starting at nine
+    # scores it with the tone.
+    assert loudness(intro) < -60.0
+    assert loudness(chorus) > -30.0
+
+
+def test_the_bed_ends_rather_than_stopping(tmp_path):
+    # A track cut off mid-phrase is the most audible thing in an otherwise
+    # finished cut.
+    import inspect
+
+    from montagewright.renderer import MUSIC_FADE_SECONDS, _mux_music
+
+    assert MUSIC_FADE_SECONDS > 0
+    said = inspect.getsource(_mux_music)
+    assert "afade=t=out" in said
+    # Both mixes -- with a voice under it and without -- get the same
+    # treatment, since the one that had neither was the b-roll case.
+    assert said.count("{began}{fade}") >= 2
+
+
+def test_a_start_past_the_end_of_the_track_is_pulled_back():
+    # Pointing at 2:00 of a 2:35 track for a 60s cut would run off the end.
+    import inspect
+
+    from montagewright.renderer import _mux_music
+
+    assert "spare = max(0.0, (probe_duration(music) or 0.0) - duration)" in (
+        inspect.getsource(_mux_music)
+    )
+
+
+def test_the_rhythm_pass_is_told_it_can_choose_the_section():
+    # A field nobody is told about is a field nobody fills. The analysis has
+    # measured section boundaries all along and the prompt already listed
+    # them -- there was just nowhere to say "start at the third one".
+    from pathlib import Path
+
+    from montagewright.planner import _rhythm_schema
+
+    assert "music_from_seconds" in _rhythm_schema(["k00"])["properties"]
+
+    prompt = (
+        Path(__file__).resolve().parents[1] / "src" / "montagewright"
+        / "prompts" / "rhythm_zh-TW.txt"
+    ).read_text(encoding="utf-8")
+    assert "music_from_seconds" in prompt
+    assert "intro 就是寫成還沒有能量的" in prompt

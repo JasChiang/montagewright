@@ -143,6 +143,9 @@ class RenderPlan:
     segments: list[Segment]
     # Pixels, not "whatever the first crop happened to measure".
     output_size: tuple[int, int] = (1080, 1920)
+    # Where in the track the bed starts, carried from the EDL so the renderer
+    # does not have to know about planning to lay music that is not the intro.
+    music_from_seconds: float = 0.0
     degradations: list[DegradationStep] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -261,6 +264,7 @@ def plan_render(
         degradations=degradations,
         notes=notes,
         output_size=output_size or delivery_size(target_aspect or 9 / 16),
+        music_from_seconds=getattr(edl, "music_from_seconds", 0.0),
     )
 
 
