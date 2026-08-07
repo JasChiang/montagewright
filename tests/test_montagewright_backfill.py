@@ -183,7 +183,8 @@ def test_an_edit_saved_from_the_browser_comes_back_on_the_measured_clock(
 
 def _card(**over):
     base = {
-        "usable_from_seconds": 0.0, "usable_to_seconds": 10.0,
+        "segments": [{"from": "0:00", "to": "0:10", "status": "eligible",
+                      "why": ""}],
         "action": [], "subjects": [],
     }
     base.update(over)
@@ -223,44 +224,52 @@ def test_a_clock_reading_has_only_one_meaning():
 
 
 def test_both_ends_of_an_action_are_read_the_same_way():
-    # 1.1 and 1.13 are each readable as plain seconds, and read that way they
-    # describe a 30ms action. Read as MM:SS they are 1:10 to 1:13.
+    """1.1 and 1.13 used to be a thirty-millisecond action or 1:10 to 1:13.
+
+    Which of those it was had to be guessed, and the guess had to be made for
+    both ends together or a span could come back with its start read one way
+    and its end the other. Asked as clock readings there is nothing to guess:
+    the pair means what it says.
+    """
+
     from montagewright.clipcard import times_on_receipt
 
     got = times_on_receipt(
-        _card(action=[{"what": "x", "starts_seconds": 1.1, "ends_seconds": 1.13}]),
-        113.4,
+        _card(action=[{"what": "x", "from": "1:10", "to": "1:13"}]), 113.4
     )
 
-    assert [(a["starts_seconds"], a["ends_seconds"]) for a in got["action"]] == [
-        (70.0, 73.0)
-    ]
+    assert [(a["from"], a["to"]) for a in got["action"]] == [(70.0, 73.0)]
 
 
 def test_a_clip_that_never_had_the_problem_is_left_alone():
     from montagewright.clipcard import times_on_receipt
 
     was = _card(
-        usable_to_seconds=27.2,
-        action=[{"what": "x", "starts_seconds": 2.5, "ends_seconds": 4.5}],
-        subjects=[{"label": "x", "at_seconds": 2.0}],
+        segments=[{"from": "0:00", "to": "0:27", "status": "eligible", "why": ""}],
+        action=[{"what": "x", "from": "0:02", "to": "0:04"}],
+        subjects=[{"label": "x", "seen_at": "0:02"}],
     )
 
     got = times_on_receipt(dict(was), 27.2)
 
-    assert got["usable_from_seconds"] == 0.0 and got["usable_to_seconds"] == 27.2
-    assert got["action"] == was["action"]
+    assert (got["segments"][0]["from"], got["segments"][0]["to"]) == (0.0, 27.0)
+    assert [(a["from"], a["to"]) for a in got["action"]] == [(2.0, 4.0)]
+    assert got["subjects"][0]["seen_at"] == 2.0
 
 
 def test_a_genuinely_short_window_is_the_models_to_report():
-    # Five usable seconds out of a hundred is a strong claim, but it is a
-    # claim -- and 5.0 has no MM:SS reading that lands inside the clip, so
-    # there is nothing to prefer over it.
+    # Five usable seconds out of a hundred is a strong claim, and it is the
+    # card's to make. Nothing here second-guesses a reading any more, which
+    # is the point of asking in a notation with one meaning.
     from montagewright.clipcard import times_on_receipt
 
-    got = times_on_receipt(_card(usable_to_seconds=5.0), 100.0)
+    got = times_on_receipt(
+        _card(segments=[{"from": "0:00", "to": "0:05", "status": "eligible",
+                         "why": "只有開頭這幾秒對到焦"}]),
+        100.0,
+    )
 
-    assert got["usable_to_seconds"] == 5.0
+    assert got["segments"][0]["to"] == 5.0
 
 
 def test_an_action_that_cannot_be_read_into_the_clip_is_dropped():
@@ -269,8 +278,7 @@ def test_an_action_that_cannot_be_read_into_the_clip_is_dropped():
     from montagewright.clipcard import times_on_receipt
 
     got = times_on_receipt(
-        _card(action=[{"what": "x", "starts_seconds": 400.0, "ends_seconds": 480.0}]),
-        30.0,
+        _card(action=[{"what": "x", "from": "6:40", "to": "8:00"}]), 30.0
     )
 
     assert got["action"] == []
@@ -279,7 +287,7 @@ def test_an_action_that_cannot_be_read_into_the_clip_is_dropped():
 def test_a_clip_whose_length_is_unknown_is_not_second_guessed():
     from montagewright.clipcard import times_on_receipt
 
-    was = _card(usable_to_seconds=1.53)
+    was = _card(action=[{"what": "x", "from": "0:02", "to": "0:04"}])
 
     assert times_on_receipt(dict(was), 0.0) == was
 
@@ -295,32 +303,36 @@ def test_a_timestamp_rounded_up_past_the_end_is_kept_not_deleted():
     from montagewright.clipcard import times_on_receipt
 
     got = times_on_receipt(
-        _card(action=[{"what": "x", "starts_seconds": 10.0, "ends_seconds": 13.0}]),
-        12.012,
+        _card(action=[{"what": "x", "from": "0:10", "to": "0:13"}]), 12.012
     )
 
-    assert [(a["starts_seconds"], a["ends_seconds"]) for a in got["action"]] == [
-        (10.0, 12.012)
-    ]
+    assert [(a["from"], a["to"]) for a in got["action"]] == [(10.0, 12.012)]
 
 
-def test_the_slop_is_nowhere_near_a_notation_error():
-    # Still true of the fields that are still bare numbers: the smallest
-    # possible MM:SS collision is 1:01 as 101 on a clip just past a minute,
-    # overshooting by forty seconds, while 1fps rounding is one second.
+def test_the_slop_only_absorbs_the_rounding_it_was_sized_for():
+    """It was sized against a notation error that can no longer be made.
+
+    The smallest possible MM:SS collision was 1:01 read as 101 on a clip just
+    past a minute -- overshooting by forty seconds -- while a frame-a-second
+    clock rounds by one. Now that every time on the card is a clock reading,
+    the only thing left for it to absorb is that rounding.
+    """
+
     from montagewright.clipcard import SLOP, times_on_receipt
 
-    assert SLOP < 40
+    assert 1.0 <= SLOP < 40
 
-    got = times_on_receipt(
-        _card(action=[{"what": "x", "starts_seconds": 101.0,
-                       "ends_seconds": 102.0}]),
-        65.0,
+    # A second past the end is the sampler, and is kept, trimmed to the file.
+    inside = times_on_receipt(
+        _card(action=[{"what": "x", "from": "0:10", "to": "0:13"}]), 12.4
     )
+    assert [a["to"] for a in inside["action"]] == [12.4]
 
-    assert [(a["starts_seconds"], a["ends_seconds"]) for a in got["action"]] == [
-        (61.0, 62.0)
-    ]
+    # Well past it is not, and is dropped rather than clamped.
+    outside = times_on_receipt(
+        _card(action=[{"what": "x", "from": "0:50", "to": "0:55"}]), 12.4
+    )
+    assert outside["action"] == []
 
 
 # --- the proxy is a smaller copy, never a larger one ----------------------

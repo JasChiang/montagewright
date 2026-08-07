@@ -604,13 +604,16 @@ def test_an_action_beat_has_to_be_long_enough_to_be_one() -> None:
     from montagewright.clipcard import action_beats, card_schema
 
     entry = card_schema()["properties"]["action"]["items"]["properties"]
-    assert entry["ends_seconds"].get("description"), (
+    assert entry["to"].get("description"), (
         "the field that carries the timing must say what it wants"
     )
+    # And it is a clock reading, like every other time on the card. One
+    # notation, so `1:53` cannot arrive as 1.53 and have to be guessed at.
+    assert entry["from"]["type"] == "string" and entry["to"]["type"] == "string"
 
     card = {"action": [
-        {"what": "翻轉手機", "starts_seconds": 0.02, "ends_seconds": 0.06},
-        {"what": "手伸進畫面", "starts_seconds": 2.0, "ends_seconds": 3.4},
+        {"what": "翻轉手機", "from": "0:00", "to": "0:00"},
+        {"what": "手伸進畫面", "from": "0:02", "to": "0:03"},
     ]}
     kept = action_beats(card)
     assert [beat.what for beat in kept] == ["手伸進畫面"]
@@ -703,13 +706,13 @@ def test_a_card_box_is_only_reused_when_nothing_moved() -> None:
     from montagewright.clipcard import card_schema, subjects_from_card
 
     box = card_schema()["properties"]["subjects"]["items"]
-    assert "at_seconds" in box["required"], "a position needs its moment"
+    assert "seen_at" in box["required"], "a position needs its moment"
 
     parsed = subjects_from_card({"subjects": [{
         "label": "手機", "centre_x": 0.5, "centre_y": 0.5,
-        "width": 0.2, "height": 0.4, "moves": True, "at_seconds": 1.2,
+        "width": 0.2, "height": 0.4, "moves": True, "seen_at": "0:01",
     }]})
-    assert parsed[0].at_seconds == 1.2
+    assert parsed[0].at_seconds == 1.0
     assert parsed[0].moves
 
     source = inspect.getsource(pipeline.follow_subjects)
@@ -3877,9 +3880,8 @@ def test_an_action_snap_cannot_land_outside_the_take():
     from montagewright.clipcard import snap_to_action
 
     card = {"action": [
-        {"what": "the hand reaches in", "starts_seconds": 5.0, "ends_seconds": 6.0},
-        {"what": "somebody resets the prop", "starts_seconds": 9.0,
-         "ends_seconds": 10.0},
+        {"what": "the hand reaches in", "from": "0:05", "to": "0:06"},
+        {"what": "somebody resets the prop", "from": "0:09", "to": "0:10"},
     ]}
 
     # Unbounded, the nearest action to 8.6 is the reset.

@@ -68,10 +68,13 @@ class Beat:
 def action_beats(card: dict[str, Any]) -> list[Beat]:
     beats: list[Beat] = []
     for entry in card.get("action", []) or []:
-        try:
-            start = float(entry["starts_seconds"])
-            end = float(entry["ends_seconds"])
-        except (KeyError, TypeError, ValueError):
+        # Clock readings, like the segments above them. The card asked for
+        # bare seconds and repaired the collisions afterwards, which worked
+        # and left the same card carrying two notations -- one where `1:53`
+        # is unwritable and one where it has to be guessed at.
+        start = seconds_of(entry.get("from"))
+        end = seconds_of(entry.get("to"))
+        if start is None or end is None:
             continue
         # A span shorter than a few frames is not a span. Twenty-six of
         # forty-one beats in one library came back under a quarter of a
@@ -293,7 +296,7 @@ def card_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["what", "starts_seconds", "ends_seconds"],
+                    "required": ["what", "from", "to"],
                     "properties": {
                         "what": {
                             "type": "string",
@@ -303,15 +306,16 @@ def card_schema() -> dict[str, Any]:
                                 "is lowered'."
                             ),
                         },
-                        "starts_seconds": {
-                            "type": "number",
+                        "from": {
+                            "type": "string",
                             "description": (
-                                "動作開始的那一秒——手還沒碰到之前、機身還"
-                                "沒開始翻之前。"
+                                "動作開始的那一刻，寫成 M:SS——手還沒碰到"
+                                "之前、東西還沒開始動之前。跟上面的片段一樣"
+                                "用時鐘寫法，不要寫小數秒。"
                             ),
                         },
-                        "ends_seconds": {
-                            "type": "number",
+                        "to": {
+                            "type": "string",
                             "description": (
                                 "動作完成的那一秒。這是一段時間，不是一個"
                                 "瞬間：起訖相同或只差零點幾秒，等於沒有指出"
@@ -395,7 +399,7 @@ def card_schema() -> dict[str, Any]:
                         "width",
                         "height",
                         "moves",
-                        "at_seconds",
+                        "seen_at",
                     ],
                     "properties": {
                         "label": {
@@ -414,10 +418,11 @@ def card_schema() -> dict[str, Any]:
                         "centre_y": {"type": "number"},
                         "width": {"type": "number"},
                         "height": {"type": "number"},
-                        "at_seconds": {
-                            "type": "number",
+                        "seen_at": {
+                            "type": "string",
                             "description": (
-                                "你是看第幾秒說出這個位置的。攝影機或主體"
+                                "你是看第幾秒說出這個位置的，寫成 M:SS。"
+                                "攝影機或主體"
                                 "在動的時候，位置只在那一刻成立——後面要拿"
                                 "這個框去框別的時間點，得先知道它是什麼時候"
                                 "量的。"
@@ -464,7 +469,7 @@ def subjects_from_card(card: dict[str, Any]) -> list[SubjectBox]:
                     width=float(entry["width"]),
                     height=float(entry["height"]),
                     moves=bool(entry.get("moves", False)),
-                    at_seconds=float(entry.get("at_seconds", 0.0) or 0.0),
+                    at_seconds=seconds_of(entry.get("seen_at")) or 0.0,
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -643,21 +648,33 @@ def times_on_receipt(card: dict[str, Any], duration: float) -> dict[str, Any]:
         "why": "no segments were written, so the whole take stands",
     }]
 
+    # Actions and subject moments are clock readings too now, so the whole
+    # guessing apparatus above is gone -- what is left is range checking. A
+    # beat outside the clip is dropped rather than clamped: a missing action
+    # is a static shot, which is a fine thing to be, while an action at a
+    # wrong second puts a cut in the wrong place.
     kept = []
     for beat in card.get("action") or []:
+        start = seconds_of(beat.get("from"))
+        end = seconds_of(beat.get("to"))
+        if start is None or end is None:
+            continue
+        if not (0 <= start < end <= duration + SLOP):
+            continue
         # The same floor `action_beats` uses. Below it a beat cannot place a
         # cut anyway, so there is nothing to preserve by keeping it.
-        found = span(beat.get("starts_seconds"), beat.get("ends_seconds"), 0.25)
-        if found is None:
+        if end - start < 0.25:
             continue
-        kept.append(
-            dict(beat, starts_seconds=round(found[0], 3), ends_seconds=round(found[1], 3))
-        )
+        kept.append(dict(beat, **{
+            "from": round(start, 3), "to": round(min(end, duration), 3),
+        }))
     card["action"] = kept
 
     for subject in card.get("subjects") or []:
-        found = readings(subject.get("at_seconds"))
-        subject["at_seconds"] = round(found[0] if found else 0.0, 3)
+        seen = seconds_of(subject.get("seen_at"))
+        subject["seen_at"] = round(
+            seen if seen is not None and 0 <= seen <= duration + SLOP else 0.0, 3
+        )
     return card
 
 
