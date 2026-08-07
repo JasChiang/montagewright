@@ -190,27 +190,36 @@ def _card(**over):
     return base
 
 
-def test_a_colon_that_became_a_decimal_point_is_read_back():
-    """1:53 arrived as 1.53 on a clip lasting 113.4 seconds.
+def test_a_clock_reading_has_only_one_meaning():
+    """The collision this repair existed for is now unwritable.
 
-    The dangerous case: 1.53 is inside the clip, so it passes every range
-    check while claiming a two-minute take is usable for a second and a half.
+    A take lasting 113.4s came back saying it was usable to `1.53`, which is
+    1:53 with the colon turned into a decimal point -- the dangerous shape,
+    because 1.53 is inside the clip and so passes every range check while
+    claiming two minutes of take is good for a second and a half. Another,
+    71.1s long, said `110.0`, which is 1:10 with the colon dropped. Both
+    clips over a minute in the library, both wrong, in opposite directions.
+
+    Segments are asked for in the notation the model already reads video in,
+    so neither is a thing that can be written. There is nothing to guess
+    between.
     """
 
-    from montagewright.clipcard import times_on_receipt
+    from montagewright.spans import seconds_of
 
-    got = times_on_receipt(_card(usable_to_seconds=1.53), 113.4)
+    assert seconds_of("1:53") == 113.0
+    assert seconds_of("1:10") == 70.0
+    assert seconds_of("0:00") == 0.0
+    assert seconds_of("12:04") == 724.0
 
-    assert got["usable_to_seconds"] == 113.0
+    # A bare number is still read, because a model told six times to write
+    # M:SS will occasionally write 67 -- and with no colon to have been lost
+    # there is no second reading to weigh it against.
+    assert seconds_of(67) == 67.0
+    assert seconds_of("67") is None  # two digits past 59 is not a clock
 
-
-def test_a_colon_that_vanished_is_read_back():
-    # 1:10 arrived as 110 on a clip lasting 71.1 seconds.
-    from montagewright.clipcard import times_on_receipt
-
-    got = times_on_receipt(_card(usable_to_seconds=110.0), 71.1)
-
-    assert got["usable_to_seconds"] == 70.0
+    assert seconds_of("") is None
+    assert seconds_of("about a minute") is None
 
 
 def test_both_ends_of_an_action_are_read_the_same_way():
@@ -296,15 +305,22 @@ def test_a_timestamp_rounded_up_past_the_end_is_kept_not_deleted():
 
 
 def test_the_slop_is_nowhere_near_a_notation_error():
-    # The smallest possible MM:SS collision is 1:01 as 101 on a clip just
-    # past a minute, overshooting by forty seconds. Rounding is one second.
+    # Still true of the fields that are still bare numbers: the smallest
+    # possible MM:SS collision is 1:01 as 101 on a clip just past a minute,
+    # overshooting by forty seconds, while 1fps rounding is one second.
     from montagewright.clipcard import SLOP, times_on_receipt
 
     assert SLOP < 40
 
-    got = times_on_receipt(_card(usable_to_seconds=101.0), 61.0)
+    got = times_on_receipt(
+        _card(action=[{"what": "x", "starts_seconds": 101.0,
+                       "ends_seconds": 102.0}]),
+        65.0,
+    )
 
-    assert got["usable_to_seconds"] == 61.0
+    assert [(a["starts_seconds"], a["ends_seconds"]) for a in got["action"]] == [
+        (61.0, 62.0)
+    ]
 
 
 # --- the proxy is a smaller copy, never a larger one ----------------------

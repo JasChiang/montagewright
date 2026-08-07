@@ -806,6 +806,10 @@ class MaterialItem:
     # 1.8s the cut actually used.
     usable_from: float = 0.0
     usable_to: float = 0.0
+    # The stretches of this take a shot may be cut from, each with a name.
+    # What selection is allowed to say, rather than a hint about what it
+    # should say: a rejected stretch has no id, so there is nothing to name.
+    spans: tuple[Any, ...] = ()
     # How far this particular source can be pushed into before the delivered
     # frame is being enlarged past what the direction will accept. 1.0 means
     # no room at all. Measured from this file's own dimensions against the
@@ -957,13 +961,12 @@ def _describe_material(material: list[MaterialItem]) -> str:
             facts.append(f"素材自己的運鏡：{item.camera_motion}")
         elif item.camera_moves:
             facts.append("攝影機有運動")
-        if item.usable_to > 0 and (
-            item.usable_from > 0.05
-            or item.usable_to < item.duration_seconds - 0.05
+        if len(item.spans) == 1 and item.spans[0].seconds >= (
+            item.duration_seconds - 0.1
         ):
-            facts.append(
-                f"可用區間 {item.usable_from:.1f}–{item.usable_to:.1f}s"
-            )
+            pass  # The whole take stands; saying so adds nothing.
+        elif item.spans:
+            facts.append(f"{len(item.spans)} 段可用")
         if item.push_room <= 1.02:
             facts.append("推近沒有空間：這支的解析度只夠滿版，推了就會糊")
         else:
@@ -990,6 +993,16 @@ def _describe_material(material: list[MaterialItem]) -> str:
         else:
             facts.append("這個交付比例下橫向縱向都沒有空間，鏡頭移不了")
         head = f"- {item.source_id}（{'、'.join(facts)}）：{item.summary}"
+        # The ids a plan may name, with what is in each. Everything else on
+        # this line describes the take; this is the part that is choosable,
+        # and the stretches that failed are absent rather than warned about.
+        if item.spans:
+            head += "\n    可選片段：" + "；".join(
+                f"{span.span_id}（{span.starts_seconds:.1f}–"
+                f"{span.ends_seconds:.1f}s，{span.seconds:.1f} 秒"
+                + (f"，{span.why}" if span.why else "") + "）"
+                for span in item.spans
+            )
         if item.action:
             head += "\n    動作：" + "；".join(item.action)
         if item.needs:
@@ -1131,7 +1144,7 @@ def decide_direction(
     return decided, Usage.from_interaction(interaction)
 
 
-def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
+def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
     """Flat shots plus flat coverage. Nothing nests more than one level.
 
     The previous plan schema reached the API's grammar ceiling and every call
@@ -1166,8 +1179,8 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                     # written "travels" is writing the looks that follow in
                     # the presence of that word.
                     "required": [
-                        "source_id",
-                        "start_seconds",
+                        "span_id",
+                        "start_offset_seconds",
                         "frame",
                         "looks",
                         "energy",
@@ -1175,8 +1188,23 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                         "why",
                     ],
                     "properties": {
-                        "source_id": {"type": "string", "enum": source_ids},
-                        "start_seconds": {"type": "number"},
+                        # A span, not a file and a second. `C8330` plus 9.8
+                        # is always well formed, including when 9.8 lands in
+                        # the middle of somebody saying "again"; `C8330:s03`
+                        # either exists or it does not, and a rejected
+                        # stretch is not in this list to be named.
+                        "span_id": {"type": "string", "enum": span_ids},
+                        "start_offset_seconds": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "description": (
+                                "從這個片段的**開頭**算起第幾秒進。0 就是"
+                                "從片段開頭進，那通常是對的——片段的邊界"
+                                "已經是修過的了。只有在同一個片段裡有好幾"
+                                "個動作、你要的是後面那個時才需要往後移。"
+                                "超出片段的值會被收回片段內。"
+                            ),
+                        },
                         "seconds_needed": {
                             "type": "number",
                             "description": (
@@ -1366,6 +1394,11 @@ def select_shots(
         if item.source_id
         not in {entry["source_id"] for entry in direction.get("unusable", [])}
     ]
+    # Every stretch of every surviving take that may be cut into, which is
+    # the vocabulary the answer is written in. A take with two good passes
+    # separated by somebody calling it offers two; one nobody segmented
+    # offers itself whole.
+    offered = [span for item in usable for span in item.spans]
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     selection_input: list[dict[str, Any]] = [
         {
@@ -1394,12 +1427,48 @@ def select_shots(
         },
         response_format={
             "mime_type": "application/json",
-            "schema": _selection_schema([item.source_id for item in usable]),
+            "schema": _selection_schema([one.span_id for one in offered]),
         },
     )
     chosen = _parse(interaction, what="selection pass")
+    expand_spans(chosen, offered)
     chosen["frame_disagreements"] = frame_disagreements(chosen.get("shots") or [])
     return chosen, Usage.from_interaction(interaction)
+
+
+def expand_spans(chosen: dict[str, Any], offered: "list[Any]") -> None:
+    """Write each shot's span back out as the file and second it resolves to.
+
+    The one place that knows both shapes, which is the only way this project
+    has ever survived changing one. Fourteen readers across four modules ask
+    a shot for its `source_id` and its `start_seconds` -- the executor, the
+    report, the interface, the timeline exports, the transcript matcher --
+    and none of them needs to learn about spans to be correct. What they
+    needed was for those two fields to stop being free.
+
+    So the answer is still a file and a second by the time anyone reads it.
+    The difference is that the model no longer writes them: it names a span
+    that exists and says how far into it to begin, and both are resolved
+    here against bounds it cannot reach past.
+    """
+
+    by_id = {one.span_id: one for one in offered}
+    for shot in chosen.get("shots") or []:
+        span = by_id.get(str(shot.get("span_id", "")))
+        if span is None:
+            continue
+        start, _ = span.at(
+            float(shot.get("start_offset_seconds", 0.0) or 0.0),
+            float(shot.get("seconds_needed", 0.0) or 0.0),
+        )
+        shot["source_id"] = span.source_id
+        shot["start_seconds"] = round(start, 3)
+        # Carried so the layers that decide lengths can see the edge they may
+        # not cross. Rhythm stretches shots onto beats and the executor asks
+        # only whether the time exists in the file; neither can tell a second
+        # of take from a second of somebody resetting a prop.
+        shot["usable_from_seconds"] = span.starts_seconds
+        shot["usable_to_seconds"] = span.ends_seconds
 
 
 def frame_disagreements(shots: list[dict[str, Any]]) -> list[str]:
@@ -1463,6 +1532,7 @@ def replan_shots(
         if item.source_id
         not in {entry["source_id"] for entry in direction.get("unusable", [])}
     ]
+    offered = [span for item in usable for span in item.spans]
     prompt = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
     problems = "\n\n".join(
         f"### 第 {index + 1} 顆（{shot['source_id']}）\n"
@@ -1504,9 +1574,11 @@ def replan_shots(
         },
         response_format={
             "mime_type": "application/json",
-            "schema": _selection_schema([item.source_id for item in usable]),
+            "schema": _selection_schema([one.span_id for one in offered]),
         },
     )
-    return _parse(interaction, what="replan pass"), Usage.from_interaction(
+    again = _parse(interaction, what="replan pass")
+    expand_spans(again, offered)
+    return again, Usage.from_interaction(
         interaction
     )

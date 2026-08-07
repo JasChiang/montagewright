@@ -3751,14 +3751,18 @@ def test_the_usable_window_is_a_constraint_not_a_hint():
 
     card = {
         "version": "x", "summary": "", "usable": True,
-        "usable_from_seconds": 4.2, "usable_to_seconds": 8.5,
+        "segments": [{"from": 4.2, "to": 8.5, "status": "eligible", "why": ""}],
         "subjects": [], "action": [],
     }
     with tempfile.TemporaryDirectory() as work:
         where = Path(work) / "c.json"
         where.write_text(json.dumps(card), encoding="utf-8")
+        # As `expand_spans` leaves it: the span the planner named, already
+        # resolved to a file and a second, with its edges carried along.
         selection = {"shots": [{
-            "source_id": "C017", "start_seconds": 0.0, "seconds_needed": 3.0,
+            "span_id": "C017:s00", "source_id": "C017",
+            "start_seconds": 4.2, "seconds_needed": 3.0,
+            "usable_from_seconds": 4.2, "usable_to_seconds": 8.5,
             "frame": "settles", "energy": "medium", "why": "",
             "looks": [{"at": "a", "seconds": 1.0, "framing": "thirds"}],
         }]}
@@ -3889,3 +3893,102 @@ def test_an_action_snap_cannot_land_outside_the_take():
     # And a gesture inside the window is still snapped to.
     moved, note = snap_to_action(card, 5.4, 2.0, within=(4.2, 8.5))
     assert moved == 5.0 and note
+
+
+def test_a_rejected_stretch_has_no_name_to_be_chosen_by():
+    """The whole argument, in one assertion.
+
+    A file and a second is always well formed: `C8330` plus 9.8 is a valid
+    plan even when 9.8 lands in the middle of somebody saying "again". A span
+    either exists or it does not, and the stretches that failed are simply
+    not in the vocabulary the answer is written in.
+    """
+
+    from montagewright.spans import spans_of
+
+    card = {"usable": True, "segments": [
+        {"from": "0:00", "to": "0:03", "status": "reject", "why": "還在甩"},
+        {"from": "0:03", "to": "0:09", "status": "eligible", "why": "第一次"},
+        {"from": "0:09", "to": "0:11", "status": "reject", "why": "有人喊卡"},
+        {"from": "0:11", "to": "0:18", "status": "eligible", "why": "第二次"},
+        {"from": "0:18", "to": "0:22", "status": "reject", "why": "收器材"},
+    ]}
+    found = spans_of(card, "C8330", 22.0)
+
+    # Two islands, not one window swallowing the water between them.
+    assert [one.span_id for one in found] == ["C8330:s01", "C8330:s03"]
+    assert [(one.starts_seconds, one.ends_seconds) for one in found] == [
+        (3.0, 9.0), (11.0, 18.0)
+    ]
+    # The rejected stretches are absent, not marked.
+    assert not [one for one in found if "喊卡" in one.why]
+
+    # A take nobody segmented offers itself whole, which is exactly as much
+    # as was known before any of this existed.
+    assert [one.span_id for one in spans_of({"usable": True}, "C1", 8.0)] == ["C1:s00"]
+    # A take the card called unusable offers nothing at all.
+    assert spans_of({"usable": False}, "C2", 8.0) == []
+
+
+def test_an_offset_cannot_walk_out_of_its_span():
+    """The number the planner still writes is answered against the span."""
+
+    from montagewright.spans import Span
+
+    span = Span("C1:s01", "C1", 11.0, 18.0)
+
+    assert span.at(0.0, 3.0) == (11.0, 14.0)
+    assert span.at(2.0, 3.0) == (13.0, 16.0)
+    # Past the end, pulled back so the whole shot still fits inside.
+    assert span.at(99.0, 3.0) == (15.0, 18.0)
+    # Longer than the span, shortened to it rather than running over.
+    assert span.at(0.0, 99.0) == (11.0, 18.0)
+    # Negative is not a way out either.
+    assert span.at(-5.0, 2.0) == (11.0, 13.0)
+
+
+def test_a_span_is_written_back_out_as_a_file_and_a_second():
+    """Fourteen readers ask a shot for `source_id` and `start_seconds`.
+
+    None of them needs to learn about spans to stay correct; what they needed
+    was for those two fields to stop being the model's to invent. One place
+    knows both shapes, which is the only way this project has survived
+    changing one before.
+    """
+
+    from montagewright.planner import expand_spans
+    from montagewright.spans import Span
+
+    offered = [Span("C1:s00", "C1", 0.0, 5.0), Span("C1:s01", "C1", 11.0, 18.0)]
+    chosen = {"shots": [
+        {"span_id": "C1:s01", "start_offset_seconds": 2.0, "seconds_needed": 3.0},
+        {"span_id": "C1:s00", "start_offset_seconds": 0.0, "seconds_needed": 2.0},
+    ]}
+    expand_spans(chosen, offered)
+
+    assert [s["source_id"] for s in chosen["shots"]] == ["C1", "C1"]
+    assert [s["start_seconds"] for s in chosen["shots"]] == [13.0, 0.0]
+    # And the edges travel too, because rhythm and the executor decide
+    # lengths after this and only know how long the file is.
+    assert chosen["shots"][0]["usable_from_seconds"] == 11.0
+    assert chosen["shots"][0]["usable_to_seconds"] == 18.0
+
+    # A name nobody offered is left alone rather than invented around.
+    stray = {"shots": [{"span_id": "C9:s07", "start_offset_seconds": 0.0}]}
+    expand_spans(stray, offered)
+    assert "source_id" not in stray["shots"][0]
+
+
+def test_the_planner_is_offered_spans_and_not_files():
+    """The schema's enum is the list of what exists."""
+
+    from montagewright.planner import _selection_schema
+
+    shot = _selection_schema(["C1:s00", "C1:s01"])["properties"]["shots"]["items"]
+    assert "span_id" in shot["required"]
+    assert shot["properties"]["span_id"]["enum"] == ["C1:s00", "C1:s01"]
+    # The two fields it used to be free to write are gone from the contract.
+    assert "source_id" not in shot["properties"]
+    assert "start_seconds" not in shot["properties"]
+    # And the offset that remains is bounded at the schema level too.
+    assert shot["properties"]["start_offset_seconds"]["minimum"] == 0.0

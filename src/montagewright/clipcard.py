@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from montagewright.planner import MAX_OUTPUT_TOKENS, ask
+from montagewright.spans import seconds_of
 
 from montagewright.uploads import upload_now
 
@@ -162,8 +163,7 @@ def card_schema() -> dict[str, Any]:
             "shot_size",
             "facing",
             "speech",
-            "usable_from_seconds",
-            "usable_to_seconds",
+            "segments",
             "needs",
         ],
         "properties": {
@@ -192,22 +192,66 @@ def card_schema() -> dict[str, Any]:
                     "before it commits an aspect."
                 ),
             },
-            "usable_from_seconds": {
-                "type": "number",
+            "segments": {
+                "type": "array",
+                "minItems": 1,
                 "description": (
-                    "從第幾秒起這支才真的可用。開頭常有攝影機還在甩、還在"
-                    "對焦、或畫面還沒穩定的部分——那些不是可以剪進片子的"
-                    "素材，寫出可用的起點比說整支不能用有用得多。"
-                    "整支都可用就填 0。"
+                    "把這支素材從頭到尾切成連續、不重疊的片段，每一段說它"
+                    "能不能剪進片子。第一段從 0:00 開始，最後一段到素材"
+                    "結尾，中間首尾相接不留空隙。\n"
+                    "這裡取代了「可用起點／可用終點」那一組數字，因為一組"
+                    "起訖只能說「前面不能用、中間可以、後面不能用」，而毛"
+                    "片常見的樣子是：晃動 → 一次好的 → 有人喊卡 → 重新"
+                    "構圖 → 又一次好的 → 收器材。那是兩座可用的島，中間"
+                    "隔著不能用的水，一組起訖表達不出來——只能把喊卡那段"
+                    "包進去，或者丟掉一個好的。\n"
+                    "整支從頭到尾都能用，就給一段涵蓋全部。"
                 ),
-            },
-            "usable_to_seconds": {
-                "type": "number",
-                "description": (
-                    "到第幾秒為止還可用。結尾常有鏡頭已經移開、"
-                    "人已經走出畫面、或開始收東西的部分。"
-                    "整支都可用就填總長。"
-                ),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["from", "to", "status", "why"],
+                    "properties": {
+                        "from": {
+                            "type": "string",
+                            "description": (
+                                "這一段從哪裡開始，寫成 M:SS 或 MM:SS，"
+                                "例如 0:00、1:07。**不要寫成小數秒。**"
+                                "你看到的影片時間就是這個格式，換算成 73.5 "
+                                "這種數字反而會出錯——之前 1:10 被寫成 110、"
+                                "1:53 被寫成 1.53，兩支超過一分鐘的素材都錯了。"
+                                "而且影片是一秒一格給你的，你本來就分辨不到"
+                                "比一秒更細，寫小數只是在編造精度。"
+                            ),
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "這一段到哪裡結束，同樣是 M:SS。",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["eligible", "reject"],
+                            "description": (
+                                "`eligible`：這一段本身成立，可以剪進片子。"
+                                "`reject`：不能用——動作做到一半中斷、有人"
+                                "說重來、攝影機還在甩或還在對焦、工作人員"
+                                "入鏡收東西、講到一半停下來。\n"
+                                "判斷的是**這一段本身**成不成立，不是它好不"
+                                "好看，也不是別的 take 有沒有比它好——那是"
+                                "後面比較過所有素材才能回答的問題。手持晃"
+                                "動、淺景深、構圖不完整都是風格，不是缺陷。"
+                            ),
+                        },
+                        "why": {
+                            "type": "string",
+                            "description": (
+                                "reject 的說明為什麼不能用；eligible 說這一"
+                                "段裡發生了什麼。兩種都要寫，因為後面挑片"
+                                "的人只看得到這句話。"
+                            ),
+                        },
+                    },
+                },
             },
             "needs": {
                 "type": "array",
@@ -577,15 +621,27 @@ def times_on_receipt(card: dict[str, Any], duration: float) -> dict[str, Any]:
         real = [one for one in pairs if one[2] - one[1] >= least]
         return min(real or pairs)[1:]
 
-    # A usable window is judged against the clip: a couple of seconds out of
-    # two minutes is the shape MM:SS-as-a-decimal leaves behind.
-    window = span(
-        card.get("usable_from_seconds"),
-        card.get("usable_to_seconds"),
-        max(1.0, duration * 0.1),
-    ) or (0.0, duration)
-    card["usable_from_seconds"] = round(window[0], 3)
-    card["usable_to_seconds"] = round(window[1], 3)
+    # Segments are read rather than repaired. They are asked for as clock
+    # readings, so `1:53` has one meaning and the notation this whole
+    # function exists to undo cannot be written down. Everything below it is
+    # still a bare number and still needs the guesswork.
+    edges: list[dict[str, Any]] = []
+    for entry in card.get("segments") or []:
+        first = seconds_of(entry.get("from"))
+        last = seconds_of(entry.get("to"))
+        if first is None or last is None:
+            continue
+        first = max(0.0, min(first, duration))
+        last = max(0.0, min(last, duration))
+        if last <= first:
+            continue
+        edges.append(dict(entry, **{
+            "from": round(first, 3), "to": round(last, 3),
+        }))
+    card["segments"] = edges or [{
+        "from": 0.0, "to": round(duration, 3), "status": "eligible",
+        "why": "no segments were written, so the whole take stands",
+    }]
 
     kept = []
     for beat in card.get("action") or []:
@@ -748,7 +804,16 @@ def build_library(
             continue
         try:
             card, usage = describe_clip(
-                proxy, client=client, cache=cache, model_id=model_id
+                proxy, client=client, cache=cache, model_id=model_id,
+                # Cutting a take into what survives and what does not is a
+                # judgement -- whether an action finished, whether "again"
+                # was a line or an instruction -- and low turns out to mean
+                # off: measured across five clips it produced exactly zero
+                # thought tokens. Medium is 795 to 1,398 each, roughly flat
+                # against duration, which put the library at $0.91 instead
+                # of $0.43. Once per batch of rushes, since cards are
+                # content addressed.
+                thinking="medium",
             )
         except Exception as error:
             # One unreadable clip is not a reason to abandon the library.

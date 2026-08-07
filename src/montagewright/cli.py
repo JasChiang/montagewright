@@ -41,6 +41,7 @@ from montagewright.planner import (
     select_shots,
 )
 from montagewright.schema import EDL, Clip, move_of_shot, reframe_of, subject_of
+from montagewright.spans import spans_of
 from montagewright.uploads import (
     UploadCache,
     default_cache_path,
@@ -483,8 +484,9 @@ def command_render(args: argparse.Namespace) -> int:
                 camera_motion=str((card or {}).get("camera_motion", "") or ""),
                 shot_size=str((card or {}).get("shot_size", "") or ""),
                 facing=str((card or {}).get("facing", "") or ""),
-                usable_from=float((card or {}).get("usable_from_seconds", 0.0)),
-                usable_to=float((card or {}).get("usable_to_seconds", 0.0)),
+                spans=tuple(
+                    spans_of(card, source_id, _duration(proxy))
+                ),
                 push_room=_push_room(
                     originals.get(source_id, proxy), ASPECTS[args.aspect]
                 ),
@@ -1134,7 +1136,7 @@ def _edl_from_selection(
         # the length started from a constant.
         wanted = float(shot.get("seconds_needed") or 0.0) or 4.0
         card = load_card(cards[shot["source_id"]]) if shot["source_id"] in cards else None
-        window = _usable_window(card)
+        window = _usable_window(shot)
         if window is not None:
             # The card said where this take is worth cutting into and until
             # now that answer only ever reached a line of prompt text. A
@@ -1178,13 +1180,17 @@ def _edl_from_selection(
     return EDL(project_id=rushes.name, clips=clips), snaps
 
 
-def _usable_window(card: dict | None) -> tuple[float, float] | None:
-    """The stretch of a take the card judged worth cutting into."""
+def _usable_window(shot: dict) -> tuple[float, float] | None:
+    """The span this shot was cut from, as bounds.
 
-    if not card:
-        return None
-    first = float(card.get("usable_from_seconds", 0.0) or 0.0)
-    last = float(card.get("usable_to_seconds", 0.0) or 0.0)
+    Read off the shot rather than off the card, because by the time this runs
+    the planner has already named a span and `expand_spans` has written its
+    edges here. Going back to the card would mean picking one of several
+    stretches again, on less information than the plan had.
+    """
+
+    first = float(shot.get("usable_from_seconds", 0.0) or 0.0)
+    last = float(shot.get("usable_to_seconds", 0.0) or 0.0)
     return (first, last) if last > first else None
 
 
