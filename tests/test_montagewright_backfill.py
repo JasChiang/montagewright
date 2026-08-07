@@ -1397,3 +1397,52 @@ def test_an_unknown_distance_is_not_a_zero_one(tmp_path):
 
     assert _look_boxes(card, both) == []
     assert len(_look_boxes(card, one)) == 1
+
+
+def test_the_rhythm_prompt_asks_for_a_shape_not_a_beat_count():
+    """The old one opened on music and got beats back.
+
+    Eight shots quantised to six, seven or eight, four of them the same
+    length to the centisecond, with reasons reading "8 beats" -- which the
+    prompt already forbade. Naming the failure was not enough; the question
+    itself was about the track.
+    """
+
+    from pathlib import Path
+
+    prompt = (
+        Path(__file__).resolve().parents[1] / "src" / "montagewright"
+        / "prompts" / "rhythm_zh-TW.txt"
+    ).read_text(encoding="utf-8")
+
+    # The sequence is the subject, and sameness is named as the failure.
+    assert "一串鏡頭合起來的形狀" in prompt
+    assert "每顆都差不多長，就是還沒有做這件事" in prompt
+    # Music is an input rather than the ruler, and its absence is normal.
+    assert "音樂是另一個輸入，不是尺" in prompt
+    assert "沒有配樂的時候不必找替代的格線" in prompt
+    # And the measured floor is described as measured.
+    assert "運鏡本身至少要" in prompt
+
+
+def test_the_planner_is_shown_each_shot_s_measured_floor():
+    from montagewright.planner import _needs_at_least
+    from montagewright.schema import Clip, reframe_of
+
+    reframe = reframe_of({"looks": [{"at": "A"}, {"at": "B"}], "why": "x"})
+    reframe = reframe.model_copy(update={
+        "look_boxes": [(0.15, 0.5, 1.0), (0.85, 0.5, 1.0)],
+    })
+    clip = Clip(
+        clip_id="k00", source_id="s", approx_in_seconds=0.0,
+        approx_out_seconds=3.0, reframe=reframe,
+    )
+
+    assert _needs_at_least(clip) > 0.0
+    # And a shot whose looks were never located says nothing rather than zero.
+    bare = Clip(
+        clip_id="k01", source_id="s", approx_in_seconds=0.0,
+        approx_out_seconds=3.0,
+        reframe=reframe_of({"looks": [{"at": "A"}, {"at": "B"}], "why": "x"}),
+    )
+    assert _needs_at_least(bare) == 0.0

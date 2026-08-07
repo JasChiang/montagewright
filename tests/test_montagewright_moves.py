@@ -1046,21 +1046,35 @@ def test_a_timeline_carries_the_reasons_and_the_original_media() -> None:
         assert "-00.mp4" in xml and "segments" not in xml
 
 
-def test_no_music_means_no_rhythm_pass() -> None:
-    """Its whole job is reconciling a length against a track.
+def test_rhythm_is_decided_whether_or_not_there_is_music() -> None:
+    """This asserted the opposite, on reasoning that turned out to be wrong.
 
-    Called with no grid it went looking for section boundaries in music that
-    was never supplied, and every length was already the one selection asked
-    for -- so there was nothing to reconcile even if it had survived.
+    "Its whole job is reconciling a length against a track" -- but what it
+    reconciles is the sequence against itself. Gated on having a grid, a film
+    with no music had nothing deciding its pacing at all: every length was
+    whatever selection guessed for that shot alone, and nothing ever asked
+    whether eight in a row had a shape. Speech-led cuts, which need shaping
+    most, got none of it.
     """
 
     import inspect
 
     from montagewright import pipeline
 
-    assert "decide_rhythm_first and grid is not None" in inspect.getsource(
-        pipeline.run
-    )
+    source = inspect.getsource(pipeline.run)
+
+    assert "decide_rhythm_first and grid is not None" not in source
+    assert "if decide_rhythm_first:" in source
+
+
+def test_a_film_with_no_track_is_told_so_rather_than_shown_an_empty_grid() -> None:
+    from montagewright.planner import decide_rhythm
+    import inspect
+
+    said = inspect.getsource(decide_rhythm)
+
+    assert "這支片沒有配樂" in said
+    assert "沒有拍點要對" in said
 
 
 def test_how_music_sits_under_speech_is_decided_not_computed() -> None:

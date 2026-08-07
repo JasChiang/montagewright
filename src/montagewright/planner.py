@@ -174,6 +174,23 @@ def _describe_music(grid: BeatGrid) -> str:
     return "\n".join(lines)
 
 
+def _needs_at_least(clip) -> float:
+    """The least this clip's own move can happen in, or zero if unknown."""
+
+    from montagewright.reframe import seconds_needed_for
+
+    reframe = getattr(clip, "reframe", None)
+    if reframe is None or len(reframe.looks) < 2 or not reframe.look_boxes:
+        return 0.0
+    if len(reframe.look_boxes) < len(reframe.looks):
+        return 0.0
+    stops = [
+        (one.seconds, box[0], box[1], box[2])
+        for one, box in zip(reframe.looks, reframe.look_boxes)
+    ]
+    return seconds_needed_for(stops, reframe.camera_energy)
+
+
 def _describe_clips(edl: EDL, context: dict[str, dict] | None = None) -> str:
     """Everything about a shot that bears on how long it should be.
 
@@ -214,6 +231,13 @@ def _describe_clips(edl: EDL, context: dict[str, dict] | None = None) -> str:
         ]
         if clip.reframe:
             facts.append(f"運鏡={clip.reframe.camera_move}")
+            # Measured from this shot: the rests it asked for plus the
+            # distance between its looks at the speed its energy allows.
+            # Not a suggestion and not a per-move constant -- below this the
+            # move cannot happen, on this footage, at this energy.
+            floor = _needs_at_least(clip)
+            if floor > 0.0:
+                facts.append(f"運鏡本身至少要 {floor:.1f}s")
         share = extra.get("subject_share")
         if share:
             facts.append(f"主體佔畫面{share * 100:.0f}%")
@@ -312,7 +336,7 @@ def upload_music(path: Path, client: Any) -> Any:
 
 def decide_rhythm(
     edl: EDL,
-    grid: BeatGrid,
+    grid: BeatGrid | None,
     *,
     intent: str,
     brief: str = "",
@@ -327,6 +351,17 @@ def decide_rhythm(
     `music_sync` plus an out-point reflecting the hold it asked for. Grounding
     turns that into frames.
 
+    Music is an input, not the reason this runs. It used to be gated on
+    having a grid, so a film with no track had nothing deciding its pacing at
+    all -- every length was whatever selection guessed for that shot alone,
+    and nothing ever looked at the sequence. Speech-led cuts, which are the
+    ones most in need of shaping, never got any.
+
+    And when there was a track, the pacing came from the track: eight shots
+    quantised to six, seven or eight beats, four of them the same length to
+    the centisecond, with reasons that read "8 beats" -- which this prompt
+    explicitly forbids. A BPM is a property of the music, not of the film.
+
     Pass `music` to let the model hear the track rather than only read its
     measurements. The grid still owns every timestamp either way; hearing it
     changes what the model asks for, not where local code puts it.
@@ -338,16 +373,23 @@ def decide_rhythm(
     clip_ids = [clip.clip_id for clip in edl.clips]
     prompt = (PROMPTS / "rhythm_zh-TW.txt").read_text(encoding="utf-8")
 
-    heard = "你會實際聽到這首音樂。" if music is not None else (
-        "這次只提供音樂的量測結果，沒有音檔。"
-    )
+    if grid is None:
+        about_music = (
+            "## 音樂\n\n這支片沒有配樂。長度完全由畫面跟內容決定，"
+            "沒有拍點要對，也沒有小節要湊。\n\n"
+        )
+    else:
+        heard = "你會實際聽到這首音樂。" if music is not None else (
+            "這次只提供音樂的量測結果，沒有音檔。"
+        )
+        about_music = f"## 音樂\n\n{heard}\n{_describe_music(grid)}\n\n"
     request_input: list[dict[str, Any]] = [
         {
             "type": "text",
             "text": (
                 f"{prompt}\n\n## 這支片要傳達什麼\n\n{intent}\n\n"
                 + (f"## 剪輯 brief\n\n{brief}\n\n" if brief else "")
-                + f"## 音樂\n\n{heard}\n{_describe_music(grid)}\n\n"
+                + about_music
                 + (
                     # Every length was decided against its own neighbours and
                     # nothing against the whole, so eight defensible calls

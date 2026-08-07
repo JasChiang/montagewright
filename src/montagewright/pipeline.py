@@ -1071,11 +1071,13 @@ def run(
 
     report = Report(ledger=ledger)
 
-    # Without music there is nothing for this pass to reconcile. Its whole
-    # job is deciding a length against a track, and every length is already
-    # the one selection asked for -- calling it with no grid asked it to
-    # describe music that is not there.
-    if decide_rhythm_first and grid is not None:
+    # Runs whether or not there is a track. It was gated on having one --
+    # the reasoning being that with no music there is nothing to reconcile --
+    # and that was wrong: what it reconciles is the sequence against itself.
+    # Without it every length was whatever selection guessed for that shot
+    # alone, and nothing ever asked whether eight of them in a row had any
+    # shape. Speech-led cuts, which need shaping most, got none of it.
+    if decide_rhythm_first:
         if ledger is not None:
             ledger.check()
         edl, usage = decide_rhythm(
