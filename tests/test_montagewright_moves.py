@@ -3679,3 +3679,39 @@ def test_the_production_path_hands_the_tracks_to_the_builder():
     measuring = inspect.getsource(pipeline._measure_looks)
     assert "frames, times = _sample_frames(" in measuring
     assert "frame_index" in measuring
+
+
+def test_every_look_that_promised_whole_is_checked_not_only_the_first():
+    """`must_be_whole` moved onto the look and the check did not follow.
+
+    `reframe.subject` is built from `looks[0]`, so a shot that settles on a
+    face and then on a wordmark that has to be whole made its second promise
+    to nobody -- which is the case the field was moved onto the look for.
+    """
+
+    from montagewright.schema import Look, reframe_of
+
+    shot = {
+        "looks": [
+            {"at": "the presenter", "seconds": 1.0, "must_be_whole": False},
+            {"at": "the wordmark", "seconds": 1.0, "must_be_whole": True},
+        ],
+        "energy": "medium",
+    }
+    reframe = reframe_of(shot)
+    # The promise survives onto the look even though the first subject is
+    # what `reframe.subject` is built from.
+    assert reframe.subject is not None
+    assert reframe.subject.min_visible < 0.99
+    assert [one.must_be_whole for one in reframe.looks] == [False, True]
+
+    import inspect
+
+    from montagewright import pipeline
+
+    checking = inspect.getsource(pipeline.follow_subjects)
+    later = checking[checking.index("for index, look in enumerate(reframe.looks[1:]"):]
+    later = later[: later.index("if reframe.subject is not None")]
+    assert "look.must_be_whole" in later
+    assert "find_subject(card, look.at)" in later
+    assert "box.width <= crop_width" in later

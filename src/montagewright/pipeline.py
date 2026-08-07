@@ -576,6 +576,40 @@ def follow_subjects(
                 if card is not None and reframe.subject is not None
                 else None
             )
+            # Every look, not only the first. `reframe.subject` is built from
+            # `looks[0]`, so a shot that settles on a face and then on a
+            # wordmark that has to be whole had the promise on the second one
+            # read by nothing at all -- and `must_be_whole` moved onto the
+            # look precisely because a shot can make different promises about
+            # different parts of itself.
+            if card is not None:
+                crop_width = target_aspect / source.aspect_ratio
+                for index, look in enumerate(reframe.looks[1:], start=1):
+                    if not look.must_be_whole:
+                        continue
+                    box = find_subject(card, look.at)
+                    if box is None or box.width <= crop_width:
+                        continue
+                    report.degradations.append(
+                        DegradationStep(
+                            clip_id=clip.clip_id,
+                            ladder="other",
+                            ladder_other="whole_subject_promised_without_a_move",
+                            trigger=(
+                                f"look {index + 1} of this shot was declared "
+                                "whole and no crop of this source can hold "
+                                "it, so settling on it shows part of it"
+                            ),
+                            measured={
+                                "look": float(index + 1),
+                                "subject_width_vw": round(box.width, 4),
+                                "widest_crop_vw": round(crop_width, 4),
+                                "most_visible_fraction": round(
+                                    crop_width / box.width, 4
+                                ),
+                            },
+                        )
+                    )
             if reframe.subject is not None and card is not None:
                 crop_width = target_aspect / source.aspect_ratio
                 # A promise that the subject must be whole, on a subject no
