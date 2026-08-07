@@ -495,21 +495,25 @@ def _schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": [
-                        "text", "heard", "speaker",
-                        "starts_seconds", "ends_seconds",
-                    ],
+                    # Three fields left when the local clock won. The times
+                    # were parsed and dropped -- `across_lines` aligns the
+                    # corrected text onto the recogniser's own per-word
+                    # measurements and never reads them -- and `heard` was
+                    # overwritten from the stored words, because a model
+                    # asked to correct errors and quote them unchanged in one
+                    # breath corrects both, and did: it reported 髮 where the
+                    # recogniser had said 發, erasing the only evidence the
+                    # field carries.
+                    #
+                    # Removing them is not only about wasted output. Asking
+                    # something that cannot measure time to state times makes
+                    # it reconcile its text with numbers it invented, and the
+                    # text is the half being kept.
+                    "required": ["text", "speaker"],
                     "properties": {
                         "text": {
                             "type": "string",
                             "description": "改正後的字幕文字。",
-                        },
-                        "heard": {
-                            "type": "string",
-                            "description": (
-                                "辨識器原本給的同一段文字。沒改就填一樣的"
-                                "——後面要靠這個看出你改了什麼。"
-                            ),
                         },
                         "speaker": {
                             "type": "string",
@@ -519,8 +523,6 @@ def _schema() -> dict[str, Any]:
                                 "受訪男子」。畫面外的聲音就說畫面外。"
                             ),
                         },
-                        "starts_seconds": {"type": "number"},
-                        "ends_seconds": {"type": "number"},
                     },
                 },
             },
@@ -540,8 +542,23 @@ def describe(
     locale: str = "zh-TW",
     cache=None,
     model_id: str | None = None,
+    audio: Path | None = None,
 ) -> tuple[dict[str, Any], Any]:
-    """Hear it locally, then have the words corrected against the picture."""
+    """Hear it locally, then have the words corrected against the picture.
+
+    `audio` is the file the recogniser listens to, when that should not be
+    the one the model watches. It ran on the proxy, whose sound is 64 kbps
+    AAC re-encoded from the master's uncompressed PCM -- twenty-four times
+    smaller, for a picture the model needs and a waveform it does not. That
+    loss bought nothing: the recogniser runs on this machine, and the
+    original is on disk beside the proxy. Measured over ninety seconds of
+    street interview it cost eight differences in three hundred and
+    eighty-five characters.
+
+    Split rather than swapped, because the upload has to stay the proxy. It
+    is already in the file cache from the card pass, and sending the master
+    would re-upload a 4K file to say the same thing.
+    """
 
     # Imported here, not at the top: backfill reads Word from this module,
     # so a module-level import would close the circle.
@@ -554,7 +571,7 @@ def describe(
         _parse,
     )
 
-    heard = hear(source, locale=locale)
+    heard = hear(audio or source, locale=locale)
     words = words_of(heard)
     silences = gaps(words)
     # The recogniser's own confidence marks where it struggled, and it is a
@@ -588,7 +605,15 @@ def describe(
                 "type": "video",
                 "mime_type": "video/mp4",
                 "uri": uri,
-                "resolution": "low",
+                # The one pass that has to read small print. It is told to
+                # take product names, model numbers and anything on a screen
+                # from the picture rather than from memory, and at low each
+                # frame is capped at seventy tokens -- not enough to read a
+                # model number off a display. Video is sampled at one frame a
+                # second whatever is sent, so the whole difference on a
+                # twenty-second interview is about four thousand tokens, and
+                # only clips whose speech is content ever come through here.
+                "resolution": "high",
             },
             {
                 "type": "text",

@@ -782,6 +782,8 @@ def test_a_transcript_is_its_own_card() -> None:
     fields on the clip card.
     """
 
+    import inspect
+
     from montagewright import clipcard, transcript
 
     assert "transcript" not in clipcard.card_schema()["properties"]
@@ -793,9 +795,24 @@ def test_a_transcript_is_its_own_card() -> None:
         "a talking shot framed on whoever is not talking is the fault this "
         "is here to make fixable"
     )
-    assert "heard" in fields["lines"]["items"]["properties"], (
-        "what the recogniser said has to survive, or a correction is invisible"
-    )
+    # What the recogniser said still has to survive, or a correction is
+    # invisible -- but it is not the model's to write. Asked to correct an
+    # error and quote it unchanged in one breath it corrects both, and did:
+    # it reported 髮 where the recogniser had said 發, erasing the only
+    # evidence the field carries. It is filled locally from the stored words.
+    written = fields["lines"]["items"]["properties"]
+    assert "heard" not in written
+    assert transcript.Line(
+        text="x", heard="y", starts_seconds=0.0, ends_seconds=1.0
+    ).corrected
+    assert "what_was_heard(" in inspect.getsource(transcript.describe)
+
+    # Nor are the times. `across_lines` puts the corrected text back on the
+    # recogniser's own per-word clock and never reads a model timestamp, so
+    # asking for one only makes it reconcile its text against a number it
+    # invented -- and the text is the half being kept.
+    assert "starts_seconds" not in written and "ends_seconds" not in written
+    assert "across_lines(" in inspect.getsource(transcript.describe)
 
 
 def test_spoken_boundaries_land_on_a_measured_break() -> None:

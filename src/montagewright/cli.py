@@ -430,6 +430,11 @@ def command_render(args: argparse.Namespace) -> int:
                     card, usage = transcribe(
                         proxies[source_id], client=client,
                         locale=args.locale, cache=cache,
+                        # The model watches the proxy, which is already
+                        # uploaded; the recogniser runs here and has no
+                        # reason to listen to a 64 kbps re-encode of a file
+                        # sitting next to it.
+                        audio=originals.get(source_id),
                     )
                 except Exception as error:
                     print(
