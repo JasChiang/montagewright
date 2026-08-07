@@ -1482,3 +1482,29 @@ def test_no_prompt_teaches_a_field_the_schema_does_not_have():
                 offenders.append(f"{name} still teaches `{field}`")
 
     assert not offenders, "\n  ".join(offenders)
+
+
+def test_the_music_lane_is_drawn_over_the_span_the_cut_uses(tmp_path):
+    """It trimmed by report.json, which is written last.
+
+    So a run that stopped partway drew the whole track: a 2m35s bed
+    stretched across a 29s timeline, every position on the lane pointing at
+    the wrong moment, in the one view whose job is showing where sound sits.
+    The film is on disk and its length is the answer.
+    """
+
+    import inspect
+
+    import montagewright.webapp as web
+
+    source = inspect.getsource(web.create_app)
+    drawing = source[source.index('def waveform('):]
+    drawing = drawing[: drawing.index("@app.get")]
+
+    measured = drawing.index("probe_duration(")
+    fallback = drawing.index("run.report()")
+
+    assert measured < fallback, (
+        "the cut's own length has to be measured before the report is "
+        "consulted, because a crashed run has a film and no report"
+    )

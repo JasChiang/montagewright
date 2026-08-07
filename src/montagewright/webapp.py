@@ -622,8 +622,20 @@ def create_app() -> FastAPI:
         width = max(400, min(width, 6000))
         drawn = run.output / f"wave-{which}-{width}.png"
         if not drawn.exists():
-            report = run.report() or {}
-            seconds = float(report.get("duration_seconds") or 0.0)
+            # How long the cut is, measured off the cut. This read
+            # report.json, which is written last -- so a run that stopped
+            # partway drew the whole track instead of the part it used: a
+            # 2m35s bed stretched across a 29s timeline, every position on
+            # the lane pointing at the wrong moment, in the one view whose
+            # job is showing where the sound sits.
+            seconds = 0.0
+            for name in ("picture.mp4", "deliverable.mp4", "preview.mp4"):
+                if (run.output / name).exists():
+                    seconds = probe_duration(run.output / name) or 0.0
+                    if seconds:
+                        break
+            if not seconds:
+                seconds = float((run.report() or {}).get("duration_seconds") or 0.0)
             trim = ["-t", f"{seconds:.3f}"] if seconds and which == "music" else []
             subprocess.run(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
