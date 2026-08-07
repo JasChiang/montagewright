@@ -10,9 +10,11 @@
 
 - `reasoning`：先寫這個。為什麼這批素材適合這樣剪。先推理再決定，不是先決定再解釋。
 - `material_assessment`：手上有什麼——類型、光線、氛圍、可以撐起什麼。
-- `material_notes`：逐支素材的判斷。真的不能用的標 `usable: false` 並說明；同一動作有多次嘗試時，用 `supersedes` 指出這支勝過哪幾支。
+- `unusable`：只放**不要送進選片**的素材，一支一筆，寫 `source_id` 跟 `reason`。同一件事拍了好幾次時，留下最好的那一次，其餘每一筆用 `superseded_by` 指出勝過它的是哪一支。沒有要排除的就給空陣列。
+  這份清單是會生效的：列進去的素材選片看不到，所以列錯一支等於把它從這支片裡刪掉。
 - `direction`：整體調性、剪輯節奏策略、調色方向。
 - `target_seconds`、`aspect`：目標長度與輸出比例。
+- `music_under_speech`：音樂怎麼待在人聲底下，見下面那一節。
 - `music_suggestion`：只有在沒有給音樂時才填，說明什麼樣的音樂適合。
 
 ## 幾件事
