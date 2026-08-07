@@ -323,7 +323,12 @@ def test_a_subject_that_cannot_fit_says_so_before_it_is_chosen() -> None:
         label="硬幣", centre_x=0.5, centre_y=0.5, width=0.10, height=0.2,
         moves=False,
     )
-    assert _subject_line(small, WIDE, TALL) == "硬幣"
+    # No fraction, because this one fits whole. Whether it moves is still
+    # said: that question has an answer for every subject, not only the ones
+    # the delivery frame cannot hold.
+    fits = _subject_line(small, WIDE, TALL)
+    assert fits.startswith("硬幣（")
+    assert "%" not in fits
 
 
 def test_a_pan_onto_a_small_subject_centres_it_rather_than_hugging_an_edge() -> None:
@@ -3149,3 +3154,79 @@ def test_the_subtitle_panel_has_the_operations_captioning_needs() -> None:
     assert "Math.max(2, Math.min(cut, line.text.length - 2))" in page
     # The line being spoken is marked without rebuilding rows being typed in.
     assert "function followCue()" in page
+
+
+def test_a_still_subject_says_so_before_the_shot_is_planned():
+    """The executor was answering this after the plan was already spent.
+
+    A frame told to follow something that stands still becomes a hold, and
+    that substitution was happening in `reframe`, one pass too late to change
+    anything, and recorded as a degradation -- forty-five of them in one run.
+    The card has always known; the listing simply did not say.
+    """
+
+    from montagewright.cli import _subject_line
+    from montagewright.clipcard import SubjectBox
+
+    still = SubjectBox(
+        label="the row of watches", centre_x=0.5, centre_y=0.5,
+        width=0.56, height=0.3, moves=False, at_seconds=1.0,
+    )
+    walking = SubjectBox(
+        label="the model", centre_x=0.5, centre_y=0.5,
+        width=0.2, height=0.8, moves=True, at_seconds=1.0,
+    )
+    said = _subject_line(still, 16 / 9, 9 / 16)
+    assert "定鏡" in said
+    # And the fraction it can show is still there: two facts, one line.
+    assert "57%" in said
+    assert "移動" in _subject_line(walking, 16 / 9, 9 / 16)
+
+
+def test_the_quoted_travel_time_is_the_one_the_render_will_take():
+    """A price the planner budgets against, read from the executor's table.
+
+    Selection is told `seconds_needed` must cover "the travel between" the
+    looks and was never told the speed, so it could not price a move and
+    stopped asking for them -- twenty-three shots, twenty-three single looks.
+    The quote has to be the real number or it is worse than none.
+    """
+
+    from montagewright.planner import _travel_seconds
+    from montagewright.reframe import ENERGY_LIMITS, seconds_needed_for
+    from montagewright.schema import LOOK_ENERGIES
+
+    room = 0.684
+    quoted = _travel_seconds(room)
+    for label, energy in LOOK_ENERGIES.items():
+        # What the executor will actually charge for the same distance, with
+        # no dwell at either end, is travel alone.
+        stops = [(0.0, 0.0, 0.0, 0.3164), (0.0, room, 0.0, 0.3164)]
+        charged = seconds_needed_for(stops, energy) - 2 * 0.35
+        assert f"{label} {charged:.1f}s" in quoted, (label, quoted, charged)
+
+    # All three, because the speed follows the energy the same answer picks.
+    assert set(LOOK_ENERGIES) == {"low", "medium", "high"}
+    assert len(set(ENERGY_LIMITS[e]["max_speed"] for e in LOOK_ENERGIES.values())) == 3
+
+
+def test_the_energy_a_shot_asks_for_reaches_the_camera():
+    """Two vocabularies, and until now nothing joined them.
+
+    The shot says low/medium/high; the speed table is keyed calm/active/
+    dynamic. `reframe_of` hard-coded "active", so a shot's own label had no
+    effect on anything and a calm passage swept at the same rate as a frantic
+    one.
+    """
+
+    from montagewright.reframe import ENERGY_LIMITS
+    from montagewright.schema import look_energy, reframe_of
+
+    for asked, expected in (("low", "calm"), ("medium", "active"), ("high", "dynamic")):
+        assert look_energy(asked) == expected
+        shot = {"looks": [{"at": "a", "seconds": 1.0}], "energy": asked}
+        assert reframe_of(shot).camera_energy == expected
+
+    # An absent or unknown label still has to land on a real speed.
+    for junk in (None, "", "brisk"):
+        assert look_energy(junk) in ENERGY_LIMITS

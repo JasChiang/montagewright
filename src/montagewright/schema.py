@@ -681,6 +681,32 @@ def move_of(looks: "list[Look]") -> str:
     return "pan"
 
 
+# Two vocabularies met here and neither knew about the other. A shot says its
+# energy is low, medium or high; the executor's speed table is keyed calm,
+# active and dynamic. Nothing joined them, so every move ran at one hard-coded
+# speed and the label a shot chose for itself was decoration.
+#
+# Not a coincidence of names: how lively a passage is and how fast a frame
+# may travel are the same judgement seen from two sides, which is why the
+# planner is asked for one of them and not both.
+LOOK_ENERGIES: dict[str, CameraEnergy] = {
+    "low": "calm",
+    "medium": "active",
+    "high": "dynamic",
+}
+
+# What travel is priced at when nothing has said otherwise -- quoted to the
+# planner in the material listing, so the number it budgets against and the
+# number the executor runs at are read from one place.
+LOOK_ENERGY: CameraEnergy = "active"
+
+
+def look_energy(energy: object) -> CameraEnergy:
+    """The camera speed a shot's energy asks for."""
+
+    return LOOK_ENERGIES.get(str(energy or ""), LOOK_ENERGY)
+
+
 def reframe_of(shot: dict) -> Reframe:
     """The reframe a shot asked for, built the one way.
 
@@ -717,5 +743,5 @@ def reframe_of(shot: dict) -> Reframe:
         ),
         framing=(looks[0].framing if looks else
                  str(shot.get("framing", "thirds") or "thirds")),
-        camera_energy="active",
+        camera_energy=look_energy(shot.get("energy")),
     )

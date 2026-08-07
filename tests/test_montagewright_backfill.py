@@ -580,7 +580,10 @@ def test_the_planner_is_told_which_moves_have_nowhere_to_go():
     ])
 
     assert "橫向可移 68%" in said
-    assert "tilt 做不到" in said
+    assert "縱向沒有空間" in said
+    # And what the room costs in seconds, which is the half that was missing:
+    # a distance nobody can price is a move nobody asks for.
+    assert "走完全程" in said and "medium 1.0s" in said
 
 
 def test_a_source_already_at_the_delivery_aspect_says_neither_move_works():
@@ -593,7 +596,10 @@ def test_a_source_already_at_the_delivery_aspect_says_neither_move_works():
         )
     ])
 
-    assert "pan 跟 tilt 都做不到" in said
+    # Named by what the frame cannot do, not by a move name: the planner no
+    # longer chooses from a menu, so `pan` and `tilt` are words it can neither
+    # write nor be told.
+    assert "橫向縱向都沒有空間" in said
 
 
 # --- a push is the one move whose frame shrinks --------------------------

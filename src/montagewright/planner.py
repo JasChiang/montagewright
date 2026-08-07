@@ -907,6 +907,35 @@ def _describe_one(item: MaterialItem) -> str:
     return _describe_material([item])
 
 
+def _travel_seconds(room: float) -> str:
+    """How long the frame takes to cross that much of this clip, per energy.
+
+    Selection is told to make `seconds_needed` hold "all of the looks plus
+    the travel between them" and was never told how fast the frame may
+    travel, which is not a budget anybody can write. Asked to price something
+    unpriceable, it stopped asking for travel at all: twenty-three shots in a
+    row with a single look, which is the definition of a hold.
+
+    All three are quoted rather than the middle one, because the speed
+    follows the energy the same answer chooses per shot -- a low-energy shot
+    crosses the same distance in nearly three times the seconds, so a single
+    number would be wrong for two thirds of the film. The ceilings are read
+    from the executor's own table so the price the planner budgets against
+    and the speed the render runs at cannot drift apart.
+
+    This is the travel alone. The rests at either end are the planner's to
+    choose and are what `seconds` on each look already says.
+    """
+
+    from montagewright.reframe import ENERGY_LIMITS
+    from montagewright.schema import LOOK_ENERGIES
+
+    return "／".join(
+        f"{label} {max(0.0, room) / ENERGY_LIMITS[energy]['max_speed']:.1f}s"
+        for label, energy in LOOK_ENERGIES.items()
+    )
+
+
 def _describe_material(material: list[MaterialItem]) -> str:
     """The card's measurements alongside the description.
 
@@ -944,16 +973,22 @@ def _describe_material(material: list[MaterialItem]) -> str:
         if item.pan_room > 0.02 or item.tilt_room > 0.02:
             room = []
             if item.pan_room > 0.02:
-                room.append(f"橫向可移 {item.pan_room:.0%} 畫面寬")
+                room.append(
+                    f"橫向可移 {item.pan_room:.0%} 畫面寬，"
+                    f"走完全程 energy {_travel_seconds(item.pan_room)}"
+                )
             else:
-                room.append("橫向沒有空間，pan 做不到")
+                room.append("橫向沒有空間，鏡頭橫著走不動")
             if item.tilt_room > 0.02:
-                room.append(f"縱向可移 {item.tilt_room:.0%} 畫面高")
+                room.append(
+                    f"縱向可移 {item.tilt_room:.0%} 畫面高，"
+                    f"走完全程 energy {_travel_seconds(item.tilt_room)}"
+                )
             else:
-                room.append("縱向沒有空間，tilt 做不到")
+                room.append("縱向沒有空間，鏡頭直著走不動")
             facts.append("、".join(room))
         else:
-            facts.append("這個交付比例下橫向縱向都沒有空間，pan 跟 tilt 都做不到")
+            facts.append("這個交付比例下橫向縱向都沒有空間，鏡頭移不了")
         head = f"- {item.source_id}（{'、'.join(facts)}）：{item.summary}"
         if item.action:
             head += "\n    動作：" + "；".join(item.action)

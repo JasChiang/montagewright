@@ -930,7 +930,8 @@ def _speech_lines(card: dict | None, limit: int = 40) -> tuple[str, ...]:
 
 
 def _subject_line(box, source_aspect: float, target_aspect: float) -> str:
-    """A subject, and how much of it the delivery frame can hold.
+    """A subject, how much of it the delivery frame can hold, and whether it
+    moves.
 
     Selection was marking a wordmark "must be whole" on a 16:9 plate being
     delivered 9:16, where the widest possible crop covers a third of it. The
@@ -938,12 +939,24 @@ def _subject_line(box, source_aspect: float, target_aspect: float) -> str:
     was unkeepable at the moment it was made. Told the fraction, it can move
     the camera across the subject, pick a tighter shot of the same thing, or
     accept a partial view on purpose.
+
+    Whether it moves is the same argument one step later. A frame asked to
+    follow something that stands still is a hold, and the executor was
+    working that out after the shot had been planned, substituting, and
+    recording a degradation -- forty-five of them in one run, which is not a
+    ladder of exceptions any more, it is the normal path. The card already
+    answers it; the planner simply was not being told.
     """
 
     fits = min(1.0, (target_aspect / source_aspect) / max(box.width, 1e-9))
-    if fits >= 0.995:
-        return box.label
-    return f"{box.label}（交付比例裡最多只能露出 {fits * 100:.0f}%）"
+    facts = []
+    if fits < 0.995:
+        facts.append(f"交付比例裡最多只能露出 {fits * 100:.0f}%")
+    facts.append(
+        "會在畫面裡移動" if getattr(box, "moves", False)
+        else "整段停在原地，跟著它走等於定鏡"
+    )
+    return f"{box.label}（{'、'.join(facts)}）"
 
 
 def _duration(path: Path) -> float:
