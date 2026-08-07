@@ -614,6 +614,7 @@ def describe_clip(
     client,
     cache=None,
     model_id: str | None = None,
+    thinking: str = "low",
 ) -> tuple[dict[str, Any], Any]:
     """Watch one clip and write its card.
 
@@ -664,7 +665,15 @@ def describe_clip(
             },
             {"type": "text", "text": instruction},
         ],
-        generation_config={"thinking_level": "low", "max_output_tokens": MAX_OUTPUT_TOKENS},
+        generation_config={
+            # Describing what is in a frame is recognition and needs little
+            # deliberation. Deciding whether a take failed -- whether an
+            # action finished, whether "again" was a line or an instruction --
+            # is a judgement, and would want more. Parameterised so the two
+            # can be measured against each other rather than argued about.
+            "thinking_level": thinking,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        },
         response_format={
             "mime_type": "application/json",
             "schema": card_schema(),
