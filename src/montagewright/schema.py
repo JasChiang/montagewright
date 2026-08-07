@@ -564,6 +564,73 @@ class ReviewVerdict(ModelFacing):
         return self
 
 
+def looks_of(shot: dict) -> "list[Look]":
+    """The looks in a selection shot, whichever shape it was written in.
+
+    The one place that knows both. Taking `camera_move` out of the schema
+    left six readers still asking for it or for `subject`: two raised, and
+    four returned an empty string or "hold" and carried on. The run that
+    found this had already paid for direction and selection.
+
+    A lesson written an hour earlier and then not applied -- when a field
+    goes, the thing to search for is not who still writes it but who still
+    reads it. So there is one reader now, and everything else asks it.
+    """
+
+    looks = [
+        Look(
+            at=str(one.get("at", "")),
+            seconds=float(one.get("seconds", 0.0) or 0.0),
+            framing=str(one.get("framing", "thirds") or "thirds"),
+            must_be_whole=bool(one.get("must_be_whole", False)),
+        )
+        for one in (shot.get("looks") or [])
+        if str(one.get("at", "")).strip()
+    ]
+    if looks:
+        return looks
+
+    named = str(shot.get("subject", "") or "").strip()
+    if not named:
+        return []
+    framing = str(shot.get("framing", "thirds") or "thirds")
+    move = str(shot.get("camera_move", "hold") or "hold")
+    whole = bool(shot.get("must_be_whole"))
+    first = Look(
+        at=named,
+        framing="thirds" if move == "push_in" else framing,
+        must_be_whole=whole,
+    )
+    if shot.get("then_subject"):
+        return [first, Look(at=str(shot["then_subject"]), framing=framing)]
+    if move in {"push_in", "pull_out"}:
+        tight = Look(at=named, framing="fill", must_be_whole=whole)
+        return [tight, first] if move == "pull_out" else [first, tight]
+    return [first]
+
+
+def subject_of(shot: dict) -> str:
+    """What this shot is about, for anything that wants one name."""
+
+    looks = looks_of(shot)
+    return looks[0].at if looks else ""
+
+
+def must_be_whole_of(shot: dict) -> bool:
+    """Whether anything this shot looks at has to be entire."""
+
+    return any(one.must_be_whole for one in looks_of(shot))
+
+
+def move_of_shot(shot: dict) -> str:
+    """The old move name for a shot, read off its looks."""
+
+    looks = looks_of(shot)
+    if looks:
+        return move_of(looks)
+    return str(shot.get("camera_move", "hold") or "hold")
+
+
 def move_of(looks: "list[Look]") -> str:
     """What a list of looks turns out to be, in the old vocabulary.
 
@@ -601,38 +668,7 @@ def reframe_of(shot: dict) -> Reframe:
     and a pan measured at 0.278 -> 0.696 came back as a held centre crop.
     """
 
-    looks = [
-        Look(
-            at=str(one.get("at", "")),
-            seconds=float(one.get("seconds", 0.0) or 0.0),
-            framing=str(one.get("framing", "thirds") or "thirds"),
-            must_be_whole=bool(one.get("must_be_whole", False)),
-        )
-        for one in (shot.get("looks") or [])
-        if str(one.get("at", "")).strip()
-    ]
-    if not looks:
-        # A plan written before looks existed, or one that named no subject.
-        # The old fields say the same thing in a longer way, so read them
-        # that way rather than keeping two paths through the executor.
-        named = str(shot.get("subject", "") or "").strip()
-        if named:
-            framing = str(shot.get("framing", "thirds") or "thirds")
-            move = str(shot.get("camera_move", "hold") or "hold")
-            looks = [
-                Look(
-                    at=named,
-                    framing="thirds" if move == "push_in" else framing,
-                    must_be_whole=bool(shot.get("must_be_whole")),
-                )
-            ]
-            if shot.get("then_subject"):
-                looks.append(Look(at=str(shot["then_subject"]), framing=framing))
-            elif move in {"push_in", "pull_out"}:
-                # The same thing, seen closer. A pull out is that reversed.
-                tight = Look(at=named, framing="fill",
-                             must_be_whole=bool(shot.get("must_be_whole")))
-                looks = [tight, looks[0]] if move == "pull_out" else [looks[0], tight]
+    looks = looks_of(shot)
 
     first = looks[0] if looks else None
     return Reframe(

@@ -40,7 +40,7 @@ from montagewright.planner import (
     replan_shots,
     select_shots,
 )
-from montagewright.schema import EDL, Clip, reframe_of
+from montagewright.schema import EDL, Clip, move_of_shot, reframe_of, subject_of
 from montagewright.uploads import (
     UploadCache,
     default_cache_path,
@@ -694,8 +694,8 @@ def command_render(args: argparse.Namespace) -> int:
             for (index, old, _), new in zip(failing, fresh):
                 print(
                     f"  replan k{index:02d}: {old['source_id']} "
-                    f"{old.get('camera_move')} → {new['source_id']} "
-                    f"{new.get('camera_move')} — {new.get('why', '')[:70]}",
+                    f"{move_of_shot(old)} → {new['source_id']} "
+                    f"{move_of_shot(new)} — {new.get('why', '')[:70]}",
                     flush=True,
                 )
                 selection["shots"][index] = new
@@ -942,7 +942,7 @@ def _rhythm_context(
         )
         entry: dict[str, object] = {"why": shot.get("why", "")}
         if card is not None:
-            box = find_subject(card, shot["subject"])
+            box = find_subject(card, subject_of(shot))
             if box is not None:
                 entry["subject_share"] = round(box.width * box.height, 4)
             beats = action_beats(card)
@@ -986,7 +986,7 @@ def _edl_from_selection(
                 source_id=shot["source_id"],
                 approx_in_seconds=start,
                 approx_out_seconds=start + wanted,
-                in_looks_like=shot["subject"],
+                in_looks_like=subject_of(shot),
                 energy_intent=shot.get("energy", "medium"),
                 reframe=reframe,
             )
@@ -1197,7 +1197,7 @@ def command_timeline(args: argparse.Namespace) -> int:
                 approx_in_seconds=start,
                 approx_out_seconds=start
                 + float(rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)),
-                in_looks_like=shot.get("subject", ""),
+                in_looks_like=subject_of(shot),
                 energy_intent=shot.get("energy", "medium"),
                 reframe=reframe_of(shot),
             )

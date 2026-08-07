@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from montagewright.schema import looks_of, move_of_shot
 from montagewright.capabilities import (
     INTENT_NAMES,
     describe_for_prompt,
@@ -1187,9 +1188,11 @@ def replan_shots(
     prompt = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
     problems = "\n\n".join(
         f"### 第 {index + 1} 顆（{shot['source_id']}）\n"
-        f"原本的規劃：運鏡 {shot.get('camera_move')}、"
-        f"主體「{shot.get('subject')}」、構圖 {shot.get('framing')}、"
-        f"{float(shot.get('seconds_needed') or 0):.1f} 秒\n"
+        f"原本的規劃：{move_of_shot(shot)}，畫面停在 "
+        + "　→　".join(
+            f"「{one.at}」（{one.framing}）" for one in looks_of(shot)
+        )
+        + f"，{float(shot.get('seconds_needed') or 0):.1f} 秒\n"
         f"當初的理由：{shot.get('why', '')}\n"
         f"看片的人說：{note}"
         for index, shot, note in failing

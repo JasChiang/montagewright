@@ -33,6 +33,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from montagewright.renderer import probe_duration
+from montagewright.schema import move_of_shot, subject_of
 from montagewright.uploads import default_library
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
@@ -719,8 +720,8 @@ def create_app() -> FastAPI:
                 "seconds": round(seconds, 3),
                 "in_seconds": float(shot.get("start_seconds", 0.0)),
                 "source_seconds": round(found[source_id], 3),
-                "subject": shot.get("subject", ""),
-                "camera_move": shot.get("camera_move", "hold"),
+                "subject": subject_of(shot),
+                "camera_move": move_of_shot(shot),
                 "why": shot.get("why", ""),
                 "delivered": verdicts.get(key, {}).get("delivered"),
                 "note": verdicts.get(key, {}).get("note", ""),
@@ -799,7 +800,7 @@ def create_app() -> FastAPI:
                 clip_id=f"k{index:02d}", source_id=source_id,
                 approx_in_seconds=start,
                 approx_out_seconds=start + float(entry["seconds"]),
-                in_looks_like=plan.get("subject", ""),
+                in_looks_like=subject_of(plan),
                 energy_intent=plan.get("energy", "medium"),
                 reframe=reframe_of(plan),
             ))

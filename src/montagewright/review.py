@@ -23,7 +23,7 @@ from typing import Any
 
 from montagewright.capabilities import describe_limits_for_prompt
 from montagewright.cost import BudgetSpent, Ledger
-from montagewright.schema import DegradationStep, Issue, ReviewVerdict
+from montagewright.schema import looks_of, move_of_shot, must_be_whole_of, DegradationStep, Issue, ReviewVerdict
 
 from montagewright.planner import MAX_OUTPUT_TOKENS
 
@@ -227,15 +227,24 @@ def _shot_schema(clip_ids: list[str]) -> dict[str, Any]:
 def _describe_plan(shot: dict[str, Any], seconds: float, steps: list) -> str:
     """What this shot promised, so the promise can be checked."""
 
+    # The looks themselves, not a move name and one subject. A reviewer
+    # checking whether the shot did what it promised needs to know it
+    # promised three stops, not that it promised "pan".
+    looks = looks_of(shot)
     lines = [
-        f"運鏡：{shot.get('camera_move', 'hold')}",
-        f"主體：{shot.get('subject', '')}",
-        f"構圖：{shot.get('framing', 'thirds')}",
+        f"運鏡：{move_of_shot(shot)}",
+        "畫面停在：" + "　→　".join(
+            f"「{one.at}」（{one.framing}"
+            + (f"，停 {one.seconds:g}s" if one.seconds else "")
+            + ("，必須完整" if one.must_be_whole else "")
+            + "）"
+            for one in looks
+        ) if looks else "畫面停在：（沒有指定主體）",
         f"長度：{seconds:.2f}s（選片估要 "
         f"{float(shot.get('seconds_needed') or 0):.1f}s）",
         f"為什麼挑這顆：{shot.get('why', '')}",
     ]
-    if shot.get("must_be_whole"):
+    if must_be_whole_of(shot):
         lines.append("這顆的主體被裁掉一部分就失去意義，字要讀得完。")
     for step in steps:
         measured = "、".join(f"{k}={v}" for k, v in step.measured.items())

@@ -1092,3 +1092,39 @@ def test_a_subject_nobody_can_find_is_named_rather_than_guessed(monkeypatch):
     )
 
     assert stops == [] and missing == "the ghost"
+
+
+def test_only_one_place_knows_what_shape_a_shot_is_written_in():
+    """Six readers survived the field being removed from the schema.
+
+    Two raised -- one of them after direction and selection had been paid
+    for -- and four returned an empty string or "hold" and carried on. The
+    lesson had been written an hour earlier and not applied: when a field
+    goes, search for who still reads it, not who still writes it.
+
+    So there is one reader, and this is what keeps it that way.
+    """
+
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "montagewright"
+    reading = re.compile(
+        r'\[["\'](?:subject|camera_move|then_subject|must_be_whole)["\']\]'
+        r'|\.get\(\s*["\'](?:subject|camera_move|then_subject|must_be_whole)["\']'
+    )
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "schema.py":
+            continue  # the one place allowed to know both shapes
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if reading.search(line):
+                offenders.append(f"{path.name}:{number}  {line.strip()}")
+
+    assert not offenders, (
+        "these read a selection shot's old fields directly instead of going "
+        "through schema.looks_of / subject_of / move_of_shot:\n  "
+        + "\n  ".join(offenders)
+    )

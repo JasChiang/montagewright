@@ -34,6 +34,7 @@ from typing import Any
 from xml.sax.saxutils import escape
 
 from montagewright.executor import CropBox, RenderPlan, Segment
+from montagewright.schema import looks_of, move_of_shot
 
 FPS = 30
 
@@ -90,8 +91,12 @@ def _notes(clip_id: str, index: int, report: dict[str, Any]) -> list[str]:
         lines.append(f"選片：{shot['why']}")
     if rhythm.get("why"):
         lines.append(f"長度：{rhythm['why']}")
-    if shot.get("camera_move"):
-        lines.append(f"運鏡：{shot['camera_move']}／{shot.get('framing', '')}")
+    looks = looks_of(shot)
+    if looks:
+        # Names the move and then where it went, since a marker read in Final
+        # Cut is the only account of the shot a person has there.
+        where = " → ".join(f"{one.at}（{one.framing}）" for one in looks)
+        lines.append(f"運鏡：{move_of_shot(shot)}　{where}")
     for step in report.get("degradations", []):
         if step.get("clip_id") == clip_id:
             lines.append(
