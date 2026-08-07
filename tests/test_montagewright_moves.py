@@ -288,7 +288,18 @@ def test_a_subject_wider_than_the_delivery_is_recorded_under_every_move() -> Non
 
     source = inspect.getsource(pipeline.follow_subjects)
     fact_at = source.index("subject_wider_than_delivery")
-    for branch in ('if (\n                move == "pan"', 'if move in {"push_in"'):
+    # Every branch that dispatches on what the shot is, whatever those
+    # happen to be called today. This named the two-subject pan branch,
+    # which has since been deleted -- the property is "before all of them",
+    # not "before these two". Guards that only skip or warn do not count.
+    branches = [
+        line
+        for line in source.splitlines()
+        if line.startswith("            if ")
+        and ("move ==" in line or "move in " in line or "reframe.looks" in line)
+    ]
+    assert len(branches) >= 3, branches
+    for branch in branches:
         assert source.index(branch) > fact_at, (
             f"the fit check must run before {branch!r} dispatches, or that "
             "move delivers a clipped subject with nothing in the report"

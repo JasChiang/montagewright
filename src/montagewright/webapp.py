@@ -33,7 +33,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from montagewright.renderer import probe_duration
-from montagewright.schema import move_of_shot, subject_of
+from montagewright.schema import looks_of, move_of_shot, subject_of
 from montagewright.uploads import default_library
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
@@ -722,6 +722,18 @@ def create_app() -> FastAPI:
                 "source_seconds": round(found[source_id], 3),
                 "subject": subject_of(shot),
                 "camera_move": move_of_shot(shot),
+                # Every stop, not only the first. A shot that settles on
+                # three watches in turn was showing one name and the word
+                # "pan", in the panel whose job is saying what was planned.
+                "looks": [
+                    {
+                        "at": one.at,
+                        "seconds": one.seconds,
+                        "framing": one.framing,
+                        "whole": one.must_be_whole,
+                    }
+                    for one in looks_of(shot)
+                ],
                 "why": shot.get("why", ""),
                 "delivered": verdicts.get(key, {}).get("delivered"),
                 "note": verdicts.get(key, {}).get("note", ""),

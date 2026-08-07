@@ -37,7 +37,6 @@ from montagewright.reframe import (
     Observation,
     OutOfFrame,
     build_crop_path,
-    build_handoff_path,
     build_sweep_path,
     build_look_path,
     build_tilt_path,
@@ -553,77 +552,14 @@ def follow_subjects(
                         )
                     )
 
-            if (
-                move == "pan"
-                and reframe.then_subject is not None
-                and reframe.subject is not None
-            ):
-                # Two subjects in one frame: pan from the first to the second
-                # rather than cutting the take to itself. Both endpoints are
-                # measured, because a nine-box position is a hint about which
-                # subject is meant, not a coordinate to aim at -- aiming at it
-                # overshoots the subject and lands on background.
-                # Pulling frames means running ffmpeg over the take. Doing
-                # it before asking whether there is anything to ask meant a
-                # rebuild -- which never has a client -- extracted frames
-                # for every shot and threw them all away: eight and a half
-                # seconds before a finished cut would open.
-                frames = (
-                    _sample_frames(
-                        source, clip.approx_in_seconds,
-                        clip.approx_out_seconds, work,
-                    )[0]
-                    if _may_ask(client) else []
-                )
-                centres = []
-                widths = []
-                for subject in (reframe.subject, reframe.then_subject):
-                    # Without a client there is nothing to ask, which is the
-                    # case when a plan is rebuilt after the run. Skipping the
-                    # subject left this list short and the indexing below
-                    # raised on it; the card measured both endpoints already,
-                    # and two measured endpoints is the whole move.
-                    if not _may_ask(client):
-                        seat = (
-                            find_subject(card, subject.description)
-                            if card is not None
-                            else None
-                        )
-                        centres.append(seat.centre_x if seat else 0.5)
-                        widths.append(seat.width if seat else 0.0)
-                        continue
-                    _afford(report)
-                    boxes, usage = locate_subject(
-                        frames, subject.description, client=client
-                    )
-                    _charge(report, "subject", usage)
-                    across = [
-                        float(box["centre_x"])
-                        for box in boxes
-                        if box.get("present") and box.get("centre_x") is not None
-                    ]
-                    centres.append(sum(across) / len(across) if across else 0.5)
-                    spans = [
-                        float(box["width"])
-                        for box in boxes
-                        if box.get("present") and box.get("width") is not None
-                    ]
-                    widths.append(sum(spans) / len(spans) if spans else 0.0)
-                paths[clip.clip_id] = build_handoff_path(
-                    source_aspect=source.aspect_ratio,
-                    target_aspect=target_aspect,
-                    duration_seconds=duration,
-                    from_centre=centres[0],
-                    to_centre=centres[1],
-                    from_width=widths[0],
-                    to_width=widths[1],
-                    energy=reframe.camera_energy,
-                )
-                report.subject_notes[clip.clip_id] = (
-                    f"handoff {centres[0]:.3f} -> {centres[1]:.3f}"
-                )
-                report.following_shots += 1
-                continue
+            # The two-subject pan used to be handled here, above the looks
+            # branch below -- and `then_subject` is set exactly when there is
+            # a second look, so it shadowed it completely. Every pan went to
+            # the old builder and the third look of a row of three watches
+            # was still being dropped, which is the whole thing the refactor
+            # was for. Deleted rather than reordered: build_look_path does
+            # what it did, for any number of stops.
+
 
             # Every shot that settles somewhere more than once, whatever the
             # move turned out to be called. One builder walks the list; the
