@@ -288,6 +288,12 @@ class Reframe(ModelFacing):
             "silently ignored."
         ),
     )
+    # What the plan said the frame would do, kept so the executor can tell a
+    # substitution from an instruction carried out. One look means "stay on
+    # this", which for something that walks is a follow and for something
+    # standing still is a held frame -- both are the plan happening, and
+    # without this every settled shot was recorded as a downgraded follow.
+    planned_to_move: bool = False
     camera_energy: CameraEnergy = Field(
         default="calm",
         description=(
@@ -766,4 +772,7 @@ def reframe_of(shot: dict) -> Reframe:
         framing=(looks[0].framing if looks else
                  str(shot.get("framing", "thirds") or "thirds")),
         camera_energy=look_energy(shot.get("energy")),
+        planned_to_move=(
+            str(shot.get("frame", "")) == "travels" or len(looks) > 1
+        ),
     )

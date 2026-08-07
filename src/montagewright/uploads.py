@@ -165,9 +165,27 @@ def upload_now(path: Path, client: Any) -> Any:
     # Chinese name -- which is most of the material this is pointed at -- came
     # back as UnicodeEncodeError for every clip in the folder. The bytes are
     # what is being sent; the name is not part of them.
+    from montagewright.cost import BudgetSpent
+    from montagewright.planner import _is_spend_cap
+
     path = Path(path)
-    with _ascii_named(path) as sendable:
-        uploaded = client.files.upload(file=str(sendable))
+    try:
+        with _ascii_named(path) as sendable:
+            uploaded = client.files.upload(file=str(sendable))
+    except Exception as error:
+        # The same 429, on the other API surface. `ask` has translated this
+        # since the first time it happened, and uploads went straight past
+        # that: a run with a finished film, a report and every card paid for
+        # died on an upload with a raw traceback, recorded as a crash rather
+        # than as having run out of money. Which of the two it was decides
+        # whether the answer is to debug or to top up.
+        if _is_spend_cap(error):
+            raise BudgetSpent(
+                "the provider's own spending cap stopped this run -- raise "
+                "it at ai.studio/spend and resume; nothing already paid for "
+                "will be paid for twice"
+            ) from error
+        raise
     while getattr(uploaded.state, "name", str(uploaded.state)) == "PROCESSING":
         time.sleep(2.0)
         uploaded = client.files.get(name=uploaded.name)

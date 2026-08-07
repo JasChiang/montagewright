@@ -4052,3 +4052,80 @@ def test_the_inspector_names_the_move_the_shot_actually_makes():
     # And the declaration sits beside it, so a plan that said it would move
     # and did not is visible without opening the report.
     assert "plan.frame" in said
+
+
+def test_a_shot_that_planned_to_hold_is_not_a_downgraded_follow():
+    """Fourteen of sixteen shots were recorded as substitutions.
+
+    One look means "stay on this", which for something that walks is a follow
+    and for something standing still is a held frame. Both are the plan being
+    carried out, and until the plan said so out loud there was no way to tell
+    them apart -- so every settled shot came back carrying a note saying the
+    frame held still on a shot whose plan was to hold still.
+
+    That is not free. Each degradation is a question the shot reviewer has to
+    adjudicate, and the shot reviewer is a paid call per shot.
+    """
+
+    from montagewright.reframe import Observation, build_crop_path
+    from montagewright.schema import reframe_of
+
+    still = [Observation(seconds=0.0, centre_x=0.5, centre_y=0.5,
+                         width=0.2, height=0.4)]
+    common = dict(source_aspect=16 / 9, target_aspect=9 / 16, clip_id="k00")
+
+    asked_to_hold: list = []
+    build_crop_path(still, degradations=asked_to_hold,
+                    planned_to_move=False, **common)
+    assert [one.ladder for one in asked_to_hold] == []
+
+    asked_to_move: list = []
+    build_crop_path(still, degradations=asked_to_move,
+                    planned_to_move=True, **common)
+    assert [one.ladder for one in asked_to_move] == ["static_on_subject"]
+
+    # The declaration travels on the reframe, from the field the planner
+    # answers before it writes a single look.
+    assert reframe_of({"looks": [{"at": "a"}], "frame": "settles"}).planned_to_move is False
+    assert reframe_of({"looks": [{"at": "a"}], "frame": "travels"}).planned_to_move is True
+    # Two looks is a move whatever the declaration says, because it is one.
+    assert reframe_of({"looks": [{"at": "a"}, {"at": "b"}]}).planned_to_move is True
+
+
+def test_the_spend_cap_reads_the_same_on_an_upload():
+    """A 429 on the other API surface was a crash rather than an ending.
+
+    `ask` has translated this since the first time it happened. Uploads went
+    straight past it, so a run with a finished film, a written report and
+    every card paid for died on `files.upload` with a raw traceback --
+    recorded as broken rather than as out of money, which are two different
+    things to do next.
+    """
+
+    import inspect
+
+    from montagewright import uploads
+    from montagewright.cost import BudgetSpent
+
+    source = inspect.getsource(uploads.upload_now)
+    assert "_is_spend_cap(error)" in source
+    assert "BudgetSpent(" in source
+    assert "ai.studio/spend" in source
+
+    class _Capped:
+        class files:
+            @staticmethod
+            def upload(**_):
+                raise RuntimeError(
+                    "429 RESOURCE_EXHAUSTED: Your project has exceeded its "
+                    "monthly spending cap."
+                )
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+        handle.write(b"x")
+        where = Path(handle.name)
+    with pytest.raises(BudgetSpent):
+        uploads.upload_now(where, _Capped())

@@ -1137,6 +1137,7 @@ def build_crop_path(
     clip_id: str = "",
     min_visible: float = 0.85,
     degradations: list[DegradationStep] | None = None,
+    planned_to_move: bool = True,
 ) -> CropPath:
     """Turn subject observations into a crop that follows them.
 
@@ -1181,12 +1182,18 @@ def build_crop_path(
         """Frame where the subject spent its time, and say why not to follow.
 
         Both reasons to hold end here: the subject barely moved, or it moved
-        and came back. Either way a follow was planned and something else was
-        delivered, so the substitution is recorded rather than passed off as
-        the plan being carried out.
+        and came back. Whether that is a substitution depends on what was
+        asked for, and until the plan said so out loud there was no way to
+        tell -- so every shot that settled on one thing came through here and
+        was recorded as a follow that had been downgraded. Fourteen of them
+        in a sixteen-shot film, each one a note saying the frame held still
+        on a shot whose plan was to hold still.
+
+        That is not free. Every degradation is a question the shot reviewer
+        has to adjudicate, and the shot reviewer is a paid call.
         """
 
-        if degradations is not None:
+        if degradations is not None and planned_to_move:
             degradations.append(
                 DegradationStep(
                     clip_id=clip_id,

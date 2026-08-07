@@ -948,6 +948,13 @@ def follow_subjects(
                             source_aspect=source.aspect_ratio,
                             target_aspect=target_aspect,
                             energy=reframe.camera_energy,
+                            # A shot that said it settles is not a follow
+                            # that was downgraded. One look means "stay on
+                            # this", which for something that walks is a
+                            # follow and for something standing still is a
+                            # held frame -- both are the plan being carried
+                            # out, and only one of them used to say so.
+                            planned_to_move=reframe.planned_to_move,
                             framing=reframe.framing,
                             clip_id=clip.clip_id,
                             min_visible=reframe.subject.min_visible,
