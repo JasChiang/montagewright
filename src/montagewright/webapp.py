@@ -837,7 +837,10 @@ def create_app() -> FastAPI:
 
         from montagewright.clipcard import card_map
         from montagewright.executor import plan_render
-        from montagewright.pipeline import Report, follow_subjects, probe
+        from montagewright.pipeline import (
+            Report, follow_subjects, probe, read_crops,
+        )
+        from montagewright.reframe import CropPath
         from montagewright.schema import EDL, Clip, reframe_of
 
         report = run.report() or {}
@@ -890,10 +893,36 @@ def create_app() -> FastAPI:
                 reframe=reframe_of(plan),
             ))
         edl = EDL(project_id=run.run_id, clips=clips)
-        paths = follow_subjects(
-            edl, sources, target_aspect=aspect, report=Report(),
-            cards=cards, checkpoint=None, client=None,
-        )
+        # What the render actually did, where it still applies. Rebuilding
+        # is the same arithmetic for a held frame and is not for anything
+        # that followed a subject: that path came out of a mask propagation
+        # nothing here can repeat, so the timeline was being written from a
+        # guess at what the film did.
+        #
+        # Per shot rather than all or nothing, because this also serves a
+        # recut, and a recut changes lengths. A stored path is a set of
+        # times, so it is only the answer while the shot is still as long as
+        # it was when the path was made; where it is not, that one shot is
+        # rebuilt and the rest still come off the record.
+        stored = read_crops(run.output / "work" / "crops.json")
+        paths: dict[str, CropPath] = {}
+        stale = []
+        for index, entry in enumerate(wanted):
+            here = f"k{index:02d}"
+            was = stored.get(f"k{int(entry['index']):02d}")
+            covered = was.keyframes[-1].seconds if was and was.keyframes else -1.0
+            if was and abs(covered - float(entry["seconds"])) <= 0.05:
+                paths[here] = was
+            else:
+                stale.append(here)
+        if stale:
+            rebuilt = follow_subjects(
+                edl, sources, target_aspect=aspect, report=Report(),
+                cards=cards, checkpoint=None, client=None,
+            )
+            for clip_id in stale:
+                if clip_id in rebuilt:
+                    paths[clip_id] = rebuilt[clip_id]
         plan = plan_render(
             edl, sources, target_aspect=aspect, crop_paths=paths
         )

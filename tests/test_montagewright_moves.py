@@ -3535,3 +3535,62 @@ def test_the_side_by_side_pane_keeps_its_layout_while_a_take_reloads():
     # a listener attached to the element would follow the wrong one.
     assert "$('raw-video').addEventListener" not in page
     assert "$('frame').addEventListener" in page
+
+
+def test_a_crop_path_survives_a_round_trip_through_disk():
+    """`write_crops` had no reader, so the record was written and ignored."""
+
+    import tempfile
+    from pathlib import Path
+
+    from montagewright.executor import CropBox
+    from montagewright.pipeline import read_crops, write_crops
+    from montagewright.reframe import CropPath, Keyframe
+
+    was = {
+        "k00": CropPath([
+            Keyframe(0.0, CropBox(0.10, 0.0, 0.3164, 1.0)),
+            Keyframe(1.5, CropBox(0.42, 0.0, 0.3164, 1.0)),
+            Keyframe(3.0, CropBox(0.68, 0.0, 0.3164, 1.0)),
+        ]),
+        "k01": CropPath([Keyframe(0.0, CropBox(0.0, 0.0, 0.5, 0.5))]),
+    }
+    with tempfile.TemporaryDirectory() as work:
+        where = Path(work) / "crops.json"
+        write_crops(was, where)
+        back = read_crops(where)
+
+    assert sorted(back) == ["k00", "k01"]
+    assert [round(k.seconds, 3) for k in back["k00"].keyframes] == [0.0, 1.5, 3.0]
+    assert [round(k.crop.x, 5) for k in back["k00"].keyframes] == [0.1, 0.42, 0.68]
+
+    # A run that kept no record says so rather than raising: those exist.
+    assert read_crops(Path(work) / "gone.json") == {}
+
+
+def test_the_timeline_is_written_from_what_the_render_did():
+    """FCPXML that disagrees with the film opens as a different cut.
+
+    The exports rebuilt the crop paths from the cards with no client and no
+    checkpoint. For a held frame that is the same arithmetic; for anything
+    that followed a subject it is a guess, because that path came out of a
+    mask propagation nothing there can repeat.
+    """
+
+    import inspect
+
+    from montagewright import cli, webapp
+
+    exporting = inspect.getsource(cli.command_timeline)
+    assert exporting.index("read_crops(") < exporting.index("follow_subjects(")
+    # And says so when there is no record, rather than quietly guessing.
+    assert "will differ from the film" in exporting
+
+    # The interface rebuilds per shot, because it also serves a recut and a
+    # recut changes lengths -- a stored path is a set of times, so it holds
+    # only while the shot is as long as it was.
+    rebuilding = inspect.getsource(webapp.create_app)
+    rebuilding = rebuilding[rebuilding.index("stored = read_crops("):]
+    rebuilding = rebuilding[: rebuilding.index("plan = plan_render(")]
+    assert 'abs(covered - float(entry["seconds"])) <= 0.05' in rebuilding
+    assert "if stale:" in rebuilding

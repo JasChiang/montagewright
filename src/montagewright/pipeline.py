@@ -26,12 +26,13 @@ from typing import Any
 from montagewright.clipcard import find_subject, load_card
 from montagewright.cost import Ledger, Spend
 from montagewright.executor import (
-    RenderPlan, Source, delivery_size, plan_render,
+    CropBox, RenderPlan, Source, delivery_size, plan_render,
 )
 from montagewright.grounding import BeatGrid, apply_to_edl, ground_timeline
 from montagewright.planner import Usage, decide_rhythm, locate_subject
 from montagewright.reframe import (
     CropPath,
+    Keyframe,
     achieved_upscale,
     zoom_budget,
     Observation,
@@ -402,6 +403,45 @@ def write_crops(paths: dict[str, CropPath], destination: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def read_crops(source: Path) -> dict[str, CropPath]:
+    """The crop paths a render actually used, back off disk.
+
+    The counterpart nobody wrote. `write_crops` exists because a follow came
+    out of a mask propagation that cannot be repeated afterwards, and the
+    interface reads it for exactly that reason -- but the timeline exports
+    rebuilt the plan instead, with no client and no checkpoint, and wrote
+    whatever that came to into the FCPXML.
+
+    Which is the one output where being approximately right is worst. A
+    report that disagrees with the film is a wrong number on a page; an
+    edit list that disagrees with it opens in Final Cut as a different cut,
+    and the person who opens it has no way to tell.
+    """
+
+    if not source.exists():
+        return {}
+    try:
+        stored = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    paths: dict[str, CropPath] = {}
+    for clip_id, frames in (stored or {}).items():
+        keyframes = [
+            Keyframe(
+                seconds=float(frame["at"]),
+                crop=CropBox(
+                    x=float(frame["x"]), y=float(frame["y"]),
+                    width=float(frame["w"]), height=float(frame["h"]),
+                ),
+            )
+            for frame in frames or []
+            if all(key in frame for key in ("at", "x", "y", "w", "h"))
+        ]
+        if keyframes:
+            paths[str(clip_id)] = CropPath(keyframes)
+    return paths
 
 
 def follow_subjects(

@@ -1327,7 +1327,7 @@ def command_timeline(args: argparse.Namespace) -> int:
 
     from montagewright.clipcard import card_map
     from montagewright.executor import plan_render
-    from montagewright.pipeline import Report, follow_subjects, probe
+    from montagewright.pipeline import Report, follow_subjects, probe, read_crops
     from montagewright.timeline import to_fcpxml, to_xmeml
 
     output = args.output.expanduser().resolve()
@@ -1372,10 +1372,27 @@ def command_timeline(args: argparse.Namespace) -> int:
             )
         )
     edl = EDL(project_id=output.name, clips=clips)
-    paths = follow_subjects(
-        edl, sources, target_aspect=aspect, report=Report(),
-        cards=cards, checkpoint=None, client=None,
-    )
+    # What the render actually did, when the run left a record of it. This
+    # used to rebuild the paths from the cards with no client and no
+    # checkpoint, which for a held frame is the same arithmetic and for
+    # anything that followed a subject is not: that path came out of a mask
+    # propagation nothing here can repeat. The timeline is the one output
+    # where being approximately right is worst -- a wrong number in a report
+    # is a wrong number, an edit list that disagrees with the film opens as a
+    # different cut and the person opening it cannot tell.
+    paths = read_crops(output / "work" / "crops.json")
+    if paths:
+        print(f"crops       {len(paths)} read from the render", flush=True)
+    else:
+        print(
+            "crops       no record kept by this run; rebuilding from the "
+            "cards, so followed shots will differ from the film",
+            flush=True,
+        )
+        paths = follow_subjects(
+            edl, sources, target_aspect=aspect, report=Report(),
+            cards=cards, checkpoint=None, client=None,
+        )
     plan = plan_render(edl, sources, target_aspect=aspect, crop_paths=paths)
     width, height = (1920, 1080) if aspect >= 1.0 else (1080, 1920)
     for flavour, suffix, build in (
