@@ -3301,3 +3301,115 @@ def test_a_plan_that_says_one_thing_and_describes_another_is_reported():
     from montagewright.schema import move_of_shot
 
     assert move_of_shot({"frame": "travels", "looks": [one]}) == "hold"
+
+
+def test_the_speed_budget_covers_every_axis_not_just_across():
+    """`_limit_speed` read `x` and copied the rest through unchanged.
+
+    So a tilt arrived at whatever speed the keyframes asked for and a push
+    changed size instantly, while the report said the energy budget had been
+    applied. It was named for the budget and enforced it on the one move that
+    existed when it was written.
+    """
+
+    from montagewright.reframe import ENERGY_LIMITS, Keyframe, _limit_speed
+    from montagewright.executor import CropBox
+
+    ceiling = ENERGY_LIMITS["calm"]["max_speed"]
+
+    def travelled(start: CropBox, end: CropBox) -> tuple[float, float, float]:
+        limited, _ = _limit_speed(
+            [Keyframe(0.0, start), Keyframe(1.0, end)], ENERGY_LIMITS["calm"]
+        )
+        last = limited[-1].crop
+        return (
+            abs(last.x - start.x), abs(last.y - start.y),
+            abs(last.width - start.width),
+        )
+
+    # Straight down, far further than a second of calm allows.
+    base = CropBox(0.0, 0.0, 0.5, 0.5)
+    _, down, _ = travelled(base, CropBox(0.0, 0.5, 0.5, 0.5))
+    assert down <= ceiling + 1e-6, down
+
+    # Closing in, ditto. The width may not collapse in one step.
+    _, _, closed = travelled(base, CropBox(0.0, 0.0, 0.1, 0.1))
+    assert closed <= ceiling + 1e-6, closed
+
+    # A diagonal keeps its direction: clamping each axis on its own would
+    # cut the longer component and leave the shorter one, bending the path.
+    across, down, _ = travelled(base, CropBox(0.4, 0.2, 0.5, 0.5))
+    assert across > 1e-6 and down > 1e-6
+    assert abs(across / down - 2.0) < 0.05, (across, down)
+
+
+def test_a_multi_look_path_cannot_crop_past_the_resolution_budget():
+    """The looks builder was given two aspect ratios and no pixels.
+
+    So it cropped as tightly as a framing asked and the pipeline measured the
+    upscale afterwards, which is a record of a soft shot rather than a
+    prevention of one -- and the shot has been spent by the time it is read.
+    """
+
+    from montagewright.reframe import (
+        MAX_UPSCALE,
+        achieved_upscale,
+        build_look_path,
+    )
+
+    # A framing asking for a tenth of the frame width, on 4K delivered
+    # 1080x1920 -- room to push, but nothing like this much.
+    stops = [(0.4, 0.3, 0.5, 0.10), (0.4, 0.7, 0.5, 0.10)]
+    common = dict(
+        source_aspect=16 / 9, target_aspect=9 / 16, duration_seconds=3.0,
+        energy="active",
+    )
+    pixels = dict(
+        source_width=3840, source_height=2160,
+        output_width=1080, output_height=1920,
+    )
+
+    degradations: list = []
+    guarded = build_look_path(
+        stops, clip_id="k00", degradations=degradations, **pixels, **common
+    )
+    tightest = min(guarded.keyframes, key=lambda one: one.crop.width).crop
+    assert achieved_upscale(tightest, **pixels) <= MAX_UPSCALE + 1e-3
+    assert [one.ladder for one in degradations] == ["reduced_zoom"]
+
+    # And the same call without the pixel dimensions is the old behaviour,
+    # which is what this guards against coming back.
+    loose = build_look_path(stops, clip_id="k00", **common)
+    assert achieved_upscale(
+        min(loose.keyframes, key=lambda one: one.crop.width).crop, **pixels
+    ) > MAX_UPSCALE
+
+    # A source is not opened out further than its own pixels require: the
+    # same framing on the same file delivered smaller keeps more of the push.
+    smaller = build_look_path(
+        stops, clip_id="k01", degradations=[],
+        source_width=3840, source_height=2160,
+        output_width=540, output_height=960, **common,
+    )
+    assert (
+        min(one.crop.width for one in smaller.keyframes)
+        < min(one.crop.width for one in guarded.keyframes)
+    )
+
+
+def test_the_production_path_passes_the_output_size_to_the_looks_builder():
+    """A guard that only covers the builder guards the wrong caller.
+
+    The last refactor's own test named a branch by string and went green
+    when the branch was deleted; this asserts the call the pipeline makes.
+    """
+
+    import inspect
+
+    from montagewright import pipeline
+
+    source = inspect.getsource(pipeline.follow_subjects)
+    call = source[source.index("build_look_path("):]
+    call = call[: call.index(")\n")]
+    for given in ("source_width=", "source_height=", "output_width=", "output_height="):
+        assert given in call, given

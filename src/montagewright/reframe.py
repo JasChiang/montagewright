@@ -147,20 +147,34 @@ def _limit_speed(
     for previous, current in zip(keyframes, keyframes[1:]):
         span = max(current.seconds - previous.seconds, 1e-6)
         anchor = limited[-1].crop
-        desired = current.crop.x - anchor.x
-        speed = abs(desired) / span
+        # All three axes, and scaled together rather than one at a time.
+        # This read only `x`, so a tilt arrived at any speed it liked and a
+        # push changed size instantly -- the limiter was named for the
+        # budget but only enforced it on the one move that existed when it
+        # was written. Clamping each axis on its own would also bend the
+        # path, since a diagonal whose across component is cut and whose
+        # down component is not stops being a straight line.
+        want = (
+            current.crop.x - anchor.x,
+            current.crop.y - anchor.y,
+            current.crop.width - anchor.width,
+        )
+        fastest = max(abs(one) for one in want)
+        speed = fastest / span
         peak = max(peak, speed)
         allowed = limits["max_speed"] * span
-        if abs(desired) > allowed:
-            desired = allowed if desired > 0 else -allowed
+        share = allowed / fastest if fastest > allowed else 1.0
+        moved_x, moved_y, moved_w = (one * share for one in want)
+        width = min(1.0, max(1e-3, anchor.width + moved_w))
+        height = min(1.0, current.crop.height * (width / max(current.crop.width, 1e-9)))
         limited.append(
             Keyframe(
                 seconds=current.seconds,
                 crop=CropBox(
-                    x=min(max(anchor.x + desired, 0.0), 1.0 - current.crop.width),
-                    y=current.crop.y,
-                    width=current.crop.width,
-                    height=current.crop.height,
+                    x=min(max(anchor.x + moved_x, 0.0), max(0.0, 1.0 - width)),
+                    y=min(max(anchor.y + moved_y, 0.0), max(0.0, 1.0 - height)),
+                    width=width,
+                    height=height,
                 ),
             )
         )
@@ -383,6 +397,10 @@ def build_look_path(
     energy: CameraEnergy = "calm",
     clip_id: str = "",
     degradations: list[DegradationStep] | None = None,
+    source_width: int = 0,
+    source_height: int = 0,
+    output_width: int = 0,
+    output_height: int = 0,
 ) -> CropPath:
     """Walk a shot through the places it looks, resting at each.
 
@@ -409,12 +427,53 @@ def build_look_path(
     if duration_seconds <= 0:
         duration_seconds = 1e-3
 
+    # The tightest this source may be cropped before the delivered frame is
+    # being enlarged past what anyone will accept. The single-look push
+    # builder has always asked; this one was only given two aspect ratios, so
+    # it could crop as tightly as a framing asked for and the pipeline
+    # recorded the upscale afterwards. Measuring a violation is not the same
+    # as preventing one, and the shot has already been spent by then.
+    floor = 0.0
+    if source_width and source_height and output_width and output_height:
+        widest = min(1.0, target_aspect / source_aspect) if (
+            target_aspect < source_aspect
+        ) else 1.0
+        floor = widest * zoom_budget(
+            source_width=source_width,
+            source_height=source_height,
+            source_aspect=source_aspect,
+            target_aspect=target_aspect,
+            output_width=output_width,
+            output_height=output_height,
+        )
+
     def box(centre_x: float, centre_y: float, width: float) -> CropBox:
+        width = max(width, floor)
         height = min(1.0, width * source_aspect / target_aspect)
         width = min(1.0, width)
         x = min(max(centre_x - width / 2.0, 0.0), max(0.0, 1.0 - width))
         y = min(max(centre_y - height / 2.0, 0.0), max(0.0, 1.0 - height))
         return CropBox(x, y, width, height)
+
+    if floor > 0.0 and degradations is not None:
+        asked = min((w for _, _, _, w in stops), default=floor)
+        if asked < floor - 1e-6:
+            degradations.append(
+                DegradationStep(
+                    clip_id=clip_id,
+                    ladder="reduced_zoom",
+                    trigger=(
+                        "the framing asked to crop tighter than this source "
+                        "can supply at the delivery size, so the tightest "
+                        "look was opened out to the resolution budget"
+                    ),
+                    measured={
+                        "asked_crop_vw": round(asked, 4),
+                        "allowed_crop_vw": round(floor, 4),
+                        "max_upscale": MAX_UPSCALE,
+                    },
+                )
+            )
 
     boxes = [box(cx, cy, w) for _, cx, cy, w in stops]
     if len(boxes) == 1:

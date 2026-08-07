@@ -589,6 +589,13 @@ def follow_subjects(
                         energy=reframe.camera_energy,
                         clip_id=clip.clip_id,
                         degradations=report.degradations,
+                        # Without these it can crop as tightly as a framing
+                        # asks and the upscale is only discovered below, on
+                        # a shot that has already been rendered soft.
+                        source_width=source.width,
+                        source_height=source.height,
+                        output_width=out_w,
+                        output_height=out_h,
                     )
                     tightest = min(
                         paths[clip.clip_id].keyframes,
