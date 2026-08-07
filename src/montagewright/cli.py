@@ -619,151 +619,174 @@ def command_render(args: argparse.Namespace) -> int:
     rounds: list[Round] = []
     shot_verdicts: dict[str, dict] = {}
     stopped = "review not requested"
-    if args.review:
-        # Every round renders before it reviews, so a stopping condition
-        # always leaves a finished film rather than a half-planned one.
-        while True:
-            keep_going, stopped = should_continue(rounds, ledger=ledger)
-            if not keep_going:
-                break
-            # Two questions, two viewings. The shots say whether each one did
-            # what its plan promised; the cut says whether the eight of them
-            # are a film. Only the second was ever asked, and it is the one
-            # that cannot see a clipped wordmark going past in three seconds.
-            try:
-                shot_verdicts = review_shots(
-                    {
-                        f"k{index:02d}": path
-                        for index, path in enumerate(result.segment_paths)
-                    },
-                    selection["shots"],
-                    seconds={
-                        clip_id: entry["seconds"]
-                        for clip_id, entry in report.rhythm_decisions.items()
-                    },
-                    degradations=report.degradations,
-                    client=client,
-                    cache=cache,
-                    ledger=ledger,
-                )
-            except BudgetSpent as error:
-                stopped = str(error)
-                break
-            missed = [
-                f"{clip_id}: {entry.get('note', '')}"
-                for clip_id, entry in shot_verdicts.items()
-                if not entry.get("delivered", True)
-            ]
-            print(
-                f"shots: {len(shot_verdicts) - len(missed)}/"
-                f"{len(shot_verdicts)} delivered what they planned",
-                flush=True,
-            )
-            for line in missed:
-                print(f"  {line[:110]}", flush=True)
-            try:
-                verdict = review_cut(
-                    result.preview,
-                    brief=brief,
-                    direction=direction["direction"],
-                    client=client,
-                    cache=cache,
-                    ledger=ledger,
-                )
-            except BudgetSpent as error:
-                stopped = str(error)
-                break
-            rounds.append(
-                Round(
-                    index=len(rounds) + 1,
-                    verdict=verdict,
-                    actionable=actionable_keys(verdict),
-                )
-            )
-            print(
-                f"review {len(rounds)}: {verdict.verdict} "
-                f"({len(verdict.issues)} issues) — {verdict.overall[:70]}",
-                flush=True,
-            )
-            keep_going, stopped = should_continue(rounds, ledger=ledger)
-            if not keep_going:
-                break
-            failing = [
-                (index, shot, shot_verdicts[f"k{index:02d}"].get("note", ""))
-                for index, shot in enumerate(selection["shots"])
-                if not shot_verdicts.get(f"k{index:02d}", {}).get(
-                    "delivered", True
-                )
-            ]
-            if not failing:
-                # The cut reviewer wants a change nobody can point at a shot.
-                stopped = (
-                    "revision asked for, but no shot was named as undelivered"
-                )
-                break
-            try:
-                ledger.check()
-                replanned, usage = replan_shots(
-                    failing,
-                    material,
-                    direction,
-                    brief=brief,
-                    context="\n".join(
-                        f"第 {index + 1} 顆（{shot['source_id']}）："
-                        f"{shot.get('why', '')}"
-                        for index, shot in enumerate(selection["shots"])
-                    ),
-                    cache=cache,
-                    client=client,
-                )
-            except BudgetSpent as error:
-                stopped = str(error)
-                break
-            ledger.record(
-                "replan",
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens + usage.thought_tokens,
-            )
-            fresh = replanned.get("shots", [])
-            if len(fresh) != len(failing):
-                stopped = (
-                    f"replan returned {len(fresh)} shots for "
-                    f"{len(failing)} that needed one"
-                )
-                break
-            for (index, old, _), new in zip(failing, fresh):
-                print(
-                    f"  replan k{index:02d}: {old['source_id']} "
-                    f"{move_of_shot(old)} → {new['source_id']} "
-                    f"{move_of_shot(new)} — {new.get('why', '')[:70]}",
-                    flush=True,
-                )
-                selection["shots"][index] = new
-            # Everything downstream is rebuilt from the amended selection, so
-            # the next round renders a different film rather than re-reading
-            # the same one.
-            edl, snaps = _edl_from_selection(selection, rushes, cards)
-            sources = {
-                shot["source_id"]: probe(
-                    shot["source_id"], found[shot["source_id"]]
-                )
-                for shot in selection["shots"]
-                if shot["source_id"] in found
-            }
-            rhythm_context = _rhythm_context(selection, cards)
-            try:
-                ledger.check()
-                result, plan, report, resolved = cut(
-                    edl, sources, rhythm_context
-                )
-            except BudgetSpent as error:
-                stopped = str(error)
-                break
-            report.target_seconds = float(direction["target_seconds"])
-        if rounds:
-            report.degradations = adjudicate(
-                report.degradations, rounds[-1].verdict, shot_verdicts
-            )
+    # Whatever happens in here, the account of the run still gets written.
+    # It used to be written once at the very end, so a crash anywhere after
+    # the render discarded everything the run had already decided and paid
+    # for: one left a finished film, a review round and three replans on
+    # disk with no report, and the interface reads that as a run that
+    # produced nothing but a video.
+    #
+    # "The report is a deliverable as much as the file is" was already the
+    # rule here. A report that exists only when nothing went wrong is a
+    # trophy. The error is named in the report and printed in full, so this
+    # records a failure rather than swallowing one.
+    crashed: BaseException | None = None
+    try:
+      if args.review:
+          # Every round renders before it reviews, so a stopping condition
+          # always leaves a finished film rather than a half-planned one.
+          while True:
+              keep_going, stopped = should_continue(rounds, ledger=ledger)
+              if not keep_going:
+                  break
+              # Two questions, two viewings. The shots say whether each one did
+              # what its plan promised; the cut says whether the eight of them
+              # are a film. Only the second was ever asked, and it is the one
+              # that cannot see a clipped wordmark going past in three seconds.
+              try:
+                  shot_verdicts = review_shots(
+                      {
+                          f"k{index:02d}": path
+                          for index, path in enumerate(result.segment_paths)
+                      },
+                      selection["shots"],
+                      seconds={
+                          clip_id: entry["seconds"]
+                          for clip_id, entry in report.rhythm_decisions.items()
+                      },
+                      degradations=report.degradations,
+                      client=client,
+                      cache=cache,
+                      ledger=ledger,
+                  )
+              except BudgetSpent as error:
+                  stopped = str(error)
+                  break
+              missed = [
+                  f"{clip_id}: {entry.get('note', '')}"
+                  for clip_id, entry in shot_verdicts.items()
+                  if not entry.get("delivered", True)
+              ]
+              print(
+                  f"shots: {len(shot_verdicts) - len(missed)}/"
+                  f"{len(shot_verdicts)} delivered what they planned",
+                  flush=True,
+              )
+              for line in missed:
+                  print(f"  {line[:110]}", flush=True)
+              try:
+                  verdict = review_cut(
+                      result.preview,
+                      brief=brief,
+                      direction=direction["direction"],
+                      client=client,
+                      cache=cache,
+                      ledger=ledger,
+                  )
+              except BudgetSpent as error:
+                  stopped = str(error)
+                  break
+              rounds.append(
+                  Round(
+                      index=len(rounds) + 1,
+                      verdict=verdict,
+                      actionable=actionable_keys(verdict),
+                  )
+              )
+              print(
+                  f"review {len(rounds)}: {verdict.verdict} "
+                  f"({len(verdict.issues)} issues) — {verdict.overall[:70]}",
+                  flush=True,
+              )
+              keep_going, stopped = should_continue(rounds, ledger=ledger)
+              if not keep_going:
+                  break
+              failing = [
+                  (index, shot, shot_verdicts[f"k{index:02d}"].get("note", ""))
+                  for index, shot in enumerate(selection["shots"])
+                  if not shot_verdicts.get(f"k{index:02d}", {}).get(
+                      "delivered", True
+                  )
+              ]
+              if not failing:
+                  # The cut reviewer wants a change nobody can point at a shot.
+                  stopped = (
+                      "revision asked for, but no shot was named as undelivered"
+                  )
+                  break
+              try:
+                  ledger.check()
+                  replanned, usage = replan_shots(
+                      failing,
+                      material,
+                      direction,
+                      brief=brief,
+                      context="\n".join(
+                          f"第 {index + 1} 顆（{shot['source_id']}）："
+                          f"{shot.get('why', '')}"
+                          for index, shot in enumerate(selection["shots"])
+                      ),
+                      cache=cache,
+                      client=client,
+                  )
+              except BudgetSpent as error:
+                  stopped = str(error)
+                  break
+              ledger.record(
+                  "replan",
+                  input_tokens=usage.input_tokens,
+                  output_tokens=usage.output_tokens + usage.thought_tokens,
+              )
+              fresh = replanned.get("shots", [])
+              if len(fresh) != len(failing):
+                  stopped = (
+                      f"replan returned {len(fresh)} shots for "
+                      f"{len(failing)} that needed one"
+                  )
+                  break
+              for (index, old, _), new in zip(failing, fresh):
+                  print(
+                      f"  replan k{index:02d}: {old['source_id']} "
+                      f"{move_of_shot(old)} → {new['source_id']} "
+                      f"{move_of_shot(new)} — {new.get('why', '')[:70]}",
+                      flush=True,
+                  )
+                  selection["shots"][index] = new
+              # Everything downstream is rebuilt from the amended selection, so
+              # the next round renders a different film rather than re-reading
+              # the same one.
+              edl, snaps = _edl_from_selection(selection, rushes, cards)
+              sources = {
+                  shot["source_id"]: probe(
+                      shot["source_id"], found[shot["source_id"]]
+                  )
+                  for shot in selection["shots"]
+                  if shot["source_id"] in found
+              }
+              rhythm_context = _rhythm_context(selection, cards)
+              try:
+                  ledger.check()
+                  result, plan, report, resolved = cut(
+                      edl, sources, rhythm_context
+                  )
+              except BudgetSpent as error:
+                  stopped = str(error)
+                  break
+              report.target_seconds = float(direction["target_seconds"])
+          if rounds:
+              report.degradations = adjudicate(
+                  report.degradations, rounds[-1].verdict, shot_verdicts
+              )
+
+    except BudgetSpent as error:
+        stopped = str(error)
+        print(f"\nstopped: {stopped}", flush=True)
+    except Exception as error:  # noqa: BLE001 -- re-raised below, after the report
+        import traceback
+
+        crashed = error
+        stopped = f"{type(error).__name__}: {error}"[:400]
+        traceback.print_exc()
 
     _write_report(
         output,
@@ -780,6 +803,12 @@ def command_render(args: argparse.Namespace) -> int:
         result=result,
         usages=[],
     )
+    if crashed is not None:
+        print(
+            "\nthe report was written before this run gave up, so what it "
+            "did decide is on disk",
+            flush=True,
+        )
     print(f"\n{report.summary()}", flush=True)
     for stage, usd in sorted(
         report.spend().get("by_stage", {}).items(), key=lambda kv: -kv[1]
@@ -862,6 +891,11 @@ def command_render(args: argparse.Namespace) -> int:
                     encoding="utf-8",
                 )
                 print(f"timeline    {path}", flush=True)
+
+    # Everything that could still be delivered has been. The run failed all
+    # the same, and says so to whoever asked.
+    if crashed is not None:
+        raise crashed
     return 0
 
 

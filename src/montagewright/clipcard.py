@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from montagewright.planner import MAX_OUTPUT_TOKENS
+from montagewright.planner import MAX_OUTPUT_TOKENS, ask
 
 from montagewright.uploads import upload_now
 
@@ -607,7 +607,8 @@ def describe_clip(
     else:
         uri, _ = cache.uri_for(proxy, client, mime_type="video/mp4")
 
-    interaction = client.interactions.create(
+    interaction = ask(
+        client,
         model=model_id or MODEL_ID,
         store=False,
         # The video first, the question after it. Google's own guidance for

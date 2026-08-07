@@ -1255,3 +1255,84 @@ def test_a_run_without_a_report_can_still_be_opened():
         "the workspace is only revealed once a report exists, so a run that "
         "crashed cannot be opened"
     )
+
+
+def test_the_report_survives_a_crash_in_the_review_loop(tmp_path, monkeypatch):
+    """It was written once, at the very end.
+
+    So a crash anywhere after the render discarded everything already
+    decided and paid for. One run left a finished film, a review round and
+    three replans on disk with no report -- which the interface reads as a
+    run that produced nothing but a video.
+    """
+
+    import json
+    import re
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "montagewright" / "cli.py"
+    ).read_text(encoding="utf-8")
+
+    # The review loop is inside a try whose handlers set `stopped` and let
+    # _write_report run; the crash is re-raised only after delivery.
+    loop = source.index("if args.review:")
+    guard = source.rindex("try:", 0, loop)
+    writes = source.index("_write_report(", loop)
+    handler = source.index("except Exception as error:", guard)
+    reraise = source.index("raise crashed", writes)
+
+    assert guard < loop < handler < writes < reraise, (
+        "the report has to be written between catching the failure and "
+        "giving up on the run"
+    )
+    # And the failure is named rather than swallowed.
+    assert "traceback.print_exc()" in source[handler:writes]
+    assert re.search(r"stopped = f\"\{type\(error\)\.__name__\}", source)
+
+
+def test_the_providers_own_cap_is_this_project_s_budget(monkeypatch):
+    """A 429 for money is not a 429 for pace.
+
+    Hitting the provider's spending cap arrived as a raw traceback out of
+    the SDK. BudgetSpent already means exactly this and already has a path:
+    stop, keep what exists, do not degrade to continue. Whose cap it was
+    does not change what to do about it.
+    """
+
+    import pytest
+
+    from montagewright.cost import BudgetSpent
+    from montagewright.planner import _is_spend_cap, ask
+
+    class Capped(Exception):
+        code = 429
+
+        def __str__(self):
+            return (
+                "429 RESOURCE_EXHAUSTED. Your project has exceeded its "
+                "monthly spending cap."
+            )
+
+    class TooFast(Exception):
+        code = 429
+
+        def __str__(self):
+            return "429 RESOURCE_EXHAUSTED. Quota exceeded for requests"
+
+    assert _is_spend_cap(Capped())
+    assert not _is_spend_cap(TooFast())
+
+    class Client:
+        def __init__(self, error):
+            self.error = error
+
+        @property
+        def interactions(self):
+            raise self.error
+
+    with pytest.raises(BudgetSpent):
+        ask(Client(Capped()))
+    # Pace is the SDK's to retry, so it keeps its own type.
+    with pytest.raises(TooFast):
+        ask(Client(TooFast()))

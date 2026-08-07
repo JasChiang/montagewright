@@ -25,6 +25,7 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
+from montagewright.planner import ask
 from montagewright.uploads import upload_now
 
 CARD_VERSION = "montagewright-transcript-v1"
@@ -576,7 +577,8 @@ def describe(
         uri, _ = cache.uri_for(source, client, mime_type="video/mp4")
 
     instruction = (PROMPTS / "transcript_zh-TW.txt").read_text(encoding="utf-8")
-    interaction = client.interactions.create(
+    interaction = ask(
+        client,
         model=model_id or MODEL_ID,
         store=False,
         # The video first, the question after it: Google's guidance for a

@@ -23,6 +23,7 @@ from typing import Any
 
 from montagewright.capabilities import describe_limits_for_prompt
 from montagewright.cost import BudgetSpent, Ledger
+from montagewright.planner import ask
 from montagewright.schema import looks_of, move_of_shot, must_be_whole_of, DegradationStep, Issue, ReviewVerdict
 
 from montagewright.planner import MAX_OUTPUT_TOKENS
@@ -135,7 +136,8 @@ def review_cut(
     else:
         uri, _ = cache.uri_for(preview, client, mime_type="video/mp4")
 
-    interaction = client.interactions.create(
+    interaction = ask(
+        client,
         model=model_id,
         store=False,
         input=[
@@ -311,7 +313,8 @@ def review_shots(
             }
         )
 
-    interaction = client.interactions.create(
+    interaction = ask(
+        client,
         model=model_id,
         store=False,
         input=body,

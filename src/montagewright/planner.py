@@ -248,6 +248,47 @@ def _asked(client: Any) -> Any:
     return client
 
 
+def _is_spend_cap(error: Exception) -> bool:
+    """Whether the provider stopped us for money rather than for pace.
+
+    A 429 is either "too fast" or "out of budget", and only one of those is
+    worth waiting out -- the SDK already retries the first. The message is
+    what tells them apart, so it is what this reads.
+    """
+
+    if getattr(error, "code", None) != 429 and "429" not in str(error):
+        return False
+    said = str(error).lower()
+    return "spend" in said or "spending cap" in said or "billing" in said
+
+
+def ask(client: Any, **request: Any) -> Any:
+    """Make one model call, and say what happened in this project's terms.
+
+    The provider has a cap of its own, and hitting it arrived as a raw
+    traceback out of the SDK -- so a run that had already rendered a film,
+    reviewed it and replanned three shots died without writing its report,
+    and the interface had nothing to show but the video.
+
+    `BudgetSpent` already means exactly this and already has a path: stop,
+    keep what exists, do not degrade to continue. Whose cap it was does not
+    change what to do about it.
+    """
+
+    from montagewright.cost import BudgetSpent
+
+    try:
+        return _asked(client).interactions.create(**request)
+    except Exception as error:
+        if _is_spend_cap(error):
+            raise BudgetSpent(
+                "the provider's own spending cap stopped this run -- raise "
+                "it at ai.studio/spend and resume; nothing already paid for "
+                "will be paid for twice"
+            ) from error
+        raise
+
+
 def upload_music(path: Path, client: Any) -> Any:
     """Put the track where the model can hear it.
 
@@ -350,7 +391,7 @@ def decide_rhythm(
         },
     }
 
-    interaction = _asked(client).interactions.create(**request)
+    interaction = ask(client, **request)
     payload = _parse(interaction, what="rhythm pass")
     decisions = {
         entry["clip_id"]: entry for entry in payload.get("decisions", [])
@@ -589,7 +630,8 @@ def locate_subject(
             {"type": "image", "mime_type": "image/jpeg", "uri": uploaded.uri}
         )
 
-    interaction = _asked(client).interactions.create(
+    interaction = ask(
+        client,
         model=MODEL_ID,
         store=False,
         input=request_input,
@@ -902,7 +944,8 @@ def decide_direction(
     if music is not None:
         request_input.append(_attach_music(music, cache, client))
 
-    interaction = _asked(client).interactions.create(
+    interaction = ask(
+        client,
         model=MODEL_ID,
         store=False,
         input=request_input,
@@ -1133,7 +1176,8 @@ def select_shots(
     ]
     selection_input += _attach_material(usable, cache, client)
 
-    interaction = _asked(client).interactions.create(
+    interaction = ask(
+        client,
         model=MODEL_ID,
         store=False,
         input=selection_input,
@@ -1215,7 +1259,8 @@ def replan_shots(
     ]
     replan_input += _attach_material(usable, cache, client)
 
-    interaction = _asked(client).interactions.create(
+    interaction = ask(
+        client,
         model=MODEL_ID,
         store=False,
         input=replan_input,
