@@ -67,24 +67,32 @@ def _client():
     return genai.Client(api_key=key, http_options=_http_options(types))
 
 
-def _travel(proxy: Path, target_aspect: float) -> tuple[float, float]:
+def _travel(source: Path, target_aspect: float) -> tuple[float, float]:
     """Horizontal and vertical room to move, as fractions of the frame.
 
-    The proxy is fine for this one, unlike `push_room`: this is a question
-    about shape, and the proxy keeps the shape of what it was made from.
+    Not the proxy, for the same reason `push_room` is not: this looked like a
+    question about shape and is a question about resolution. A crop only has
+    to be as tall as the delivery, so what is left over is room to move -- and
+    a 640-wide proxy has nothing left over and would report that no clip
+    anywhere can be tilted.
     """
 
+    from montagewright.executor import delivery_size
     from montagewright.measure.media import probe_video
     from montagewright.reframe import travel_room
 
     try:
-        shape = probe_video(proxy).video
+        shape = probe_video(source).video
         wide, tall = int(shape.display_width), int(shape.display_height)
     except Exception:
         return 0.0, 0.0
     if not wide or not tall:
         return 0.0, 0.0
-    return travel_room(wide / tall, target_aspect)
+    out_w, out_h = delivery_size(target_aspect)
+    return travel_room(
+        source_width=wide, source_height=tall, target_aspect=target_aspect,
+        output_width=out_w, output_height=out_h,
+    )
 
 
 def _push_room(proxy: Path, target_aspect: float) -> float:
@@ -399,6 +407,12 @@ def command_render(args: argparse.Namespace) -> int:
             transcripts[source_id] = card
         print(f"  transcribed, running total ${ledger.spent_usd:.4f}", flush=True)
 
+    # Measured once per source rather than twice per field, and off the
+    # original: how far a crop can travel is a fact about resolution.
+    _room = {
+        source_id: _travel(originals.get(source_id, proxy), ASPECTS[args.aspect])
+        for source_id, proxy in proxies.items()
+    }
     material = []
     # Which takes were set aside before anything was planned, and why. The
     # card gives a reason and it was being dropped on the floor, so a run
@@ -427,8 +441,8 @@ def command_render(args: argparse.Namespace) -> int:
                 push_room=_push_room(
                     originals.get(source_id, proxy), ASPECTS[args.aspect]
                 ),
-                pan_room=_travel(proxy, ASPECTS[args.aspect])[0],
-                tilt_room=_travel(proxy, ASPECTS[args.aspect])[1],
+                pan_room=_room[source_id][0],
+                tilt_room=_room[source_id][1],
                 action=tuple(
                     f"{beat.what} {beat.starts_seconds:.1f}-{beat.ends_seconds:.1f}s"
                     for beat in action_beats(card or {})[:4]

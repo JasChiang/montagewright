@@ -345,28 +345,47 @@ PLACEMENT: dict[str, float] = {
 }
 
 
-def travel_room(source_aspect: float, target_aspect: float) -> tuple[float, float]:
-    """How far a crop of this aspect can move across this source, per axis.
+def travel_room(
+    *,
+    source_width: int,
+    source_height: int,
+    target_aspect: float,
+    output_width: int,
+    output_height: int,
+) -> tuple[float, float]:
+    """How far a crop can move across this source, per axis, for free.
 
-    Returned as fractions of the source frame, horizontal first. Zero means
-    the crop already spans that axis and a move along it has nowhere to go --
-    which is not a rare corner: delivering 9:16 from 16:9 leaves 0.684 across
-    and exactly nothing vertically, so a tilt is impossible for the whole of
-    the usual case, and delivering an aspect the source already is leaves
-    nothing in either direction.
+    Fractions of the source frame, horizontal first. Zero means a move along
+    that axis has nowhere to go.
 
-    The planner is told this for the same reason it is told `push_room`:
-    otherwise it asks for a move nobody can deliver and finds out afterwards,
-    in a degradation, having spent the shot.
+    The first version of this asked only about shape, and so assumed the crop
+    is always the largest one that fits -- full height for a wide source at a
+    tall target. That is only forced when the source has no resolution to
+    spare. A 4K take delivering 1080x1920 needs a crop just 1920 pixels tall,
+    not the 2160 it has, and the 240 left over are room to tilt: 0.111 of the
+    frame at no cost at all, and 0.342 if the whole zoom budget goes on it.
+    Reported as zero, the one move that take could carry looked impossible.
+
+    What is returned is the free room -- the crop that needs no enlarging --
+    because travel and tightening are drawn from the same spare pixels, and a
+    number that has already spent the zoom budget is not one the planner can
+    combine with `push_room`. A source with nothing spare falls back to the
+    largest crop that fits, which is what it was doing before.
     """
 
-    if source_aspect <= 0 or target_aspect <= 0:
+    if min(source_width, source_height, output_width, output_height) <= 0:
         return 0.0, 0.0
-    if source_aspect > target_aspect:
-        crop_width, crop_height = target_aspect / source_aspect, 1.0
-    else:
-        crop_width, crop_height = 1.0, source_aspect / target_aspect
-    return max(0.0, 1.0 - crop_width), max(0.0, 1.0 - crop_height)
+    if target_aspect <= 0:
+        return 0.0, 0.0
+
+    # As small as the delivery, never larger than the frame, and never wider
+    # than the frame is either.
+    tall = min(float(source_height), float(output_height), source_width / target_aspect)
+    wide = tall * target_aspect
+    return (
+        max(0.0, (source_width - wide) / source_width),
+        max(0.0, (source_height - tall) / source_height),
+    )
 
 
 def zoom_budget(

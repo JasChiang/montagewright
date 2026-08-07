@@ -537,26 +537,36 @@ def test_the_prompt_no_longer_carries_a_second_copy_of_the_listing():
 
 # --- a move needs somewhere to happen ------------------------------------
 
-def test_travel_room_is_zero_where_the_crop_already_spans_the_frame():
-    """Delivering 9:16 from 16:9 leaves nothing vertically.
+def test_travel_room_comes_from_resolution_not_only_from_shape():
+    """The first version of this asked only about aspect and got it wrong.
 
-    Which makes `tilt` impossible for the whole of the usual case -- and the
-    menu offered it anyway, the shortfall arriving as a degradation after the
-    shot had been spent.
+    It assumed the crop is always the largest that fits, so a 4K take
+    delivering 9:16 was reported as having no vertical room at all. The crop
+    only has to be as tall as the delivery -- 1920 of the 2160 it has -- and
+    the 240 left over are room to tilt.
     """
 
     from montagewright.reframe import travel_room
 
-    across, up = travel_room(16 / 9, 1080 / 1920)
+    def room(w, h, ow, oh):
+        return travel_room(
+            source_width=w, source_height=h, target_aspect=ow / oh,
+            output_width=ow, output_height=oh,
+        )
+
+    across, up = room(3840, 2160, 1080, 1920)
+    assert round(across, 3) == 0.719
+    assert round(up, 3) == 0.111
+
+    # A source with nothing spare really does have nowhere to go vertically.
+    across, up = room(1920, 1080, 1080, 1920)
     assert round(across, 3) == 0.684
     assert up == 0.0
 
-    # And an aspect the source already is has nowhere to go either way.
-    assert travel_room(16 / 9, 16 / 9) == (0.0, 0.0)
-
-    # The axis flips when the source is the tall one.
-    across, up = travel_room(9 / 16, 1920 / 1080)
-    assert across == 0.0 and round(up, 3) == 0.684
+    # And delivering the aspect the source already is only has no room when
+    # the resolution matches too -- 4K to FHD can put the frame anywhere.
+    assert room(3840, 2160, 1920, 1080) == (0.5, 0.5)
+    assert room(1920, 1080, 1920, 1080) == (0.0, 0.0)
 
 
 def test_the_planner_is_told_which_moves_have_nowhere_to_go():
