@@ -28,7 +28,27 @@ from montagewright.planner import MAX_OUTPUT_TOKENS, ask
 
 from montagewright.uploads import upload_now
 
-CARD_VERSION = "montagewright-clip-card-v1"
+def _card_version() -> str:
+    """A version that changes when the card's shape does.
+
+    Cards are keyed by the bytes they describe, so adding a field does not
+    invalidate them -- only the version does. Two required fields were added
+    without touching it, so every cached card stayed and the fields were
+    silently absent from every listing that had asked for them.
+
+    Deriving it from the required fields removes the step somebody has to
+    remember. Adding, removing or renaming one rewrites the library on the
+    next run; changing only a description does not, which is right, because
+    a description change does not make an old card wrong.
+    """
+
+    import hashlib
+
+    shape = ",".join(sorted(card_schema()["required"]))
+    return f"montagewright-clip-card-{hashlib.sha256(shape.encode()).hexdigest()[:8]}"
+
+
+CARD_VERSION = ""  # set below, once card_schema is defined
 
 
 class CardLibraryEmpty(RuntimeError):
@@ -565,6 +585,9 @@ def times_on_receipt(card: dict[str, Any], duration: float) -> dict[str, Any]:
         found = readings(subject.get("at_seconds"))
         subject["at_seconds"] = round(found[0] if found else 0.0, 3)
     return card
+
+
+CARD_VERSION = _card_version()
 
 
 def describe_clip(

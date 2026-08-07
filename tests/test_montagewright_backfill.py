@@ -1781,3 +1781,53 @@ def test_the_brief_and_the_flag_cannot_quietly_disagree():
     assert "brief 裡如果提到別的長度，以這裡為準" in inspect.getsource(
         decide_direction
     )
+
+
+def test_the_card_version_moves_when_the_card_s_shape_does():
+    """Two required fields were added and no card was rewritten.
+
+    Cards are keyed by the bytes they describe, so a schema change does not
+    invalidate them -- only the version does, and that was a string somebody
+    had to remember to bump. Every cached card stayed, `shot_size` and
+    `facing` were absent from every listing that had asked for them, and the
+    selection guidance written around them had nothing to read.
+    """
+
+    from montagewright import clipcard
+
+    was = clipcard.card_schema
+
+    def with_one_more():
+        schema = was()
+        schema["required"] = schema["required"] + ["something_new"]
+        return schema
+
+    before = clipcard._card_version()
+    clipcard.card_schema = with_one_more
+    try:
+        assert clipcard._card_version() != before
+    finally:
+        clipcard.card_schema = was
+
+    # A description change is not a shape change, and rewriting the library
+    # for one would cost a full pass for nothing.
+    assert clipcard._card_version() == before
+
+
+def test_a_card_from_an_older_shape_is_not_loaded(tmp_path):
+    import json
+
+    from montagewright.clipcard import CARD_VERSION, load_card
+
+    stale = tmp_path / "old.json"
+    stale.write_text(
+        json.dumps({"summary": "x", "version": "montagewright-clip-card-v1"}),
+        encoding="utf-8",
+    )
+    current = tmp_path / "new.json"
+    current.write_text(
+        json.dumps({"summary": "x", "version": CARD_VERSION}), encoding="utf-8"
+    )
+
+    assert load_card(stale) is None
+    assert load_card(current) is not None
