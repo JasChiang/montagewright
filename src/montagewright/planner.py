@@ -1150,9 +1150,25 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
+                    # `frame` is answered before `looks` on purpose. The old
+                    # schema made `camera_move` a required enum, so every
+                    # shot had to answer "does this one move?" before it
+                    # could be written down. Replacing it with an array whose
+                    # minimum length is one turned a question that had to be
+                    # answered into an option that had to be taken, and the
+                    # cheapest valid answer became a single look -- twenty
+                    # three shots in a row, no move anywhere in the film.
+                    #
+                    # This asks the question again without bringing the menu
+                    # back: two answers, neither of them the name of a move,
+                    # and the shape still comes from the looks. Ordering it
+                    # first is the working part. A model that has just
+                    # written "travels" is writing the looks that follow in
+                    # the presence of that word.
                     "required": [
                         "source_id",
                         "start_seconds",
+                        "frame",
                         "looks",
                         "energy",
                         "seconds_needed",
@@ -1172,6 +1188,29 @@ def _selection_schema(source_ids: list[str]) -> dict[str, Any]:
                                 "are what your list adds up to, so a count "
                                 "that leaves each shot less than it needs is "
                                 "a count with too many shots in it."
+                            ),
+                        },
+                        "frame": {
+                            "type": "string",
+                            "enum": ["settles", "travels"],
+                            "description": (
+                                "Does the frame stay where it lands in this "
+                                "shot, or does it have to go somewhere? "
+                                "`settles` means one place is the whole "
+                                "shot. `travels` means it cannot be: the "
+                                "subject walks, a second thing has to be "
+                                "brought in, something is too wide to be "
+                                "read from one position, or the shot ends "
+                                "closer than it began.\n"
+                                "Answer this before writing the looks, and "
+                                "then write looks that match it -- one entry "
+                                "for `settles`, two or more for `travels`. "
+                                "Both answers are decisions and neither is "
+                                "the safe one. A frame that moves because "
+                                "the shot looked static is worse than a "
+                                "hold; a frame that holds on something it "
+                                "cannot show in one position delivers half "
+                                "of it."
                             ),
                         },
                         "looks": {
@@ -1358,9 +1397,36 @@ def select_shots(
             "schema": _selection_schema([item.source_id for item in usable]),
         },
     )
-    return _parse(interaction, what="selection pass"), Usage.from_interaction(
-        interaction
-    )
+    chosen = _parse(interaction, what="selection pass")
+    chosen["frame_disagreements"] = frame_disagreements(chosen.get("shots") or [])
+    return chosen, Usage.from_interaction(interaction)
+
+
+def frame_disagreements(shots: list[dict[str, Any]]) -> list[str]:
+    """Shots whose `frame` answer and whose looks describe different shots.
+
+    Deliberately redundant, which the looks refactor removed on purpose --
+    `camera_move` sat beside its own targets and the two were free to
+    disagree with nobody watching. The difference is that this disagreement
+    is read. It is not a second source of truth: the looks decide what gets
+    rendered, and this only says the planner was of two minds about it.
+
+    Which is not hypothetical. In the run this was written for, a shot's
+    `why` said the frame sweeps across a row of objects and its looks named
+    one place; the rhythm pass then repeated the sweep in its own reasoning,
+    and the film held still. Prose and structure had already disagreed and
+    nothing anywhere compared them.
+    """
+
+    off = []
+    for index, shot in enumerate(shots):
+        travels = str(shot.get("frame", "")) == "travels"
+        stops = len(shot.get("looks") or [])
+        if travels and stops < 2:
+            off.append(f"k{index:02d} said travels and gave one look")
+        elif not travels and stops > 1:
+            off.append(f"k{index:02d} said settles and gave {stops} looks")
+    return off
 
 
 def replan_shots(

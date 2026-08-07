@@ -2835,7 +2835,11 @@ def test_the_planner_is_told_how_far_each_clip_can_be_pushed() -> None:
 
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     assert "最多推近" in prompt
-    assert "不要對沒有空間的素材下推近" in prompt
+    # What has to survive rewording: that "no room" is a fact about the file
+    # rather than a caution, and that the answer is a different take rather
+    # than a smaller version of the same move.
+    assert "沒有空間" in prompt and "糊" in prompt
+    assert "別把計畫打折" in prompt or "不要把原本的計畫打折" in prompt
 
 
 def test_push_room_is_read_from_the_file_that_gets_cut(tmp_path) -> None:
@@ -3230,3 +3234,70 @@ def test_the_energy_a_shot_asks_for_reaches_the_camera():
     # An absent or unknown label still has to land on a real speed.
     for junk in (None, "", "brisk"):
         assert look_energy(junk) in ENERGY_LIMITS
+
+
+def test_the_planner_has_to_say_whether_the_frame_moves():
+    """The question the looks refactor deleted, asked again without the menu.
+
+    `camera_move` was a required enum, so every shot answered "does this one
+    move?" before it could be written down. An array with a minimum length of
+    one turned that into an option rather than a question, and the cheapest
+    valid answer is a single look -- twenty-three shots, no move anywhere.
+    """
+
+    from montagewright.planner import _selection_schema
+
+    shot = _selection_schema(["A"])["properties"]["shots"]["items"]
+    assert "frame" in shot["required"]
+    assert shot["properties"]["frame"]["enum"] == ["settles", "travels"]
+
+    # Not the old menu under a new name. The two answers are not moves, and
+    # the description does not hand back the vocabulary the refactor removed
+    # -- "hold" is left out of this check because it is also an ordinary
+    # English verb, which is exactly why it stopped being a move name.
+    from montagewright.capabilities import MOVE_NAMES
+
+    written = repr(shot["properties"]["frame"])
+    menu = [name for name in MOVE_NAMES if name != "hold"]
+    assert not [name for name in menu if name in written]
+    assert not set(shot["properties"]["frame"]["enum"]) & set(MOVE_NAMES)
+
+    # Asked before the looks are written, which is the working part -- a
+    # model that has just written "travels" writes what follows in the
+    # presence of that word.
+    order = shot["required"]
+    assert order.index("frame") < order.index("looks")
+    assert list(shot["properties"]).index("frame") < list(
+        shot["properties"]
+    ).index("looks")
+
+
+def test_a_plan_that_says_one_thing_and_describes_another_is_reported():
+    """Prose and structure disagreed and nothing anywhere compared them.
+
+    One shot's `why` said the frame sweeps across a row; its looks named a
+    single place; the rhythm pass then repeated the sweep in its own
+    reasoning; the film held still.
+    """
+
+    from montagewright.planner import frame_disagreements
+
+    one = {"at": "a"}
+    assert frame_disagreements([
+        {"frame": "travels", "looks": [one]},
+        {"frame": "settles", "looks": [one, one]},
+    ]) == [
+        "k00 said travels and gave one look",
+        "k01 said settles and gave 2 looks",
+    ]
+
+    # Agreement is silent, in both directions.
+    assert frame_disagreements([
+        {"frame": "settles", "looks": [one]},
+        {"frame": "travels", "looks": [one, one, one]},
+    ]) == []
+
+    # The looks still decide what is rendered: this only reports.
+    from montagewright.schema import move_of_shot
+
+    assert move_of_shot({"frame": "travels", "looks": [one]}) == "hold"

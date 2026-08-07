@@ -775,10 +775,16 @@ def test_selection_is_told_a_row_needs_two_endpoints():
         / "prompts" / "selection_zh-TW.txt"
     ).read_text(encoding="utf-8")
 
-    # Said in the looks vocabulary now: the field it named was replaced by
-    # `looks` shortly after this test was written.
-    assert "就要給兩個落點" in prompt
-    assert "在 `looks` 裡填起點跟終點" in prompt
+    # Asserted as a property rather than as a sentence. The wording here has
+    # been rewritten three times and each rewrite broke this test without
+    # anything being wrong; what has to stay true is that a subject the frame
+    # cannot hold whole is answered with more than one place to look.
+    assert "只能露出" in prompt
+    assert "兩個落點" in prompt
+    assert "travels" in prompt
+    # And that both ends have to be told apart, which is the part that makes
+    # the two endpoints measurable rather than two names for the same place.
+    assert "起點跟終點" in prompt and "描述到能分辨" in prompt
 
 
 # --- a move has to arrive somewhere and stay there -----------------------

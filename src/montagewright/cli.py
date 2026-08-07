@@ -552,7 +552,19 @@ def command_render(args: argparse.Namespace) -> int:
         _decide(work, "selection", chose, selection)
     else:
         print("selection: reused from the last attempt", flush=True)
-    print(f"selection: {len(selection['shots'])} shots", flush=True)
+    travelling = sum(
+        1 for shot in selection["shots"] if str(shot.get("frame", "")) == "travels"
+    )
+    print(
+        f"selection: {len(selection['shots'])} shots, {travelling} with the "
+        f"frame travelling",
+        flush=True,
+    )
+    # A plan whose prose and whose structure describe different shots is not
+    # a rendering problem -- both halves came from the same answer, so it
+    # says the planner was of two minds and the film will follow the looks.
+    for note in selection.get("frame_disagreements") or []:
+        print(f"  {note}", flush=True)
 
     edl, snaps = _edl_from_selection(selection, rushes, cards)
     if snaps:
