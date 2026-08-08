@@ -21,8 +21,22 @@ Frame differencing alone would not do. A phone on a stand playing a video
 changes most of its pixels while the camera never moves, which is exactly the
 clip that started this. What separates the two is whether the whole frame
 moved together, so this estimates a global shift and reports how much of the
-frame agreed with it -- and says `unobservable` when too little of the frame
-holds still enough to tell.
+frame agreed with it.
+
+Not everything that changes a picture is a shift. A lens being uncovered, a
+push in, a hand passing close by: no offset in any direction explains those,
+and the first version of this called them `unobservable` -- "nothing in the
+frame is stable enough to compare". That reading was wrong twice over. It
+searched horizontally only, so a tilt was also unexplainable and five frames
+of one take were called unreadable for moving up and down. And the name
+claimed ignorance about the one case the model is best placed to judge:
+occlusions and zooms take seconds, so they are plainly visible at a frame a
+second, unlike the between-frame shake this exists for. Saying "cannot be
+measured" pushed the model towards `setup_reframe`, which earns no span, and
+three layers cooperated to delete a clean opening shot.
+
+So the state is now `not_a_shift`, which is what is actually known, and the
+model is told it can see this one for itself.
 """
 
 from __future__ import annotations
@@ -55,7 +69,7 @@ MOVING = 0.02
 # frames of pure noise -- where by construction no shift explains anything --
 # sit at 22.7. The first number chosen was 26, which noise passed, so the
 # state it was added for could never occur.
-UNREADABLE = 15.0
+NOT_A_SHIFT = 15.0
 
 # What the model can see. It reads video at a frame a second -- measured, not
 # assumed: the same clip sent with `fps: 4` and with nothing came back at an
@@ -74,6 +88,12 @@ SEEN_SECONDS = 1.0
 # in the measurement rather than a thing the camera did.
 LEAST_SECONDS = 0.5
 
+# What the reading means, in the cache key. A measurement is a fact about the
+# bytes, so it is content addressed and never recomputed -- which is right
+# until the measurement itself starts meaning something else, and then every
+# clip keeps answering the old question forever. Bump this when it does.
+READING = "v2-xy"
+
 
 @dataclass(frozen=True)
 class MotionInterval:
@@ -82,7 +102,7 @@ class MotionInterval:
     event_id: str
     starts_seconds: float
     ends_seconds: float
-    state: str          # still | moving | unobservable
+    state: str          # still | moving | not_a_shift
     peak_vw_s: float    # fastest global shift, frame widths per second
     travel_vw: float    # total global shift across the interval
     settles: bool       # ends still, having been moving
@@ -106,62 +126,110 @@ def measure(source: Path, duration: float) -> list[MotionInterval]:
         return [
             MotionInterval(
                 event_id="m00", starts_seconds=0.0, ends_seconds=duration,
-                state="unobservable", peak_vw_s=0.0, travel_vw=0.0,
+                state="not_a_shift", peak_vw_s=0.0, travel_vw=0.0,
                 settles=False,
             )
         ]
     return _into_intervals(shifts, duration)
 
 
+HEIGHT = 108
+
+
+# Furthest the frame is allowed to have travelled between two samples, in
+# pixels at WIDTH -- half a frame width per second at COARSE_FPS. Not a
+# preference: an offset beyond the search is not found, so the residual stays
+# high and the stretch is reported as something other than a shift. The first
+# reach was 8, and the fastest movement anywhere in this library came back as
+# exactly 0.17 frame widths per second on three separate clips, which is
+# 8/192*4 -- every one of them was pinned against the edge of the search
+# rather than measured. One real whip pan crossed the residual threshold that
+# way and was disowned; at 24 its offset is found and its residual falls from
+# 15.0 to 6.5.
+REACH = 24
+
+# Stride of the first pass. The agreement curve around a true offset is
+# broad -- a frame slid three pixels too far still matches better than one
+# slid twenty -- so a coarse sweep lands within a stride of the answer and a
+# short fine sweep finishes it. Three times the range for a fifth of the
+# comparisons a full sweep of it would need.
+COARSE = 4
+
+
+def _agreement(before: bytes, after: bytes, across: int, down: int) -> float:
+    """Mean grey difference once the later frame is slid back by this much."""
+
+    total = count = 0
+    for row in range(6, HEIGHT, 12):
+        if not 0 <= row + down < HEIGHT:
+            continue
+        base = row * WIDTH
+        moved = (row + down) * WIDTH
+        for column in range(max(0, -across) + 4, min(WIDTH, WIDTH - across) - 4, 3):
+            total += abs(before[base + column] - after[moved + column + across])
+            count += 1
+    return total / max(count, 1)
+
+
+def _slide(before: bytes, after: bytes, other: int, *, sideways: bool) -> int:
+    """The offset on one axis that best explains the change, coarse then fine."""
+
+    def score(value: int) -> float:
+        if sideways:
+            return _agreement(before, after, value, other)
+        return _agreement(before, after, other, value)
+
+    rough = min(range(-REACH, REACH + 1, COARSE), key=score)
+    near = range(max(-REACH, rough - COARSE), min(REACH, rough + COARSE) + 1)
+    return min(near, key=score)
+
+
 def _global_shift(source: Path, fps: float) -> list[tuple[float, float, float]]:
-    """(seconds, shift) per sampled frame, shift in frame widths per second.
+    """(seconds, shift, residual) per frame, shift in frame widths per second.
 
     Estimated by matching each frame against the one before it at a handful
-    of horizontal offsets and taking the offset that agrees best across the
-    frame. Crude next to optical flow and enough to separate a camera that
-    moved from a screen that changed: a screen playing video has no offset
-    that improves the match, so its best score stays poor and its shift
-    reads as zero.
+    of offsets and taking the one that agrees best across the frame. Crude
+    next to optical flow and enough to separate a camera that moved from a
+    screen that changed: a screen playing video has no offset that improves
+    the match, so its best score stays poor and its shift reads as zero.
+
+    Both axes, one at a time. A camera tilts as readily as it pans, and the
+    first version searched sideways only, so an operator lowering the frame
+    left a residual nothing could account for and the take was reported
+    unreadable. Searching the square costs the square and buys nothing here:
+    over 680 frames of this library, fixing one axis and then the other and
+    then revisiting the first found the identical offset 678 times, and the
+    two it missed were worse by 0.19 grey levels against a threshold of
+    fifteen.
     """
 
     raw = subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(source),
-            "-vf", f"fps={fps},scale={WIDTH}:108,format=gray",
+            "-vf", f"fps={fps},scale={WIDTH}:{HEIGHT},format=gray",
             "-f", "rawvideo", "-pix_fmt", "gray", "-",
         ],
         capture_output=True, check=False,
     ).stdout
-    size = WIDTH * 108
+    size = WIDTH * HEIGHT
     frames = [raw[i * size:(i + 1) * size] for i in range(len(raw) // size)]
     if len(frames) < 2:
         return []
 
     out: list[tuple[float, float, float]] = []
-    reach = max(2, WIDTH // 24)
     for index, (before, after) in enumerate(zip(frames, frames[1:]), start=1):
-        best, offset = None, 0
-        for shift in range(-reach, reach + 1):
-            total = count = 0
-            for row in range(6, 108, 12):
-                base = row * WIDTH
-                lo = max(0, -shift) + 4
-                hi = min(WIDTH, WIDTH - shift) - 4
-                for column in range(lo, hi, 3):
-                    total += abs(
-                        before[base + column] - after[base + column + shift]
-                    )
-                    count += 1
-            score = total / max(count, 1)
-            if best is None or score < best:
-                best, offset = score, shift
+        across = _slide(before, after, 0, sideways=True)
+        down = _slide(before, after, across, sideways=False)
+        across = _slide(before, after, down, sideways=True)
         # How well the best offset actually explained the change. A camera
-        # that moved leaves a low residual: shift the frame back and it
-        # matches. A screen playing video leaves a high one at every offset,
-        # because nothing about the change is a shift -- and that is the
-        # difference between "the camera was still" and "this cannot be
-        # read from the picture", which were the same answer before.
-        out.append((index / fps, abs(offset) / WIDTH * fps, best or 0.0))
+        # that moved leaves a low residual: slide the frame back and it
+        # matches. A lens being uncovered leaves a high one at every offset
+        # in both directions, because nothing about that change is a shift --
+        # and that is the difference between "the camera was still" and
+        # "this was not the camera moving", which were the same answer once.
+        residual = _agreement(before, after, across, down)
+        travelled = (across * across + down * down) ** 0.5
+        out.append((index / fps, travelled / WIDTH * fps, residual))
     return out
 
 
@@ -178,11 +246,13 @@ def _into_intervals(
     states: list[tuple[float, str, float]] = []
     now = "still"
     for at, speed, residual in shifts:
-        if residual > UNREADABLE:
-            # No offset explains what changed, so there is no shift to
-            # report and "the camera was still" would be a claim rather
-            # than a reading.
-            states.append((at, "unobservable", speed))
+        if residual > NOT_A_SHIFT:
+            # No offset in either direction explains what changed, so there
+            # is no shift to report and "the camera was still" would be a
+            # claim rather than a reading. The offset that scored best is
+            # dropped with it: it is the least bad of a bad set, not a
+            # measurement of anything.
+            states.append((at, "not_a_shift", 0.0))
             continue
         if now == "still" and speed > MOVING:
             now = "moving"
@@ -306,7 +376,19 @@ def describe(intervals: list[MotionInterval]) -> str:
         else:
             said = {
                 "still": "整段畫面沒有位移",
-                "unobservable": "量不出來（畫面裡沒有夠穩定的東西可以比對）",
+                # Not "cannot be measured". What is known is narrower and
+                # more useful: the picture changed and no shift accounts for
+                # it. Every cause of that -- a lens uncovered, a push in, a
+                # subject filling the frame -- unfolds over seconds, so it
+                # is the one kind of movement the model can see perfectly
+                # well without help. Told it was unmeasurable, it reached
+                # for `setup_reframe`, and that costs the stretch its span.
+                "not_a_shift": (
+                    "畫面大幅改變，但不是整體平移"
+                    "（推拉變焦、有東西靠近或離開鏡頭、主體佔滿畫面都會這樣）。"
+                    "這種變化橫跨好幾秒，你在畫面上看得到——照你看到的判斷，"
+                    "不要因為這裡沒有數字就當成拍壞了"
+                ),
             }[one.state]
         tail = "，最後停下來落定" if one.settles else ""
         lines.append(f"  {one.event_id}  {clock}–{until}  {said}{tail}")
@@ -322,7 +404,7 @@ def cached(source: Path, duration: float, library: Path) -> list[MotionInterval]
 
     from montagewright.uploads import content_hash
 
-    where = library / "motion" / f"{content_hash(source)[:20]}.json"
+    where = library / "motion" / f"{content_hash(source)[:20]}.{READING}.json"
     if where.exists():
         try:
             stored = json.loads(where.read_text(encoding="utf-8"))

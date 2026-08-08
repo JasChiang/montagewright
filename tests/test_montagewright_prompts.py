@@ -362,21 +362,23 @@ def test_the_card_version_moves_when_anything_about_the_card_moves():
     import json as _json
 
     from montagewright import clipcard
+    from montagewright.motion import READING
 
     was = clipcard.CARD_VERSION
     assert was.startswith("montagewright-clip-card-")
 
-    # The digest covers the whole schema and the prompt beside it.
+    # The digest covers the whole schema, the prompt beside it, and what the
+    # measurement it is shown means -- the card is answering all three.
     shape = _json.dumps(clipcard.card_schema(), sort_keys=True, ensure_ascii=False)
     prompt = (PROMPTS / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
-    expected = hashlib.sha256((shape + prompt).encode("utf-8")).hexdigest()[:8]
+    expected = hashlib.sha256((shape + prompt + READING).encode("utf-8")).hexdigest()[:8]
     assert was.endswith(expected)
 
     # A nested change moves it, which the old version could not see.
     deeper = _json.loads(shape)
     deeper["properties"]["segments"]["items"]["properties"]["status"]["enum"].append("maybe")
     moved = hashlib.sha256(
-        (_json.dumps(deeper, sort_keys=True, ensure_ascii=False) + prompt)
+        (_json.dumps(deeper, sort_keys=True, ensure_ascii=False) + prompt + READING)
         .encode("utf-8")
     ).hexdigest()[:8]
     assert moved != expected

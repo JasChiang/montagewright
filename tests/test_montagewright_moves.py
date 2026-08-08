@@ -4475,7 +4475,7 @@ def test_unreadable_footage_says_so_rather_than_saying_still():
     import tempfile
     from pathlib import Path
 
-    from montagewright.motion import UNREADABLE, measure
+    from montagewright.motion import NOT_A_SHIFT, measure
 
     with tempfile.TemporaryDirectory() as work:
         noise = Path(work) / "noise.mp4"
@@ -4493,12 +4493,87 @@ def test_unreadable_footage_says_so_rather_than_saying_still():
         found = measure(noise, 3.0)
 
     # By construction no shift explains anything, so no shift is claimed.
-    assert [one.state for one in found] == ["unobservable"]
+    assert [one.state for one in found] == ["not_a_shift"]
 
     # And the threshold sits between what real footage leaves behind and
     # what noise does -- the first number chosen was above noise, so the
     # state it was added for could never have occurred.
-    assert 12.2 < UNREADABLE < 22.7
+    assert 12.2 < NOT_A_SHIFT < 22.7
+
+
+def _synthesise(work, moving, seconds=4.0):
+    """A still pattern with the frame sliding across it. No real camera needed."""
+
+    import subprocess
+    from pathlib import Path
+
+    made = Path(work) / "pan.mp4"
+    built = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", f"nullsrc=s=640x640:d={seconds}:r=25,"
+               r"geq=lum='mod(X*3+Y*5\,256)':cb=128:cr=128,"
+               f"crop=320:180:{moving[0]}:{moving[1]}",
+         "-c:v", "libx264", "-crf", "18", str(made)],
+        capture_output=True,
+    )
+    if built.returncode != 0 or not made.exists():
+        import pytest as _pytest
+
+        _pytest.skip("ffmpeg cannot synthesise a pan here")
+    return made
+
+
+def test_a_camera_that_only_tilts_is_still_a_camera_that_moved():
+    """The search ran sideways only, so tilting was inexplicable.
+
+    Every offset tried was horizontal, which means a frame that slid up or
+    down matched nothing at any of them, left a residual no shift accounted
+    for, and was reported as not-a-shift -- the state reserved for changes
+    that are not the camera moving. Two clips of a twelve-clip sample were
+    reported as locked-off throughout while the operator was tilting.
+
+    The user found this by watching a file the measurement had called
+    unreadable and seeing an ordinary shot.
+    """
+
+    import tempfile
+
+    from montagewright.motion import measure
+
+    with tempfile.TemporaryDirectory() as work:
+        found = measure(_synthesise(work, ("0", "min(t*60\\,300)")), 4.0)
+
+    assert [one.state for one in found] == ["moving"]
+    assert found[0].peak_vw_s > 0.0
+
+
+def test_a_movement_faster_than_the_search_is_measured_not_disowned():
+    """An offset outside the search is not found, and absence read as absence.
+
+    The reach was eight pixels at the analysed width, which caps any reading
+    at 8/192*4 frame widths per second. Three clips in this library came back
+    at exactly that figure -- not a property of the footage, the edge of the
+    search -- and a real whip pan sat above it, so no offset explained it and
+    the stretch was disowned as not-a-shift.
+    """
+
+    import tempfile
+
+    from montagewright.motion import COARSE_FPS, REACH, WIDTH, measure
+
+    was = 8 / WIDTH * COARSE_FPS
+    with tempfile.TemporaryDirectory() as work:
+        found = measure(_synthesise(work, ("min(t*150\\,300)", "0")), 4.0)
+
+    # It runs out of pattern to slide across and stops, which is a real
+    # settle and reported as one. What matters is the stretch before it.
+    assert found[0].state == "moving"
+    assert not [one for one in found if one.state == "not_a_shift"]
+    # The ceiling is the corner of the search, not its edge: a reading is
+    # the two axes together, so a frame at full reach sideways and a pixel
+    # down measures fractionally past REACH.
+    corner = REACH * 2 ** 0.5 / WIDTH * COARSE_FPS
+    assert was < found[0].peak_vw_s <= corner
 
 
 def test_a_movement_too_brief_for_the_model_to_see_is_not_split_out():

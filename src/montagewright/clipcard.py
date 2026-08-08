@@ -53,10 +53,17 @@ def _card_version() -> str:
     # segments could change shape, an enum could gain a value, a unit could
     # flip from seconds to a clock reading, and every cached card stayed
     # valid while meaning something different. All of those happened.
+    # The measurement is an input to the card as much as the prompt is. When
+    # the same clip started being described as "not a shift" rather than
+    # "unmeasurable", every cached card held an answer to a question that is
+    # no longer asked -- and cards outlive runs, so it would never have
+    # resurfaced on its own.
+    from montagewright.motion import READING
+
     shape = json.dumps(card_schema(), sort_keys=True, ensure_ascii=False)
     prompt = (PROMPTS / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
-    digest = hashlib.sha256((shape + prompt).encode("utf-8")).hexdigest()[:8]
-    return f"montagewright-clip-card-{digest}"
+    said = hashlib.sha256((shape + prompt + READING).encode("utf-8"))
+    return f"montagewright-clip-card-{said.hexdigest()[:8]}"
 
 
 CARD_VERSION = ""  # set below, once card_schema is defined
