@@ -1856,6 +1856,59 @@ def test_the_brief_and_the_flag_cannot_quietly_disagree():
     )
 
 
+def test_the_delivery_aspect_is_the_request_not_the_model_s_choice():
+    """Two aspects that agreed only by luck.
+
+    The direction pass chose an aspect from an enum, uninformed by --aspect,
+    and that choice was what selection and the interface were told to plan
+    and draw for -- while the executor cropped to --aspect. When they
+    differed, the film was planned for one frame and rendered in another.
+
+    The aspect is a delivery requirement, so it is no longer the model's to
+    pick: the schema does not offer it, and whatever the pass returns, the
+    requested aspect is stamped onto the result that everything downstream
+    reads.
+    """
+
+    from montagewright import planner
+
+    schema = planner._direction_schema()
+    assert "aspect" not in schema["properties"]
+    assert "aspect" not in schema["required"]
+
+    # A fake client that answers with a different aspect than requested; the
+    # requested one is what comes back regardless.
+    import json as _json
+
+    class Reply:
+        status = "complete"
+        usage = {}
+
+        def __init__(self, payload):
+            self.output_text = _json.dumps(payload)
+
+    class Client:
+        def __init__(self, payload):
+            self._payload = payload
+
+        @property
+        def interactions(self):
+            return self
+
+        def create(self, **_):
+            return Reply(self._payload)
+
+    answer = {
+        "reasoning": "r", "material_assessment": "m", "direction": "d",
+        "target_seconds": "0:20", "music_under_speech": "duck",
+        "unusable": [], "aspect": "16:9",   # the model tries to say 16:9
+    }
+    decided, _ = planner.decide_direction(
+        [], brief="", aspect="9:16", client=Client(answer),
+    )
+    assert decided["aspect"] == "9:16"
+
+
 def test_the_card_version_moves_when_the_card_s_shape_does():
     """Two required fields were added and no card was rewritten.
 

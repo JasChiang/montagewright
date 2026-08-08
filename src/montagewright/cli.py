@@ -594,7 +594,7 @@ def command_render(args: argparse.Namespace) -> int:
     if direction is None:
         ledger.check()
         direction, usage_direction = decide_direction(
-            material, brief=brief, music=args.music,
+            material, brief=brief, aspect=args.aspect, music=args.music,
             seconds=args.seconds, cache=cache, client=client
         )
         ledger.record(

@@ -24,6 +24,7 @@ from montagewright.schema import looks_of, move_of_shot
 from montagewright.capabilities import (
     INTENT_NAMES,
     describe_for_prompt,
+    describe_limits_for_prompt,
 )
 from montagewright.grounding import BeatGrid
 from montagewright.uploads import UploadCache, upload_now
@@ -935,7 +936,6 @@ def _direction_schema() -> dict[str, Any]:
             "direction",
             "target_seconds",
             "music_under_speech",
-            "aspect",
             "unusable",
         ],
         "properties": {
@@ -965,7 +965,6 @@ def _direction_schema() -> dict[str, Any]:
                     "`none`：不要音樂。素材沒有人聲時這個欄位不影響結果。"
                 ),
             },
-            "aspect": {"type": "string", "enum": ["16:9", "9:16", "1:1"]},
             "music_suggestion": {"type": "string"},
             "unusable": {
                 "type": "array",
@@ -1210,6 +1209,7 @@ def decide_direction(
     material: list[MaterialItem],
     *,
     brief: str,
+    aspect: str = "9:16",
     music: Path | None = None,
     seconds: float = 0.0,
     cache: UploadCache | None = None,
@@ -1243,8 +1243,12 @@ def decide_direction(
         {
             "type": "text",
             "text": (
-                f"{prompt}\n\n{fixed}## 剪輯 brief\n\n{brief}\n\n"
+                f"{prompt}\n\n{fixed}"
+                f"## 交付比例\n\n這支片輸出 {aspect}，這是需求規格，不是你的選擇。"
+                f"所有調性與節奏的判斷都要建立在這個比例上。\n\n"
+                f"## 剪輯 brief\n\n{brief}\n\n"
                 f"## 執行層做得到什麼\n\n{describe_for_prompt()}\n\n"
+                f"## 執行層做不到什麼\n\n{describe_limits_for_prompt()}\n\n"
                 f"## 素材\n\n以下 {len(material)} 支，每一支的說明就寫在它自己那段影片前面。\n"
             ),
         }
@@ -1270,6 +1274,13 @@ def decide_direction(
     decided = _parse(interaction, what="direction pass")
     from montagewright.spans import seconds_of
 
+    # The delivery aspect is the request, not the model's to pick. It used to
+    # choose one from an enum, uninformed by --aspect, and that choice was
+    # what selection and the interface were then told to plan and draw for --
+    # while the executor cropped to --aspect. Two aspects that agreed only by
+    # luck. It is stamped here so every reader downstream sees the one that
+    # will actually be rendered.
+    decided["aspect"] = aspect
     decided["target_seconds"] = seconds_of(decided.get("target_seconds")) or 0.0
     if seconds > 0:
         # Overwritten rather than trusted. It is told the number and mostly
@@ -1583,6 +1594,7 @@ def select_shots(
                     f"輸出 {direction['aspect']}。\n\n"
                     f"## 剪輯 brief\n\n{brief}\n\n"
                     f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
+                    f"## 做不到的事\n\n{describe_limits_for_prompt()}\n\n"
                     f"## 可用素材\n\n以下 {len(usable)} 支，每一支的說明就寫在它自己那段影片前面。\n"
             ),
         }
@@ -1801,6 +1813,7 @@ def replan_shots(
                 f"輸出 {direction['aspect']}。\n\n"
                 + (f"## 剪輯 brief\n\n{brief}\n\n" if brief else "")
                 + f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
+                + f"## 做不到的事\n\n{describe_limits_for_prompt()}\n\n"
                 + (f"## 這支片其他顆在講什麼\n\n{context}\n\n" if context else "")
                 + f"## 要重新規劃的鏡頭\n\n{problems}\n\n"
                 f"## 可用素材\n\n以下 {len(usable)} 支，"
