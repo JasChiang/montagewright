@@ -4192,6 +4192,36 @@ def test_a_cut_lands_on_the_downbeat_rather_than_the_nearest_beat():
     assert both.nearest_cue(1.02).kind == "section_boundary"
 
 
+def test_a_cut_records_what_kind_of_event_it_landed_on():
+    """The count was true and could not be checked, which is worse than false.
+
+    A cue id is a position in a sorted list of candidates of every kind, so
+    `mc-00040` reads back as nothing. Six cuts running one beat ahead of the
+    bar were reported as six cuts on the music, and the only way anyone found
+    out was by listening. Ranking cues by strength fixed the cutting; this is
+    what makes the claim answerable next time without listening first.
+    """
+
+    from montagewright.grounding import ground_timeline
+    from montagewright.schema import EDL, Clip, MusicSync
+
+    grid = _grid()
+    period = 60.0 / 120.0
+    asked = EDL(project_id="p", clips=[Clip(
+        clip_id="k00", source_id="C1",
+        approx_in_seconds=0.0, approx_out_seconds=4 * period + 0.05,
+        music_sync=MusicSync(cut_on_beat=True),
+    )])
+    landed = ground_timeline(asked, grid).clips[0]
+    assert landed.landed_on is not None
+    assert landed.landed_kind == "downbeat"
+
+    # And the grid can be asked about a cue by name, which is what a shot
+    # naming its own sync point needs.
+    assert grid.cue(landed.landed_on).kind == "downbeat"
+    assert grid.cue("nothing-by-this-name") is None
+
+
 def test_the_preference_covers_every_cuttable_kind():
     """A kind nobody ranked would sort last by accident rather than by choice."""
 

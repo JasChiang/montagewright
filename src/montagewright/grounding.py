@@ -128,6 +128,11 @@ class BeatGrid:
     def cuttable(self) -> tuple[Cue, ...]:
         return tuple(cue for cue in self.cues if cue.kind in CUTTABLE)
 
+    def cue(self, cue_id: str | None) -> Cue | None:
+        """One cue by name, so a report can say what a cut landed on."""
+
+        return next((one for one in self.cues if one.cue_id == cue_id), None)
+
     def phrase_seconds(self, bars: int = 4) -> float:
         """How long a musical phrase runs, in seconds.
 
@@ -354,6 +359,13 @@ class GroundedClip:
     timeline_in_seconds: float
     timeline_out_seconds: float
     landed_on: str | None = None
+    # What kind of musical event that was. The id alone cannot be read back:
+    # `mc-00040` is a position in a sorted list of candidates of every kind,
+    # so a report saying nine cuts of nine landed on the music was true and
+    # unauditable -- the run before this one put six consecutive cuts on the
+    # fourth beat of the bar and reported sixteen out of sixteen. Ranking
+    # cues by strength fixed the cutting; nothing made the claim checkable.
+    landed_kind: str | None = None
     note: str | None = None
     # Set when a camera move lengthened this shot past what the rhythm asked
     # for, so the report can say why the cut runs where it does.
@@ -469,6 +481,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         )
         end = cursor + wanted
         landed: str | None = None
+        landed_kind: str | None = None
         note: str | None = None
 
         # A moment inside the shot, put where the music is. Only the cut was
@@ -518,6 +531,8 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         if wanted_point is not None:
             end = wanted_point
             landed = clip.music_sync.sync_to
+            found = grid.cue(landed) if grid is not None else None
+            landed_kind = found.kind if found is not None else "named"
             asked_for = cursor + wanted
             if abs(end - asked_for) > grid.seconds_per_beat:
                 note = (
@@ -531,6 +546,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 drift = abs(cue.time_seconds - end)
                 end = cue.time_seconds
                 landed = cue.cue_id
+                landed_kind = cue.kind
                 if drift > grid.seconds_per_beat / 2:
                     note = (
                         f"nearest cue sat {drift:.3f}s from the requested "
@@ -548,6 +564,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 timeline_in_seconds=cursor,
                 timeline_out_seconds=end,
                 landed_on=landed,
+                landed_kind=landed_kind,
                 note=note,
                 move_too_short=too_short,
             )

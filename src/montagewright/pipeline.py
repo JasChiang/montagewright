@@ -1273,6 +1273,10 @@ def run(
         entry.clip.clip_id: {
             "cut_on_beat": entry.clip.music_sync.cut_on_beat,
             "landed_on": entry.landed_on,
+            # Without this the count could not be read back: a cue id is a
+            # position in a list, not a description, so "nine of nine on the
+            # music" hid six cuts running one beat ahead of the bar.
+            "landed_kind": entry.landed_kind,
             "seconds": round(entry.duration_seconds, 3),
             "why": entry.clip.music_sync.rhythm_reason,
         }
