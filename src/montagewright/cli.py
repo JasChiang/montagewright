@@ -556,6 +556,7 @@ def command_render(args: argparse.Namespace) -> int:
                     for box in subjects_from_card(card or {})
                 ),
                 motion=tuple(motion_of(source_id) or ()),
+                crop_width=min(1.0, ASPECTS[args.aspect] / _aspect(proxy)),
                 speech=_speech_lines(transcripts.get(source_id)),
             )
         )

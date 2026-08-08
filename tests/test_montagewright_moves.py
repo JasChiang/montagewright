@@ -4221,6 +4221,8 @@ def test_a_look_at_something_outside_this_window_is_a_disagreement():
         source_id="C8329", duration_seconds=16.5, summary="",
         sightings=(("右前方的綠色錶帶智慧手錶", 2.0), ("左側平移後出現的手錶", 12.0)),
         motion=(moving(4.0, 11.0, 0.34),),
+        # What a 16:9 source is delivered through at 9:16.
+        crop_width=0.3164,
     )]
     shot = {
         "source_id": "C8329", "frame": "travels",
@@ -4244,12 +4246,44 @@ def test_a_look_at_something_outside_this_window_is_a_disagreement():
     # moment describes every moment, which is why most shots pass.
     still = [MaterialItem(
         source_id="C8329", duration_seconds=16.5, summary="",
-        sightings=material[0].sightings, motion=(),
+        sightings=material[0].sightings, motion=(), crop_width=0.3164,
     )]
     assert frame_disagreements([shot], still) == []
 
     # Without any material the older checks still run on their own.
     assert frame_disagreements([shot]) == []
+
+    # A stretch in between that no camera movement accounts for -- a lens
+    # uncovered, a subject filling the frame -- contributes no offset, and
+    # summing offsets would certify it as never having moved. That is the
+    # error this module was rewritten to stop making, so it says unknown.
+    unreadable = [MaterialItem(
+        source_id="C8329", duration_seconds=16.5, summary="",
+        sightings=material[0].sightings, crop_width=0.3164,
+        motion=(MotionInterval(
+            event_id="m00", starts_seconds=4.0, ends_seconds=11.0,
+            state="not_a_shift", peak_vw_s=0.0, travel_vw=0.0, settles=False,
+        ),),
+    )]
+    # Both looks, because the stretch nothing explains covers the reach from
+    # either sighting to this window -- including the near one that a
+    # measured pan would have carried.
+    unknown = frame_disagreements([shot], unreadable)
+    assert len(unknown) == 2
+    assert all("unknown" in one for one in unknown)
+
+    # The same drift on a wider delivery is not a problem, because the
+    # number is half the crop rather than a constant. Delivered at its own
+    # aspect this source is not cropped at all, so a subject that would have
+    # left a vertical frame is still comfortably inside this one -- which is
+    # why the first version of this check, a flat 0.15, was a rule about one
+    # shoot wearing the clothes of a general one.
+    roomy = [MaterialItem(
+        source_id="C8329", duration_seconds=16.5, summary="",
+        sightings=material[0].sightings, motion=material[0].motion,
+        crop_width=1.0,
+    )]
+    assert frame_disagreements([shot], roomy) == []
 
 
 def test_a_cut_records_what_kind_of_event_it_landed_on():
@@ -4591,22 +4625,42 @@ def test_unreadable_footage_says_so_rather_than_saying_still():
     assert 12.2 < NOT_A_SHIFT < 22.7
 
 
-def _synthesise(work, moving, seconds=4.0):
-    """A still pattern with the frame sliding across it. No real camera needed."""
+def _pan_across(work, across_px_s, down_px_s=0, seconds=3.0):
+    """A still plate with a 320x180 window travelling across it.
+
+    Still is the point: an earlier version of this drew `random(1)` per
+    frame, so every frame was a fresh field of noise and there was nothing
+    for any offset to match -- the measurement correctly reported that
+    nothing explained the change, and the test read it as a bug in the
+    measurement. A repeating pattern is no better: `mod(X*3+Y*5,256)` has a
+    period of 85 pixels, so a shift of 85 scores perfectly and the reading
+    is whatever aliasing decides.
+
+    The window is 320 wide, so a pan of N pixels a second is exactly
+    N/320 frame widths a second, whatever the analysis is scaled to.
+    """
 
     import subprocess
     from pathlib import Path
 
-    made = Path(work) / "pan.mp4"
-    built = subprocess.run(
+    plate = Path(work) / "plate.png"
+    subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-         "-i", f"nullsrc=s=640x640:d={seconds}:r=25,"
-               r"geq=lum='mod(X*3+Y*5\,256)':cb=128:cr=128,"
-               f"crop=320:180:{moving[0]}:{moving[1]}",
-         "-c:v", "libx264", "-crf", "18", str(made)],
+         "-i", "nullsrc=s=160x45,geq=lum='random(1)*255':cb=128:cr=128",
+         "-frames:v", "1",
+         "-vf", "scale=2560:1440:flags=bicubic,gblur=sigma=3", str(plate)],
         capture_output=True,
     )
-    if built.returncode != 0 or not made.exists():
+    made = Path(work) / "pan.mp4"
+    built = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-loop", "1", "-i", str(plate), "-t", str(seconds), "-r", "25",
+         "-vf", f"crop=320:180:'min(t*{across_px_s}\\,2200)'"
+                f":'min(t*{down_px_s}\\,1200)'",
+         "-c:v", "libx264", "-crf", "14", "-pix_fmt", "yuv420p", str(made)],
+        capture_output=True,
+    )
+    if built.returncode != 0 or not made.exists() or not plate.exists():
         import pytest as _pytest
 
         _pytest.skip("ffmpeg cannot synthesise a pan here")
@@ -4631,39 +4685,51 @@ def test_a_camera_that_only_tilts_is_still_a_camera_that_moved():
     from montagewright.motion import measure
 
     with tempfile.TemporaryDirectory() as work:
-        found = measure(_synthesise(work, ("0", "min(t*60\\,300)")), 4.0)
+        found = measure(_pan_across(work, 0, 90), 3.0)
 
-    assert [one.state for one in found] == ["moving"]
-    assert found[0].peak_vw_s > 0.0
+    assert found[0].state == "moving"
+    assert not [one for one in found if one.state == "not_a_shift"]
 
 
-def test_a_movement_faster_than_the_search_is_measured_not_disowned():
-    """An offset outside the search is not found, and absence read as absence.
+def test_the_speed_a_pan_is_measured_at_is_the_speed_it_was_shot_at():
+    """A search radius is a ceiling, and a ceiling reads as a wall.
 
     The reach was eight pixels at the analysed width, which caps any reading
-    at 8/192*4 frame widths per second. Three clips in this library came back
-    at exactly that figure -- not a property of the footage, the edge of the
-    search -- and a real whip pan sat above it, so no offset explained it and
-    the stretch was disowned as not-a-shift.
+    at 8/192*4 frame widths per second -- and three clips came back at
+    exactly that figure, pinned against the edge of the search rather than
+    measured. Raising it to twenty-four moved the wall and left it standing:
+    a faster pan would have found it. What removes it is looking on a
+    smaller copy first, where a movement too big to find is small, so the
+    only limit left is how much picture two frames still share.
+
+    Checked against pans of known speed rather than against another
+    estimate agreeing with it, because two approximations can be wrong
+    together. The 320-wide window makes the answer arithmetic: N pixels a
+    second is N/320 frame widths a second.
+
+    Readings run about a tenth high. Sampling 25fps material at 4 leaves
+    consecutive samples six or seven source frames apart, and a peak picks
+    the seven -- a bias the thresholds share, since they were calibrated
+    through the same sampler.
     """
 
     import tempfile
 
-    from montagewright.motion import COARSE_FPS, REACH, WIDTH, measure
+    from montagewright.motion import COARSE_FPS, SHARED, measure
 
-    was = 8 / WIDTH * COARSE_FPS
-    with tempfile.TemporaryDirectory() as work:
-        found = measure(_synthesise(work, ("min(t*150\\,300)", "0")), 4.0)
+    # Well past what the old fixed reach could see: 0.5 widths a second was
+    # its ceiling and the fastest of these is three times that.
+    for speed in (60, 240, 480):
+        with tempfile.TemporaryDirectory() as work:
+            found = measure(_pan_across(work, speed), 3.0)
+        wanted = speed / 320.0
+        fastest = max(one.peak_vw_s for one in found)
+        assert found[0].state == "moving", speed
+        assert abs(fastest - wanted) / wanted < 0.2, (speed, fastest, wanted)
 
-    # It runs out of pattern to slide across and stops, which is a real
-    # settle and reported as one. What matters is the stretch before it.
-    assert found[0].state == "moving"
-    assert not [one for one in found if one.state == "not_a_shift"]
-    # The ceiling is the corner of the search, not its edge: a reading is
-    # the two axes together, so a frame at full reach sideways and a pixel
-    # down measures fractionally past REACH.
-    corner = REACH * 2 ** 0.5 / WIDTH * COARSE_FPS
-    assert was < found[0].peak_vw_s <= corner
+    # And the ceiling that remains is the one physics imposes: past half a
+    # frame there is not enough shared picture for any offset to be evidence.
+    assert (1.0 - SHARED) * COARSE_FPS == 2.0
 
 
 def test_a_movement_too_brief_for_the_model_to_see_is_not_split_out():

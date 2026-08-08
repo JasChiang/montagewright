@@ -92,7 +92,7 @@ LEAST_SECONDS = 0.5
 # bytes, so it is content addressed and never recomputed -- which is right
 # until the measurement itself starts meaning something else, and then every
 # clip keeps answering the old question forever. Bump this when it does.
-READING = "v2-xy"
+READING = "v3-pyramid"
 
 
 @dataclass(frozen=True)
@@ -136,52 +136,107 @@ def measure(source: Path, duration: float) -> list[MotionInterval]:
 HEIGHT = 108
 
 
-# Furthest the frame is allowed to have travelled between two samples, in
-# pixels at WIDTH -- half a frame width per second at COARSE_FPS. Not a
-# preference: an offset beyond the search is not found, so the residual stays
-# high and the stretch is reported as something other than a shift. The first
-# reach was 8, and the fastest movement anywhere in this library came back as
-# exactly 0.17 frame widths per second on three separate clips, which is
-# 8/192*4 -- every one of them was pinned against the edge of the search
-# rather than measured. One real whip pan crossed the residual threshold that
-# way and was disowned; at 24 its offset is found and its residual falls from
-# 15.0 to 6.5.
-REACH = 24
+# How much of the two frames must still overlap for a comparison between
+# them to mean anything. This is the only free number in the search, and it
+# also decides how far an offset can be looked for: past half a frame there
+# is not enough picture in common for any offset to be evidence of anything,
+# so the reach is not a second thing to choose -- it falls out of this.
+#
+# It replaces a pixel count. That count was 8, then 24, and both were the
+# same mistake: an offset outside the search is not found, so the residual
+# stays high and a real movement is reported as something other than a
+# shift. Three clips came back at exactly 0.17 frame widths per second,
+# which is 8/192*4 -- the edge of the search, not a property of any of them.
+# Raising it to 24 moved the wall. Reading coarsely first removes it: the
+# ceiling is now what physics allows rather than what was affordable.
+SHARED = 0.5
 
-# Stride of the first pass. The agreement curve around a true offset is
-# broad -- a frame slid three pixels too far still matches better than one
-# slid twenty -- so a coarse sweep lands within a stride of the answer and a
-# short fine sweep finishes it. Three times the range for a fifth of the
-# comparisons a full sweep of it would need.
-COARSE = 4
+# How far down to look first. A pan too fast to find at full size is a small
+# offset once the picture is a quarter as wide, and the answer there says
+# which handful of full-size offsets are worth trying. Sixteen times fewer
+# pixels per comparison pays for the whole coarse sweep several times over.
+SHRINK = 4
 
 
-def _agreement(before: bytes, after: bytes, across: int, down: int) -> float:
-    """Mean grey difference once the later frame is slid back by this much."""
+def _shrink(frame: bytes, width: int, height: int, by: int) -> bytes:
+    """The same picture, box-averaged down by an integer factor."""
 
+    across, down = width // by, height // by
+    out = bytearray(across * down)
+    area = by * by
+    for row in range(down):
+        for column in range(across):
+            total = 0
+            for inner in range(by):
+                base = (row * by + inner) * width + column * by
+                total += sum(frame[base:base + by])
+            out[row * across + column] = total // area
+    return bytes(out)
+
+
+def _agreement(
+    before: bytes, after: bytes, width: int, height: int, across: int, down: int
+) -> float:
+    """Mean grey difference once the later frame is slid back by this much.
+
+    Infinite when too little of the two frames still overlaps. That is not a
+    guard against bad input -- it is what stops the search reaching offsets
+    where a perfect score means nothing, and it is why the range of the
+    search never had to be picked.
+    """
+
+    if (width - abs(across)) * (height - abs(down)) < SHARED * width * height:
+        return float("inf")
+    step = max(1, width // 64)
+    rows = max(1, height // 9)
     total = count = 0
-    for row in range(6, HEIGHT, 12):
-        if not 0 <= row + down < HEIGHT:
+    for row in range(rows // 2, height, rows):
+        if not 0 <= row + down < height:
             continue
-        base = row * WIDTH
-        moved = (row + down) * WIDTH
-        for column in range(max(0, -across) + 4, min(WIDTH, WIDTH - across) - 4, 3):
+        base = row * width
+        moved = (row + down) * width
+        edge = max(2, width // 48)
+        for column in range(
+            max(0, -across) + edge, min(width, width - across) - edge, step
+        ):
             total += abs(before[base + column] - after[moved + column + across])
             count += 1
-    return total / max(count, 1)
+    return total / max(count, 1) if count else float("inf")
 
 
-def _slide(before: bytes, after: bytes, other: int, *, sideways: bool) -> int:
-    """The offset on one axis that best explains the change, coarse then fine."""
+def _slide(
+    before: bytes, after: bytes, width: int, height: int,
+    other: int, reach: int, *, sideways: bool,
+) -> int:
+    """The offset on one axis that best explains the change."""
 
     def score(value: int) -> float:
         if sideways:
-            return _agreement(before, after, value, other)
-        return _agreement(before, after, other, value)
+            return _agreement(before, after, width, height, value, other)
+        return _agreement(before, after, width, height, other, value)
 
-    rough = min(range(-REACH, REACH + 1, COARSE), key=score)
-    near = range(max(-REACH, rough - COARSE), min(REACH, rough + COARSE) + 1)
-    return min(near, key=score)
+    return min(range(-reach, reach + 1), key=score)
+
+
+def _settle(
+    before: bytes, after: bytes, width: int, height: int,
+    across: int, down: int, reach: int,
+) -> tuple[int, int]:
+    """Fix one axis, then the other, then revisit the first.
+
+    A camera tilts as readily as it pans, and the first version of this
+    searched sideways only -- so an operator lowering the frame left a
+    residual nothing could account for and two clips of a twelve-clip
+    sample were reported locked-off throughout. Searching the square costs
+    the square and buys nothing: over 680 frames of this library, one axis
+    at a time found the identical offset 678 times, and the two it missed
+    were worse by 0.19 grey levels against a threshold of fifteen.
+    """
+
+    across = _slide(before, after, width, height, down, reach, sideways=True)
+    down = _slide(before, after, width, height, across, reach, sideways=False)
+    across = _slide(before, after, width, height, down, reach, sideways=True)
+    return across, down
 
 
 def _global_shift(source: Path, fps: float) -> list[tuple[float, float, float]]:
@@ -193,14 +248,11 @@ def _global_shift(source: Path, fps: float) -> list[tuple[float, float, float]]:
     screen that changed: a screen playing video has no offset that improves
     the match, so its best score stays poor and its shift reads as zero.
 
-    Both axes, one at a time. A camera tilts as readily as it pans, and the
-    first version searched sideways only, so an operator lowering the frame
-    left a residual nothing could account for and the take was reported
-    unreadable. Searching the square costs the square and buys nothing here:
-    over 680 frames of this library, fixing one axis and then the other and
-    then revisiting the first found the identical offset 678 times, and the
-    two it missed were worse by 0.19 grey levels against a threshold of
-    fifteen.
+    Coarsely first, then finely. A movement too big to find at full size is
+    a small one on a picture a quarter as wide, so the ceiling on what can
+    be measured stops being the size of the search and becomes the point
+    where two frames no longer share enough picture to compare -- which is a
+    fact about pictures rather than a number anyone chose.
     """
 
     raw = subprocess.run(
@@ -216,18 +268,37 @@ def _global_shift(source: Path, fps: float) -> list[tuple[float, float, float]]:
     if len(frames) < 2:
         return []
 
+    small = [_shrink(one, WIDTH, HEIGHT, SHRINK) for one in frames]
+    narrow, short = WIDTH // SHRINK, HEIGHT // SHRINK
+    # As far as either picture can be slid while still sharing SHARED of
+    # itself with the other. Derived, not chosen -- see `_agreement`.
+    far = int(narrow * (1.0 - SHARED))
+    near = SHRINK
+
     out: list[tuple[float, float, float]] = []
     for index, (before, after) in enumerate(zip(frames, frames[1:]), start=1):
-        across = _slide(before, after, 0, sideways=True)
-        down = _slide(before, after, across, sideways=False)
-        across = _slide(before, after, down, sideways=True)
+        rough_x, rough_y = _settle(
+            small[index - 1], small[index], narrow, short, 0, 0, far
+        )
+        across, down = rough_x * SHRINK, rough_y * SHRINK
+        # Refine around what the small picture pointed at, within one coarse
+        # pixel of it -- which is all the coarse answer can be wrong by.
+        for _ in range(2):
+            across = min(
+                range(across - near, across + near + 1),
+                key=lambda x: _agreement(before, after, WIDTH, HEIGHT, x, down),
+            )
+            down = min(
+                range(down - near, down + near + 1),
+                key=lambda y: _agreement(before, after, WIDTH, HEIGHT, across, y),
+            )
         # How well the best offset actually explained the change. A camera
         # that moved leaves a low residual: slide the frame back and it
         # matches. A lens being uncovered leaves a high one at every offset
         # in both directions, because nothing about that change is a shift --
         # and that is the difference between "the camera was still" and
         # "this was not the camera moving", which were the same answer once.
-        residual = _agreement(before, after, across, down)
+        residual = _agreement(before, after, WIDTH, HEIGHT, across, down)
         travelled = (across * across + down * down) ** 0.5
         out.append((index / fps, travelled / WIDTH * fps, residual))
     return out
@@ -349,22 +420,33 @@ def travelled_between(
     intervals: "list[MotionInterval] | tuple[MotionInterval, ...]",
     first: float,
     second: float,
-) -> float:
+) -> float | None:
     """How far the frame moved between two moments, in frame widths.
 
     What makes a position measured at one second usable at another. On a
     locked-off take the answer is zero and a coordinate keeps forever; on a
     take whose camera travels it is the distance the thing has drifted, and
     past a point the thing is not in the picture at all.
+
+    `None` when a stretch in between is not a shift at all. Counting those
+    as zero was the same error this module was rewritten to stop making: a
+    subject seen before a lens is uncovered and used after it would have
+    been certified as never having moved, because the one kind of change no
+    offset describes contributed nothing to a sum of offsets. Nothing is
+    known about that distance, and "nothing is known" is not "nothing".
     """
 
     low, high = sorted((first, second))
     gone = 0.0
     for one in intervals:
-        if one.state != "moving" or one.seconds <= 0.0:
+        if one.seconds <= 0.0:
             continue
         shared = max(0.0, min(high, one.ends_seconds) - max(low, one.starts_seconds))
-        if shared > 0.0:
+        if shared <= 0.0:
+            continue
+        if one.state == "not_a_shift":
+            return None
+        if one.state == "moving":
             gone += one.travel_vw * shared / one.seconds
     return gone
 

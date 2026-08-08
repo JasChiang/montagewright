@@ -867,6 +867,9 @@ class MaterialItem:
     # `frame_disagreements`.
     sightings: tuple[tuple[str, float], ...] = ()
     motion: tuple[Any, ...] = ()
+    # The delivery crop as a share of this source's frame, which is what
+    # decides how far a subject can drift before it leaves the shot.
+    crop_width: float = 1.0
     # Measured, not answered. See the note where this is filled in.
     camera_moves: bool = False
     # What the source camera does, not merely that it does something. A
@@ -1576,18 +1579,6 @@ def expand_spans(chosen: dict[str, Any], offered: "list[Any]") -> None:
         shot["source_motion_role"] = span.motion_role
 
 
-# How far the frame may travel between the moment a subject was measured and
-# the moment a shot uses it, before the measurement stops describing this
-# window. A delivery crop of a 16:9 source at 9:16 is 0.316 frame widths
-# wide, so half of that is the point where a coordinate taken from another
-# moment falls outside the crop entirely. Calibrated too: across a ten-shot
-# cut every shot that delivered what it planned sat at 0.035 or below, and
-# the one that did not asked for a subject the frame had travelled 0.242
-# away from -- a row of watches that the take's own pan does not reach until
-# six seconds after this shot has cut away.
-CARRIES_VW = 0.15
-
-
 def frame_disagreements(
     shots: list[dict[str, Any]], material: "list[MaterialItem] | None" = None
 ) -> list[str]:
@@ -1610,10 +1601,22 @@ def frame_disagreements(
 
     seen: dict[tuple[str, str], float] = {}
     moved: dict[str, tuple[Any, ...]] = {}
+    # How far the frame may travel between the moment a subject was measured
+    # and the moment a shot uses it, before the measurement stops describing
+    # this window. Half the crop this source is delivered through: past that,
+    # a coordinate taken from another moment is outside the crop entirely.
+    #
+    # Per source and per delivery, not a constant. The first version was
+    # 0.15, which is half of 0.316 -- the crop a 16:9 source gets at 9:16, and
+    # only that. The same number is far too strict for a square delivery and
+    # nonsense for a 16:9 one, so it was a rule about one shoot wearing the
+    # clothes of a general one.
+    carries: dict[str, float] = {}
     for item in material or []:
         for label, at in item.sightings:
             seen[(item.source_id, label)] = at
         moved[item.source_id] = item.motion
+        carries[item.source_id] = max(0.02, item.crop_width / 2)
 
     off = []
     for index, shot in enumerate(shots):
@@ -1641,12 +1644,21 @@ def frame_disagreements(
             if at is None:
                 continue
             gone = travelled_between(moved.get(source) or (), at, middle)
-            if gone > CARRIES_VW:
+            clock = f"{int(at) // 60}:{at % 60:04.1f}"
+            if gone is None:
                 off.append(
                     f"k{index:02d} looks at '{look.get('at')}', which was "
-                    f"seen at {int(at) // 60}:{at % 60:04.1f} -- the frame "
-                    f"travels {gone:.2f} widths between there and this shot, "
-                    "so it is not in this window"
+                    f"seen at {clock} -- the picture changes between there "
+                    "and this shot in a way no camera movement accounts for, "
+                    "so whether it is still in frame is unknown"
+                )
+            elif gone > carries.get(source, 0.5):
+                off.append(
+                    f"k{index:02d} looks at '{look.get('at')}', which was "
+                    f"seen at {clock} -- the frame travels {gone:.2f} widths "
+                    f"between there and this shot, more than the "
+                    f"{carries.get(source, 0.5):.2f} its crop is wide, so it "
+                    "is not in this window"
                 )
     return off
 
