@@ -26,7 +26,7 @@ from montagewright.cost import BudgetSpent, Ledger
 from montagewright.planner import ask
 from montagewright.schema import looks_of, move_of_shot, must_be_whole_of, DegradationStep, Issue, ReviewVerdict
 
-from montagewright.planner import MAX_OUTPUT_TOKENS
+from montagewright.planner import MAX_OUTPUT_TOKENS, MODEL_ID
 
 from montagewright.uploads import upload_now
 
@@ -125,7 +125,7 @@ def review_cut(
     delivered_seconds: float = 0.0,
     cache: Any = None,
     ledger: Ledger | None = None,
-    model_id: str = "gemini-3.6-flash",
+    model_id: str = MODEL_ID,
 ) -> ReviewVerdict:
     """One pass over a finished cut.
 
@@ -297,7 +297,7 @@ def review_shots(
     client: Any,
     cache: Any = None,
     ledger: Ledger | None = None,
-    model_id: str = "gemini-3.6-flash",
+    model_id: str = MODEL_ID,
 ) -> dict[str, dict[str, Any]]:
     """Check each rendered shot against the plan that asked for it.
 

@@ -36,6 +36,7 @@ from montagewright.review import (
     should_continue,
 )
 from montagewright.planner import (
+    MODEL_ID,
     MaterialItem,
     decide_direction,
     replan_shots,
@@ -322,7 +323,7 @@ def command_render(args: argparse.Namespace) -> int:
     library = (args.library or default_library()).expanduser()
     client = _client()
     cache = UploadCache.load(args.upload_cache or default_cache_path())
-    ledger = Ledger(cap_usd=args.budget)
+    ledger = Ledger(cap_usd=args.budget, model_id=MODEL_ID)
 
     sources_paths = sorted(
         path for path in rushes.iterdir() if path.suffix in VIDEO_SUFFIXES
@@ -1429,7 +1430,7 @@ def command_transcribe(args: argparse.Namespace) -> int:
 
     client = _client()
     cache = UploadCache.load(args.upload_cache or default_cache_path())
-    ledger = Ledger(cap_usd=args.budget)
+    ledger = Ledger(cap_usd=args.budget, model_id=MODEL_ID)
 
     sources = (
         sorted(p for p in args.source.iterdir() if p.suffix in VIDEO_SUFFIXES)
