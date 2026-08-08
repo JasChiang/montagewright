@@ -208,6 +208,37 @@ def _rhythm_schema(clip_ids: list[str]) -> dict[str, Any]:
                                 "只是想對拍就不要填，那是 `cut_on_beat` 的事。"
                             ),
                         },
+                        "anchor": {
+                            "type": "string",
+                            "description": (
+                                "這顆裡面要對到音樂的那一刻，寫動作的 id"
+                                "（`a01`）。素材清單上「這段裡的動作」有列。\n"
+                                "**只有出點會自動對到拍點。** 想讓鏡頭裡面"
+                                "某一刻落在音樂上——手機闔上那一下卡在下拍、"
+                                "手勢的最高點卡在重音——就要在這裡指名，"
+                                "本機會反推進點讓它成立。\n"
+                                "不需要就留空。多數鏡頭不需要：對齊出點就夠了。"
+                            ),
+                        },
+                        "anchor_lands_on": {
+                            "type": "string",
+                            "enum": [
+                                "downbeat", "accent", "section_boundary", "beat",
+                            ],
+                            "description": (
+                                "那一刻要落在什麼上。`downbeat` 是小節的第一拍，"
+                                "多數情況要的是這個。填了 `anchor` 才有意義。"
+                            ),
+                        },
+                        "anchor_relation": {
+                            "type": "string",
+                            "enum": ["on", "before", "after"],
+                            "description": (
+                                "`on`：那一刻就落在拍點上。`before`／`after`："
+                                "刻意早一點或晚一點——那是一個決定，"
+                                "prompt 說過晚半拍進來比切斷動作好看。"
+                            ),
+                        },
                         "rhythm_reason": {
                             "type": "string",
                             "description": (
@@ -555,6 +586,13 @@ def _apply(
                     "approx_out_seconds": clip.approx_in_seconds + max(hold, 0.1),
                     "music_sync": MusicSync(
                         cut_on_beat=bool(decision["cut_on_beat"]),
+                        anchor=(decision.get("anchor") or None),
+                        anchor_lands_on=str(
+                            decision.get("anchor_lands_on") or "downbeat"
+                        ),
+                        anchor_relation=str(
+                            decision.get("anchor_relation") or "on"
+                        ),
                         beats=decision.get("beats"),
                         sync_to=decision.get("sync_to"),
                         rhythm_reason=str(decision.get("rhythm_reason", "")),

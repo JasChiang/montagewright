@@ -70,6 +70,7 @@ class CardLibraryEmpty(RuntimeError):
 class Beat:
     """One movement in a clip, and when it runs."""
 
+    beat_id: str
     what: str
     starts_seconds: float
     ends_seconds: float
@@ -93,7 +94,14 @@ def action_beats(card: dict[str, Any]) -> list[Beat]:
         # snapped onto them and the rhythm pass was shown them as how long
         # the action takes. A guessed timestamp is worse than none.
         if end - start >= 0.25:
-            beats.append(Beat(str(entry.get("what", "")), start, end))
+            beats.append(
+                Beat(
+                    str(entry.get("id", "") or f"a{len(beats):02d}"),
+                    str(entry.get("what", "")),
+                    start,
+                    end,
+                )
+            )
     return sorted(beats, key=lambda beat: beat.starts_seconds)
 
 
@@ -337,8 +345,16 @@ def card_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["what", "from", "to"],
+                    "required": ["id", "what", "from", "to"],
                     "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": (
+                                "這個動作的短名字，`a01`、`a02` 這樣照順序編。"
+                                "後面排節奏的時候要用它指名『這個動作要落在"
+                                "哪個拍點上』——一段描述指不準，一個 id 可以。"
+                            ),
+                        },
                         "what": {
                             "type": "string",
                             "description": (

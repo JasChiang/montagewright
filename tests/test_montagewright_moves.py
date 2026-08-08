@@ -4545,3 +4545,99 @@ def test_a_movement_too_brief_for_the_model_to_see_is_not_split_out():
     assert [one.state for one in _into_intervals(opens, 5.5)] == ["still"]
 
     assert SEEN_SECONDS == 1.0
+
+
+def test_a_moment_inside_the_shot_can_be_put_on_the_beat():
+    """Only the cut was ever aligned, so only the cut could be asked for.
+
+    "The phone snaps shut on the downbeat and the shot runs on" is an
+    ordinary thing to want and could not be said. Worse, a model choosing a
+    length so an action completed at the cut had that alignment taken away
+    again by the snap, which moves the out-point by up to a beat: the two
+    goals were fighting through the same one control.
+    """
+
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.schema import EDL, Clip, MusicSync
+
+    # A downbeat every two seconds.
+    grid = BeatGrid(bpm=120.0, meter=4, duration_seconds=60.0, cues=tuple(
+        [Cue(cue_id=f"d{i:02d}", time_seconds=i * 2.0, kind="downbeat")
+         for i in range(30)]
+        + [Cue(cue_id=f"b{i:02d}", time_seconds=i * 0.5, kind="beat")
+           for i in range(120)]
+    ))
+
+    def film(anchor=None, relation="on", window=(0.0, 20.0), start=3.0):
+        return ground_timeline(EDL(project_id="p", clips=[Clip(
+            clip_id="k00", source_id="C1",
+            approx_in_seconds=start, approx_out_seconds=start + 4.0,
+            moments={"a01": 5.3},
+            usable_from_seconds=window[0], usable_to_seconds=window[1],
+            music_sync=MusicSync(
+                cut_on_beat=False, anchor=anchor, anchor_relation=relation,
+            ),
+        )]), grid).clips[0]
+
+    # Unanchored, the shot starts where it was told and the moment lands
+    # wherever it happens to -- 2.3 seconds in, which is nothing in
+    # particular.
+    assert film().clip.approx_in_seconds == 3.0
+
+    # Anchored, the in-point moves so the moment falls on a downbeat. The
+    # length is untouched -- the rhythm pass decided that.
+    anchored = film(anchor="a01")
+    assert anchored.clip.approx_in_seconds != 3.0, "nothing moved"
+    landing = 0.0 + (5.3 - anchored.clip.approx_in_seconds)
+    assert abs(landing % 2.0) < 1e-6, landing
+    assert abs(anchored.duration_seconds - 4.0) < 1e-6
+
+    # Deliberately loose is a decision, and it is a beat either side.
+    late = film(anchor="a01", relation="after")
+    assert late.clip.approx_in_seconds < anchored.clip.approx_in_seconds
+
+    # A moment this take does not have is said rather than ignored.
+    missing = film(anchor="a09")
+    assert "a09" in (missing.note or "")
+
+    # And an anchor that would need the shot to start outside the stretch it
+    # may be cut from is refused, not approximated -- an anchor half
+    # honoured is a cut placed where nothing asked for it.
+    boxed = film(anchor="a01", window=(5.2, 9.0), start=5.2)
+    assert "outside" in (boxed.note or ""), boxed.note
+    assert boxed.clip.approx_in_seconds == 5.2
+
+
+def test_a_sample_is_the_same_clips_every_time_and_spread_across_the_shoot():
+    """The point is not to pay for seventy-four cards to try one change.
+
+    Random would defeat it: a fresh set every run is a fresh set of cards to
+    buy. Taking the first N would defeat it differently -- rushes arrive in
+    shooting order, so the front of the folder is all one setup.
+    """
+
+    import inspect
+
+    from montagewright import cli
+
+    source = inspect.getsource(cli.command_render)
+    sampling = source[source.index("if args.sample and"):]
+    sampling = sampling[: sampling.index("flush=True,") + 12]
+
+    # Evenly spaced, so twelve clips are twelve different setups.
+    assert "len(sources_paths) / args.sample" in sampling
+    # Deterministic: no randomness anywhere near it.
+    assert "random" not in sampling.lower()
+
+    # The arithmetic it describes, on a stand-in folder.
+    def pick(total, n):
+        paths = list(range(total))
+        step = total / n
+        return [paths[min(total - 1, int(i * step))] for i in range(n)]
+
+    assert pick(74, 12) == [0, 6, 12, 18, 24, 30, 37, 43, 49, 55, 61, 67]
+    assert pick(74, 12) == pick(74, 12)
+    # Never off the end, and never the same clip twice.
+    for total, n in ((74, 12), (5, 5), (7, 3), (3, 10)):
+        got = pick(total, min(n, total))
+        assert max(got) < total and len(set(got)) == len(got), (total, n)

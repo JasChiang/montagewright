@@ -367,6 +367,21 @@ def command_render(args: argparse.Namespace) -> int:
             rushes_paths.append(piece)
     sources_paths = rushes_paths
 
+    # A subset, chosen the same way every time. Random would mean a fresh set
+    # of cards on every run, which is the cost this exists to avoid; evenly
+    # spaced means the sample is not all of one setup, which taking the first
+    # N would be -- rushes arrive in shooting order.
+    if args.sample and 0 < args.sample < len(sources_paths):
+        step = len(sources_paths) / args.sample
+        sources_paths = [
+            sources_paths[min(len(sources_paths) - 1, int(i * step))]
+            for i in range(args.sample)
+        ]
+        print(
+            f"sampling {len(sources_paths)} of {len(rushes_paths)} clips",
+            flush=True,
+        )
+
     proxies = {
         path.stem: _make_proxy(
             path, work / "proxies" / f"{path.stem}.mp4", library=library
@@ -1218,6 +1233,12 @@ def _edl_from_selection(
                 # executor asks only whether the time exists in the file;
                 # neither could tell a second of usable take from a second
                 # of somebody resetting a prop.
+                # Every moment this take offers, by name, so the rhythm pass
+                # can point at one and grounding can put it on a beat.
+                moments={
+                    one.beat_id: one.starts_seconds
+                    for one in action_beats(card or {})
+                },
                 usable_from_seconds=(window[0] if window else 0.0),
                 usable_to_seconds=(window[1] if window else 0.0),
             )
@@ -1509,6 +1530,15 @@ def main(argv: list[str] | None = None) -> int:
              "pass picks a length, which is the right default when nobody "
              "has a slot to fill and the wrong one when they do -- writing "
              "'make it 15 seconds' in the brief is a request, not a number.",
+    )
+    render.add_argument(
+        "--sample", type=int, default=0, metavar="N",
+        help="cut from N of the clips instead of all of them. For trying a "
+             "change without paying to describe a whole shoot: seventy-four "
+             "cards is about a dollar and twelve is fifteen cents. The same "
+             "N always picks the same clips, spread across the folder rather "
+             "than taken off the front, so the cards stay cached between "
+             "runs and the sample is not all one setup.",
     )
     render.add_argument("--sam-checkpoint", type=Path)
     render.add_argument(

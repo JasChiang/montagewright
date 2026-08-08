@@ -471,6 +471,26 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         landed: str | None = None
         note: str | None = None
 
+        # A moment inside the shot, put where the music is. Only the cut was
+        # ever aligned, so "the phone snaps shut on the downbeat and the shot
+        # runs on" could not be asked for -- and a model that chose a length
+        # so the action completed at the cut had that taken away again by the
+        # snap, which moves the out-point by up to a beat. The two goals were
+        # fighting through the same one control.
+        #
+        # Solved by moving the in-point rather than the length: the shot is
+        # as long as the rhythm pass said, and it starts wherever it has to
+        # for the named moment to fall on the beat.
+        if grid is not None and clip.music_sync.anchor:
+            moved, why = _put_anchor_on_the_music(clip, grid, cursor)
+            if moved is not None:
+                clip = clip.model_copy(update={
+                    "approx_in_seconds": moved,
+                    "approx_out_seconds": moved + wanted,
+                })
+            if why:
+                note = why
+
         # A named point is an instruction, not a hint. `resolve_sync_point`
         # has been here since the grid was written and nothing ever called
         # it, so a shot asked to land on `chorus_1_start` was placed by
@@ -572,6 +592,57 @@ def apply_to_edl(edl: EDL, timeline: GroundedTimeline) -> EDL:
             clip.model_copy(update={"approx_out_seconds": out})
         )
     return edl.model_copy(update={"clips": rewritten})
+
+
+def _put_anchor_on_the_music(
+    clip: Clip, grid: BeatGrid, cursor: float
+) -> tuple[float | None, str | None]:
+    """Where this shot has to begin for its anchored moment to hit the beat.
+
+    The moment sits at a known second of the source. Shift the in-point and
+    it slides along the film; the arithmetic is one line. What makes this
+    worth a function is everything it must refuse.
+
+    A shot may not begin outside the stretch of take it was cut from, and it
+    may not run past the end of it, so the in-point that would put the moment
+    on the beat is sometimes not available. That is reported rather than
+    approximated: an anchor half honoured is a cut nobody asked for, placed
+    where nothing asked for it.
+    """
+
+    wanted = clip.music_sync.anchor
+    at = clip.moments.get(str(wanted))
+    if at is None:
+        return None, f"no moment called '{wanted}' in this take"
+
+    length = clip.approx_out_seconds - clip.approx_in_seconds
+    shows_at = cursor + (at - clip.approx_in_seconds)
+    kind = clip.music_sync.anchor_lands_on
+    candidates = [one for one in grid.cues if one.kind == kind]
+    if not candidates:
+        return None, f"this track has no {kind} to land '{wanted}' on"
+    cue = min(candidates, key=lambda one: abs(one.time_seconds - shows_at))
+
+    # `before` and `after` are a beat either side, which is what an editor
+    # means by cutting deliberately loose.
+    aimed = cue.time_seconds + {
+        "before": -grid.seconds_per_beat,
+        "after": grid.seconds_per_beat,
+    }.get(clip.music_sync.anchor_relation, 0.0)
+
+    begins = at - (aimed - cursor)
+    window = clip.usable_window
+    if window is not None and not (
+        window[0] - 1e-6 <= begins and begins + length <= window[1] + 1e-6
+    ):
+        return None, (
+            f"putting '{wanted}' on the {kind} needs this shot to start at "
+            f"{begins:.2f}s, which is outside the {window[0]:.1f}-"
+            f"{window[1]:.1f}s it may be cut from"
+        )
+    if begins < 0.0:
+        return None, f"putting '{wanted}' on the {kind} needs a start before zero"
+    return round(begins, 3), None
 
 
 def resolve_sync_point(grid: BeatGrid, name: str) -> float | None:

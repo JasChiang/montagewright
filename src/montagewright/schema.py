@@ -350,6 +350,14 @@ class MusicSync(ModelFacing):
             "moment late."
         ),
     )
+    # A moment inside the shot that should land on the music, rather than
+    # the cut. Only the out-point was ever aligned, so "the phone snaps shut
+    # on the downbeat and the shot runs on" could not be said -- and a model
+    # choosing a length so an action completes at the cut had that alignment
+    # taken away again by the snap, which moves the out-point by up to a beat.
+    anchor: str | None = None
+    anchor_lands_on: str = "downbeat"
+    anchor_relation: str = "on"
     sync_to: str | None = Field(
         default=None,
         description=(
@@ -432,6 +440,10 @@ class Clip(ModelFacing):
     # time existed in the file.
     #
     # Zero for either end means nobody said, and nothing is enforced.
+    # Where each nameable moment in this take sits, by the id the card gave
+    # it. Carried because grounding is what puts one on a beat, and the card
+    # is read three layers earlier.
+    moments: dict[str, float] = Field(default_factory=dict)
     usable_from_seconds: float = Field(default=0.0, ge=0.0)
     usable_to_seconds: float = Field(default=0.0, ge=0.0)
 
