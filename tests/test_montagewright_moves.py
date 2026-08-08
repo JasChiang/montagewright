@@ -565,10 +565,15 @@ def test_must_be_whole_is_described_as_a_requirement_not_a_lever() -> None:
     described = _selection_schema(["C1"])["properties"]["shots"]["items"][
         "properties"
     ]["looks"]["items"]["properties"]["must_be_whole"]["description"]
-    assert "does not fulfil" in described
+    # States a requirement, does not fulfil one: the crop will not shrink a
+    # subject to fit, so the flag is a declaration and not a lever.
+    assert "宣告不是開關" in described
 
+    # The declaration lives once, in the schema above. The selection prompt
+    # no longer repeats it -- it carries the judgement the schema cannot: the
+    # measured ceiling on how much of a subject this source can ever show.
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
-    assert "是一句宣告，不是一個開關" in prompt
+    assert "只能露出" in prompt and "填 false" in prompt
     replan = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
     assert "不是一個做法" in replan
 

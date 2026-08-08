@@ -1369,50 +1369,19 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                             "type": "string",
                             "enum": ["settles", "travels"],
                             "description": (
-                                "Does the frame stay where it lands in this "
-                                "shot, or does it have to go somewhere? "
-                                "`settles` means one place is the whole "
-                                "shot. `travels` means it cannot be: the "
-                                "subject walks, a second thing has to be "
-                                "brought in, something is too wide to be "
-                                "read from one position, or the shot ends "
-                                "closer than it began.\n"
-                                "Answer this before writing the looks, and "
-                                "then write looks that match it -- one entry "
-                                "for `settles`, two or more for `travels`. "
-                                "Both answers are decisions and neither is "
-                                "the safe one. A frame that moves because "
-                                "the shot looked static is worse than a "
-                                "hold; a frame that holds on something it "
-                                "cannot show in one position delivers half "
-                                "of it."
+                                "畫面定住還是要移動。先答這個，再讓 looks 配合："
+                                "`settles` 一個落點，`travels` 兩個以上。"
+                                "怎麼判斷見 prompt 的「畫面要不要動」。"
                             ),
                         },
                         "looks": {
                             "type": "array",
                             "minItems": 1,
                             "description": (
-                                "Where the frame goes in this shot, in order. "
-                                "One entry holds on one thing. Two move from "
-                                "the first to the second. Three stop on the "
-                                "way -- three handsets introduced in turn. "
-                                "Two entries naming the same thing at "
-                                "different framing is a push in, or a pull "
-                                "out written the other way round.\n"
-                                "There is no separate move to choose. What "
-                                "used to be called hold, pan, tilt, push in "
-                                "and pull out are all just what a list of "
-                                "looks turns out to be, and local code works "
-                                "out which one it made and reports it. It "
-                                "also measures where each subject is and how "
-                                "fast the frame may travel -- none of that "
-                                "is yours to give.\n"
-                                "What is yours is what to look at and how "
-                                "long to look, and the second is a real "
-                                "judgement: a two-word logo is read faster "
-                                "than a row of three watches. Every entry "
-                                "costs time, and `seconds_needed` has to "
-                                "hold all of them plus the travel between."
+                                "畫面依序停在哪裡，每個落點填 at／seconds／"
+                                "framing。運鏡是本機依落點推導的，你不用選；"
+                                "完整規則見「運鏡能力」那一節。你決定看什麼、"
+                                "看多久。"
                             ),
                             "items": {
                                 "type": "object",
@@ -1451,42 +1420,31 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                                     "seconds": {
                                         "type": "string",
                                         "description": (
-                                            "How long the frame rests here "
-                                            "before moving on. 0 lets local "
-                                            "code use a floor that reads as a "
-                                            "stop at all. Give a real number "
-                                            "when this thing needs reading "
-                                            "rather than noticing."
+                                            "在這個落點停多久再走。填 0 讓本機"
+                                            "用一個「還算停頓」的下限；要人讀懂"
+                                            "而不只是掃過，就給一個真的秒數。"
                                         ),
                                     },
                                     "framing": {
                                         "type": "string",
                                         "enum": list(INTENT_NAMES),
                                         "description": (
-                                            "Where this subject sits and how "
-                                            "tightly. `fill` closes in until "
-                                            "it carries the frame; the others "
-                                            "place it in the space there is. "
-                                            "Negative space is a composition, "
-                                            "not a shortfall."
+                                            "這個主體擺哪裡、多緊。`fill` 收到"
+                                            "它撐滿畫面；其餘的把它放進現有的"
+                                            "空間裡。留白是構圖，不是缺陷。"
                                         ),
                                     },
                                     "must_be_whole": {
                                         "type": "boolean",
                                         "description": (
-                                            "True only when partial cropping "
-                                            "destroys this: rendered text, a "
-                                            "logo, a UI state, a readout. "
-                                            "Half a wordmark is not a tighter "
-                                            "shot of a wordmark, it is an "
-                                            "unreadable one. This states a "
-                                            "requirement and does not fulfil "
-                                            "one -- no crop shrinks a subject "
-                                            "to fit. A subject wider than any "
-                                            "crop of its source has to be "
-                                            "read across in two looks, or "
-                                            "found in a tighter take, or "
-                                            "accepted partial with this false."
+                                            "這個落點被裁掉一部分會不會失去"
+                                            "意義。字、logo、UI 狀態、螢幕數值"
+                                            "填 true——看到一半等於看不懂；人、"
+                                            "手持物件、一張臉填 false，出框仍"
+                                            "成立。這是宣告不是開關：本機不會"
+                                            "為它把畫面縮小塞進去。要它成真得"
+                                            "靠規劃——兩個落點帶過去、換一顆更"
+                                            "窄的素材、或填 false 接受局部。"
                                         ),
                                     },
                                 },

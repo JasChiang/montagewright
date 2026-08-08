@@ -845,7 +845,7 @@ def test_selection_is_told_a_row_needs_two_endpoints():
     assert "travels" in prompt
     # And that both ends have to be told apart, which is the part that makes
     # the two endpoints measurable rather than two names for the same place.
-    assert "起點跟終點" in prompt and "描述到能分辨" in prompt
+    assert "起點終點" in prompt and "描述到能分辨" in prompt
 
 
 # --- a move has to arrive somewhere and stay there -----------------------
