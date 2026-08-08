@@ -4499,3 +4499,49 @@ def test_unreadable_footage_says_so_rather_than_saying_still():
     # what noise does -- the first number chosen was above noise, so the
     # state it was added for could never have occurred.
     assert 12.2 < UNREADABLE < 22.7
+
+
+def test_a_movement_too_brief_for_the_model_to_see_is_not_split_out():
+    """Asking about something invisible is how footage gets deleted.
+
+    The measurement resolves a three-quarter-second movement; the model reads
+    video at a frame a second, so both of its sampled frames can fall either
+    side of one. Split out anyway, it becomes an interval with no picture
+    behind it, the honest answer is `unknown`, and `unknown` earns no span --
+    two reasonable rules combining to throw the take away.
+
+    That the model cannot be given a finer rate is measured rather than
+    assumed: the same clip sent with an fps hint and without came back at an
+    identical token count, so the Interactions API ignores it.
+    """
+
+    from montagewright.motion import SEEN_SECONDS, _into_intervals
+
+    # Still, a blink of movement, still. At four samples a second.
+    shifts = (
+        [(i / 4, 0.001, 0.2) for i in range(1, 21)]      # 5s still
+        + [(5 + i / 4, 0.30, 0.2) for i in range(1, 3)]  # 0.5s moving
+        + [(5.5 + i / 4, 0.001, 0.2) for i in range(1, 21)]
+    )
+    found = _into_intervals(shifts, 10.5)
+    assert [one.state for one in found] == ["still"], [
+        (one.event_id, one.state, one.seconds) for one in found
+    ]
+
+    # A movement long enough to have been seen is kept.
+    longer = (
+        [(i / 4, 0.001, 0.2) for i in range(1, 21)]
+        + [(5 + i / 4, 0.30, 0.2) for i in range(1, 13)]   # 3s moving
+        + [(8 + i / 4, 0.001, 0.2) for i in range(1, 21)]
+    )
+    assert "moving" in [one.state for one in _into_intervals(longer, 13.0)]
+
+    # And a clip that opens with a brief one has nothing behind it to be
+    # absorbed into, which is the commonest place for one.
+    opens = (
+        [(i / 4, 0.30, 0.2) for i in range(1, 3)]
+        + [(0.5 + i / 4, 0.001, 0.2) for i in range(1, 21)]
+    )
+    assert [one.state for one in _into_intervals(opens, 5.5)] == ["still"]
+
+    assert SEEN_SECONDS == 1.0

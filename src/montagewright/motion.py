@@ -57,6 +57,19 @@ MOVING = 0.02
 # state it was added for could never occur.
 UNREADABLE = 15.0
 
+# What the model can see. It reads video at a frame a second -- measured, not
+# assumed: the same clip sent with `fps: 4` and with nothing came back at an
+# identical 722 input tokens, so the Interactions API ignores the hint rather
+# than refusing it.
+#
+# A movement shorter than this can fall entirely between two of its frames.
+# Splitting it out anyway produces an interval the model has no picture of,
+# asks what it meant, and is told -- correctly -- that it cannot say. Two
+# rules then combine to delete footage: the honest answer is `unknown`, and
+# `unknown` earns no span. Three of sixteen moving stretches in a twenty-clip
+# sample were this short.
+SEEN_SECONDS = 1.0
+
 # Shortest stretch worth calling a state. Below it the reading is a flicker
 # in the measurement rather than a thing the camera did.
 LEAST_SECONDS = 0.5
@@ -198,6 +211,38 @@ def _into_intervals(
     # before it, and two neighbouring intervals both saying "the frame is
     # moving" reads as a measurement artefact, which is what it is.
     joined: list[list[tuple[float, str, float]]] = []
+    for run in merged:
+        state = max(set(one[1] for one in run), key=[o[1] for o in run].count)
+        if joined and joined[-1][1] == state:
+            joined[-1][0].extend(run)
+        else:
+            joined.append(([*run], state))
+    merged = [run for run, _ in joined]
+
+    # A movement too brief for the model to have seen belongs to whatever
+    # surrounds it. The measurement can resolve it and the question about it
+    # cannot be answered, so asking is how footage gets thrown away.
+    absorbed: list[list[tuple[float, str, float]]] = []
+    for run in merged:
+        state = max(set(one[1] for one in run), key=[o[1] for o in run].count)
+        span = run[-1][0] - run[0][0]
+        if absorbed and state == "moving" and span < SEEN_SECONDS:
+            absorbed[-1].extend(run)
+        else:
+            absorbed.append([*run])
+    # A clip that opens with a brief movement has nothing behind it to be
+    # absorbed into, and that is the commonest place for one -- the camera
+    # settling as the take begins.
+    if len(absorbed) > 1:
+        first = absorbed[0]
+        state = max(set(one[1] for one in first), key=[o[1] for o in first].count)
+        if state == "moving" and first[-1][0] - first[0][0] < SEEN_SECONDS:
+            absorbed[1][:0] = first
+            absorbed.pop(0)
+    merged = absorbed
+
+    # Joining may have left neighbours agreeing again.
+    joined = []
     for run in merged:
         state = max(set(one[1] for one in run), key=[o[1] for o in run].count)
         if joined and joined[-1][1] == state:
