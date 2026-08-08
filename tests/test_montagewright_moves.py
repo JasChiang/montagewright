@@ -4326,6 +4326,34 @@ def test_a_cut_lands_on_the_downbeat_rather_than_the_nearest_beat():
     assert both.nearest_cue(1.02).kind == "section_boundary"
 
 
+def test_a_cut_review_note_at_a_timecode_names_the_shot_it_lands_in():
+    """A fault the finished-film pass found, dropped for want of a clip_id.
+
+    The whole-cut reviewer reports a problem at a time -- dust on a screen at
+    0:10, a coin cropped at 0:10 -- and often names no shot, so clip_id is
+    null. The replan loop acted only on shots the per-shot pass marked
+    undelivered, so the run stopped with "revision asked for, but no shot was
+    named" and shipped the fault. The timeline knows what is on screen at
+    0:10; the note maps to it.
+    """
+
+    from montagewright.cli import _shot_at_second
+
+    # Three shots of 4, 3 and 5 seconds: windows 0-4, 4-7, 7-12.
+    rhythm = {
+        "k00": {"seconds": 4.0},
+        "k01": {"seconds": 3.0},
+        "k02": {"seconds": 5.0},
+    }
+    assert _shot_at_second(0.0, rhythm) == "k00"
+    assert _shot_at_second(5.0, rhythm) == "k01"
+    assert _shot_at_second(10.0, rhythm) == "k02"
+    # Past the last cut belongs to the last shot, not to nothing.
+    assert _shot_at_second(99.0, rhythm) == "k02"
+    # No timeline is the only case that names nothing.
+    assert _shot_at_second(1.0, {}) is None
+
+
 def test_a_look_at_something_outside_this_window_is_a_disagreement():
     """Two facts on record, never compared, and a pan that was a hold.
 

@@ -874,6 +874,37 @@ def command_render(args: argparse.Namespace) -> int:
                       "delivered", True
                   )
               ]
+              # A whole-cut fault the per-shot pass did not raise still names
+              # a shot: the reviewer's timecode maps to whatever is on screen
+              # then. Without this a "revise" verdict over dust on a screen or
+              # a cropped reference object found nothing to replan and shipped
+              # the fault. Only major and blocking issues -- a minor note does
+              # not spend a round -- and the shot's own duration decides which
+              # one 0:10 fell in.
+              by_index = {row[0]: row for row in failing}
+              for issue in verdict.issues:
+                  if issue.severity not in {"major", "blocking"}:
+                      continue
+                  named = issue.clip_id
+                  if not named and issue.at_seconds is not None:
+                      named = _shot_at_second(
+                          issue.at_seconds, report.rhythm_decisions
+                      )
+                  if not named or not named.startswith("k"):
+                      continue
+                  try:
+                      idx = int(named[1:])
+                  except ValueError:
+                      continue
+                  if not 0 <= idx < len(selection["shots"]):
+                      continue
+                  note = f"整片審核指出：{issue.description}。建議：{issue.fix}"
+                  if idx in by_index:
+                      i, shot, old = by_index[idx]
+                      by_index[idx] = (i, shot, f"{old}；{note}")
+                  else:
+                      by_index[idx] = (idx, selection["shots"][idx], note)
+              failing = [by_index[i] for i in sorted(by_index)]
               undelivered = len(failing)
               keep_going, stopped = should_continue(
                   rounds, ledger=ledger, undelivered=undelivered
@@ -1131,6 +1162,32 @@ def _subject_line(box, source_aspect: float, target_aspect: float) -> str:
         else "整段停在原地，跟著它走等於定鏡"
     )
     return f"{box.label}（{'、'.join(facts)}）"
+
+
+def _shot_at_second(seconds: float, rhythm: dict[str, dict]) -> str | None:
+    """Which shot covers this moment on the timeline.
+
+    The whole-cut reviewer reports a problem at a time -- dust on a screen at
+    0:10, a reference object cropped at 0:10 -- and often names no shot, so
+    `clip_id` comes back null. The loop that could fix it only acts on shots
+    the per-shot reviewer marked undelivered, so a real fault found by the
+    one pass that watches the finished film was written down and dropped,
+    and the run stopped saying "revision asked for, but no shot was named".
+    The timeline knows which shot is on screen at 0:10; this is that lookup,
+    from the durations already recorded per shot.
+    """
+
+    if not rhythm:
+        return None
+    cursor = 0.0
+    for clip_id in sorted(rhythm):
+        length = float(rhythm[clip_id].get("seconds") or 0.0)
+        if cursor <= seconds < cursor + length:
+            return clip_id
+        cursor += length
+    # Past the last cut -- rounding, or a note on the final frame -- belongs
+    # to the last shot rather than to nothing.
+    return max(rhythm)
 
 
 def _duration(path: Path) -> float:
