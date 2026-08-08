@@ -34,9 +34,8 @@ from pathlib import Path
 
 # Coarse enough to be cheap on seventy-four clips, fine enough to see a
 # camera settle: shake lives well above this and a pan is visible at any
-# rate. Refined only where something looks like it is happening.
+# rate.
 COARSE_FPS = 4.0
-FINE_FPS = 12.0
 
 # Width to analyse at. Global motion is a whole-frame property and survives
 # scaling; the cost does not.
@@ -48,6 +47,15 @@ STILL = 0.004
 
 # Above this the frame is moving enough that a viewer would see it.
 MOVING = 0.02
+
+# Mean grey difference, 0..255, left over after the best offset has been
+# taken out. Below this a shift explains the change and the reading stands;
+# above it nothing does. Calibrated rather than picked: across this library
+# the median residual is 0.1 to 0.7 and the worst single frame is 12.2, while
+# frames of pure noise -- where by construction no shift explains anything --
+# sit at 22.7. The first number chosen was 26, which noise passed, so the
+# state it was added for could never occur.
+UNREADABLE = 15.0
 
 # Shortest stretch worth calling a state. Below it the reading is a flicker
 # in the measurement rather than a thing the camera did.
@@ -71,41 +79,6 @@ class MotionInterval:
         return max(0.0, self.ends_seconds - self.starts_seconds)
 
 
-def _samples(source: Path, fps: float) -> list[tuple[float, float, float]]:
-    """Per-frame global shift, as (seconds, dx, dy) in frame widths.
-
-    ffmpeg's own motion estimation, read off the frame metadata rather than
-    computed here. `mestimate` produces per-block vectors and `signalstats`
-    would only describe brightness; what is wanted is one number per frame
-    for how far the whole picture went, so the vectors are averaged.
-    """
-
-    found = subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(source),
-            "-vf",
-            f"fps={fps},scale={WIDTH}:-2,format=gray,"
-            "mestimate=epzs:mb_size=16:search_param=7,"
-            "metadata=mode=print:file=-",
-            "-f", "null", "-",
-        ],
-        capture_output=True, text=True, check=False,
-    )
-    return _read_vectors(found.stdout, fps)
-
-
-def _read_vectors(printed: str, fps: float) -> list[tuple[float, float, float]]:
-    """Turn ffmpeg's metadata dump into one shift per frame."""
-
-    out: list[tuple[float, float, float]] = []
-    at = 0.0
-    for line in printed.splitlines():
-        if line.startswith("frame:"):
-            at = len(out) / max(fps, 1e-6)
-            out.append((round(at, 4), 0.0, 0.0))
-    return out
-
-
 def measure(source: Path, duration: float) -> list[MotionInterval]:
     """Split a clip into stretches of still, moving, and unreadable.
 
@@ -127,7 +100,7 @@ def measure(source: Path, duration: float) -> list[MotionInterval]:
     return _into_intervals(shifts, duration)
 
 
-def _global_shift(source: Path, fps: float) -> list[tuple[float, float]]:
+def _global_shift(source: Path, fps: float) -> list[tuple[float, float, float]]:
     """(seconds, shift) per sampled frame, shift in frame widths per second.
 
     Estimated by matching each frame against the one before it at a handful
@@ -151,7 +124,7 @@ def _global_shift(source: Path, fps: float) -> list[tuple[float, float]]:
     if len(frames) < 2:
         return []
 
-    out: list[tuple[float, float]] = []
+    out: list[tuple[float, float, float]] = []
     reach = max(2, WIDTH // 24)
     for index, (before, after) in enumerate(zip(frames, frames[1:]), start=1):
         best, offset = None, 0
@@ -169,12 +142,18 @@ def _global_shift(source: Path, fps: float) -> list[tuple[float, float]]:
             score = total / max(count, 1)
             if best is None or score < best:
                 best, offset = score, shift
-        out.append((index / fps, abs(offset) / WIDTH * fps))
+        # How well the best offset actually explained the change. A camera
+        # that moved leaves a low residual: shift the frame back and it
+        # matches. A screen playing video leaves a high one at every offset,
+        # because nothing about the change is a shift -- and that is the
+        # difference between "the camera was still" and "this cannot be
+        # read from the picture", which were the same answer before.
+        out.append((index / fps, abs(offset) / WIDTH * fps, best or 0.0))
     return out
 
 
 def _into_intervals(
-    shifts: list[tuple[float, float]], duration: float
+    shifts: list[tuple[float, float, float]], duration: float
 ) -> list[MotionInterval]:
     """Group a per-frame reading into stretches, with hysteresis.
 
@@ -185,7 +164,13 @@ def _into_intervals(
 
     states: list[tuple[float, str, float]] = []
     now = "still"
-    for at, speed in shifts:
+    for at, speed, residual in shifts:
+        if residual > UNREADABLE:
+            # No offset explains what changed, so there is no shift to
+            # report and "the camera was still" would be a claim rather
+            # than a reading.
+            states.append((at, "unobservable", speed))
+            continue
         if now == "still" and speed > MOVING:
             now = "moving"
         elif now == "moving" and speed < STILL:
@@ -207,6 +192,19 @@ def _into_intervals(
             merged[-1].extend(run)
         else:
             merged.append(run)
+
+    # Adjacent runs of the same state are one thing the camera did. They can
+    # end up split when a brief blip between them is absorbed into the run
+    # before it, and two neighbouring intervals both saying "the frame is
+    # moving" reads as a measurement artefact, which is what it is.
+    joined: list[list[tuple[float, str, float]]] = []
+    for run in merged:
+        state = max(set(one[1] for one in run), key=[o[1] for o in run].count)
+        if joined and joined[-1][1] == state:
+            joined[-1][0].extend(run)
+        else:
+            joined.append(([*run], state))
+    merged = [run for run, _ in joined]
 
     out: list[MotionInterval] = []
     for index, run in enumerate(merged):
@@ -246,11 +244,25 @@ def describe(intervals: list[MotionInterval]) -> str:
     for one in intervals:
         clock = f"{int(one.starts_seconds) // 60}:{one.starts_seconds % 60:04.1f}"
         until = f"{int(one.ends_seconds) // 60}:{one.ends_seconds % 60:04.1f}"
-        said = {
-            "still": "整段畫面沒有位移",
-            "moving": "整個畫面在位移",
-            "unobservable": "量不出來（畫面裡沒有夠穩定的東西可以比對）",
-        }[one.state]
+        if one.state == "moving":
+            # How hard, because "the frame moved" covers a slow deliberate
+            # push and a knock, and telling those apart is the whole job the
+            # model is being given here.
+            how = (
+                "很輕微" if one.peak_vw_s < 0.06
+                else "平穩" if one.peak_vw_s < 0.18
+                else "快" if one.peak_vw_s < 0.4
+                else "很急"
+            )
+            said = (
+                f"整個畫面在位移（{how}，最快每秒 {one.peak_vw_s:.2f} 個畫面寬，"
+                f"總共移動約 {one.travel_vw:.2f} 個畫面寬）"
+            )
+        else:
+            said = {
+                "still": "整段畫面沒有位移",
+                "unobservable": "量不出來（畫面裡沒有夠穩定的東西可以比對）",
+            }[one.state]
         tail = "，最後停下來落定" if one.settles else ""
         lines.append(f"  {one.event_id}  {clock}–{until}  {said}{tail}")
     return "\n".join(lines)

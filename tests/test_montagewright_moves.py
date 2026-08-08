@@ -4460,3 +4460,42 @@ def test_a_digital_move_on_a_take_that_already_moves_is_reported():
     assert "digital_move_on_a_moving_take" in checking
     # A locked take is not flagged for having a move added to it.
     assert 'in {"authored", "subject_follow"}' in checking
+
+
+def test_unreadable_footage_says_so_rather_than_saying_still():
+    """"The camera did not move" and "this cannot be read" are not the same.
+
+    The module claimed to report the second and only ever produced the first,
+    because nothing measured how well the estimate fitted. A docstring
+    describing behaviour the code does not have is the same fault this
+    project keeps finding elsewhere.
+    """
+
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from montagewright.motion import UNREADABLE, measure
+
+    with tempfile.TemporaryDirectory() as work:
+        noise = Path(work) / "noise.mp4"
+        made = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi",
+             "-i", "nullsrc=s=320x180:d=3:r=25,geq=random(1)*255:128:128",
+             "-c:v", "libx264", "-crf", "18", str(noise)],
+            capture_output=True,
+        )
+        if made.returncode != 0 or not noise.exists():
+            import pytest as _pytest
+
+            _pytest.skip("ffmpeg cannot synthesise noise here")
+        found = measure(noise, 3.0)
+
+    # By construction no shift explains anything, so no shift is claimed.
+    assert [one.state for one in found] == ["unobservable"]
+
+    # And the threshold sits between what real footage leaves behind and
+    # what noise does -- the first number chosen was above noise, so the
+    # state it was added for could never have occurred.
+    assert 12.2 < UNREADABLE < 22.7
