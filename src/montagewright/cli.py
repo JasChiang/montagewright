@@ -547,6 +547,15 @@ def command_render(args: argparse.Namespace) -> int:
                     _subject_line(box, _aspect(proxy), ASPECTS[args.aspect])
                     for box in subjects_from_card(card or {})
                 ),
+                # The label a look will name, beside the moment it was seen
+                # and what the camera did over the take. Two facts already
+                # on the card and in the measurement; the planner is the
+                # first place that can put them together.
+                sightings=tuple(
+                    (box.label, box.at_seconds)
+                    for box in subjects_from_card(card or {})
+                ),
+                motion=tuple(motion_of(source_id) or ()),
                 speech=_speech_lines(transcripts.get(source_id)),
             )
         )
@@ -644,7 +653,8 @@ def command_render(args: argparse.Namespace) -> int:
     # A plan whose prose and whose structure describe different shots is not
     # a rendering problem -- both halves came from the same answer, so it
     # says the planner was of two minds and the film will follow the looks.
-    for note in selection.get("frame_disagreements") or []:
+    disagreed: list[str] = list(selection.get("frame_disagreements") or [])
+    for note in disagreed:
         print(f"  {note}", flush=True)
 
     edl, snaps = _edl_from_selection(selection, rushes, cards)
@@ -709,6 +719,11 @@ def command_render(args: argparse.Namespace) -> int:
     # out. Three layers each made a defensible call last run and delivered
     # 17.9 seconds against 30, with nothing in the report saying so.
     report.target_seconds = float(direction["target_seconds"])
+    # Held from before the report existed. Kept rather than printed: these
+    # went to stdout and nowhere else, so the one that mattered -- a shot
+    # naming a subject its own window never reaches -- was on screen while
+    # the same shot was replanned twice into the same failure.
+    report.plan_disagreements.extend(disagreed)
 
     rounds: list[Round] = []
     shot_verdicts: dict[str, dict] = {}
@@ -806,8 +821,25 @@ def command_render(args: argparse.Namespace) -> int:
               # return, so an approving film reviewer threw them away
               # unread -- and the loop it gates is the only thing that can
               # act on them.
+              # The reviewer says what it saw; the disagreement says what
+              # made it inevitable. A shot told only "the pan does not pan"
+              # was replanned twice into the same pan, because the reason it
+              # could not pan -- the far end of the sweep is six seconds
+              # past where this shot cuts away -- was on stdout and nowhere
+              # the planner could read.
+              said = {}
+              for note in report.plan_disagreements:
+                  clip_id = note.split(" ", 1)[0]
+                  said.setdefault(clip_id, []).append(note)
               failing = [
-                  (index, shot, shot_verdicts[f"k{index:02d}"].get("note", ""))
+                  (
+                      index,
+                      shot,
+                      "；".join(
+                          [shot_verdicts[f"k{index:02d}"].get("note", "")]
+                          + said.get(f"k{index:02d}", [])
+                      ),
+                  )
                   for index, shot in enumerate(selection["shots"])
                   if not shot_verdicts.get(f"k{index:02d}", {}).get(
                       "delivered", True
@@ -865,6 +897,9 @@ def command_render(args: argparse.Namespace) -> int:
                   selection["shots"][index] = new
               for note in replanned.get("frame_disagreements") or []:
                   print(f"  {note}", flush=True)
+              report.plan_disagreements.extend(
+                  replanned.get("frame_disagreements") or []
+              )
               # Everything downstream is rebuilt from the amended selection, so
               # the next round renders a different film rather than re-reading
               # the same one.

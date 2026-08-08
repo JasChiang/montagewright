@@ -345,6 +345,30 @@ def _into_intervals(
     return out
 
 
+def travelled_between(
+    intervals: "list[MotionInterval] | tuple[MotionInterval, ...]",
+    first: float,
+    second: float,
+) -> float:
+    """How far the frame moved between two moments, in frame widths.
+
+    What makes a position measured at one second usable at another. On a
+    locked-off take the answer is zero and a coordinate keeps forever; on a
+    take whose camera travels it is the distance the thing has drifted, and
+    past a point the thing is not in the picture at all.
+    """
+
+    low, high = sorted((first, second))
+    gone = 0.0
+    for one in intervals:
+        if one.state != "moving" or one.seconds <= 0.0:
+            continue
+        shared = max(0.0, min(high, one.ends_seconds) - max(low, one.starts_seconds))
+        if shared > 0.0:
+            gone += one.travel_vw * shared / one.seconds
+    return gone
+
+
 def describe(intervals: list[MotionInterval]) -> str:
     """The measurement, as the card pass is shown it.
 

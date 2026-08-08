@@ -4192,6 +4192,66 @@ def test_a_cut_lands_on_the_downbeat_rather_than_the_nearest_beat():
     assert both.nearest_cue(1.02).kind == "section_boundary"
 
 
+def test_a_look_at_something_outside_this_window_is_a_disagreement():
+    """Two facts on record, never compared, and a pan that was a hold.
+
+    A shot asked to sweep across a row of watches took two seconds of a
+    seven-second pan, and named as the far end of the sweep a subject the
+    take does not reach until six seconds after this shot cuts away. The
+    card had measured when that subject was seen; the motion pass had
+    measured what the frame did in between. Nothing put the two together,
+    so the grounding pass went looking for the watches in frames they are
+    not in, found the nearest thing resembling them, and the frame travelled
+    0.013 widths -- delivered, reported, and wrong until somebody watched.
+
+    The numbers here are that run's. Every shot that delivered what it
+    planned sat at 0.035 widths or below.
+    """
+
+    from montagewright.motion import MotionInterval
+    from montagewright.planner import MaterialItem, frame_disagreements
+
+    def moving(starts, ends, travel):
+        return MotionInterval(
+            event_id="m00", starts_seconds=starts, ends_seconds=ends,
+            state="moving", peak_vw_s=0.06, travel_vw=travel, settles=True,
+        )
+
+    material = [MaterialItem(
+        source_id="C8329", duration_seconds=16.5, summary="",
+        sightings=(("右前方的綠色錶帶智慧手錶", 2.0), ("左側平移後出現的手錶", 12.0)),
+        motion=(moving(4.0, 11.0, 0.34),),
+    )]
+    shot = {
+        "source_id": "C8329", "frame": "travels",
+        "start_seconds": 4.0, "seconds_needed": 2.0,
+        "looks": [
+            {"at": "右前方的綠色錶帶智慧手錶"},
+            {"at": "左側平移後出現的手錶"},
+        ],
+    }
+
+    off = frame_disagreements([shot], material)
+    assert len(off) == 1
+    assert "左側平移後出現的手錶" in off[0]
+    assert "0:12.0" in off[0]
+
+    # The near end of the same sweep is inside the window and is not flagged:
+    # this asks whether the subject is reachable, not whether the take moves.
+    assert "右前方" not in off[0]
+
+    # And on a take whose camera never moves, a position measured at any
+    # moment describes every moment, which is why most shots pass.
+    still = [MaterialItem(
+        source_id="C8329", duration_seconds=16.5, summary="",
+        sightings=material[0].sightings, motion=(),
+    )]
+    assert frame_disagreements([shot], still) == []
+
+    # Without any material the older checks still run on their own.
+    assert frame_disagreements([shot]) == []
+
+
 def test_a_cut_records_what_kind_of_event_it_landed_on():
     """The count was true and could not be checked, which is worse than false.
 

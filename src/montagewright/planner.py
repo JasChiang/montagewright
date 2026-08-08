@@ -861,6 +861,12 @@ class MaterialItem:
     # camera across it rather than crop the middle out and call it framing.
     composition: str = ""
     subjects: tuple[str, ...] = ()
+    # When each named subject was actually seen, and what the frame did over
+    # the take. Separately these are two facts already on record; together
+    # they say whether a subject is in a given window at all. See
+    # `frame_disagreements`.
+    sightings: tuple[tuple[str, float], ...] = ()
+    motion: tuple[Any, ...] = ()
     # Measured, not answered. See the note where this is filled in.
     camera_moves: bool = False
     # What the source camera does, not merely that it does something. A
@@ -1516,7 +1522,9 @@ def select_shots(
     )
     chosen = _parse(interaction, what="selection pass")
     expand_spans(chosen, offered)
-    chosen["frame_disagreements"] = frame_disagreements(chosen.get("shots") or [])
+    chosen["frame_disagreements"] = frame_disagreements(
+        chosen.get("shots") or [], material
+    )
     return chosen, Usage.from_interaction(interaction)
 
 
@@ -1568,7 +1576,21 @@ def expand_spans(chosen: dict[str, Any], offered: "list[Any]") -> None:
         shot["source_motion_role"] = span.motion_role
 
 
-def frame_disagreements(shots: list[dict[str, Any]]) -> list[str]:
+# How far the frame may travel between the moment a subject was measured and
+# the moment a shot uses it, before the measurement stops describing this
+# window. A delivery crop of a 16:9 source at 9:16 is 0.316 frame widths
+# wide, so half of that is the point where a coordinate taken from another
+# moment falls outside the crop entirely. Calibrated too: across a ten-shot
+# cut every shot that delivered what it planned sat at 0.035 or below, and
+# the one that did not asked for a subject the frame had travelled 0.242
+# away from -- a row of watches that the take's own pan does not reach until
+# six seconds after this shot has cut away.
+CARRIES_VW = 0.15
+
+
+def frame_disagreements(
+    shots: list[dict[str, Any]], material: "list[MaterialItem] | None" = None
+) -> list[str]:
     """Shots whose `frame` answer and whose looks describe different shots.
 
     Deliberately redundant, which the looks refactor removed on purpose --
@@ -1584,6 +1606,15 @@ def frame_disagreements(shots: list[dict[str, Any]]) -> list[str]:
     nothing anywhere compared them.
     """
 
+    from montagewright.motion import travelled_between
+
+    seen: dict[tuple[str, str], float] = {}
+    moved: dict[str, tuple[Any, ...]] = {}
+    for item in material or []:
+        for label, at in item.sightings:
+            seen[(item.source_id, label)] = at
+        moved[item.source_id] = item.motion
+
     off = []
     for index, shot in enumerate(shots):
         travels = str(shot.get("frame", "")) == "travels"
@@ -1592,6 +1623,31 @@ def frame_disagreements(shots: list[dict[str, Any]]) -> list[str]:
             off.append(f"k{index:02d} said travels and gave one look")
         elif not travels and stops > 1:
             off.append(f"k{index:02d} said settles and gave {stops} looks")
+
+        # A subject named from the whole take, used in a window the take's
+        # own camera has travelled away from. Both halves were on record and
+        # nothing compared them: a shot asked to sweep across a row of
+        # watches took two seconds of a seven-second pan, so the watches it
+        # named as the far end were still off the edge of the frame. The
+        # grounding pass then looked for them in those two seconds, found
+        # the nearest thing that resembled them, and the frame travelled
+        # 0.013 of a width -- a pan that is a hold, reported as delivered
+        # until somebody watched it.
+        source = str(shot.get("source_id", ""))
+        begins = float(shot.get("start_seconds") or 0.0)
+        middle = begins + float(shot.get("seconds_needed") or 0.0) / 2
+        for look in shot.get("looks") or []:
+            at = seen.get((source, str(look.get("at", ""))))
+            if at is None:
+                continue
+            gone = travelled_between(moved.get(source) or (), at, middle)
+            if gone > CARRIES_VW:
+                off.append(
+                    f"k{index:02d} looks at '{look.get('at')}', which was "
+                    f"seen at {int(at) // 60}:{at % 60:04.1f} -- the frame "
+                    f"travels {gone:.2f} widths between there and this shot, "
+                    "so it is not in this window"
+                )
     return off
 
 
@@ -1681,7 +1737,9 @@ def replan_shots(
     # most likely to be answered with the word and not the thing -- the
     # reviewer just said the frame showed half a wordmark, and "改為橫向掃過
     # 運鏡" in the reasoning is not two looks.
-    again["frame_disagreements"] = frame_disagreements(again.get("shots") or [])
+    again["frame_disagreements"] = frame_disagreements(
+        again.get("shots") or [], material
+    )
     return again, Usage.from_interaction(
         interaction
     )

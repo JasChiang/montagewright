@@ -75,6 +75,11 @@ class Report:
     static_shots: int = 0
     degradations: list[DegradationStep] = field(default_factory=list)
     subject_notes: dict[str, str] = field(default_factory=dict)
+    # Where a plan contradicted itself, kept rather than printed. These were
+    # written to stdout and nowhere else, so the one that mattered -- a shot
+    # naming a subject its own window never reaches -- was on screen while
+    # the same shot was replanned twice into the same failure.
+    plan_disagreements: list[str] = field(default_factory=list)
     # What the direction asked for against what the cut runs to. Three layers
     # each made a defensible call -- 45 seconds of material, ten shots, a
     # beat-led length -- and the result was a third of the intended film with
