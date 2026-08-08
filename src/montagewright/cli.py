@@ -619,13 +619,23 @@ def command_render(args: argparse.Namespace) -> int:
     # The reasons are better than the cards' as well: a card sees one clip
     # and can only say it failed, while the direction has seen all of them
     # and can say which take supersedes this one.
+    # Only what the direction called broken leaves the run. A take it merely
+    # ranked below another is still material -- the comparison travels with
+    # it into selection instead of deleting it, because the two are not the
+    # same claim and only one of them is about the whole file.
+    from montagewright.planner import _beaten_and_broken
+
+    beaten, broken = _beaten_and_broken(direction)
     for entry in direction.get("unusable", []) or []:
         source_id = str(entry.get("source_id", ""))
-        if not source_id:
-            continue
-        why = str(entry.get("reason") or "no reason given")
-        better = str(entry.get("superseded_by") or "")
-        set_aside[source_id] = f"{why}（改用 {better}）" if better else why
+        if source_id in broken:
+            set_aside[source_id] = str(entry.get("reason") or "no reason given")
+    if beaten:
+        print(
+            f"  {len(beaten)} more the direction ranked below another take, "
+            "kept and passed on",
+            flush=True,
+        )
 
     chose = _asked(asked, json.dumps(direction, sort_keys=True, ensure_ascii=False))
     selection = _decided(work, "selection", chose)
@@ -832,6 +842,23 @@ def command_render(args: argparse.Namespace) -> int:
               for note in report.plan_disagreements:
                   clip_id = note.split(" ", 1)[0]
                   said.setdefault(clip_id, []).append(note)
+              # And what was measured about the shot, which is the half the
+              # reviewer cannot supply. Told only "the text is cropped", the
+              # planner answered with the same hold three rounds running; the
+              # number it was never shown said at most 63% of that wordmark
+              # can appear in this delivery from this source, which rules out
+              # every hold rather than this one.
+              for step in report.degradations:
+                  if step.clip_id is None:
+                      continue
+                  measured = ", ".join(
+                      f"{name} {value}"
+                      for name, value in (step.measured or {}).items()
+                  )
+                  said.setdefault(f"{step.clip_id}", []).append(
+                      f"本機量到：{step.trigger}"
+                      + (f"（{measured}）" if measured else "")
+                  )
               failing = [
                   (
                       index,
@@ -1324,6 +1351,7 @@ def _write_report(output: Path, **parts) -> None:
         "shots_held": report.static_shots,
         "upscales": {k: round(v, 3) for k, v in report.upscales.items()},
         "subject_notes": report.subject_notes,
+        "plan_disagreements": report.plan_disagreements,
         "degradations": [
             {
                 "clip_id": step.clip_id,

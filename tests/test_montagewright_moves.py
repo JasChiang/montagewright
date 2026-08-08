@@ -3496,23 +3496,152 @@ def test_the_shot_verdicts_are_collected_before_the_gate_that_reads_them():
     assert source.count("undelivered=undelivered") == 2
 
 
-def test_the_takes_the_direction_ruled_out_are_accounted_for():
-    """`set_aside` answered "why is this take missing" for one of two ways.
+def test_silence_about_cropping_does_not_read_as_permission():
+    """An optional boolean whose absent value is the permissive one.
 
-    The cards' `usable: false` was recorded; the direction's `unusable` list
-    was applied to selection and written down nowhere, so a run that removed
-    five clips reported none set aside and seventy-four in play.
+    `must_be_whole` says partial cropping destroys this subject. It was not
+    required, and an absent boolean reads false, so saying nothing meant
+    cropping was fine -- the opposite of the safe answer for a field that
+    exists to flag danger. In one cut seven of eight looks answered it and
+    the eighth was a wordmark; its silence dropped the fraction that had to
+    stay visible from all of it to 85%, and the title shipped as "y Unpacke"
+    after three rounds of review.
+
+    This is the same shape as the camera-move regression: a required enum
+    became an optional array, and a question nobody is made to answer stops
+    being answered.
+    """
+
+    from montagewright.planner import _selection_schema
+
+    look = (
+        _selection_schema(["C1:s00"])
+        ["properties"]["shots"]["items"]["properties"]["looks"]["items"]
+    )
+    assert "must_be_whole" in look["required"]
+    assert set(look["required"]) == set(look["properties"])
+
+
+def test_movement_that_reveals_nothing_is_not_the_source_doing_the_work():
+    """Texture was described to the planner as a camera move.
+
+    The listing labelled any recorded `camera_motion` as 素材自己的運鏡, and
+    the selection prompt reads that label as a reason to hold: the source
+    camera will bring the subject in, so a digital move on top would fight
+    it. True of a reveal or a follow. False of handheld drift, which brings
+    nothing in -- and a wordmark wider than any vertical crop sat on a take
+    whose card said 微幅手持飄移, measured at 0.06 frame widths over three
+    and a half seconds. Held twice, cropped both times.
+
+    The distinction was already measured and already on the span.
+    """
+
+    from montagewright.planner import MaterialItem, _describe_material
+    from montagewright.spans import Span
+
+    def take(role):
+        return MaterialItem(
+            source_id="C1", duration_seconds=3.5, summary="標題牆",
+            camera_motion="微幅手持飄移，鏡頭始終鎖定並呈現標題字樣。",
+            spans=(Span(
+                span_id="C1:s00", source_id="C1",
+                starts_seconds=0.0, ends_seconds=3.5, motion_role=role,
+            ),),
+        )
+
+    drift = _describe_material([take("handheld_texture")])
+    assert "素材自己的運鏡" not in drift
+    assert "這是質感，不是運鏡" in drift
+
+    # A move that reveals still counts, because there the prompt is right.
+    reveal = _describe_material([take("authored")])
+    assert "素材自己的運鏡" in reveal
+
+
+def test_every_thing_the_report_records_reaches_the_report():
+    """A field added to the account and not to the file it writes.
+
+    `plan_disagreements` was added to `Report`, filled during the run, read
+    during replanning, and never serialised -- the edit that was supposed to
+    put it in the payload matched nothing and changed nothing, silently,
+    because a string replace that finds no target is not an error. Every
+    test passed. The key was simply absent from report.json, which reads
+    exactly like a run that had nothing to say.
+
+    So omission has to be a decision. A field either appears in the payload
+    or is named here as deliberately left out, and adding one without doing
+    either fails.
+    """
+
+    import dataclasses
+    import inspect
+
+    from montagewright import cli
+    from montagewright.pipeline import Report
+
+    # Written under another name, or not written on purpose.
+    elsewhere = {
+        "aligned_cuts": "cuts_on_music",
+        "total_cuts": "cuts_on_music",
+        "following_shots": "shots_following",
+        "static_shots": "shots_held",
+        "rhythm_decisions": "rhythm",
+        "delivered_seconds": "duration_seconds",
+        "usages": "tokens",
+        "ledger": "spend",
+    }
+    written = inspect.getsource(cli._write_report)
+    missing = [
+        one.name
+        for one in dataclasses.fields(Report)
+        if f'"{one.name}"' not in written
+        and f'"{elsewhere.get(one.name, one.name)}"' not in written
+    ]
+    assert not missing, missing
+
+
+def test_a_take_that_was_beaten_is_not_a_take_that_was_removed():
+    """Naming a better attempt is a comparison, not a verdict on the file.
+
+    Every entry in the direction's `unusable` list removed a whole source
+    from selection, and the span contract exists precisely because a take is
+    usually not all one thing. Across one cut that filter took eight sources
+    and sixteen otherwise usable spans with them, and all eight had named a
+    better take rather than called anything broken -- the worst was a
+    forty-three second underwater run binned for how it ended.
+
+    So the two are separated by what the answer itself already said. An
+    entry naming `superseded_by` is advice and travels to selection beside
+    the footage; an entry naming nothing is a verdict and removes the take.
     """
 
     import inspect
 
     from montagewright import cli
+    from montagewright.planner import _beaten_and_broken
 
+    ruled = {"unusable": [
+        {"source_id": "C8400", "reason": "手錶在末段脫落",
+         "superseded_by": "C8398"},
+        {"source_id": "C8383", "reason": "誤按錄影，畫面沒有內容"},
+    ]}
+    beaten, broken = _beaten_and_broken(ruled)
+    assert broken == {"C8383"}
+    assert set(beaten) == {"C8400"}
+    assert "C8398" in beaten["C8400"] and "脫落" in beaten["C8400"]
+
+    # Selection keeps the beaten take and is told what the direction thought.
     source = inspect.getsource(cli.command_render)
     ruling = source[source.index('for entry in direction.get("unusable"'):]
     ruling = ruling[: ruling.index("chose = ")]
     assert "set_aside[source_id]" in ruling
-    assert "superseded_by" in ruling
+    assert "in broken" in ruling
+
+    picking = inspect.getsource(__import__(
+        "montagewright.planner", fromlist=["select_shots"]
+    ).select_shots)
+    assert "not in broken" in picking
+    assert "beaten" in picking
     # And it happens after the direction exists, not before it.
     assert source.index("set_aside: dict[str, str] = {}") < source.index(ruling[:40])
 

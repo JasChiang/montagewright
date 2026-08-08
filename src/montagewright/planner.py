@@ -970,8 +970,21 @@ def _direction_schema() -> dict[str, Any]:
             "unusable": {
                 "type": "array",
                 "description": (
-                    "Only takes that genuinely failed. Handheld movement, "
-                    "soft focus, and unusual framing are style, not defects."
+                    "Only takes that genuinely failed -- where no part of "
+                    "the take is worth anything to anyone. Handheld "
+                    "movement, soft focus, and unusual framing are style, "
+                    "not defects.\n"
+                    "A take that is merely beaten by a better one belongs "
+                    "here too, but with `superseded_by` naming that take. "
+                    "The difference decides what happens: broken is removed, "
+                    "beaten is told to the next pass as a preference. You "
+                    "have seen every clip and it is the only pass that can "
+                    "compare them, so the comparison is wanted -- what is "
+                    "not wanted is a whole take disappearing because of one "
+                    "moment in it. An accident at 0:43 does not spoil the "
+                    "forty seconds before it, and the card has already cut "
+                    "the take into the parts that stand and the parts that "
+                    "do not."
                 ),
                 "items": {
                     "type": "object",
@@ -1046,8 +1059,26 @@ def _describe_material(material: list[MaterialItem]) -> str:
             facts.append(f"景別{item.shot_size}")
         if item.facing and item.facing != "flat":
             facts.append(f"朝向{item.facing}")
-        if item.camera_motion:
+        # Only movement that does something for the viewer counts as the
+        # source doing the work. The selection prompt reads this label as a
+        # reason to hold -- the camera will bring the subject in, so a second
+        # move on top would fight it -- and that is true of a reveal or a
+        # follow and false of handheld texture, which brings nothing in.
+        #
+        # It cost a shot. A wordmark wider than any vertical crop sat on a
+        # take whose card said 微幅手持飄移, measured at six hundredths of a
+        # frame width across three and a half seconds. The listing called
+        # that the source's own movement, the prompt said hold, and the title
+        # was delivered as "y Unpacke" three rounds running.
+        carries = {"authored", "subject_follow"}
+        works = [one for one in item.spans if one.motion_role in carries]
+        if item.camera_motion and works:
             facts.append(f"素材自己的運鏡：{item.camera_motion}")
+        elif item.camera_motion:
+            facts.append(
+                f"攝影機在動但沒帶出新東西（{item.camera_motion}）"
+                "——這是質感，不是運鏡，要帶過什麼還是得自己走"
+            )
         elif item.camera_moves:
             facts.append("攝影機有運動")
         if len(item.spans) == 1 and item.spans[0].seconds >= (
@@ -1105,7 +1136,10 @@ def _describe_material(material: list[MaterialItem]) -> str:
 
 
 def _attach_material(
-    material: list[MaterialItem], cache: UploadCache | None, client: Any
+    material: list[MaterialItem],
+    cache: UploadCache | None,
+    client: Any,
+    beaten: "dict[str, str] | None" = None,
 ) -> list[dict[str, Any]]:
     """Each clip's description, then that clip's own footage.
 
@@ -1133,10 +1167,19 @@ def _attach_material(
             uri = uploaded.uri
         else:
             uri, _ = cache.uri_for(item.proxy, client, mime_type="video/mp4")
+        # What the pass that saw everything thought of this take, written
+        # beside the take rather than used to delete it. Removing the source
+        # threw away every stretch of it that nothing was wrong with; saying
+        # so keeps the judgement and leaves the choice here, where the brief
+        # is known and a shot's job is known.
+        said = (beaten or {}).get(item.source_id, "")
         attached.append(
             {
                 "type": "text",
-                "text": f"\n{_describe_one(item)}\n",
+                "text": (
+                    f"\n{_describe_one(item)}\n"
+                    + (f"（定調的看法：{said}）\n" if said else "")
+                ),
             }
         )
         attached.append(
@@ -1363,7 +1406,17 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                             "items": {
                                 "type": "object",
                                 "additionalProperties": False,
-                                "required": ["at", "seconds", "framing"],
+                                # `must_be_whole` among them. It was
+                                # optional, and an absent boolean reads as
+                                # false -- so silence meant "cropping this is
+                                # fine" for a field whose only purpose is to
+                                # say cropping destroys it. Seven of eight
+                                # looks in one cut answered it; the eighth
+                                # was a wordmark, and its silence lowered the
+                                # bar it had to clear from whole to 85%.
+                                "required": [
+                                    "at", "seconds", "framing", "must_be_whole"
+                                ],
                                 "properties": {
                                     "at": {
                                         "type": "string",
@@ -1468,6 +1521,31 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
     }
 
 
+def _beaten_and_broken(
+    direction: dict[str, Any]
+) -> tuple[dict[str, str], set[str]]:
+    """Split what the direction ruled out into advice and removal.
+
+    Naming a better take is a comparison. Naming nothing is a verdict. The
+    field carried both and the reader treated every entry as the second.
+    """
+
+    beaten: dict[str, str] = {}
+    broken: set[str] = set()
+    for entry in direction.get("unusable", []) or []:
+        source_id = str(entry.get("source_id") or "")
+        if not source_id:
+            continue
+        better = str(entry.get("superseded_by") or "").strip()
+        if better:
+            beaten[source_id] = (
+                f"{entry.get('reason') or ''}（定調認為 {better} 這件事做得更好）"
+            )
+        else:
+            broken.add(source_id)
+    return beaten, broken
+
+
 def select_shots(
     material: list[MaterialItem],
     direction: dict[str, Any],
@@ -1481,12 +1559,14 @@ def select_shots(
     if client is None:
         client = _default_client()
 
-    usable = [
-        item
-        for item in material
-        if item.source_id
-        not in {entry["source_id"] for entry in direction.get("unusable", [])}
-    ]
+    # Removed only when the direction says the take is broken. When it names
+    # a better attempt instead, it is comparing rather than condemning, and
+    # the comparison is worth having without the deletion: across one cut
+    # this filter took eight sources and sixteen usable spans with them, and
+    # every one of the eight had named a better take. The worst was a
+    # forty-three second underwater run binned for how it ended.
+    beaten, broken = _beaten_and_broken(direction)
+    usable = [item for item in material if item.source_id not in broken]
     # Every stretch of every surviving take that may be cut into, which is
     # the vocabulary the answer is written in. A take with two good passes
     # separated by somebody calling it offers two; one nobody segmented
@@ -1507,7 +1587,7 @@ def select_shots(
             ),
         }
     ]
-    selection_input += _attach_material(usable, cache, client)
+    selection_input += _attach_material(usable, cache, client, beaten)
 
     interaction = ask(
         client,
@@ -1691,12 +1771,14 @@ def replan_shots(
     if client is None:
         client = _default_client()
 
-    usable = [
-        item
-        for item in material
-        if item.source_id
-        not in {entry["source_id"] for entry in direction.get("unusable", [])}
-    ]
+    # Removed only when the direction says the take is broken. When it names
+    # a better attempt instead, it is comparing rather than condemning, and
+    # the comparison is worth having without the deletion: across one cut
+    # this filter took eight sources and sixteen usable spans with them, and
+    # every one of the eight had named a better take. The worst was a
+    # forty-three second underwater run binned for how it ended.
+    beaten, broken = _beaten_and_broken(direction)
+    usable = [item for item in material if item.source_id not in broken]
     offered = [span for item in usable for span in item.spans]
     prompt = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
     problems = "\n\n".join(
@@ -1726,7 +1808,7 @@ def replan_shots(
             ),
         }
     ]
-    replan_input += _attach_material(usable, cache, client)
+    replan_input += _attach_material(usable, cache, client, beaten)
 
     interaction = ask(
         client,
