@@ -823,6 +823,7 @@ class MaterialItem:
     # camera across it rather than crop the middle out and call it framing.
     composition: str = ""
     subjects: tuple[str, ...] = ()
+    # Measured, not answered. See the note where this is filled in.
     camera_moves: bool = False
     # What the source camera does, not merely that it does something. A
     # reference cut held a static frame on the left-hand handset and let the

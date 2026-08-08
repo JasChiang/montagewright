@@ -382,15 +382,23 @@ def test_the_card_version_moves_when_anything_about_the_card_moves():
     assert moved != expected
 
 
-def test_a_missing_answer_is_not_a_no():
-    """`camera_moves` was optional and the reader defaulted it to False.
+def test_whether_the_camera_moved_is_measured_rather_than_asked():
+    """It was an optional boolean answered by a model reading 1 fps.
 
-    So "the model did not say" and "the camera is still" were the same
-    value, on the field that decides whether a digital move is stacked on a
-    take that already moves.
+    Which is the rate at which a moving camera and a still one look the
+    same -- and being optional, a missing answer became "still" on the field
+    that decides whether a digital move gets stacked on a take that already
+    has one. It is a fact about the pixels, so it is read off them.
     """
 
-    assert "camera_moves" in clipcard.card_schema()["required"]
+    import inspect
+
+    from montagewright import cli
+
+    assert "camera_moves" not in clipcard.card_schema()["properties"]
+    filled = inspect.getsource(cli.command_render)
+    filled = filled[filled.index("camera_moves="):]
+    assert 'one.state == "moving"' in filled[:400]
 
 
 def test_a_decision_is_keyed_on_the_material_it_was_made_from():

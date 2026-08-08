@@ -499,7 +499,16 @@ def command_render(args: argparse.Namespace) -> int:
                 summary=(card or {}).get("summary", ""),
                 proxy=proxy,
                 composition=(card or {}).get("composition", ""),
-                camera_moves=bool((card or {}).get("camera_moves", False)),
+                # Derived, not asked. Whether the camera moved is a fact
+                # about the pixels and was being answered by a model reading
+                # one frame a second -- which is the rate at which a moving
+                # camera and a still one look the same. It was optional too,
+                # so a missing answer became "still" on the field that
+                # decides whether a digital move gets stacked on a take that
+                # already has one.
+                camera_moves=any(
+                    one.state == "moving" for one in (motion_of(source_id) or [])
+                ),
                 camera_motion=str((card or {}).get("camera_motion", "") or ""),
                 shot_size=str((card or {}).get("shot_size", "") or ""),
                 facing=str((card or {}).get("facing", "") or ""),

@@ -173,7 +173,6 @@ def card_schema() -> dict[str, Any]:
             "subjects",
             "action",
             "camera_motion",
-            "camera_moves",
             "shot_size",
             "facing",
             "speech",
@@ -368,10 +367,6 @@ def card_schema() -> dict[str, Any]:
                         },
                     },
                 },
-            },
-            "camera_moves": {
-                "type": "boolean",
-                "description": "Whether the camera itself moves in this take.",
             },
             "shot_size": {
                 "type": "string",
