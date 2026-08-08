@@ -293,6 +293,28 @@ ANSWERED = [
 ]
 
 
+def test_the_card_states_whether_a_screen_is_lit():
+    """A dark screen was narrated as a screen being shown.
+
+    A model unfolded a phone whose display was off; the card called it a
+    "black big-screen phone" and its summary said the shot "reveals the big
+    screen". Both from one pass, and contradictory: the colour word noticed
+    the screen was dark while the summary asserted it was showing something.
+    A brief that asked for lit screens caught the static displays whose cards
+    said "unlit", and missed this one, because the only pass that watches the
+    footage had described the dark screen as content.
+
+    Whether a display is lit is an observable fact, not a product-specific
+    judgement -- it holds for a phone, a watch, a monitor. The card is told
+    to state it, so a downstream reader has something to act on.
+    """
+
+    prompt = (PROMPTS / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
+    assert "會亮的裝置面板" in prompt or "螢幕" in prompt
+    # The specific trap: a dark screen is not the screen being shown.
+    assert "暗掉的螢幕不是" in prompt
+
+
 @pytest.mark.parametrize("name,build", ANSWERED, ids=[one for one, _ in ANSWERED])
 def test_every_time_a_model_writes_is_a_clock_reading(name, build):
     """A number is two readings; `1:53` is one.
