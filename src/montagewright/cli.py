@@ -3976,6 +3976,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                       },
                       degradations=report.degradations,
                       client=client,
+                      brief=brief,
                       cache=cache,
                       ledger=ledger,
                   )

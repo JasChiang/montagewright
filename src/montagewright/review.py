@@ -327,6 +327,7 @@ def review_shots(
     seconds: dict[str, float],
     degradations: list[DegradationStep],
     client: Any,
+    brief: str = "",
     cache: Any = None,
     ledger: Ledger | None = None,
     model_id: str = MODEL_ID,
@@ -339,6 +340,14 @@ def review_shots(
     first frame is empty -- six in a row survived review of the whole thing,
     every one of them found by opening a single shot. At thirty seconds and
     low resolution the next shot arrives before the fault registers.
+
+    It is also given the brief, which the whole-cut pass had and this one did
+    not. A rule the brief states -- the folding phone's screen must be lit
+    when it opens, no black screens -- is a per-shot fact, and this is the
+    pass that watches one shot at a time at delivery resolution, where a dark
+    screen the card read as lit at 1fps is plain. Without the brief it could
+    only ask whether a shot met its own plan, never whether the plan met the
+    film's requirements.
     """
 
     if not segments:
@@ -351,6 +360,14 @@ def review_shots(
         by_clip.setdefault(step.clip_id, []).append(step)
 
     instruction = (PROMPTS / "shotreview_zh-TW.txt").read_text(encoding="utf-8")
+    if brief.strip():
+        instruction += (
+            f"\n\n## 剪輯 brief\n\n{brief}\n\n"
+            "brief 裡對品質、內容或素材的要求，每一顆都適用。一顆鏡頭做到了"
+            "它自己的規劃，卻違反 brief（例如 brief 要求螢幕要亮，這顆的"
+            "螢幕是暗的），仍然算沒交出——在 `note` 裡指出是違反 brief 的"
+            "哪一條。"
+        )
     sent = [
         (f"k{index:02d}", shot)
         for index, shot in enumerate(shots)

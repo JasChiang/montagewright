@@ -6191,6 +6191,37 @@ def test_a_cut_lands_on_the_downbeat_rather_than_the_nearest_beat():
     assert both.nearest_cue(1.02).kind == "section_boundary"
 
 
+def test_the_per_shot_reviewer_is_given_the_brief():
+    """The pass that watches one shot at a time could not see the brief.
+
+    Only the whole-cut reviewer got it, so a brief rule that is really a
+    per-shot fact -- the folding phone's screen must be lit on open, no black
+    screens -- had to be noticed among several shots at once instead of on
+    the one shot, at delivery resolution, where a dark screen the card read
+    as lit at 1fps is plain. review_shots takes the brief now, folds it into
+    the instruction, and the caller passes it.
+    """
+
+    import inspect
+
+    from montagewright import cli
+    from montagewright.review import review_shots
+
+    assert "brief" in inspect.signature(review_shots).parameters
+
+    # The brief is folded into what the reviewer reads, and a shot that meets
+    # its plan but breaks the brief is still not delivered.
+    body = inspect.getsource(review_shots)
+    assert "剪輯 brief" in body
+    assert "仍然算沒交出" in body
+
+    # And the render loop actually hands it over rather than defaulting empty.
+    call = inspect.getsource(cli.command_render)
+    start = call.index("shot_verdicts = review_shots(")
+    handoff = call[start : call.index("review_cut(", start)]
+    assert "brief=brief" in handoff
+
+
 def test_a_cut_review_note_at_a_timecode_names_the_shot_it_lands_in():
     """A fault the finished-film pass found, dropped for want of a clip_id.
 
