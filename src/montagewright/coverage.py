@@ -111,6 +111,8 @@ def repair_bounded_visual_holds(
     has_independent_audio = bool(chosen.get("audio_assignments"))
     for index, shot in enumerate(shots):
         role = str(shot.get("picture_role") or "")
+        if shot.get("pacing_exception") and str(shot.get("pacing_exception_reason") or "").strip():
+            continue
         if role not in REPAIRABLE_VISUAL_HOLD_ROLES:
             continue
         if (
@@ -500,6 +502,11 @@ def _visual_claim(item: Any, shot: dict[str, Any], role: str) -> float:
 
     seconds = max(0.0, float(shot.get("seconds_needed") or 0.0))
     source_start = float(shot.get("start_seconds") or 0.0)
+    if (role not in {"speaker", "illustrative_broll"}
+            and shot.get("pacing_exception")
+            and str(shot.get("pacing_exception_reason") or "").strip()):
+        ratio = max(.25, float(shot.get("speed", 1.0) or 1.0))
+        return min(seconds, max(0.0, float(item.duration_seconds)-source_start)/ratio)
     looks = list(shot.get("looks") or [])
     grounded_look = next((
         look for look in looks

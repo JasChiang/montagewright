@@ -26,7 +26,7 @@ from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from montagewright.gemini import structured_json
+from montagewright.gemini import structured_json, video_content
 from montagewright.measure.geometry import native_yxyx_to_canonical_xyxy
 from montagewright.measure.media import (
     extract_frame,
@@ -54,6 +54,10 @@ DRAFT_PROMPT_PATH = (
 # its own evidence, and a truncated structured answer is a refused call --
 # paid for, and worth nothing.
 MAX_OUTPUT_TOKENS = 4_096
+# The full-source Agentic pass can return many sighting intervals. C8347 in
+# the 74-source acceptance run exhausted 4096 tokens despite low thinking.
+# This ceiling is not a retry loop; valid discoveries remain reusable.
+DISCOVERY_OUTPUT_TOKENS = 8_192
 EXACT_OUTPUT_POLICY_VERSION = "exact-output-v2-1024+1280n-cap12288"
 MAX_EXACT_FRAMES_PER_CALL = 8
 SOURCE_CONFIRMATION_VERSION = "adaptive-seed-v1"
@@ -81,7 +85,13 @@ def exact_frame_output_budget(frame_count: int) -> int:
 
     if frame_count < 1:
         raise ValueError("frame_count must be positive")
-    return min(12_288, max(MAX_OUTPUT_TOKENS, 1_024 + 1_280 * frame_count))
+    # The full-library September 9 run also exhausted 4,864 tokens on
+    # three-frame answers before emitting their first complete decision.
+    # Give multi-frame thinking a floor; a one-frame answer stays cheap.
+    # Keep the existing validated-result cache contract: raising only the
+    # response ceiling does not invalidate already complete identity evidence.
+    floor = MAX_OUTPUT_TOKENS if frame_count == 1 else 8_192
+    return min(12_288, max(floor, 1_024 + 1_280 * frame_count))
 VisibilityState = Literal[
     "full", "partial", "occluded", "entering", "exiting", "unknown"
 ]
@@ -108,6 +118,41 @@ FRAME_MIME_BY_SUFFIX = {
 
 class ReferenceGroundingError(RuntimeError):
     """The provider response or local evidence violated the grounding contract."""
+
+
+GroundingEscalation = Literal[
+    "none",
+    "multi_anchor_exact_bbox",
+    "shot_local_exact_bbox",
+    "manual_mask_review",
+]
+
+
+def grounding_escalation_for(
+    *,
+    matched_anchors: int,
+    sam_failed: bool,
+    crowded_or_occluded: bool = False,
+    shot_local_attempted: bool = False,
+) -> GroundingEscalation:
+    """Choose the next bounded grounding step without weakening identity.
+
+    A Gemini bbox is a semantic seed and SAM owns propagation. Failures first
+    buy another exact-frame identity decision, not a speculative video bbox.
+    Once shot-local anchors and SAM have both failed, the result is explicitly
+    routed to mask/manual review; it is never silently replaced by a similar
+    instance or a centre crop.
+    """
+
+    if not sam_failed:
+        return "none"
+    if matched_anchors < 2:
+        return "multi_anchor_exact_bbox"
+    if not shot_local_attempted:
+        return "shot_local_exact_bbox"
+    if crowded_or_occluded:
+        return "manual_mask_review"
+    return "manual_mask_review"
 
 
 class FrozenStrictModel(BaseModel):
@@ -1740,6 +1785,27 @@ def validate_candidate_payload(
 ) -> CandidateDiscoveryResult:
     """Validate a stored/provider payload without making a Gemini request."""
 
+    # Source observations use whole seconds, while the local video lineage
+    # includes a final fractional second. If the model echoes the exact file
+    # end as frame_exit but rounds its candidate end down to the last whole
+    # second, shrink the visibility metadata to the declared interval. Never
+    # extend a candidate, alter identity evidence, or repair larger conflicts.
+    import copy
+    payload = copy.deepcopy(payload)
+    for candidate in payload.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        end = candidate.get("end_ms")
+        exit_at = candidate.get("frame_exit_ms")
+        if (isinstance(end, int) and isinstance(exit_at, int)
+            and exit_at == video.duration_ms
+            and end == (video.duration_ms // 1000) * 1000
+            and 0 < exit_at - end < 1000):
+            candidate["frame_exit_ms"] = end
+            payload.setdefault("warnings", []).append(
+                f"local timing normalization: {candidate.get('candidate_id')} "
+                f"frame_exit_ms {exit_at} bounded to declared end_ms {end}"
+            )
     try:
         result = CandidateDiscoveryResult.model_validate(payload)
     except ValidationError as error:
@@ -1807,18 +1873,18 @@ def discover_reference_candidates(
     )
     parts.append({"type": "text", "text": "CANDIDATE VIDEO follows."})
     parts.append(
-        {
-            "type": "video",
-            "mime_type": video_mime_type,
-            "uri": _media_uri(
+        video_content(
+            _media_uri(
                 video_path,
                 client=client,
                 cache=cache,
                 mime_type=video_mime_type,
                 expected_sha256=video.content_sha256,
             ),
-            "resolution": video_resolution,
-        }
+            mime_type=video_mime_type,
+            resolution=video_resolution,
+            processing="agentic",
+        )
     )
     parts.append(
         {
@@ -1841,7 +1907,7 @@ def discover_reference_candidates(
         patience_seconds=300.0,
         generation_config={
             "thinking_level": "low",
-            "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "max_output_tokens": DISCOVERY_OUTPUT_TOKENS,
         },
         response_format=structured_json(_candidate_schema(selected)),
         ledger=ledger,
@@ -2929,11 +2995,7 @@ def decide_exact_frame_bboxes(
         evaluations=tuple(evaluations),
         minimum_matched_anchors=minimum_matched_anchors,
     )
-    usage = Usage(
-        input_tokens=sum(item.input_tokens for item in usages),
-        output_tokens=sum(item.output_tokens for item in usages),
-        thought_tokens=sum(item.thought_tokens for item in usages),
-    )
+    usage = Usage.total(usages)
     return result, usage
 
 
@@ -3769,8 +3831,4 @@ def decide_cross_asset_exact_frame_bboxes(
         outcomes=tuple(final),
         protocol_failures=tuple(protocol_failures),
     )
-    return result, Usage(
-        input_tokens=sum(usage.input_tokens for usage in usages),
-        output_tokens=sum(usage.output_tokens for usage in usages),
-        thought_tokens=sum(usage.thought_tokens for usage in usages),
-    )
+    return result, Usage.total(usages)

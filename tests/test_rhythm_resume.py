@@ -187,6 +187,36 @@ def test_exact_rhythm_is_not_locally_desynchronised():
     assert all(clip.music_sync.cut_on_beat for clip in fitted.clips)
 
 
+def test_natural_short_range_draft_does_not_buy_another_stretch(tmp_path):
+    from montagewright.planner import decide_rhythm
+    from montagewright.grounding import ground_timeline
+
+    requests = []
+    class Client:
+        @property
+        def interactions(self):
+            return self
+        def create(self, **request):
+            requests.append(request)
+            return type("Reply", (), {
+                "status": "completed", "usage": {},
+                "output_text": json.dumps({"music_from_seconds": "0:00", "decisions": [
+                    {"clip_id": key, "cut_on_beat": False, "hold_seconds": "0:03", "rhythm_reason": "完整的動作"}
+                    for key in ("k00", "k01")
+                ]}),
+            })()
+
+    kwargs = dict(intent="test", target_seconds=60, duration_mode="range",
+                  minimum_seconds=58, maximum_seconds=62, client=Client(), artifact_dir=tmp_path)
+    draft, _ = decide_rhythm(_edl(), None, **kwargs)
+    assert len(requests) == 1
+    assert ground_timeline(draft, None).duration_seconds == 6
+    assert any("below the allowed minimum" in fault for fault in draft.plan_disagreements)
+    remembered, _ = decide_rhythm(_edl(), None, **kwargs)
+    assert len(requests) == 1
+    assert remembered == draft
+
+
 def test_locked_grid_restores_section_labels_so_sync_to_resolves(tmp_path):
     # The reviewed-delivery grid stores cues as opaque "locked-cue-00042" ids
     # but keeps a readable label per section. sync_to("section_001") must

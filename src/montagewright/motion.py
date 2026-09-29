@@ -1,11 +1,11 @@
 """Where the camera moved, measured rather than watched.
 
-Gemini reads video at a frame a second. Camera shake happens between frames,
-so at that rate a handheld take and a locked-off one are the same thing: a
-series of individually sharp stills that differ a little. Asked whether a
-clip is stable, it answered "固定鏡頭…畫面穩定清晰" about a take whose first
-three seconds are the operator still finding the frame -- not carelessly, but
-because the question cannot be answered from what it was given.
+Sparse video browsing can miss camera shake between sampled frames, so a
+handheld take and a locked-off one may look like the same series of sharp
+stills. Asked whether a clip was stable, the model once answered
+"固定鏡頭…畫面穩定清晰" about a take whose first three seconds were the operator
+finding the frame. Static 4/8 FPS improves what it can inspect; local geometry
+still supplies the reproducible measurement.
 
 That is a measurement, and this measures it. Nothing here decides whether a
 stretch is worth using: it says the camera moved, roughly how much, and when
@@ -42,6 +42,7 @@ model is told it can see this one for itself.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -51,9 +52,12 @@ from pathlib import Path
 # rate.
 COARSE_FPS = 4.0
 
-# Width to analyse at. Global motion is a whole-frame property and survives
-# scaling; the cost does not.
+# The deterministic fallback stays deliberately tiny. Affine tracking below
+# uses a denser image so background features remain distinct.
 WIDTH = 192
+HEIGHT = 108
+AFFINE_WIDTH = 384
+AFFINE_HEIGHT = 216
 
 # Movement below this, as a fraction of frame width per second, is a still
 # camera. Sensor noise and compression alone put a floor under any measure.
@@ -71,28 +75,17 @@ MOVING = 0.02
 # state it was added for could never occur.
 NOT_A_SHIFT = 15.0
 
-# What the model can see. It reads video at a frame a second -- measured, not
-# assumed: the same clip sent with `fps: 4` and with nothing came back at an
-# identical 722 input tokens, so the Interactions API ignores the hint rather
-# than refusing it.
-#
-# A movement shorter than this can fall entirely between two of its frames.
-# Splitting it out anyway produces an interval the model has no picture of,
-# asks what it meant, and is told -- correctly -- that it cannot say. Two
-# rules then combine to delete footage: the honest answer is `unknown`, and
-# `unknown` earns no span. Three of sixteen moving stretches in a twenty-clip
-# sample were this short.
-SEEN_SECONDS = 1.0
-
 # Shortest stretch worth calling a state. Below it the reading is a flicker
-# in the measurement rather than a thing the camera did.
-LEAST_SECONDS = 0.5
+# in the measurement rather than a thing the camera did. Interactions static
+# 8 FPS can now inspect a sub-second event, so the old one-second visibility
+# floor is deliberately gone; one 4 FPS interval is the local evidence floor.
+LEAST_SECONDS = 0.25
 
 # What the reading means, in the cache key. A measurement is a fact about the
 # bytes, so it is content addressed and never recomputed -- which is right
 # until the measurement itself starts meaning something else, and then every
 # clip keeps answering the old question forever. Bump this when it does.
-READING = "v3-pyramid"
+READING = "v4-affine-background"
 
 
 @dataclass(frozen=True)
@@ -106,6 +99,14 @@ class MotionInterval:
     peak_vw_s: float    # fastest global shift, frame widths per second
     travel_vw: float    # total global shift across the interval
     settles: bool       # ends still, having been moving
+    motion_kind: str = "translation"
+    direction: str = ""
+    pan_vw_s: float = 0.0
+    tilt_vh_s: float = 0.0
+    zoom_rate_s: float = 0.0
+    rotation_deg_s: float = 0.0
+    confidence: float = 0.0
+    phase: str = ""
 
     @property
     def seconds(self) -> float:
@@ -121,7 +122,30 @@ def measure(source: Path, duration: float) -> list[MotionInterval]:
     seconds happened to fall there.
     """
 
-    shifts = _global_shift(source, COARSE_FPS)
+    affine = _global_affine(source, COARSE_FPS)
+    legacy = _global_shift(source, COARSE_FPS) if affine else None
+    # At very high translation speeds, adjacent frames share too few tracked
+    # corners for RANSAC consensus even though the coarse pyramid can still
+    # measure the global shift cleanly. Prefer that measured translation when
+    # at least a third of affine samples fail consensus and every pyramid
+    # sample remains explainable. This is a fallback between two local
+    # measurements, not a semantic guess.
+    low_consensus = sum(
+        one.residual >= NOT_A_SHIFT for one in (affine or ())
+    )
+    if (
+        affine and legacy
+        and low_consensus * 3 >= len(affine)
+        and all(residual < NOT_A_SHIFT for _, _, residual in legacy)
+    ):
+        affine = None
+    if affine:
+        shifts = [
+            (sample.at_seconds, sample.composite_speed, sample.residual)
+            for sample in affine
+        ]
+    else:
+        shifts = legacy or _global_shift(source, COARSE_FPS)
     if not shifts:
         return [
             MotionInterval(
@@ -130,10 +154,203 @@ def measure(source: Path, duration: float) -> list[MotionInterval]:
                 settles=False,
             )
         ]
-    return _into_intervals(shifts, duration)
+    intervals = _into_intervals(shifts, duration)
+    return _enrich_intervals(intervals, affine or ())
 
 
-HEIGHT = 108
+@dataclass(frozen=True)
+class AffineSample:
+    """One background-dominant camera-motion estimate between two frames."""
+
+    at_seconds: float
+    pan_vw_s: float
+    tilt_vh_s: float
+    zoom_rate_s: float
+    rotation_deg_s: float
+    inlier_ratio: float
+    residual: float
+
+    @property
+    def composite_speed(self) -> float:
+        # Express dissimilar transformations on one conservative movement
+        # scale used only for still/moving hysteresis. Components stay
+        # separate on the persisted interval and are never reconstructed
+        # from this score.
+        return max(
+            math.hypot(self.pan_vw_s, self.tilt_vh_s),
+            abs(self.zoom_rate_s) * 2.0,
+            abs(self.rotation_deg_s) / 45.0,
+        )
+
+
+def _global_affine(source: Path, fps: float) -> list[AffineSample] | None:
+    """Estimate translation, zoom and rotation from robust background tracks.
+
+    Features are spread across the whole frame and an affine transform is
+    fitted with RANSAC, so a walking foreground subject is normally rejected
+    as an outlier instead of being mistaken for a camera pan. OpenCV remains
+    an optional tracking dependency; installations without it retain the
+    deterministic pyramid-shift fallback below.
+    """
+
+    try:
+        import cv2  # type: ignore[import-not-found]
+        import numpy as np  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+
+    raw = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(source),
+            "-vf", (
+                f"fps={fps},scale={AFFINE_WIDTH}:{AFFINE_HEIGHT},format=gray"
+            ),
+            "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ],
+        capture_output=True, check=False,
+    ).stdout
+    size = AFFINE_WIDTH * AFFINE_HEIGHT
+    frames = [
+        np.frombuffer(raw[i * size:(i + 1) * size], dtype=np.uint8).reshape(
+            AFFINE_HEIGHT, AFFINE_WIDTH
+        )
+        for i in range(len(raw) // size)
+    ]
+    if len(frames) < 2:
+        return None
+
+    out: list[AffineSample] = []
+    for index, (before, after) in enumerate(zip(frames, frames[1:]), start=1):
+        points = cv2.goodFeaturesToTrack(
+            before, maxCorners=400, qualityLevel=0.01, minDistance=7,
+            blockSize=7,
+        )
+        if points is None or len(points) < 12:
+            return None
+        moved, status, _errors = cv2.calcOpticalFlowPyrLK(
+            before, after, points, None,
+            winSize=(21, 21), maxLevel=3,
+        )
+        if moved is None or status is None:
+            return None
+        good = status.reshape(-1).astype(bool)
+        starts = points.reshape(-1, 2)[good]
+        ends = moved.reshape(-1, 2)[good]
+        if len(starts) < 10:
+            return None
+        matrix, inliers = cv2.estimateAffinePartial2D(
+            starts, ends, method=cv2.RANSAC,
+            ransacReprojThreshold=2.5, maxIters=2000, confidence=0.995,
+        )
+        if matrix is None or inliers is None:
+            return None
+        ratio = float(inliers.reshape(-1).mean())
+        a, b, dx = (float(one) for one in matrix[0])
+        c, d, dy = (float(one) for one in matrix[1])
+        scale = math.sqrt(max(1e-12, a * a + c * c))
+        rotation = math.degrees(math.atan2(c, a))
+        agreed = inliers.reshape(-1).astype(bool)
+        homogeneous = np.column_stack(
+            [starts, np.ones(len(starts), dtype=np.float32)]
+        )
+        projected = homogeneous @ matrix.T
+        errors = np.linalg.norm(projected - ends, axis=1)
+        residual = float(np.median(errors[agreed])) if agreed.any() else 99.0
+        # A low-consensus transform is the least-bad explanation of local
+        # object motion, not camera geometry. Mark it as not-a-shift through
+        # the existing residual boundary.
+        if ratio < 0.35:
+            residual = max(residual, NOT_A_SHIFT + 1.0)
+        out.append(
+            AffineSample(
+                at_seconds=index / fps,
+                pan_vw_s=dx / AFFINE_WIDTH * fps,
+                tilt_vh_s=dy / AFFINE_HEIGHT * fps,
+                zoom_rate_s=(scale - 1.0) * fps,
+                rotation_deg_s=rotation * fps,
+                inlier_ratio=ratio,
+                residual=residual,
+            )
+        )
+    return out
+
+
+def _enrich_intervals(
+    intervals: list[MotionInterval], samples: "tuple[AffineSample, ...] | list[AffineSample]",
+) -> list[MotionInterval]:
+    """Attach decomposed affine facts to the existing temporal intervals."""
+
+    if not samples:
+        return intervals
+    enriched: list[MotionInterval] = []
+    previous_moving = False
+    for interval in intervals:
+        within = [
+            one for one in samples
+            if interval.starts_seconds <= one.at_seconds < interval.ends_seconds
+        ]
+        if not within:
+            enriched.append(interval)
+            previous_moving = interval.state == "moving"
+            continue
+        pan = max(within, key=lambda one: abs(one.pan_vw_s)).pan_vw_s
+        tilt = max(within, key=lambda one: abs(one.tilt_vh_s)).tilt_vh_s
+        zoom = max(within, key=lambda one: abs(one.zoom_rate_s)).zoom_rate_s
+        rotation = max(
+            within, key=lambda one: abs(one.rotation_deg_s)
+        ).rotation_deg_s
+        translation_speeds = [
+            math.hypot(one.pan_vw_s, one.tilt_vh_s) for one in within
+        ]
+        magnitudes = {
+            "translation": math.hypot(pan, tilt),
+            "zoom": abs(zoom) * 2.0,
+            "rotation": abs(rotation) / 45.0,
+        }
+        kind = max(magnitudes, key=magnitudes.get)
+        direction = ""
+        if kind == "translation":
+            if abs(pan) >= abs(tilt):
+                direction = "right" if pan > 0 else "left"
+            else:
+                direction = "down" if tilt > 0 else "up"
+        elif kind == "zoom":
+            direction = "push_in" if zoom > 0 else "pull_out"
+        elif kind == "rotation":
+            direction = "clockwise" if rotation > 0 else "counterclockwise"
+        phase = (
+            "movement_to_settle" if interval.state == "moving" and interval.settles
+            else "movement" if interval.state == "moving"
+            else "settled" if previous_moving and interval.state == "still"
+            else "hold" if interval.state == "still"
+            else "complex_change"
+        )
+        enriched.append(
+            MotionInterval(
+                **{
+                    **asdict(interval),
+                    # Preserve the historic meaning of these compatibility
+                    # fields: translation in frame widths, never the affine
+                    # classifier's mixed movement score.
+                    "peak_vw_s": round(max(translation_speeds), 4),
+                    "travel_vw": round(
+                        sum(translation_speeds) / max(COARSE_FPS, 1e-6), 4
+                    ),
+                    "motion_kind": kind,
+                    "direction": direction,
+                    "pan_vw_s": round(pan, 4),
+                    "tilt_vh_s": round(tilt, 4),
+                    "zoom_rate_s": round(zoom, 4),
+                    "rotation_deg_s": round(rotation, 3),
+                    "confidence": round(
+                        sum(one.inlier_ratio for one in within) / len(within), 3
+                    ),
+                    "phase": phase,
+                }
+            )
+        )
+        previous_moving = interval.state == "moving"
+    return enriched
 
 
 # How much of the two frames must still overlap for a comparison between
@@ -360,28 +577,6 @@ def _into_intervals(
             joined.append(([*run], state))
     merged = [run for run, _ in joined]
 
-    # A movement too brief for the model to have seen belongs to whatever
-    # surrounds it. The measurement can resolve it and the question about it
-    # cannot be answered, so asking is how footage gets thrown away.
-    absorbed: list[list[tuple[float, str, float]]] = []
-    for run in merged:
-        state = max(set(one[1] for one in run), key=[o[1] for o in run].count)
-        span = run[-1][0] - run[0][0]
-        if absorbed and state == "moving" and span < SEEN_SECONDS:
-            absorbed[-1].extend(run)
-        else:
-            absorbed.append([*run])
-    # A clip that opens with a brief movement has nothing behind it to be
-    # absorbed into, and that is the commonest place for one -- the camera
-    # settling as the take begins.
-    if len(absorbed) > 1:
-        first = absorbed[0]
-        state = max(set(one[1] for one in first), key=[o[1] for o in first].count)
-        if state == "moving" and first[-1][0] - first[0][0] < SEEN_SECONDS:
-            absorbed[1][:0] = first
-            absorbed.pop(0)
-    merged = absorbed
-
     # Joining may have left neighbours agreeing again.
     joined = []
     for run in merged:
@@ -447,6 +642,8 @@ def travelled_between(
         if one.state == "not_a_shift":
             return None
         if one.state == "moving":
+            if getattr(one, "motion_kind", "translation") != "translation":
+                return None
             gone += one.travel_vw * shared / one.seconds
     return gone
 
@@ -461,7 +658,7 @@ def describe(intervals: list[MotionInterval]) -> str:
 
     if not intervals:
         return ""
-    lines = ["本機量到的攝影機運動（你看不到這個，因為影片是一秒一格給你的）："]
+    lines = ["本機量到的攝影機運動（用來補足模型動態瀏覽可能跳過的影格）："]
     for one in intervals:
         clock = f"{int(one.starts_seconds) // 60}:{one.starts_seconds % 60:04.1f}"
         until = f"{int(one.ends_seconds) // 60}:{one.ends_seconds % 60:04.1f}"
@@ -479,6 +676,18 @@ def describe(intervals: list[MotionInterval]) -> str:
                 f"整個畫面在位移（{how}，最快每秒 {one.peak_vw_s:.2f} 個畫面寬，"
                 f"總共移動約 {one.travel_vw:.2f} 個畫面寬）"
             )
+            if one.confidence > 0.0:
+                components = [
+                    f"類型={one.motion_kind}",
+                    f"方向={one.direction or 'none'}",
+                    f"pan={one.pan_vw_s:+.3f} 畫面寬/秒",
+                    f"tilt={one.tilt_vh_s:+.3f} 畫面高/秒",
+                    f"zoom={one.zoom_rate_s:+.3f}/秒",
+                    f"rotation={one.rotation_deg_s:+.2f}°/秒",
+                    f"背景共識={one.confidence:.0%}",
+                    f"階段={one.phase}",
+                ]
+                said += "；" + "，".join(components)
         else:
             said = {
                 "still": "整段畫面沒有位移",

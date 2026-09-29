@@ -170,6 +170,9 @@ class Segment:
     # Nothing sets this away from 1.0 yet: the plumbing is in place so the two
     # clocks can never be silently fused again once speed is exposed.
     speed_ratio: float = 1.0
+    canvas_mode: str = "fill"
+    transition_in: str = "cut"
+    transition_seconds: float = 0.4
 
     @property
     def duration_seconds(self) -> float:
@@ -361,7 +364,9 @@ def plan_render(
             clip, source, degradations, notes, speed=speed
         )
         crop = None
-        if path is not None:
+        if clip.canvas_mode == "fit":
+            path = None
+        elif path is not None:
             # A followed subject supersedes the coarse anchor: the path was
             # built from where the subject actually was, not from a nine-box
             # guess. `crop` keeps the opening position so a caller reading one
@@ -378,6 +383,9 @@ def plan_render(
                 in_seconds=in_seconds,
                 out_seconds=out_seconds,
                 speed_ratio=speed,
+                canvas_mode=clip.canvas_mode,
+                transition_in=clip.transition_in,
+                transition_seconds=clip.transition_seconds,
                 crop=crop,
                 crop_path=path,
                 audio_role=clip.audio_role,

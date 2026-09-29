@@ -17,6 +17,7 @@ takes the run down instead of the server.
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import re
@@ -66,7 +67,7 @@ _USER_RUNS_ROOT = Path.home() / ".cache" / "montagewright" / "runs"
 _PROJECT_RUNS_ROOT = Path.cwd() / "artifacts" / "web-runs"
 _CONFIGURED_RUNS_ROOT = os.environ.get("MONTAGEWRIGHT_RUNS", "").strip()
 RUNS_ROOT = (
-    Path(_CONFIGURED_RUNS_ROOT).expanduser()
+    Path(_CONFIGURED_RUNS_ROOT).expanduser().resolve()
     if _CONFIGURED_RUNS_ROOT
     else _PROJECT_RUNS_ROOT
     if (Path.cwd() / "pyproject.toml").is_file()
@@ -511,7 +512,7 @@ def _state_of_a_foreign_run(out: Path) -> str:
         except (ProcessLookupError, TypeError, ValueError):
             return "interrupted"
         return "running"
-    if state in {"done", "failed", "stopped"}:
+    if state in {"done", "failed", "stopped", "budget_paused", "grounding_blocked"}:
         return state
     return "done" if (out / "report.json").exists() else "interrupted"
 
@@ -611,7 +612,7 @@ def _collect(run: Run) -> None:
         if text:
             run.lines.append(text)
     run.returncode = run.process.wait()
-    run.state = "done" if run.returncode == 0 else "failed"
+    run.state = "grounding_blocked" if run.returncode == 78 else "budget_paused" if run.returncode == 75 else ("done" if run.returncode == 0 else "failed")
     run.remember()
 
 
@@ -1197,7 +1198,7 @@ def _subtitle_lines(run, *, edits: bool = True) -> "list":
     re-deriving a line somebody had already fixed.
     """
 
-    from montagewright.transcript import Line, against_audio_assignments, against_cut
+    from montagewright.transcript import CharacterTiming, Line, against_audio_assignments, against_cut
 
     edited = run.output / "work" / "subtitles.json"
     if edits and edited.exists():
@@ -1220,6 +1221,7 @@ def _subtitle_lines(run, *, edits: bool = True) -> "list":
                         one.get("timing_confidence", "unverified")
                     ),
                     timing_locked=bool(one.get("timing_locked", False)),
+                    timed_text=tuple(CharacterTiming(**mark) for mark in one.get("timed_text", [])),
                 )
                 for one in saved
             ]
@@ -1842,13 +1844,15 @@ def create_app() -> FastAPI:
         loaded_job_path: str = Form(""),
         base_run_id: str = Form(""),
         inherit_brief: bool = Form(False),
-        aspect: str = Form("9:16"),
+        aspect: str = Form("auto"),
         seconds: float = Form(0.0),
-        duration_mode: str = Form("preferred"),
+        duration_mode: str = Form("approx"),
         minimum_seconds: float | None = Form(None),
         maximum_seconds: float | None = Form(None),
         delivery_variants_json: str = Form("[]"),
         budget: float = Form(6.0),
+        target_budget: float | None = Form(None),
+        mode: str = Form("edit"),
         review: bool = Form(True),
         preflight_only: bool = Form(False),
         timeline: str = Form("none"),
@@ -1858,20 +1862,22 @@ def create_app() -> FastAPI:
         subtitle_font: str = Form(""),
         locale: str = Form("zh-TW"),
     ) -> JSONResponse:
-        if aspect not in ASPECTS:
+        if aspect not in {"auto", *ASPECTS}:
             raise HTTPException(
                 400, f"aspect must be one of {sorted(ASPECTS)}"
             )
-        if duration_mode not in {"exact", "range", "preferred"}:
-            raise HTTPException(400, "duration_mode must be exact, range or preferred")
+        if duration_mode not in {"approx", "at_most", "exact", "range", "preferred"}:
+            raise HTTPException(400, "unknown duration_mode")
+        if duration_mode == "at_most" and seconds <= 0:
+            raise HTTPException(400, "at_most duration requires positive seconds")
         if duration_mode == "exact" and seconds <= 0:
             raise HTTPException(400, "exact duration requires seconds greater than zero")
         if duration_mode == "range" and (
             minimum_seconds is None
             or maximum_seconds is None
-            or minimum_seconds <= 0
+            or minimum_seconds < 0
             or maximum_seconds <= 0
-            or minimum_seconds > maximum_seconds
+            or minimum_seconds >= maximum_seconds
         ):
             raise HTTPException(
                 400,
@@ -2336,7 +2342,7 @@ def create_app() -> FastAPI:
                     ),
                     seconds=seconds,
                     duration_mode=cast(
-                        Literal["exact", "range", "preferred"],
+                        Literal["approx", "at_most", "exact", "range", "preferred"],
                         duration_mode if seconds > 0 else "preferred",
                     ),
                     minimum_seconds=minimum_seconds,
@@ -2360,7 +2366,8 @@ def create_app() -> FastAPI:
                 ),
                 subject=subject,
                 obligations=picture_obligations,
-                run=RunPolicy(budget_usd=budget, review=review),
+                run=RunPolicy(budget_usd=budget, review=review,
+                              target_budget_usd=target_budget, mode=mode),
             )
             # Loading a work order and pressing Start must not rebuild a
             # smaller one. Keep every advanced contract which has no simple
@@ -2416,9 +2423,9 @@ def create_app() -> FastAPI:
                         **web_job.delivery.model_dump(mode="json"),
                         "aspect": raw_delivery.get("aspect", web_job.delivery.aspect),
                         "seconds": float(raw_delivery.get("seconds") or 0.0),
-                        "duration_mode": raw_delivery.get("duration_mode", "preferred"),
-                        "minimum_seconds": None,
-                        "maximum_seconds": None,
+                        "duration_mode": raw_delivery.get("duration_mode", "approx"),
+                        "minimum_seconds": raw_delivery.get("minimum_seconds"),
+                        "maximum_seconds": raw_delivery.get("maximum_seconds"),
                     })
                     variants.append(DeliveryVariant(
                         variant_id=str(raw_variant.get("variant_id") or "").strip(),
@@ -2812,6 +2819,9 @@ def create_app() -> FastAPI:
             except (OSError, ValueError) as error:
                 print(f"timeline-data: unreadable crops.json ({error})", True)
 
+        if current_blocks and all(one.get("canvas_mode") == "fit" for one in current_blocks):
+            crops = {f"k{index:02d}": [] for index in range(len(current_blocks))}
+            recorded = True  # explicitly recorded full-frame placement has no crop boxes
         try:
             if crops:
                 raise _AlreadyHave
@@ -2894,6 +2904,9 @@ def create_app() -> FastAPI:
                 # it "it followed the subject" is a claim in a report; with
                 # it you can watch the box move over the original.
                 "crop": crops.get(key, []),
+                "canvas_mode": (current_blocks[index] if current_blocks else shot).get("canvas_mode", "fill"),
+                "transition_in": (current_blocks[index] if current_blocks else shot).get("transition_in", "cut"),
+                "transition_seconds": (current_blocks[index] if current_blocks else shot).get("transition_seconds", 0.4),
                 "source_id": source_id,
                 # Keep the exact frame-derived clock. Rounding every block
                 # independently makes the Web reel drift from the CFR film
@@ -3090,6 +3103,7 @@ def create_app() -> FastAPI:
         """
 
         from montagewright.clipcard import card_map
+        from montagewright.spans import seconds_of
         from montagewright.executor import allocate_timeline_frames, plan_render
         from montagewright.pipeline import (
             Report, follow_subjects, probe, read_crops,
@@ -3148,6 +3162,9 @@ def create_app() -> FastAPI:
                 clip_id=f"k{index:02d}", source_id=source_id,
                 approx_in_seconds=start,
                 approx_out_seconds=start + float(entry["seconds"]),
+                canvas_mode=entry.get("canvas_mode", plan.get("canvas_mode", "fill")),
+                transition_in=entry.get("transition_in", plan.get("transition_in", "cut")),
+                transition_seconds=seconds_of(entry.get("transition_seconds", plan.get("transition_seconds", 0.4))) or 0.4,
                 speed=speed,
                 in_looks_like=subject_of(plan),
                 energy_intent=plan.get("energy", "medium"),
@@ -3498,6 +3515,9 @@ def create_app() -> FastAPI:
                 "shots": [
                     {
                         "selection_index": int(wanted[index]["index"]),
+                        "canvas_mode": segment.canvas_mode,
+                        "transition_in": segment.transition_in,
+                        "transition_seconds": segment.transition_seconds,
                         "in_seconds": segment.in_seconds,
                         "start_frame": start,
                         "frame_count": end - start,
@@ -3647,6 +3667,35 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "no such run")
         return run
 
+    @app.get("/api/runs/{run_id}/proposal")
+    def proposal(run_id: str):
+        path = _run(run_id).output / "proposal.md"
+        if not path.exists():
+            raise HTTPException(404, "proposal not ready")
+        return FileResponse(path, media_type="text/markdown", filename="proposal.md")
+
+    @app.get("/api/runs/{run_id}/editor-context")
+    def editor_context(run_id: str):
+        from montagewright.checkpoints import read_json
+        root = _run(run_id).output / "work" / "editor"
+        current = read_json(root / "current.json") or {}
+        revision = str(current.get("revision", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", revision):
+            raise HTTPException(404, "editor context not ready")
+        context = read_json(root / "revisions" / revision / "context.json")
+        last = read_json(root / "last-render.json")
+        return {"context": context, "last_render": last,
+                "events": [read_json(path) for path in sorted((root / "revisions" / revision / "events").glob("*.json"))]}
+
+    @app.get("/api/runs/{run_id}/editor-preview/{revision}")
+    def editor_preview(run_id: str, revision: str):
+        if not re.fullmatch(r"[0-9a-f]{64}", revision):
+            raise HTTPException(404, "unknown revision")
+        path = _run(run_id).output / "work" / "editor" / "revisions" / revision / "preview.mp4"
+        if not path.exists():
+            raise HTTPException(404, "preview not ready")
+        return FileResponse(path, media_type="video/mp4")
+
     @app.get("/api/runs/{run_id}")
     def status(run_id: str, since: int = 0) -> JSONResponse:
         run = _catch_up(_run(run_id))
@@ -3657,6 +3706,10 @@ def create_app() -> FastAPI:
             "total_lines": len(run.lines),
             "report": run.report() if run.state != "running" else None,
             "has_video": (run.output / "preview.mp4").exists(),
+            "preflight_only": "--preflight-only" in run.command,
+            "has_editor_context": (run.output / "work" / "editor" / "current.json").exists(),
+            "has_proposal": (run.output / "proposal.md").exists(),
+            "proposal_only": (run.output / "proposal.md").exists() and not (run.output / "preview.mp4").exists(),
             # What this run was made from, so another round of the same
             # material does not have to be pointed at it again. Opening a
             # cut and asking for a new round is the ordinary way to try a
@@ -3863,7 +3916,8 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/runs/{run_id}/resume")
-    def resume(run_id: str) -> JSONResponse:
+    def resume(run_id: str, budget: float | None = Form(None),
+               mode: str | None = Form(None)) -> JSONResponse:
         """Run it again into the same place.
 
         Nothing already paid for is paid for twice: the cards, transcripts,
@@ -3892,6 +3946,14 @@ def create_app() -> FastAPI:
             )
         if run.process is not None and run.process.poll() is None:
             raise HTTPException(409, "it is still going")
+        if budget is not None and (not math.isfinite(budget) or budget < 0):
+            raise HTTPException(400, "budget must be finite and non-negative")
+        if mode is not None and mode not in {"edit", "propose"}:
+            raise HTTPException(400, "mode must be edit or propose")
+        for flag, value in (("--budget", budget), ("--mode", mode)):
+            if value is not None:
+                # Last explicit override wins, both now and after restart.
+                run.command += [flag, str(value)]
         run.lines.append("— 續跑 —")
         run.state = "running"
         # Persistence is part of starting a run, not an afterthought.  The
@@ -5229,9 +5291,10 @@ def create_app() -> FastAPI:
             else ((1920, 1080) if aspect == "16:9" else (1080, 1920))
         )
         try:
-            timed = as_cues(
-                timed, aspect, width, height, words=_subtitle_words(run),
-            )
+            if not (run.output / "work" / "subtitles.json").exists():
+                timed = as_cues(
+                    timed, aspect, width, height, words=_subtitle_words(run),
+                )
         except NoFontHere:
             # Without a font there is nothing to measure against, and a long
             # cue in a file is better than no file.

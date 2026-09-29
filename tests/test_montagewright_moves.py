@@ -2296,12 +2296,10 @@ def test_every_paid_stage_checks_the_cap_before_spending() -> None:
 
     from montagewright import cli
 
-    source = inspect.getsource(cli.command_render)
-    # Each of these is a paid call site; each must be preceded by a check.
-    for call in ("transcribe(", "replan_shots("):
-        for match in re.finditer(re.escape(call), source):
-            before = source[max(0, match.start() - 700):match.start()]
-            assert "ledger.check()" in before, f"{call} spends unchecked"
+    from montagewright.planner import ask
+    source = inspect.getsource(ask)
+    assert source.index("ledger.reserve(") < source.index("interactions.create(")
+    assert source.index("return replay(saved)") < source.index("ledger.reserve(")
 
     # Inside the render, the subject pass is one call per shot, so a cap read
     # only between stages lets a whole plan through after it is reached.
@@ -2631,9 +2629,10 @@ def test_a_questionable_identity_shot_can_be_replaced_without_moving_beats() -> 
     assert "replacement: b.replacement || null" in page
 
     command = inspect.getsource(cli.command_render)
-    assert 'shot["identity_status"] = "needs_review"' in command
-    assert 'look["entity_id"] = "none"' in command
-    assert "needs_review for manual replacement" in command
+    # Automatic recovery must not use the manual editor's identity override.
+    assert 'look["entity_id"] = "none"' not in command
+    assert "selection = recover(selection, unproved.faults" in command
+    assert "restore_legacy_constraints(selection)" in command
 
 
 def test_a_degradation_is_shown_in_words_with_its_number() -> None:
@@ -6665,6 +6664,11 @@ def test_selected_window_reports_local_source_motion_separately_from_semantics()
         # crop should have reached its last landing by.
         "settles_at_seconds": 1.0,
         "event_ids": ["m00", "m01"],
+        "motion_kinds": ["translation"],
+        "peak_pan_frame_widths_per_second": 0.0,
+        "peak_tilt_frame_heights_per_second": 0.0,
+        "peak_zoom_rate_per_second": 0.0,
+        "peak_rotation_degrees_per_second": 0.0,
     }
 
 
@@ -6978,21 +6982,10 @@ def test_the_speed_a_pan_is_measured_at_is_the_speed_it_was_shot_at():
     assert (1.0 - SHARED) * COARSE_FPS == 2.0
 
 
-def test_a_movement_too_brief_for_the_model_to_see_is_not_split_out():
-    """Asking about something invisible is how footage gets deleted.
+def test_a_subsecond_movement_visible_to_static_sampling_is_kept():
+    """Static 8 FPS can inspect a brief measured movement agentic may skip."""
 
-    The measurement resolves a three-quarter-second movement; the model reads
-    video at a frame a second, so both of its sampled frames can fall either
-    side of one. Split out anyway, it becomes an interval with no picture
-    behind it, the honest answer is `unknown`, and `unknown` earns no span --
-    two reasonable rules combining to throw the take away.
-
-    That the model cannot be given a finer rate is measured rather than
-    assumed: the same clip sent with an fps hint and without came back at an
-    identical token count, so the Interactions API ignores it.
-    """
-
-    from montagewright.motion import SEEN_SECONDS, _into_intervals
+    from montagewright.motion import _into_intervals
 
     # Still, a blink of movement, still. At four samples a second.
     shifts = (
@@ -7001,7 +6994,7 @@ def test_a_movement_too_brief_for_the_model_to_see_is_not_split_out():
         + [(5.5 + i / 4, 0.001, 0.2) for i in range(1, 21)]
     )
     found = _into_intervals(shifts, 10.5)
-    assert [one.state for one in found] == ["still"], [
+    assert [one.state for one in found] == ["still", "moving", "still"], [
         (one.event_id, one.state, one.seconds) for one in found
     ]
 
@@ -7013,15 +7006,14 @@ def test_a_movement_too_brief_for_the_model_to_see_is_not_split_out():
     )
     assert "moving" in [one.state for one in _into_intervals(longer, 13.0)]
 
-    # And a clip that opens with a brief one has nothing behind it to be
-    # absorbed into, which is the commonest place for one.
+    # A brief opening settle is evidence too and must not be erased.
     opens = (
         [(i / 4, 0.30, 0.2) for i in range(1, 3)]
         + [(0.5 + i / 4, 0.001, 0.2) for i in range(1, 21)]
     )
-    assert [one.state for one in _into_intervals(opens, 5.5)] == ["still"]
-
-    assert SEEN_SECONDS == 1.0
+    assert [one.state for one in _into_intervals(opens, 5.5)] == [
+        "moving", "still",
+    ]
 
 
 def test_a_moment_inside_the_shot_can_be_put_on_the_beat():

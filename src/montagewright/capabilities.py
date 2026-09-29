@@ -61,6 +61,33 @@ CAMERA_INTENT_NAMES: tuple[str, ...] = tuple(
     name for name, _ in CAMERA_INTENTS
 )
 
+# A source move and a digital crop move are independent trajectories.  The
+# plan has to state how they compose or an authored pan can accidentally get
+# a second, unrelated pan laid over it.
+NATIVE_MOTION_POLICIES: tuple[tuple[str, str], ...] = (
+    ("preserve_native", "固定數位裁切，完整保留素材本身有意義的運鏡。"),
+    (
+        "follow_native",
+        "素材在跟拍；數位框只補償主體位置，不另外製造第二個運動。",
+    ),
+    (
+        "stabilize_then_reframe",
+        "開頭是找構圖或干擾；只使用停穩後的區間再重新構圖。",
+    ),
+    (
+        "add_digital_after_settle",
+        "先讓素材自己的運動完成並停穩，再開始一次數位運鏡。",
+    ),
+    (
+        "digital_forbidden",
+        "原生運動或可用時間無法安全合成，只能固定數位框。",
+    ),
+)
+
+NATIVE_MOTION_POLICY_NAMES: tuple[str, ...] = tuple(
+    name for name, _ in NATIVE_MOTION_POLICIES
+)
+
 # Compatibility for legacy cached answers and the renderer dispatch table.
 # New planning code must use CAMERA_INTENT_NAMES; unlike the removed
 # CAMERA_MOVES/MOVE_FLOORS table this carries no timing authority.
@@ -116,6 +143,14 @@ def describe_for_prompt() -> str:
         "",
         "本機會量落點後決定實際沿水平或垂直方向移動。不要填座標，也不要"
         "把原素材的運鏡和數位裁切混成一件事。",
+        "",
+        "每顆也必須選 `native_motion_policy`，明確說兩條運動如何合成：",
+    ]
+    lines.extend(f"- `{name}`：{when}" for name, when in NATIVE_MOTION_POLICIES)
+    lines += [
+        "`preserve_native` 只能搭配 use_source_motion；`follow_native` 只補償"
+        "跟拍主體；要新增數位運鏡時必須等原生運動停穩，否則選"
+        " digital_forbidden。",
         "",
         "本機負責的是：每個落點實際在畫面的哪個位置、鏡頭走多快、"
         "兩端跟中途各停多久才算真的停下來、以及走不完的時候照實回報。"

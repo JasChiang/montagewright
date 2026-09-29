@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from montagewright.capabilities import describe_limits_for_prompt
-from montagewright.gemini import structured_json
+from montagewright.gemini import structured_json, video_content
 from montagewright.cost import BudgetSpent, Ledger
 from montagewright.planner import ask
 from montagewright.schema import looks_of, move_of_shot, must_be_whole_of, DegradationStep, Issue, ReviewVerdict
@@ -146,6 +146,20 @@ def _what_happened_already(rounds: "list[Round] | None") -> str:
     return "\n".join(lines)
 
 
+def _identity_review_parts(grounding_spec: Any, client: Any, cache: Any) -> list[dict[str, Any]]:
+    if grounding_spec is None:
+        return []
+    from montagewright.reference_grounding import reference_prompt_parts
+
+    return [{"type": "text", "text": (
+        "以下是本片共用的身分證據與 scope。產品型號判斷必須比對這些參考圖，"
+        "不可用記憶中的外觀替影片改名。看不清或證據矛盾請標示未確認，"
+        "說明缺少哪個可見特徵；身分相符仍須獨立檢查裁切、可讀性與運鏡。"
+    )}] + reference_prompt_parts(
+        grounding_spec, client=client, cache=cache, resolution="high",
+    )
+
+
 def review_cut(
     preview: Path,
     *,
@@ -158,6 +172,10 @@ def review_cut(
     cache: Any = None,
     ledger: Ledger | None = None,
     model_id: str = MODEL_ID,
+    grounding_spec: Any = None,
+    complete_pass: bool = False,
+    editorial_decisions: list[dict] | None = None,
+    duration_contract: dict | None = None,
 ) -> ReviewVerdict:
     """One pass over a finished cut.
 
@@ -169,12 +187,31 @@ def review_cut(
     """
 
     if ledger is not None:
-        ledger.check()
+        pass  # ask() checks budget after durable response lookup.
 
     instruction = (PROMPTS / "review_zh-TW.txt").read_text(
         encoding="utf-8"
     ).replace("{limits}", describe_limits_for_prompt())
-    if wanted_seconds > 0 and delivered_seconds > 0:
+    if editorial_decisions:
+        instruction += ("\n目前剪輯決策如下，用來理解本版意圖，不是完成證據。初始創意定調可以經工具驗證後修訂，"
+                        "使用者 brief 的硬條件始終優先。fit 代表刻意保留原畫面並留白，9:16 比例本身不等於必須裁切填滿。"
+                        "仍須根據實際影片檢查主體、可讀性、節奏與聲音，不能因計畫聲稱做到就放行。\n"
+                        + json.dumps(editorial_decisions, ensure_ascii=False))
+    # Verify near-digital silence locally before asking for editorial audio
+    # judgments. This evidence prevents invented speech from driving recuts.
+    from montagewright.renderer import _peak
+    if preview.exists() and _peak(preview) <= -90:
+        instruction += "\n本機已量測此成片音軌為數位靜音（峰值低於 -90 dBFS）。不可聲稱聽到人聲或音樂；若需求需要聲音，仍應指出缺少聲音。"
+    if duration_contract:
+        instruction += (
+            "\n\n## 本機交付片長規格\n\n"
+            + json.dumps(duration_contract, ensure_ascii=False)
+            + f"\n實際成片 {delivered_seconds:.3f} 秒。range 在上下限內即可，不必硬湊中心；"
+            "低於下限只能作短版草稿並說明缺口，不能宣稱已符合片長。"
+            "不得以重複、拖慢或停格補秒數；素材不足時保留自然短版，不要求無限重看重剪。"
+            "首尾呼應或動作慢放必須有實際敘事功能，不能只相信計畫的理由。\n"
+        )
+    elif wanted_seconds > 0 and delivered_seconds > 0:
         off = delivered_seconds - wanted_seconds
         instruction += (
             f"\n\n## 長度\n\n這支片要 {wanted_seconds:.0f} 秒，"
@@ -187,6 +224,20 @@ def review_cut(
             )
             + "\n"
         )
+    approval_path = None
+    if ledger is not None and ledger.journal_path and preview.exists() and grounding_spec is None:
+        from montagewright.checkpoints import key_for, read_json
+        from montagewright.editor_workspace import decoded_digest
+        identity = {"version": "approved-cut-v1", "media": decoded_digest(preview),
+                    "instruction": instruction, "brief": brief, "direction": direction,
+                    "model": model_id, "complete_pass": complete_pass,
+                    "wanted_seconds": wanted_seconds, "delivered_seconds": delivered_seconds}
+        approval_path = Path(ledger.journal_path).parent / "work" / "approved-cuts" / (key_for(identity) + ".json")
+        saved = read_json(approval_path)
+        if saved:
+            print("review: reused approval for unchanged picture, sound and brief", flush=True)
+            return ReviewVerdict.model_validate(saved)
+
     if cache is None:
         uri = upload_now(preview, client).uri
     else:
@@ -200,12 +251,9 @@ def review_cut(
         input=[
         # The video first, the question after it: Google's guidance for a
         # single video is to put the text last.
-            {
-                "type": "video",
-                "mime_type": "video/mp4",
-                "uri": uri,
-                "resolution": "low",
-            },
+            video_content(uri, resolution="high" if complete_pass else "low",
+                          processing={"type": "static", "fps": 2.0} if complete_pass else "agentic"),
+            *_identity_review_parts(grounding_spec, client, cache),
             {
                 "type": "text",
                 "text": (
@@ -236,7 +284,11 @@ def review_cut(
     for issue in payload.get("issues") or []:
         if isinstance(issue, dict) and "at_seconds" in issue:
             issue["at_seconds"] = seconds_of(issue["at_seconds"])
-    return ReviewVerdict.model_validate(payload)
+    verdict = ReviewVerdict.model_validate(payload)
+    if approval_path is not None and verdict.verdict == "approve":
+        from montagewright.checkpoints import write_json
+        write_json(approval_path, verdict.model_dump(mode="json"))
+    return verdict
 
 
 def _shot_schema(clip_ids: list[str]) -> dict[str, Any]:
@@ -331,6 +383,8 @@ def review_shots(
     cache: Any = None,
     ledger: Ledger | None = None,
     model_id: str = MODEL_ID,
+    grounding_spec: Any = None,
+    _batch: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Check each rendered shot against the plan that asked for it.
 
@@ -352,8 +406,20 @@ def review_shots(
 
     if not segments:
         return {}
+    if _batch and len(segments) > 3:
+        # Stable small groups give ask() independent paid checkpoints. A
+        # replacement in k09 must not invalidate the verdicts for k00-k08.
+        combined = {}
+        keys = sorted(segments)
+        for offset in range(0, len(keys), 3):
+            combined.update(review_shots(
+                {key: segments[key] for key in keys[offset:offset+3]}, shots,
+                seconds=seconds, degradations=degradations, client=client,
+                brief=brief, cache=cache, ledger=ledger, model_id=model_id,
+                grounding_spec=grounding_spec, _batch=False))
+        return combined
     if ledger is not None:
-        ledger.check()
+        pass  # ask() checks budget after durable response lookup.
 
     by_clip: dict[str, list[DegradationStep]] = {}
     for step in degradations:
@@ -374,6 +440,7 @@ def review_shots(
         if f"k{index:02d}" in segments
     ]
     body: list[dict[str, Any]] = [{"type": "text", "text": instruction}]
+    body.extend(_identity_review_parts(grounding_spec, client, cache))
     for clip_id, shot in sent:
         plan = _describe_plan(
             shot, seconds.get(clip_id, 0.0), by_clip.get(clip_id, [])
@@ -385,12 +452,7 @@ def review_shots(
         else:
             uri, _ = cache.uri_for(path, client, mime_type="video/mp4")
         body.append(
-            {
-                "type": "video",
-                "mime_type": "video/mp4",
-                "uri": uri,
-                "resolution": "low",
-            }
+            video_content(uri, resolution="low", processing="agentic")
         )
 
     interaction = ask(
@@ -461,8 +523,8 @@ def should_continue(
     # budget one replan at a time.
     if len(rounds) >= MAX_ROUNDS:
         return False, f"reached the {MAX_ROUNDS}-round cap"
-    if ledger is not None and ledger.remaining_usd <= 0:
-        return False, "budget spent"
+    # The paid dispatcher enforces the cap after checking saved responses.
+    # Cached review/replan work must remain possible at zero balance.
     if len(rounds) >= 2:
         previous = set(rounds[-2].actionable)
         current = set(latest.actionable)

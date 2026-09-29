@@ -753,3 +753,25 @@ def test_web_subtitle_writers_respect_the_output_lease(tmp_path):
     finally:
         lease.release()
         web.RUNS.pop(run.run_id, None)
+
+
+def test_editor_context_and_revision_video_are_connected(tmp_path, monkeypatch):
+    from montagewright.checkpoints import write_json
+    rushes = tmp_path / 'rushes'
+    rushes.mkdir()
+    (rushes / 'take.mp4').touch()
+    monkeypatch.setattr(web, 'RUNS_ROOT', tmp_path / 'runs')
+    monkeypatch.setattr(web.subprocess, 'Popen', _FinishedProcess)
+    web.RUNS.clear()
+    client = TestClient(web.create_app())
+    run_id = client.post('/api/runs', data={'source_path': str(rushes), 'review': 'false'}).json()['run_id']
+    root = web.RUNS[run_id].output / 'work/editor'
+    revision = 'a' * 64
+    write_json(root / 'current.json', {'revision': revision})
+    write_json(root / 'revisions' / revision / 'context.json', {'brief': 'all three phones', 'materials': [{'source_id':'one'}]})
+    write_json(root / 'last-render.json', {'revision': revision, 'previous': None})
+    (root / 'revisions' / revision / 'preview.mp4').write_bytes(b'rendered-video')
+    assert client.get(f'/api/runs/{run_id}').json()['has_editor_context']
+    assert client.get(f'/api/runs/{run_id}/editor-context').json()['context']['brief'] == 'all three phones'
+    assert client.get(f'/api/runs/{run_id}/editor-preview/{revision}').content == b'rendered-video'
+    assert client.get(f'/api/runs/{run_id}/editor-preview/not-a-revision').status_code == 404

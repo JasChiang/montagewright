@@ -261,7 +261,12 @@ def _render_segment(
     # putting CFR after it made identical authored moves run at different
     # speeds for 24, 30 and 60 fps sources.
     filters: list[str] = [f"fps=fps={output_fps}:round=near"]
-    if segment.crop_path is not None and not segment.crop_path.is_static:
+    if segment.canvas_mode == "fit":
+        filters.extend([
+            f"scale={output_size[0]}:{output_size[1]}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+            f"pad={output_size[0]}:{output_size[1]}:(ow-iw)/2:(oh-ih)/2",
+        ])
+    elif segment.crop_path is not None and not segment.crop_path.is_static:
         # A following camera. The x expression is evaluated per frame, so the
         # motion lives in the same filter as the crop rather than in a
         # separate command stream.
@@ -282,7 +287,12 @@ def _render_segment(
     # editing timeline. Editorial times remain seconds; this is the single
     # boundary where they are quantised to deliverable frames.
     handle_filters = [f"fps=fps={output_fps}:round=near"]
-    if segment.crop_path is not None and not segment.crop_path.is_static:
+    if segment.canvas_mode == "fit":
+        handle_filters.extend([
+            f"scale={output_size[0]}:{output_size[1]}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+            f"pad={output_size[0]}:{output_size[1]}:(ow-iw)/2:(oh-ih)/2",
+        ])
+    elif segment.crop_path is not None and not segment.crop_path.is_static:
         handle_filters.extend(ffmpeg_crop_filters(
             segment.crop_path, source.width, source.height, output_size,
             output_fps=output_fps, clock_offset_seconds=head,
@@ -311,7 +321,9 @@ def _render_segment(
         handle_filters.extend(retime)
     if output_frames is not None:
         filters.extend([
-            "tpad=stop_mode=clone:stop_duration=1",
+            # Cover decoder/frame-grid rounding only, never a one-second
+            # freeze that could conceal missing source content.
+            "tpad=stop_mode=clone:stop=2",
             f"trim=end_frame={output_frames}",
             "setpts=PTS-STARTPTS",
         ])
@@ -370,6 +382,7 @@ def _render_segment(
         "-c:a", "aac", "-b:a", "192k",
         "-color_primaries", "bt709", "-color_trc", "bt709",
         "-colorspace", "bt709",
+        "-bsf:v", "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
         "-pix_fmt", "yuv420p", "-r", str(output_fps), "-fps_mode", "cfr",
     ]
     if output_frames is not None:
@@ -403,6 +416,7 @@ def _render_segment(
                 "-c:a", "aac", "-b:a", "192k",
                 "-color_primaries", "bt709", "-color_trc", "bt709",
                 "-colorspace", "bt709",
+        "-bsf:v", "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
                 "-pix_fmt", "yuv420p", "-r", str(output_fps),
                 "-fps_mode", "cfr",
             ]
@@ -864,6 +878,8 @@ def render(
         segment_paths.append((rendered, handles, segment.screen_duration_seconds))
 
     picture = _concat(segment_paths, output_dir / "picture.mp4", output_dir)
+    from montagewright.transitions import apply_transitions
+    picture = apply_transitions(plan, segment_paths, picture)
     mix_picture = picture
     if plan.audio_assignments:
         mix_picture = _lay_audio_assignments(

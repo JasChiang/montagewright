@@ -221,7 +221,9 @@ def technical_qc_faults(
             faults.append("master loudness could not be measured")
         else:
             integrated = float(matches[-1])
-            if abs(integrated - job.delivery.loudness_lufs) > 1.0:
+            from montagewright.renderer import _peak
+            digital_silence = integrated <= -69 and _peak(artifact) <= -90
+            if not digital_silence and abs(integrated - job.delivery.loudness_lufs) > 1.0:
                 faults.append(
                     f"master loudness {integrated:.1f} LUFS differs from "
                     f"{job.delivery.loudness_lufs:.1f} LUFS"

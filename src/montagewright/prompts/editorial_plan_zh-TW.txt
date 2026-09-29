@@ -37,6 +37,11 @@ continuity scene 中要檢查：景別變化是否足夠、180 度軸線、人�
 
 ## 具名動作、運鏡與變速
 
+- 純配樂產品展示有自己的內容任務：依畫面選 `music_montage`、`establishing`、`title_read` 或 `primary_action`。`illustrative_broll` 需要敘事音訊覆蓋；沒有敘事音訊時，它不能憑空支持整段展示時間。
+- 沒有額外動作或原生運鏡證據時，`music_montage` 每顆最多 4 秒、`establishing` 與 `primary_action` 最多 3 秒；`end_hold` 最多 1.5 秒。若素材與故事需要更長的凝視、情緒停頓或緩慢閱讀，可設 pacing_exception 並在 pacing_exception_reason 說明觀眾在等待或理解什麼；本機仍檢查來源長度與同步，實際節奏由成片審查裁決。需補足精確片長時新增不同且有內容的鏡頭，不要只為湊時長拉長結尾。具名動作可依本機列出的實際動作長度支持更長時間。
+- `primary_action` 的來源若列有具名動作，必須同時選有效 `action_id` 與 `action_treatment`；不能填 `none` 卻宣稱完成該動作。
+- `use_source_motion` 只適用 `authored` 或 `subject_follow`；`handheld_texture` 只是手持微動。數位運鏡的路程加上所有 looks 停留，必須容納在該鏡頭長度內。兩個落點選 `reveal` 或 `compare`，三個以上才選 `multi_stop`。
+
 - `complete_here` 必須完整看到本機列出的動作區間；`after_completion` 從結果開始；`intentional_cut` 必須真的與動作重疊並在完成前離開。
 - `speed` 是每螢幕秒讀多少來源秒。只有強調動作、壓縮過程或配合整體節奏時使用；不得用變速掩蓋不足的 handle 或不完整的動作。
 - camera intent 說觀眾感受到的目的：保持原生運鏡、跟隨、揭示、比較、推近、拉遠或逐站閱讀。本機量幾何、速度與裁切可行性；做不到就換來源或意圖。
@@ -54,3 +59,12 @@ continuity scene 中要檢查：景別變化是否足夠、180 度軸線、人�
 - 只能引用輸入列出的 span、action、audio、event 與 entity ID。
 - 看不清、聽不清、身份不確定、素材不足或工具做不到時明說，不要靠理由文字把不存在的畫面變成證據。
 - 片長區塊會明說是「精確交付規格」或「軟目標」。精確時必須在選鏡階段就規劃足夠內容；兩種都不可用重複、空停留或砍句補秒數。
+
+## 跨鏡頭轉場
+
+預設 `transition_in` 為 cut。必要時才選 dissolve 或 dip_black，`transition_seconds` 為 0.1–0.8 秒。第一顆只能 cut。轉場以原切點為中心，不改整體時間線或音訊。dissolve 僅用原速且兩側至少各有半個轉場長度的真實來源餘裕；speaker 嘴型同步鏡頭不可溶接。無餘裕用 cut 或 dip_black，不得補造來源。轉場不能取代合理的前後鏡頭關係。
+
+
+## 片長與素材不足
+
+片長區間由本機工作單決定，在區間內自然收尾，不必湊到中心值。沒有足夠內容時保留完整自然的短版，在 uncovered 說明缺少多少內容與原因；短版仍是未達交付片長的草稿。不得以重播同一段源畫面、拖慢播放或停格湊秒數。首尾呼應、對比重播、動作慢放必須服務具體敘事或可見細節，在 why／intentional_repeat_reason 說明；片長不足不能作為理由。

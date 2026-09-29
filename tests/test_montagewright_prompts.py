@@ -205,7 +205,8 @@ def test_the_second_listener_never_sees_the_first_ones_answer():
     source = inspect.getsource(transcript.describe)
     listening = source[source.index("listening = ask("):source.index("listened = _parse")]
     # The video goes to the first call and the recogniser's words do not.
-    assert '"type": "video"' in listening
+    assert "video_content(" in listening
+    assert "processing=static_video_processing(1.0)" in listening
     assert "hearing_zh-TW.txt" in listening
     assert "rough" not in listening
 
@@ -213,7 +214,7 @@ def test_the_second_listener_never_sees_the_first_ones_answer():
     # say was said by the first one.
     correcting = source[source.index("instruction = "):source.index("payload = _parse")]
     assert '"type": "video"' not in correcting
-    assert "uri" not in correcting
+    assert "video_content(uri" in correcting
     assert "rough" in correcting and "said_by_ear" in correcting
 
     # And the recogniser's clock reaches neither of them.
@@ -261,7 +262,7 @@ def test_the_correction_is_told_where_the_second_listener_is_wrong():
 
     assert "盲聽" in second
     assert "永遠不要為了跟它一致而刪掉重複的字" in second
-    assert "不要從它那裡引進辨識器完全沒有的整句話" in second
+    assert "而影片確實聽得見，應完整補回" in second
 
     # And the listening prompt fights for the disfluencies in the first place.
     heard = (PROMPTS / "hearing_zh-TW.txt").read_text(encoding="utf-8")
@@ -391,6 +392,7 @@ def test_the_card_version_moves_when_anything_about_the_card_moves():
     import json as _json
 
     from montagewright import clipcard
+    from montagewright.gemini import VIDEO_PROCESSING_POLICY_VERSION
     from montagewright.motion import READING
 
     was = clipcard.CARD_VERSION
@@ -400,14 +402,17 @@ def test_the_card_version_moves_when_anything_about_the_card_moves():
     # measurement it is shown means -- the card is answering all three.
     shape = _json.dumps(clipcard.card_schema(), sort_keys=True, ensure_ascii=False)
     prompt = (PROMPTS / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
-    expected = hashlib.sha256((shape + prompt + READING).encode("utf-8")).hexdigest()[:8]
+    expected = hashlib.sha256(
+        (shape + prompt + READING + VIDEO_PROCESSING_POLICY_VERSION + "full-source-static-v1").encode("utf-8")
+    ).hexdigest()[:8]
     assert was.endswith(expected)
 
     # A nested change moves it, which the old version could not see.
     deeper = _json.loads(shape)
     deeper["properties"]["segments"]["items"]["properties"]["status"]["enum"].append("maybe")
     moved = hashlib.sha256(
-        (_json.dumps(deeper, sort_keys=True, ensure_ascii=False) + prompt + READING)
+        (_json.dumps(deeper, sort_keys=True, ensure_ascii=False) + prompt + READING
+         + VIDEO_PROCESSING_POLICY_VERSION)
         .encode("utf-8")
     ).hexdigest()[:8]
     assert moved != expected

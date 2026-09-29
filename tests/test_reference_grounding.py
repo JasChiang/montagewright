@@ -263,6 +263,20 @@ def _candidate_payload(spec, video, *, lock_hash=None, end_ms=7_000):
     }
 
 
+def test_fractional_file_end_is_bounded_without_expanding_candidate_or_mutating_raw(tmp_path):
+    spec = _write_spec(tmp_path)
+    video = _video_lineage("a" * 64).model_copy(update={"duration_ms": 12_512})
+    payload = _candidate_payload(spec, video, end_ms=12_000)
+    payload["candidates"][0]["frame_exit_ms"] = 12_512
+    result = validate_candidate_payload(payload, spec=spec, video=video, target_ids=("target.primary",))
+    assert result.candidates[0].end_ms == result.candidates[0].frame_exit_ms == 12_000
+    assert payload["candidates"][0]["frame_exit_ms"] == 12_512
+    assert any("local timing normalization" in warning for warning in result.warnings)
+    payload["candidates"][0]["end_ms"] = 10_000
+    with pytest.raises(ReferenceGroundingError, match="frame_exit_ms"):
+        validate_candidate_payload(payload, spec=spec, video=video, target_ids=("target.primary",))
+
+
 def test_candidate_visibility_facts_are_categorical_and_bounded(tmp_path):
     spec = _write_spec(tmp_path)
     video = _video_lineage("a" * 64)
@@ -1516,7 +1530,8 @@ def test_exact_frame_output_budget_scales_for_multi_frame_answers():
     from montagewright.reference_grounding import exact_frame_output_budget
 
     assert exact_frame_output_budget(1) == 4096
-    assert exact_frame_output_budget(5) == 7424
+    assert exact_frame_output_budget(3) == 8192
+    assert exact_frame_output_budget(5) == 8192
     assert exact_frame_output_budget(8) == 11264
 
 

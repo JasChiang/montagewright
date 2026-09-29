@@ -563,7 +563,7 @@ def _afford(report: "Report") -> None:
     """
 
     if report.ledger is not None:
-        report.ledger.check()
+        pass  # Budget is checked at paid dispatch, after checkpoint lookup.
 
 
 def _charge(report: "Report", stage: str, usage: Usage) -> None:
@@ -596,6 +596,10 @@ def _source_motion_measurement(
             travel += float(interval.travel_vw) * overlap / seconds
             peak = max(peak, float(interval.peak_vw_s))
     states = tuple(dict.fromkeys(str(one.state) for one in selected))
+    motion_kinds = tuple(dict.fromkeys(
+        str(getattr(one, "motion_kind", "translation")) for one in selected
+        if str(one.state) == "moving"
+    ))
     # When the take's own move comes to rest, in shot time. The digital crop
     # should reach its last landing by then: a crop still travelling after the
     # source has locked off is a lone drift over a static plate, and a crop
@@ -615,6 +619,26 @@ def _source_motion_measurement(
         "moving": "moving" in states,
         "travel_frame_widths": round(travel, 4),
         "peak_frame_widths_per_second": round(peak, 4),
+        "motion_kinds": list(motion_kinds),
+        "peak_pan_frame_widths_per_second": round(max(
+            (abs(float(getattr(one, "pan_vw_s", 0.0))) for one in selected),
+            default=0.0,
+        ), 4),
+        "peak_tilt_frame_heights_per_second": round(max(
+            (abs(float(getattr(one, "tilt_vh_s", 0.0))) for one in selected),
+            default=0.0,
+        ), 4),
+        "peak_zoom_rate_per_second": round(max(
+            (abs(float(getattr(one, "zoom_rate_s", 0.0))) for one in selected),
+            default=0.0,
+        ), 4),
+        "peak_rotation_degrees_per_second": round(max(
+            (
+                abs(float(getattr(one, "rotation_deg_s", 0.0)))
+                for one in selected
+            ),
+            default=0.0,
+        ), 3),
         "settles": any(bool(one.settles) for one in selected),
         "settles_at_seconds": (
             round(settles_at, 4) if settles_at is not None else None
@@ -992,9 +1016,7 @@ def _native_motion_for(
     drift past the take's own settle can be seen.
     """
 
-    if reframe is None or reframe.source_motion_role not in {
-        "authored", "subject_follow",
-    }:
+    if reframe is None:
         return 0.0, None
     measured = _source_motion_measurement(
         (measurements or {}).get(clip.source_id, ()),
@@ -1003,9 +1025,18 @@ def _native_motion_for(
     )
     if not measured.get("available") or not measured.get("moving"):
         return 0.0, None
+    contributes_speed = reframe.source_motion_role in {
+        "authored", "subject_follow",
+    }
+    waits_for_settle = reframe.native_motion_policy in {
+        "stabilize_then_reframe", "add_digital_after_settle",
+    }
     return (
-        float(measured.get("peak_frame_widths_per_second") or 0.0),
-        measured.get("settles_at_seconds"),
+        (
+            float(measured.get("peak_frame_widths_per_second") or 0.0)
+            if contributes_speed else 0.0
+        ),
+        measured.get("settles_at_seconds") if waits_for_settle else None,
     )
 
 
@@ -2002,6 +2033,7 @@ def _reference_subject_samples(
         ExactFrameBBoxBatchResult,
         decide_exact_frame_bboxes,
         discover_reference_candidates,
+        grounding_escalation_for,
         inspect_video_lineage,
         materialize_frame_at_time,
     )
@@ -2012,6 +2044,7 @@ def _reference_subject_samples(
         _set_target_grounding(report, clip.clip_id, target_id, {
             "status": "local_geometry_unavailable",
             "reason": str(error)[:200],
+            "escalation": "manual_mask_review",
         })
         raise RuntimeError(
             f"{clip.clip_id}: reference-critical target {target_id} requires "
@@ -2087,6 +2120,9 @@ def _reference_subject_samples(
                     )
                 except ReferenceShotUnusable as unusable:
                     grounding_record["fallback_reason"] = str(unusable)[:200]
+                    grounding_record["escalation"] = grounding_escalation_for(
+                        matched_anchors=1, sam_failed=True
+                    )
                     _set_target_grounding(
                         report, clip.clip_id, target_id, grounding_record
                     )
@@ -2097,6 +2133,9 @@ def _reference_subject_samples(
                         f"{type(error).__name__}: {error}"
                     )[:200]
                     grounding_record["fallback_reason"] = reason
+                    grounding_record["escalation"] = grounding_escalation_for(
+                        matched_anchors=1, sam_failed=True
+                    )
                     _set_target_grounding(
                         report, clip.clip_id, target_id, grounding_record
                     )
@@ -2117,6 +2156,7 @@ def _reference_subject_samples(
                 "seeded_inside_cut": bool(inside),
                 "validation_mode": "multi_anchor_fallback",
                 "fallback_reason": fallback_reason,
+                "escalation": "shot_local_exact_bbox",
             })
             try:
                 return _geometry_from_confirmed(
@@ -2316,6 +2356,11 @@ def _reference_subject_samples(
         _set_target_grounding(report, clip.clip_id, target_id, {
             "status": "identity_unverified",
             "matched_anchors": batch.matched_anchor_count,
+            "escalation": grounding_escalation_for(
+                matched_anchors=batch.matched_anchor_count,
+                sam_failed=True,
+                shot_local_attempted=True,
+            ),
         })
         return [], [], ()
 
@@ -2366,6 +2411,16 @@ def _reference_subject_samples(
         _set_target_grounding(report, clip.clip_id, target_id, {
             "status": "local_geometry_failed",
             "reason": type(error).__name__,
+            "escalation": grounding_escalation_for(
+                matched_anchors=len(anchors),
+                sam_failed=True,
+                crowded_or_occluded=any(
+                    evaluation.decision.excluded_instances
+                    or evaluation.decision.occlusion_state in {"minor", "major"}
+                    for evaluation in matched
+                ),
+                shot_local_attempted=True,
+            ),
         })
         raise ReferenceGeometryUnavailable(
             clip.clip_id, target_id,
@@ -2387,6 +2442,16 @@ def _reference_subject_samples(
             "anchors_agreed": states.get("_anchors_agreed"),
             "anchors_offered": states.get("_anchors_offered"),
             "best_agreement_pct": states.get("_best_agreement_pct"),
+            "escalation": grounding_escalation_for(
+                matched_anchors=len(anchors),
+                sam_failed=True,
+                crowded_or_occluded=any(
+                    evaluation.decision.excluded_instances
+                    or evaluation.decision.occlusion_state in {"minor", "major"}
+                    for evaluation in matched
+                ),
+                shot_local_attempted=True,
+            ),
         })
         if states.get("identity_unverified"):
             raise ReferenceGeometryUnavailable(
@@ -2565,6 +2630,16 @@ def follow_subjects(
         total = len(edl.clips)
         for index, clip in enumerate(edl.clips, start=1):
             reframe = clip.reframe
+            if clip.canvas_mode == "fit":
+                # Fit displays the full source. A proof for a smaller crop
+                # cannot certify identities or exclusions in this full frame.
+                report.static_shots += 1
+                if grounding_spec is not None or forbidden_obligations:
+                    report.note_release_faults("full-frame identity", [
+                        f"{clip.clip_id}: fit requires full-frame identity/exclusion evidence; "
+                        "the existing crop-based proof is not sufficient. Choose a validated fill treatment or review this draft."
+                    ])
+                continue
             if reframe is None:
                 continue
             try:
@@ -3736,7 +3811,7 @@ def run(
     authored_split_edl = edl
     if decide_rhythm_first:
         if ledger is not None:
-            ledger.check()
+            pass  # Budget is checked at paid dispatch, after checkpoint lookup.
         edl, usage = decide_rhythm(
             edl,
             grid,
@@ -4055,6 +4130,9 @@ def run(
         "shots": [
             {
                 "selection_index": index,
+                "canvas_mode": segment.canvas_mode,
+                "transition_in": segment.transition_in,
+                "transition_seconds": segment.transition_seconds,
                 "in_seconds": segment.in_seconds,
                 "start_frame": start,
                 "frame_count": end - start,

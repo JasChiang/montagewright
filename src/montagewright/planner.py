@@ -19,6 +19,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -27,11 +28,12 @@ from montagewright.schema import camera_intent_of, looks_of, move_of_shot
 from montagewright.capabilities import (
     CAMERA_INTENT_NAMES,
     INTENT_NAMES,
+    NATIVE_MOTION_POLICY_NAMES,
     describe_for_prompt,
     describe_limits_for_prompt,
 )
 from montagewright.grounding import BeatGrid
-from montagewright.gemini import structured_json
+from montagewright.gemini import structured_json, video_content
 from montagewright.uploads import UploadCache, upload_now
 from montagewright.schema import EDL, Clip, MusicSync
 
@@ -51,18 +53,15 @@ def _http_options(types):
         timeout=REQUEST_TIMEOUT_MS,
         retry_options=types.HttpRetryOptions(attempts=1),
     )
-MODEL_ID = "gemini-3.7-flash"
-# The whole pipeline runs on 3.7. The scoped Selection repair -- the one
-# planning call that re-attaches the File API clips after the first answer --
-# briefly used 3.6 because 3.7 was rejecting video attachments for this
-# project, which turned out to be a transient fault. It is back on 3.7 so the
-# pipeline is one model; the override stays only as an escape hatch if that
-# rejection ever recurs.
+MODEL_ID = os.environ.get("MONTAGEWRIGHT_GEMINI_MODEL", "gemini-3.8-flash")
+# The whole pipeline defaults to Google's current stable Flash endpoint. The
+# scoped Selection repair -- the one planning call that can use a different
+# model after the first answer -- keeps an override only as an escape hatch.
 SELECTION_PATCH_MODEL_ID = os.environ.get(
     "MONTAGEWRIGHT_SELECTION_PATCH_MODEL", MODEL_ID
 )
 
-# 3.7 Flash does not use custom sampling knobs, so consistency comes from the
+# Flash does not use custom generation sampling knobs, so consistency comes from
 # response schema and the instructions rather than from temperature.
 THINKING_HIGH = "high"
 SERVER_ERROR_ATTEMPTS = 2
@@ -126,16 +125,44 @@ class Usage:
     input_tokens: int
     output_tokens: int
     thought_tokens: int
+    tool_use_tokens: int = 0
+    processing_calls: int = 0
+    processing_results: int = 0
+
+    @classmethod
+    def total(cls, usages: Iterable["Usage"]) -> "Usage":
+        items = tuple(usages)
+        return cls(
+            input_tokens=sum(one.input_tokens for one in items),
+            output_tokens=sum(one.output_tokens for one in items),
+            thought_tokens=sum(one.thought_tokens for one in items),
+            tool_use_tokens=sum(one.tool_use_tokens for one in items),
+            processing_calls=sum(one.processing_calls for one in items),
+            processing_results=sum(one.processing_results for one in items),
+        )
 
     @classmethod
     def from_interaction(cls, interaction: Any) -> "Usage":
         usage = getattr(interaction, "usage", None) or {}
         if not isinstance(usage, dict):
             usage = getattr(usage, "__dict__", {}) or {}
+        step_types = []
+        for step in getattr(interaction, "steps", None) or ():
+            if isinstance(step, dict):
+                kind = step.get("type")
+            else:
+                kind = getattr(step, "type", None)
+                enum_value = getattr(kind, "value", None)
+                if enum_value is not None:
+                    kind = enum_value
+            step_types.append(str(kind or ""))
         return cls(
             input_tokens=int(usage.get("total_input_tokens") or 0),
             output_tokens=int(usage.get("total_output_tokens") or 0),
             thought_tokens=int(usage.get("total_thought_tokens") or 0),
+            tool_use_tokens=int(usage.get("total_tool_use_tokens") or 0),
+            processing_calls=step_types.count("processing_call"),
+            processing_results=step_types.count("processing_result"),
         )
 
 
@@ -527,6 +554,7 @@ def ask(
     client: Any,
     *,
     patience_seconds: float | None = None,
+    max_attempts: int | None = None,
     ledger: Any | None = None,
     budget_stage: str | None = None,
     upload_cache: Any | None = None,
@@ -558,6 +586,23 @@ def ask(
 
     from montagewright.cost import BudgetSpent
 
+    from montagewright.checkpoints import (
+        response_path, read_json, write_json, capture, settle_saved, replay,
+    )
+    checkpoint = response_path(ledger, budget_stage or "unknown", request, upload_cache)
+    if checkpoint is not None:
+        saved = read_json(checkpoint)
+        if saved is not None:
+            if ledger is not None:
+                ledger.completion_reserve.pop(budget_stage, None)
+            settle_saved(ledger, checkpoint, saved)
+            print(f"{budget_stage}: reused paid response checkpoint", flush=True)
+            return replay(saved)
+
+    attempts = SERVER_ERROR_ATTEMPTS if max_attempts is None else int(max_attempts)
+    if attempts < 1:
+        raise ValueError("max_attempts must be at least one")
+
     if patience_seconds is not None:
         request["timeout"] = float(patience_seconds)
     reservation_id = None
@@ -583,10 +628,17 @@ def ask(
         )
     interaction = None
     refreshed_media = False
-    for attempt in range(SERVER_ERROR_ATTEMPTS):
+    for attempt in range(attempts):
         try:
             interaction = _asked(client).interactions.create(**request)
             break
+        except (KeyboardInterrupt, SystemExit):
+            # A local stop does not prove the provider stopped before billing.
+            if ledger is not None and budget_stage is not None:
+                ledger.note_uncertain_attempt(budget_stage, status=0)
+            if reservation_id is not None and ledger is not None:
+                ledger.cancel(reservation_id)
+            raise
         except Exception as error:
             provider_budget = _provider_budget_message(error)
             if provider_budget is not None:
@@ -616,7 +668,7 @@ def ask(
                     )
                     continue
             retryable = status in {500, 502, 503, 504}
-            if retryable and attempt + 1 < SERVER_ERROR_ATTEMPTS:
+            if retryable and attempt + 1 < attempts:
                 if ledger is not None and budget_stage is not None:
                     ledger.note_uncertain_attempt(
                         budget_stage, status=int(status)
@@ -624,7 +676,7 @@ def ask(
                 delay = SERVER_ERROR_BACKOFF_SECONDS * (2**attempt)
                 print(
                     f"Gemini {status}: retrying the same request "
-                    f"{attempt + 1}/{SERVER_ERROR_ATTEMPTS - 1} after "
+                    f"{attempt + 1}/{attempts - 1} after "
                     f"{delay:g}s",
                     flush=True,
                 )
@@ -635,6 +687,13 @@ def ask(
             raise
     if interaction is None:  # pragma: no cover - loop returns or raises.
         raise RuntimeError("Gemini interaction retry loop did not return")
+    if checkpoint is not None and ledger is not None:
+        saved = capture(interaction, budget_stage or "unknown", str(request["model"]))
+        write_json(checkpoint, saved)
+        if reservation_id is not None:
+            ledger.cancel(reservation_id)
+        settle_saved(ledger, checkpoint, saved)
+        return interaction
     if reservation_id is not None and ledger is not None:
         usage = Usage.from_interaction(interaction)
         raw_usage = getattr(interaction, "usage", None) or {}
@@ -645,6 +704,9 @@ def ask(
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens + usage.thought_tokens,
             cached_tokens=int(raw_usage.get("total_cached_tokens") or 0),
+            tool_use_tokens=usage.tool_use_tokens,
+            processing_calls=usage.processing_calls,
+            processing_results=usage.processing_results,
         )
     return interaction
 
@@ -842,11 +904,7 @@ def decide_rhythm(
             upload_cache=cache, **request
         )
         used = Usage.from_interaction(interaction)
-        usage_total = Usage(
-            usage_total.input_tokens + used.input_tokens,
-            usage_total.output_tokens + used.output_tokens,
-            usage_total.thought_tokens + used.thought_tokens,
-        )
+        usage_total = Usage.total((usage_total, used))
         payload = _parse(interaction, what="rhythm pass")
         decisions = {
             entry["clip_id"]: entry
@@ -907,6 +965,24 @@ def decide_rhythm(
         )
         coverage_faults = coverage.faults
         release_faults = rhythm_motion_faults(edl, candidate, grid)
+        if duration_mode == "range" and minimum_seconds is not None and coverage.duration_seconds < minimum_seconds:
+            without_minimum = edl_coverage_audit(
+                executable, target_seconds, maximum_seconds=maximum_seconds,
+            )
+            if not without_minimum.faults and not release_faults:
+                # Rhythm cannot invent coverage. Keep the already-paid,
+                # complete short cut rather than buying another stretch.
+                candidate = candidate.model_copy(update={
+                    "plan_disagreements": list(dict.fromkeys([
+                        *candidate.plan_disagreements, *coverage_faults,
+                    ])),
+                })
+                if artifact_dir is not None:
+                    from montagewright.planning_artifacts import decide
+                    decide(Path(artifact_dir), "rhythm", cache_key,
+                           {"edl": candidate.model_dump(mode="json")})
+                print("rhythm: preserving natural short draft; duration minimum unmet", flush=True)
+                return candidate, usage_total
         all_faults = (*coverage_faults, *release_faults)
         if (target_seconds <= 0 or not coverage_faults) and not release_faults:
             if artifact_dir is not None:
@@ -2446,6 +2522,20 @@ def _describe_material(material: list[MaterialItem]) -> str:
             )
         elif item.camera_moves:
             facts.append("攝影機有運動")
+        moving_measurements = [
+            one for one in item.motion
+            if str(getattr(one, "state", "")) == "moving"
+        ]
+        if moving_measurements:
+            phases = "、".join(
+                f"{float(one.starts_seconds):.1f}–"
+                f"{float(one.ends_seconds):.1f}s "
+                f"{getattr(one, 'motion_kind', 'translation')}"
+                f"/{getattr(one, 'direction', '') or 'mixed'}"
+                + ("後停穩" if bool(getattr(one, "settles", False)) else "")
+                for one in moving_measurements[:4]
+            )
+            facts.append(f"本機運鏡階段：{phases}")
         if len(item.spans) == 1 and item.spans[0].seconds >= (
             item.duration_seconds - 0.1
         ):
@@ -2649,12 +2739,7 @@ def _attach_material(
             }
         )
         attached.append(
-            {
-                "type": "video",
-                "mime_type": "video/mp4",
-                "uri": uri,
-                "resolution": "low",
-            }
+            video_content(uri, resolution="low", processing="agentic")
         )
     return attached
 
@@ -2971,6 +3056,7 @@ def _selection_schema(
                         "action_id",
                         "action_treatment",
                         "camera_intent",
+                        "native_motion_policy",
                         "agrees_with_direction",
                         "direction_disagreement_reason",
                         "pacing_exception",
@@ -3048,7 +3134,8 @@ def _selection_schema(
                                 "撐滿一個節拍長度（設 speed<1 放慢）——搭不搭"
                                 "節奏、要不要強調，由你依需求決定。只有刻意要"
                                 "變速時才填，其餘省略即原速。變速可以搭配運鏡："
-                                "慢動作推近、加速搖鏡都可以。"
+                                "慢動作推近、加速搖鏡都可以。why 必須說明具體動作或敘事用途，"
+                                "不得為湊足全片秒數而拖慢；內容不足交短版草稿。"
                             ),
                         },
                         "intentional_repeat": {
@@ -3160,6 +3247,15 @@ def _selection_schema(
                             "description": (
                                 "這顆採用哪一種剪輯運鏡意圖。先答，再用 looks "
                                 "寫出相符落點；完整語彙見 prompt 的運鏡能力。"
+                            ),
+                        },
+                        "native_motion_policy": {
+                            "type": "string",
+                            "enum": list(NATIVE_MOTION_POLICY_NAMES),
+                            "description": (
+                                "原素材運鏡與數位裁切如何合成。依素材的運動"
+                                "角色、停穩時間與可移空間選擇，不可讓兩個"
+                                "無關運動同時發生。"
                             ),
                         },
                         "agrees_with_direction": {
@@ -3496,6 +3592,11 @@ def _selection_schema(
                 },
             },
         }
+    shot_properties = result["properties"]["shots"]["items"]["properties"]
+    shot_properties["canvas_mode"] = {"type": "string", "enum": ["fill", "fit"],
+        "description": "fill 裁切填滿；fit 保留完整來源畫面並加黑色留白，適合寬構圖。fit 不可同時宣稱數位推拉或跟隨，文字必須仍可讀。"}
+    shot_properties["transition_in"] = {"type": "string", "enum": ["cut", "dissolve", "dip_black"]}
+    shot_properties["transition_seconds"] = {"type": "string", "description": "0:00.100 to 0:00.800; default 0:00.400"}
     return result
 
 
@@ -3540,6 +3641,11 @@ def _editorial_plan_schema(
     rhythm = _rhythm_schema(["k00"])
 
     shot = _copy.deepcopy(base["properties"]["shots"])
+    shot["items"]["properties"]["transition_in"] = {
+        "type": "string", "enum": ["cut", "dissolve", "dip_black"]}
+    shot["items"]["properties"]["transition_seconds"] = {
+        "type": "string", "description": "0:00.100 to 0:00.800; default 0:00.400"}
+
     # Per-run ids are application data, not grammar. Hundreds of span/action
     # enum members made the otherwise-flat schema cross the provider's
     # complexity ceiling. Keep fixed editorial enums in the schema and audit
@@ -3873,6 +3979,11 @@ def load_editorial_plan_replay(
     for shot in provider_shape.get("shots") or []:
         for look in shot.get("looks") or []:
             look.setdefault("co_visible_entity_ids", [])
+        # Recorded plans predate the explicit native-motion contract. Preserve
+        # the source move and only permit a digital move after it settles.
+        shot.setdefault("native_motion_policy", "add_digital_after_settle")
+    for shot in replay.get("shots") or []:
+        shot.setdefault("native_motion_policy", "add_digital_after_settle")
     provider_shape.pop("aspect", None)
     provider_shape.pop("event_disagreements", None)
     target = provider_shape.get("target_seconds")
@@ -3977,8 +4088,9 @@ def decide_editorial_plan(
             (
                 f"## 片長\n\n這支片必須落在 {float(range_minimum):g}–"
                 f"{float(range_maximum):g} 秒；{seconds:g} 秒是區間內的理想目標。"
-                "先以內容完整、節奏自然為準，但不得交出區間外的計畫；"
-                "不可切字、重複或空停留補秒數。\n\n"
+                "先以內容完整、節奏自然為準，在區間內自然收尾。"
+                "若素材不足以達到下限，保留自然完整的短版並在 uncovered 說明缺口；"
+                "短版只能作草稿，不得宣稱符合交付。不可切字、重複、拖慢或停格補秒數。\n\n"
                 if duration_mode == "range"
                 and range_minimum is not None and range_maximum is not None
                 else
@@ -4020,10 +4132,11 @@ def decide_editorial_plan(
     # Media first and the actual editorial question last. This follows the
     # provider's video guidance and prevents a long table from anchoring what
     # the editor thinks it sees before it has watched the reel.
-    request_input: list[dict[str, Any]] = [{
-        "type": "video", "mime_type": "video/mp4",
-        "uri": planning_uri, "resolution": "low",
-    }]
+    request_input: list[dict[str, Any]] = [
+        video_content(
+            planning_uri, resolution="low", processing="agentic"
+        )
+    ]
     if grounding_spec is not None:
         from montagewright.reference_grounding import reference_prompt_parts
 
@@ -4196,11 +4309,7 @@ def decide_editorial_plan(
                 + "; ".join(faults)
             )
     usages = [Usage.from_interaction(one) for one in interactions]
-    return plan, Usage(
-        input_tokens=sum(one.input_tokens for one in usages),
-        output_tokens=sum(one.output_tokens for one in usages),
-        thought_tokens=sum(one.thought_tokens for one in usages),
-    )
+    return plan, Usage.total(usages)
 
 
 def _selection_patch_schema(
@@ -4821,6 +4930,19 @@ def normalize_selection(
         )
     narrative_repairs: list[str] = []
     shots = chosen.get("shots") or []
+    for index, shot in enumerate(shots):
+        for look in shot.get("looks") or []:
+            companions = look.get("co_visible_entity_ids") or []
+            distinct = list(dict.fromkeys(
+                entity for entity in companions
+                if entity != look.get("entity_id")
+            ))
+            if distinct != companions:
+                look["co_visible_entity_ids"] = distinct
+                narrative_repairs.append(
+                    f"k{index:02d}: removed duplicate identity references "
+                    "from the co-visible set; distinct companions are unchanged"
+                )
     speech_windows: dict[str, tuple[str, float, float]] = {}
     speech_descriptions: dict[str, str] = {}
     for item in material:
@@ -4993,6 +5115,11 @@ def select_shots(
     commitments: Any | None = None,
     duration_mode: str = "exact",
     initial_selection: dict[str, Any] | None = None,
+    identity_evidence: dict[tuple[str, str], dict[str, Any]] | None = None,
+    max_repair_attempts: int = 2,
+    inspection_parts: list[dict] | None = None,
+    inspected_results: list[dict] | None = None,
+    previously_viewed_shots: list[dict] | None = None,
     attempt_recorder: Callable[
         [dict[str, Any], tuple[str, ...], int], None
     ] | None = None,
@@ -5006,6 +5133,8 @@ def select_shots(
     paying to rethink the entire cut.
     """
 
+    if max_repair_attempts < 0:
+        raise ValueError("max_repair_attempts must be nonnegative")
     if client is None:
         client = _default_client()
 
@@ -5080,15 +5209,40 @@ def select_shots(
         )
         if graphic_candidates else ""
     )
+    from montagewright.coverage import VISUAL_ONLY_LIMITS
+
+    execution_context = (
+        "\n\n## 本機內容秒數規則\n"
+        + json.dumps(VISUAL_ONLY_LIMITS, ensure_ascii=False, sort_keys=True)
+        + "\n以上為沒有額外動作／原生運鏡證據時，各畫面任務的秒數上限。"
+        "純配樂產品片請依實際任務選 music_montage、establishing、"
+        "title_read 或具名 primary_action；illustrative_broll 覆蓋敘事音訊，"
+        "沒有敘事音訊時不能用此角色替全片補秒。end_hold 最多 1.5 秒，"
+        "其 looks 停留與運鏡路程也必須在這個長度內完成。"
+    )
+    if identity_evidence:
+        execution_context += (
+            "\n\n## 來源 exact-frame 身分檢查結果\n"
+            + json.dumps([
+                {"source_id": source, "target_id": target, "evidence": evidence}
+                for (source, target), evidence in sorted(identity_evidence.items())
+            ], ensure_ascii=False, sort_keys=True)
+            + "\n優先選已有正面身分證據的來源。不確定不等於已證明不是目標，"
+            "但不可把未確認來源寫成已確認；若仍選它，後續最終時窗須重新驗證。"
+        )
     selection_input: list[dict[str, Any]] = [
         {
             "type": "text",
             "text": (
-                    f"{prompt}\n\n## 已定好的調性\n\n"
+                    f"{prompt}{execution_context}\n\n## 已定好的調性\n\n"
                     f"{direction['direction']}\n\n"
                     f"{'精確' if duration_mode == 'exact' else '偏好'}長度 "
                     f"{direction['target_seconds']:.0f} 秒，"
                     f"輸出 {direction['aspect']}。\n\n"
+                    + ("本機交付片長規格：" + json.dumps(direction["duration_contract"], ensure_ascii=False)
+                       + "。區間內自然收尾；素材不足則保留短版並說明缺口，不可湊長。\n\n"
+                       if direction.get("duration_contract") else "")
+                    +
                     f"## 節奏密度\n\n目標約 "
                     f"{direction.get('target_shot_count', 0)} 顆；典型鏡長 "
                     f"{direction.get('typical_shot_seconds', 0):.1f} 秒；"
@@ -5130,10 +5284,11 @@ def select_shots(
             target_ids=grounding_target_ids,
             resolution="high",
         )
-    selection_input += _attach_material(usable, cache, client, beaten)
+    selection_input += (inspection_parts if inspection_parts is not None
+                        else _attach_material(usable, cache, client, beaten))
 
     def response_schema(span_ids: list[str]) -> dict[str, Any]:
-        return structured_json(_selection_schema(
+        schema_value = _selection_schema(
             span_ids,
             min_shots=min_shots,
             max_shots=max_shots,
@@ -5147,7 +5302,13 @@ def select_shots(
                 )) if selection_commitments is not None else None
             ),
             action_ids=_action_ids_for_material(usable),
-        ))
+        )
+        rhythm_fields = _rhythm_schema(["k00"])["properties"]["decisions"]["items"]["properties"]
+        for name in ("cut_on_beat", "sync_to", "beats"):
+            schema_value["properties"]["shots"]["items"]["properties"][name] = copy.deepcopy(
+                rhythm_fields[name]
+            )
+        return structured_json(schema_value)
 
     schema = response_schema([one.span_id for one in offered])
     usage_total = Usage(0, 0, 0)
@@ -5276,11 +5437,7 @@ def select_shots(
                 upload_cache=cache,
             )
             used = Usage.from_interaction(interaction)
-            usage_total = Usage(
-                usage_total.input_tokens + used.input_tokens,
-                usage_total.output_tokens + used.output_tokens,
-                usage_total.thought_tokens + used.thought_tokens,
-            )
+            usage_total = Usage.total((usage_total, used))
             try:
                 candidate = _merge_selection_patch(
                     base, _parse(interaction, what="selection shot patch"),
@@ -5327,7 +5484,7 @@ def select_shots(
     pending_initial = copy.deepcopy(initial_selection)
     pending_patch_base: dict[str, Any] | None = None
     pending_patch_indices: set[int] = set()
-    for attempt in range(3):
+    for attempt in range(1 + max_repair_attempts):
         validating_previous = pending_initial is not None
         if validating_previous:
             assert pending_initial is not None
@@ -5349,11 +5506,7 @@ def select_shots(
                 upload_cache=cache,
             )
             used = Usage.from_interaction(interaction)
-            usage_total = Usage(
-                usage_total.input_tokens + used.input_tokens,
-                usage_total.output_tokens + used.output_tokens,
-                usage_total.thought_tokens + used.thought_tokens,
-            )
+            usage_total = Usage.total((usage_total, used))
             parsed = _parse(
                 interaction,
                 what=(
@@ -5402,6 +5555,13 @@ def select_shots(
         normalize_selection(
             chosen, usable, commitments=selection_commitments
         )
+        if inspected_results is not None:
+            from montagewright.editor_workspace import inspected_selection_faults
+            def viewed_key(shot):
+                return tuple(shot.get(key) for key in ("source_id", "start_seconds", "seconds_needed", "speed"))
+            previous = {viewed_key(shot) for shot in previously_viewed_shots or []}
+            faults.extend(inspected_selection_faults(
+                [shot for shot in chosen.get("shots") or [] if viewed_key(shot) not in previous], inspected_results))
         faults.extend(span_contract_disagreements(
             chosen.get("shots") or [], usable
         ))
@@ -5534,8 +5694,14 @@ def select_shots(
                     float(direction.get("target_seconds") or 0.0),
                     hard_target=False,
                 )
-        faults.extend(coverage.faults)
-        faults.extend(sequence_disagreements(chosen.get("shots") or []))
+        # Holds may have changed above. Judge the executable result using
+        # precisely the same gates as resume and the caller, not stale faults
+        # collected before normalization shortened a shot.
+        faults = audit_cached_selection(
+            chosen, material, direction,
+            commitments=selection_commitments, grounding_spec=grounding_spec,
+            duration_mode=duration_mode,
+        )
         if attempt_recorder is not None and not validating_previous:
             attempt_recorder(
                 copy.deepcopy(chosen), tuple(dict.fromkeys(faults)), attempt + 1
@@ -5671,13 +5837,17 @@ def select_shots(
                 # Global faults (for example audio assignment structure) need
                 # a complete answer. Keep the full original span grammar;
                 # narrowing a full response to failing spans is contradictory.
-                attempt_schema = schema
+                attempt_schema = response_schema([
+                    span.span_id for item in usable
+                    if item.source_id not in repair_excluded_sources
+                    for span in item.spans
+                ])
                 speech_catalog = "\n".join(
                     f"- source={item.source_id}: {line}"
                     for item in usable
                     for line in item.speech
                 ) or "- （沒有可引用的逐字稿 span）"
-                attempt_input = [{
+                attempt_input = [selection_input[0], {
                     "type": "text",
                     "text": (
                         "你只在修正上一版 Selection 的本機執行錯誤。"
@@ -5686,8 +5856,14 @@ def select_shots(
                         "目錄列出的單一講者與時間範圍；若內容包含提問與回答，"
                         "必須引用各自的 span，不能用一個短 span 的理由宣稱兩者"
                         "都有。speaker 畫面的長度必須由同來源 narrative audio "
-                        "實際覆蓋；偏好秒數無法自然成立時可以交較短的完整版本，"
-                        "不可用無證據的 speaker 尾段補秒。\n\n"
+                        "實際覆蓋；不可用無證據的 speaker 尾段補秒。\n\n"
+                        + (
+                            "本次是精確長度交付；必須增加有內容的鏡頭以符合目標，"
+                            "不可自行縮短成片。\n\n"
+                            if duration_mode == "exact" else
+                            "本次是偏好長度；內容不足時可以交較短的完整版本。\n\n"
+                        )
+                        +
                         "## 已定方向\n"
                         + json.dumps(
                             direction, ensure_ascii=False, sort_keys=True
@@ -5707,7 +5883,7 @@ def select_shots(
                         )
                         + exclusion_note
                     ),
-                }] + _attach_material(usable, cache, client, beaten)
+                }] + selection_input[1:]
     if faults:
         # A look nobody can reach is one look, not the film. Two repairs
         # have already been spent asking for a different plan; dropping the
@@ -5737,7 +5913,11 @@ def select_shots(
                 "holds on what it can see"
             )
         if salvaged:
-            faults = frame_disagreements(chosen.get("shots") or [], material)
+            faults = audit_cached_selection(
+                chosen, material, direction,
+                commitments=selection_commitments,
+                grounding_spec=grounding_spec, duration_mode=duration_mode,
+            )
             chosen.setdefault("plan_disagreements", []).extend(salvaged)
     if faults:
         degrade_selection(chosen, faults)
@@ -5907,6 +6087,9 @@ def audit_cached_selection(
     from montagewright.coverage import selection_coverage_audit
 
     coverage_copy = copy.deepcopy(chosen)
+    duration_contract = direction.get("duration_contract") or {}
+    # A short but complete cut is a useful draft. The final release gate owns
+    # the minimum; selection must not keep paying to stretch a thin pool.
     check(
         "coverage",
         lambda: list(selection_coverage_audit(
@@ -5914,9 +6097,12 @@ def audit_cached_selection(
             usable,
             float(direction.get("target_seconds") or 0.0),
             hard_target=duration_mode == "exact",
+            maximum_seconds=(duration_contract.get("maximum_seconds")
+                             if duration_mode == "range" else None),
         ).faults),
     )
     check("sequence", lambda: sequence_disagreements(shots))
+    check("duration padding", lambda: duration_padding_disagreements(shots))
     return list(dict.fromkeys(faults))
 
 
@@ -6037,8 +6223,11 @@ def action_contract_disagreements(
             continue
         action_start, action_end, usable_from, usable_to = resolved
         seconds = float(shot.get("seconds_needed") or 0.0)
+        speed = max(1e-6, float(shot.get("speed") or 1.0))
+        source_start = float(shot.get("start_seconds", usable_from))
+        source_end = source_start + seconds * speed
         if treatment == "complete_here":
-            needed = max(0.0, action_end - action_start)
+            needed = max(0.0, action_end - action_start) / speed
             if action_start < usable_from - 1e-3 or action_end > usable_to + 1e-3:
                 faults.append(
                     f"k{index:02d} action {selected!r} cannot complete inside "
@@ -6049,6 +6238,12 @@ def action_contract_disagreements(
                     f"k{index:02d} gives {seconds:.2f}s to action {selected!r}, "
                     f"but complete_here needs at least {needed:.2f}s; choose "
                     "fewer shots, after_completion, or a different action"
+                )
+            elif source_start > action_start + 1e-3 or source_end < action_end - 1e-3:
+                faults.append(
+                    f"k{index:02d} complete_here window {source_start:.2f}–"
+                    f"{source_end:.2f}s does not contain action {selected!r} "
+                    f"at {action_start:.2f}–{action_end:.2f}s"
                 )
         elif treatment == "after_completion":
             if action_end < usable_from - 1e-3:
@@ -6064,8 +6259,6 @@ def action_contract_disagreements(
                 )
         elif treatment == "intentional_cut":
             why = str(shot.get("why") or "").strip()
-            source_start = float(shot.get("start_seconds") or usable_from)
-            source_end = source_start + seconds
             if not why:
                 faults.append(
                     f"k{index:02d} intentionally cuts action {selected!r} "
@@ -6622,6 +6815,9 @@ def expand_spans(
         shot["source_motion_description"] = (source_motion or {}).get(
             span.source_id, ""
         )
+        shot["native_motion_policy"] = str(
+            shot.get("native_motion_policy") or "add_digital_after_settle"
+        )
         shot["pacing_exception"] = bool(shot.get("pacing_exception", False))
         shot["pacing_exception_reason"] = str(
             shot.get("pacing_exception_reason", "") or ""
@@ -6663,6 +6859,39 @@ def repair_selection_motion_contracts(
             str(one) for one in (advice.get("locally_feasible") or [])
         }
         source_role = str(shot.get("source_motion_role") or "locked")
+        policy = str(
+            shot.get("native_motion_policy") or "add_digital_after_settle"
+        )
+
+        # These combinations have only one coherent physical reading. Fixing
+        # the policy locally prevents a paid replan whose sole job would be
+        # to rename the same intended trajectory.
+        if intent == "use_source_motion" and policy != "preserve_native":
+            policy = "preserve_native"
+            repaired.append(
+                f"k{index:02d}: aligned native policy with source motion"
+            )
+        elif source_role == "subject_follow" and intent == "follow_subject":
+            if policy != "follow_native":
+                policy = "follow_native"
+                repaired.append(
+                    f"k{index:02d}: native follow is compensated, not stacked"
+                )
+        elif source_role in {"setup_reframe", "disturbance"}:
+            if policy not in {"stabilize_then_reframe", "digital_forbidden"}:
+                policy = "stabilize_then_reframe"
+                repaired.append(
+                    f"k{index:02d}: reframing starts after source settle"
+                )
+        elif source_role in {"authored", "handheld_texture"} and intent not in {
+            "hold", "use_source_motion",
+        }:
+            if policy not in {"add_digital_after_settle", "digital_forbidden"}:
+                policy = "add_digital_after_settle"
+                repaired.append(
+                    f"k{index:02d}: digital move starts after native settle"
+                )
+        shot["native_motion_policy"] = policy
 
         # ``sequential_read`` is already an editorial decision: the viewer
         # must be led across more than one part of the source composition.
@@ -6829,6 +7058,11 @@ def repair_selection_motion_contracts(
                 "into one group composition"
             )
 
+        if intent == "use_source_motion":
+            policy = "preserve_native"
+        elif source_role == "subject_follow" and intent == "follow_subject":
+            policy = "follow_native"
+        shot["native_motion_policy"] = policy
         shot["delivered_camera_intent"] = intent
         shot["frame"] = (
             "settles" if intent in {"hold", "use_source_motion"} else "travels"
@@ -6895,8 +7129,26 @@ def repair_selection_source_windows(
             and str(shot.get("picture_role") or "") == "speaker"
         ):
             continue
+        motion_floor = float(span.starts_seconds)
+        if str(shot.get("native_motion_policy") or "") == "stabilize_then_reframe":
+            settles = [
+                float(one.ends_seconds)
+                for one in item.motion
+                if str(getattr(one, "state", "")) == "moving"
+                and bool(getattr(one, "settles", False))
+                and float(one.ends_seconds) >= float(span.starts_seconds)
+                and float(one.ends_seconds) <= float(span.ends_seconds)
+            ]
+            if settles:
+                motion_floor = min(settles)
         action_start_raw = shot.get("content_action_start_seconds")
         action_complete_raw = shot.get("content_action_complete_seconds")
+        # Direct Editorial Plans have no legacy commitment projection. The
+        # named action still has an immutable boundary in MaterialItem.
+        if action_start_raw is None or action_complete_raw is None:
+            boundary = resolve_action_boundary(shot, material)
+            if boundary is not None:
+                action_start_raw, action_complete_raw = boundary[:2]
         if (
             str(shot.get("action_treatment") or "none") == "complete_here"
             and action_start_raw is not None
@@ -6904,10 +7156,17 @@ def repair_selection_source_windows(
         ):
             action_start = float(action_start_raw)
             action_complete = float(action_complete_raw)
+            speed = max(1e-6, float(shot.get("speed") or 1.0))
             action_duration = max(0.0, action_complete - action_start)
             if action_duration <= span_duration + 1e-6:
                 original_duration = duration
-                duration = max(duration, action_duration)
+                # Legacy commitments may carry a minimum; a direct model
+                # answer must choose sufficient duration itself.
+                if shot.get("content_action_start_seconds") is None:
+                    if duration * speed < action_duration - 1e-6:
+                        continue
+                else:
+                    duration = max(duration, action_duration / speed)
                 current = float(
                     shot.get("start_seconds") or span.starts_seconds
                 )
@@ -6916,10 +7175,10 @@ def repair_selection_source_windows(
                 # nearest such point rather than asking Gemini to do decimal
                 # source-clock arithmetic.
                 earliest = max(
-                    float(span.starts_seconds), action_complete - duration,
+                    motion_floor, action_complete - duration * speed,
                 )
                 latest = min(
-                    action_start, float(span.ends_seconds) - duration,
+                    action_start, float(span.ends_seconds) - duration * speed,
                 )
                 if earliest <= latest + 1e-6:
                     proposed = min(max(current, earliest), latest)
@@ -6964,10 +7223,25 @@ def repair_selection_source_windows(
                 at - _look_evaluation_offset(shot, look, position, len(stable))
             )
         if not desired_starts:
+            current = float(shot.get("start_seconds") or span.starts_seconds)
+            if (
+                motion_floor > current + 1e-3
+                and motion_floor + duration <= float(span.ends_seconds) + 1e-6
+            ):
+                shot["start_seconds"] = round(motion_floor, 3)
+                shot["start_offset_seconds"] = round(
+                    motion_floor - float(span.starts_seconds), 3
+                )
+                repaired.append(
+                    f"k{index:02d}: skipped setup motion and began at the "
+                    f"measured settle {motion_floor:.2f}s"
+                )
             continue
         desired = sum(desired_starts) / len(desired_starts)
         latest = float(span.ends_seconds) - duration
-        proposed = min(max(desired, float(span.starts_seconds)), latest)
+        if motion_floor + duration > float(span.ends_seconds) + 1e-6:
+            continue
+        proposed = min(max(desired, motion_floor), latest)
         current = float(shot.get("start_seconds") or span.starts_seconds)
         if abs(proposed - current) <= 1e-3:
             continue
@@ -7037,6 +7311,10 @@ def frame_disagreements(
     for index, shot in enumerate(shots):
         legacy = "camera_intent" not in shot
         intent = camera_intent_of(shot)
+        if shot.get("canvas_mode") == "fit":
+            if intent not in {"hold", "use_source_motion"}:
+                off.append(f"k{index:02d} fit preserves the full frame and cannot execute a digital crop move")
+            continue
         travels = str(shot.get("frame", "")) == "travels"
         all_looks = list(shot.get("looks") or [])
         stable_looks = [
@@ -7295,6 +7573,34 @@ def repair_single_look_hold_overflow(
     return tuple(repaired)
 
 
+def _padding_reason(reason: str) -> bool:
+    """Reject explicit padding admissions; visual editorial QA still matters.
+
+    This is deliberately not a claim to infer purpose from arbitrary prose.
+    A bookend and slow action can be legitimate; a target length is not their
+    justification. Negative instructions are not admissions of padding.
+    """
+    clauses = re.split(r"[。；;，,\n]", reason.lower())
+    for clause in clauses:
+        if re.search(r"不可|不得|不要|不靠|不是|不為|不用|避免|not |never |without |avoid ", clause):
+            continue
+        if re.search(r"湊(?:滿|足|齊)?(?:秒|長|片長|時長)|補(?:滿|足)?秒數|填(?:滿|補)(?:片長|時長)|"
+                     r"pad(?:ding)? (?:the |out |to )?(?:duration|runtime|length)|"
+                     r"(?:fill|reach|meet) (?:the )?(?:target )?(?:duration|runtime|length)", clause):
+            return True
+    return False
+
+
+def duration_padding_disagreements(shots: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"k{index:02d}: declared duration padding; retain a natural shorter draft "
+        "with a shortfall, not repeated footage, slow motion or empty holds"
+        for index, shot in enumerate(shots)
+        if any(_padding_reason(str(shot.get(key) or "")) for key in
+               ("why", "intentional_repeat_reason", "pacing_exception_reason"))
+    ]
+
+
 def _declared_repeat(shot: dict[str, Any]) -> bool:
     """The editor said this shot repeats on purpose, and said why.
 
@@ -7303,16 +7609,16 @@ def _declared_repeat(shot: dict[str, Any]) -> bool:
     a pair, which is the one that chose to come back to the take.
     """
 
-    return bool(shot.get("intentional_repeat")) and bool(
-        str(shot.get("intentional_repeat_reason") or "").strip()
-    )
+    reason = str(shot.get("intentional_repeat_reason") or "").strip()
+    return bool(shot.get("intentional_repeat")) and bool(reason) and not _padding_reason(reason)
 
 
 def _overlapping_repeat_pairs(
     shots: list[dict[str, Any]],
 ) -> "list[tuple[int, int, float, str]]":
-    """Undeclared pairs that show overlapping source windows of one span.
+    """Undeclared pairs that show overlapping windows of one source.
 
+    Span labels cannot hide a repeat; compare source seconds at playback rate.
     Overlapping windows of the same take are the same frames on screen twice,
     which is the one repeat that almost never carries new information. Yielded
     as (earlier index, later index, overlap seconds, span) for both the notes
@@ -7326,16 +7632,14 @@ def _overlapping_repeat_pairs(
             left, right = shots[i], shots[j]
             if str(left.get("source_id", "")) != str(right.get("source_id", "")):
                 continue
-            if str(left.get("span_id", "")) != str(right.get("span_id", "")):
-                continue
             left_start = float(left.get("start_seconds") or 0.0)
             right_start = float(right.get("start_seconds") or 0.0)
-            left_end = left_start + float(left.get("seconds_needed") or 0.0)
-            right_end = right_start + float(right.get("seconds_needed") or 0.0)
+            left_end = left_start + float(left.get("seconds_needed") or 0.0) * float(left.get("speed") or 1.0)
+            right_end = right_start + float(right.get("seconds_needed") or 0.0) * float(right.get("speed") or 1.0)
             overlap = min(left_end, right_end) - max(left_start, right_start)
             if overlap <= 0.25:
                 continue
-            if _declared_repeat(right) or _declared_repeat(left):
+            if _declared_repeat(right):
                 continue
             pairs.append((i, j, overlap, str(left.get("span_id", ""))))
     return pairs
@@ -7424,6 +7728,9 @@ def replan_shots(
     ledger: Any | None = None,
     grounding_spec: Any | None = None,
     commitments: Any | None = None,
+    editor_selection: dict | None = None,
+    editor_preview: Path | None = None,
+    editor_timeline: dict | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Plan the shots that did not deliver, again, from what was seen.
 
@@ -7506,7 +7813,52 @@ def replan_shots(
             target_ids=grounding_target_ids,
             resolution="high",
         )
-    replan_input += _attach_material(usable, cache, client, beaten)
+    inspected = []
+    workspace = None
+    if ledger is not None and getattr(ledger, "journal_path", None) and any(
+        item.proxy is not None and item.proxy.exists() for item in usable
+    ):
+        from montagewright.editor_workspace import EditorWorkspace, gather_evidence
+
+        workspace = EditorWorkspace(
+            Path(ledger.journal_path).parent / "work" / "editor", usable,
+            brief=brief, direction=direction,
+            selection=editor_selection or {"shots": [shot for _, shot, _ in failing],
+                                           "sequence_context": context},
+            preview=editor_preview, timeline=editor_timeline,
+            problems=[{"clip_id": f"k{i:02d}", "reason": note} for i, _, note in failing],
+        )
+        initial = []
+        indexed = {item.source_id: item for item in usable}
+        for index, shot, _ in failing[:3]:
+            item = indexed.get(shot["source_id"])
+            if item is None:
+                continue
+            start = max(0.0, float(shot.get("start_seconds", 0)) - 2)
+            end = min(item.duration_seconds, start + min(20, float(shot.get("seconds_needed", 3)) + 4))
+            if end > start:
+                initial.append({"operation": "inspect_source", "source_id": item.source_id,
+                                "start": start, "end": end, "framing": "source"})
+        if editor_preview is not None and editor_timeline:
+            rows = editor_timeline.get("shots", [])
+            fps = float(editor_timeline.get("output_fps", 30))
+            for index, _, _ in failing[:1]:
+                if index < len(rows):
+                    row = rows[index]
+                    start = max(0, float(row["start_frame"]) / fps - 2)
+                    total = sum(float(r["frame_count"]) for r in rows) / fps
+                    end = min(total, start + min(20, float(row["frame_count"]) / fps + 4))
+                    initial.append({"operation": "inspect_cut", "source_id": "current_cut",
+                                    "start": start, "end": end, "framing": "source"})
+        evidence, inspected = gather_evidence(workspace, client=client, cache=cache,
+                                               ledger=ledger, initial=initial)
+        replan_input += evidence
+        replan_input.append({"type": "text", "text":
+            "請根據以上實際回看影片提交替換鏡頭。只可選已回看的來源時間範圍；"
+            "全片目錄供保持脈絡，不能把尚未看的其他區間當成已驗證候選。"
+            "保留原始來源時钟，診斷預覽不是新的素材來源。"})
+    else:
+        replan_input += _attach_material(usable, cache, client, beaten)
 
     schema = structured_json(_selection_schema(
         [one.span_id for one in offered],
@@ -7536,11 +7888,7 @@ def replan_shots(
             upload_cache=cache,
         )
         used = Usage.from_interaction(interaction)
-        usage_total = Usage(
-            usage_total.input_tokens + used.input_tokens,
-            usage_total.output_tokens + used.output_tokens,
-            usage_total.thought_tokens + used.thought_tokens,
-        )
+        usage_total = Usage.total((usage_total, used))
         again = _parse(interaction, what="replan pass")
         local_contract_faults = selection_clock_disagreements(
             again.get("shots") or []
@@ -7550,6 +7898,17 @@ def replan_shots(
             source_motion={item.source_id: item.camera_motion for item in usable},
         )
         replacement_shots = again.get("shots") or []
+        if workspace is not None:
+            from montagewright.editor_workspace import inspected_selection_faults
+            # Unchanged source windows already belong to the editor's viewed
+            # plan. A framing repair need not purchase another viewing of
+            # those same frames; changed/new windows still require inspection.
+            def source_window(shot):
+                return tuple(shot.get(key) or (1 if key == "speed" else 0)
+                             for key in ("source_id", "start_seconds", "seconds_needed", "speed"))
+            viewed = {source_window(s) for s in (editor_selection or {}).get("shots", [])}
+            local_contract_faults.extend(inspected_selection_faults(
+                [s for s in replacement_shots if source_window(s) not in viewed], inspected))
         local_contract_faults.extend(action_contract_disagreements(
             replacement_shots, usable
         ))
@@ -7602,6 +7961,13 @@ def replan_shots(
     # reviewer just said the frame showed half a wordmark, and "改為橫向掃過
     # 運鏡" in the reasoning is not two looks.
     replacement_shots = again.get("shots") or []
+    originals_by_id = {f"k{index:02d}": old for index, old, _ in failing}
+    for shot in replacement_shots:
+        old = originals_by_id.get(str(shot.get("replace_clip_id")), {})
+        # The legacy replacement schema does not author rhythm. Retain the
+        # cut-on-beat intention while local grounding resolves new cut times.
+        if "cut_on_beat" not in shot and "cut_on_beat" in old:
+            shot["cut_on_beat"] = old["cut_on_beat"]
     local_disagreements = frame_disagreements(replacement_shots, material)
     stable_disagreements: list[str] = []
     for note in local_disagreements:
@@ -7613,4 +7979,6 @@ def replan_shots(
             stable_id = local_id
         stable_disagreements.append(note.replace(local_id, stable_id, 1))
     again["frame_disagreements"] = stable_disagreements
+    if workspace is not None:
+        workspace.record("replacement_proposal", again)
     return again, usage_total

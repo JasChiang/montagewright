@@ -86,6 +86,8 @@ class EditPoint(_Strict):
     continuity_mode: str = "none"
     motivation: str = "content"
     source_event_ref: str = "none"
+    transition_in: Literal["cut", "dissolve", "dip_black"] = "cut"
+    transition_seconds: float = Field(default=0.4, ge=0.1, le=0.8)
     # Sound edges are deliberately not assumed to coincide with picture.
     audio_edges: tuple[str, ...] = ()
 
@@ -207,6 +209,8 @@ def from_edl(edl: EDL) -> EditorialTimeline:
             continuity_mode=edl.clips[index + 1].continuity_mode,
             motivation=edl.clips[index + 1].cut_motivation,
             source_event_ref=edl.clips[index + 1].source_event_ref,
+            transition_in=edl.clips[index + 1].transition_in,
+            transition_seconds=edl.clips[index + 1].transition_seconds,
             audio_edges=audio_edges,
         ))
 

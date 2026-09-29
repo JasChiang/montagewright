@@ -75,6 +75,7 @@ from montagewright.review import (
     review_shots,
     should_continue,
 )
+from montagewright.grounding_recovery import GroundingBlocked
 from montagewright.planner import (
     MAX_OUTPUT_TOKENS,
     MODEL_ID,
@@ -108,6 +109,7 @@ from montagewright.schema import (
     Clip,
     ContentContract,
     ContentPolicy,
+    MusicSync,
     delivered_camera_intent_of,
     looks_of,
     move_of_shot,
@@ -455,7 +457,7 @@ def _confirm_material_identity_for_target(
         prepared_sources.append((item, one, cache_path, Path(source)))
 
     if prepared:
-        ledger.check()
+        pass  # Paid dispatch reserves budget; local/replayed work can continue.
         try:
             judged = decide_cross_asset_exact_frame_bboxes(
                 spec, target, prepared,
@@ -530,7 +532,7 @@ def _confirm_material_identity_for_target(
         source = masters.get(item.source_id)
         if discovery is None or source is None:
             continue
-        ledger.check()
+        pass  # Paid dispatch reserves budget; local/replayed work can continue.
         detail: dict[str, str] = {}
         try:
             found = confirm_source_identity(
@@ -1078,7 +1080,7 @@ def _screen_material_identity(
         if proxy is None or not Path(proxy).exists():
             kept.append(item)
             continue
-        ledger.check()
+        pass  # Paid dispatch reserves budget; local/replayed work can continue.
         try:
             screened = remembered_discovery(
                 proxy, spec,
@@ -1322,11 +1324,10 @@ def _make_proxy(
 def _encode_proxy(source: Path, destination: Path) -> None:
     """Shrink the frame, keep the clock.
 
-    This forced 15fps for a while, which nothing asked for. Gemini samples
-    video at one frame a second whatever it is given, so the extra frames
-    were never looked at; SAM tracks the original rather than this file, at
-    its own rate; and the only thing left watching a proxy at full speed is
-    the web preview, which is happier at the source rate anyway.
+    This forced 15fps for a while, which nothing asked for. Gemini's agentic
+    or static sampling policy is explicit and independent of the encoded
+    proxy rate; SAM tracks the original at its own rate; and the web preview
+    is happier at the source rate anyway.
 
     What the resampling did cost was a clock that no longer matched. At
     15fps a duration has to land on a multiple of 1/15, so a 12.012s take
@@ -1470,6 +1471,19 @@ def _expand_render_job_argv(
     job = EditJob.model_validate(job_for_form(job_path))
     job_rushes, job_options = job_to_argv(job, job_path)
     remaining = [*argv[:starts], *argv[ends:]]
+    # A deliberate mode change replaces the job's old range. Do not leave
+    # hidden min/max flags attached to an exact/approx/at_most override.
+    mode_override = next((arg.split("=", 1)[1] for arg in remaining
+                          if arg.startswith("--duration-mode=")), None)
+    if "--duration-mode" in remaining:
+        index = remaining.index("--duration-mode")
+        if index + 1 < len(remaining):
+            mode_override = remaining[index + 1]
+    if mode_override is not None and mode_override != "range":
+        for option in ("--minimum-seconds", "--maximum-seconds"):
+            if option in job_options:
+                index = job_options.index(option)
+                del job_options[index:index + 2]
     # The ordinary syntax keeps rushes immediately after ``render``.  A work
     # order may supply it instead; explicit positional rushes remain the
     # authority when both exist.
@@ -1541,7 +1555,10 @@ def _resolved_job(args: argparse.Namespace, rushes: Path, output: Path) -> Any:
         ),
         sound=Sound(speech=args.speech, locale=args.locale),
         subject=subject,
-        run=RunPolicy(budget_usd=args.budget, review=bool(args.review)),
+        run=RunPolicy(budget_usd=args.budget, review=bool(args.review),
+                      technical_repair=getattr(args, "technical_repair", True),
+                      mode=getattr(args, "mode", "edit"),
+                      target_budget_usd=getattr(args, "target_budget", None)),
     )
     original = getattr(args, "_job", None)
     if original is not None:
@@ -1677,7 +1694,7 @@ def _run_campaign_variants(args: argparse.Namespace, job: Any) -> int:
                 }, ensure_ascii=False, indent=2), encoding="utf-8",
             )
             raise
-        _write_run_state(state, "done" if not outcome else "failed")
+        _write_run_state(state, "budget_paused" if outcome == 75 else ("done" if not outcome else "failed"))
         release_path = output / "release-manifest.json"
         release_status = "rendered_draft"
         if release_path.exists():
@@ -2203,9 +2220,8 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
     # Subtitles are derived from this run's resolved picture/audio clocks.
     # A file left by an earlier run is never evidence that the current run
     # produced captions, even when its duration happens to match.
-    _invalidate_subtitle_derivatives(output)
+    cache = _writable_upload_cache(args.upload_cache, output)
     client = _client()
-    cache = UploadCache.load(args.upload_cache or default_cache_path())
     ledger = Ledger(
         # Replay is a wiring test, not a disguised provider run. Cached cards,
         # transcripts and grounding may be reused; any missing paid artifact
@@ -2217,6 +2233,8 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
         ),
         model_id=MODEL_ID,
         journal_path=output / "spend-events.jsonl",
+        cumulative_budget=True,
+        target_usd=getattr(args, "target_budget", None),
     )
 
     source_entries = [
@@ -2315,6 +2333,9 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             print(f"  {source_id} — no motion measured: {error}"[:120], flush=True)
             return None
 
+    from montagewright.budget_plan import prepare as prepare_budget
+    prepare_budget(ledger, proxies, library, output, mode=getattr(args, "mode", "edit"),
+                   subtitles=args.subtitles, review=args.review, speech=args.speech)
     print(f"measuring camera motion across {len(proxies)} clips", flush=True)
     try:
         cards, stats = build_library(
@@ -2339,6 +2360,32 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
     for line in stats.get("failures", [])[:5]:
         print(f"  card failed — {line[:140]}", flush=True)
 
+    from montagewright.workflow import publish_coverage
+    coverage = publish_coverage(output, proxies, cards)
+    if not coverage["complete"]:
+        raise RuntimeError("material understanding incomplete; see work/material-coverage.json and resume")
+
+    if args.aspect == "auto":
+        from montagewright.planner import ask, _parse
+        from montagewright.gemini import structured_json
+        result_aspect = ask(client, model=MODEL_ID, store=False,
+            input=[{"type": "text", "text": "依已完整分析的素材、構圖與需求建議成片比例，勿一律直式。需求："
+                    + (args.brief.read_text(encoding="utf-8") if args.brief else "") + "\n素材：" + json.dumps({k: load_card(v) for k, v in cards.items()}, ensure_ascii=False)}],
+            generation_config={"thinking_level": "high", "max_output_tokens": 4096},
+            response_format=structured_json({"type": "object", "required": ["aspect", "why"],
+                "properties": {"aspect": {"type": "string", "enum": list(ASPECTS)},
+                               "why": {"type": "string"}}}),
+            ledger=ledger, budget_stage="delivery_choice")
+        picked = _parse(result_aspect, what="delivery aspect")
+        if picked.get("aspect") not in ASPECTS:
+            raise ValueError("Gemini returned an unsupported aspect")
+        args.aspect = picked["aspect"]
+        resolved_job = resolved_job.model_copy(update={"delivery": resolved_job.delivery.model_copy(update={"aspect": args.aspect})})
+        write_job(resolved_job_path, resolved_job)
+        from montagewright.checkpoints import write_json
+        write_json(work / "delivery-choice.json", picked)
+        print(f"delivery choice: {args.aspect} — {picked['why']}", flush=True)
+
     # Only where the speech is the content. A transcript costs a call and a
     # minute per clip, and on b-roll it answers a question nobody asked --
     # so the card, which already watched the clip with its audio, says which
@@ -2353,7 +2400,8 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
     speaking = [
         source_id for source_id in proxies
         if (load_card(cards[source_id]) if source_id in cards else {})
-        and (load_card(cards[source_id]) or {}).get("speech") == "content"
+        and ((load_card(cards[source_id]) or {}).get("speech") == "content"
+             or (args.subtitles != "none" and (load_card(cards[source_id]) or {}).get("speech") == "ambient"))
         and not (
             source_id in sync_members
             and sync_members[source_id].group_id in master_audio_groups
@@ -2378,7 +2426,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 # Before the call, not after: a transcript on a long clip is
                 # one of the more expensive things here, and the cap is meant
                 # to stop work rather than to describe it afterwards.
-                ledger.check()
+                pass  # Paid dispatch reserves budget; local/replayed work can continue.
                 try:
                     card, usage = transcribe(
                         proxies[source_id], client=client,
@@ -2440,7 +2488,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 )
                 card = load_transcript(destination)
                 if card is None:
-                    ledger.check()
+                    pass  # Paid dispatch reserves budget; local/replayed work can continue.
                     card, _ = transcribe(
                         proxies[picture_id], client=client, locale=args.locale,
                         cache=cache, audio=audio_path, ledger=ledger,
@@ -2472,7 +2520,10 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             set_aside[source_id] = str(
                 card.get("unusable_reason") or "no reason given"
             )
-            continue
+            # Identity screening covers the entire handed-in pool. An early
+            # generic usability verdict must not silently skip its grounding.
+            if args.reference_grounding_spec is None:
+                continue
         # The card says where each subject is; a previous run's tracker has
         # measured how wide the thing the crop follows actually is. Price the
         # object that will be cropped, not the one the description framed.
@@ -2499,9 +2550,9 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 proxy=proxy,
                 composition=(card or {}).get("composition", ""),
                 # Derived, not asked. Whether the camera moved is a fact
-                # about the pixels and was being answered by a model reading
-                # one frame a second -- which is the rate at which a moving
-                # camera and a still one look the same. It was optional too,
+                # about the pixels and was being answered from sparse model
+                # viewing, where a moving camera and a still one can look the
+                # same. It was optional too,
                 # so a missing answer became "still" on the field that
                 # decides whether a digital move gets stacked on a take that
                 # already has one.
@@ -2609,6 +2660,8 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
     # close-up of "the rear camera module" was a different model. Its
     # alternate was too.
     if args.reference_grounding_spec is not None:
+        card_rejected = set(set_aside)
+        screening_sources = [item.source_id for item in material]
         material, identity_aside, sightings = _screen_material_identity(
             material,
             args.reference_grounding_spec,
@@ -2618,6 +2671,19 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             library=library,
         )
         set_aside.update(identity_aside)
+        material = [item for item in material if item.source_id not in card_rejected]
+        from montagewright.checkpoints import write_json
+        write_json(work / "identity-screen-coverage.json", {
+            "source_count": len(screening_sources),
+            "answered_count": len(sightings),
+            "sources": [{
+                "source_id": source_id,
+                "status": "answered" if source_id in sightings else "unresolved",
+                "selection_exclusion": set_aside.get(source_id),
+                "discovery": sightings[source_id].model_dump(mode="json")
+                    if source_id in sightings else None,
+            } for source_id in screening_sources],
+        })
         # Exact boxes are deliberately deferred until direction has bought a
         # bounded primary/alternate pool.  Screening protects recall; paying
         # to locate every positive source before knowing whether the edit can
@@ -2813,7 +2879,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 )
                 material_log = _decided(work, "material_log", material_log_key)
                 if material_log is None:
-                    ledger.check()
+                    pass  # Paid dispatch reserves budget; local/replayed work can continue.
                     print(
                         "material logging: project exceeds the direct reel "
                         "attention budget; Gemini is binning its visual cards",
@@ -2916,7 +2982,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 )
             else:
                 print("editorial stringout: verified cached reel", flush=True)
-            ledger.check()
+            pass  # Paid dispatch reserves budget; local/replayed work can continue.
             print("editorial plan: one merged call with one stringout", flush=True)
             try:
                 plan, usage_direction = decide_editorial_plan(
@@ -2939,7 +3005,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 raise SystemExit(
                     "paid editorial plan failed the local ID contract; saved "
                     "work/invalid-editorial-plan-provider.json. Resume with "
-                    "--allow-paid-plan-repair for one scoped text-only repair."
+                    "--allow-paid-plan-repair for one bounded repair call."
                 ) from error
             _decide(work, "editorial_plan", plan_key, plan)
         else:
@@ -2947,8 +3013,19 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
         # The same authored object supplies story context to audits/replans and
         # supplies shots to execution.  This is deliberately not converted to
         # legacy Direction/Selection or candidate commitments.
+        plan["duration_contract"] = resolved_job.editorial_contract()["duration"]
         direction = plan
         editorial_selection = copy.deepcopy(plan)
+        from montagewright.workflow import publish_proposal
+        publish_proposal(output, plan, aspect=args.aspect, brief=brief)
+        from montagewright.editor_workspace import EditorWorkspace
+        EditorWorkspace(work / "editor", material, brief=brief, direction=direction,
+                        selection=editorial_selection).record("proposal", plan)
+        if getattr(args, "mode", "edit") == "propose":
+            print(f"proposal_ready: {output / 'proposal.md'}", flush=True)
+            output_lease.release()
+            return 0
+
     else:
         direction = _decided(work, "direction", asked)
     if not direct_editorial_plan and direction is None:
@@ -2985,7 +3062,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
     if not direct_editorial_plan and direction is None:
-        ledger.check()
+        pass  # Paid dispatch reserves budget; local/replayed work can continue.
         direction, usage_direction = decide_direction(
             material, brief=brief, aspect=args.aspect, music=args.music,
             music_grid=grid,
@@ -2998,6 +3075,8 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
         print("direction: reused from the last attempt", flush=True)
     if direction is None:  # Defensive invariant and type narrowing.
         raise RuntimeError("planning produced neither an editorial plan nor direction")
+    # Locally owned bounds must survive cached plans and every bounded replan.
+    direction["duration_contract"] = resolved_job.editorial_contract()["duration"]
     print(
         f"direction: {direction['target_seconds']:.0f}s {direction['aspect']}, "
         f"{len(direction.get('unusable', []))} ruled out",
@@ -3075,8 +3154,8 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 flush=True,
             )
         direct_plan_prepared = True
-    # The screen is a filter, not a judge. It reads a 640-pixel proxy at a
-    # frame a second, and when direction -- which watched the same clip --
+    # The screen is a filter, not a judge. It reads a 640-pixel proxy, and
+    # when direction -- which watched the same clip --
     # promises the locked product from a source the screen called absent,
     # the disagreement belongs to the per-shot check that decodes the master
     # at 1440 and looks at the actual frames. Refusing it here argued with a
@@ -3203,7 +3282,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             correction_fault = error
             if correction == 2:
                 raise
-            ledger.check()
+            pass  # Paid dispatch reserves budget; local/replayed work can continue.
             correction_key = _asked(
                 json.dumps(direction, ensure_ascii=False, sort_keys=True),
                 planning_state.material_digest,
@@ -3429,6 +3508,19 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             candidate = saved_attempt.get("selection")
             if isinstance(candidate, dict):
                 selection_to_repair = copy.deepcopy(candidate)
+                normalize_selection(
+                    selection_to_repair, material, commitments=commitments,
+                )
+                attempt_faults = audit_cached_selection(
+                    selection_to_repair, material, direction,
+                    commitments=commitments,
+                    grounding_spec=args.reference_grounding_spec,
+                    duration_mode=args.duration_mode,
+                )
+                if not attempt_faults:
+                    provider_selection = selection_to_repair
+                    selection_to_repair = None
+                    _decide(work, "selection", chose, provider_selection)
                 print(
                     "selection: recovered the latest paid provider attempt "
                     "for local validation before asking again",
@@ -3468,7 +3560,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                     "contract validation; no provider repair needed",
                     flush=True,
                 )
-            elif selection_to_repair is None:
+            else:
                 selection_to_repair = recovered
                 print(
                     "selection: the saved paid draft still needs a scoped "
@@ -3476,7 +3568,11 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                     + "\n  - ".join(recovered_faults),
                     flush=True,
                 )
-    if editorial_selection is not None and provider_selection is None:
+    if (
+        editorial_selection is not None
+        and provider_selection is None
+        and selection_to_repair is None
+    ):
         # The merged call chose the shots but returned them in the model's raw
         # shape -- MM:SS times, spans not yet resolved -- exactly as
         # select_shots receives them from the three-call path. So run the same
@@ -3534,7 +3630,14 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             _decide(work, "selection", chose, provider_selection)
             print("selection: executing the merged editorial plan directly", flush=True)
     if provider_selection is None:
-        ledger.check()
+        if direct_editorial_plan and not bool(
+            getattr(args, "allow_paid_plan_repair", False)
+        ):
+            raise SystemExit(
+                "saved editorial selection still needs repair; review it "
+                "offline or explicitly pass --allow-paid-plan-repair."
+            )
+        pass  # Paid dispatch reserves budget; local/replayed work can continue.
         def record_selection_attempt(
             draft: dict[str, Any], faults: tuple[str, ...], attempt: int,
         ) -> None:
@@ -3554,6 +3657,8 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 commitments=commitments,
                 duration_mode=args.duration_mode,
                 initial_selection=selection_to_repair,
+                identity_evidence=identity_confirmation_outcomes,
+                max_repair_attempts=1 if direct_editorial_plan else 2,
                 attempt_recorder=record_selection_attempt,
             )
         except SelectionUnrenderable as error:
@@ -3643,6 +3748,10 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
     else:
         selection = resolved
         print("selection: reused locally resolved execution plan", flush=True)
+    from montagewright.grounding_recovery import restore_legacy_constraints
+    restore_legacy_constraints(selection)
+    if direct_editorial_plan:
+        _inherit_editorial_music(selection, direction)
     cached_sequence_faults = sequence_disagreements(selection.get("shots") or [])
     if cached_sequence_faults:
         # Two adjacent shots reusing overlapping source is a possible repeated
@@ -3762,6 +3871,9 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
 
         if direction is None:  # Defensive closure narrowing for the renderer.
             raise RuntimeError("render reached without editorial direction")
+        if direct_editorial_plan:
+            _inherit_editorial_music(selection, direction)
+            edl = edl.model_copy(update=_selection_music_placement(selection))
         try:
             revalidate_manifest(ingest)
         except IngestError as error:
@@ -3769,7 +3881,8 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 f"source changed before render: {error}"
             ) from error
 
-        return run(
+        _invalidate_subtitle_derivatives(output)
+        rendered = run(
             edl,
             sources,
             grid,
@@ -3831,58 +3944,28 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             decide_rhythm_first=not direct_editorial_plan,
         )
 
-    # A shot whose identity cannot be proved is one review item, not a reason
-    # to throw away the draft.  Do not silently replace it with another model
-    # choice: that made repeated repairs expensive and, worse, repeatedly
-    # selected the same attractive lookalike.  Keep the editor's timing, make
-    # the picture a safe untracked hold, and let the report/Web editor say
-    # exactly which shot needs a human replacement.
+        # Each successful revision becomes the resume authority. Keeping only
+        # the initial execution plan here made resume revert a repaired shot.
+        _decide(work, "resolved-selection", resolved_selection_key, selection)
+        from montagewright.editor_workspace import record_render
+        record_render(work / "editor", material=material, brief=brief,
+                      direction=direction, selection=selection, preview=rendered[0].preview,
+                      timeline=json.loads((work / "current-timeline.json").read_text()))
+        return rendered
+
+    # Identity failure returns evidence to the editor; it never removes the
+    # target in order to force a center-cropped output.
     identity_swaps: list[str] = []
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             result, plan, report, resolved = cut(edl, sources, rhythm_context)
             break
         except ReferenceShotsUnusable as unproved:
-            if attempt == 2:
-                raise
-            repaired = 0
-            for fault in unproved.faults:
-                index = next(
-                    (
-                        at for at, shot in enumerate(selection["shots"])
-                        if f"k{at:02d}" == fault.clip_id
-                    ),
-                    None,
-                )
-                if index is None:
-                    continue
-                shot = selection["shots"][index]
-                failed_looks = [
-                    look for look in shot.get("looks") or []
-                    if look.get("entity_id") == fault.entity_id
-                ]
-                if not failed_looks:
-                    continue
-                issue = _why(fault)
-                shot["identity_status"] = "needs_review"
-                shot.setdefault("identity_target_id", fault.entity_id)
-                prior_issue = str(shot.get("identity_issue") or "")
-                shot["identity_issue"] = "; ".join(
-                    one for one in (prior_issue, issue) if one
-                )
-                shot["delivered_camera_intent"] = "hold"
-                shot["frame"] = "settles"
-                for look in failed_looks:
-                    look["entity_id"] = "none"
-                identity_swaps.append(
-                    f"{fault.clip_id}: {shot.get('span_id')} could not prove "
-                    f"{fault.entity_id} ({issue}); kept as an untracked draft "
-                    "shot and marked needs_review for manual replacement"
-                )
-                repaired += 1
-                print(f"  {identity_swaps[-1]}", flush=True)
-            if not repaired:
-                raise
+            from montagewright.grounding_recovery import recover
+            selection = recover(selection, unproved.faults, material=material,
+                direction=direction, brief=brief, work=work, client=client,
+                cache=cache, ledger=ledger, grounding_spec=args.reference_grounding_spec,
+                attempt=attempt)
             _decide(
                 work, "resolved-selection", resolved_selection_key, selection
             )
@@ -3936,6 +4019,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
     # and it would otherwise re-read a verdict from before the replan and
     # stop on it.
     undelivered = 0
+    budget_interrupted = False
     stopped = "review not requested"
     # Whatever happens in here, the account of the run still gets written.
     # It used to be written once at the very end, so a crash anywhere after
@@ -3953,7 +4037,13 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
       if args.review:
           # Every round renders before it reviews, so a stopping condition
           # always leaves a finished film rather than a half-planned one.
+          last_review_digest = None
           while True:
+              from montagewright.editor_workspace import decoded_digest
+              current_digest = decoded_digest(result.preview)
+              if last_review_digest == current_digest:
+                  stopped = "revision did not change decoded picture or sound; no additional paid review"
+                  break
               keep_going, stopped = should_continue(
                   rounds, ledger=ledger, undelivered=undelivered
               )
@@ -3975,12 +4065,14 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                           for clip_id, entry in report.rhythm_decisions.items()
                       },
                       degradations=report.degradations,
+                      grounding_spec=args.reference_grounding_spec,
                       client=client,
                       brief=brief,
                       cache=cache,
                       ledger=ledger,
                   )
               except BudgetSpent as error:
+                  budget_interrupted = True
                   stopped = str(error)
                   break
               missed = [
@@ -4002,14 +4094,22 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                       direction=direction["direction"],
                       wanted_seconds=report.target_seconds or 0.0,
                       delivered_seconds=report.delivered_seconds or 0.0,
+                      duration_contract=resolved_job.editorial_contract()["duration"],
+                      complete_pass=True,
+                      editorial_decisions=[{key: shot.get(key) for key in
+                          ("source_id", "canvas_mode", "camera_intent", "why", "picture_role", "audio_role", "speed", "intentional_repeat", "intentional_repeat_reason")}
+                          for shot in selection.get("shots", [])],
                       already=rounds,
+                      grounding_spec=args.reference_grounding_spec,
                       client=client,
                       cache=cache,
                       ledger=ledger,
                   )
               except BudgetSpent as error:
+                  budget_interrupted = True
                   stopped = str(error)
                   break
+              last_review_digest = current_digest
               rounds.append(
                   Round(
                       index=len(rounds) + 1,
@@ -4028,19 +4128,40 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                   and issue.issue_type == "audio_content"
               ]
               if audio_issues:
+                  keep_going, stopped = should_continue(
+                      rounds, ledger=ledger, undelivered=len(audio_issues)
+                  )
+                  if not keep_going:
+                      break
                   # A wrong sentence is not repaired by replacing the image
                   # at its timecode. Re-run the joint selection pass so the
                   # canonical transcript span and the B-roll covering it can
                   # change together, then render before the next review.
                   feedback = "\n".join(
                       f"- {issue.description}；請改成：{issue.fix}"
-                      for issue in audio_issues
+                      for issue in verdict.issues
+                      if issue.severity in {"major", "blocking"}
                   )
                   try:
-                      ledger.check()
+                      pass  # Paid dispatch reserves budget; local/replayed work can continue.
+                      from montagewright.editor_workspace import EditorWorkspace, gather_evidence
+                      audio_workspace = EditorWorkspace(work / "editor", material,
+                          brief=brief, direction=direction, selection=selection,
+                          preview=result.preview,
+                          timeline=json.loads((work / "current-timeline.json").read_text()),
+                          problems=[issue.model_dump(mode="json") for issue in verdict.issues])
+                      audio_evidence, audio_inspected = gather_evidence(audio_workspace, client=client,
+                          cache=cache, ledger=ledger, initial=[{
+                              "operation": "inspect_cut", "source_id": "current_cut",
+                              "start": max(0, float(audio_issues[0].at_seconds or 0)-2),
+                              "end": min(result.duration_seconds, float(audio_issues[0].at_seconds or 0)+8),
+                              "framing": "source"}])
                       selection, _ = select_shots(
                           material,
                           direction,
+                          inspection_parts=audio_evidence,
+                          inspected_results=audio_inspected,
+                          previously_viewed_shots=selection.get("shots", []),
                           brief=(
                               brief
                               + "\n\n## 上一版聲音審核未通過\n"
@@ -4082,6 +4203,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                           edl, sources, rhythm_context
                       )
                   except BudgetSpent as error:
+                      budget_interrupted = True
                       stopped = str(error)
                       break
                   report.target_seconds = float(direction["target_seconds"])
@@ -4167,7 +4289,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                   for index, shot in enumerate(selection["shots"])
               )
               try:
-                  ledger.check()
+                  pass  # Paid dispatch reserves budget; local/replayed work can continue.
                   replanned, usage = replan_shots(
                       failing,
                       material,
@@ -4179,8 +4301,12 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                       ledger=ledger,
                       grounding_spec=args.reference_grounding_spec,
                       commitments=commitments,
+                      editor_selection=selection,
+                      editor_preview=result.preview,
+                      editor_timeline=json.loads((work / "current-timeline.json").read_text()) if (work / "current-timeline.json").exists() else None,
                   )
               except BudgetSpent as error:
+                  budget_interrupted = True
                   stopped = str(error)
                   break
               fresh = replanned.get("shots", [])
@@ -4210,7 +4336,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                   # Shipping a repeated window is worse than keeping the last
                   # reviewed cut, but a single correction usually resolves it.
                   try:
-                      ledger.check()
+                      pass  # Paid dispatch reserves budget; local/replayed work can continue.
                       replanned, usage = replan_shots(
                           failing,
                           material,
@@ -4226,8 +4352,12 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                           ledger=ledger,
                           grounding_spec=args.reference_grounding_spec,
                           commitments=commitments,
+                          editor_selection=selection,
+                          editor_preview=result.preview,
+                          editor_timeline=json.loads((work / "current-timeline.json").read_text()) if (work / "current-timeline.json").exists() else None,
                       )
                   except BudgetSpent as error:
+                      budget_interrupted = True
                       stopped = str(error)
                       break
                   fresh = replanned.get("shots", [])
@@ -4292,11 +4422,12 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                   selection, cards, material=material
               )
               try:
-                  ledger.check()
+                  pass  # Paid dispatch reserves budget; local/replayed work can continue.
                   result, plan, report, resolved = cut(
                       edl, sources, rhythm_context
                   )
               except BudgetSpent as error:
+                  budget_interrupted = True
                   stopped = str(error)
                   break
               report.target_seconds = float(direction["target_seconds"])
@@ -4310,6 +4441,7 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
               )
 
     except BudgetSpent as error:
+        budget_interrupted = True
         stopped = str(error)
         print(f"\nstopped: {stopped}", flush=True)
     except Exception as error:  # noqa: BLE001 -- re-raised below, after the report
@@ -4422,11 +4554,22 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             from montagewright.subtitles import as_cues
 
             wide, tall = plan.output_size
+            (work / "subtitle-layout-pending.json").unlink(missing_ok=True)
             said = as_cues(
                 said, args.aspect, wide, tall, words=subtitle_words,
+                client=client, ledger=ledger,
+                context=json.dumps({"brief": brief, "shots": selection.get("shots", [])}, ensure_ascii=False),
             )
-        except Exception:
-            pass
+            from montagewright.checkpoints import write_json
+            from montagewright.caption_plan import save_cues
+            save_cues(work / "subtitles.json", said)
+        except Exception as error:
+            from montagewright.checkpoints import write_json
+            write_json(work / "subtitle-layout-pending.json", {"reason": str(error)})
+            if isinstance(error, BudgetSpent):
+                budget_interrupted = True
+            report.plan_disagreements.append(f"subtitle layout pending: {error}")
+            print(f"subtitle layout pending: {error}", flush=True)
         if said:
             (output / "subtitles.srt").write_text(
                 to_srt(said, with_speaker=True), encoding="utf-8"
@@ -4501,10 +4644,53 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
         )
         else result.deliverable
     )
+    subtitle_review_faults = []
+    if args.review and resolved_job.delivery.subtitles == "burn" and release_artifact.exists():
+        from montagewright.checkpoints import write_json
+        from montagewright.caption_plan import repair_cues, save_cues
+        from montagewright.subtitles import burn, look
+        from montagewright.transcript import to_srt
+        try:
+            for caption_round in range(2):
+                final_verdict = review_cut(release_artifact, brief=brief + "\n確認字幕錯漏、斷句、閱讀速度、遮擋與聲音同步。",
+                    direction=str(direction.get("direction", "")), client=client,
+                    wanted_seconds=float(direction.get("target_seconds") or 0),
+                    delivered_seconds=result.duration_seconds, cache=cache, ledger=ledger,
+                    duration_contract=resolved_job.editorial_contract()["duration"],
+                    grounding_spec=args.reference_grounding_spec, complete_pass=True,
+                    editorial_decisions=[{key: shot.get(key) for key in ("source_id", "canvas_mode", "why", "speed", "intentional_repeat", "intentional_repeat_reason")}
+                        for shot in selection.get("shots", [])])
+                write_json(work / f"captioned-cut-review-{caption_round}.json", final_verdict.model_dump(mode="json"))
+                write_json(work / "captioned-cut-review.json", final_verdict.model_dump(mode="json"))
+                if final_verdict.verdict == "approve":
+                    break
+                if caption_round or not transcripts:
+                    subtitle_review_faults.append("captioned cut requires review: " + final_verdict.overall)
+                    break
+                fixed = repair_cues(said, subtitle_words, video=result.deliverable,
+                    feedback=final_verdict.model_dump(mode="json"), aspect=args.aspect,
+                    width=plan.output_size[0], height=plan.output_size[1], client=client, cache=cache, ledger=ledger)
+                if [(x.text, x.starts_seconds, x.ends_seconds) for x in fixed] == [(x.text, x.starts_seconds, x.ends_seconds) for x in said]:
+                    subtitle_review_faults.append("caption review requires a non-text correction; unchanged captions were not rendered again")
+                    break
+                save_cues(work / "subtitles-before-repair.json", said)
+                repaired_video = burn(result.deliverable, fixed, output / "deliverable-subtitled-repair.mp4",
+                    aspect=args.aspect, work=work / "subs", style=look(args.subtitle_look), words=subtitle_words)
+                # A failed burn must leave the previous video and its track in agreement.
+                repaired_video.replace(output / "deliverable-subtitled.mp4")
+                save_cues(work / "subtitles.json", fixed)
+                said = fixed
+                (output / "subtitles.srt").write_text(to_srt(said, with_speaker=True), encoding="utf-8")
+                release_artifact = output / "deliverable-subtitled.mp4"
+        except Exception as error:
+            if isinstance(error, BudgetSpent):
+                budget_interrupted = True
+            subtitle_review_faults.append("captioned cut review pending: " + str(error))
     qc_faults = list(technical_qc_faults(
         release_artifact, resolved_job,
         expected_duration=result.duration_seconds,
     ))
+    qc_faults.extend(subtitle_review_faults)
     if resolved_job.delivery.subtitles == "burn" and not (
         output / "deliverable-subtitled.mp4"
     ).exists():
@@ -4517,6 +4703,14 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
             qc_faults.append(
                 "delivery requires a non-empty sidecar subtitle file"
             )
+    if (work / "subtitle-layout-pending.json").exists():
+        qc_faults.append("semantic subtitle layout is pending; see work/subtitle-layout-pending.json")
+    selected_sources = {segment.source.source_id for segment in plan.segments}
+    selected_sources.update(a.source.source_id for a in plan.audio_assignments)
+    for source_id in selected_sources:
+        unresolved = (transcripts.get(source_id) or {}).get("unresolved_lines") or []
+        if unresolved:
+            qc_faults.append(f"{source_id}: {len(unresolved)} corrected speech lines lack Apple timing anchors")
     (work / "technical-qc.json").write_text(
         json.dumps({
             "version": "montagewright-technical-qc-v1",
@@ -4555,6 +4749,10 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
     # the same, and says so to whoever asked.
     if crashed is not None:
         raise crashed
+    if budget_interrupted:
+        from montagewright.checkpoints import write_json
+        write_json(work / "pause.json", {"status": "budget_paused", "reason": stopped, "draft": str(release_manifest.artifact)})
+        return 75
     return 0
 
 
@@ -5027,6 +5225,25 @@ def _material_event_seconds(item: Any, event_ref: str) -> float | None:
     return None
 
 
+def _inherit_editorial_music(selection: dict, direction: dict) -> None:
+    """A scoped shot repair must retain the editor's music placement."""
+    for key in ("music_from_seconds", "music_spans"):
+        if key not in selection and key in direction:
+            selection[key] = copy.deepcopy(direction[key])
+
+
+def _selection_music_placement(selection: dict) -> dict:
+    from montagewright.spans import seconds_of
+    return {
+        "music_from_seconds": seconds_of(selection.get("music_from_seconds")) or 0.0,
+        "music_spans": [
+            (seconds_of(span["from_seconds"]), seconds_of(span["to_seconds"]))
+            if isinstance(span, dict) else tuple(seconds_of(t) for t in span)
+            for span in selection.get("music_spans") or []
+        ],
+    }
+
+
 def _edl_from_selection(
     selection: dict, rushes: Path, cards: dict[str, Path], *,
     transcripts: dict[str, dict] | None = None,
@@ -5036,6 +5253,7 @@ def _edl_from_selection(
     dialogue_mode: str = "continuous_soundbite",
     sync_members: dict[str, Any] | None = None,
 ) -> tuple[EDL, dict[str, str]]:
+    from montagewright.spans import seconds_of
     clips = []
     snaps: dict[str, str] = {}
     material_by_source = {
@@ -5408,6 +5626,15 @@ def _edl_from_selection(
                 approx_in_seconds=start,
                 approx_out_seconds=start + wanted,
                 speed=speed,
+                music_sync=MusicSync(
+                    cut_on_beat=bool(shot.get("cut_on_beat", False)),
+                    sync_to=shot.get("sync_to") or None,
+                    beats=shot.get("beats") or None,
+                    rhythm_reason=str(shot.get("why") or ""),
+                ),
+                canvas_mode=shot.get("canvas_mode", "fill"),
+                transition_in=shot.get("transition_in", "cut"),
+                transition_seconds=seconds_of(shot.get("transition_seconds", 0.4)) or 0.4,
                 in_looks_like=subject_of(shot),
                 energy_intent=shot.get("energy", "medium"),
                 audio_role=shot.get("audio_role", "auto"),
@@ -5577,7 +5804,8 @@ def _edl_from_selection(
     for dropped in audio_drops:
         print(f"  {dropped}", flush=True)
     return EDL(
-        project_id=rushes.name, clips=clips, audio_clips=audio_clips
+        project_id=rushes.name, clips=clips, audio_clips=audio_clips,
+        **_selection_music_placement(selection),
     ), snaps
 
 
@@ -5817,6 +6045,20 @@ def _write_report(output: Path, **parts) -> None:
     )
 
 
+def _writable_upload_cache(requested: Path | None, output: Path) -> UploadCache:
+    """Prove upload receipts can be saved before sending any source bytes."""
+    cache = UploadCache.load(requested or default_cache_path())
+    try:
+        cache.save()
+    except OSError:
+        if requested is not None:
+            raise
+        cache = UploadCache.load(output / "work" / "uploads.json")
+        cache.save()
+        print(f"upload cache: using writable run-local cache {cache.path}", flush=True)
+    return cache
+
+
 def command_transcribe(args: argparse.Namespace) -> int:
     """Subtitle a video without touching the edit.
 
@@ -5827,10 +6069,6 @@ def command_transcribe(args: argparse.Namespace) -> int:
 
     from montagewright.transcript import describe, lines_of, load, save, to_srt
     from montagewright.uploads import content_hash
-
-    client = _client()
-    cache = UploadCache.load(args.upload_cache or default_cache_path())
-    ledger = Ledger(cap_usd=args.budget, model_id=MODEL_ID)
 
     sources = (
         sorted(
@@ -5845,10 +6083,14 @@ def command_transcribe(args: argparse.Namespace) -> int:
 
     output = (args.output or args.source.parent).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+    cache = _writable_upload_cache(args.upload_cache, output)
+    client = _client()
+    ledger = Ledger(cap_usd=args.budget, model_id=MODEL_ID, journal_path=output / "spend-events.jsonl", cumulative_budget=True)
 
     library = (args.library or default_library()).expanduser()
     work = output / "work"
 
+    unresolved_sources = []
     for source in sources:
         # The same proxy a render would make, keyed the same way. Both
         # commands transcribe the same material and this one kept its answer
@@ -5874,9 +6116,27 @@ def command_transcribe(args: argparse.Namespace) -> int:
             )
             save(card, destination)
         lines = lines_of(card)
+        if getattr(args, "aspect", None):
+            from montagewright.subtitles import as_cues
+            from montagewright.transcript import words_in
+            wide, tall = ((1920, 1080) if args.aspect == "16:9" else
+                          (1080, 1080) if args.aspect == "1:1" else
+                          (1080, 1350) if args.aspect == "4:5" else (1080, 1920))
+            lines = as_cues(lines, args.aspect, wide, tall, words=words_in(card),
+                            client=client, ledger=ledger)
         (output / f"{source.stem}.srt").write_text(
             to_srt(lines), encoding="utf-8"
         )
+        from montagewright.checkpoints import write_json
+        unresolved = card.get("unresolved_lines", [])
+        write_json(output / f"{source.stem}.transcript-status.json", {
+            "status": "timing_review_required" if unresolved else "transcribed",
+            "unresolved_lines": unresolved, "uncertain": card.get("uncertain", []),
+            "raw_asr": card.get("raw_asr"),
+        })
+        if unresolved:
+            unresolved_sources.append(source.name)
+            print(f"timing review required: {source.name}; see transcript-status.json", flush=True)
         changed = sum(1 for line in lines if line.corrected)
         print(
             f"{source.name}: {len(lines)} lines, {changed} corrected, "
@@ -5887,7 +6147,7 @@ def command_transcribe(args: argparse.Namespace) -> int:
             print(f"  unsure — {str(note)[:120]}", flush=True)
 
     print(f"transcript spend ${ledger.spent_usd:.4f}", flush=True)
-    return 0
+    return 2 if unresolved_sources else 0
 
 
 def command_timeline(args: argparse.Namespace) -> int:
@@ -6337,9 +6597,13 @@ def main(argv: list[str] | None = None) -> int:
         default="context_allowed",
         help=argparse.SUPPRESS,
     )
+    render.add_argument("--mode", choices=["edit", "propose"], default="edit")
+    render.add_argument("--target-budget", type=float, default=None)
+    render.add_argument("--technical-repair", action=argparse.BooleanOptionalAction, default=True,
+                        help="allow one isolated Codex wiring repair after a Python exception")
     render.add_argument("--music", type=Path)
     render.add_argument("--music-map", type=Path, help=argparse.SUPPRESS)
-    render.add_argument("--aspect", choices=sorted(ASPECTS), default="9:16")
+    render.add_argument("--aspect", choices=["auto", *sorted(ASPECTS)], default="auto")
     render.add_argument(
         "--seconds", type=float, default=0.0,
         help="how long the finished cut should be. Without it the direction "
@@ -6348,9 +6612,9 @@ def main(argv: list[str] | None = None) -> int:
              "'make it 15 seconds' in the brief is a request, not a number.",
     )
     render.add_argument(
-        "--duration-mode", choices=("exact", "range", "preferred"), default="exact",
-        help="whether --seconds is a hard delivery specification or a preferred "
-             "maximum that may resolve shorter when verified content is insufficient",
+        "--duration-mode", choices=("approx", "at_most", "exact", "range", "preferred"), default="approx",
+        help="approx (default): seconds +/- 2; at_most: seconds-2 through seconds; "
+             "exact: frame-accurate; range: explicit bounds; preferred: shorter allowed",
     )
     render.add_argument("--minimum-seconds", type=float, default=None)
     render.add_argument("--maximum-seconds", type=float, default=None)
@@ -6380,7 +6644,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     render.add_argument(
         "--review",
-        action="store_true",
+        action="store_true", default=True,
         help="Watch the finished cut and report what it would change.",
     )
     render.add_argument(
@@ -6432,6 +6696,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     speak.add_argument("source", type=Path)
     speak.add_argument("--locale", default="zh-TW")
+    speak.add_argument("--aspect", choices=sorted(ASPECTS), default=None,
+                       help="semantically segment subtitles for the delivery aspect")
     speak.add_argument("--output", type=Path)
     speak.add_argument("--budget", type=float, default=5.0)
     speak.add_argument("--upload-cache", type=Path)
@@ -6508,10 +6774,36 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         _write_run_state(state, "stopped")
         raise
-    except BaseException:
+    except BudgetSpent as error:
+        from montagewright.checkpoints import write_json
+        reason = str(error)
+        provider_billing = reason.startswith("Gemini ")
+        write_json(Path(where) / "work" / "pause.json", {
+            "status": "budget_paused", "reason": reason,
+            "resume": (
+                "Resolve the provider billing condition described above, then "
+                "resume this output with the existing authorized total budget"
+                if provider_billing else
+                "Increase the authorized total budget and resume this output"
+            ),
+        })
+        _write_run_state(state, "budget_paused")
+        print(f"budget_paused: {error}", flush=True)
+        return 75
+    except GroundingBlocked as error:
+        _write_run_state(state, "grounding_blocked")
+        print(f"grounding_blocked: {error}", flush=True)
+        return 78
+    except BaseException as error:
         _write_run_state(state, "failed")
+        if args.command == "render" and getattr(args, "technical_repair", False):
+            from montagewright.technical_repair import attempt
+            resumed = attempt(error, output=Path(where), argv=effective_argv)
+            if resumed is not None:
+                _write_run_state(state, "budget_paused" if resumed == 75 else "done" if not resumed else "failed")
+                return resumed
         raise
-    _write_run_state(state, "done" if not outcome else "failed")
+    _write_run_state(state, "budget_paused" if outcome == 75 else "done" if not outcome else "failed")
     return outcome
 
 

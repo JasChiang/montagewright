@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from montagewright.planner import ask
-from montagewright.gemini import structured_json
+from montagewright.gemini import structured_json, video_content, static_video_processing
 from montagewright.uploads import upload_now
 
 # v3: two listenings rather than one. The recogniser's timings never reach
@@ -1214,7 +1214,18 @@ def describe(
         _parse,
     )
 
-    heard = hear(audio or source, locale=locale)
+    from montagewright.checkpoints import key_for, read_json, write_json
+    from montagewright.uploads import content_hash
+    evidence_root = (Path(getattr(ledger, "journal_path")).parent / "work" / "asr"
+                     if getattr(ledger, "journal_path", None) else None)
+    raw_path = (evidence_root / (key_for({"audio": content_hash(audio or source),
+                "locale": locale, "swift": TOOL.with_suffix(".swift").read_text()}) + ".json")
+                if evidence_root else None)
+    heard = read_json(raw_path) if raw_path else None
+    if heard is None:
+        heard = hear(audio or source, locale=locale)
+        if raw_path:
+            write_json(raw_path, heard)
     words = words_of(heard)
     silences = gaps(words)
     vad_silences = detector_silences(heard)
@@ -1265,10 +1276,8 @@ def describe(
         model=model_id or MODEL_ID,
         store=False,
         input=[
-            {
-                "type": "video",
-                "mime_type": "video/mp4",
-                "uri": uri,
+            video_content(
+                uri,
                 # Low, deliberately, and this has been argued once already.
                 #
                 # The picture is here mostly for `speaker`: who is saying
@@ -1297,8 +1306,9 @@ def describe(
                 # revisiting for a clip that is both, which would want the
                 # card to record whether there is text on screen so this can
                 # be asked per clip instead of guessed for all of them.
-                "resolution": "low",
-            },
+                resolution="low",
+                processing=static_video_processing(1.0),
+            ),
             {
                 "type": "text",
                 "text": (PROMPTS / "hearing_zh-TW.txt").read_text(encoding="utf-8"),
@@ -1315,11 +1325,8 @@ def describe(
     listened = _parse(listening, what="hearing")
     usage = Usage.from_interaction(listening)
 
-    # Second listening: two transcripts of one piece of audio, and no media
-    # at all. Everything the picture had to say was said by the call above --
-    # who is speaking, what is written on screen, which words a recogniser
-    # would mangle -- and the question left is which of two readings of the
-    # same sound is right, which is a question about two texts.
+    # Compare both transcripts against the source again; text consensus alone
+    # cannot decide which conflicting reading matches the actual audio.
     said_by_ear = "\n".join(
         f"[{one.get('from', '')}–{one.get('to', '')}] "
         f"{one.get('speaker', '')}：{one.get('said', '')}"
@@ -1339,7 +1346,7 @@ def describe(
         upload_cache=cache,
         model=model_id or MODEL_ID,
         store=False,
-        input=[{
+        input=[video_content(uri, resolution="low", processing=static_video_processing(1.0)), {
             "type": "text",
             "text": (
                 f"{instruction}\n\n## 辨識器聽到的（照順序，沒有時間）"
@@ -1357,11 +1364,7 @@ def describe(
     )
     payload = _parse(interaction, what="transcript")
     spent = Usage.from_interaction(interaction)
-    usage = Usage(
-        input_tokens=usage.input_tokens + spent.input_tokens,
-        output_tokens=usage.output_tokens + spent.output_tokens,
-        thought_tokens=usage.thought_tokens + spent.thought_tokens,
-    )
+    usage = Usage.total((usage, spent))
 
     # The model knows the words and where a sentence ends. The recogniser
     # knows when. Take each from the one that has it: the corrected lines are
@@ -1373,12 +1376,24 @@ def describe(
         str(entry.get("text", "")).strip()
         for entry in payload.get("lines", []) or []
     ]
+    original_apple_text = "".join(w.text for w in words)
+    from montagewright.asr_recovery import recover
+    words, recovery_attempts = recover(said, words, listened.get("blocks") or [],
+        audio=audio or source, locale=locale,
+        root=(evidence_root / "recovery") if evidence_root else None)
     timings = across_lines(said, words)
 
+    unresolved = []
     lines = []
     for entry, text, (start, end, timed_text) in zip(
         payload.get("lines", []) or [], said, timings
     ):
+        missing = "".join(piece.text for piece in timed_text
+                          if piece.ends_seconds <= piece.starts_seconds
+                          and any(c.isalnum() for c in piece.text))
+        if end <= start or missing:
+            unresolved.append({"text": text, "missing_text": missing or text,
+                               "reason": "no Apple timing anchor for inserted speech"})
         if end <= start:
             continue
         lines.append({
@@ -1409,6 +1424,10 @@ def describe(
         })
 
     card = {
+        "unresolved_lines": unresolved,
+        "recovery_attempts": recovery_attempts,
+        "raw_asr": str(raw_path) if raw_path else None,
+        "revisions": {"apple_text": original_apple_text, "corrected_lines": said},
         "summary": payload.get("summary", ""),
         "language": payload.get("language", locale),
         "heard_with": heard.get("locale", locale),

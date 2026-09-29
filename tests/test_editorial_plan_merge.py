@@ -83,6 +83,157 @@ def _material():
     ]
 
 
+@pytest.mark.parametrize("duration_mode", ["exact", "preferred"])
+def test_selection_repair_keeps_contract_evidence_and_paid_call_bound(
+    monkeypatch, duration_mode,
+):
+    import copy
+
+    material = _material()
+    shot = _executable_shot("C1:s00", subject="phone", story_point="show phone")
+    # A four-second end hold is shortened locally to 1.5 seconds. Its
+    # three-second look then fails the very same audit the CLI uses.
+    shot.update(seconds_needed=4.0, picture_role="end_hold")
+    initial = {"shots": [shot], "audio_assignments": []}
+    planner.expand_spans(initial, [s for item in material for s in item.spans])
+    before = copy.deepcopy(initial)
+    requests = []
+
+    def fake_ask(client, **request):
+        requests.append(request)
+        return SimpleNamespace(
+            status="completed", output_text=json.dumps({
+                "shots": [shot], "audio_assignments": [],
+            }), usage={"total_input_tokens": 10, "total_output_tokens": 10},
+        )
+
+    monkeypatch.setattr(planner, "ask", fake_ask)
+    monkeypatch.setattr(planner, "_attach_material", lambda *a: [{
+        "type": "text", "text": "C1 recorded material evidence",
+    }])
+    direction = {
+        "direction": "a music-led product film", "aspect": "9:16",
+        "target_seconds": 29.0, "target_shot_count": 8, "unusable": [],
+    }
+    selected, _ = planner.select_shots(
+        material, direction, brief="Distinctive launch brief",
+        client=object(), initial_selection=initial,
+        identity_evidence={("C1", "device.fold"): {"status": "unverified"}},
+        duration_mode=duration_mode, max_repair_attempts=1,
+    )
+    assert initial == before
+    assert len(requests) == 1
+    prompt = "\n".join(p.get("text", "") for p in requests[0]["input"])
+    assert "Distinctive launch brief" in prompt
+    assert "native_motion_policy" in prompt
+    assert "music_montage" in prompt
+    assert '"status": "unverified"' in prompt
+    assert "C1 recorded material evidence" in prompt
+    assert ("不可自行縮短成片" in prompt) == (duration_mode == "exact")
+    faults = planner.audit_cached_selection(
+        selected, material, direction, duration_mode=duration_mode,
+    )
+    assert faults
+    assert set(faults) <= set(selected["invalid_selection_faults"])
+
+
+@pytest.mark.parametrize("speed", [1.0, 2.0])
+def test_direct_named_action_owns_window_without_commitments(speed):
+    material = [MaterialItem(
+        source_id="C8376", duration_seconds=14,
+        summary="pose for photo",
+        spans=(Span("C8376:s00", "C8376", 0, 14, "pose", "handheld_texture"),),
+        action_ids=("a01",), action_windows=(("a01", 0, 4),),
+        action=("`a01` pose 0.0-4.0s",), sightings=(("phone", 3.0),),
+    )]
+    shot = _executable_shot("C8376:s00", subject="phone", story_point="pose")
+    shot.update(
+        action_id="a01", action_treatment="complete_here", speed=speed,
+        start_offset_seconds=3, seconds_needed=4 / speed,
+    )
+    shot["looks"][0]["seconds"] = 4 / speed
+    selected = {"shots": [shot], "audio_assignments": []}
+    planner.expand_spans(selected, list(material[0].spans))
+    assert any("does not contain" in fault for fault in
+               planner.action_contract_disagreements(selected["shots"], material))
+    planner.normalize_selection(selected, material)
+    assert shot["start_seconds"] == 0
+    assert shot["seconds_needed"] == 4 / speed
+    assert not planner.action_contract_disagreements(selected["shots"], material)
+    from montagewright.coverage import selection_coverage_audit
+    assert not selection_coverage_audit(selected, material, 4 / speed).faults
+
+
+def test_edl_preserves_editor_timing_unless_music_alignment_is_requested(tmp_path):
+    from montagewright.cli import _edl_from_selection
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+
+    shot = _executable_shot("C1:s00", subject="phone", story_point="detail")
+    shot.update(seconds_needed=3.1, picture_role="music_montage")
+    selection = {"shots": [shot], "audio_assignments": []}
+    planner.expand_spans(selection, [s for item in _material() for s in item.spans])
+    edl, _ = _edl_from_selection(selection, tmp_path, {}, material=_material())
+    grid = BeatGrid(100, 4, tuple(Cue(str(i), i * 0.6, "beat") for i in range(10)), 6)
+    assert edl.clips[0].music_sync.cut_on_beat is False
+    assert ground_timeline(edl, grid).clips[0].duration_seconds == pytest.approx(3.1)
+    shot.update(cut_on_beat=True, beats=4, sync_to="chorus")
+    edl, _ = _edl_from_selection(selection, tmp_path, {}, material=_material())
+    assert edl.clips[0].music_sync.cut_on_beat is True
+    assert edl.clips[0].music_sync.beats == 4
+    assert edl.clips[0].music_sync.sync_to == "chorus"
+
+
+def test_normalization_keeps_distinct_co_visible_identities():
+    shot = _executable_shot("C1:s00", subject="phone", story_point="compare")
+    look = shot["looks"][0]
+    look.update(entity_id="phone", co_visible_entity_ids=["phone", "watch", "watch"])
+    selected = {"shots": [shot], "audio_assignments": []}
+    planner.expand_spans(selected, [s for item in _material() for s in item.spans])
+    planner.normalize_selection(selected, _material())
+    assert look["entity_id"] == "phone"
+    assert look["co_visible_entity_ids"] == ["watch"]
+
+
+def test_resume_promotes_valid_attempt_before_older_blocked_draft(tmp_path):
+    import ast
+    import copy
+    import inspect
+    from montagewright import cli
+
+    # Execute the real recovery branch in isolation: no scanning, uploads or
+    # provider calls. The recovered answer still runs the production audit.
+    tree = ast.parse(inspect.getsource(cli.command_render))
+    branch = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If) and any(
+            isinstance(stmt, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "saved_attempt"
+                for target in stmt.targets
+            ) for stmt in node.body
+        )
+    )
+    candidate = {"shots": [_executable_shot(
+        "C1:s00", subject="phone", story_point="detail",
+    )], "audio_assignments": []}
+    planner.expand_spans(candidate, [s for item in _material() for s in item.spans])
+    saved = []
+    scope = dict(
+        provider_selection=None, selection_to_repair=None, work=tmp_path,
+        chose="new-contract", material=_material(), commitments=None,
+        direction={"target_seconds": 3, "unusable": []}, copy=copy,
+        args=SimpleNamespace(reference_grounding_spec=None, duration_mode="exact"),
+        _decided=lambda *a: None,
+        _latest_decision=lambda *a: {"selection": candidate, "faults": []},
+        _decide=lambda *a: saved.append(a),
+        normalize_selection=planner.normalize_selection,
+        audit_cached_selection=planner.audit_cached_selection,
+    )
+    exec(compile(ast.Module(body=[branch], type_ignores=[]), "recovery", "exec"), scope)
+    assert scope["provider_selection"] is not None
+    assert scope["selection_to_repair"] is None
+    assert saved[0][1:3] == ("selection", "new-contract")
+
+
 _PLAN = {
     "reasoning": "r", "material_assessment": "m", "direction": "d",
     "target_seconds": "1:00",
@@ -743,3 +894,67 @@ def test_subject_location_is_checkpointed_immediately(monkeypatch, tmp_path):
     assert len(calls) == 1
     assert calls[0]["generation_config"]["max_output_tokens"] == 4096
     assert usage == planner.Usage(0, 0, 0)
+
+
+def test_scoped_repair_retains_music_and_edl_uses_shifted_beat_clock(tmp_path):
+    from montagewright.cli import _edl_from_selection, _inherit_editorial_music
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+
+    shot = _executable_shot('C1:s00', subject='phone', story_point='detail')
+    shot.update(seconds_needed=3.1, picture_role='music_montage', cut_on_beat=True)
+    selection = {'shots': [shot]}
+    planner.expand_spans(selection, [s for item in _material() for s in item.spans])
+    direction = {'music_from_seconds': '0:16', 'music_spans': []}
+    _inherit_editorial_music(selection, direction)
+    edl, _ = _edl_from_selection(selection, tmp_path, {}, material=_material())
+    assert edl.music_from_seconds == 16
+    grid = BeatGrid(100, 4, tuple(Cue(str(i), i * .6, 'beat') for i in range(50)), 30)
+    timeline = ground_timeline(edl, grid)
+    # 19.2 would exceed the shot's 3.1-second evidence claim; the prior
+    # absolute beat is 18.6, i.e. 2.6 seconds into the shifted music.
+    assert timeline.clips[0].duration_seconds == pytest.approx(2.6)
+    assert selection['music_spans'] is not direction['music_spans']
+    selection['music_from_seconds'] = 0
+    _inherit_editorial_music(selection, direction)
+    assert selection['music_from_seconds'] == 0  # explicit editorial revision wins
+
+
+def test_music_span_clock_survives_edl_compilation(tmp_path):
+    from montagewright.cli import _edl_from_selection
+    shot = _executable_shot('C1:s00', subject='phone', story_point='detail')
+    selection = {'shots': [shot], 'music_spans': [
+        {'from_seconds': '0:16', 'to_seconds': '0:24'}, [32, 40],
+    ]}
+    planner.expand_spans(selection, [s for item in _material() for s in item.spans])
+    edl, _ = _edl_from_selection(selection, tmp_path, {}, material=_material())
+    assert edl.music_spans == [(16, 24), (32, 40)]
+
+
+@pytest.mark.parametrize('offset,allowed', [(0, True), (1, False)])
+def test_replan_reuses_same_viewed_window_but_requires_new_interval_evidence(tmp_path, monkeypatch, offset, allowed):
+    import copy
+    from dataclasses import replace
+    import montagewright.editor_workspace as workspace
+    from montagewright.cost import Ledger
+
+    proxy = tmp_path / 'proxy.mp4'
+    proxy.write_bytes(b'fixture; media tools are mocked')
+    material = [replace(_material()[0], proxy=proxy)]
+    old = _executable_shot('C1:s00', subject='phone', story_point='detail')
+    old.update(seconds_needed=3, picture_role='music_montage', cut_on_beat=True)
+    selection = {'shots': [old]}
+    planner.expand_spans(selection, list(material[0].spans))
+    new = copy.deepcopy(old)
+    new.update(replace_clip_id='k00', start_offset_seconds=offset)
+    new.pop('cut_on_beat')  # the legacy replacement schema lacks rhythm fields
+    monkeypatch.setattr(workspace, 'gather_evidence', lambda *a, **k: ([], []))
+    monkeypatch.setattr(planner, 'ask', lambda *a, **k: SimpleNamespace(
+        output_text=json.dumps({'shots': [new]})))
+    kwargs = dict(client=object(), editor_selection=selection,
+                  ledger=Ledger(cap_usd=0, journal_path=tmp_path/'spend.jsonl'))
+    if allowed:
+        result, _ = planner.replan_shots([(0, old, 'reframe')], material, {'unusable': [], 'direction': 'product detail', 'target_seconds': 3, 'aspect': '9:16'}, **kwargs)
+        assert result['shots'][0]['cut_on_beat'] is True
+    else:
+        with pytest.raises(ValueError, match='outside inspected footage'):
+            planner.replan_shots([(0, old, 'reframe')], material, {'unusable': [], 'direction': 'product detail', 'target_seconds': 3, 'aspect': '9:16'}, **kwargs)

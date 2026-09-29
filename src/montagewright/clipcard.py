@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from montagewright.planner import MAX_OUTPUT_TOKENS, ask
-from montagewright.gemini import structured_json
+from montagewright.gemini import (
+    VIDEO_PROCESSING_POLICY_VERSION,
+    motion_video_processing,
+    static_video_processing,
+    structured_json,
+    video_content,
+)
 from montagewright.spans import seconds_of
 
 from montagewright.uploads import upload_now
@@ -63,7 +69,11 @@ def _card_version() -> str:
 
     shape = json.dumps(card_schema(), sort_keys=True, ensure_ascii=False)
     prompt = (PROMPTS / "clipcard_zh-TW.txt").read_text(encoding="utf-8")
-    said = hashlib.sha256((shape + prompt + READING).encode("utf-8"))
+    said = hashlib.sha256(
+        (shape + prompt + READING + VIDEO_PROCESSING_POLICY_VERSION + "full-source-static-v1").encode(
+            "utf-8"
+        )
+    )
     return f"montagewright-clip-card-{said.hexdigest()[:8]}"
 
 
@@ -761,11 +771,10 @@ def clip_seconds(path: Path) -> float:
 
 # How far past the measured end a timestamp may land and still be believed.
 #
-# Gemini samples video at one frame a second, so what it can say is roughly
-# integer seconds -- on a clip lasting 12.012s the last frame it holds is at
-# 12, and "the action ends at 13" is a rounding artefact rather than a
-# mistake. A tolerance of half a second, which is what this had first, threw
-# that away and deleted a real action.
+# Model timestamps remain coarse even when the visual sampling rate is denser:
+# on a clip lasting 12.012s, "the action ends at 13" can be a semantic rounding
+# artefact rather than a mistake. A tolerance of half a second, which is what
+# this had first, threw that away and deleted a real action.
 #
 # There is a lot of room to be generous here: the smallest possible MM:SS
 # collision is 1:01 written as 101 on a clip just past a minute, which
@@ -969,13 +978,10 @@ def describe_clip(
             f"（{duration:.1f} 秒）。\n"
             f"時間一律寫成 MM:SS，最後一段要到這裡為止。\n"
         )
-        # The half it cannot see. Video reaches it at a frame a second, and
-        # camera shake is what happens between frames, so "is this stable"
-        # is not a question the picture it was given can answer -- it
-        # answered "固定鏡頭，畫面穩定清晰" about a take whose first three
-        # seconds are the operator still finding the frame. Measured here
-        # and handed over as intervals with ids, so the model is asked what
-        # the movement means and never whether it happened.
+        # Local measurement supplies the reproducible geometry even when
+        # agentic browsing skips a brief shake. A moving take is sent at a
+        # fixed 4/8 FPS below, so the model is asked what the measured move
+        # means and never whether it happened.
         if motion:
             from montagewright.motion import describe as describe_motion
 
@@ -987,6 +993,9 @@ def describe_clip(
     else:
         uri, _ = cache.uri_for(proxy, client, mime_type="video/mp4")
 
+    processing = motion_video_processing(motion, source_seconds=duration)
+    if processing == "agentic":
+        processing = static_video_processing(1.0)
     interaction = ask(
         client,
         upload_cache=cache,
@@ -996,12 +1005,11 @@ def describe_clip(
         # a single video is to put the text last, and this had it the other
         # way round since the card writer was first written.
         input=[
-            {
-                "type": "video",
-                "mime_type": "video/mp4",
-                "uri": uri,
-                "resolution": "low",
-            },
+            video_content(
+                uri,
+                resolution="low",
+                processing=processing,
+            ),
             {"type": "text", "text": instruction},
         ],
         # One short clip. Anything past this is not a slow answer, it is a
@@ -1028,6 +1036,9 @@ def describe_clip(
     # whatever the field says, so the conversion happens on receipt.
     card["subjects"] = _to_frame_fractions(card.get("subjects", []))
     card = times_on_receipt(card, duration)
+    card["inspection"] = {"start_seconds": 0.0, "end_seconds": duration,
+                          "processing": processing, "audio": "included",
+                          "scope": "full_source_sampled"}
     return card, Usage.from_interaction(interaction)
 
 

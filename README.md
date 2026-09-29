@@ -119,7 +119,10 @@ Montagewright 分開保存：
 
 `--budget` 是整輪工作的美元上限。每次付費呼叫送出前，Montagewright 會用最大輸出 token 先保留最壞情況預算；餘額不夠就不送出，留下當下最好的成片，而不是偷偷換成較差的判斷。
 
-目前 production model 固定為 `gemini-3.7-flash`。費率依 Google 公告，
+目前 production model 預設為穩定版 `gemini-3.8-flash`（可用
+`MONTAGEWRIGHT_GEMINI_MODEL` 覆寫）。長片語意瀏覽使用 agentic；
+只有本機量到運動的素材卡使用 static 4 FPS，20 秒內的快速運動才升到 8 FPS。
+費率依 Google 公告，
 以 UTC 日期在每次預算保留與實際結算時自動選擇：
 
 | Token 類型 | 至 2026-12-31（含） | 2027-01-01 起 |
@@ -168,6 +171,15 @@ pip install -e .
 export GEMINI_API_KEY='...'
 # GOOGLE_API_KEY 也可使用
 ```
+
+第一次驗證 Agentic Video 時，先用單一短片做不重試的 smoke test：
+
+```bash
+python -m scripts.agentic_video_smoke fixtures/generated/C_fast_transient_ui.mp4
+```
+
+結果會寫入 `artifacts/agentic-smoke/`；只有回應同時包含
+`processing_call` 與 `processing_result` 才標記為官方 agentic 已驗證。
 
 ### SAM 2.1（建議安裝）
 

@@ -20,10 +20,12 @@ from uuid import uuid4
 from typing import Mapping, NotRequired, TypedDict
 
 # USD per million tokens. Thinking tokens bill at the output rate. Google
-# publishes an introductory 3.7 Flash price through 2026-12-31, inclusive;
+# publishes the same introductory 3.7/3.8 Flash price through 2026-12-31;
 # the transition is evaluated in UTC every time money is reserved or settled,
 # so a long-lived Web process does not need a restart on New Year's Day.
-GEMINI_37_PROMO_END = date(2026, 12, 31)
+GEMINI_FLASH_PROMO_END = date(2026, 12, 31)
+# Compatibility name for callers written before 3.8 shipped.
+GEMINI_37_PROMO_END = GEMINI_FLASH_PROMO_END
 PRICING: dict[str, dict[str, dict[str, float]]] = {
     "gemini-3.6-flash": {
         # 3.6 has no temporary introductory rate.  Keeping both periods in
@@ -52,6 +54,18 @@ PRICING: dict[str, dict[str, dict[str, float]]] = {
             "output": 7.50,
         },
     },
+    "gemini-3.8-flash": {
+        "promotional": {
+            "input": 0.75,
+            "cached_input": 0.075,
+            "output": 3.75,
+        },
+        "standard": {
+            "input": 1.50,
+            "cached_input": 0.15,
+            "output": 7.50,
+        },
+    },
 }
 
 
@@ -65,7 +79,7 @@ def pricing_for(
     when = datetime.now(timezone.utc).date() if at is None else (
         at.date() if isinstance(at, datetime) else at
     )
-    period = "promotional" if when <= GEMINI_37_PROMO_END else "standard"
+    period = "promotional" if when <= GEMINI_FLASH_PROMO_END else "standard"
     return PRICING[model_id][period]
 
 
@@ -104,7 +118,7 @@ class Spend(TypedDict):
 @dataclass
 class Ledger:
     cap_usd: float
-    model_id: str = "gemini-3.7-flash"
+    model_id: str = "gemini-3.8-flash"
     journal_path: Path | None = None
     run_id: str = field(default_factory=lambda: uuid4().hex)
     entries: list[dict[str, float | str]] = field(default_factory=list)
@@ -112,12 +126,19 @@ class Ledger:
         default_factory=list
     )
     reservations: dict[str, Reservation] = field(default_factory=dict)
+    cumulative_budget: bool = False
+    target_usd: float | None = None
+    completion_reserve: dict[str, float] = field(default_factory=dict)
+    target_notified: bool = False
+    prior_spend_usd: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         if self.model_id not in PRICING:
             raise ValueError(
                 f"no production pricing for {self.model_id}"
             )
+        if self.cumulative_budget:
+            self.prior_spend_usd = float(self.cumulative_summary()["spent_usd"])
 
     @property
     def spent_usd(self) -> float:
@@ -127,7 +148,7 @@ class Ledger:
     def remaining_usd(self) -> float:
         return max(
             0.0,
-            self.cap_usd - self.spent_usd - self.reserved_usd,
+            self.cap_usd - self.prior_spend_usd - self.spent_usd - self.reserved_usd,
         )
 
     @property
@@ -166,12 +187,23 @@ class Ledger:
             output_tokens=max_output_tokens,
             rates=pricing_for(charged_model),
         )
-        available = self.cap_usd - self.spent_usd - self.reserved_usd
+        # Reserve completion stages before spending on earlier work. Once a
+        # stage is actually reached its own escrow is available to that call.
+        self.completion_reserve.pop(stage, None)
+        if stage in {"shot_review", "review"}:
+            # A rendered artifact must be assessed before optional further
+            # editorial tool work. Keeping that future repair escrow here
+            # blocked the Fold8 review with $0.97 still under its $6 cap.
+            self.completion_reserve.pop("editor_tools", None)
+        protected = sum(self.completion_reserve.values())
+        available = (
+            self.cap_usd - self.prior_spend_usd - self.spent_usd - self.reserved_usd - protected
+        )
         if usd > available + 1e-9:
             raise BudgetSpent(
                 f"{stage} could cost up to ${usd:.4f}, but only "
                 f"${max(0.0, available):.4f} remains of the "
-                f"${self.cap_usd:.2f} cap; it was not sent"
+                f"${self.cap_usd:.2f} cap (${protected:.4f} protected for completion); it was not sent"
             )
         reservation_id = uuid4().hex
         self.reservations[reservation_id] = Reservation(
@@ -194,6 +226,9 @@ class Ledger:
         input_tokens: int,
         output_tokens: int,
         cached_tokens: int = 0,
+        tool_use_tokens: int = 0,
+        processing_calls: int = 0,
+        processing_results: int = 0,
     ) -> float:
         reservation = self.reservations.pop(reservation_id)
         return self.record(
@@ -201,6 +236,9 @@ class Ledger:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
+            tool_use_tokens=tool_use_tokens,
+            processing_calls=processing_calls,
+            processing_results=processing_results,
             model_id=reservation.model_id,
         )
 
@@ -212,12 +250,16 @@ class Ledger:
         output_tokens: int,
         cached_tokens: int = 0,
         model_id: str | None = None,
+        tool_use_tokens: int = 0,
+        processing_calls: int = 0,
+        processing_results: int = 0,
+        response_id: str | None = None,
     ) -> float:
         now = datetime.now(timezone.utc)
         charged_model = model_id or self.model_id
         rates = pricing_for(charged_model, at=now)
         usd = self._usd(
-            input_tokens=input_tokens,
+            input_tokens=input_tokens + tool_use_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
             rates=rates,
@@ -225,11 +267,12 @@ class Ledger:
         entry: dict[str, float | str] = {
             "stage": stage,
             "input": input_tokens,
+            "tool_use": tool_use_tokens,
             "cached": cached_tokens,
             "output": output_tokens,
             "usd": round(usd, 6),
             "pricing_period": (
-                "promotional" if now.date() <= GEMINI_37_PROMO_END
+                "promotional" if now.date() <= GEMINI_FLASH_PROMO_END
                 else "standard"
             ),
             "input_rate": rates["input"],
@@ -237,8 +280,17 @@ class Ledger:
             "output_rate": rates["output"],
             "pricing_at": now.isoformat(),
             "model_id": charged_model,
+            "processing_calls": processing_calls,
+            "processing_results": processing_results,
         }
+        if response_id is not None:
+            entry["response_id"] = response_id
         self.entries.append(entry)
+        if (self.target_usd is not None and not self.target_notified
+                and self.prior_spend_usd + self.spent_usd >= self.target_usd):
+            self.target_notified = True
+            print(f"target budget reached (${self.target_usd:.2f}); continuing within authorized ${self.cap_usd:.2f}", flush=True)
+
         self._journal(entry)
         return usd
 
@@ -307,7 +359,7 @@ class Ledger:
         return {
             "cap_usd": self.cap_usd,
             "spent_usd": round(spent, 6),
-            # The cap is per invocation; cumulative history may exceed it.
+            # Render resumes include historical spend in the available cap.
             "remaining_usd": round(self.remaining_usd, 6),
             "calls": settled_calls,
             "by_stage": by_stage,
@@ -318,9 +370,10 @@ class Ledger:
     def check(self) -> None:
         """Call before dispatching, so the cap stops work rather than paying for it."""
 
-        if self.spent_usd >= self.cap_usd:
+        spent = self.prior_spend_usd + self.spent_usd
+        if spent >= self.cap_usd:
             raise BudgetSpent(
-                f"spent ${self.spent_usd:.4f} of ${self.cap_usd:.2f}; "
+                f"spent ${spent:.4f} of ${self.cap_usd:.2f}; "
                 "delivering the best cut reached so far"
             )
 

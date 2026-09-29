@@ -19,9 +19,9 @@ class _Strict(BaseModel):
 
 
 class Delivery(_Strict):
-    aspect: Literal["9:16", "16:9", "1:1", "4:5"] = "9:16"
+    aspect: Literal["auto", "9:16", "16:9", "1:1", "4:5"] = "auto"
     seconds: float = Field(default=0.0, ge=0.0)
-    duration_mode: Literal["exact", "range", "preferred"] = "preferred"
+    duration_mode: Literal["approx", "at_most", "exact", "range", "preferred"] = "approx"
     minimum_seconds: float | None = Field(default=None, ge=0.0)
     maximum_seconds: float | None = Field(default=None, gt=0.0)
     subtitles: Literal["none", "sidecar", "burn"] = "sidecar"
@@ -38,6 +38,35 @@ class Delivery(_Strict):
     width: int | None = Field(default=None, gt=0)
     height: int | None = Field(default=None, gt=0)
     loudness_lufs: float = Field(default=-14.0, ge=-24.0, le=-9.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_duration_request(cls, value: Any) -> Any:
+        """Compile friendly requests once; all execution uses explicit bounds.
+
+        Keep the legacy preferred mode available for deliberately unbounded
+        short drafts. Omitted modes now mean approximately, across all inputs.
+        """
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        mode = value.get("duration_mode", "approx")
+        if mode not in {"approx", "at_most"}:
+            return value
+        seconds = float(value.get("seconds", 0.0))
+        if value.get("minimum_seconds") is not None or value.get("maximum_seconds") is not None:
+            raise ValueError("explicit duration bounds require duration_mode range")
+        if seconds <= 0:
+            if mode == "at_most":
+                raise ValueError("at_most duration requires positive seconds")
+            value["duration_mode"] = "preferred"
+            return value
+        value.update(
+            duration_mode="range",
+            minimum_seconds=max(0.0, seconds - 2.0),
+            maximum_seconds=seconds if mode == "at_most" else seconds + 2.0,
+        )
+        return value
 
     @model_validator(mode="after")
     def exact_has_a_number(self) -> "Delivery":
@@ -143,7 +172,16 @@ class Subject(_Strict):
 
 class RunPolicy(_Strict):
     budget_usd: float = Field(default=5.0, ge=0.0)
-    review: bool = False
+    review: bool = True
+    technical_repair: bool = True
+    mode: Literal["edit", "propose"] = "edit"
+    target_budget_usd: float | None = Field(default=None, ge=0.0)
+
+    @model_validator(mode="after")
+    def target_within_cap(self):
+        if self.target_budget_usd is not None and self.target_budget_usd > self.budget_usd:
+            raise ValueError("target budget must not exceed authorized budget")
+        return self
 
 
 class TimelineWindow(_Strict):
@@ -408,8 +446,10 @@ def job_to_argv(job: EditJob, source_path: Path) -> tuple[str | None, list[str]]
     option("--speech", job.sound.speech)
     option("--locale", job.sound.locale)
     option("--budget", job.run.budget_usd)
-    if job.run.review:
-        argv.append("--review")
+    option("--mode", job.run.mode)
+    option("--target-budget", job.run.target_budget_usd)
+    argv.append("--review" if job.run.review else "--no-review")
+    argv.append("--technical-repair" if job.run.technical_repair else "--no-technical-repair")
 
     subject = job.subject
     if subject is not None:

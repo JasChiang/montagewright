@@ -1539,8 +1539,10 @@
         <div class="graphic-preview-status hide" id="graphic-preview-status">正在產生精準預覽…</div>
         <div class="crop-warning hide" id="crop-warn">這一輪沒有留下裁切紀錄，框是事後從素材卡重算的，不等於實際裁切</div>
       </div>
+      <div id="editor-history" class="hide"><a id="editor-context-link" target="_blank">素材脈絡與工具紀錄</a> · <a id="editor-current" target="_blank">本版預覽</a> · <a id="editor-previous" target="_blank">上一版預覽</a></div>
       <div class="screen">
         <div class="stage-label">預覽工作區</div>
+
         <div class="over" id="over"></div>
         <!-- While it cuts. Each shot is a file on disk the moment it is
              rendered, so there is no reason for this to be a black screen
@@ -1671,6 +1673,10 @@
         <p class="group-say">給誰看、要記得什麼、非講不可的是哪些。寫得越具體，挑片越像你要的。</p>
         <div class="fields">
           <div class="field wide brief-field">
+            <label for="run-mode">這次要完成什麼</label>
+            <select id="run-mode"><option value="edit">直接剪輯並審片</option><option value="propose">看完素材，先提供方案</option></select>
+            <label for="target-budget">目標預算（美元，可留空；接近時提醒）</label>
+            <input id="target-budget" type="number" min="0" step="0.5" placeholder="不另外設定">
             <textarea id="brief" placeholder="例如：給沒到現場的人看。要有會場氛圍與人物，主角是那台摺疊機，最後收在一顆穩定的產品畫面。"></textarea>
             <label class="check"><input type="checkbox" id="inherit-brief"> 沿用目前這一輪的 Brief</label>
             <details class="deeper"><summary>已經寫成檔案了</summary>
@@ -1700,19 +1706,21 @@
               <input type="number" id="seconds" min="0" step="1" placeholder="自動"
                      style="flex:0 0 84px">
               <select id="duration-mode">
-                <option value="preferred">大約就好</option>
+                <option value="approx">大約（前後 2 秒）</option>
+                <option value="at_most">不得超過（可少 2 秒）</option>
                 <option value="range">落在允許範圍</option>
                 <option value="exact">要剛剛好</option>
+                <option value="preferred">依素材長度（可更短）</option>
               </select>
             </div>
             <div class="row hide" id="duration-range-fields" style="gap:8px;margin-top:7px">
               <label style="flex:1">最短秒數<input type="number" id="minimum-seconds" min="0" step="1" placeholder="例如 27"></label>
               <label style="flex:1">最長秒數<input type="number" id="maximum-seconds" min="0" step="1" placeholder="例如 33"></label>
             </div>
-            <div class="why">「大約」不會用空停留硬補滿。</div></div>
+            <div class="why">例如 60 秒：大約為 58–62 秒，不得超過為 58–60 秒。未填則自動。素材不足會保留短版並標示缺口，不會用空停留硬補滿，也不靠重複或拖慢湊長。</div></div>
           <div class="field"><label>畫面比例</label>
-            <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select>
-            <div class="why">9:16 直式，給手機看。</div></div>
+            <select id="aspect"><option value="auto">由 Gemini 建議</option><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select>
+            <div class="why">未指定比例時，先由 Gemini 根據素材建議。</div></div>
           <div class="field"><label>現場說話</label>
             <select id="speech"><option value="auto">有人講話就聽寫</option><option value="never">不用聽寫</option></select>
             <div class="why">沒有旁白的活動片可以關掉，省時間。</div></div>
@@ -1827,15 +1835,15 @@
           </select></div>
         <div class="field"><label>最多花多少（美元）</label>
           <input type="number" id="budget" value="6" min="0.5" step="0.5">
-          <div class="why">花到這個數字就停下來，已經做完的不會重付。</div></div>
+          <div class="why">新的付費步驟超出上限時暫停；保存成果，調高上限後續跑。</div></div>
         </div></details>
       </div>
       <div class="actions">
         <button class="ghost" id="preflight-go" disabled>先做免費檢查</button>
         <button id="go" disabled>開始剪輯（會使用 Gemini）</button>
         <input type="checkbox" class="hide" id="preflight-only">
-        <label class="check"><input type="checkbox" id="review"> 剪完讓它自己審一遍再改（比較慢，也比較貴）</label>
-        <span class="why">兩個按鈕都會先做完整本機檢查；只有「開始剪輯」在檢查通過後才呼叫 Gemini。開始前會保存可重跑的工作單。</span>
+        <label class="check"><input type="checkbox" id="review" checked> 剪完讓它自己審一遍再改（比較慢，也比較貴）</label>
+        <span class="why">兩個按鈕都會先做完整本機檢查；提案或剪輯都會在檢查通過後使用 Gemini。開始前會保存可重跑的工作單。</span>
         <span class="grow"></span>
         <button class="ghost" id="close-sheet">關閉</button>
       </div>
@@ -1850,6 +1858,8 @@
         </span>
       </div>
       <div class="fault hide" id="fault"></div>
+      <div id="proposal-result" class="hide"><a id="proposal-download">下載剪輯方案</a>
+      <button id="proposal-edit">依此方案繼續剪輯</button></div>
       <ol class="steps" id="steps"></ol>
       <details id="raw"><summary class="why">原始輸出</summary><div id="log"></div></details>
     </div>
@@ -1978,10 +1988,15 @@ function addDeliveryVariant(value = {}) {
   row.innerHTML = `<label style="flex:1;min-width:120px">版本名稱<input class="variant-id" value="${esc(value.variant_id || `version-${deliveryVariantSerial}`)}"></label>
     <label style="flex:0 0 100px">比例<select class="variant-aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select></label>
     <label style="flex:0 0 100px">秒數<input type="number" min="1" step="1" class="variant-seconds" value="${esc(value.delivery?.seconds || 15)}"></label>
-    <label style="flex:0 0 130px">長度規格<select class="variant-duration"><option value="preferred">大約</option><option value="exact">固定</option></select></label>
+    <label style="flex:0 0 150px">長度規格<select class="variant-duration"><option value="approx">大約（前後 2 秒）</option><option value="at_most">不得超過</option><option value="range">指定範圍</option><option value="exact">固定</option><option value="preferred">依素材（可更短）</option></select></label>
+    <label class="variant-range" style="flex:0 0 90px">最短<input type="number" min="0" step="any" class="variant-minimum" value="${esc(value.delivery?.minimum_seconds ?? '')}"></label>
+    <label class="variant-range" style="flex:0 0 90px">最長<input type="number" min="0" step="any" class="variant-maximum" value="${esc(value.delivery?.maximum_seconds ?? '')}"></label>
     <button type="button" class="ghost variant-remove">移除</button>`;
   row.querySelector('.variant-aspect').value = value.delivery?.aspect || '16:9';
-  row.querySelector('.variant-duration').value = value.delivery?.duration_mode === 'exact' ? 'exact' : 'preferred';
+  row.querySelector('.variant-duration').value = value.delivery?.duration_mode || 'approx';
+  const updateRange = () => row.querySelectorAll('.variant-range').forEach(el => el.classList.toggle('hide', row.querySelector('.variant-duration').value !== 'range'));
+  row.querySelector('.variant-duration').addEventListener('change', updateRange);
+  updateRange();
   row.querySelector('.variant-remove').addEventListener('click', () => row.remove());
   $('delivery-variants').appendChild(row);
 }
@@ -1994,6 +2009,10 @@ function deliveryVariants() {
       aspect: row.querySelector('.variant-aspect').value,
       seconds: Number(row.querySelector('.variant-seconds').value || 0),
       duration_mode: row.querySelector('.variant-duration').value,
+      ...(row.querySelector('.variant-duration').value === 'range' ? {
+        minimum_seconds: row.querySelector('.variant-minimum').value === '' ? null : Number(row.querySelector('.variant-minimum').value),
+        maximum_seconds: row.querySelector('.variant-maximum').value === '' ? null : Number(row.querySelector('.variant-maximum').value),
+      } : {}),
     },
   }));
 }
@@ -2059,10 +2078,10 @@ $('load-job').addEventListener('click', async () => {
   const delivery = variants.length ? (variants[0].delivery || {}) : (job.delivery || {});
   $('aspect').value = delivery.aspect || '9:16';
   $('seconds').value = delivery.seconds || '';
-  $('duration-mode').value = delivery.duration_mode || 'preferred';
+  $('duration-mode').value = delivery.duration_mode || 'approx';
   $('duration-range-fields').classList.toggle('hide', $('duration-mode').value !== 'range');
-  $('minimum-seconds').value = delivery.minimum_seconds || '';
-  $('maximum-seconds').value = delivery.maximum_seconds || '';
+  $('minimum-seconds').value = delivery.minimum_seconds ?? '';
+  $('maximum-seconds').value = delivery.maximum_seconds ?? '';
   $('subtitles').value = delivery.subtitles || 'sidecar';
   $('setup-look').value = delivery.subtitle_look || 'plain';
   $('timeline').value = delivery.timeline || 'none';
@@ -2098,6 +2117,8 @@ $('load-job').addEventListener('click', async () => {
   $('forbidden-end-seconds').value = forbiddenWindow.end_seconds ?? '';
   const run = job.run || {};
   if (run.budget_usd != null) $('budget').value = run.budget_usd;
+  $('run-mode').value = run.mode || 'edit';
+  $('target-budget').value = run.target_budget_usd ?? '';
   $('review').checked = Boolean(run.review);
   updateGroundingSpecSummary(false);
   $('job-note').textContent = '已載入；常用欄位顯示在下面，進階同步、權利與交付約束會原樣保留。';
@@ -2347,6 +2368,7 @@ async function openRun(id, where, how) {
     return;
   }
   const data = await res.json();
+  updateEditorLinks(data);
   markRunInUrl(id, how);
   $('log').textContent = data.lines.join('\n');
   allLines = data.lines;
@@ -2416,7 +2438,7 @@ async function openRun(id, where, how) {
       data.source_path || data.source || runId;
     $('crumb-meta').textContent =
       ({ running: '執行中', failed: '失敗', stopped: '已停止',
-         interrupted: '中斷' }[data.state] || data.state)
+         interrupted: '中斷', grounding_blocked: '主體證據不足（待修正）', budget_paused: '預算暫停（可接續）' }[data.state] || data.state)
       + `　·　${data.lines.length} 行`;
   }
   // And it never started the clock. Polling began only when this tab was the
@@ -5051,6 +5073,8 @@ $('recut').addEventListener('click', async () => {
         gain_db: b.gain_db || 0, audio_role: b.audio_role || 'auto',
         audio_completion: b.audio_completion || 'none',
         picture_role: b.picture_role || 'primary_action',
+        canvas_mode: b.canvas_mode || 'fill',
+        transition_in: b.transition_in || 'cut', transition_seconds: b.transition_seconds || 0.4,
         replacement: b.replacement || null }))
     }),
   });
@@ -5281,9 +5305,13 @@ async function startRun(preflightOnly) {
   body.append('seconds', $('seconds').value || '0');
   body.append('duration_mode', durationMode);
   body.append('delivery_variants_json', JSON.stringify(deliveryVariants()));
-  if ($('minimum-seconds').value) body.append('minimum_seconds', $('minimum-seconds').value);
-  if ($('maximum-seconds').value) body.append('maximum_seconds', $('maximum-seconds').value);
+  if (durationMode === 'range') {
+    if ($('minimum-seconds').value !== '') body.append('minimum_seconds', $('minimum-seconds').value);
+    if ($('maximum-seconds').value !== '') body.append('maximum_seconds', $('maximum-seconds').value);
+  }
   body.append('budget', $('budget').value);
+  body.append('mode', $('run-mode').value);
+  if ($('target-budget').value !== '') body.append('target_budget', $('target-budget').value);
   body.append('review', $('review').checked ? 'true' : 'false');
   body.append('preflight_only', preflightOnly ? 'true' : 'false');
   body.append('timeline', $('timeline').value);
@@ -5361,11 +5389,21 @@ async function startRun(preflightOnly) {
   ticker = setInterval(() => { paintSteps(lastProgress, 'running'); }, 1000);
   poll();
 }
+$('run-mode').addEventListener('change', () => { $('go').textContent = $('run-mode').value === 'propose' ? '分析素材並提出方案（會使用 Gemini）' : '開始剪輯（會使用 Gemini）'; });
 $('go').addEventListener('click', () => startRun(false));
 $('preflight-go').addEventListener('click', () => startRun(true));
 
+$('proposal-edit').addEventListener('click', async () => {
+  const body = new FormData(); body.append('mode', 'edit'); body.append('budget', $('budget').value);
+  const res = await fetch(`/api/runs/${runId}/resume`, {method: 'POST', body});
+  if (!res.ok) { sayFault('無法繼續剪輯', await plainError(res)); return; }
+  $('proposal-result').classList.add('hide');
+  clearInterval(timer); timer = setInterval(poll, 1200); poll();
+});
 $('resume').addEventListener('click', async () => {
-  const res = await fetch(`/api/runs/${runId}/resume`, { method: 'POST' });
+  const body = new FormData();
+  body.append('budget', $('budget').value);
+  const res = await fetch(`/api/runs/${runId}/resume`, { method: 'POST', body });
   if (!res.ok) { sayFault('繼續跑不了', await plainError(res)); return; }
   $('resume').classList.add('hide');
   $('fault').classList.add('hide');
@@ -5642,6 +5680,20 @@ function classify(line) {
   return '';
 }
 
+function updateEditorLinks(data) {
+  $('editor-history').classList.toggle('hide', !data.has_editor_context);
+  $('editor-context-link').href = `/api/runs/${runId}/editor-context`;
+  if (data.has_editor_context && data.state !== 'running') {
+    fetch(`/api/runs/${runId}/editor-context`).then(r => r.ok ? r.json() : null).then(editor => {
+      const last = editor?.last_render;
+      $('editor-current').classList.toggle('hide', !last);
+      $('editor-previous').classList.toggle('hide', !last?.previous);
+      if (last) $('editor-current').href = `/api/runs/${runId}/editor-preview/${last.revision}`;
+      if (last?.previous) $('editor-previous').href = `/api/runs/${runId}/editor-preview/${last.previous.revision}`;
+    }).catch(() => {});
+  }
+}
+
 async function poll() {
   const res = await fetch(`/api/runs/${runId}?since=${seen}`);
   const data = await res.json();
@@ -5653,13 +5705,18 @@ async function poll() {
   }
   seen = data.total_lines;
   $('log').scrollTop = $('log').scrollHeight;
-  $('state').textContent = { running: '執行中', done: '完成', failed: '失敗', stopped: '已停止', interrupted: '中斷' }[data.state] || data.state;
+  $('state').textContent = { running: '執行中', done: '完成', failed: '失敗', stopped: '已停止', interrupted: '中斷', grounding_blocked: '主體證據不足，保留原片等待修正', budget_paused: '預算暫停，可續跑' }[data.state] || data.state;
+  if (data.preflight_only && data.state === 'done') $('state').textContent = '免費檢查通過，尚未使用 Gemini；可開始提案或剪輯';
   $('state').className = 'state' + (data.state === 'done' ? ' done' : '');
   allLines = allLines.concat(data.lines);
   lastProgress = data.progress;
   paintSteps(lastProgress, data.state);
   paintSheet(data.progress, data.state);
-  if (data.state === 'failed' || data.state === 'stopped') {
+  $('proposal-result').classList.toggle('hide', !data.has_proposal || data.state === 'running');
+  $('proposal-download').href = `/api/runs/${runId}/proposal`;
+  updateEditorLinks(data);
+  $('proposal-edit').classList.toggle('hide', !data.proposal_only);
+  if (data.state === 'failed' || data.state === 'stopped' || data.state === 'budget_paused' || data.state === 'grounding_blocked') {
     showFault(allLines);
     $('raw').open = true;
     $('resume').classList.remove('hide');

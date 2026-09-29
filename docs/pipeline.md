@@ -10,7 +10,7 @@
 
 | 問題 | 由誰答 | 用什麼看 |
 | --- | --- | --- |
-| 這支素材裡有什麼、可用區間在哪 | Gemini | proxy 640px 影片 |
+| 這支素材裡有什麼、可用區間在哪 | Gemini | proxy 640px；靜態用 agentic，量到運動時用 static 4/8 FPS |
 | 這支素材裡有沒有那個產品 | Gemini | proxy 影片 **high 解析度** |
 | 產品在第幾秒最清楚、框在哪 | Gemini | **母檔 1440px 靜態圖** |
 | 這批素材該剪成什麼 | Gemini | 全部 proxy ＋ 音樂 ＋ Brief |
@@ -18,13 +18,39 @@
 | 每顆多長、切在哪個拍點 | Gemini | 音樂 ＋ 鏡頭畫面 |
 | 這一顆的畫格裡到底是不是它 | Gemini | **母檔 1440px 實際要用的那幾格** |
 | 拍點落在第幾秒 | 本機 | onset 分析 |
-| 攝影機有沒有在動、動多少 | 本機 | 母檔，192px @ 4fps |
+| 攝影機有沒有在動、動多少 | 本機 | 母檔，384px @ 4fps 背景 feature＋RANSAC affine；無 OpenCV 時 192px shift fallback |
 | 哪幾秒對到焦 | 本機 | 母檔，640px @ 2fps |
 | 主體逐格在哪 | 本機 | SAM 從 Gemini 給的框開始逐格追 |
 | 裁切能移多遠、成本多少 | 本機 | 算術 |
 
 原則：**語意問題給模型，量測留在本機。** 這不是信任問題 —— 是兩邊各自
 只能回答一種問題，而失敗都來自問錯邊。
+
+### Gemini 影片瀏覽政策
+
+- 完整 stringout、逐字稿、身分候選搜尋與審片使用 `agentic`，讓模型按問題瀏覽長片。
+- Clip Card 先讀本機運動量測；沒有運動使用 `agentic`，量到運動使用 `static 4 FPS`。
+- 只有 20 秒內且含一秒以下或快速運動的素材卡升到 `static 8 FPS`，不把整支長片全面加密取格。
+- 所有影片輸入都由同一個建構器建立，成本預估也會把 static FPS 寫入 countTokens 的 video metadata。
+
+### Selection 修復與續跑
+
+Render 的預算涵蓋同一輸出目錄內所有續跑的已記錄花費；重新啟動不會重置額度。
+合併 Editorial Plan 的續跑優先使用最新失敗草稿，不以原始規劃覆寫修復結果。
+`--allow-paid-plan-repair` 在此路徑每次最多啟動一次 Selection 修復呼叫；
+全片結構修復會攜帶原 brief、完整剪輯規則、參考圖、素材影片及已取得的
+來源 exact-frame 身分證據，因此仍可能產生影片與 agentic tool-use 費用。
+精確長度交付需要 Gemini 補足有內容的鏡頭；偏好長度才允許縮短。
+純音樂段落可使用 `music_montage`，不能以沒有敘事音訊的
+`illustrative_broll` 充當內容覆蓋。縮短停留或移除不可達落點後，
+必須重新通過完整本機審核；來源身分確認也不等於最終時窗追蹤已通過。
+
+### 原生運鏡與數位運鏡
+
+Selection 除了 `camera_intent`，必須再選 `native_motion_policy`：保留原生運鏡、
+補償原生跟拍、停穩後重構圖、停穩後加入數位運鏡，或禁止數位運鏡。本機會先
+提供 pan／tilt 空間、最大推近、運動種類與停穩階段；執行層會真的延後數位路徑，
+或在禁止疊加時改用固定數位框，不再只於成片報告寫警告。
 
 ---
 
@@ -47,6 +73,11 @@ verify        逐顆對照它自己的宣告；沒做到的換替代品，重跑
 render        segments → concat → 配樂 → preview
 review        （預設關閉）先逐顆對照計畫，再看整支
 ```
+
+聲音分類維持既有兩層，不因 P0–P2 改寫：Clip Card 先分 `content / ambient /
+none`；Selection 再依剪輯用途選 `discard / narrative / sync_action /
+ambient_texture`。Gemini 判斷語意用途，逐字時間與同步時鐘仍由本機提供。
+降噪、去風聲與人聲分離不混進這個分類決策。
 
 ---
 
@@ -224,13 +255,13 @@ repair，必須由下一次全量 ledger 驗收。
 | --- | --- |
 | 相鄰跳接目前是結構式偵測 | 已抓同 source 連續窗與同主體 1.35× 景別跳變；跨檔案同 setup 還需要 perceptual embedding |
 | `plan_disagreements` 已進前端 | 可看逐顆與全片疑點；後續可再做篩選與嚴重度 |
-| 運鏡有本機 feasibility catalog | 已按原生 motion、pan/tilt room、push room 與 target 排 treatment；清晰度仍未納入數值排名 |
+| 運鏡有本機 feasibility catalog | 已按 affine 原生 motion、pan/tilt room、push room、停穩階段與 target 排 treatment；清晰度仍未納入數值排名 |
 | Brief 散文被當成字卡文案 | 解析器規則是「條列＝指示、散文＝文案」，整份用散文寫指示會誤判 |
 | layout 備案沒人讀 | 「塞不下就用 40m」有抽出來，版面算不下時沒有程式碼去讀它 |
 | 升級後未確認的素材仍是 carrier | 會浪費一輪修復才被逐顆驗證擋下 |
 | 每輪修復重追所有鏡頭 | 花時間不花錢，但可以只重追換掉的 |
 | **框比例沒有驗算** | spec 聲明了比例，模型回傳的框沒有人量，Ultra 被當成 Fold8 進了成片 |
-| **同框多台近似機種** | 模型每格都認得出「有一台」，但不同格可能指不同台；錨點彼此 IoU=0 就被讀成「身分無法確立」 |
+| **同框多台近似機種** | exact-frame bbox 會先增加錨點並重跑 SAM；shot-local 仍失敗就標成 `manual_mask_review`，不自動改跟相似物 |
 | **跨檔案 setup 辨識仍不足** | 不同 source 的同機位、同構圖跳接尚未能純本機可靠配對 |
 | 20 個常數單一樣本擬合 | 全部對著這一批素材調出來，沒在第二批素材上驗證過 |
 

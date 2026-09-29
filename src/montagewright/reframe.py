@@ -591,6 +591,7 @@ def build_look_path(
     monotonic_route: bool = False,
     native_speed: float = 0.0,
     native_settles_at: float | None = None,
+    native_motion_policy: str = "add_digital_after_settle",
 ) -> CropPath:
     """Walk a shot through the places it looks, resting at each.
 
@@ -1080,6 +1081,40 @@ def build_look_path(
     # made a conspicuous correction at the cut.  Keep the replan degradation
     # above, but produce a complete reviewable preview instead of silently
     # changing the treatment to a hold.
+    if native_motion_policy == "digital_forbidden":
+        keyframes = [Keyframe(0.0, boxes[0])]
+    elif (
+        native_motion_policy in {
+            "stabilize_then_reframe", "add_digital_after_settle",
+        }
+        and native_settles_at is not None
+        and 0.0 < native_settles_at < duration_seconds
+        and keyframes
+    ):
+        # One trajectory at a time: hold the initial digital crop while the
+        # source settles, then fit the requested digital route into the time
+        # that remains.  The speed limiter below remains authoritative and
+        # will report if the shortened window cannot deliver the route.
+        first_time = keyframes[0].seconds
+        span = max(keyframes[-1].seconds - first_time, 1e-9)
+        available = max(0.0, duration_seconds - native_settles_at)
+        remapped = [
+            Keyframe(
+                round(
+                    native_settles_at
+                    + (one.seconds - first_time) / span * available,
+                    4,
+                ),
+                one.crop,
+            )
+            for one in keyframes
+        ]
+        keyframes = [
+            Keyframe(0.0, keyframes[0].crop),
+            Keyframe(round(native_settles_at, 4), keyframes[0].crop),
+            *remapped,
+        ]
+
     limited, _ = _limit_speed(keyframes, limits)
     designed = CropPath(_dedupe(keyframes))
     delivered = CropPath(_dedupe(limited))
@@ -1164,6 +1199,7 @@ def build_declared_look_path(
         track_during_stops=policy.track_during_stops,
         continuous_read=policy.continuous_read,
         monotonic_route=policy.monotonic_route,
+        native_motion_policy=reframe.native_motion_policy,
         **geometry,
     )
 

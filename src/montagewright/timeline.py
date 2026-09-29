@@ -132,6 +132,8 @@ def _notes(clip_id: str, index: int, report: dict[str, Any]) -> list[str]:
     verdict = report.get("shots", {}).get(clip_id, {})
 
     lines = []
+    if shot.get("transition_in", "cut") != "cut":
+        lines.append(f"轉場：{shot['transition_in']}；MP4 已套用，此外部時間軸需手動重建轉場")
     if shot.get("why"):
         lines.append(f"選片：{shot['why']}")
     if rhythm.get("why"):

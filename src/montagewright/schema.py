@@ -402,6 +402,13 @@ class Reframe(ModelFacing):
     # the warning was advice with no way to check it.
     source_motion_role: str = "locked"
     source_motion_description: str = ""
+    native_motion_policy: Literal[
+        "preserve_native",
+        "follow_native",
+        "stabilize_then_reframe",
+        "add_digital_after_settle",
+        "digital_forbidden",
+    ] = "add_digital_after_settle"
     editorial_intent: str = Field(
         default="hold",
         description=(
@@ -608,6 +615,16 @@ class Clip(ModelFacing):
             "push or a sped-up pan both work."
         ),
     )
+    canvas_mode: Literal["fill", "fit"] = "fill"
+
+    @model_validator(mode="after")
+    def fit_has_no_digital_move(self):
+        if self.canvas_mode == "fit" and self.reframe is not None and self.reframe.camera_move != "hold":
+            raise ValueError("fit preserves the full image; choose hold or source motion instead of digital movement")
+        return self
+
+    transition_in: Literal["cut", "dissolve", "dip_black"] = "cut"
+    transition_seconds: float = Field(default=0.4, ge=0.1, le=0.8)
     in_looks_like: str = Field(
         default="",
         description=(
@@ -1185,6 +1202,13 @@ def reframe_of(shot: dict) -> Reframe:
         "push_in": "push_in",
         "pull_out": "pull_out",
     }.get(editorial_intent, inferred_move)
+    native_motion_policy = str(
+        shot.get("native_motion_policy") or "add_digital_after_settle"
+    )
+    if native_motion_policy == "digital_forbidden" and editorial_intent not in {
+        "hold", "use_source_motion",
+    }:
+        camera_move = "hold"
     return Reframe(
         looks=looks,
         subject=(
@@ -1214,6 +1238,7 @@ def reframe_of(shot: dict) -> Reframe:
         source_motion_description=str(
             shot.get("source_motion_description", "") or ""
         )[:240],
+        native_motion_policy=native_motion_policy,
         editorial_intent=editorial_intent,
         pacing_exception=bool(shot.get("pacing_exception", False)),
         pacing_exception_reason=str(

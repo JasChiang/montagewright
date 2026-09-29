@@ -29,6 +29,7 @@ class _Interactions:
             "total_output_tokens": 20,
             "total_thought_tokens": 10,
             "total_cached_tokens": 40,
+            "total_tool_use_tokens": 12,
         }
 
     def create(self, **request):
@@ -42,6 +43,25 @@ class _Client:
     def __init__(self, *, tokens=100, usage=None):
         self.models = _Models(tokens)
         self.interactions = _Interactions(usage)
+
+
+def test_resume_reserves_against_cumulative_spend_without_rebilling(tmp_path):
+    import json
+
+    journal = tmp_path / "spend.jsonl"
+    journal.write_text(json.dumps({"stage": "selection", "usd": 3.973173}) + "\n")
+    ledger = Ledger(cap_usd=6, journal_path=journal, cumulative_budget=True)
+    assert ledger.spent_usd == 0  # No new provider call this invocation.
+    assert ledger.remaining_usd == pytest.approx(2.026827)
+    assert ledger.cumulative_summary()["spent_usd"] == pytest.approx(3.973173)
+    before = journal.read_text()
+    with pytest.raises(BudgetSpent):
+        ledger.reserve("selection", input_tokens=10_000_000, max_output_tokens=100)
+    assert journal.read_text() == before
+    exhausted = Ledger(cap_usd=3, journal_path=journal, cumulative_budget=True)
+    with pytest.raises(BudgetSpent):
+        exhausted.check()
+    assert exhausted.remaining_usd == 0
 
 
 def test_structured_json_matches_the_installed_interactions_contract():
@@ -125,6 +145,7 @@ def test_a_completed_call_replaces_its_reservation_with_actual_usage():
     assert ledger.entries[0]["stage"] == "selection"
     assert ledger.entries[0]["cached"] == 40
     assert ledger.entries[0]["output"] == 30
+    assert ledger.entries[0]["tool_use"] == 12
     rates = pricing_for("gemini-3.7-flash")
     assert ledger.entries[0]["input_rate"] == rates["input"]
     assert ledger.entries[0]["cached_input_rate"] == rates["cached_input"]
@@ -184,6 +205,34 @@ def test_a_transient_500_retries_once_under_one_reservation(monkeypatch):
     assert len(ledger.entries) == 1
     assert ledger.summary()["uncertain_attempts"] == 1
     assert "known USD total excludes" in ledger.summary()["cost_warning"]
+    assert not ledger.reservations
+
+
+def test_a_smoke_call_can_disable_provider_retries():
+    class ServerError(RuntimeError):
+        code = 500
+
+    client = _Client(tokens=100)
+
+    def fails(**_):
+        client.interactions.calls += 1
+        raise ServerError("500 internal")
+
+    client.interactions.create = fails
+    ledger = Ledger(cap_usd=1.0)
+
+    with pytest.raises(ServerError):
+        ask(
+            client,
+            model="gemini-3.8-flash",
+            input="hello",
+            generation_config={"max_output_tokens": 1_000},
+            ledger=ledger,
+            budget_stage="agentic_smoke",
+            max_attempts=1,
+        )
+
+    assert client.interactions.calls == 1
     assert not ledger.reservations
 
 
@@ -285,6 +334,48 @@ def test_gemini_37_pricing_changes_after_the_published_utc_deadline():
     }
 
 
+def test_gemini_38_uses_the_published_flash_promo_and_standard_rates():
+    assert pricing_for("gemini-3.8-flash", at=date(2026, 12, 31)) == {
+        "input": 0.75, "cached_input": 0.075, "output": 3.75,
+    }
+    assert pricing_for("gemini-3.8-flash", at=date(2027, 1, 1)) == {
+        "input": 1.50, "cached_input": 0.15, "output": 7.50,
+    }
+
+
+def test_agentic_steps_and_tool_tokens_are_written_to_the_spend_journal():
+    client = _Client()
+    client.interactions.create = lambda **_: SimpleNamespace(
+        status="completed",
+        output_text="{}",
+        usage={
+            "total_input_tokens": 100,
+            "total_output_tokens": 20,
+            "total_thought_tokens": 10,
+            "total_tool_use_tokens": 40,
+        },
+        steps=[
+            {"type": "processing_call"},
+            {"type": "processing_result"},
+            {"type": "model_output"},
+        ],
+    )
+    ledger = Ledger(cap_usd=1.0)
+
+    ask(
+        client,
+        model="gemini-3.8-flash",
+        input="hello",
+        generation_config={"max_output_tokens": 1_000},
+        ledger=ledger,
+        budget_stage="agentic_smoke",
+    )
+
+    assert ledger.entries[0]["tool_use"] == 40
+    assert ledger.entries[0]["processing_calls"] == 1
+    assert ledger.entries[0]["processing_results"] == 1
+
+
 def test_paid_attempts_survive_a_later_run_in_the_same_output_folder(tmp_path):
     journal = tmp_path / "spend-events.jsonl"
     first = Ledger(cap_usd=10.0, journal_path=journal)
@@ -336,3 +427,29 @@ def test_a_project_spend_cap_is_money_even_though_it_is_a_403():
     assert said is not None
     assert "ai.studio/spend" in said, "say where the cap lives"
     assert "resume" in said and "cached" in said, "say that nothing is lost"
+
+
+def test_interrupted_paid_call_records_unknown_billing_without_retry(tmp_path):
+    client = _Client()
+    calls = []
+    def interrupted(**kwargs):
+        calls.append(kwargs)
+        raise KeyboardInterrupt()
+    client.interactions.create = interrupted
+    ledger = Ledger(cap_usd=3,journal_path=tmp_path/'spend.jsonl')
+    with pytest.raises(KeyboardInterrupt):
+        ask(client,model='gemini-3.8-flash',store=False,input=[{'type':'text','text':'test'}],
+            generation_config={'max_output_tokens':100},ledger=ledger,budget_stage='review')
+    assert len(calls) == 1
+    assert ledger.cumulative_summary()['uncertain_attempts'] == 1
+    assert not ledger.reservations
+
+
+def test_rendered_cut_review_takes_priority_over_optional_repair_escrow():
+    ledger = Ledger(cap_usd=1.0, completion_reserve={'review': .3, 'editor_tools': .69})
+    reservation = ledger.reserve('shot_review', input_tokens=1000, max_output_tokens=1000)
+    assert reservation in ledger.reservations
+    assert ledger.completion_reserve == {'review': .3}
+    with pytest.raises(BudgetSpent):
+        ledger.reserve('shot_review', input_tokens=10**9, max_output_tokens=1000)
+    assert ledger.cap_usd == 1.0

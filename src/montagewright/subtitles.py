@@ -882,7 +882,8 @@ def burn(
     return destination
 
 
-def as_cues(lines, aspect: str, width: int, height: int, *, words=None):
+def as_cues(lines, aspect: str, width: int, height: int, *, words=None,
+            client=None, ledger=None, context=""):
     """The lines a viewer should see, whatever is going to show them.
 
     The file and the picture had better agree, and a fifty-six character
@@ -891,9 +892,12 @@ def as_cues(lines, aspect: str, width: int, height: int, *, words=None):
 
     area = safe_area(aspect)
     face = _face(max(12, round(height * area.text_height)))
-    return split_cues(
-        lines, face, round(width * (1 - area.side_margin * 2)), words=words,
-    )
+    room = round(width * (1 - area.side_margin * 2))
+    if client is not None and lines:
+        from montagewright.caption_plan import semantic_cues
+        return semantic_cues(lines, aspect=aspect, face=face, room=room,
+                             client=client, ledger=ledger, context=context)
+    return split_cues(lines, face, room, words=words)
 
 
 # The looks worth offering by name. Anything finer is a Style, which is

@@ -4,7 +4,116 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, Literal, TypedDict
+
+
+VIDEO_PROCESSING_POLICY_VERSION = "video-processing-v1"
+MOTION_STATIC_FPS = 4.0
+MOTION_FAST_STATIC_FPS = 8.0
+MOTION_FAST_MAX_SOURCE_SECONDS = 20.0
+MOTION_FAST_EVENT_SECONDS = 1.0
+MOTION_FAST_PEAK_VW_S = 0.08
+MOTION_FAST_ZOOM_RATE_S = 0.04
+MOTION_FAST_ROTATION_DEG_S = 3.0
+
+
+class StaticVideoProcessing(TypedDict, total=False):
+    type: Literal["static"]
+    fps: float
+    start_offset: str
+    end_offset: str
+
+
+VideoProcessing = Literal["agentic", "static"] | StaticVideoProcessing
+
+
+def static_video_processing(
+    fps: float, *, start_offset: str | None = None,
+    end_offset: str | None = None,
+) -> StaticVideoProcessing:
+    """A validated fixed-rate Interactions video-processing request."""
+
+    if not 0.0 < float(fps) <= 24.0:
+        raise ValueError("static video FPS must be in (0, 24]")
+    processing: StaticVideoProcessing = {
+        "type": "static",
+        "fps": float(fps),
+    }
+    if start_offset is not None:
+        processing["start_offset"] = str(start_offset)
+    if end_offset is not None:
+        processing["end_offset"] = str(end_offset)
+    return processing
+
+
+def motion_video_processing(
+    intervals: Iterable[Any] | None, *, source_seconds: float,
+) -> VideoProcessing:
+    """Choose dense sampling only when local facts say motion needs it.
+
+    The whole-library semantic pass remains agentic for a still take. A take
+    with measured motion is fixed-rate so the semantic role is based on the
+    same observable frames on every run. Eight FPS is reserved for short
+    sources containing a sub-second or fast movement; applying it to long
+    rushes would spend context on unrelated seconds.
+    """
+
+    measured = tuple(intervals or ())
+    interesting = [
+        one for one in measured
+        if str(getattr(one, "state", "")) in {"moving", "not_a_shift"}
+    ]
+    if not interesting:
+        return "agentic"
+    fast = source_seconds <= MOTION_FAST_MAX_SOURCE_SECONDS and any(
+        (
+            str(getattr(one, "state", "")) == "moving"
+            and (
+                float(getattr(one, "seconds", 0.0)) <= MOTION_FAST_EVENT_SECONDS
+                or float(getattr(one, "peak_vw_s", 0.0))
+                >= MOTION_FAST_PEAK_VW_S
+                or abs(float(getattr(one, "zoom_rate_s", 0.0)))
+                >= MOTION_FAST_ZOOM_RATE_S
+                or abs(float(getattr(one, "rotation_deg_s", 0.0)))
+                >= MOTION_FAST_ROTATION_DEG_S
+            )
+        )
+        for one in interesting
+    )
+    return static_video_processing(
+        MOTION_FAST_STATIC_FPS if fast else MOTION_STATIC_FPS
+    )
+
+
+def video_content(
+    uri: str,
+    *,
+    mime_type: str = "video/mp4",
+    resolution: Literal["low", "medium", "high", "ultra_high"] = "low",
+    processing: VideoProcessing = "agentic",
+) -> dict[str, Any]:
+    """Build one Interactions video block with an explicit viewing policy."""
+
+    if not uri:
+        raise ValueError("video content requires a URI")
+    if isinstance(processing, dict):
+        if processing.get("type") != "static":
+            raise ValueError("structured video processing must have type=static")
+        processing = static_video_processing(
+            float(processing.get("fps", 1.0)),
+            start_offset=processing.get("start_offset"),
+            end_offset=processing.get("end_offset"),
+        )
+    elif processing not in {"agentic", "static"}:
+        raise ValueError(f"unsupported video processing {processing!r}")
+    return {
+        "type": "video",
+        "mime_type": mime_type,
+        "uri": uri,
+        "resolution": resolution,
+        "processing": processing,
+    }
 
 
 def structured_json(schema: dict[str, Any]) -> dict[str, Any]:
@@ -55,13 +164,30 @@ def _count_contents(value: Any) -> Any:
                     raise ValueError(
                         f"unsupported media resolution {resolution!r}"
                     ) from error
-            parts.append(
-                types.Part.from_uri(
-                    file_uri=uri,
-                    mime_type=part.get("mime_type"),
-                    media_resolution=counted_resolution,
-                )
+            counted_part = types.Part.from_uri(
+                file_uri=uri,
+                mime_type=part.get("mime_type"),
+                media_resolution=counted_resolution,
             )
+            processing = part.get("processing") if kind == "video" else None
+            if isinstance(processing, dict):
+                if processing.get("type") != "static":
+                    raise ValueError(
+                        "structured video processing must have type=static"
+                    )
+                fps = float(processing.get("fps", 1.0))
+                if not 0.0 < fps <= 24.0:
+                    raise ValueError("static video FPS must be in (0, 24]")
+                counted_part.video_metadata = types.VideoMetadata(
+                    fps=fps,
+                    start_offset=processing.get("start_offset"),
+                    end_offset=processing.get("end_offset"),
+                )
+            elif processing not in {None, "agentic", "static"}:
+                raise ValueError(
+                    f"unsupported video processing {processing!r}"
+                )
+            parts.append(counted_part)
             continue
         raise TypeError(f"budget preflight cannot count content type {kind!r}")
     return types.Content(role="user", parts=parts)
