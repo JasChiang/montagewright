@@ -39,6 +39,46 @@ def test_a_corrected_character_takes_the_span_of_the_one_it_replaced():
     assert all(one.measured for one in timed[:-1])
 
 
+def test_missing_character_borrows_nearby_time_as_an_estimate():
+    timed = align("便宜算一種功能嗎", said(
+        ("便宜算一種功能", 1.0, 2.4),
+    ))
+
+    missing = timed[-1]
+    assert missing.text == "嗎"
+    assert 2.25 <= missing.starts_seconds < missing.ends_seconds
+    assert abs(missing.ends_seconds - 2.4) < 1e-6
+    assert not missing.measured
+
+
+def test_missing_character_is_not_placed_inside_a_long_silent_gap():
+    timed = align("你嗎好", said(("你", 1.0, 1.2), ("好", 2.0, 2.2)))
+
+    assert timed[1].text == "嗎"
+    assert timed[1].starts_seconds == timed[1].ends_seconds
+
+
+def test_sentence_final_missing_character_stays_near_previous_speech():
+    timed = align("功能嗎？下一句", said(
+        ("功能", 1.0, 1.4), ("下一句", 2.0, 2.6),
+    ))
+
+    missing = timed[2]
+    assert missing.text == "嗎"
+    assert 1.25 <= missing.starts_seconds < missing.ends_seconds <= 1.4
+    assert not missing.measured
+
+
+def test_recovery_targets_only_missing_speech_beside_a_measured_gap():
+    from montagewright.asr_recovery import _unheard_gaps
+
+    words = said(("狀況", 173.39, 173.69), ("最耗電", 176.23, 177.01))
+    assert _unheard_gaps(["狀況嗎？比如說最耗電"], words) == [
+        (173.44, 176.48),
+    ]
+    assert _unheard_gaps(["狀況最耗電"], words) == []
+
+
 def test_punctuation_the_correction_added_takes_no_time():
     timed = align("在夏天，吹頭髮。", HEARD)
 
@@ -2370,6 +2410,7 @@ def test_old_transcript_with_apple_word_clock_migrates_without_retranscribing(
     path = tmp_path / "old.json"
     path.write_text(json.dumps({
         "version": "montagewright-transcript-older",
+        "unresolved_lines": [{"text": "舊標記", "missing_text": "舊"}],
         "lines": [{
             "text": "吹頭髮很熱，還會流汗。",
             "speaker": "受訪者",
@@ -2390,6 +2431,7 @@ def test_old_transcript_with_apple_word_clock_migrates_without_retranscribing(
     assert migrated["lines"][0]["starts_seconds"] == 2.0
     assert migrated["lines"][0]["ends_seconds"] == 4.0
     assert migrated["lines"][0]["timed_text"]
+    assert migrated["unresolved_lines"] == []
 
 
 def test_travel_between_landings_takes_only_the_time_it_needs():

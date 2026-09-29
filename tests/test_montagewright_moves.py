@@ -1654,6 +1654,29 @@ def test_adjacent_asr_lines_become_one_canonical_continuous_soundbite() -> None:
     assert any("`S01:t00-t01`" in one and "連續多行" in one for one in described)
 
 
+def test_late_interview_speech_remains_available_to_planner_and_renderer() -> None:
+    from montagewright.cli import _audio_spans, _speech_lines
+    from montagewright.transcript import CARD_VERSION
+
+    card = {
+        "version": CARD_VERSION,
+        "lines": [
+            {
+                "text": "前段回答" if index < 44 else "耳機連線的故事",
+                "speaker": "受訪者",
+                "starts_seconds": float(index * 3),
+                "ends_seconds": float(index * 3 + 2),
+            }
+            for index in range(45)
+        ],
+    }
+
+    described = _speech_lines("S01", card)
+    available = _audio_spans({"S01": card})
+    assert any("`S01:t44`" in line and "耳機連線的故事" in line for line in described)
+    assert available["S01:t44"]["in_seconds"] == 132.0
+
+
 def test_continuous_soundbites_split_at_long_pauses_and_duration_cap() -> None:
     from montagewright.cli import _audio_spans_for_source
     from montagewright.transcript import CARD_VERSION

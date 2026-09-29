@@ -4764,7 +4764,7 @@ def _suffix(rushes: Path, stem: str) -> str:
 
 
 def _speech_lines(
-    source_id: str | dict, card: dict | None = None, limit: int = 40,
+    source_id: str | dict, card: dict | None = None, limit: int | None = None,
     *, edit_mode: str = "continuous_soundbite",
 ) -> tuple[str, ...]:
     """The soundbites, as the planner needs to read them.
@@ -4794,7 +4794,7 @@ def _speech_lines(
 
 
 def _audio_spans_for_source(
-    source_id: str, card: dict, *, limit: int = 40,
+    source_id: str, card: dict, *, limit: int | None = None,
     max_gap_seconds: float = 1.2, max_span_seconds: float = 14.0,
     edit_mode: str = "continuous_soundbite",
 ) -> dict[str, dict]:

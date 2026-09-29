@@ -42,7 +42,7 @@ TOOL = Path(__file__).resolve().parents[2] / "tools" / "transcribe" / "transcrib
 # Below this a "word" is usually the recogniser splitting one syllable, and a
 # subtitle cannot sit on it.
 MIN_WORD_SECONDS = 0.04
-ALIGNMENT_VERSION = "corrected-character-clock-v1"
+ALIGNMENT_VERSION = "corrected-character-clock-v2"
 
 
 class TranscriberMissing(RuntimeError):
@@ -354,7 +354,19 @@ def load(path: Path) -> dict[str, Any] | None:
     ):
         return None
     migrated_lines = []
+    unresolved = []
     for line, (start, end, clock) in zip(raw_lines, timings):
+        missing = "".join(
+            piece.text for piece in clock
+            if piece.ends_seconds <= piece.starts_seconds
+            and any(char.isalnum() for char in piece.text)
+        )
+        if missing:
+            unresolved.append({
+                "text": str(line.get("text", "")),
+                "missing_text": missing,
+                "reason": "no Apple timing anchor for inserted speech",
+            })
         migrated_lines.append({
             **line,
             "starts_seconds": round(start, 3),
@@ -378,6 +390,7 @@ def load(path: Path) -> dict[str, Any] | None:
         **payload,
         "version": CARD_VERSION,
         "lines": migrated_lines,
+        "unresolved_lines": unresolved,
         "timing": timing,
     }
 

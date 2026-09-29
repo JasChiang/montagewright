@@ -9,9 +9,10 @@ that cannot be checked by looking.
 So the text comes from one and the clock from the other, and this is the
 join. Corrected characters are aligned against the recognised ones; wherever
 they agree the recognised timing is kept exactly, and where they differ the
-new characters are spread across the span the old ones occupied. Nothing is
-invented and nothing drifts: the first and last moment of a line are moments
-the recogniser actually measured.
+new characters are spread across the span the old ones occupied. A character
+missing from recognition can borrow a short window between or inside measured
+neighbours, marked as estimated. The first and last moment of a line remain
+anchored to measured speech.
 
 This module is deliberately self-contained: it uses Python's sequence matcher
 and the Apple word spans already present in a Montagewright transcript card.
@@ -61,6 +62,37 @@ def _pieces(words: list[Word]) -> list[tuple[str, float, float]]:
     return out
 
 
+def _insertion_window(
+    heard: list[tuple[str, float, float]], at: int, *, sentence_end: bool = False,
+) -> tuple[float, float] | None:
+    """Estimate a missed character only near measured neighbouring speech.
+
+    A long gap could be silence or a whole missed answer; placing text there
+    from string order alone would invent speech timing. Short insertions may
+    borrow a small part of adjacent measured words without moving those words.
+    """
+
+    before = heard[at - 1] if at else None
+    after = heard[at] if at < len(heard) else None
+    if before and after:
+        gap = after[1] - before[2]
+        if gap > 0.3:
+            return (
+                (max(before[1], before[2] - 0.15), before[2])
+                if sentence_end else None
+            )
+        if gap > 0:
+            return before[2], after[1]
+        left = max(before[1], before[2] - 0.15)
+        right = min(after[2], after[1] + 0.15)
+        return (left, right) if right > left else None
+    if before:
+        return max(before[1], before[2] - 0.15), before[2]
+    if after:
+        return after[1], min(after[2], after[1] + 0.15)
+    return None
+
+
 def align(said: str, words: list[Word]) -> list[Timed]:
     """Lay corrected text over recognised timings.
 
@@ -92,14 +124,21 @@ def align(said: str, words: list[Word]) -> list[Timed]:
                 placed[spoken[s0 + step]] = (begins, ends, True)
         elif kind in ("replace", "insert"):
             # Spread the new characters over whatever the old ones occupied.
-            # An insertion has no span of its own, so it borrows the moment
-            # between its neighbours.
+            # An insertion has no measured span of its own; estimate only
+            # from a short window touching measured neighbours.
             if h1 > h0:
                 begins, ends = heard[h0][1], heard[h1 - 1][2]
-            elif h0 < len(heard):
-                begins = ends = heard[h0][1]
             else:
-                begins = ends = heard[-1][2]
+                next_spoken = spoken[s1] if s1 < len(spoken) else len(said)
+                sentence_end = any(
+                    mark in said[spoken[s1 - 1] + 1:next_spoken]
+                    for mark in "。！？?!"
+                )
+                window = _insertion_window(heard, h0, sentence_end=sentence_end)
+                if window is None:
+                    begins = ends = heard[h0][1] if h0 < len(heard) else heard[-1][2]
+                else:
+                    begins, ends = window
             count = max(s1 - s0, 1)
             step = (ends - begins) / count
             for index in range(s1 - s0):
