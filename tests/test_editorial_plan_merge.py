@@ -372,8 +372,10 @@ def test_merged_speaker_audio_is_routed_only_once():
         "gain_db": 0.0, "why": "answer",
     }]
     planner.expand_spans(chosen, list(_material()[0].spans))
-    planner.expand_audio_assignments(chosen, ["C1:t00"])
+    # A fresh Selection reaches normalization with the schema's MM:SS audio
+    # offset; audio expansion runs only after this stage.
     repairs = planner.normalize_selection(chosen, _material())
+    planner.expand_audio_assignments(chosen, ["C1:t00"])
     assert chosen["audio_assignments"][0]["offset_seconds"] == 0.0
     assert chosen["audio_assignments"][0]["audio_id"] == "a00"
     assert chosen["shots"][0]["audio_role"] == "discard"

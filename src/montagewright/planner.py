@@ -4919,6 +4919,7 @@ def normalize_selection(
     """
 
     from montagewright.camera import shot_key
+    from montagewright.spans import seconds_of
 
     if commitments is not None:
         from montagewright.candidate_commitments import (
@@ -5032,7 +5033,7 @@ def normalize_selection(
             window is not None
             and str(shot.get("picture_role") or "") == "speaker"
             and window[0] == str(shot.get("source_id") or "")
-            and abs(float(assignment.get("offset_seconds") or 0.0)) <= 1e-6
+            and abs(seconds_of(assignment.get("offset_seconds")) or 0.0) <= 1e-6
         ):
             named = resolve_named_span(shot, list(material))
             if named is not None:
