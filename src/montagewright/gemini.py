@@ -208,6 +208,9 @@ def count_request_tokens(
     five-percent envelope around the provider count.
     """
 
+    estimator = getattr(client, "estimate_request_tokens", None)
+    if estimator is not None:
+        return estimator(model=model, input_value=input_value, response_format=response_format)
     models = getattr(client, "models", None)
     counter = getattr(models, "count_tokens", None)
     if counter is None:

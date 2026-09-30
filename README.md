@@ -70,7 +70,7 @@ montagewright-web
 # http://127.0.0.1:8765/
 ```
 
-> 目前是積極開發中的本機剪輯工具，不是託管服務。素材、SAM 與 FFmpeg 都在執行 Montagewright 的電腦上處理；需要語意理解的影片與音訊會依工作階段上傳到 Gemini API。
+> 目前是積極開發中的本機剪輯工具，不是託管服務。素材、SAM 與 FFmpeg 都在執行 Montagewright 的電腦上處理；需要語意理解的影片與音訊會依工作階段送到所選的 Gemini 後端。
 
 ## 它現在能做什麼
 
@@ -117,12 +117,12 @@ Montagewright 分開保存：
 
 ### 成本上限是停止條件，不是品質旋鈕
 
-`--budget` 是整輪工作的美元上限。每次付費呼叫送出前，Montagewright 會用最大輸出 token 先保留最壞情況預算；餘額不夠就不送出，留下當下最好的成片，而不是偷偷換成較差的判斷。
+`--budget` 是整輪工作的美元停止門檻。每次付費呼叫送出前，Montagewright 會估計輸入並用最大輸出 token 保留預算；餘額不夠就不送出。Google 後端使用 `countTokens`，fal OpenRouter 沒有等價的計數端點，因此依本機媒體長度保守估算。fal 實際收費可能與預留額不同，不能把這個門檻當成供應商的硬性支出上限。
 
-目前 production model 預設為穩定版 `gemini-3.8-flash`（可用
-`MONTAGEWRIGHT_GEMINI_MODEL` 覆寫）。長片語意瀏覽使用 agentic；
+目前 model 預設為 `gemini-3.8-flash`（可用
+`MONTAGEWRIGHT_GEMINI_MODEL` 覆寫）。此分支預設透過 fal OpenRouter 呼叫 `google/gemini-3.8-flash`；原生 Google 後端可用 `MONTAGEWRIGHT_GEMINI_BACKEND=google` 選擇。原生後端的長片語意瀏覽使用 agentic；
 只有本機量到運動的素材卡使用 static 4 FPS，20 秒內的快速運動才升到 8 FPS。
-費率依 Google 公告，
+預算保留費率依 Google 公告，
 以 UTC 日期在每次預算保留與實際結算時自動選擇：
 
 | Token 類型 | 至 2026-12-31（含） | 2027-01-01 起 |
@@ -131,7 +131,7 @@ Montagewright 分開保存：
 | cached input | US$0.075 | US$0.15 |
 | output／thinking | US$3.75 | US$7.50 |
 
-這是 Montagewright 用來做預算保留與報表的固定費率，不是 Google 帳戶的 quota。API 的 429 仍可能來自 rate limit、billing、shared project quota 或帳戶層級限制。
+fal 回應若包含 `usage.cost`，帳本會使用供應商回報費用；否則帳本使用上述估價並標記來源。API 的 429 仍可能來自速率或帳單限制。
 
 ## 安裝
 
@@ -139,7 +139,7 @@ Montagewright 分開保存：
 
 - Python `>=3.12,<3.13`
 - FFmpeg／ffprobe
-- Gemini API key
+- fal API key；使用原生 Google 後端時才需要 Gemini API key
 - 建議：Apple Silicon Mac；SAM 2.1 與本機轉錄在這個環境最完整
 
 macOS 可先安裝 FFmpeg：
@@ -168,8 +168,8 @@ pip install -e .
 已經 export 同名變數，shell 的值優先、不會被 `.env` 覆蓋：
 
 ```bash
-export GEMINI_API_KEY='...'
-# GOOGLE_API_KEY 也可使用
+export FAL_KEY='...'
+# 原生 Google 後端：MONTAGEWRIGHT_GEMINI_BACKEND=google GEMINI_API_KEY='...'
 ```
 
 第一次驗證 Agentic Video 時，先用單一短片做不重試的 smoke test：
@@ -532,13 +532,13 @@ CUT/
 
 - Proxy、Clip Cards、transcripts 與 SAM artifacts 以內容和執行契約定址。
 - 同一批素材換 Brief，不需要重做 Brief-free Clip Cards。
-- Gemini File API URI 會放在共用 upload cache；素材未變時可避免重傳，但新的規劃仍會計算 input token。
+- 原生 Google 後端會快取 Gemini File API URI；fal 後端以本機檔案及內容雜湊供重跑使用，媒體會在每次模型請求時送出。
 - SAM cache 會檢查 checkpoint、implementation revision、shot window、seed 與 source fingerprint；不相符就拒絕沿用。
 - Web preview PNG 與 metadata 原子發布，並驗證 signature；損壞 cache 不會被當成成功預覽。
 
 ## 已知限制
 
-- 目前使用 Google Gemini API key；尚未提供 Vertex AI backend 切換。
+- fal OpenRouter 的 Chat Completions 可在 `video_url` 帶 `processing=agentic` 或 `static`。Agentic 導航證據以加密 `reasoning_details` 回傳，形式不同於 Gemini Interactions 的 `processing_call/result`；程式會保存原始欄位，不會捏造舊欄位。OpenRouter 文件尚未提供 Interactions 指定取樣 FPS／起訖區間或 `countTokens` 的對應欄位；fal 的 `static` 只保證模式，不能保證原本要求的 1／2／4／8 FPS，需要精確固定取樣驗收時請使用 `MONTAGEWRIGHT_GEMINI_BACKEND=google`。fal 影片以 data URI 隨請求傳輸；Google AI Studio 路由的請求本文上限是 20 MB。程式會在送出前擋下超過 19 MB 的 inline 請求，並把 fal 規劃 stringout 壓到 14 MB 以下。OpenRouter Files API 目前不支援 MP4，fal storage URL 也不能直接替代 Gemini AI Studio 的影片 File URI。
 - `--review` 目前審查的是主要剪輯成片，字卡軌是在 review loop 後 materialize；Gemini 還不能在同一輪 review 中直接提出結構化字卡修正。
 - 字卡 `music_sync` 已可在本機對齊 accent／downbeat；目前只同步進場完成點，尚未提供逐字、逐行或連續音訊反應動畫。字卡動畫 easing 目前固定為 linear。
 - Web 可檢查裁切框與運鏡，但尚未提供完整的 source-time crop keyframe editor。

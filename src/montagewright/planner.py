@@ -589,7 +589,10 @@ def ask(
     from montagewright.checkpoints import (
         response_path, read_json, write_json, capture, settle_saved, replay,
     )
-    checkpoint = response_path(ledger, budget_stage or "unknown", request, upload_cache)
+    checkpoint = response_path(
+        ledger, budget_stage or "unknown", request, upload_cache,
+        provider=getattr(client, "provider", "gemini_interactions"),
+    )
     if checkpoint is not None:
         saved = read_json(checkpoint)
         if saved is not None:
@@ -599,7 +602,10 @@ def ask(
             print(f"{budget_stage}: reused paid response checkpoint", flush=True)
             return replay(saved)
 
-    attempts = SERVER_ERROR_ATTEMPTS if max_attempts is None else int(max_attempts)
+    attempts = (
+        1 if getattr(client, "provider", None) == "fal_openrouter"
+        else SERVER_ERROR_ATTEMPTS
+    ) if max_attempts is None else int(max_attempts)
     if attempts < 1:
         raise ValueError("max_attempts must be at least one")
 
@@ -707,6 +713,7 @@ def ask(
             tool_use_tokens=usage.tool_use_tokens,
             processing_calls=usage.processing_calls,
             processing_results=usage.processing_results,
+            provider_cost_usd=raw_usage.get("provider_cost_usd"),
         )
     return interaction
 
@@ -1364,12 +1371,17 @@ def _parse(interaction: Any, *, what: str) -> dict[str, Any]:
 
 
 def _default_client() -> Any:
-    from google import genai  # imported lazily so tests need no key
-    from google.genai import types
-
     from montagewright.environment import load_project_env
 
     load_project_env()
+    backend = os.environ.get("MONTAGEWRIGHT_GEMINI_BACKEND", "fal_openrouter")
+    if backend == "fal_openrouter":
+        from montagewright.fal_openrouter import client_from_env
+        return client_from_env()
+    if backend != "google":
+        raise PlannerError(f"unsupported MONTAGEWRIGHT_GEMINI_BACKEND: {backend}")
+    from google import genai  # imported lazily so tests need no key
+    from google.genai import types
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise PlannerError("GEMINI_API_KEY is required for a live rhythm pass")
@@ -4134,7 +4146,11 @@ def decide_editorial_plan(
     # the editor thinks it sees before it has watched the reel.
     request_input: list[dict[str, Any]] = [
         video_content(
-            planning_uri, resolution="low", processing="agentic"
+            planning_uri, resolution="low", processing=(
+                "static" if getattr(client, "provider", None) == "fal_openrouter"
+                and getattr(stringout_manifest, "duration_seconds", float("inf")) < 300
+                else "agentic"
+            )
         )
     ]
     if grounding_spec is not None:

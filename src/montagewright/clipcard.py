@@ -1036,9 +1036,21 @@ def describe_clip(
     # whatever the field says, so the conversion happens on receipt.
     card["subjects"] = _to_frame_fractions(card.get("subjects", []))
     card = times_on_receipt(card, duration)
-    card["inspection"] = {"start_seconds": 0.0, "end_seconds": duration,
-                          "processing": processing, "audio": "included",
-                          "scope": "full_source_sampled"}
+    fal_backend = getattr(client, "provider", None) == "fal_openrouter"
+    actual_processing = processing
+    if fal_backend:
+        actual_processing = (
+            "openrouter_static"
+            if isinstance(processing, dict) or processing == "static"
+            else "openrouter_agentic"
+        )
+    card["inspection"] = {
+        "start_seconds": 0.0, "end_seconds": duration,
+        "processing": actual_processing,
+        "requested_processing": processing if fal_backend else None,
+        "backend": "fal_openrouter" if fal_backend else "gemini_interactions",
+        "audio": "included", "scope": "full_source_sampled",
+    }
     return card, Usage.from_interaction(interaction)
 
 

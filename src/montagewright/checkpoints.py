@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 
@@ -35,7 +36,8 @@ def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def response_path(ledger, stage: str, request: dict, upload_cache=None) -> Path | None:
+def response_path(ledger, stage: str, request: dict, upload_cache=None,
+                  *, provider: str = "gemini_interactions") -> Path | None:
     journal = getattr(ledger, "journal_path", None)
     if journal is None:
         return None
@@ -43,12 +45,28 @@ def response_path(ledger, stage: str, request: dict, upload_cache=None) -> Path 
                   for digest, entry in getattr(upload_cache, "entries", {}).items()}
     def canonical(value):
         if isinstance(value, dict):
-            return {k: ("sha256:" + identities[v] if k == "uri" and isinstance(v, str) and v in identities
-                        else canonical(v)) for k, v in value.items()}
+            result = {}
+            for k, v in value.items():
+                if k == "uri" and isinstance(v, str):
+                    if provider == "fal_openrouter" and v.startswith("file://"):
+                        source = Path(unquote(urlparse(v).path))
+                        digest = hashlib.sha256()
+                        with source.open("rb") as handle:
+                            for block in iter(lambda: handle.read(1 << 20), b""):
+                                digest.update(block)
+                        result[k] = "sha256:" + digest.hexdigest()
+                        continue
+                    if v in identities:
+                        result[k] = "sha256:" + identities[v]
+                        continue
+                result[k] = canonical(v)
+            return result
         if isinstance(value, list):
             return [canonical(v) for v in value]
         return value
     stable = canonical({k: v for k, v in request.items() if k != "timeout"})
+    if provider != "gemini_interactions":
+        stable = {"provider": provider, "request": stable}
     return Path(journal).parent / "work" / "responses" / (
         key_for({"stage": stage, "request": stable}) + ".json"
     )
@@ -65,12 +83,14 @@ def capture(interaction, stage: str, model: str) -> dict:
         "status": getattr(status, "value", status),
         "output_text": getattr(interaction, "output_text", None),
         "provider_id": getattr(interaction, "id", None),
+        "provider": getattr(interaction, "provider", "gemini_interactions"),
         "stage": stage, "model": model,
         "steps": [
             step.model_dump(mode="json", exclude_none=True) if hasattr(step, "model_dump")
             else json.loads(json.dumps(step if isinstance(step, dict) else vars(step), default=str))
             for step in getattr(interaction, "steps", None) or []
         ],
+        "reasoning_details": getattr(interaction, "reasoning_details", None) or [],
         "usage": {
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens + usage.thought_tokens,
@@ -78,6 +98,7 @@ def capture(interaction, stage: str, model: str) -> dict:
             "tool_use_tokens": usage.tool_use_tokens,
             "processing_calls": usage.processing_calls,
             "processing_results": usage.processing_results,
+            "provider_cost_usd": raw.get("provider_cost_usd"),
         },
     }
 
@@ -97,5 +118,6 @@ def replay(saved: dict):
     # Historical cost remains in the ledger, not in this invocation's usage.
     return SimpleNamespace(status=saved["status"], output_text=saved["output_text"],
                            id=saved.get("provider_id"), usage={}, steps=[],
+                           reasoning_details=saved.get("reasoning_details", []),
                            saved_processing_steps=saved.get("steps", []),
                            checkpoint_reused=True)

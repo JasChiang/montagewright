@@ -229,6 +229,7 @@ class Ledger:
         tool_use_tokens: int = 0,
         processing_calls: int = 0,
         processing_results: int = 0,
+        provider_cost_usd: float | None = None,
     ) -> float:
         reservation = self.reservations.pop(reservation_id)
         return self.record(
@@ -239,6 +240,7 @@ class Ledger:
             tool_use_tokens=tool_use_tokens,
             processing_calls=processing_calls,
             processing_results=processing_results,
+            provider_cost_usd=provider_cost_usd,
             model_id=reservation.model_id,
         )
 
@@ -254,6 +256,7 @@ class Ledger:
         processing_calls: int = 0,
         processing_results: int = 0,
         response_id: str | None = None,
+        provider_cost_usd: float | None = None,
     ) -> float:
         now = datetime.now(timezone.utc)
         charged_model = model_id or self.model_id
@@ -264,6 +267,8 @@ class Ledger:
             cached_tokens=cached_tokens,
             rates=rates,
         )
+        if provider_cost_usd is not None:
+            usd = float(provider_cost_usd)
         entry: dict[str, float | str] = {
             "stage": stage,
             "input": input_tokens,
@@ -280,6 +285,7 @@ class Ledger:
             "output_rate": rates["output"],
             "pricing_at": now.isoformat(),
             "model_id": charged_model,
+            "billing_source": "provider" if provider_cost_usd is not None else "estimated_rates",
             "processing_calls": processing_calls,
             "processing_results": processing_results,
         }

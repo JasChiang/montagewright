@@ -294,11 +294,17 @@ def _sam_checkpoint_for(args: argparse.Namespace) -> Path | None:
 
 
 def _client():
-    from google import genai
-    from google.genai import types
     from montagewright.environment import load_project_env
 
     load_project_env()
+    backend = os.environ.get("MONTAGEWRIGHT_GEMINI_BACKEND", "fal_openrouter")
+    if backend == "fal_openrouter":
+        from montagewright.fal_openrouter import client_from_env
+        return client_from_env()
+    if backend != "google":
+        raise SystemExit(f"unsupported MONTAGEWRIGHT_GEMINI_BACKEND: {backend}")
+    from google import genai
+    from google.genai import types
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise SystemExit("GEMINI_API_KEY is required")
@@ -2959,6 +2965,11 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
 
             planning_video = work / "editorial-stringout.mp4"
             planning_manifest_path = work / "editorial-stringout.json"
+            fal_inline_limit = (
+                14_000_000
+                if getattr(client, "provider", None) == "fal_openrouter"
+                else None
+            )
             planning_manifest = None
             if planning_video.exists() and planning_manifest_path.exists():
                 try:
@@ -2968,6 +2979,11 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                     require_stringout_matches(
                         planning_manifest, planning_material
                     )
+                    if (
+                        fal_inline_limit is not None
+                        and planning_video.stat().st_size > fal_inline_limit
+                    ):
+                        planning_manifest = None
                 except (OSError, ValueError, json.JSONDecodeError, StringoutError):
                     planning_manifest = None
             if planning_manifest is None:
@@ -2979,7 +2995,17 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                 planning_manifest = build_stringout(
                     planning_material, planning_video,
                     manifest_path=planning_manifest_path,
+                    width=640 if fal_inline_limit is not None else 1280,
+                    height=360 if fal_inline_limit is not None else 720,
                 )
+                if (
+                    fal_inline_limit is not None
+                    and planning_video.stat().st_size > fal_inline_limit
+                ):
+                    raise SystemExit(
+                        "fal editorial stringout exceeds its safe inline size; "
+                        "reduce the planning selects before dispatch"
+                    )
             else:
                 print("editorial stringout: verified cached reel", flush=True)
             pass  # Paid dispatch reserves budget; local/replayed work can continue.

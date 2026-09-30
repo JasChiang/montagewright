@@ -422,6 +422,13 @@ def upload_now(
     from montagewright.planner import _is_spend_cap, _provider_budget_message
 
     path = Path(path)
+    if getattr(client, "provider", None) == "fal_openrouter":
+        # The Chat Completions request carries local media bytes directly.
+        # An ASCII temporary hardlink would be deleted before that request.
+        uploaded = client.files.upload(file=str(path))
+        if on_uploaded is not None:
+            on_uploaded(uploaded)
+        return uploaded
     try:
         with _ascii_named(path) as sendable:
             uploaded = client.files.upload(file=str(sendable))
