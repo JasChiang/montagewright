@@ -7536,6 +7536,16 @@ def frame_disagreements(
             )
             gone = travelled_between(moved.get(source) or (), at, evaluation)
             clock = f"{int(at) // 60}:{at % 60:04.1f}"
+            # "Unknown" is only a fault while the card sighting is all there
+            # will ever be. A look bound to a locked identity is located by
+            # tracklet grounding inside this very cut; if it is not there,
+            # that is a measured absence with its own recovery, not a guess.
+            located_in_cut = str(look.get("entity_id") or "none") != "none" and (
+                os.environ.get("MONTAGEWRIGHT_GROUNDING", "tracklet")
+                == "tracklet"
+            )
+            if gone is None and located_in_cut:
+                continue
             if gone is None:
                 off.append(
                     f"k{index:02d} looks at '{look.get('at')}', which was "

@@ -2979,11 +2979,6 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                     require_stringout_matches(
                         planning_manifest, planning_material
                     )
-                    if (
-                        fal_inline_limit is not None
-                        and planning_video.stat().st_size > fal_inline_limit
-                    ):
-                        planning_manifest = None
                 except (OSError, ValueError, json.JSONDecodeError, StringoutError):
                     planning_manifest = None
             if planning_manifest is None:
@@ -3002,9 +2997,14 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                     fal_inline_limit is not None
                     and planning_video.stat().st_size > fal_inline_limit
                 ):
-                    raise SystemExit(
-                        "fal editorial stringout exceeds its safe inline size; "
-                        "reduce the planning selects before dispatch"
+                    # The fal adapter re-encodes an oversized video on the
+                    # same timeline at dispatch (`_fal_sized`), so the reel's
+                    # burned ids and source clock are what the model reads.
+                    print(
+                        "editorial stringout: "
+                        f"{planning_video.stat().st_size / 1e6:.1f} MB; fal "
+                        "dispatch sends a smaller encoding of the same timeline",
+                        flush=True,
                     )
             else:
                 print("editorial stringout: verified cached reel", flush=True)

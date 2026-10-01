@@ -78,7 +78,9 @@ def test_video_maps_processing_to_openrouter_video_url(tmp_path):
     mapped = _content([part])
     assert mapped[0]["type"] == "video_url"
     assert mapped[0]["video_url"]["url"].startswith("data:video/mp4;base64,")
-    assert mapped[0]["video_url"]["processing"] == "agentic"
+    # Agentic on this route either 503s or answers empty with zero input
+    # tokens (measured 2026-09-30), so it is sent as static.
+    assert mapped[0]["video_url"]["processing"] == "static"
     static = _content([video_content(video.as_uri(), processing={"type": "static", "fps": 4})])
     assert static[0]["video_url"]["processing"] == "static"
     assert "fps" not in static[0]["video_url"]
@@ -125,5 +127,103 @@ def test_oversize_inline_request_stops_before_network(monkeypatch):
     client = FalOpenRouterClient("test-key")
     with pytest.raises(ValueError, match="inline request"):
         client.interactions.create(
-            model="gemini-3.8-flash", input="x" * 19_000_000,
+            model="gemini-3.8-flash", input="x" * 20_000_000,
         )
+
+
+def test_a_video_answer_with_zero_input_tokens_is_refused(monkeypatch, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video bytes")
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, *a):
+            return json.dumps({
+                "choices": [{"message": {"content": "{\"words\": []}"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 9},
+            }).encode()
+
+    monkeypatch.setattr(
+        "montagewright.fal_openrouter.urlopen", lambda *a, **k: _Response()
+    )
+    client = FalOpenRouterClient("test-key")
+    with pytest.raises(RuntimeError, match="zero input tokens"):
+        client.interactions.create(
+            model="gemini-3.8-flash",
+            input=[video_content(video.as_uri(), processing="static"),
+                   {"type": "text", "text": "what is shown"}],
+        )
+
+
+def test_an_oversized_video_is_reencoded_on_the_same_timeline(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    from montagewright import fal_openrouter as fo
+
+    video = tmp_path / "long.mp4"
+    sp.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+            "-i", "testsrc2=s=1280x720:r=30:d=12,noise=alls=60:allf=t",
+            "-c:v", "libx264", "-b:v", "3M", str(video)], check=True)
+    monkeypatch.setattr(fo, "FAL_VIDEO_MAX_BYTES", 2_000_000)
+    monkeypatch.setattr(fo.tempfile, "gettempdir", lambda: str(tmp_path))
+    sized = fo._fal_sized(video)
+    assert sized != video and sized.stat().st_size <= 2_000_000
+    assert abs(fo._duration_seconds(sized) - fo._duration_seconds(video)) < 0.2
+
+
+def test_many_videos_that_sum_past_the_body_are_all_shrunk_not_dropped(
+    tmp_path, monkeypatch,
+):
+    import subprocess as sp
+
+    from montagewright import fal_openrouter as fo
+
+    videos = []
+    for index in range(4):
+        video = tmp_path / f"take{index}.mp4"
+        sp.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f",
+                "lavfi", "-i",
+                f"testsrc2=s=640x360:r=30:d=6,noise=alls={40 + index}:allf=t",
+                "-c:v", "libx264", "-b:v", "1500k", str(video)], check=True)
+        videos.append(video)
+    total = sum(one.stat().st_size for one in videos)
+    monkeypatch.setattr(fo, "FAL_REQUEST_MAX_BYTES", int(total * 1.34 * 0.6))
+    monkeypatch.setattr(fo.tempfile, "gettempdir", lambda: str(tmp_path))
+    sent = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, *a):
+            return json.dumps({
+                "choices": [{"message": {"content": "{}"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 2},
+            }).encode()
+
+    def _urlopen(request, **kwargs):
+        sent["body"] = request.data
+        return _Response()
+
+    monkeypatch.setattr(fo, "urlopen", _urlopen)
+    client = FalOpenRouterClient("test-key")
+    client.interactions.create(
+        model="gemini-3.8-flash",
+        input=[video_content(one.as_uri(), processing="static") for one in videos]
+        + [{"type": "text", "text": "compare"}],
+    )
+    body = json.loads(sent["body"])
+    assert len(sent["body"]) <= fo.FAL_REQUEST_MAX_BYTES
+    assert sum(
+        part["type"] == "video_url" for part in body["messages"][0]["content"]
+    ) == 4

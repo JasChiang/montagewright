@@ -7727,6 +7727,7 @@ def test_selection_requires_every_lock_mandated_grounding_target():
     ) == []
 
 
+@pytest.mark.usefixtures("legacy_grounding")
 def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
@@ -7852,6 +7853,7 @@ def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatc
     )
 
 
+@pytest.mark.usefixtures("legacy_grounding")
 def test_reference_critical_grounding_without_sam_fails_before_gemini(
     monkeypatch, tmp_path
 ):

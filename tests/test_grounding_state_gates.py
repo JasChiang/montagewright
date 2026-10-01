@@ -98,6 +98,7 @@ def test_target_keyed_confirmation_never_routes_a_box_to_b():
     assert _confirmed_target_frames({"C1": (a,)}, "C1", "target.b") == ()
 
 
+@pytest.mark.usefixtures("legacy_grounding")
 def test_clientless_confirmed_seed_still_runs_local_geometry(monkeypatch, tmp_path):
     from montagewright.executor import Source
     from montagewright.pipeline import Report, _reference_subject_samples
@@ -136,6 +137,7 @@ def test_clientless_confirmed_seed_still_runs_local_geometry(monkeypatch, tmp_pa
     assert handed["validation_mode"] == "single_seed_continuity"
 
 
+@pytest.mark.usefixtures("legacy_grounding")
 def test_missing_checkpoint_fails_before_exact_frame_work(monkeypatch, tmp_path):
     from montagewright.executor import Source
     from montagewright.pipeline import Report, _reference_subject_samples
@@ -169,6 +171,7 @@ def test_missing_checkpoint_fails_before_exact_frame_work(monkeypatch, tmp_path)
     )
 
 
+@pytest.mark.usefixtures("legacy_grounding")
 def test_clientless_final_window_reads_exact_cache_before_refusing(
     monkeypatch, tmp_path
 ):

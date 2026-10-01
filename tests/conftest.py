@@ -67,3 +67,10 @@ def content_map(provenance: ModelProvenance) -> ContentMap:
         model_provenance=provenance,
     )
 
+
+
+@pytest.fixture
+def legacy_grounding(monkeypatch):
+    """Exercise the exact-frame bbox + SAM path instead of tracklet picks."""
+
+    monkeypatch.setenv("MONTAGEWRIGHT_GROUNDING", "legacy")

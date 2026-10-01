@@ -991,6 +991,42 @@ def test_bound_action_is_stronger_than_one_recurring_subject_sighting() -> None:
     assert "picture changes" in frame_disagreements([without_action], [item])[0]
 
 
+def test_identity_bound_look_is_located_in_the_cut_not_guessed_from_the_card(
+    monkeypatch,
+) -> None:
+    from montagewright.motion import MotionInterval
+    from montagewright.planner import MaterialItem, frame_disagreements
+    from montagewright.spans import Span
+
+    item = MaterialItem(
+        "C1", 30.0, "a handset on a stand",
+        sightings=(("the handset", 7.0),),
+        spans=(Span("C1:s00", "C1", 0.0, 30.0),),
+        motion=(
+            MotionInterval("m00", 0.0, 13.0, "still", 0.0, 0.0, False),
+            MotionInterval("m01", 13.0, 16.0, "not_a_shift", 0.0, 0.0, False),
+            MotionInterval("m02", 16.0, 30.0, "still", 0.0, 0.0, False),
+        ),
+    )
+    shot = {
+        "source_id": "C1", "span_id": "C1:s00",
+        "start_seconds": 20.0, "seconds_needed": 4.0,
+        "camera_intent": "hold", "frame": "settles",
+        "action_treatment": "none",
+        "looks": [{
+            "entity_id": "device.x", "at": "the handset",
+            "seconds": 1.0, "framing": "centre", "must_be_whole": False,
+            "presentation_intent": "centered_hold", "includes": [],
+        }],
+    }
+    # Tracklet grounding finds (or fails to find) the identity inside this
+    # cut, so an unmeasurable camera change since the card is not a fault.
+    assert frame_disagreements([shot], [item]) == []
+    # The card sighting is all the legacy path will ever have.
+    monkeypatch.setenv("MONTAGEWRIGHT_GROUNDING", "legacy")
+    assert "picture changes" in frame_disagreements([shot], [item])[0]
+
+
 def test_selection_patch_schema_cannot_return_a_complete_timeline() -> None:
     from montagewright.planner import _selection_patch_schema
 

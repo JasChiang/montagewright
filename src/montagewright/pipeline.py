@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -1999,6 +2000,111 @@ def _geometry_from_confirmed(
     )
 
 
+def _tracklet_subject_samples(
+    source: Source,
+    clip: Any,
+    target_id: str,
+    *,
+    spec: Any,
+    client: Any,
+    upload_cache: Any | None,
+    report: Report,
+    work: Path,
+    output: Path | None,
+    memory: Path | None,
+    intent: str,
+) -> tuple[
+    list[dict[str, Any]],
+    list[float],
+    tuple[tuple[float, tuple[float, float, float, float]], ...],
+]:
+    """Locate a locked identity in one cut by picking among local proposals.
+
+    Same return shape as the exact-frame path, so the crop path and every
+    reader after it are unchanged. Boxes are the detector's; the model only
+    names which proposals are the target and which must stay in frame
+    together. A lookalike can be named, and so excluded, but never required.
+    """
+
+    from montagewright.tracklet_grounding import (
+        TrackletGroundingError,
+        ground_cut,
+    )
+
+    start = float(clip.approx_in_seconds)
+    end = float(clip.approx_out_seconds)
+    try:
+        result = ground_cut(
+            source.path, start, end, target_id,
+            spec=spec, intent=intent, client=client, cache=upload_cache,
+            ledger=report.ledger, work=work, memory=memory,
+        )
+    except TrackletGroundingError as error:
+        report.subject_notes[clip.clip_id] = f"tracklet grounding: {error}"[:200]
+        _set_target_grounding(report, clip.clip_id, target_id, {
+            "status": "identity_unverified",
+            "validation_mode": "tracklet_pick",
+            "reason": str(error)[:200],
+        })
+        return [], [], ()
+    usage = result.pop("_usage_object", None)
+    if usage is not None:
+        _charge(report, "tracklet_pick", usage)
+    if output is not None:
+        _write_grounding_record(
+            output / f"{clip.clip_id}-{target_id.replace(':', '_')}-tracklets.json",
+            result,
+        )
+    pick = result.get("pick") or {}
+    record = {
+        "status": (
+            "tracklet_geometry_validated"
+            if result["status"] == "target_located" else result["status"]
+        ),
+        "validation_mode": "tracklet_pick",
+        "required_tracklets": pick.get("required", []),
+        "target_tracklets": pick.get("targets", []),
+        "unboxed_target": pick.get("unboxed_target", False),
+        "note": pick.get("note", ""),
+        "tracklets": result.get("tracklets", []),
+        "excluded_instances": result.get("excluded_instances", []),
+        "contact_sheet": pick.get("sheet"),
+    }
+    _set_target_grounding(report, clip.clip_id, target_id, record)
+    if result["status"] != "target_located":
+        report.subject_notes[clip.clip_id] = (
+            f"tracklet grounding: {target_id} {result['status']}"
+            + (f" ({pick.get('note')})" if pick.get("note") else "")
+        )[:200]
+        return [], [], ()
+
+    boxes: list[dict[str, Any]] = []
+    times: list[float] = []
+    anchors: list[tuple[float, tuple[float, float, float, float]]] = []
+    for sample in result["samples"]:
+        if not sample.get("present"):
+            continue
+        x0, y0, x1, y1 = (float(v) for v in sample["box"])
+        boxes.append({
+            "frame_index": len(times),
+            "present": True,
+            "centre_x": (x0 + x1) / 2.0,
+            "centre_y": (y0 + y1) / 2.0,
+            "width": x1 - x0,
+            "height": y1 - y0,
+            "disambiguation": pick.get("note", ""),
+            "geometry_source": "grounding-dino+tracklet",
+        })
+        times.append(float(sample["at"]))
+        anchors.append((float(sample["at"]), (x0, y0, x1, y1)))
+    if len(boxes) < 2:
+        report.subject_notes[clip.clip_id] = (
+            f"tracklet grounding: {target_id} present on {len(boxes)} sample(s)"
+        )
+        return [], [], ()
+    return boxes, times, tuple(anchors)
+
+
 def _reference_subject_samples(
     source: Source,
     clip: Any,
@@ -2014,6 +2120,7 @@ def _reference_subject_samples(
     checkpoint: Path | None,
     memory: Path | None = None,
     confirmed: "tuple[Any, ...] | None" = None,
+    intent: str = "",
 ) -> tuple[
     list[dict[str, Any]],
     list[float],
@@ -2026,6 +2133,13 @@ def _reference_subject_samples(
     reference-conditioned decision must match the locked identity on at least
     two distinct PTS values before any box is exposed to SAM or reframing.
     """
+
+    if os.environ.get("MONTAGEWRIGHT_GROUNDING", "tracklet") == "tracklet":
+        return _tracklet_subject_samples(
+            source, clip, target_id, spec=spec, client=client,
+            upload_cache=upload_cache, report=report, work=work,
+            output=output, memory=memory, intent=intent,
+        )
 
     from montagewright.reference_grounding import (
         ReferenceGroundingError,
@@ -2701,6 +2815,17 @@ def follow_subjects(
                                     confirmed_identities,
                                     clip.source_id,
                                     entity_id,
+                                ),
+                                # What this shot is meant to show of the
+                                # identity -- one unit, a pair, a colour
+                                # line-up -- decides which proposals must
+                                # stay in frame together.
+                                intent="；".join(
+                                    look.at for look in reframe.looks
+                                    if entity_id in (
+                                        look.entity_id,
+                                        *tuple(look.co_visible_entity_ids),
+                                    )
                                 ),
                             )
                         except ReferenceShotUnusable as unusable:

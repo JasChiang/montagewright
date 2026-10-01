@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -1597,6 +1598,26 @@ def _media_uri(
     if immutable_snapshot:
         if expected_sha256 is None:
             raise ValueError("immutable media snapshot requires expected_sha256")
+        if getattr(client, "provider", None) == "fal_openrouter":
+            # fal reads the bytes when the request is sent, not at "upload",
+            # so a snapshot in a directory deleted on return is gone by then.
+            # Keep it, named by its own verified hash: content-addressed, so
+            # it can never be mistaken for different bytes.
+            kept_dir = Path(tempfile.gettempdir()) / "montagewright-fal-media"
+            kept_dir.mkdir(parents=True, exist_ok=True)
+            kept = kept_dir / f"{expected_sha256}{path.suffix.lower()}"
+            if not kept.exists() or sha256_file(kept) != expected_sha256:
+                staged = kept_dir / f".{expected_sha256}.{os.getpid()}"
+                shutil.copyfile(path, staged)
+                if sha256_file(staged) != expected_sha256:
+                    staged.unlink(missing_ok=True)
+                    raise ReferenceGroundingError(
+                        "media bytes changed before immutable upload snapshot"
+                    )
+                staged.replace(kept)
+            return _media_uri(
+                kept, client=client, cache=cache, mime_type=mime_type,
+            )
         # Upload the verified copy, not a mutable source path checked earlier.
         # References and exact frames are small; copying them closes the gap
         # between hash verification and the uploader/cache reading their bytes.
