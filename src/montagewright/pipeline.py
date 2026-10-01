@@ -2013,6 +2013,24 @@ def _geometry_from_confirmed(
     )
 
 
+def _shot_intent(clip: Any, reframe: Any, entity_id: str) -> str:
+    """What the identity pick is told this shot has to show."""
+
+    looks = "；".join(
+        look.at for look in reframe.looks
+        if entity_id in (look.entity_id, *tuple(look.co_visible_entity_ids))
+    )
+    sync = getattr(clip, "music_sync", None)
+    purpose = str(getattr(sync, "rhythm_reason", "") or "").strip()
+    story = str(getattr(clip, "story_point", "") or "").strip()
+    parts = [f"畫面停在：{looks}" if looks else ""]
+    if purpose:
+        parts.append(f"這顆鏡頭的目的：{purpose}")
+    if story:
+        parts.append(f"敘事段落：{story}")
+    return "\n".join(one for one in parts if one)
+
+
 def _tracklet_subject_samples(
     source: Source,
     clip: Any,
@@ -2899,13 +2917,13 @@ def follow_subjects(
                                 # identity -- one unit, a pair, a colour
                                 # line-up -- decides which proposals must
                                 # stay in frame together.
-                                intent="；".join(
-                                    look.at for look in reframe.looks
-                                    if entity_id in (
-                                        look.entity_id,
-                                        *tuple(look.co_visible_entity_ids),
-                                    )
-                                ),
+                                # The look names where the frame settles; the
+                                # shot's purpose says what it must deliver.
+                                # "The lavender one in the middle" under a
+                                # purpose of "close on the three-colour
+                                # line-up" needs all three kept, and the look
+                                # alone let the pick require one.
+                                intent=_shot_intent(clip, reframe, entity_id),
                                 target_aspect=target_aspect,
                                 keep_whole=any(
                                     look.must_be_whole

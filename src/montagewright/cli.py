@@ -4335,6 +4335,14 @@ def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGe
                   budget_interrupted = True
                   stopped = str(error)
                   break
+              except ValueError as error:
+                  # The replan could not be made to honour the selection's own
+                  # contracts (replan_shots already retried once). That ends
+                  # this repair, not the run: the cut already rendered and
+                  # reviewed stays the result, with the reason on record --
+                  # the same as every other way a round can fail to land.
+                  stopped = f"replan was not executable: {error}"
+                  break
               fresh = replanned.get("shots", [])
               if len(fresh) != len(failing):
                   stopped = (

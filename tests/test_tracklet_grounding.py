@@ -169,3 +169,17 @@ def test_the_contact_sheet_is_kept_with_the_output(monkeypatch, tmp_path):
     assert kept.read_bytes() == b"jpeg"
     record = report.reference_grounding["k00"]
     assert record["contact_sheet"] == str(kept)
+
+
+def test_the_pick_is_told_the_shot_purpose_not_only_where_it_settles():
+    from montagewright.pipeline import _shot_intent
+
+    look = SimpleNamespace(at="中間的淡紫色機身", entity_id="device.x",
+                           co_visible_entity_ids=())
+    clip = SimpleNamespace(
+        music_sync=SimpleNamespace(rhythm_reason="收尾回到三色並排陳列的 hero shot"),
+        story_point="結尾",
+    )
+    intent = _shot_intent(clip, SimpleNamespace(looks=[look]), "device.x")
+    assert "中間的淡紫色機身" in intent
+    assert "三色並排" in intent and "結尾" in intent
