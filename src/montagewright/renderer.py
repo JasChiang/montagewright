@@ -645,21 +645,54 @@ def _mux_music(
         ).replace("[voice][bed]amix", "[voice][bed_mix]amix", 1)
         bed_out = ["-map", "[bed_only]"]
 
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(picture), "-i", str(music),
-        "-filter_complex", chain,
-        "-map", "0:v:0", "-map", "[out]",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        "-shortest", str(destination),
-    ]
-    if bed_out:
-        command += bed_out + [
-            "-c:a", "aac", "-b:a", "128k", "-shortest",
-            str(destination.parent / "bed-as-laid.m4a"),
+    # loudnorm resamples to 192 kHz internally and emits it; left alone the
+    # limiter ran there and AAC re-encoded at 96 kHz, which is how a chain
+    # asking for -1.5 dBTP delivered +2.2. Return to 48 kHz *before* the
+    # limiter so it holds the rate that is actually encoded.
+    limiter = f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled"
+    chain = chain.replace(limiter, f"aresample=48000,{limiter}")
+
+    def _encode(chain_now: str) -> None:
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(picture), "-i", str(music),
+            "-filter_complex", chain_now,
+            "-map", "0:v:0", "-map", "[out]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-shortest", str(destination),
         ]
-    _run(command)
+        if bed_out:
+            command += bed_out + [
+                "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-shortest",
+                str(destination.parent / "bed-as-laid.m4a"),
+            ]
+        _run(command)
+
+    _encode(chain)
+    # alimiter holds sample peaks; AAC adds its own overshoot (about 1.2 dB
+    # measured on a dense music bed). Measure the encoded file and, if it is
+    # still over, lower the ceiling by exactly the overshoot and encode again.
+    ceiling_db = TRUE_PEAK_CEILING_DB
+    for _ in range(2):
+        peak = _encoded_true_peak(destination)
+        if peak is None or peak <= TRUE_PEAK_CEILING_DB + 0.3:
+            break
+        ceiling_db -= (peak - TRUE_PEAK_CEILING_DB) + 0.1
+        lowered = f"alimiter=limit={10 ** (ceiling_db / 20):.6f}:level=disabled"
+        _encode(chain.replace(limiter, lowered))
     return destination
+
+
+def _encoded_true_peak(path: Path) -> float | None:
+    """The finished file's true peak, as the release audit will read it."""
+
+    measured = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+         "-filter_complex", "ebur128=peak=true", "-f", "null", "-"],
+        capture_output=True, text=True, check=False,
+    )
+    peaks = re.findall(r"Peak:\s*(-?[0-9.]+) dBFS", measured.stderr)
+    return float(peaks[-1]) if peaks else None
 
 
 def _preview(source: Path, destination: Path, *, video_encoder: str) -> Path:

@@ -50,8 +50,13 @@ def recover(selection, faults, *, material, direction, brief, work: Path,
     if proposal is None:
         try:
             proposal, _ = replan_shots(failing, material, direction, brief=brief,
-                context='Identity grounding failed. Do not clear targets or use an unconstrained center crop. '
-                        'Inspect earlier/later source moments or alternative footage. Preserve the required product identity.',
+                context='Identity grounding or framing could not be delivered for these shots; each failure '
+                        'says which. Do not clear targets or use an unconstrained center crop. Preserve the '
+                        'required product identity. When the identity was not proved, inspect earlier/later '
+                        'source moments or alternative footage. When the required units were all found but '
+                        'together do not fit the delivery aspect, choose how to give: canvas_mode fit keeps '
+                        'the whole source frame, a sequential_read look travels across them if the shot is '
+                        'long enough, or use a different shot where they sit closer together.',
                 client=client, cache=cache, ledger=ledger, grounding_spec=grounding_spec,
                 editor_selection=selection)
         except ValueError as error:

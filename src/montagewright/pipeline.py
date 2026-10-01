@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -240,6 +241,18 @@ class ReferenceShotUnusable(RuntimeError):
 
 class ReferenceIdentityUnconfirmed(ReferenceShotUnusable):
     """The frames could not show that this is the same instance."""
+
+
+class ReferenceGroupDoesNotFit(ReferenceShotUnusable):
+    """Every unit the shot must keep is found, and together they are wider
+    than any fill crop at the delivery aspect.
+
+    The measurement used to be recorded as an advisory and the shot was
+    rendered centred anyway, cutting a member out. Which way to give is an
+    editorial choice -- keep the whole frame, read across them, or use other
+    footage -- so it goes back to the planner with the numbers, before
+    anything is rendered.
+    """
 
 
 class ReferenceShotsUnusable(RuntimeError):
@@ -2013,6 +2026,9 @@ def _tracklet_subject_samples(
     output: Path | None,
     memory: Path | None,
     intent: str,
+    target_aspect: float | None = None,
+    keep_whole: bool = False,
+    reads_across: bool = False,
 ) -> tuple[
     list[dict[str, Any]],
     list[float],
@@ -2056,6 +2072,17 @@ def _tracklet_subject_samples(
             result,
         )
     pick = result.get("pick") or {}
+    # The sheet is the evidence a reviewer reads to see why these units were
+    # chosen. It was written to a scratch directory and gone by the time
+    # anyone could look.
+    sheet = Path(str(pick.get("sheet") or ""))
+    if output is not None and pick.get("sheet") and sheet.is_file():
+        kept_sheet = output / (
+            f"{clip.clip_id}-{target_id.replace(':', '_')}-tracklets.jpg"
+        )
+        kept_sheet.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(sheet, kept_sheet)
+        pick["sheet"] = str(kept_sheet)
     record = {
         "status": (
             "tracklet_geometry_validated"
@@ -2102,6 +2129,53 @@ def _tracklet_subject_samples(
             f"tracklet grounding: {target_id} present on {len(boxes)} sample(s)"
         )
         return [], [], ()
+
+    # Does what must stay in frame fit a fill crop at the delivery aspect?
+    # Only asked when the shot promises it: several units required together,
+    # or one declared whole. A look that reads across them, or that allows a
+    # partial reveal, has already chosen to give.
+    required_count = len(pick.get("required") or [])
+    if (
+        target_aspect
+        and not reads_across
+        and (required_count >= 2 or keep_whole)
+    ):
+        source_aspect = source.aspect_ratio
+        crop_w = min(1.0, target_aspect / source_aspect)
+        crop_h = min(1.0, source_aspect / target_aspect)
+        fitting = [
+            one for one in boxes
+            if one["width"] <= crop_w * 0.98 and one["height"] <= crop_h * 0.98
+        ]
+        if len(fitting) < 0.8 * len(boxes):
+            widest = max(one["width"] for one in boxes)
+            tallest = max(one["height"] for one in boxes)
+            over = max(widest / crop_w, tallest / crop_h)
+            what = (
+                f"the {required_count} units it must keep together"
+                if required_count >= 2 else f"{target_id}, declared whole,"
+            )
+            message = (
+                f"{clip.clip_id}: {what} span {widest:.2f} of the source width "
+                f"({over:.1f}x a fill crop at the delivery aspect, which holds "
+                f"{crop_w:.2f}) in {len(boxes) - len(fitting)} of {len(boxes)} "
+                "sampled moments. Choose how to give: canvas_mode fit keeps the "
+                "whole source frame; a sequential_read look travels across them "
+                "if the shot is long enough; or use a different shot where they "
+                "sit closer together."
+            )
+            record["status"] = "group_does_not_fit"
+            record["fit_measurement"] = {
+                "group_width": round(widest, 3),
+                "group_height": round(tallest, 3),
+                "crop_width": round(crop_w, 3),
+                "crop_height": round(crop_h, 3),
+                "over": round(over, 2),
+                "fitting_samples": len(fitting),
+                "samples": len(boxes),
+            }
+            _set_target_grounding(report, clip.clip_id, target_id, record)
+            raise ReferenceGroupDoesNotFit(clip.clip_id, target_id, message)
     return boxes, times, tuple(anchors)
 
 
@@ -2121,6 +2195,9 @@ def _reference_subject_samples(
     memory: Path | None = None,
     confirmed: "tuple[Any, ...] | None" = None,
     intent: str = "",
+    target_aspect: float | None = None,
+    keep_whole: bool = False,
+    reads_across: bool = False,
 ) -> tuple[
     list[dict[str, Any]],
     list[float],
@@ -2139,6 +2216,8 @@ def _reference_subject_samples(
             source, clip, target_id, spec=spec, client=client,
             upload_cache=upload_cache, report=report, work=work,
             output=output, memory=memory, intent=intent,
+            target_aspect=target_aspect, keep_whole=keep_whole,
+            reads_across=reads_across,
         )
 
     from montagewright.reference_grounding import (
@@ -2827,6 +2906,23 @@ def follow_subjects(
                                         *tuple(look.co_visible_entity_ids),
                                     )
                                 ),
+                                target_aspect=target_aspect,
+                                keep_whole=any(
+                                    look.must_be_whole
+                                    for look in reframe.looks
+                                    if look.entity_id == entity_id
+                                ),
+                                # A look that travels across the group, or
+                                # that lets members enter and leave, has
+                                # already decided not to hold them together.
+                                reads_across=any(
+                                    look.presentation_intent in {
+                                        "sequential_read", "partial_reveal",
+                                        "transition_pass",
+                                    }
+                                    for look in reframe.looks
+                                    if look.entity_id == entity_id
+                                ) or len(reframe.looks) >= 2,
                             )
                         except ReferenceShotUnusable as unusable:
                             if entity_id in planned_entity_ids:

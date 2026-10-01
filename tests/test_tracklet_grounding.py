@@ -104,3 +104,68 @@ def test_remembered_pick_is_replayed_without_a_client(tmp_path):
         client=None, cache=None, ledger=None, work=tmp_path, memory=memory,
     )
     assert result["status"] == "target_located"
+
+
+def _fake_cut(width, required, sheet=None):
+    samples = [
+        {"at": 0.5 * i, "present": True,
+         "box": [0.25, 0.3, 0.25 + width, 0.7], "members": len(required),
+         "of": len(required)}
+        for i in range(6)
+    ]
+    return {
+        "status": "target_located", "times": [s["at"] for s in samples],
+        "samples": samples, "tracklets": [],
+        "pick": {"required": required, "targets": required,
+                 "unboxed_target": False, "note": "",
+                 "sheet": str(sheet) if sheet else None},
+        "excluded_instances": [], "usage": None,
+    }
+
+
+def _call(monkeypatch, tmp_path, result, **kwargs):
+    from montagewright import pipeline
+    from montagewright.executor import Source
+
+    monkeypatch.setattr(tg, "ground_cut", lambda *a, **k: dict(result))
+    source = Source("C1", tmp_path / "C1.mp4", 10.0, 1920, 1080)
+    clip = SimpleNamespace(clip_id="k00", approx_in_seconds=0.0,
+                           approx_out_seconds=3.0)
+    report = pipeline.Report()
+    return pipeline._tracklet_subject_samples(
+        source, clip, "device.x", spec=SimpleNamespace(), client=object(),
+        upload_cache=None, report=report, work=tmp_path,
+        output=tmp_path / "out", memory=None, intent="two side by side",
+        target_aspect=9 / 16, **kwargs,
+    ), report
+
+
+def test_a_required_pair_wider_than_a_vertical_crop_goes_back_to_the_planner(
+    monkeypatch, tmp_path,
+):
+    from montagewright.pipeline import ReferenceGroupDoesNotFit
+
+    # 9:16 out of 16:9 keeps 0.316 of the width; the pair spans 0.50.
+    with pytest.raises(ReferenceGroupDoesNotFit, match="canvas_mode fit"):
+        _call(monkeypatch, tmp_path, _fake_cut(0.50, [1, 2]))
+
+
+def test_a_pair_that_fits_or_a_look_that_reads_across_is_delivered(
+    monkeypatch, tmp_path,
+):
+    (boxes, _, _), _ = _call(monkeypatch, tmp_path, _fake_cut(0.25, [1, 2]))
+    assert len(boxes) == 6
+    (boxes, _, _), _ = _call(
+        monkeypatch, tmp_path, _fake_cut(0.50, [1, 2]), reads_across=True,
+    )
+    assert len(boxes) == 6
+
+
+def test_the_contact_sheet_is_kept_with_the_output(monkeypatch, tmp_path):
+    sheet = tmp_path / "scratch-sheet.jpg"
+    sheet.write_bytes(b"jpeg")
+    _, report = _call(monkeypatch, tmp_path, _fake_cut(0.2, [1], sheet))
+    kept = tmp_path / "out" / "k00-device.x-tracklets.jpg"
+    assert kept.read_bytes() == b"jpeg"
+    record = report.reference_grounding["k00"]
+    assert record["contact_sheet"] == str(kept)

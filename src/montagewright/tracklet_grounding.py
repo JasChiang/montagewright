@@ -49,7 +49,11 @@ MAX_GAP_SAMPLES = 2
 MIN_PRESENCE = 0.2
 MIN_AREA = 0.0015
 SHEET_MOMENTS = (0.15, 0.5, 0.85)
-PICK_VERSION = "tracklet-pick-v1"
+# How far either side of the cut identity evidence is read from. Geometry
+# never comes from here: these frames are not in the film.
+CONTEXT_SECONDS = 1.5
+# v2: context frames either side of the cut; "cannot see it" is uncertain.
+PICK_VERSION = "tracklet-pick-v2"
 PICK_OUTPUT_TOKENS = 3072
 
 Box = tuple[float, float, float, float]  # x0, y0, x1, y1 in 0..1
@@ -109,6 +113,15 @@ def _iou(a: Box, b: Box) -> float:
         (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
     )
     return inter / union if union > 0 else 0.0
+
+
+def _duration(source: Path) -> float:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(source)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(probe.stdout.strip())
 
 
 def sample_frames(
@@ -264,17 +277,34 @@ def contact_sheet(
     frames: Sequence[tuple[float, Path]],
     tracklets: Sequence[Tracklet],
     destination: Path,
+    inside: Sequence[int] | None = None,
 ) -> list[int]:
-    """Three moments of the cut side by side, every tracklet outlined and
-    numbered where it is. Returns the sample indices shown."""
+    """Moments of the cut side by side, every tracklet outlined and numbered
+    where it is. Returns the sample indices shown.
+
+    `inside` are the samples within the cut. When the take continues either
+    side, one moment from just before and one from just after are added and
+    labelled CONTEXT: the same unit is often identifiable a second earlier
+    -- its back turned to camera -- and nowhere inside the cut itself.
+    """
 
     from PIL import Image, ImageDraw, ImageFont
 
     count = len(frames)
-    shown = sorted({
-        min(count - 1, max(0, round(share * (count - 1))))
+    inside = list(inside) if inside is not None else list(range(count))
+    within = len(inside)
+    shown_inside = [
+        inside[min(within - 1, max(0, round(share * (within - 1))))]
         for share in SHEET_MOMENTS
+    ]
+    before = [i for i in range(count) if i < inside[0]]
+    after = [i for i in range(count) if i > inside[-1]]
+    shown = sorted({
+        *shown_inside,
+        *([before[len(before) // 2]] if before else []),
+        *([after[len(after) // 2]] if after else []),
     })
+    context = set(shown) - set(inside)
     try:
         font = ImageFont.truetype(
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf", 26
@@ -301,8 +331,15 @@ def contact_sheet(
             ty = y0 - tag_h if y0 - tag_h >= 0 else y0
             draw.rectangle([x0, ty, x0 + tag_w, ty + tag_h], fill=colour)
             draw.text((x0 + 5, ty + 2), tag, fill="black", font=font)
-        draw.rectangle([0, 0, 150, 34], fill="black")
-        draw.text((6, 3), f"{frames[sample][0]:.1f}s", fill="white", font=font)
+        label = f"{frames[sample][0]:.1f}s"
+        if sample in context:
+            label += " CONTEXT"
+            draw.rectangle([0, 0, width - 1, height - 1], outline="#888888", width=10)
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+        draw.rectangle([0, 0, right - left + 14, 34], fill="black")
+        draw.text((6, 3), label, fill="white", font=font)
+        if len(shown) > 3:
+            image = image.resize((image.width * 2 // 3, image.height * 2 // 3))
         tiles.append(image)
     width, height = tiles[0].size
     sheet = Image.new("RGB", (width * len(tiles), height), "black")
@@ -361,21 +398,26 @@ def _pick_schema(numbers: Sequence[int]) -> dict[str, Any]:
 PICK_PROMPT = """你是剪輯助理，負責在一顆鏡頭裡指認產品身份。
 
 上面是參考圖與身份目錄（target 的 identity cues、stable exclusions）。
-最後一張圖是同一顆鏡頭的三個時刻並排（左到右時間遞增，左上角是來源秒數）。
-本機偵測器把畫面裡每一個候選物件框起來並編號 #1、#2…；同一個號碼在三個時刻是同一個物件。
+最後一張圖是同一顆鏡頭的幾個時刻並排（左到右時間遞增，左上角是來源秒數）。
+標 CONTEXT、外框灰色的是這顆鏡頭前後一點點的同一段素材，不會出現在成片裡，
+只用來幫你認身份：同一台機器可能在鏡頭前一秒剛好轉到背面。
+本機偵測器把畫面裡每一個候選物件框起來並編號 #1、#2…；同一個號碼在各時刻是同一個物件。
 偵測器只懂類別，不懂型號，而且可能框錯（例如把手臂上的圖案當成手錶）。
 
 請做兩件事，不要寫任何座標：
 
 1. 對每一個號碼判斷：
    - target：符合 target 的身份（依 identity_semantics；同 SKU 的不同實機都算 target）
-   - other_product：是產品，但屬於 stable exclusions 或其他型號
+   - other_product：是產品，而且你**看得到**與 target 矛盾的特徵（例如三顆鏡頭、直立翻蓋），
+     或它屬於 stable exclusions
    - not_a_product：框錯了，不是產品
-   - uncertain：看不清，無法判斷
-   evidence 寫你看得到的具體依據（機身比例、相機排列、折疊方式…）。
+   - uncertain：辨識特徵在所有時刻都看不到（只看到側邊、螢幕、被手遮住），
+     無法判斷是不是 target。**看不到 ≠ 不是**，這種情況一律用 uncertain，不要用 other_product
+   evidence 寫你看得到的具體依據（機身比例、相機排列、折疊方式…），並註明是在哪個時刻看到的。
 
 2. 這顆鏡頭在剪輯上要呈現：{intent}
    在 required_numbers 列出「必須同時留在畫面裡」才能完成這個呈現的號碼。
+   只看非 CONTEXT 的時刻判斷誰要同框。
    只要一台就能完成時只列一台；要並排比較、多色展示、手持互動時，列出所有參與的號碼。
    只能列 verdict 是 target 的號碼，或和 target 直接互動而不可切掉的物件。
    target 不在這顆鏡頭裡就回空陣列。
@@ -398,6 +440,7 @@ def pick(
     from montagewright.planner import MODEL_ID, Usage, ask
     from montagewright.gemini import structured_json
     from montagewright.reference_grounding import (
+        _media_uri,
         _parse_payload,
         reference_prompt_parts,
     )
@@ -407,11 +450,14 @@ def pick(
         resolution="high",
     )
     parts.append({"type": "text", "text": "SHOT CONTACT SHEET follows."})
+    # The same uploader the reference images use: a File API URI on the
+    # Google backend, a local URI the fal adapter inlines at dispatch.
     parts.append({
         "type": "image",
         "mime_type": "image/jpeg",
-        "uri": sheet.resolve().as_uri() if cache is None else _sheet_uri(
-            sheet, client, cache
+        "uri": _media_uri(
+            sheet.resolve(), client=client, cache=cache,
+            mime_type="image/jpeg",
         ),
         "resolution": "high",
     })
@@ -437,11 +483,6 @@ def pick(
     )
     payload = _parse_payload(interaction, "tracklet pick")
     return payload, Usage.from_interaction(interaction)
-
-
-def _sheet_uri(sheet: Path, client: Any, cache: Any) -> str:
-    uri, _ = cache.uri_for(sheet, client, mime_type="image/jpeg")
-    return uri
 
 
 def validate_pick(
@@ -555,24 +596,39 @@ def ground_cut(
             "no client and no remembered pick for this cut"
         )
 
-    frames = sample_frames(source, start, end, work / f"tracklets-{key[:12]}")
-    if len(frames) < 2:
+    # Identity is read over a little more of the take than the cut uses;
+    # geometry is only ever taken from inside the cut.
+    try:
+        duration = _duration(source)
+    except (subprocess.CalledProcessError, ValueError):
+        duration = end + CONTEXT_SECONDS
+    window_start = max(0.0, start - CONTEXT_SECONDS)
+    window_end = min(duration, end + CONTEXT_SECONDS)
+    frames = sample_frames(
+        source, window_start, window_end, work / f"tracklets-{key[:12]}"
+    )
+    inside = [
+        index for index, (at, _) in enumerate(frames)
+        if start - 1e-3 <= at < end + 1e-3
+    ]
+    if len(inside) < 2:
         raise TrackletGroundingError(
-            f"only {len(frames)} frame(s) decoded in {start:.2f}-{end:.2f}s"
+            f"only {len(inside)} frame(s) decoded in {start:.2f}-{end:.2f}s"
         )
     tracklets = link(detect(frames))
     usage = None
-    if not tracklets:
+    in_cut = set(inside)
+    if not any(set(one.detections) & in_cut for one in tracklets):
         result = {
             "status": "no_candidates",
-            "times": [t for t, _ in frames],
+            "times": [frames[i][0] for i in inside],
             "samples": [],
             "tracklets": [],
             "pick": None,
         }
     else:
         sheet = work / f"tracklets-{key[:12]}" / "sheet.jpg"
-        shown = contact_sheet(frames, tracklets, sheet)
+        shown = contact_sheet(frames, tracklets, sheet, inside=inside)
         numbers = [one.number for one in tracklets]
         payload, usage = pick(
             spec, target_id, sheet, numbers, intent,
@@ -589,9 +645,17 @@ def ground_cut(
                 key=lambda one: (len(one.detections), one.mean_area()),
             )
             decided["required"] = [by_presence.number]
+        # A unit seen only in the context frames is evidence, not something
+        # this cut can keep in frame.
+        decided["required"] = [
+            one.number for one in tracklets
+            if one.number in decided["required"]
+            and set(one.detections) & in_cut
+        ]
         chosen = [one for one in tracklets if one.number in decided["required"]]
         samples = []
-        for index, (at, _) in enumerate(frames):
+        for index in inside:
+            at = frames[index][0]
             boxes = [b for b in (one.box_at(index) for one in chosen) if b]
             if not boxes:
                 samples.append({"at": at, "present": False})
@@ -617,7 +681,8 @@ def ground_cut(
             "status": (
                 "target_located" if decided["required"] else "target_absent"
             ),
-            "times": [t for t, _ in frames],
+            "times": [frames[i][0] for i in inside],
+            "context_seconds": [round(window_start, 3), round(window_end, 3)],
             "samples": samples,
             "tracklets": [
                 {
